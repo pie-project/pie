@@ -103,7 +103,7 @@ async fn main(_input: String) -> Result<String> {
     // finish() (F7) lands after the last decode submit, not here).
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
+    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
 
     let mut got: Vec<u32> = Vec::with_capacity(MAX_TOKENS);
     got.push(g0 as u32);
@@ -163,7 +163,7 @@ async fn main(_input: String) -> Result<String> {
                 .with_context(|| format!("decode submit @{step}"))?;
             let t = out
                 .take()
-                .get::<i32>()
+                .to_host::<Vec<i32>>()
                 .await
                 .with_context(|| format!("out.take @{step}"))?;
             let Some(&t0) = t.first() else {

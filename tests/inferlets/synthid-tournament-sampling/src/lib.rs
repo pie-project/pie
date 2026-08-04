@@ -435,13 +435,17 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
+    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
     let s0 = score_out_p
         .take()
-        .get::<f32>()
+        .to_host::<f32>()
         .await
-        .context("score take")?[0];
-    let n0 = null_out_p.take().get::<f32>().await.context("null take")?[0];
+        .context("score take")?;
+    let n0 = null_out_p
+        .take()
+        .to_host::<f32>()
+        .await
+        .context("null take")?;
     generated.push(g0 as u32);
     scores.push(s0);
     nulls.push(n0);
@@ -529,19 +533,19 @@ async fn main(input: Input) -> Result<Output> {
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
             let s = score_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("score_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("score_out.take @{}", generated.len()))?;
             let z = null_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("null_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("null_out.take @{}", generated.len()))?;
             generated.push(t as u32);
             scores.push(s);
             nulls.push(z);

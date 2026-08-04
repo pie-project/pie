@@ -79,9 +79,9 @@ async fn append_tokens(
     fwd.submit(pipeline).context("append shared prefix")?;
     Ok(next_token
         .take()
-        .get::<i32>()
+        .to_host::<i32>()
         .await
-        .context("read branch token")?[0])
+        .context("read branch token")?)
 }
 
 async fn generate(
@@ -162,9 +162,9 @@ async fn generate(
     run_ahead(&pipeline, &fwd, budget as usize, async || {
         let token = token_out
             .take()
-            .get::<i32>()
+            .to_host::<i32>()
             .await
-            .context("read leaf token")?[0] as u32;
+            .context("read leaf token")? as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

@@ -91,7 +91,7 @@ async fn main(_input: String) -> Result<String> {
     let pipeline = Pipeline::new();
     gmask.put(vec![true; (kp1 * v) as usize]); // all-allow
     fwd.submit(&pipeline).context("submit")?;
-    let committed = out.take().get::<i32>().await.context("out.take")?;
+    let committed = out.take().to_host::<Vec<i32>>().await.context("out.take")?;
 
     let result = format!(
         "MTP_GRAMMAR K={K} committed={} (SDK-authored §6.1 native-MTP+grammar, vocab={vocab})",

@@ -301,7 +301,7 @@ async fn main(input: Input) -> Result<Output> {
             .with_context(|| format!("prefill chunk submit @{base}"))?;
         tok_out_c
             .take()
-            .get::<i32>()
+            .to_host::<Vec<i32>>()
             .await
             .with_context(|| format!("prefill chunk take @{base}"))?;
     }
@@ -394,22 +394,22 @@ async fn main(input: Input) -> Result<Output> {
         .submit(&pipe)
         .with_context(|| format!("prefill submit @{base}"))?;
 
-    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
+    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
     generated.push(g0 as u32);
 
     let prefill_scores = scores_out
         .take()
-        .get::<f32>()
+        .to_host::<Vec<f32>>()
         .await
         .context("snapkv_scores.take")?;
     let layers_observed = layers_out
         .take()
-        .get::<u32>()
+        .to_host::<u32>()
         .await
-        .context("snapkv_layer_count.take")?[0];
+        .context("snapkv_layer_count.take")?;
     let device_page_mass = page_mass_out
         .take()
-        .get::<f32>()
+        .to_host::<Vec<f32>>()
         .await
         .context("snapkv_page_mass.take")?;
 
@@ -501,9 +501,9 @@ async fn main(input: Input) -> Result<Output> {
         run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })

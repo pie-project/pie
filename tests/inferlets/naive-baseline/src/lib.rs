@@ -167,18 +167,18 @@ async fn main(input: Input) -> Result<Output> {
         // has to be drained or the channel fills.
         g0 = tok_out_p
             .take()
-            .get::<i32>()
+            .to_host::<i32>()
             .await
-            .with_context(|| format!("g0 take @{base}"))?[0];
+            .with_context(|| format!("g0 take @{base}"))?;
         if want_stats {
             s1_out_p
                 .take()
-                .get::<f32>()
+                .to_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("s1 take @{base}"))?;
             s2_out_p
                 .take()
-                .get::<f32>()
+                .to_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("s2 take @{base}"))?;
         }
@@ -252,18 +252,18 @@ async fn main(input: Input) -> Result<Output> {
         run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
             if want_stats {
                 s1_out
                     .take()
-                    .get::<f32>()
+                    .to_host::<Vec<f32>>()
                     .await
                     .with_context(|| format!("s1_out.take @{}", generated.len()))?;
                 s2_out
                     .take()
-                    .get::<f32>()
+                    .to_host::<Vec<f32>>()
                     .await
                     .with_context(|| format!("s2_out.take @{}", generated.len()))?;
             }

@@ -99,30 +99,34 @@ async fn main(_input: Input) -> Result<String> {
     fwd.submit(&pipeline)
         .context("sampling-primitives submit")?;
 
-    let token = token_out.take().get::<i32>().await.context("read token")?[0] as usize;
+    let token = token_out
+        .take()
+        .to_host::<i32>()
+        .await
+        .context("read token")? as usize;
     let logits = logits_out
         .take()
-        .get::<f32>()
+        .to_host::<Vec<f32>>()
         .await
         .context("read logits")?;
     let entropy = entropy_out
         .take()
-        .get::<f32>()
+        .to_host::<f32>()
         .await
-        .context("read entropy")?[0];
+        .context("read entropy")?;
     let probabilities = probs_out
         .take()
-        .get::<f32>()
+        .to_host::<Vec<f32>>()
         .await
         .context("read probabilities")?;
     let log_probabilities = logprobs_out
         .take()
-        .get::<f32>()
+        .to_host::<Vec<f32>>()
         .await
         .context("read log-probabilities")?;
     let keep_mask = keep_out
         .take()
-        .get::<i32>()
+        .to_host::<Vec<i32>>()
         .await
         .context("read nucleus keep-mask")?;
     pipeline.close();

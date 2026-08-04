@@ -163,7 +163,7 @@ async fn main(input: Input) -> Result<String> {
         .context("amateur prefill")?;
     let first_amateur_logits = amateur_prefill_out
         .take()
-        .get::<f32>()
+        .to_host::<Vec<f32>>()
         .await
         .context("read amateur prefill logits")?;
 
@@ -344,7 +344,7 @@ async fn main(input: Input) -> Result<String> {
     for step in 0..budget {
         let amateur_logits = amateur_logits_out
             .take()
-            .get::<f32>()
+            .to_host::<Vec<f32>>()
             .await
             .context("read amateur logits")?;
 
@@ -369,7 +369,7 @@ async fn main(input: Input) -> Result<String> {
 async fn read_expert_token(channel: &Channel) -> Result<u32> {
     channel
         .take()
-        .get::<i32>()
+        .to_host::<Vec<i32>>()
         .await
         .context("read expert token")?
         .first()

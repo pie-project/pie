@@ -42,7 +42,7 @@ const MAX_TOKENS: u32 = 16;
 const PAGE_T: u32 = 16;
 
 async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
-    t.get::<i32>().await.context("tensor take")
+    t.to_host::<Vec<i32>>().await.context("tensor take")
 }
 
 /// Committed length of a sentinel `[k+1]` tail = the count before the first

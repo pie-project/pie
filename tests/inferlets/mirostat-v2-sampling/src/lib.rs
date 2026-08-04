@@ -213,8 +213,8 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
-    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
-    let s0 = s_out_p.take().get::<f32>().await.context("s0 take")?[0];
+    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
+    let s0 = s_out_p.take().to_host::<f32>().await.context("s0 take")?;
 
     generated.push(g0 as u32);
     surprises.push(s0);
@@ -285,14 +285,14 @@ async fn main(input: Input) -> Result<Output> {
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
             let s = s_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("s_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("s_out.take @{}", generated.len()))?;
             generated.push(t as u32);
             surprises.push(s);
             mu -= lr * (s - tau);

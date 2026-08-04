@@ -193,9 +193,9 @@ async fn main(input: Input) -> Result<Output> {
     prefill.submit(&pipeline).context("token-healing prefill")?;
     let first = first_out
         .take()
-        .get::<i32>()
+        .to_host::<i32>()
         .await
-        .context("read healed token")?[0] as u32;
+        .context("read healed token")? as u32;
 
     let mut generated = vec![first];
 
@@ -246,7 +246,11 @@ async fn main(input: Input) -> Result<Output> {
 
         let budget = input.max_tokens - 1;
         run_ahead(&pipeline, &decode, budget as usize, async || {
-            let token = token_out.take().get::<i32>().await.context("read token")?[0] as u32;
+            let token = token_out
+                .take()
+                .to_host::<i32>()
+                .await
+                .context("read token")? as u32;
             generated.push(token);
             Ok(ControlFlow::Continue(()))
         })

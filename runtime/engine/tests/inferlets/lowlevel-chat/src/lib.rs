@@ -99,7 +99,12 @@ impl Stream {
     /// Harvest one fire's sampled token off the `out` channel (blocks by
     /// awaiting the in-flight fire; poison surfaces as `Err`).
     async fn take_token(&self) -> Result<u32> {
-        let v = self.out.take().get::<i32>().await.context("out take")?;
+        let v = self
+            .out
+            .take()
+            .to_host::<Vec<i32>>()
+            .await
+            .context("out take")?;
         Ok(v.first().copied().unwrap_or(0) as u32)
     }
 }
@@ -164,7 +169,11 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     // handoff still rides the host (awaited take), unchanged.
     let pipeline = Pipeline::new();
     fwd_p.submit(&pipeline).context("prefill submit")?;
-    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?;
+    let g0 = g0_ch
+        .take()
+        .to_host::<Vec<i32>>()
+        .await
+        .context("g0 take")?;
     let g0 = g0.first().copied().unwrap_or(0) as u32;
 
     // ── 2. DECODE PASS (1-wide, device loop-carried): the epilogue carries

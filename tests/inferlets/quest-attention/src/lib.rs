@@ -269,9 +269,9 @@ async fn main(input: Input) -> Result<Output> {
         // skipped -- the epilogue put has to be drained or the channel fills.
         g0 = tok_out_p
             .take()
-            .get::<i32>()
+            .to_host::<i32>()
             .await
-            .with_context(|| format!("g0 take @{base}"))?[0];
+            .with_context(|| format!("g0 take @{base}"))?;
     }
     generated.push(g0 as u32);
 
@@ -412,30 +412,30 @@ async fn main(input: Input) -> Result<Output> {
         run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
             if let Some(ch) = scores_out.as_ref() {
                 last_scores = ch
                     .take()
-                    .get::<f32>()
+                    .to_host::<Vec<f32>>()
                     .await
                     .with_context(|| format!("quest_scores.take @{}", generated.len()))?;
             }
             layers_observed = match layers_out.as_ref() {
                 Some(ch) => ch
                     .take()
-                    .get::<u32>()
+                    .to_host::<u32>()
                     .await
-                    .with_context(|| format!("quest_layer_count.take @{}", generated.len()))?[0],
+                    .with_context(|| format!("quest_layer_count.take @{}", generated.len()))?,
                 None => layers_observed,
             };
             kv_len_last = match kvlen_out.as_ref() {
                 Some(ch) => ch
                     .take()
-                    .get::<u32>()
+                    .to_host::<u32>()
                     .await
-                    .with_context(|| format!("quest_kv_len.take @{}", generated.len()))?[0],
+                    .with_context(|| format!("quest_kv_len.take @{}", generated.len()))?,
                 None => kv_len_last,
             };
             generated.push(t as u32);

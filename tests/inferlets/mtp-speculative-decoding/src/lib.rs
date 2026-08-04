@@ -120,12 +120,12 @@ async fn main(input: Input) -> Result<String> {
 
     let seed = seed_out
         .take()
-        .get::<i32>()
+        .to_host::<i32>()
         .await
-        .context("read prefill seed")?[0] as u32;
+        .context("read prefill seed")? as u32;
     let seed_drafts = drafts_out
         .take()
-        .get::<i32>()
+        .to_host::<Vec<i32>>()
         .await
         .context("read prefill drafts")?
         .into_iter()
@@ -263,7 +263,7 @@ async fn main(input: Input) -> Result<String> {
     run_ahead(&pipeline, &fwd, input.max_tokens, async || {
         let round = committed_out
             .take()
-            .get::<i32>()
+            .to_host::<Vec<i32>>()
             .await
             .context("read committed round")?;
         let live = unpad_tokens(&round);

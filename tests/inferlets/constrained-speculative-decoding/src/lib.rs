@@ -233,7 +233,7 @@ async fn verify(
     fwd.submit(&pipeline).context("verify constrained draft")?;
     let target = target_out
         .take()
-        .get::<i32>()
+        .to_host::<Vec<i32>>()
         .await
         .context("read verification result")?
         .into_iter()

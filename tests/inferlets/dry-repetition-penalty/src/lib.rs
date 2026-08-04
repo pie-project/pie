@@ -402,9 +402,17 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
-    let c0 = cnt_out_p.take().get::<f32>().await.context("cnt take")?[0];
-    let k0 = peak_out_p.take().get::<f32>().await.context("peak take")?[0];
+    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
+    let c0 = cnt_out_p
+        .take()
+        .to_host::<f32>()
+        .await
+        .context("cnt take")?;
+    let k0 = peak_out_p
+        .take()
+        .to_host::<f32>()
+        .await
+        .context("peak take")?;
     generated.push(g0 as u32);
     counts.push(c0);
     peaks.push(k0);
@@ -484,19 +492,19 @@ async fn main(input: Input) -> Result<Output> {
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
             let c = cnt_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("cnt_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("cnt_out.take @{}", generated.len()))?;
             let k = peak_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("peak_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("peak_out.take @{}", generated.len()))?;
             generated.push(t as u32);
             counts.push(c);
             peaks.push(k);

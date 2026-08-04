@@ -157,7 +157,7 @@ async fn main(_input: String) -> Result<String> {
 
     // Host drain: the g0 copy first (the decode burst is already in the
     // engine while this take waits), then the decode ring with refill.
-    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
+    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
     let mut generated: Vec<u32> = Vec::with_capacity(MAX_TOKENS);
     eprintln!("[TEMPGEN_PIPELINED] got token: {g0}");
     generated.push(g0 as u32);
@@ -166,7 +166,7 @@ async fn main(_input: String) -> Result<String> {
     while taken < submitted {
         let t = out
             .take()
-            .get::<i32>()
+            .to_host::<Vec<i32>>()
             .await
             .with_context(|| format!("out.take @{}", generated.len()))?;
         taken += 1;

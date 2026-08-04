@@ -394,8 +394,9 @@ channel_from_iter!(f32);
 channel_from_iter!(bool);
 
 /// The result of [`Channel::take`]/[`Channel::read`]. In a stage closure it is
-/// an in-program value (via [`AsTensor`]); on the host [`get`](Self::get) /
-/// [`bytes`](Self::bytes) await the committed value.
+/// an in-program value ([`tensor`](Self::tensor), or [`AsTensor`]); on the host
+/// [`to_host`](Self::to_host) / [`bytes`](Self::bytes) await the committed
+/// value.
 pub struct Taken {
     dsl: pie_dsl::Taken,
     wit: Rc<wit_channel::Channel>,
@@ -424,12 +425,18 @@ impl Taken {
         }
     }
 
-    /// Materialize the committed value to the host, decoded to `T`.
+    /// Materialize the committed value to the host as `T` — either a whole
+    /// `Vec<f32>` or, for a one-element channel, a bare `f32`.
     ///
-    /// `T` must be the channel's own dtype. The bytes are a raw
+    /// `T`'s element type must be the channel's own dtype. The bytes are a raw
     /// little-endian window, so decoding an `f32` channel as `i32` would
     /// reinterpret the bit pattern and return plausible garbage.
-    pub async fn get<T: HostElem>(self) -> Result<Vec<T>, String> {
+    ///
+    /// ```ignore
+    /// let logits = out.take().to_host::<Vec<f32>>().await?;
+    /// let count = n_ch.take().to_host::<i32>().await?;
+    /// ```
+    pub async fn to_host<T: FromChannel>(self) -> Result<T, String> {
         if T::DTYPE != self.dtype {
             return Err(format!(
                 "channel holds {:?}, decoded as {:?}",
@@ -438,7 +445,7 @@ impl Taken {
             ));
         }
         let raw = self.bytes().await?;
-        Ok(T::decode(&raw))
+        T::from_bytes(&raw)
     }
 }
 
@@ -456,7 +463,7 @@ impl AsTensor for &Taken {
 /// A host-readable element type (little-endian, 4 bytes/elem; `bool` is 1 byte).
 ///
 /// [`DTYPE`](Self::DTYPE) is what makes the raw byte window self-describing:
-/// [`Taken::get`] refuses a `T` the channel does not hold.
+/// [`Taken::to_host`] refuses a `T` the channel does not hold.
 pub trait HostElem: Copy {
     const DTYPE: DType;
     fn decode(raw: &[u8]) -> Vec<Self>;
@@ -491,6 +498,42 @@ impl HostElem for bool {
         raw.iter().map(|&byte| byte != 0).collect()
     }
 }
+
+/// A type [`Taken::to_host`] can materialize a channel into: a whole
+/// `Vec<T>`, or a bare `T` for a channel that holds a single value.
+///
+/// The impls are spelled out rather than blanket over [`HostElem`] because
+/// `impl<T: HostElem> FromChannel for T` and `for Vec<T>` overlap under
+/// coherence.
+pub trait FromChannel: Sized {
+    /// The dtype the channel must hold.
+    const DTYPE: DType;
+    fn from_bytes(raw: &[u8]) -> Result<Self, String>;
+}
+
+macro_rules! from_channel {
+    ($t:ty) => {
+        impl FromChannel for Vec<$t> {
+            const DTYPE: DType = <$t as HostElem>::DTYPE;
+            fn from_bytes(raw: &[u8]) -> Result<Self, String> {
+                Ok(<$t as HostElem>::decode(raw))
+            }
+        }
+        impl FromChannel for $t {
+            const DTYPE: DType = <$t as HostElem>::DTYPE;
+            fn from_bytes(raw: &[u8]) -> Result<Self, String> {
+                <$t as HostElem>::decode(raw)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("channel is empty, expected one {}", stringify!($t)))
+            }
+        }
+    };
+}
+from_channel!(i32);
+from_channel!(u32);
+from_channel!(f32);
+from_channel!(bool);
 
 // ---------------------------------------------------------------------------
 // WorkingSet

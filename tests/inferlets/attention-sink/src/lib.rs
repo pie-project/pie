@@ -124,9 +124,9 @@ async fn main(input: Input) -> Result<String> {
     // stream's last submit — finish() right after it (F7).
     let first = first_out
         .take()
-        .get::<i32>()
+        .to_host::<i32>()
         .await
-        .context("read first token")?[0] as u32;
+        .context("read first token")? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -211,9 +211,9 @@ async fn main(input: Input) -> Result<String> {
     run_ahead(&pipeline, &decode, budget, async || {
         let token = token_out
             .take()
-            .get::<i32>()
+            .to_host::<i32>()
             .await
-            .context("read generated token")?[0] as u32;
+            .context("read generated token")? as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

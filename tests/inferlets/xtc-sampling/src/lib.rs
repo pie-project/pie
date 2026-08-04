@@ -282,9 +282,9 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
-    let a0 = s1_out_p.take().get::<f32>().await.context("s1 take")?[0];
-    let b0 = s2_out_p.take().get::<f32>().await.context("s2 take")?[0];
+    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
+    let a0 = s1_out_p.take().to_host::<f32>().await.context("s1 take")?;
+    let b0 = s2_out_p.take().to_host::<f32>().await.context("s2 take")?;
     generated.push(g0 as u32);
     s1.push(a0);
     s2.push(b0);
@@ -354,19 +354,19 @@ async fn main(input: Input) -> Result<Output> {
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
             let a = s1_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("s1_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("s1_out.take @{}", generated.len()))?;
             let b = s2_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("s2_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("s2_out.take @{}", generated.len()))?;
             generated.push(t as u32);
             s1.push(a);
             s2.push(b);

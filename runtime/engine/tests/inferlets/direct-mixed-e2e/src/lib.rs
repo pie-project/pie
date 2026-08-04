@@ -95,37 +95,41 @@ async fn main(_input: String) -> Result<String> {
     mixed.submit(&pipeline).context("mixed submit")?;
     let token_value = mixed_token
         .take()
-        .get::<u32>()
+        .to_host::<u32>()
         .await
-        .context("mixed token")?[0];
+        .context("mixed token")?;
     let scalar_value = mixed_scalar
         .take()
-        .get::<f32>()
+        .to_host::<f32>()
         .await
-        .context("mixed scalar")?[0];
-    let vector_value = vector.take().get::<u32>().await.context("vector")?;
-    let empty_prefix = prefix_len.take().get::<u32>().await.context("prefix")?[0] as usize;
+        .context("mixed scalar")?;
+    let vector_value = vector
+        .take()
+        .to_host::<Vec<u32>>()
+        .await
+        .context("vector")?;
+    let empty_prefix = prefix_len.take().to_host::<u32>().await.context("prefix")? as usize;
     let samplers = [
         sampler_a
             .take()
-            .get::<u32>()
+            .to_host::<u32>()
             .await
-            .context("sampler_a take")?[0],
+            .context("sampler_a take")?,
         sampler_b
             .take()
-            .get::<u32>()
+            .to_host::<u32>()
             .await
-            .context("sampler_b take")?[0],
+            .context("sampler_b take")?,
         sampler_c
             .take()
-            .get::<u32>()
+            .to_host::<u32>()
             .await
-            .context("sampler_c take")?[0],
+            .context("sampler_c take")?,
         sampler_d
             .take()
-            .get::<u32>()
+            .to_host::<u32>()
             .await
-            .context("sampler_d take")?[0],
+            .context("sampler_d take")?,
     ];
     pipeline.close();
 
@@ -144,7 +148,7 @@ async fn main(_input: String) -> Result<String> {
     entropy_pass
         .submit(&entropy_pipeline)
         .context("entropy submit")?;
-    let entropy_value = entropy.take().get::<f32>().await.context("entropy")?[0];
+    let entropy_value = entropy.take().to_host::<f32>().await.context("entropy")?;
     entropy_pipeline.close();
 
     let mixed_ok = token_value == 7 && (scalar_value - 1.25).abs() < f32::EPSILON;

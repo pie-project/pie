@@ -18,7 +18,7 @@ pub type Result<T> = std::result::Result<T, String>;
 /// ws.reserve(pages).context("reserve KV")?;
 /// tok_out
 ///     .take()
-///     .get::<i32>()
+///     .to_host::<i32>()
 ///     .await
 ///     .with_context(|| format!("tok_out.take @{}", generated.len()))?;
 /// ```

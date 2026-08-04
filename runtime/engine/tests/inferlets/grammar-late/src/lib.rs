@@ -165,12 +165,12 @@ async fn main(input: String) -> Result<String> {
             .with_context(|| format!("submit @{step}"))?;
         let token = tok_out
             .take()
-            .get::<i32>()
+            .to_host::<i32>()
             .await
-            .with_context(|| format!("tok_out.take @{step}"))?[0] as u32;
+            .with_context(|| format!("tok_out.take @{step}"))? as u32;
         let logits = raw
             .take()
-            .get::<f32>()
+            .to_host::<Vec<f32>>()
             .await
             .with_context(|| format!("raw.take @{step}"))?;
 

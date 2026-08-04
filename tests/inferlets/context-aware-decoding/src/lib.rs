@@ -174,7 +174,7 @@ async fn main(input: Input) -> Result<String> {
     uncond_prefill.submit(&pipeline).context("uncond prefill")?;
     let first_uncond_logits = u_pre_out
         .take()
-        .get::<f32>()
+        .to_host::<Vec<f32>>()
         .await
         .context("read uncond prefill logits")?;
 
@@ -347,7 +347,7 @@ async fn main(input: Input) -> Result<String> {
         uncond_decode.submit(&pipeline).context("uncond decode")?;
         let uncond_logits = u_logits_out
             .take()
-            .get::<f32>()
+            .to_host::<Vec<f32>>()
             .await
             .context("read uncond logits")?;
 
@@ -396,21 +396,15 @@ fn report(
 async fn read_i32(channel: &Channel) -> Result<i32> {
     channel
         .take()
-        .get::<i32>()
+        .to_host::<i32>()
         .await
-        .context("read i32 channel")?
-        .first()
-        .copied()
-        .context("empty i32 channel")
+        .context("read i32 channel")
 }
 
 async fn read_f32(channel: &Channel) -> Result<f32> {
     channel
         .take()
-        .get::<f32>()
+        .to_host::<f32>()
         .await
-        .context("read f32 channel")?
-        .first()
-        .copied()
-        .context("empty f32 channel")
+        .context("read f32 channel")
 }

@@ -312,9 +312,9 @@ async fn main(input: Input) -> Result<Output> {
 
         g0 = tok_out_p
             .take()
-            .get::<i32>()
+            .to_host::<i32>()
             .await
-            .with_context(|| format!("g0 take @{base}"))?[0];
+            .with_context(|| format!("g0 take @{base}"))?;
     }
     generated.push(g0 as u32);
 
@@ -490,21 +490,21 @@ async fn main(input: Input) -> Result<Output> {
         run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
             if let (Some(sc), Some(lc)) = (scores_out.as_ref(), layers_out.as_ref()) {
                 last_scores = sc
                     .take()
-                    .get::<f32>()
+                    .to_host::<Vec<f32>>()
                     .await
                     .with_context(|| format!("h2o_scores.take @{}", generated.len()))?;
                 let layers_before = layers_observed;
                 layers_observed = lc
                     .take()
-                    .get::<u32>()
+                    .to_host::<u32>()
                     .await
-                    .with_context(|| format!("h2o_layer_count.take @{}", generated.len()))?[0];
+                    .with_context(|| format!("h2o_layer_count.take @{}", generated.len()))?;
                 // The fire that produced this row had `n + generated.len()` KV
                 // positions live: the prompt plus every token committed before it.
                 last_kv_len = n + generated.len() as u32;

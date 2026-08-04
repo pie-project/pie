@@ -150,7 +150,7 @@ async fn main(_input: String) -> Result<String> {
     // decode fires continue the SAME growing context, so they all submit here.
     let pipeline = Pipeline::new();
     fwd_p.submit(&pipeline).context("prefill submit")?;
-    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
+    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
 
     // `count` = total tokens generated so far (across every kind), INCLUDING
     // `last_tok`; the next fire embeds `last_tok` at absolute position
@@ -232,7 +232,7 @@ async fn main(_input: String) -> Result<String> {
                     .with_context(|| format!("{name} submit @{step}"))?;
                 let t = out
                     .take()
-                    .get::<i32>()
+                    .to_host::<Vec<i32>>()
                     .await
                     .with_context(|| format!("{name} out.take @{step}"))?;
                 let Some(&t0) = t.first() else {

@@ -154,9 +154,9 @@ async fn main(input: String) -> Result<String> {
             .with_context(|| format!("submit @{step}"))?;
         let token = tok_out
             .take()
-            .get::<i32>()
+            .to_host::<i32>()
             .await
-            .with_context(|| format!("tok_out.take @{step}"))?[0] as u32;
+            .with_context(|| format!("tok_out.take @{step}"))? as u32;
 
         // Grammar conformance: the masked argmax MUST be in this request's alphabet.
         if !alphabet.contains(&token) {

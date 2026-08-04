@@ -147,7 +147,7 @@ async fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<
     fwd.submit(&pipeline).context("verify cached draft")?;
     let target = target_out
         .take()
-        .get::<i32>()
+        .to_host::<Vec<i32>>()
         .await
         .context("read verification result")?
         .into_iter()

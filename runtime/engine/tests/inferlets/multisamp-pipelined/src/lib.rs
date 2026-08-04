@@ -126,9 +126,9 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
         .with_context(|| format!("{name} prefill submit"))?;
     let g0 = g0_ch
         .take()
-        .get::<i32>()
+        .to_host::<i32>()
         .await
-        .with_context(|| format!("{name} g0 take"))?[0];
+        .with_context(|| format!("{name} g0 take"))?;
 
     let mut got: Vec<u32> = Vec::with_capacity(STEPS_PER_KIND);
     got.push(g0 as u32);
@@ -202,7 +202,7 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
         while inflight > 0 {
             let t = out
                 .take()
-                .get::<i32>()
+                .to_host::<Vec<i32>>()
                 .await
                 .with_context(|| format!("{name} out.take @{}", got.len()))?;
             inflight -= 1;

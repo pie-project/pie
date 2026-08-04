@@ -224,17 +224,17 @@ async fn main(input: String) -> Result<String> {
 
         let picked = out
             .take()
-            .get::<i32>()
+            .to_host::<Vec<i32>>()
             .await
             .with_context(|| format!("out.take @{step}"))?;
         let _parents = out_par
             .take()
-            .get::<u32>()
+            .to_host::<Vec<u32>>()
             .await
             .with_context(|| format!("out_par.take @{step}"))?;
         let _scr = out_scr
             .take()
-            .get::<f32>()
+            .to_host::<Vec<f32>>()
             .await
             .with_context(|| format!("out_scr.take @{step}"))?;
         if let Some(&t0) = picked.first() {

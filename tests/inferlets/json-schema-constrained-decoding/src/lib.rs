@@ -113,9 +113,9 @@ async fn main(input: Input) -> Result<String> {
     // stream's last submit — finish() right after it (F7).
     let first = first_out
         .take()
-        .get::<i32>()
+        .to_host::<i32>()
         .await
-        .context("read first constrained token")?[0] as u32;
+        .context("read first constrained token")? as u32;
 
     let mut generated = vec![first];
     constraint
@@ -181,9 +181,9 @@ async fn main(input: Input) -> Result<String> {
             submitted += 1;
             let token = token_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .context("read constrained token")?[0] as u32;
+                .context("read constrained token")? as u32;
             generated.push(token);
             constraint
                 .accept_tokens(&[token])

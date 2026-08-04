@@ -180,8 +180,8 @@ async fn main(input: String) -> Result<String> {
     // zero decode fires follow.
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
-    let s0 = s_out_p.take().get::<f32>().await.context("s0 take")?[0];
+    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
+    let s0 = s_out_p.take().to_host::<f32>().await.context("s0 take")?;
 
     generated.push(g0 as u32);
     surprises.push(s0);
@@ -248,14 +248,14 @@ async fn main(input: String) -> Result<String> {
                 .with_context(|| format!("decode submit @{step}"))?;
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{step}"))?[0];
+                .with_context(|| format!("tok_out.take @{step}"))?;
             let s = s_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("s_out.take @{step}"))?[0];
+                .with_context(|| format!("s_out.take @{step}"))?;
             generated.push(t as u32);
             surprises.push(s);
             mu -= lr * (s - tau);

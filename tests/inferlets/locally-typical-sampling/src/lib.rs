@@ -245,9 +245,17 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
-    let k0 = kept_out_p.take().get::<f32>().await.context("k0 take")?[0];
-    let m0 = mass_out_p.take().get::<f32>().await.context("m0 take")?[0];
+    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
+    let k0 = kept_out_p
+        .take()
+        .to_host::<f32>()
+        .await
+        .context("k0 take")?;
+    let m0 = mass_out_p
+        .take()
+        .to_host::<f32>()
+        .await
+        .context("m0 take")?;
     generated.push(g0 as u32);
     kept_sizes.push(k0);
     kept_mass.push(m0);
@@ -317,19 +325,19 @@ async fn main(input: Input) -> Result<Output> {
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
-                .get::<i32>()
+                .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
             let k = kept_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("kept_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("kept_out.take @{}", generated.len()))?;
             let m = mass_out
                 .take()
-                .get::<f32>()
+                .to_host::<f32>()
                 .await
-                .with_context(|| format!("mass_out.take @{}", generated.len()))?[0];
+                .with_context(|| format!("mass_out.take @{}", generated.len()))?;
             generated.push(t as u32);
             kept_sizes.push(k);
             kept_mass.push(m);

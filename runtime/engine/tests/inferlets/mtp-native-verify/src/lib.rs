@@ -58,11 +58,11 @@ const PAGE_T: u32 = 16;
 
 /// Decode a `[k]`/`[k+1]` i32 host vector.
 async fn get_u32(t: inferlet::ptir::Taken) -> Result<Vec<u32>> {
-    t.get::<u32>().await.context("tensor take")
+    t.to_host::<Vec<u32>>().await.context("tensor take")
 }
 
 async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
-    t.get::<i32>().await.context("tensor take")
+    t.to_host::<Vec<i32>>().await.context("tensor take")
 }
 
 /// Committed length of a sentinel `[k+1]` tail = the count before the first

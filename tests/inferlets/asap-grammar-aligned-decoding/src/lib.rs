@@ -536,21 +536,15 @@ fn asap_step(
 async fn read_i32(channel: &Channel) -> Result<i32> {
     channel
         .take()
-        .get::<i32>()
+        .to_host::<i32>()
         .await
-        .context("read i32 channel")?
-        .first()
-        .copied()
-        .context("empty i32 channel")
+        .context("read i32 channel")
 }
 
 async fn read_f32(channel: &Channel) -> Result<f32> {
     channel
         .take()
-        .get::<f32>()
+        .to_host::<f32>()
         .await
-        .context("read f32 channel")?
-        .first()
-        .copied()
-        .context("empty f32 channel")
+        .context("read f32 channel")
 }
