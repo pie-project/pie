@@ -4186,9 +4186,20 @@ GroupedLanePageMask resolve_lane_page_mask(
 // Every disagreement throws. A silently unresolved lora is a request whose
 // adapter never applied while every sample still returns — the exact failure
 // class the sink-name bind gate exists to prevent.
-model::LoraLaneView resolve_lane_lora(
+// PER-SITE PAIRS (the adapter rung, north-star-dsl.md): a prologue may
+// carry MULTIPLE lora sinks — one (A, B, SITES) per projection site
+// set — and the lane contributes one table entry per sink over the
+// same token span. Site sets must be DISJOINT across the lane's sinks
+// (one pair per site; the consumer's per-entry width checks then bind
+// each site to its own d_out — the q+v case).
+std::vector<model::LoraLaneView> resolve_lane_lora_sinks(
     const StagedLane& lane,
-    const plan::StagePlan& stage) {
+    const plan::StagePlan& stage);
+
+model::LoraLaneView resolve_lane_lora_one(
+    const StagedLane& lane,
+    const plan::StagePlan& stage,
+    const plan::PlanOp* sink) {
     // Value id -> producing op, via the stage's flat result numbering (the
     // same walk the fused packer uses for its `bases` table).
     std::vector<std::uint32_t> bases(stage.ops.size());
@@ -4208,19 +4219,6 @@ model::LoraLaneView resolve_lane_lora(
             "lora sink argument has no producing op in its stage");
     };
 
-    const plan::PlanOp* sink = nullptr;
-    for (const auto& normalized : stage.ops) {
-        const auto& op = normalized.op;
-        if (op.tag != PTIR_OP_SINK_CALL) continue;
-        if (op.name_idx < stage.names.size() &&
-            stage.names[op.name_idx] == "lora") {
-            if (sink != nullptr) {
-                throw std::runtime_error(
-                    "lora sink appears twice in one prologue stage");
-            }
-            sink = &op;
-        }
-    }
     if (sink == nullptr) {
         throw std::runtime_error(
             "lora resolution ran on a stage without the sink");
@@ -4352,6 +4350,39 @@ model::LoraLaneView resolve_lane_lora(
         .d_in = d_in,
         .d_out = d_out,
     };
+}
+
+std::vector<model::LoraLaneView> resolve_lane_lora_sinks(
+    const StagedLane& lane,
+    const plan::StagePlan& stage) {
+    std::vector<model::LoraLaneView> views;
+    std::uint64_t claimed_sites = 0;
+    for (const auto& normalized : stage.ops) {
+        const auto& op = normalized.op;
+        if (op.tag != PTIR_OP_SINK_CALL) continue;
+        if (op.name_idx >= stage.names.size() ||
+            stage.names[op.name_idx] != "lora") {
+            continue;
+        }
+        model::LoraLaneView view = resolve_lane_lora_one(lane, stage, &op);
+        if ((view.sites_bits & claimed_sites) != 0) {
+            // One pair per site: an overlap would leave the projection
+            // with two deltas of possibly different shapes and the
+            // consumer to pick — the silent-misapplication class the
+            // sink gates exist to prevent.
+            throw std::runtime_error(
+                "lora sinks claim overlapping sites in one prologue "
+                "(bits " + std::to_string(view.sites_bits & claimed_sites) +
+                ")");
+        }
+        claimed_sites |= view.sites_bits;
+        views.push_back(view);
+    }
+    if (views.empty()) {
+        throw std::runtime_error(
+            "lora resolution ran on a stage without the sink");
+    }
+    return views;
 }
 
 const float* resolve_lane_attn_score(
@@ -4632,8 +4663,10 @@ void execute_declared_phase(
                     throw std::runtime_error(
                         "lora sink resolved twice for one lane");
                 }
-                launch.lora_lanes.push_back(
-                    resolve_lane_lora(lane, stage));
+                for (const model::LoraLaneView& view :
+                     resolve_lane_lora_sinks(lane, stage)) {
+                    launch.lora_lanes.push_back(view);
+                }
                 launch.lora_lane_sources.push_back(&lane);
             }
             std::uint64_t attn_score_kv_max = 0;

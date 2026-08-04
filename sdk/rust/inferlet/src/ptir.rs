@@ -714,7 +714,7 @@ struct ForwardInner {
     attention_ws: Option<Rc<KvWorkingSet>>,
     rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
     program_attached: bool,
-    adapter_attached: bool,
+    adapter_sites: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -807,7 +807,7 @@ impl ForwardPass {
                 attention_ws: None,
                 rs_working_sets: Vec::new(),
                 program_attached: false,
-                adapter_attached: false,
+                adapter_sites: 0,
             }),
         }
     }
@@ -1044,15 +1044,17 @@ impl ForwardPass {
             }
         };
         {
+            // One pair per SITE (the per-site rung): each call emits its
+            // own lora sink; the driver enforces the same disjointness at
+            // resolution.
             let mut inner = self.inner.borrow_mut();
-            if inner.adapter_attached {
-                return Err(
-                    "adapter: one adapter per pass in v0 (per-site pairs \
-                     are the recorded next rung)"
-                        .to_string(),
-                );
+            if inner.adapter_sites & site.bit() != 0 {
+                return Err(format!(
+                    "adapter: site {site:?} already carries an adapter \
+                     on this pass"
+                ));
             }
-            inner.adapter_attached = true;
+            inner.adapter_sites |= site.bit();
         }
         self.prologue(move || {
             intrinsics::kernel::lora(

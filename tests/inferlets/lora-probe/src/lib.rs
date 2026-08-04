@@ -51,6 +51,15 @@ struct Input {
     /// must be byte-identical: same channels, same lowering).
     #[serde(default = "default_surface")]
     surface: String,
+    /// Which sites carry adapters: "q" (the original single-site probe)
+    /// or "qv" (the per-site-pairs rung: distinct shapes per site,
+    /// adapter surface only).
+    #[serde(default = "default_sites")]
+    sites: String,
+}
+
+fn default_sites() -> String {
+    "q".into()
 }
 
 fn default_surface() -> String {
@@ -147,6 +156,13 @@ async fn main(input: Input) -> Result<Output> {
     let b_host: Vec<f32> = (0..b_len as u32)
         .map(|i| pattern(i, 0x0b0b_b0b0, 0.5) * adapter_scale)
         .collect();
+    // The v site's pair (per-site rung): SAME d_in and rank, its OWN
+    // d_out (v width) and its own deterministic contents.
+    const D_OUT_V: u32 = 1024; // kv width = 8 heads * head_dim 128
+    let bv_len = (NUM_LAYERS * D_OUT_V * RANK) as usize;
+    let bv_host: Vec<f32> = (0..bv_len as u32)
+        .map(|i| pattern(i, 0x0c0c_c0c0, 0.5) * adapter_scale)
+        .collect();
     let make_lora_channels = |a_host: &Vec<f32>, b_host: &Vec<f32>| {
         (
             Channel::from_shaped([NUM_LAYERS, RANK, D_IN], a_host.clone())
@@ -202,6 +218,17 @@ async fn main(input: Input) -> Result<Output> {
             fwd_p
                 .adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
                 .map_err(|e| e.to_string())?;
+            if input.sites == "qv" {
+                let av = Channel::from_shaped(
+                    [NUM_LAYERS, RANK, D_IN], a_host.clone())
+                    .named("lora_a_v");
+                let bv = Channel::from_shaped(
+                    [NUM_LAYERS, D_OUT_V, RANK], bv_host.clone())
+                    .named("lora_b_v");
+                fwd_p
+                    .adapter(Site::V, |x, y| y + mm(&bv, mm(&av, x)))
+                    .map_err(|e| e.to_string())?;
+            }
         } else if input.surface == "clone" {
             let (a2, b2) = (lora_a.clone(), lora_b.clone());
             fwd_p.prologue(move || {
@@ -277,6 +304,16 @@ async fn main(input: Input) -> Result<Output> {
             use inferlet::ptir::adapter::{mm, Site};
             fwd.adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
                 .map_err(|e| e.to_string())?;
+            if input.sites == "qv" {
+                let av = Channel::from_shaped(
+                    [NUM_LAYERS, RANK, D_IN], a_host.clone())
+                    .named("lora_a_v");
+                let bv = Channel::from_shaped(
+                    [NUM_LAYERS, D_OUT_V, RANK], bv_host.clone())
+                    .named("lora_b_v");
+                fwd.adapter(Site::V, |x, y| y + mm(&bv, mm(&av, x)))
+                    .map_err(|e| e.to_string())?;
+            }
         } else {
             fwd.prologue(move || {
                 intrinsics::kernel::lora(
