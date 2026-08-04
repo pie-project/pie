@@ -65,7 +65,7 @@ pub mod model;
 pub mod value;
 
 pub use builder::{Builder, PortInput, Traced};
-pub use channel::{Channel, HostError, IntoPut, Put, Taken};
+pub use channel::{Channel, IntoPut, Put};
 pub use error::{Endpoint, Span, TraceError, TraceErrors};
 /// The eDSL op surface. Glob-re-exported rather than listed: an op is public
 /// exactly when it is `pub` in [`value`], so adding one is a single edit and

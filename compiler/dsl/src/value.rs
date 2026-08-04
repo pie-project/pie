@@ -175,6 +175,23 @@ fn poison_id(detail: alloc::string::String, ty: ValueType) -> ValueId {
     )
 }
 
+/// [`poison`] for a value produced outside any traced stage: no op can be
+/// emitted there, so the stand-in is a zeroed constant of the same type. The
+/// error still lands (via [`PENDING`](crate::context)) in the trace the channel
+/// belongs to.
+#[track_caller]
+pub(crate) fn poison_const(detail: alloc::string::String, ty: ValueType) -> Tensor {
+    context::record_error(detail, Span::here());
+    let width = if ty.dtype == DType::Bool { 1 } else { 4 };
+    Tensor {
+        inner: TensorInner::Const(ConstData {
+            shape: ty.shape,
+            dtype: ty.dtype,
+            bytes: alloc::vec![0u8; ty.shape.numel() as usize * width],
+        }),
+    }
+}
+
 /// Record an authoring mistake whose recovery is a shape rather than a value.
 #[track_caller]
 fn poison_shape(detail: alloc::string::String, fallback: Shape) -> Shape {

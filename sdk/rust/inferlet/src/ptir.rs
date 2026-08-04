@@ -324,13 +324,13 @@ impl Channel {
     /// [`take_host`](Self::take_host); asking a host channel for an in-program
     /// value is an authoring error and is reported as one.
     pub fn take(&self) -> Tensor {
-        self.dsl().take().tensor()
+        self.dsl().take()
     }
 
     /// `read()` — peek a cell (leaves it full), inside a stage closure. Device
     /// counterpart of [`read_host`](Self::read_host).
     pub fn read(&self) -> Tensor {
-        self.dsl().read().tensor()
+        self.dsl().read()
     }
 
     /// Consume a cell on the host, decoded as `T` — a whole `Vec<f32>`, or a
@@ -350,7 +350,7 @@ impl Channel {
     /// ```
     pub async fn take_host<T: FromChannel>(&self) -> Result<T, String> {
         self.check_host::<T>("take")?;
-        let _endpoint = self.dsl().take();
+        self.dsl().note_host_take();
         let raw = self.wit().take().await;
         self.decode_host::<T>(raw, "take")
     }
@@ -359,7 +359,7 @@ impl Channel {
     /// [`take_host`](Self::take_host) otherwise.
     pub async fn read_host<T: FromChannel>(&self) -> Result<T, String> {
         self.check_host::<T>("read")?;
-        let _endpoint = self.dsl().read();
+        self.dsl().note_host_read();
         let raw = self.wit().read().await;
         self.decode_host::<T>(raw, "read")
     }
