@@ -105,8 +105,8 @@ fn truncation_keep(
         Mode::Eta => {
             // min(eps, sqrt(eps) * exp(-H)): the floor relaxes with entropy.
             let h = entropy_from_logprobs(&probs, &logprobs);
-            let adaptive = mul(Tensor::constant(epsilon.sqrt()), exp(neg(&h)));
-            min_elem(Tensor::constant(epsilon), adaptive)
+            let adaptive = epsilon.sqrt() * exp(-&h);
+            min_elem(epsilon, adaptive)
         }
     };
 
@@ -115,7 +115,7 @@ fn truncation_keep(
     let argmax_ind = ge(&probs, broadcast(reduce_max(&probs), [vocab]));
     let keep = or(base_mask, argmax_ind);
 
-    let zeros = broadcast(Tensor::constant(0.0f32), [vocab]);
+    let zeros = broadcast(0.0f32, [vocab]);
     let kept_mass = reshape(reduce_sum(select(&keep, &probs, &zeros)), [1]);
     let kept = reshape(reduce_sum(cast(&keep, dtype::f32)), [1]);
     (keep, kept, kept_mass)
@@ -128,15 +128,15 @@ fn truncation_step(
     mode: Mode,
     temperature: f32,
     epsilon: f32,
-    rng_state: impl AsTensor,
+    rng_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor) {
     let scaled = if temperature == 1.0 {
         logits
     } else {
-        div(&logits, temperature)
+        &logits / temperature
     };
     let (keep, kept, kept_mass) = truncation_keep(&scaled, vocab, mode, epsilon);
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     let token = gumbel_max(masked, rng_state);
     (token, kept, kept_mass)
@@ -222,7 +222,7 @@ async fn main(input: Input) -> Result<Output> {
         let r = rng_p.take();
         let logits = intrinsics::logits();
         let (token, kept, kmass) = truncation_step(logits, vocab, mode, temperature, epsilon, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         kept_out_p.put(&kept);
         mass_out_p.put(&kmass);
@@ -284,17 +284,17 @@ async fn main(input: Input) -> Result<Output> {
             let (token, kept, kmass) =
                 truncation_step(logits, vocab, mode, temperature, epsilon, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             kept_out.put(&kept);
             mass_out.put(&kmass);

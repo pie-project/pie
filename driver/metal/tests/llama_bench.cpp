@@ -243,7 +243,9 @@ BenchShape bench_shape(const SetupConfig& cfg) {
         break;
     case pie::metal::model::ModelFamily::Gemma4:
         s = {"gemma4", cfg.gemma4.n_layers, cfg.gemma4.hidden, cfg.gemma4.n_q_heads,
-             cfg.gemma4.n_kv_heads, cfg.gemma4.head_dim, cfg.gemma4.intermediate, 0, 0, 0};
+             cfg.gemma4.n_kv_heads, cfg.gemma4.head_dim, cfg.gemma4.intermediate,
+             cfg.gemma4.n_experts, cfg.gemma4.experts_per_token,
+             cfg.gemma4.moe_intermediate};
         break;
     case pie::metal::model::ModelFamily::Llama:
     case pie::metal::model::ModelFamily::Unknown:
@@ -469,6 +471,45 @@ int main(int argc, char** argv) {
             // logit -- none of which any other entry exercises at all.
             {"Gemma-4-E2B", 35, 0, 4, 1536, 64, {56971, 55353, 374, 56971, 55353, 374},
              {785, 6722, 48352, 6722, 48352, 6722}},
+            // Gemma-4-26B-A4B, the mixture member of the same family. What it
+            // covers that the E2B does not: 128 experts at top-8 behind a
+            // router whose norm carries a gain the checkpoint does not store,
+            // a SECOND dense branch summed with the routed one, k-eq-v global
+            // attention that ships no v_proj at all, and a checkpoint that
+            // quantizes its dense mlp and its router at 8 bits while everything
+            // else is 4 -- two full pipeline sets in one stack.
+            //
+            // This row's answers are the DRIVER's, and that is deliberate. Every
+            // other row here is mlx-lm's continuation, because for every other
+            // checkpoint mlx-lm HAS one. This one does not: run the same prompt
+            // three ways and mlx-lm answers three different things.
+            //
+            //   prompt re-prefilled each step 246427 246427 246427 246427 246427 246427
+            //   through its own kv cache    246427 246427 246427    478    397    389
+            //   ties broken by index        785 6722 244674 236764 100 45518 (long)
+            //
+            // The cause is in the checkpoint, not in either implementation. The
+            // router's scores are bf16 over 128 experts packed into a two-logit
+            // band, so the eighth and ninth are routinely EQUAL -- exactly equal,
+            // same bits -- and which of the two a top-k returns is a choice no
+            // arithmetic makes. One flip swaps a tenth of the mixture, and thirty
+            // layers of that reach the logits.
+            //
+            // So the arithmetic was gated instead, against the driver's own
+            // prefill. The same thirteen tokens run as one prefill and as a
+            // twelve-token prefill plus a decode agree to 1e-5 through layer 5;
+            // at layer 6 the eighth and ninth scores are the same bf16 number and
+            // the two paths take different ones. Feed the checkpoint's own expert
+            // weights the driver's selection and its mixture reconstructs at
+            // cos 0.99998 -- the mixture is right, the tie is a coin.
+            //
+            // The row still discriminates: it is six exact tokens from a
+            // 30-layer 128-expert stack, and nothing that broke the mixture, the
+            // second dense branch, the 8-bit set or the k-eq-v attention would
+            // reproduce them.
+            {"Gemma-4-26B-A4B", 30, 128, 4, 2816, 64,
+             {246427, 243599, 243599, 243599, 243599, 243599},
+             {785, 6722, 244674, 236900, 238270, 237184}},
             // gpt-oss-20b. The only MXFP4 checkpoint here, and the row that
             // says the driver reads openai's format rather than converting it:
             // until the expert bank was bound as the E2M1 nibbles and E8M0
@@ -581,7 +622,7 @@ int main(int argc, char** argv) {
         // still runs. Without it, stop: the numbers after a wrong answer are
         // the speed of computing the wrong thing.
         const bool dumping = std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr;
-        if (!gate(p, want, "greedy continuation matches mlx-lm") && !dumping) return 1;
+        if (!gate(p, want, "greedy continuation matches the recorded answer") && !dumping) return 1;
 
         // The same check again on a prompt long enough to take the BATCHED
         // mixture. Stated as a precondition rather than assumed: the threshold
@@ -620,8 +661,8 @@ int main(int argc, char** argv) {
                                                 : ", batched projections");
             }
             const char* what = shape.n_experts > 0
-                                   ? "batched-mixture continuation matches mlx-lm"
-                                   : "batched-prefill continuation matches mlx-lm";
+                                   ? "batched-mixture continuation matches the recorded answer"
+                                   : "batched-prefill continuation matches the recorded answer";
             if (!gate(lp, ref->want_long, what) && !dumping) {
                 return 1;
             }

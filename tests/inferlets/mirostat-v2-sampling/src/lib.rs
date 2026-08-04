@@ -86,12 +86,12 @@ fn mirostat_step(
     floor: Floor,
     logits: Tensor,
     vocab: u32,
-    mu: impl AsTensor,
-    r: impl AsTensor,
+    mu: &Tensor,
+    r: &Tensor,
 ) -> (Tensor, Tensor) {
     let mu = reshape(mu, []); // [1] -> scalar
     let probs = softmax(&logits);
-    let thr = exp(neg(&mu));
+    let thr = exp(-&mu);
     let base_mask = pivot_threshold(&probs, prob_ge(thr));
     let mask = match floor {
         Floor::Argmax => {
@@ -104,11 +104,11 @@ fn mirostat_step(
         }
         _ => base_mask,
     };
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&mask, &logits, &neg_inf);
     let token = gumbel_max(masked, r); // [1] i32
     let p_token = scalar_gather(&probs, cast(&token, dtype::u32)); // [1] f32
-    let surprise = neg(log(p_token)); // [1] f32
+    let surprise = -log(p_token); // [1] f32
     (token, surprise)
 }
 
@@ -198,8 +198,8 @@ async fn main(input: Input) -> Result<Output> {
         let mu_v = mu_p.take();
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
-        let (token, surprise) = mirostat_step(floor, logits, vocab, mu_v, &r);
-        let r_next = add(&r, iota(2));
+        let (token, surprise) = mirostat_step(floor, logits, vocab, &mu_v, &r);
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         s_out_p.put(&surprise);
         rng_p.put(&r_next);
@@ -263,18 +263,18 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits(); // [vocab] f32
             let (token, surprise) = mirostat_step(floor, logits, vocab, &mu_v, &r);
 
-            let r_next = add(&r, iota(2));
-            let mu_next = sub(&mu_v, mul(sub(&surprise, tau), lr));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let mu_next = &mu_v - (&surprise - tau) * lr;
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             s_out.put(&surprise);
             rng.put(&r_next);

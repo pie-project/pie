@@ -82,10 +82,10 @@ async fn main(_input: String) -> Result<String> {
     fwd_p.epilogue(move || {
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let logits = intrinsics::logits(); // [vocab] f32
-        let scaled = div(logits, TEMPERATURE);
+        let scaled = logits / TEMPERATURE;
         let g = gumbel(&r, [vocab]);
-        let t = reduce_argmax(add(scaled, g)); // [1] i32 categorical draw
-        let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
+        let t = reduce_argmax(scaled + g); // [1] i32 categorical draw
+        let r_next = &r + iota(2); // advance ctr: [key, ctr+1]
         tok_in.put(&t);
         g0_ch.put(&t);
         rng_p.put(&r_next);
@@ -122,21 +122,21 @@ async fn main(_input: String) -> Result<String> {
         let length = kv_len.take();
         let r = rng.take(); // [2] u32 rng state
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
-        let scaled = div(logits, TEMPERATURE);
+        let scaled = logits / TEMPERATURE;
         let g = gumbel(&r, [vocab]);
-        let t = reduce_argmax(add(scaled, g)); // [1] i32 categorical draw
+        let t = reduce_argmax(scaled + g); // [1] i32 categorical draw
 
-        let r_next = add(&r, iota(2));
-        let next_length = add(&length, 1u32);
-        let page_count = div(add(&next_length, page_size - 1), page_size);
+        let r_next = &r + iota(2);
+        let next_length = &length + 1u32;
+        let page_count = (&next_length + (page_size - 1)) / page_size;
 
         tok_in.put(&t);
         kv_len.put(&next_length);
         positions.put(&length);
-        w_slot.put(div(&length, page_size));
-        w_off.put(rem(&length, page_size));
+        w_slot.put(&length / page_size);
+        w_off.put(&length % page_size);
         page_indptr.take();
-        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        page_indptr.put(iota(2) * broadcast(&page_count, [2]));
         out.put(&t);
         rng.put(&r_next);
     });

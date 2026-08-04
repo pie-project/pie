@@ -128,36 +128,28 @@ struct Cfg {
 ///
 /// Returns `(keep_mask, dropped_count, fired)` where `fired` is 1.0 on steps
 /// where the gate opened and 0.0 otherwise.
-fn xtc_mask(
-    logits: &Tensor,
-    vocab: u32,
-    cfg: Cfg,
-    rng_state: impl AsTensor + Copy,
-) -> (Tensor, Tensor, Tensor) {
+fn xtc_mask(logits: &Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
     let probs = softmax(logits);
     let p_max = reduce_max(&probs);
 
     // Stage 1 — min-p floor. Inert when min_p == 0, since every probability is
     // >= 0.
-    let floor = mul(Tensor::constant(cfg.min_p), &p_max);
+    let floor = cfg.min_p * &p_max;
     let kept_floor = ge(&probs, broadcast(&floor, [vocab]));
 
     // Stage 2 — XTC, over the tokens that survived the floor.
-    let above = and(
-        &kept_floor,
-        ge(&probs, broadcast(Tensor::constant(cfg.threshold), [vocab])),
-    );
+    let above = and(&kept_floor, ge(&probs, broadcast(cfg.threshold, [vocab])));
 
     // Least likely token that still clears the threshold. Tokens below it are
     // sent to +inf so the reduction ignores them.
-    let inf = broadcast(Tensor::constant(f32::INFINITY), [vocab]);
+    let inf = broadcast(f32::INFINITY, [vocab]);
     let min_above = reduce_min(select(&above, &probs, &inf));
 
     // Bernoulli gate on a decorrelated state. `reduce_min` collapses the
     // one-element draw to a scalar.
-    let gate_state = add(rng_state, broadcast(Tensor::constant(GATE_OFFSET), [2]));
+    let gate_state = rng_state + broadcast(GATE_OFFSET, [2]);
     let u = reduce_min(rng(&gate_state, [1]));
-    let fired = lt(&u, Tensor::constant(cfg.probability));
+    let fired = lt(&u, cfg.probability);
 
     let drop = and(
         broadcast(&fired, [vocab]),
@@ -169,19 +161,14 @@ fn xtc_mask(
 }
 
 /// One sampling step: temperature, head removal, Gumbel-max draw.
-fn step(
-    logits: Tensor,
-    vocab: u32,
-    cfg: Cfg,
-    rng_state: impl AsTensor + Copy,
-) -> (Tensor, Tensor, Tensor) {
+fn step(logits: Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
     let scaled = if cfg.temperature == 1.0 {
         logits
     } else {
-        div(&logits, cfg.temperature)
+        &logits / cfg.temperature
     };
     let (keep, dropped, fired) = xtc_mask(&scaled, vocab, cfg, rng_state);
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     (gumbel_max(masked, rng_state), dropped, fired)
 }
@@ -272,7 +259,7 @@ async fn main(input: Input) -> Result<Output> {
         let r = rng_p.take();
         let logits = intrinsics::logits();
         let (token, a, b) = step(logits, vocab, cfg, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         s1_out_p.put(&a);
         s2_out_p.put(&b);
@@ -333,17 +320,17 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let (token, a, b) = step(logits, vocab, cfg, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             s1_out.put(&a);
             s2_out.put(&b);

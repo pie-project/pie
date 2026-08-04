@@ -153,15 +153,15 @@ async fn main(input: String) -> Result<String> {
         fwd.epilogue(move || {
             let length = kv_len.take();
             let t = echo.take(); // [1] i32 — the echo token
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
-            let next_page_indptr = mul(iota(2), broadcast(&page_count, [2]));
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
+            let next_page_indptr = iota(2) * broadcast(&page_count, [2]);
             tok_in.put(&t);
             echo.put(&t);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
             page_indptr.put(&next_page_indptr);
             out.put(&t);

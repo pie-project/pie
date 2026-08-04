@@ -390,6 +390,15 @@ struct SetupConfig {
         float rope_theta_full = 1.0e6f;
         float rope_theta_sliding = 1.0e4f;
         float full_partial_rotary = 0.25f;
+        // The mixture, and the k-eq-V attention that comes with it on the 26B.
+        // Zero and false on every dense member, which is how the geometry tells
+        // a dense gemma 4 from a routed one.
+        bool enable_moe = false;
+        int n_experts = 0;
+        int experts_per_token = 0;
+        int moe_intermediate = 0;
+        bool attention_k_eq_v = false;
+        int n_global_kv_heads = 0;
         bool present() const { return n_layers > 0 && hidden > 0; }
     } gemma4;
     /// GPT-OSS's shape, when `model_type` says so. Zero means "not gpt-oss",

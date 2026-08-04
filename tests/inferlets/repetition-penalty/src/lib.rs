@@ -132,35 +132,29 @@ fn apply_penalties(
     counts: &Tensor,
     prompt_present: &Tensor,
 ) -> (Tensor, Tensor, Tensor) {
-    let zero = broadcast(Tensor::constant(0.0f32), [vocab]);
+    let zero = broadcast(0.0f32, [vocab]);
     let out_seen = gt(counts, &zero);
     // `prompt_present` is carried as 0.0/1.0 floats so the channel dtype stays
     // uniform with `counts`; 0.5 is the only sensible split point.
-    let prompt_seen = gt(prompt_present, broadcast(Tensor::constant(0.5f32), [vocab]));
+    let prompt_seen = gt(prompt_present, broadcast(0.5f32, [vocab]));
     let seen = or(&out_seen, &prompt_seen);
 
     // CTRL-style repetition penalty. Dividing a positive logit and multiplying
     // a negative one both move it toward -inf, which is the point: a single
     // multiplicative rule would *reward* already-negative logits.
-    let r = broadcast(Tensor::constant(cfg.repetition_penalty), [vocab]);
+    let r = broadcast(cfg.repetition_penalty, [vocab]);
     let positive = gt(logits, &zero);
-    let repenalized = select(&positive, div(logits, &r), mul(logits, &r));
+    let repenalized = select(&positive, logits / &r, logits * &r);
     let l = select(&seen, &repenalized, logits);
 
     // Frequency scales with how often the token was emitted; presence is a flat
     // charge for having been emitted at all.
-    let freq = mul(
-        broadcast(Tensor::constant(cfg.frequency_penalty), [vocab]),
-        counts,
-    );
-    let pres = mul(
-        broadcast(Tensor::constant(cfg.presence_penalty), [vocab]),
-        cast(&out_seen, dtype::f32),
-    );
+    let freq = broadcast(cfg.frequency_penalty, [vocab]) * counts;
+    let pres = broadcast(cfg.presence_penalty, [vocab]) * cast(&out_seen, dtype::f32);
 
     let penalized = reshape(reduce_sum(cast(&seen, dtype::f32)), [1]);
     let peak = reshape(reduce_max(counts), [1]);
-    (sub(sub(&l, &freq), &pres), penalized, peak)
+    (&l - &freq - &pres, penalized, peak)
 }
 
 /// One sampling step. Returns `(token, counts_next, penalized_count, peak)`.
@@ -170,7 +164,7 @@ fn step(
     cfg: Cfg,
     counts: &Tensor,
     prompt_present: &Tensor,
-    rng_state: impl AsTensor + Copy,
+    rng_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor) {
     let (penalized, n_penalized, peak) =
         apply_penalties(&logits, vocab, cfg, counts, prompt_present);
@@ -179,13 +173,13 @@ fn step(
     let scaled = if cfg.temperature == 1.0 {
         penalized
     } else {
-        div(&penalized, cfg.temperature)
+        &penalized / cfg.temperature
     };
     let token = gumbel_max(scaled, rng_state);
     // `gumbel_max` reduces the row away, so the token index is rank-0. The
     // scatter's `vals` must then be rank-0 too — a `[1]` vector would not match
     // `idx.dims ++ base.dims[1..]`, which is empty here.
-    let counts_next = scatter_add(counts, &token, Tensor::constant(1.0f32));
+    let counts_next = scatter_add(counts, &token, 1.0f32);
     (token, counts_next, n_penalized, peak)
 }
 
@@ -287,7 +281,7 @@ async fn main(input: Input) -> Result<Output> {
         let present = present_p.take();
         let logits = intrinsics::logits();
         let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         pen_out_p.put(&n_pen);
         peak_out_p.put(&peak);
@@ -361,17 +355,17 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             pen_out.put(&n_pen);
             peak_out.put(&peak);

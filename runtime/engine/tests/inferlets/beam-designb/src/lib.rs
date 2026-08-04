@@ -104,19 +104,17 @@ async fn main(_input: String) -> Result<String> {
     )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block.
-        let cand = add(
-            broadcast(reshape(scores.take(), [B, 1]), [B, v]),
-            log_softmax(intrinsics::logits()),
-        );
+        let cand =
+            broadcast(reshape(scores.take(), [B, 1]), [B, v]) + log_softmax(intrinsics::logits());
         let (s, i) = top_k(reshape(cand, [B * v]), B);
-        let parent = div(&i, v);
-        let tok_i = cast(rem(&i, v), dtype::i32);
+        let parent = &i / v;
+        let tok_i = cast(&i % v, dtype::i32);
 
         // 2. flat tail-append positions: wpos = fill + lane.
         let base = fill.take(); // [1]
         let lane = iota(B); // [B]
         let base_b = broadcast(reshape(&base, [1]), [B]); // [1] -> [B]
-        let wpos = add(&base_b, &lane); // [B]
+        let wpos = &base_b + &lane; // [B]
 
         // 3. mask evolution: inherit parent's ancestry, OR the new position.
         let inherited = gather(mask.take(), &parent);
@@ -130,18 +128,18 @@ async fn main(_input: String) -> Result<String> {
         // PHYSICAL page id: map the flat pool-page index (wpos / PAGE_T) through
         // the physical pool ids. pids [POOL_PAGES] is host-fed each fire.
         let pids = pool_ids_ch.take(); // [POOL_PAGES] physical page ids
-        let logical_slot = div(&wpos, page_t);
+        let logical_slot = &wpos / page_t;
         let w_slot_v = gather(&pids, &logical_slot); // [B] physical page id
-        let w_off_v = rem(&wpos, page_t);
+        let w_off_v = &wpos % page_t;
         w_slot.put(&w_slot_v);
         w_off.put(&w_off_v);
 
         // physical KV span after this step's appends (mask restricts attention).
-        let filled = add(&base, B); // [1]
+        let filled = &base + B; // [1]
         klen.take();
         klen.put(broadcast(reshape(&filled, [1]), [B]));
 
-        pos.put(add(pos.take(), 1u32));
+        pos.put(pos.take() + 1u32);
         fill.put(&filled);
         scores.put(&s);
         toks.put(&tok_i);

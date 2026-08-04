@@ -577,7 +577,29 @@ enum class Kernel : uint8_t {
     // when the shared expert arrived: a routed layer now runs both, at
     // different widths and over different buffers, and one kind cannot answer
     // for two extents.
-    LlExpertSiluMul
+    LlExpertSiluMul,
+    // ── Gemma 4's mixture (gemma-4-26B-A4B). APPEND ONLY, same rule as above.
+    //
+    // Separate from the `Ll*` set for the reason a kind IS a weight name here:
+    // gemma spells its stacked experts `experts.switch_glu.{gate,up,down}_proj`
+    // and its router `router.proj`, and it carries three tensors no other
+    // family has -- the router's own norm scale, its per-expert gain, and the
+    // two branch norms the mixture layer adds. The KERNELS are the shared ones;
+    // only the weights differ, which is exactly what a kind names.
+    G4Router,            // router.proj (no bias) + router.per_expert_scale
+    G4RouterNorm,        // router.scale, folded with hidden**-0.5 at load
+    G4RouterTopK,        // top-k, softmax over the selected, then the gain
+    G4MoeNorm,           // pre_feedforward_layernorm_2
+    G4DenseBranchNorm,   // post_feedforward_layernorm_1
+    G4MoeBranchNorm,     // post_feedforward_layernorm_2
+    G4ExpertGate,        // experts.switch_glu.gate_proj (stacked)
+    G4ExpertUp,          // experts.switch_glu.up_proj
+    G4ExpertDown,        // experts.switch_glu.down_proj
+    G4ExpertGeglu,       // GeGLU over the sorted stack -- gemma's activation
+    G4MoeSort,
+    G4MoeGather,
+    G4ExpertCombine,
+    G4BranchAdd          // h1 + h2, the two branches meeting
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

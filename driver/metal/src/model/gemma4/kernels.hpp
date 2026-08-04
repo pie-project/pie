@@ -69,9 +69,18 @@ struct Gemma4Psos {
     /// for the per-layer table). The scale must NOT be folded into the weights:
     /// the LM head reads the very same tied table unscaled.
     Pso embed_scaled{};
-    /// `per_layer_projection` is K=256, the one projection whose K is not a
-    /// multiple of `affine_qmv_fast`'s 512-wide reduction block.
-    Pso qmv_narrow{};
+    /// The bounds-checked matvec, for every projection whose K is not a whole
+    /// number of the aligned kernel's reduction blocks. gemma 4 has three such
+    /// shapes and no other family has any: `per_layer_projection` is K=256,
+    /// and the 26B's hidden 2816 and intermediate 2112 are 5.5 and 8.25 blocks
+    /// at the widths their tensors are stored in. The aligned kernel reduces a
+    /// whole block past the end of every row, which is a NaN at the end of a
+    /// tensor and a wrong number everywhere else.
+    Pso qmv_tail{};
+    /// The same kernel at the checkpoint's SECOND affine width, for the dense
+    /// FFN and router a mixed-precision checkpoint spares at 8 bits. Invalid,
+    /// and never selected, when there is only one width.
+    Pso qmv_tail_alt{};
     /// Partial rotary over the whole head, which is what gemma4's full-attention
     /// layers mean by "a quarter of it". See rope.metal.
     Pso rope_prop{};
@@ -88,10 +97,33 @@ struct Gemma4Psos {
     /// that is `n_layers * ple_dim` wide per row.
     Pso geglu_strided{};
 
+    // ── the mixture (gemma-4-26B-A4B), built only for a model that has one ──
+    /// gemma's router: the shared top-k, plus the learned `per_expert_scale`
+    /// the softmax is multiplied by. A separate instantiation of the same
+    /// kernel rather than an optional buffer -- an unbound buffer is not a null
+    /// pointer here, so llama and gpt-oss would have to bind a tensor they do
+    /// not have.
+    Pso router_topk{};
+    Pso qmv_routed{};
+    /// The batched form's three column tiles.
+    Pso qmm_routed[3]{};
+    Pso moe_sort{};
+    Pso moe_gather{};
+    Pso moe_combine{};
+    /// `h1 + h2`. The plain elementwise add -- gemma's dense path never needs
+    /// one, because every add it does is fused into a norm.
+    Pso residual_add{};
+
+    bool moe_valid() const {
+        return router_topk.valid() && qmv_routed.valid() && moe_sort.valid() &&
+               moe_gather.valid() && moe_combine.valid() && residual_add.valid() &&
+               qmm_routed[0].valid() && qmm_routed[1].valid() && qmm_routed[2].valid();
+    }
+
     bool valid() const {
         return sdpa_swa_d256.valid() && sdpa_swa_d512.valid() && geglu_tanh.valid() &&
                logit_softcap.valid() && layer_scalar.valid() && ple_combine.valid() &&
-               vnorm.valid() && embed_scaled.valid() && qmv_narrow.valid() &&
+               vnorm.valid() && embed_scaled.valid() && qmv_tail.valid() &&
                rope_prop.valid() && embed_scaled_mb.valid() && rope_prop_mb.valid() &&
                rms_residual.valid() && rms_residual_scaled.valid() && geglu_strided.valid();
     }

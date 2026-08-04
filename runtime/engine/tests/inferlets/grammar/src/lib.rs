@@ -124,15 +124,15 @@ async fn main(input: String) -> Result<String> {
         let m = gmask.take(); // [V] bool, host-fed per step
         let lg = intrinsics::logits(); // [V] f32 (read-out row)
         let tok = reshape(reduce_argmax(mask_apply(&lg, &m)), [1]); // [1] i32
-        let next_length = add(&length, 1u32);
-        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+        let next_length = &length + 1u32;
+        let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
         tok_in.put(&tok);
         kv_len.put(&next_length);
         positions.put(&length);
-        w_slot.put(div(&length, PAGE_T));
-        w_off.put(rem(&length, PAGE_T));
+        w_slot.put(&length / PAGE_T);
+        w_off.put(&length % PAGE_T);
         page_indptr.take();
-        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        page_indptr.put(iota(2) * broadcast(&page_count, [2]));
         tok_out.put(&tok);
         raw.put(&lg);
     });

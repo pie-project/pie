@@ -105,7 +105,7 @@ struct Cfg {
 /// `x[i + 1]`, with the final element repeated so the difference vanishes at
 /// the end of the candidate window instead of wrapping.
 fn shift1(x: &Tensor, k: u32) -> Tensor {
-    let idx = min_elem(add(iota(k), 1u32), broadcast(Tensor::constant(k - 1), [k]));
+    let idx = min_elem(iota(k) + 1u32, broadcast(k - 1, [k]));
     gather(x, &idx)
 }
 
@@ -121,44 +121,39 @@ fn tail_free_keep(logits: &Tensor, vocab: u32, k_max: u32, z: f32) -> (Tensor, T
     let (_sorted, order) = top_k(logits, k_max);
     let p = gather(&probs, &order);
 
-    let d1 = sub(&p, shift1(&p, k_max));
-    let d2 = sub(&d1, shift1(&d1, k_max));
+    let d1 = &p - shift1(&p, k_max);
+    let d2 = &d1 - shift1(&d1, k_max);
     // |d2| without an abs op.
-    let curvature = max_elem(&d2, neg(&d2));
+    let curvature = max_elem(&d2, -&d2);
 
     // A perfectly flat curve has zero curvature everywhere; floor the total so
     // the normalization cannot divide by zero.
-    let total = max_elem(reduce_sum(&curvature), Tensor::constant(1e-9f32));
-    let norm = div(&curvature, broadcast(&total, [k_max]));
+    let total = max_elem(reduce_sum(&curvature), 1e-9f32);
+    let norm = &curvature / broadcast(&total, [k_max]);
     // Exclusive prefix, so the most likely candidate always passes.
-    let exclusive = sub(cumsum(&norm), &norm);
-    let keep_sorted = lt(&exclusive, broadcast(Tensor::constant(z), [k_max]));
+    let exclusive = cumsum(&norm) - &norm;
+    let keep_sorted = lt(&exclusive, broadcast(z, [k_max]));
 
-    let zeros = broadcast(Tensor::constant(0.0f32), [k_max]);
+    let zeros = broadcast(0.0f32, [k_max]);
     let kept_mass = reshape(reduce_sum(select(&keep_sorted, &p, &zeros)), [1]);
     let kept = reshape(reduce_sum(cast(&keep_sorted, dtype::f32)), [1]);
 
-    let base = broadcast(Tensor::constant(false), [vocab]);
+    let base = broadcast(false, [vocab]);
     let keep = scatter_set(base, &order, keep_sorted);
     (keep, kept, kept_mass)
 }
 
 /// One sampling step: temperature, curvature mask, Gumbel-max draw.
-fn step(
-    logits: Tensor,
-    vocab: u32,
-    cfg: Cfg,
-    rng_state: impl AsTensor + Copy,
-) -> (Tensor, Tensor, Tensor) {
+fn step(logits: Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
     // Temperature first: the curve whose curvature we measure has to be the
     // curve we actually sample from.
     let scaled = if cfg.temperature == 1.0 {
         logits
     } else {
-        div(&logits, cfg.temperature)
+        &logits / cfg.temperature
     };
     let (keep, kept, kept_mass) = tail_free_keep(&scaled, vocab, cfg.k_max, cfg.z);
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     (gumbel_max(masked, rng_state), kept, kept_mass)
 }
@@ -246,7 +241,7 @@ async fn main(input: Input) -> Result<Output> {
         let r = rng_p.take();
         let logits = intrinsics::logits();
         let (token, a, b) = step(logits, vocab, cfg, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         s1_out_p.put(&a);
         s2_out_p.put(&b);
@@ -307,17 +302,17 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let (token, a, b) = step(logits, vocab, cfg, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             s1_out.put(&a);
             s2_out.put(&b);

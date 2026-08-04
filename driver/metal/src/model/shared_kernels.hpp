@@ -22,6 +22,14 @@ struct RmsParams {          // rms_norm.metal:22      (buffer 3)
     std::uint32_t axis_size;  // feature dim
     std::uint32_t w_stride;   // 1 (contiguous)
     std::uint32_t plus_one;   // 1 applies the `(1 + w)` gain, 0 uses `w` raw
+    /// A constant multiplier on the weight, defaulted so the four-field
+    /// aggregate initializers everywhere else keep meaning what they meant.
+    ///
+    /// Gemma 4's router is the only thing that needs it: mlx-lm normalizes with
+    /// `scale * hidden**-0.5`, and the checkpoint stores `scale`. Folding the
+    /// root at load would mean writing to a mapping the driver deliberately
+    /// never writes to.
+    float gain = 1.0f;
 };
 struct RowGatherParams {    // row_gather.metal       (buffer 3)
     std::uint32_t width;

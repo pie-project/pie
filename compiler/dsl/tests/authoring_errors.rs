@@ -6,8 +6,6 @@
 //! mistake an author can make therefore has to arrive through
 //! [`Builder::build`]'s `Err`, carrying the span of the call that made it.
 
-use core::cell::RefCell;
-
 use pie_dsl::builder::Builder;
 use pie_dsl::error::TraceError;
 use pie_dsl::prelude::*;
@@ -66,7 +64,7 @@ fn every_mistake_in_one_trace_is_reported_together() {
         // Two independent mistakes: rank-2 keys, then one index too many.
         let _ = row_membership(rows.take(), keys.take());
         let _ = scalar_gather(matrix.take(), index.take());
-        output.put(Channel::seeded([2, 4], dtype::bool).take().tensor());
+        output.put(Channel::seeded([2, 4], dtype::bool).take());
     });
 
     let errors = builder.build().expect_err("two mistakes must fail");
@@ -91,7 +89,7 @@ fn a_bad_channel_seed_survives_until_the_next_build() {
     let output = Channel::new([2, 3], dtype::u32);
     let mut builder = Builder::new(32_000, 16);
     builder.stage(Stage::Epilogue, || {
-        output.put(seeded.take().tensor());
+        output.put(seeded.take());
     });
 
     let errors = builder.build().expect_err("a mis-shaped seed must fail");
@@ -104,13 +102,13 @@ fn a_bad_channel_seed_survives_until_the_next_build() {
 fn a_host_take_used_as_a_tensor_is_reported() {
     let host = Channel::new([4], dtype::u32);
     let output = Channel::new([4], dtype::u32);
-    // Taken outside the trace, so this is a host take: its bytes cross the
-    // driver boundary. Carrying it into a stage does not make it in-program.
-    let taken = RefCell::new(Some(host.take()));
+    // Taking outside the trace, where the bytes cross the driver boundary and
+    // there is no in-program value to take. Carrying the stand-in into a stage
+    // does not make it one.
+    let taken = host.take();
     let mut builder = Builder::new(32_000, 16);
-    builder.stage(Stage::Epilogue, || {
-        let taken = taken.borrow_mut().take().expect("the stage runs once");
-        output.put(taken.tensor());
+    builder.stage(Stage::Epilogue, move || {
+        output.put(taken.clone());
     });
 
     let errors = builder

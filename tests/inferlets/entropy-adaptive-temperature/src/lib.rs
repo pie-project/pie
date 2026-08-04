@@ -139,24 +139,16 @@ fn edt_temperature(logits: &Tensor, cfg: Cfg) -> (Tensor, Tensor) {
     let h = entropy_from_logprobs(&probs, &logprobs);
 
     // A one-hot row has H = 0; floor it so the reciprocal stays finite.
-    let h_safe = max_elem(&h, Tensor::constant(1e-6f32));
-    let exponent = div(Tensor::constant(cfg.theta), &h_safe);
-    let t = mul(
-        Tensor::constant(cfg.t0),
-        exp(mul(&exponent, Tensor::constant(cfg.ln_n))),
-    );
-    (max_elem(&t, Tensor::constant(cfg.min_temperature)), h)
+    let h_safe = max_elem(&h, 1e-6f32);
+    let exponent = cfg.theta / &h_safe;
+    let t = cfg.t0 * exp(&exponent * cfg.ln_n);
+    (max_elem(&t, cfg.min_temperature), h)
 }
 
 /// One sampling step: derive the temperature from this row's entropy, then draw.
-fn step(
-    logits: Tensor,
-    vocab: u32,
-    cfg: Cfg,
-    rng_state: impl AsTensor + Copy,
-) -> (Tensor, Tensor, Tensor) {
+fn step(logits: Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
     let (temperature, h) = edt_temperature(&logits, cfg);
-    let scaled = div(&logits, broadcast(&temperature, [vocab]));
+    let scaled = &logits / broadcast(&temperature, [vocab]);
     (
         gumbel_max(scaled, rng_state),
         reshape(&h, [1]),
@@ -252,7 +244,7 @@ async fn main(input: Input) -> Result<Output> {
         let r = rng_p.take();
         let logits = intrinsics::logits();
         let (token, a, b) = step(logits, vocab, cfg, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         s1_out_p.put(&a);
         s2_out_p.put(&b);
@@ -313,17 +305,17 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let (token, a, b) = step(logits, vocab, cfg, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             s1_out.put(&a);
             s2_out.put(&b);

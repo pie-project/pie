@@ -215,13 +215,13 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
         let base_b = broadcast(reshape(&base, [1]), [pool]);
         let new_mask = reshape(le(&col, &base_b), [1, pool]);
 
-        let logical_slot = div(&base, PAGE_T);
+        let logical_slot = &base / PAGE_T;
         let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = rem(&base, PAGE_T);
-        let klen_v = add(&base, 1u32);
-        let next_free = add(&base, 1u32);
+        let w_off_v = &base % PAGE_T;
+        let klen_v = &base + 1u32;
+        let next_free = &base + 1u32;
         let pages_v = reshape(&pids, [pool_pages]);
-        let pidx_v = mul(&iota(2), pool_pages);
+        let pidx_v = &iota(2) * pool_pages;
 
         tok_in.put(&tok); // the device carrier: next fire embeds this token
         out.put(&tok);
