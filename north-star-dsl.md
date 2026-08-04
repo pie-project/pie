@@ -2841,3 +2841,29 @@ CHANGE — tart's machinery belongs driver-side. Consequences:
    (the driver already reads per-region k — a driver-side sort of
    band DISPATCH order is possible; the rows themselves cannot be
    reordered driver-side).
+
+## THE DEV MERGE LANDS (2026-08-04): WIT 0.3 era opens
+
+github/dev (395+ commits) is merged (f94e97c7e + 8eb4bcef1): engine/
+worker/tokenizer upstream wholesale with data-field regrafts; all 34
+driver conflict hunks resolved with the V2 machinery INTACT — forward
+goldens 23/23, region table / bands / spatial / seams compiled and
+runtime-live; engine tests 403/403; full driver-cuda build green; E2E
+0.3 lanes and 11-lane concurrent probes clean. DORMANT this era,
+awaiting re-port onto the 0.3 container/channel surface: tart's guest
+APIs (set-max-layers, fwd.adapter, the 0.2 test inferlets and their
+batteries), qwen3_5 declared walker + hooks, upstream's fused LM-head
+argmax (deliberately off in tart bodies).
+
+TWO ATTRIBUTION RESULTS worth the whole day:
+1. THE CHURN FAULT IS UPSTREAM-WIDE: the 9-lane mixed 0.3 churn fails
+   98.3% on PURE github/dev vs 99% on the merged tree — e0454c39e
+   (dense-mask channels out of shared steps) is a partial fix; the
+   reservation/no-retry mechanism tart root-caused stands, upstream
+   included. The fix conversation belongs upstream.
+2. THE PHANTOM KILLER WAS A NEIGHBOUR: a co-located agent session
+   (cleanup-bravo) issues `pkill -x pie` on this box — today's
+   mystery SIGTERMs, dead boots and at least part of the historical
+   "boot-window register-death" flakiness were CROSS-AGENT KILLS, not
+   engine bugs. Standing ops rule: run our engine as `pie-tart`
+   (copy the binary; -x match misses it).
