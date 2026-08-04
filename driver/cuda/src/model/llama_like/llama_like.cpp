@@ -1252,6 +1252,9 @@ void prepare_llama_like_decode_plan(
     }
     const int min_prefill_decode_pages =
         std::max(0, fwd_cfg.prefill_decode_min_kv_pages);
+    // ④ Act 1: bands are re-stamped per fire; a deployment branch that
+    // returns early must not leave a previous fire's bands armed.
+    state.depth_band_count = 0;
     std::uint64_t total_kv_pages = 0;
     for (int r = 0; r < num_requests; ++r) {
         total_kv_pages += static_cast<std::uint64_t>(
@@ -1294,6 +1297,37 @@ void prepare_llama_like_decode_plan(
             fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
             full_attention_variant, cache.hnd_layout(),
             /*causal_mask=*/false);
+        // ④ Act 1 (banded depth, prefill family): a band's prefix
+        // dispatch on this deployment is the planned causal prefill —
+        // one plan per boundary, identity-qo prefix restriction, each
+        // in its OWN workspace (the per-band isolation rule).
+        if (depth_band_count >= 2 && depth_band_count <= 3 &&
+            is_pure_decode && !have_custom_mask) {
+            for (std::uint32_t j = 0; j < depth_band_count; ++j) {
+                const std::uint32_t rows = depth_band_rows[j];
+                state.depth_band_k[j] = depth_band_k[j];
+                state.depth_band_rows[j] = rows;
+                if (rows == 0) continue;
+                if (!state.depth_band_prefill_plans[j]) {
+                    state.depth_band_prefill_plans[j] =
+                        ops::make_prefill_plan();
+                }
+                ops::plan_attention_flashinfer_prefill_bf16(
+                    *state.depth_band_prefill_plans[j],
+                    qo_indptr_h.data(), kv_page_indptr_h,
+                    kv_last_page_lens_h,
+                    /*total_tokens=*/static_cast<int>(rows),
+                    static_cast<int>(rows),
+                    num_q_heads_local, num_kv_heads_local,
+                    cfg.head_dim_kernel, cache.page_size(),
+                    depth_band_ws(static_cast<int>(j)),
+                    /*stream=*/nullptr,
+                    fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
+                    full_attention_variant, cache.hnd_layout(),
+                    /*causal_mask=*/false);
+            }
+            state.depth_band_count = depth_band_count;
+        }
         return;
     }
     if (!state.decode_plan) {
@@ -1656,7 +1690,9 @@ void llama_like_forward_paged(
     // the full-depth prefix is rows [0, split) of every base array.
     const auto run_layer = [&](const int L, const int N, const int R,
                                const ops::DecodePlanCache* decode_plan,
-                               AttentionWorkspace& attn_ws) {
+                               AttentionWorkspace& attn_ws,
+                               const ops::PrefillPlanCache*
+                                   prefill_plan_override = nullptr) {
         const auto& layer = w.layers[L];
 
         // Pre-norm: norm(y) → norm_x; QKV reads from norm_x.
@@ -2128,7 +2164,8 @@ void llama_like_forward_paged(
             kernels::launch_dequant_kv_cache_layer_to_bf16_active(
                 kv_view, kv_page_indices, num_pages_in_batch, stream);
             ops::dispatch_attention_flashinfer_prefill_bf16(
-                *prefill_decode_plan,
+                *(prefill_plan_override != nullptr ? prefill_plan_override
+                                                   : prefill_decode_plan),
                 attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
@@ -2614,7 +2651,20 @@ void llama_like_forward_paged(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
-    if (plan_state.depth_band_count >= 2) {
+    const bool bands_runnable =
+        plan_state.depth_band_count >= 2 && is_pure_decode &&
+        !has_custom_mask && hooks == nullptr && !use_xqa_decode_path &&
+        (use_decode_path || use_prefill_decode_path) &&
+        layer_bound == cfg.num_hidden_layers;
+    if (plan_state.depth_band_count >= 2 && !bands_runnable &&
+        std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
+        // Degrade loudly-quietly: the fire runs full depth (today's
+        // demotion) rather than dying — deployments the banded walk
+        // does not serve yet (XQA) or shapes the frame gate should
+        // have declined.
+        std::fprintf(stderr, "[depth-bands] DECLINE R=%d\n", R);
+    }
+    if (bands_runnable) {
         // ④ Act 1 (banded depth): distinct-k bands, deepest-first. At
         // any layer the live rows are the prefix [0, band_rows[j]) of
         // the interval containing it (the seriation's deepest-first
@@ -2623,14 +2673,6 @@ void llama_like_forward_paged(
         // nothing lives past that band (the all-truncated fire's
         // bonus: layers past the deepest k never launch).
         const int m = static_cast<int>(plan_state.depth_band_count);
-        if (!is_pure_decode || has_custom_mask || hooks != nullptr ||
-            !use_decode_path || use_prefill_decode_path ||
-            use_xqa_decode_path ||
-            layer_bound != cfg.num_hidden_layers) {
-            throw std::runtime_error(
-                "depth bands: prepared bands reached an unsupported "
-                "fire shape (frame/driver gate drift)");
-        }
         if (std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
             std::fprintf(stderr, "[depth-bands] R=%d m=%d", R, m);
             for (int j = 0; j < m; ++j) {
@@ -2660,13 +2702,19 @@ void llama_like_forward_paged(
             const ops::DecodePlanCache* band_plan =
                 plan_state.depth_band_plans[static_cast<std::size_t>(j)]
                     .get();
-            if (band_plan == nullptr) {
+            const ops::PrefillPlanCache* band_prefill =
+                plan_state
+                    .depth_band_prefill_plans[static_cast<std::size_t>(j)]
+                    .get();
+            if (use_prefill_decode_path ? band_prefill == nullptr
+                                        : band_plan == nullptr) {
                 throw std::runtime_error(
                     "depth bands: band active but prepare built no "
                     "plan for it");
             }
             for (int L = from; L < to; ++L) {
-                run_layer(L, live, live, band_plan, depth_band_ws(j));
+                run_layer(L, live, live, band_plan, depth_band_ws(j),
+                          band_prefill);
             }
         }
     } else if (full_depth_rows != 0xffffffffu &&

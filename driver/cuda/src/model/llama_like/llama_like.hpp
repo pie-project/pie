@@ -154,6 +154,10 @@ struct LlamaLikePlanState {
     // workspace (the two-plans-one-workspace lesson, per band).
     // count == 0 = unbanded fire.
     std::array<ops::DecodePlanCachePtr, 3> depth_band_plans;
+    // Prefill-family band plans (force_prefill / prefill-decode
+    // deployments — their per-band prefix dispatch is the planned
+    // causal prefill, not the decode kernel).
+    std::array<ops::PrefillPlanCachePtr, 3> depth_band_prefill_plans;
     std::array<std::uint32_t, 3> depth_band_k{};
     std::array<std::uint32_t, 3> depth_band_rows{};
     std::uint32_t depth_band_count = 0;
