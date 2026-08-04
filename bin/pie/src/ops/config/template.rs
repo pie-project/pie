@@ -34,7 +34,6 @@ pub fn default_config_content() -> String {
         .replace("[model.scheduler]", "[worker.model.scheduler]")
         .replace("[model]", "[worker.model]")
         .replace("[server]", "[worker.server]")
-        .replace("[auth]", "[worker.auth]")
         .replace("[telemetry]", "[worker.telemetry]")
         .replace("[runtime]", "[worker.runtime]");
     format!("{STANDALONE_HEADER}{worker_body}")
@@ -65,9 +64,6 @@ python_snapshot = true
 # max_concurrent_processes = 64           # cap on in-flight inferlets
                                           # (default: the driver's max forward
                                           # requests, which is what fills a batch)
-
-[auth]
-enabled = false
 
 [telemetry]
 enabled = false

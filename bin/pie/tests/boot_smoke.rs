@@ -56,8 +56,6 @@ fn standalone_toml(snapshot: &str) -> String {
          listen = \"127.0.0.1:0\"\n\
          \n\
          [worker]\n\
-         [worker.auth]\n\
-         enabled = false\n\
          \n\
          [worker.model]\n\
          name = \"smoke\"\n\

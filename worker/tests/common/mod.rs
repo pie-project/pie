@@ -88,8 +88,6 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
          allow_fs = true\n\
          fs_scratch_dir = \"{scratch}\"\n\
          \n\
-         [auth]\n\
-         enabled = false\n\
          \n\
          [model]\n\
          name = \"default\"\n\

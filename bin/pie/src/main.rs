@@ -48,12 +48,6 @@ enum Command {
         cmd: RuntimeCmd,
     },
 
-    /// Manage authorized users for the auth backend (add / remove / list).
-    Auth {
-        #[command(subcommand)]
-        cmd: ops::auth::AuthCmd,
-    },
-
     /// Inspect what pie has written under `$PIE_HOME`.
     Cache {
         #[command(subcommand)]
@@ -71,12 +65,6 @@ enum Command {
         #[command(subcommand)]
         cmd: ops::inferlet::InferletCmd,
     },
-
-    /// Create a new inferlet project (forwards to the Bakery tooling).
-    New(ops::bakery::NewArgs),
-
-    /// Build an inferlet to a `.wasm` component (forwards to the Bakery tooling).
-    Build(ops::bakery::BuildArgs),
 
     /// Manage per-driver venvs + diagnostics (`pie driver <type> ...`).
     Driver {
@@ -157,11 +145,6 @@ async fn main() -> anyhow::Result<ExitCode> {
             ops::doctor::doctor()?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Auth { cmd } => {
-            startup::init_cli(&cli.global)?;
-            ops::auth::run(cmd)?;
-            Ok(ExitCode::SUCCESS)
-        }
         Command::Cache { cmd } => {
             startup::init_cli(&cli.global)?;
             ops::cache::run(cmd)?;
@@ -175,16 +158,6 @@ async fn main() -> anyhow::Result<ExitCode> {
         Command::Inferlet { cmd } => {
             startup::init_cli(&cli.global)?;
             ops::inferlet::run(cmd, &cli.global).await?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::New(args) => {
-            startup::init_cli(&cli.global)?;
-            ops::bakery::run_new(args)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Build(args) => {
-            startup::init_cli(&cli.global)?;
-            ops::bakery::run_build(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Driver { cmd } => {

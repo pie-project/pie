@@ -240,10 +240,8 @@ mod tests {
 
     #[test]
     fn an_authored_entry_cannot_be_named() {
-        for name in ["config", "auth"] {
-            let err = selected(&[name.to_string()]).unwrap_err().to_string();
-            assert!(err.contains("never cleared"), "got: {err}");
-        }
+        let err = selected(&["config".to_string()]).unwrap_err().to_string();
+        assert!(err.contains("never cleared"), "got: {err}");
     }
 
     #[test]

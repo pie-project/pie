@@ -3,8 +3,6 @@
 //! the shared `#[tokio::main]` runtime. The R3 weight/runtime *download* IO
 //! (`hf`, `py_runtime`) lives here — the worker lib links no provisioning code.
 
-pub mod auth;
-pub mod bakery;
 pub mod cache;
 pub mod config;
 pub mod diag;

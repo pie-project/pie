@@ -113,12 +113,6 @@ pub fn entries() -> Vec<Entry> {
             what: "The config file. Authored, not derived.",
             reclaim: Reclaim::Never,
         },
-        Entry {
-            name: "auth",
-            path: home.join("authorized_users.toml"),
-            what: "Authorized users. Authored, not derived.",
-            reclaim: Reclaim::Never,
-        },
     ]
 }
 
@@ -168,7 +162,7 @@ mod tests {
         // The failure this guards is silent and total: a `pie cache clear`
         // that takes config.toml with it looks like it worked.
         for entry in entries() {
-            if matches!(entry.name, "config" | "auth") {
+            if entry.name == "config" {
                 assert_eq!(
                     entry.reclaim,
                     Reclaim::Never,

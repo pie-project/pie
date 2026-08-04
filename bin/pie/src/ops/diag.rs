@@ -39,13 +39,8 @@ pub fn check(path: &Path, debug: bool) -> Result<()> {
 fn check_summary(path: &Path, cfg: &config::Config) -> String {
     let m = &cfg.model;
     let model_summary = format!("{}:{}", m.name, m.driver.kind.as_str());
-    let auth = if cfg.auth.enabled {
-        "auth enabled"
-    } else {
-        "auth disabled"
-    };
     format!(
-        "✓ {} valid: 1 model; {auth}; {model_summary}",
+        "✓ {} valid: 1 model; {model_summary}",
         path.display(),
     )
 }

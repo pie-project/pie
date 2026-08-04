@@ -442,8 +442,8 @@ mod tests {
     #[test]
     fn set_nested_creates_intermediate_table() {
         let mut t: toml::Value = toml::from_str("").unwrap();
-        set_nested(&mut t, "auth.enabled", toml::Value::Boolean(true)).unwrap();
-        assert_eq!(t["auth"]["enabled"].as_bool().unwrap(), true);
+        set_nested(&mut t, "telemetry.enabled", toml::Value::Boolean(true)).unwrap();
+        assert_eq!(t["telemetry"]["enabled"].as_bool().unwrap(), true);
     }
 
     #[test]

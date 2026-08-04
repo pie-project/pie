@@ -25,8 +25,6 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
-    pub auth: AuthConfig,
-    #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -412,23 +410,6 @@ fn default_registry() -> String {
 }
 fn default_true() -> bool {
     true
-}
-
-// -----------------------------------------------------------------------------
-// [auth]
-// -----------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1587,6 +1568,33 @@ device = "cuda:0"
 "#;
         let cfg: Config = toml::from_str(one).unwrap();
         assert_eq!(cfg.model.driver.device, vec!["cuda:0".to_string()]);
+    }
+
+    #[test]
+    fn rejects_legacy_auth_section() {
+        // `[auth]` is gone because nothing behind it authenticated anything:
+        // no code ever read `authorized_users.toml`, the gateway states that
+        // the edge has already authed and it does not re-verify, and the
+        // engine answered AuthProve with "Already authenticated" without
+        // looking at the signature. `enabled = true` -- the old default --
+        // therefore reported a protection that did not exist.
+        //
+        // An existing config carrying the section must fail loudly rather than
+        // be ignored, because someone who wrote `enabled = true` deserves to
+        // find out it never meant anything.
+        let legacy = r#"
+[auth]
+enabled = true
+
+[model]
+name = "a"
+hf_repo = "x"
+[model.driver]
+type = "metal"
+device = ["cuda:0"]
+"#;
+        let err = Config::parse(legacy).unwrap_err().to_string();
+        assert!(err.contains("auth"), "got: {err}");
     }
 
     #[test]
