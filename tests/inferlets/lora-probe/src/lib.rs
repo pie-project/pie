@@ -46,6 +46,15 @@ struct Input {
     /// Scale folded into B's seed contents. 0.0 = zero-B adapter.
     #[serde(default)]
     adapter_scale: f32,
+    /// Which surface attaches the adapter: "sink" (kernel::lora, the
+    /// original) or "adapter" (fwd.adapter, the PEFT v0a surface —
+    /// must be byte-identical: same channels, same lowering).
+    #[serde(default = "default_surface")]
+    surface: String,
+}
+
+fn default_surface() -> String {
+    "sink".into()
 }
 
 fn default_prompt() -> String {
@@ -186,14 +195,31 @@ async fn main(input: Input) -> Result<Output> {
         let (lora_a, lora_b) = make_lora_channels(&a_host, &b_host);
         let fwd_p = ForwardPass::new();
         // The configuration sink: reads are peeks (no edge onto the decode
-        // chain), SITES is trace-known placement.
-        fwd_p.prologue(move || {
-            intrinsics::kernel::lora(
-                lora_a.read(),
-                lora_b.read(),
-                Tensor::constant(SITE_Q),
-            );
-        });
+        // chain), SITES is trace-known placement. The "adapter" surface
+        // states the SAME thing through the PEFT v0a classifier.
+        if input.surface == "adapter" {
+            use inferlet::ptir::adapter::{mm, Site};
+            fwd_p
+                .adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
+                .map_err(|e| e.to_string())?;
+        } else if input.surface == "clone" {
+            let (a2, b2) = (lora_a.clone(), lora_b.clone());
+            fwd_p.prologue(move || {
+                intrinsics::kernel::lora(
+                    a2.read(),
+                    b2.read(),
+                    Tensor::constant(SITE_Q),
+                );
+            });
+        } else {
+            fwd_p.prologue(move || {
+                intrinsics::kernel::lora(
+                    lora_a.read(),
+                    lora_b.read(),
+                    Tensor::constant(SITE_Q),
+                );
+            });
+        }
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
@@ -247,13 +273,19 @@ async fn main(input: Input) -> Result<Output> {
 
         let (lora_a, lora_b) = make_lora_channels(&a_host, &b_host);
         let fwd = ForwardPass::new();
-        fwd.prologue(move || {
-            intrinsics::kernel::lora(
-                lora_a.read(),
-                lora_b.read(),
-                Tensor::constant(SITE_Q),
-            );
-        });
+        if input.surface == "adapter" {
+            use inferlet::ptir::adapter::{mm, Site};
+            fwd.adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
+                .map_err(|e| e.to_string())?;
+        } else {
+            fwd.prologue(move || {
+                intrinsics::kernel::lora(
+                    lora_a.read(),
+                    lora_b.read(),
+                    Tensor::constant(SITE_Q),
+                );
+            });
+        }
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,

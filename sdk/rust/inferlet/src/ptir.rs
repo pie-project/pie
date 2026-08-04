@@ -38,6 +38,81 @@ use crate::working_set::{KvWorkingSet, PageRange, PageSpan};
 
 pub use pie_dsl::intrinsics;
 
+/// The PEFT adapter surface's expression vocabulary
+/// ([`ForwardPass::adapter`]): a tiny CLOSED language over the site's
+/// input `x` and base output `y`, classified — never interpreted — into
+/// the driver's CORRECTION lowerings. `mm` multiplies by a channel-borne
+/// weight; `+` composes. Scale/bias join with their forms.
+pub mod adapter {
+    use super::Channel;
+
+    /// Model projection sites, the llama-like bit vocabulary
+    /// (driver/cuda/src/model/lora.hpp `LoraSite` — placement is
+    /// structure; the driver refuses unconsumed sites loudly).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Site {
+        Q,
+        K,
+        V,
+        O,
+        GateUp,
+        Down,
+    }
+
+    impl Site {
+        pub fn bit(self) -> u32 {
+            match self {
+                Site::Q => 1 << 0,
+                Site::K => 1 << 1,
+                Site::V => 1 << 2,
+                Site::O => 1 << 3,
+                Site::GateUp => 1 << 4,
+                Site::Down => 1 << 5,
+            }
+        }
+    }
+
+    /// One adapter expression node. Built by the closure, consumed by
+    /// the classifier; never executed directly.
+    pub struct Expr {
+        pub(crate) kind: ExprKind,
+    }
+
+    pub(crate) enum ExprKind {
+        X,
+        Y,
+        Mm(Channel, Box<Expr>),
+        Add(Box<Expr>, Box<Expr>),
+    }
+
+    impl Expr {
+        pub(crate) fn x() -> Self {
+            Expr { kind: ExprKind::X }
+        }
+        pub(crate) fn y() -> Self {
+            Expr { kind: ExprKind::Y }
+        }
+    }
+
+    /// `mm(w, e)` — multiply the expression by the channel-borne weight
+    /// (the channel's leading dim is the layer axis; rank rides its
+    /// shape).
+    pub fn mm(w: &Channel, e: Expr) -> Expr {
+        Expr {
+            kind: ExprKind::Mm(w.clone(), Box::new(e)),
+        }
+    }
+
+    impl std::ops::Add for Expr {
+        type Output = Expr;
+        fn add(self, rhs: Expr) -> Expr {
+            Expr {
+                kind: ExprKind::Add(Box::new(self), Box::new(rhs)),
+            }
+        }
+    }
+}
+
 // Re-export the eDSL vocabulary so an author writes stage closures with a single
 // `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
 pub use pie_dsl::DType as Dtype;
@@ -639,6 +714,7 @@ struct ForwardInner {
     attention_ws: Option<Rc<KvWorkingSet>>,
     rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
     program_attached: bool,
+    adapter_attached: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -731,6 +807,7 @@ impl ForwardPass {
                 attention_ws: None,
                 rs_working_sets: Vec::new(),
                 program_attached: false,
+                adapter_attached: false,
             }),
         }
     }
@@ -902,6 +979,89 @@ impl ForwardPass {
     /// Attach the `prologue` stage (overview §5.3).
     pub fn prologue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Prologue, body);
+    }
+
+    /// Attach a PEFT adapter at a model site (north-star-dsl.md, the
+    /// adapter design final): placement is STRUCTURE (this call, one per
+    /// site), weights are CONTENTS (the channels inside the expression),
+    /// and FORM is the closed expression the closure builds over
+    /// `(x, y)` — `x` the site's input activations, `y` its base
+    /// projection output.
+    ///
+    /// v0 CLASSIFIES the expression and lowers the recognized form onto
+    /// the proven span-grouped CORRECTION path (`kernel::lora`):
+    ///
+    /// ```ignore
+    /// fwd.adapter(adapter::Site::Q, |x, y| y + mm(b, mm(a, x)))?; // LoRA
+    /// ```
+    ///
+    /// Unrecognized forms and second calls refuse LOUDLY (the closed
+    /// world; per-site pairs and the scale/bias forms are recorded
+    /// rungs). The channels' leading dim carries the layer axis and the
+    /// rank rides their shapes (`a: [L, R, d]`, `b: [L, d_out, R]`,
+    /// scale folded into `b` — the §6.5 contract, unchanged).
+    pub fn adapter(
+        &self,
+        site: adapter::Site,
+        f: impl FnOnce(adapter::Expr, adapter::Expr) -> adapter::Expr,
+    ) -> Result<(), String> {
+        use adapter::ExprKind as K;
+        let expr = f(adapter::Expr::x(), adapter::Expr::y());
+        let (lhs, rhs) = match expr.kind {
+            K::Add(l, r) => (*l, *r),
+            _ => {
+                return Err(
+                    "adapter: form not lowerable (v0 lowers the low-rank \
+                     form `y + mm(b, mm(a, x))` only)"
+                        .to_string(),
+                )
+            }
+        };
+        let delta = match (&lhs.kind, &rhs.kind) {
+            (K::Y, _) => rhs.kind,
+            (_, K::Y) => lhs.kind,
+            _ => {
+                return Err(
+                    "adapter: the base output `y` must be one addend"
+                        .to_string(),
+                )
+            }
+        };
+        let (b, a) = match delta {
+            K::Mm(b, inner) => match inner.kind {
+                K::Mm(a, x) if matches!(x.kind, K::X) => (b, a),
+                _ => {
+                    return Err(
+                        "adapter: the delta must be mm(b, mm(a, x))"
+                            .to_string(),
+                    )
+                }
+            },
+            _ => {
+                return Err(
+                    "adapter: the delta must be mm(b, mm(a, x))".to_string(),
+                )
+            }
+        };
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.adapter_attached {
+                return Err(
+                    "adapter: one adapter per pass in v0 (per-site pairs \
+                     are the recorded next rung)"
+                        .to_string(),
+                );
+            }
+            inner.adapter_attached = true;
+        }
+        self.prologue(move || {
+            intrinsics::kernel::lora(
+                a.read(),
+                b.read(),
+                Tensor::constant(site.bit()),
+            );
+        });
+        Ok(())
     }
     /// Attach the `on_attn_proj` stage (per layer, before attention).
     pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
