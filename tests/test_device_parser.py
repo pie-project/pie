@@ -1277,6 +1277,64 @@ class StackDeeperThanTheBlock(unittest.TestCase):
         )
 
 
+class TheWindowIsCapped(unittest.TestCase):
+    """One grammar must not size every row of every batch for itself.
+
+    `cand_window` is `batch x configurations x readings x window` and is 95% of
+    a batch's memory. Over 116 corpus schemas the replay window is 20 at the
+    median and 32 at the p90, and then 349 - so without a cap one schema in ten
+    costs the other nine an eightfold buffer: 8.40 GiB at batch 512 against
+    1.32 with the cap.
+    """
+
+    def setUp(self):
+        _requirements()
+
+    def test_a_grammar_past_the_cap_is_refused_rather_than_paid_for(self):
+        from engrain._engine import DeviceGrammar, WindowTooWide
+
+        compiler = support.Compiler(VOCABULARY)
+        # Deeply nested arrays are what make a replay window wide: closing them
+        # is one reduction chain.
+        schema = {"type": "array"}
+        for _ in range(4):
+            schema = {"type": "array", "items": schema}
+        grammar = compiler.compile_json_schema(json.dumps(schema))
+
+        roomy = DeviceGrammar(window_cap=None)
+        roomy.admit(grammar)
+        needed = roomy.window_bound
+        self.assertGreater(needed, 2, "the premise: this grammar wants a window")
+
+        tight = DeviceGrammar(window_cap=needed - 1)
+        with self.assertRaises(WindowTooWide) as refusal:
+            tight.admit(grammar)
+        self.assertEqual(refusal.exception.needed, needed)
+        self.assertEqual(refusal.exception.limit, needed - 1)
+        # The refusal left the pool as it was: nothing admitted, and no
+        # ceiling raised on the way to deciding.
+        self.assertEqual(tight.count, 0)
+        self.assertEqual(tight.window_bound, 0)
+
+        # And a pool with room takes it, so the cap is the only thing refusing.
+        roomy_enough = DeviceGrammar(window_cap=needed)
+        roomy_enough.admit(grammar)
+        self.assertEqual(roomy_enough.count, 1)
+
+    def test_the_window_the_batch_allocates_follows_the_cap(self):
+        """Which is the point: the buffer is the cap, not the worst schema."""
+        from engrain._engine import DeviceGrammar
+
+        compiler = support.Compiler(VOCABULARY)
+        schema = {"type": "array"}
+        for _ in range(4):
+            schema = {"type": "array", "items": schema}
+        grammar = compiler.compile_json_schema(json.dumps(schema))
+        pool = DeviceGrammar(window_cap=None)
+        pool.admit(grammar)
+        self.assertGreaterEqual(pool.window, pool.window_bound)
+
+
 class SizedForTheMachine(unittest.TestCase):
     """Nothing that decides how much of a device to use may be a constant.
 

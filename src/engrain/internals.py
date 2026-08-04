@@ -24,6 +24,7 @@ from engrain.device import (
     DeviceGrammar,
     ResidentTables,
     StackTooDeep,
+    WindowTooWide,
 )
 
 __all__ = [
@@ -32,5 +33,6 @@ __all__ = [
     "DeviceGrammar",
     "ResidentTables",
     "StackTooDeep",
+    "WindowTooWide",
     "pack_configurations",
 ]

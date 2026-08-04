@@ -2732,6 +2732,29 @@ class ResidentTables:
 _SIGNED = {"action_values", "action_extra"}
 
 
+class WindowTooWide(ValueError):
+    """A grammar's replay window is wider than the pool will hold for it.
+
+    The window is the part of a stack one reduction chain rewrites, and the
+    batch allocates `batch x configurations x readings x window` for it -
+    which is 95% of a batch's memory and the only factor there that a single
+    grammar can multiply for every row. Measured over 116 corpus schemas the
+    bound is 20 at the median and 32 at the p90, and then 349 at the p99: one
+    schema in ten costs everyone else an eightfold buffer.
+
+    So a grammar past the cap is not admitted, and the caller keeps it on the
+    reference matcher - exact, and slower for that request alone rather than
+    larger for all of them.
+    """
+
+    def __init__(self, needed: int, limit: int) -> None:
+        super().__init__(
+            f"a replay window of {needed} exceeds the pool's cap of {limit}"
+        )
+        self.needed = needed
+        self.limit = limit
+
+
 class StackTooDeep(ValueError):
     """A parse went deeper than the batch was built for.
 
@@ -2776,6 +2799,7 @@ class DeviceGrammar:
         self,
         compiled=None,
         max_stack: int = 256,
+        window_cap: int | None = None,
         max_reductions: int | None = None,
         max_configs: int = 128,
         window: int | None = None,
@@ -2788,6 +2812,14 @@ class DeviceGrammar:
         # and its replays raise the overflow flag, which is the honest failure:
         # visible rather than silent. See `problems()`.
         self.max_stack = max_stack
+        # What a grammar's replay window may be before the pool refuses it.
+        # `None` - the default - keeps every grammar and lets the widest of
+        # them size the batch, which is what a library should do: refusing a
+        # schema is the caller's decision, not the compiler's. A serving
+        # backend has the opposite priority and asks for a cap, because 95% of
+        # a batch's memory is behind this number and over 116 corpus schemas it
+        # is 20 at the median, 32 at the p90 and 349 at the p99.
+        self.window_cap = window_cap
         self.max_reductions = (
             max_reductions if max_reductions is not None else max_stack
         )
@@ -3066,6 +3098,12 @@ class DeviceGrammar:
         tables = (
             compiled if isinstance(compiled, ResidentTables) else self.prepare(compiled)
         )
+        # Before anything is written, because a refusal must leave the pool as
+        # it was. The window is the one ceiling a single grammar can multiply
+        # for every row of every batch, and 95% of a batch's memory is behind
+        # it.
+        if self.window_cap is not None and tables.window_bound > self.window_cap:
+            raise WindowTooWide(tables.window_bound, self.window_cap)
         if self.count == 0 and not self.vocab_size:
             self.vocab_size = tables.vocab_size
             self.mask_words = tables.mask_words

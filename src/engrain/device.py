@@ -12,7 +12,8 @@ from engrain._engine import (  # noqa: F401
     DeviceBatch,
     DeviceGrammar,
     StackTooDeep,
+    WindowTooWide,
     ResidentTables,
 )
 
-__all__ = ["DeviceBatch", "DeviceGrammar", "ResidentTables", "StackTooDeep"]
+__all__ = ["DeviceBatch", "DeviceGrammar", "ResidentTables", "StackTooDeep", "WindowTooWide"]
