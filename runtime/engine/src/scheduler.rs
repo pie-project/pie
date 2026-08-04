@@ -514,6 +514,15 @@ pub(crate) struct RunAheadAcc {
     pub exec_blk_partial: AtomicU64,
     /// Gate held (no awaited lane missing) while a wave was executing.
     pub exec_held: AtomicU64,
+    /// Near-miss attribution: executing evaluations with 1..=3 lanes
+    /// missing — the composition of the LAST holes denying the chain.
+    pub exec_nm_evals: AtomicU64,
+    pub exec_nm_owed: AtomicU64,
+    pub exec_nm_empty: AtomicU64,
+    pub exec_nm_partial: AtomicU64,
+    /// Minimum `missing` seen across this wave's executing evaluations
+    /// (swap-reset to MAX at each wave record): how close the gate came.
+    pub exec_miss_min: AtomicU64,
     /// Boundary-opening seals taken while a wave was executing — the next
     /// wave was sealed before the current one completed (the chain engaged).
     pub seal_exec: AtomicU64,
@@ -554,6 +563,11 @@ pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
     exec_blk_empty: AtomicU64::new(0),
     exec_blk_partial: AtomicU64::new(0),
     exec_held: AtomicU64::new(0),
+    exec_nm_evals: AtomicU64::new(0),
+    exec_nm_owed: AtomicU64::new(0),
+    exec_nm_empty: AtomicU64::new(0),
+    exec_nm_partial: AtomicU64::new(0),
+    exec_miss_min: AtomicU64::new(u64::MAX),
     seal_exec: AtomicU64::new(0),
 };
 

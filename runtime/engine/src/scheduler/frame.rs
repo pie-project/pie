@@ -1624,8 +1624,17 @@ impl FramePolicy {
                     acc.exec_blk_empty.fetch_add(blk_empty, Ordering::Relaxed);
                     acc.exec_blk_partial
                         .fetch_add(blk_partial, Ordering::Relaxed);
+                    acc.exec_miss_min
+                        .fetch_min(missing as u64, Ordering::Relaxed);
                     if missing == 0 {
                         acc.exec_held.fetch_add(1, Ordering::Relaxed);
+                    } else if missing <= 3 {
+                        // Near miss: these lanes are the LAST holes.
+                        acc.exec_nm_evals.fetch_add(1, Ordering::Relaxed);
+                        acc.exec_nm_owed.fetch_add(blk_owed, Ordering::Relaxed);
+                        acc.exec_nm_empty.fetch_add(blk_empty, Ordering::Relaxed);
+                        acc.exec_nm_partial
+                            .fetch_add(blk_partial, Ordering::Relaxed);
                     }
                 }
                 if missing == 1 && blocking_pin {

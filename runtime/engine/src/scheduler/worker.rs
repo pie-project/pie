@@ -4796,6 +4796,18 @@ impl BatchScheduler {
             take(&racc.exec_blk_partial),
         );
         let (ra_exec_held, ra_seal_exec) = (take(&racc.exec_held), take(&racc.seal_exec));
+        let (ra_exec_nm_evals, ra_exec_nm_owed, ra_exec_nm_empty, ra_exec_nm_partial) = (
+            take(&racc.exec_nm_evals),
+            take(&racc.exec_nm_owed),
+            take(&racc.exec_nm_empty),
+            take(&racc.exec_nm_partial),
+        );
+        let ra_exec_miss_min = {
+            let min = racc
+                .exec_miss_min
+                .swap(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            if min == u64::MAX { -1i64 } else { min as i64 }
+        };
         let (ra_plan_calls, ra_plan_us, ra_freed_poke, ra_freed_skip) = (
             take(&racc.plan_calls),
             take(&racc.plan_ns) / 1000,
@@ -4873,6 +4885,7 @@ impl BatchScheduler {
             "wave_id": timing.wave_id,
             "membership_hash": timing.membership_hash,
             "cuda_submitted": cuda_submitted,
+            "ra_exec_miss_min": ra_exec_miss_min,
             "fire_count": batch_size,
             "batch_size": batch_size,
             "tokens": total_tokens,
@@ -5004,6 +5017,10 @@ impl BatchScheduler {
                 ("ra_exec_blk_partial", ra_exec_blk_partial),
                 ("ra_exec_held", ra_exec_held),
                 ("ra_seal_exec", ra_seal_exec),
+                ("ra_exec_nm_evals", ra_exec_nm_evals),
+                ("ra_exec_nm_owed", ra_exec_nm_owed),
+                ("ra_exec_nm_empty", ra_exec_nm_empty),
+                ("ra_exec_nm_partial", ra_exec_nm_partial),
                 ("ra_leave_close", ra_leave_close),
                 ("ra_leave_hit", ra_leave_hit),
                 ("ra_leave_removed", ra_leave_removed),
