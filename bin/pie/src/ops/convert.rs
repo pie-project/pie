@@ -92,8 +92,9 @@ fn pie_version() -> &'static str {
 
 #[derive(Args, Debug)]
 pub struct ConvertArgs {
-    /// What to convert: a HuggingFace repo ID already in the local cache, a
-    /// snapshot directory, or a single `.safetensors`/`.gguf`/`.zt` file.
+    /// What to import: a HuggingFace repo ID, a snapshot directory, or a
+    /// single `.safetensors`/`.gguf`/`.zt` file. A repo ID that is not in the
+    /// local cache is fetched first.
     pub source: String,
     /// Write the artifact here instead of the model store. A path ending in
     /// `.zt` is the artifact; a directory receives `<name>.zt`.
@@ -114,6 +115,11 @@ pub struct ConvertArgs {
     /// After the artifact is written and every tensor digest verifies, delete
     /// the source weight files it was computed from. Config and tokenizer
     /// files stay.
+    ///
+    /// Only for a source that is already on disk. Reclaiming the HuggingFace
+    /// snapshots an import downloaded is `pie cache clear snapshots`, which
+    /// knows about all of them rather than the one just fetched, asks before
+    /// deleting, and says how much it got back.
     #[arg(long)]
     pub delete_source: bool,
 }
@@ -518,11 +524,17 @@ fn resolve_snapshot(repo_id: &str) -> Result<PathBuf> {
     let repo_dir =
         hf_hub::resolve_cache_dir().join(format!("models--{}", repo_id.replace('/', "--")));
     let snapshots = repo_dir.join("snapshots");
+    if !snapshots.exists() {
+        // Fetched here rather than by a separate `download` command. Whether a
+        // source needs the network is a property of that source, not a
+        // different operation -- and a `download` that stopped at the snapshot
+        // left the user one undiscoverable step short of a servable model,
+        // which is why it converted too. Two commands doing fetch-and-convert
+        // and convert is one command with an argument.
+        crate::ops::model::fetch_snapshot(repo_id)?;
+    }
     let entries = std::fs::read_dir(&snapshots).map_err(|_| {
-        anyhow!(
-            "{repo_id} is neither a path nor a downloaded model; \
-             run `pie model download {repo_id}` first"
-        )
+        anyhow!("{repo_id} is neither a path nor a model any registry has")
     })?;
     let snapshot = entries
         .filter_map(|entry| entry.ok())

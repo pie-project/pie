@@ -33,29 +33,9 @@ pub enum ModelCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Fetch a model by HuggingFace repo ID and convert it to a `.zt` artifact.
-    Download {
-        repo_id: String,
-        /// Download the complete HF snapshot, including alternate weight
-        /// formats Pie does not use. By default, Pie downloads only runtime
-        /// artifacts: config/tokenizer files and model*.safetensors.
-        #[arg(long)]
-        all: bool,
-        /// Fetch only. Leaves the HF snapshot as-is and writes no artifact —
-        /// for debugging, or for feeding the files to something other than pie.
-        #[arg(long)]
-        raw: bool,
-        /// Delete the HF snapshot once the artifact is written and verified.
-        /// Off by default: keeping it means a re-convert costs no download.
-        #[arg(long)]
-        clean: bool,
-        /// Convert even if an up-to-date artifact is already in the store.
-        #[arg(long)]
-        force: bool,
-        /// Split the artifact into shards of about this size (e.g. `16GiB`).
-        #[arg(long, value_name = "SIZE", value_parser = crate::ops::convert::parse_size)]
-        max_shard_size: Option<u64>,
-    },
+    /// Make a model servable: fetch it if it is remote, convert it to a
+    /// `.zt` artifact, and put it in the store.
+    Import(crate::ops::convert::ConvertArgs),
     /// Remove a stored artifact by name. Prompts for confirmation;
     /// `--yes` skips the prompt.
     Remove {
@@ -67,24 +47,14 @@ pub enum ModelCmd {
         #[arg(long)]
         staging: bool,
     },
-    /// Rewrite a checkpoint as pie's canonical `.zt` artifact.
-    Convert(crate::ops::convert::ConvertArgs),
 }
 
 pub fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
         ModelCmd::List { json } => list(json),
         ModelCmd::Info { name, json } => info(name, json),
-        ModelCmd::Download {
-            repo_id,
-            all,
-            raw,
-            clean,
-            force,
-            max_shard_size,
-        } => download(repo_id, all, raw, clean, force, max_shard_size),
+        ModelCmd::Import(args) => crate::ops::convert::run(args),
         ModelCmd::Remove { name, yes, staging } => remove(name, yes, staging),
-        ModelCmd::Convert(args) => crate::ops::convert::run(args),
     }
 }
 
@@ -338,38 +308,32 @@ fn info(name: String, json: bool) -> Result<()> {
 // download
 // -----------------------------------------------------------------------------
 
-fn download(
-    repo_id: String,
-    all: bool,
-    raw: bool,
-    clean: bool,
-    force: bool,
-    max_shard_size: Option<u64>,
-) -> Result<()> {
-    let (owner, name) = parse_repo_id(&repo_id)?;
-
-    if all {
-        println!("Downloading full snapshot: {repo_id}");
-    } else {
-        println!("Downloading runtime artifacts: {repo_id}");
-    }
+/// Fetch a HuggingFace snapshot into the local cache.
+///
+/// The runtime-artifact filter is not a flag any more: an import converts what
+/// it fetches, and the formats the old `--all` added are ones the conversion
+/// drops anyway. They were only useful with the `--raw` that has gone with it
+/// -- and "get files from HuggingFace without converting them" is
+/// `huggingface-cli`'s job, not a mode of a pie command.
+pub(crate) fn fetch_snapshot(repo_id: &str) -> Result<std::path::PathBuf> {
+    let (owner, name) = parse_repo_id(repo_id)?;
+    println!("Fetching {repo_id}");
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let label = repo_id.clone();
+    let label = repo_id.to_string();
+    // Built out here so the result line can report what the transfer cost --
+    // the bar erases itself when it finishes.
+    let progress = ProgressBar::new();
+    let bar = progress.clone();
     let snapshot_path = runtime.block_on(async move {
         let client = hf_hub::HFClient::new().map_err(|e| anyhow!("init HF client: {e}"))?;
         let repo = client.model(owner, name);
-        let progress = ProgressBar::new();
-        let allow_patterns = if all {
-            None
-        } else {
-            Some(runtime_snapshot_allow_patterns())
-        };
+        let progress = bar;
         let result = repo
             .snapshot_download()
-            .maybe_allow_patterns(allow_patterns)
+            .maybe_allow_patterns(Some(runtime_snapshot_allow_patterns()))
             .progress(progress.clone())
             .send()
             .await
@@ -377,63 +341,13 @@ fn download(
         progress.finish();
         result
     })?;
-    println!("✓ Downloaded to {}", snapshot_path.display());
-
-    if raw {
-        println!("\n(--raw: no artifact written; `pie model convert {repo_id}` when you want one)");
-        return Ok(());
-    }
-
-    // Download is fetch *and* convert: what the runtime serves is the
-    // artifact, so a download that stopped at the snapshot would leave the
-    // user one undiscoverable step short of a usable model.
-    println!();
-    crate::ops::convert::run(crate::ops::convert::ConvertArgs {
-        source: repo_id.clone(),
-        out: None,
-        dry_run: false,
-        force,
-        delete_source: false,
-        max_shard_size,
-    })?;
-
-    let staging = crate::ops::store::staging_dir(&repo_id);
-    if clean {
-        if let Some(dir) = &staging {
-            // Only after `convert` returned Ok, which means the artifact is
-            // written; the snapshot is reconstructible by re-downloading, so
-            // this is the reversible half of the two.
-            let bytes = crate::ops::store::staging_bytes(dir);
-            std::fs::remove_dir_all(dir)
-                .map_err(|err| anyhow!("cannot delete {}: {err}", dir.display()))?;
-            println!(
-                "✓ Removed the HF snapshot ({} reclaimed)",
-                crate::ops::store::format_bytes(bytes)
-            );
-        }
-        return Ok(());
-    }
-
-    // The snapshot stays by default, so say what it costs. Keeping it means a
-    // re-convert needs no network; not saying so means the user discovers
-    // twice the disk usage on their own.
-    if let Some(dir) = &staging {
-        let bytes = crate::ops::store::staging_bytes(dir);
-        if bytes > 0 {
-            let colorize = std::io::stdout().is_terminal();
-            let (dim, reset) = if colorize {
-                ("\x1b[2m", "\x1b[0m")
-            } else {
-                ("", "")
-            };
-            println!(
-                "{dim}The HF snapshot is kept ({}), so a re-convert needs no download.\n\
-                 Add --clean, or `pie model remove {repo_id} --staging`, to reclaim it.{reset}",
-                crate::ops::store::format_bytes(bytes)
-            );
-        }
-    }
-    Ok(())
+    println!(
+        "{} fetched to {}{}",
+        crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
+        crate::ui::short_path(&snapshot_path),
+        progress.summary()
+    );
+    Ok(snapshot_path)
 }
 
 fn parse_repo_id(s: &str) -> Result<(String, String)> {
@@ -493,11 +407,27 @@ impl ProgressBar {
     fn finish(&self) {
         self.inner.finished.store(true, Ordering::Relaxed);
         if self.inner.is_tty {
-            // Replace the bar line with a clean blank so the post-
-            // download "✓ Downloaded to …" lands on a fresh row.
+            // Replace the bar line with a clean blank so the result line lands
+            // on a fresh row.
             eprint!("\r\x1b[K");
             let _ = std::io::stderr().flush();
         }
+    }
+
+    /// What the transfer actually cost, for the result line.
+    ///
+    /// The bar erases itself when it finishes, so without this the only record
+    /// of a twenty-minute fetch was that it had ended.
+    fn summary(&self) -> String {
+        let moved = self.inner.bytes_done.load(Ordering::Relaxed);
+        if moved == 0 {
+            return String::new();
+        }
+        format!(
+            " ({} in {})",
+            crate::ui::bytes(moved),
+            crate::ui::duration(self.inner.started.elapsed())
+        )
     }
 
     fn draw(&self) {
@@ -528,14 +458,26 @@ impl ProgressBar {
         let bar_width = 30usize;
         let filled = (pct * bar_width as f64).round() as usize;
         let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-        let line = format!(
-            "\r\x1b[K  {bar} {pct:>5.1}% {done} / {total} @ {rate}/s",
+        // An ETA only once there is a rate worth extrapolating from. Guessing
+        // from the first hundred milliseconds swings by minutes, which teaches
+        // a reader to ignore the field.
+        let eta = if total > done && rate > 1.0 && elapsed > 2.0 {
+            let remaining = std::time::Duration::from_secs_f64((total - done) as f64 / rate);
+            format!(" {} left", crate::ui::duration(remaining))
+        } else {
+            String::new()
+        };
+        let body = format!(
+            "  {bar} {pct:>5.1}% {done} / {total} @ {rate}{eta}",
             pct = pct * 100.0,
-            done = format_bytes(done),
-            total = format_bytes(total),
-            rate = format_bytes(rate as u64),
+            done = crate::ui::bytes(done),
+            total = crate::ui::bytes(total),
+            rate = crate::ui::rate(rate),
         );
-        eprint!("{line}");
+        // Cut to the terminal: a line that wraps puts the cursor on a second
+        // screen row, and the `\r` that starts the next redraw returns to the
+        // start of THAT row, leaving the first behind as debris.
+        eprint!("\r\x1b[K{}", crate::ui::clip(&body, crate::ui::width()));
         let _ = std::io::stderr().flush();
     }
 }
