@@ -76,3 +76,7 @@ pie-engine = { path = "../../runtime/engine" }
 pie-client = { path = "../../client/rust" }
 # Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# SIGPIPE disposition — see `die_quietly_on_closed_pipe` in main.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

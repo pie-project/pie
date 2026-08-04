@@ -73,11 +73,13 @@ pub fn doctor(global: &startup::GlobalArgs) -> Result<bool> {
     // ── Summary ───────────────────────────────────────────────────────────
     println!();
     if failures > 0 {
-        println!("✗ pie cannot boot here ({failures} blocking, {warnings} warnings).");
+        let plural = if warnings == 1 { "" } else { "s" };
+        println!("✗ pie cannot boot here ({failures} blocking, {warnings} warning{plural}).");
         return Ok(false);
     }
     if warnings > 0 {
-        println!("! Ready, with warnings ({passes} passed, {warnings} warnings).");
+        let plural = if warnings == 1 { "" } else { "s" };
+        println!("! Ready, with warnings ({passes} passed, {warnings} warning{plural}).");
     } else {
         println!("✓ Ready ({passes} checks).");
     }

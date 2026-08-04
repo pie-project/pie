@@ -247,7 +247,7 @@ fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
         let found = get_nested(&root, &key).ok_or_else(|| {
             // Absent is a real answer here, not a failure of lookup: pie
             // derives a value when a key is missing, so say which it is.
-            anyhow!("{key} is not set (pie derives it; `pie config show` lists what is)")
+            anyhow!("{key} is not set; pie derives it. `pie config list` shows every key and its value")
         })?;
         println!("{}", display_value(found));
         return Ok(());

@@ -76,8 +76,29 @@ enum RuntimeCmd {
     Status,
 }
 
+/// Die quietly when a reader goes away, the way every other CLI does.
+///
+/// Rust masks SIGPIPE at startup, so a `println!` into a closed pipe returns
+/// EPIPE, and `println!` panics on a write error. `pie config list | head` was
+/// therefore printing a panic and exiting non-zero -- for doing exactly what
+/// `head` asks of it. Restoring the default disposition turns that back into
+/// the signal it is.
+#[cfg(unix)]
+fn die_quietly_on_closed_pipe() {
+    // SAFETY: setting a signal disposition to SIG_DFL before any threads that
+    // could observe a different one. This is the documented workaround for
+    // rust-lang/rust#62569.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn die_quietly_on_closed_pipe() {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
+    die_quietly_on_closed_pipe();
     let cli = Cli::parse();
     match cli.command {
         Command::Serve => serve(cli.global).await,
