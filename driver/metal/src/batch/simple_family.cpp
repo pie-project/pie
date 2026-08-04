@@ -1258,14 +1258,29 @@ std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
 
     // A ROUTED expert bank, and nothing else. One pattern, no family.
     //
-    // What makes streaming a bank worth doing is that the bank is read
-    // SPARSELY. A token reads 8 experts of 128 per layer, so an eighth of it
-    // faults in and the kernel evicts the rest: measured at 16.31 GB out of
+    // What this buys is a LOAD that maps instead of copying: 16.31 GB out of
     // the heap on Qwen3-30B-A3B, load 33.2 s -> 0.67 s, prefill unchanged and
-    // decode down 3%. A DENSE FFN is read whole every token, so paging it
-    // saves no traffic at all -- the only thing it buys is that a model larger
-    // than RAM runs slowly instead of failing to load, which is a different
-    // decision under a switch that does not name it.
+    // decode down 3%. A dense FFN would map just as well, but it is read whole
+    // every token, so mapping it trades a copy for nothing else, and this
+    // switch is about the banks where the trade is one-sided.
+    //
+    // What it does NOT buy is running a model larger than the machine, and it
+    // is worth being exact about why, because this comment used to claim the
+    // opposite -- that a token touching 8 experts of 128 faults an eighth of
+    // the bank in and the kernel evicts the rest. Nothing is evicted. The
+    // mapping goes into the residency set and `requestResidency` wires every
+    // page of it, whether or not a kernel ever reads it. Measured with
+    // `vm_stat` across a streamed Qwen3-30B-A3B run: wired memory goes from
+    // 1.5 GB at rest to 18.4 GB while the model is live -- the 16.31 GB pack
+    // plus the 0.87 GB heap, all of it, for the whole run -- and returns to
+    // 1.4 GB when it exits.
+    //
+    // That is the hardware, not this driver: an Apple Silicon GPU has no
+    // demand paging, and a kernel that touched a page the residency set had
+    // let go would abort its command buffer rather than fault it back. So a
+    // bank larger than the working set cannot be mapped at all; it has to be
+    // paged through a bounded slab that stays wired while its CONTENTS change,
+    // which is a different mechanism from this one and not yet built here.
     //
     // This predicate used to stream the dense FFN too, for the families that
     // have one. That was wrong twice over. It made one switch mean two trades,
