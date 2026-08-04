@@ -31,18 +31,8 @@ async fn main(_input: String) -> Result<String> {
     let positions = Channel::from_iter(0..n).named("positions");
     let pages = Channel::from_iter(0..max_pages).named("pages");
     let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
-    let w_slot = Channel::from(
-        (0..n)
-            .map(|position| position / page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot");
-    let w_off = Channel::from(
-        (0..n)
-            .map(|position| position % page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off");
+    let w_slot = Channel::from_iter((0..n).map(|position| position / page_size)).named("w_slot");
+    let w_off = Channel::from_iter((0..n).map(|position| position % page_size)).named("w_off");
     let kv_len = Channel::from([n]).named("kv_len");
     let entropy_out = Channel::new([1], dtype::f32).named("entropy_out");
 

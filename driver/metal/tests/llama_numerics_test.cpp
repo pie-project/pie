@@ -852,13 +852,29 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         expect(false, std::string(who) + ": pipelines compiled (" + err + ")");
         return;
     }
-    if (paged && !load_multibatch_psos(ctx, kernels_dir, mb, g.quant, /*with_d512=*/false,
-                                       &err)) {
+    if (paged && !load_multibatch_psos(
+                     ctx, kernels_dir, mb, g.quant, /*with_d512=*/false, &err,
+                     /*routed=*/g.is_moe(),
+                     /*fp16_precast=*/!g.is_moe() &&
+                         g.quant.bits == 4 && g.quant.group == 64)) {
         expect(false, std::string(who) + ": multi-batch pipelines compiled (" + err + ")");
         return;
     }
     const MultiBatchPsos* mbp = paged ? &mb : nullptr;
     bind_llama_consts(ctx, dag, g, R, paged);
+    // A split projection is two dispatches sharing one argument table, and the
+    // second one reads the partials the first wrote. Skipping this bind is not
+    // an unbound-slot crash: the reduce sums whatever the partials buffer holds
+    // and writes it over the projection's output.
+    SlotHandle splitk_partial = ctx.heap_alloc(
+        sizeof(float) * llama::llama_splitk_partial_elems(g, R));
+    std::vector<SlotHandle> splitk_keep;
+    llama::bind_llama_splitk(ctx, dag, g, R, splitk_partial, splitk_keep);
+    SlotHandle fp16_input = ctx.heap_alloc(
+        sizeof(std::uint16_t) * std::size_t(llama::llama_qmm_pool_rows(R)) *
+        std::size_t(std::max(g.hidden, g.intermediate)));
+    std::vector<SlotHandle> fp16_keep;
+    llama::bind_llama_fp16_qmm(ctx, dag, g, R, R, R, fp16_input, fp16_keep);
     try {
         bind_llama_dag(ctx, b, dag, g, col, /*ordinal_base=*/0, paged);
     } catch (const std::exception& e) {

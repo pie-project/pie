@@ -121,3 +121,45 @@ fn a_host_take_used_as_a_tensor_is_reported() {
         "{errors}"
     );
 }
+
+#[test]
+fn a_dense_constant_is_refused_with_the_channel_it_should_have_been() {
+    // Neither uniform nor affine, so neither `broadcast` nor `iota` reaches
+    // it. There is no third spelling: `const` carries one scalar, and bulk
+    // data belongs in a channel.
+    let output = Channel::new([4], dtype::f32);
+    let mut builder = Builder::new(32_000, 16);
+    builder.stage(Stage::Epilogue, || {
+        output.put(Tensor::constant([0.0f32, -3.5, 0.0, 12.25]));
+    });
+
+    let errors = builder
+        .build()
+        .expect_err("a general vector constant has no lowering");
+    let authoring = authoring(&errors);
+    assert_eq!(authoring.len(), 1, "{errors}");
+    let detail = detail(authoring[0]);
+    // The diagnostic has to name the way out, not just the refusal: an author
+    // who is told "not representable" reaches for a workaround, and the one
+    // they want is a first-class part of the model.
+    assert!(detail.contains("Channel::from"), "{detail}");
+    assert!(
+        detail.contains("broadcast") && detail.contains("iota"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn a_uniform_and_an_affine_constant_still_lower() {
+    let uniform = Channel::new([4], dtype::f32);
+    let ramp = Channel::new([4], dtype::u32);
+    let mut builder = Builder::new(32_000, 16);
+    builder.stage(Stage::Epilogue, || {
+        uniform.put(Tensor::constant([2.5f32; 4]));
+        ramp.put(Tensor::constant([10u32, 12, 14, 16]));
+    });
+
+    builder
+        .build()
+        .expect("broadcast and iota cover these two shapes");
+}

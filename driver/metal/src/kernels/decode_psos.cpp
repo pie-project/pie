@@ -168,7 +168,9 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           AffineFormat quant,
                           bool with_d512,
                           std::string* err,
-                          bool routed) {
+                          bool routed,
+                          bool fp16_precast,
+                          bool fp16_strided) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
     const std::string q = quant.kernel_suffix();
@@ -202,23 +204,49 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     };
 
     const std::string qmm = "quantized_qmm_t.metal";
-    for (int w = 0; w < 2; ++w) {
+    // The table's first axis IS `kQmmBMs`. Spelling the extent as a literal in
+    // the header is unavoidable -- it cannot see the model layer -- so the two
+    // are tied here, where both are visible.
+    static_assert(pie::metal::kQmmBMCount ==
+                      int(sizeof(out.qmm_t) / sizeof(out.qmm_t[0])),
+                  "the PSO table's row-block axis must match kQmmBMs");
+    for (int w = 0; w < pie::metal::kQmmBMCount; ++w) {
+        const int bm = pie::metal::kQmmBMs[w];
         for (int i = 0; i < 3; ++i) {
             const int bn = 16 << i;
-            const int bm = w == 0 ? pie::metal::kQmmBM : pie::metal::kQmmBMWide;
             const std::string suffix = q + "_bm_" + std::to_string(bm) +
                                        "_bn_" + std::to_string(bn);
             want(qmm, "affine_qmm_t" + suffix, &out.qmm_t[w][i]);
+            if (fp16_precast && quant.group == 64 && quant.bits == 4) {
+                want(qmm, "affine_qmm_t_fp16_precast" + suffix,
+                     &out.qmm_t_fp16_precast[w][i]);
+            }
             want(qmm, "affine_qmm_t_residual" + suffix, &out.qmm_t_residual[w][i]);
             want(qmm, "affine_qmm_t_bias" + suffix, &out.qmm_t_bias[w][i]);
         }
-    }
-    for (int w = 0; w < 2; ++w) {
-        const int bm = w == 0 ? pie::metal::kQmmBM : pie::metal::kQmmBMWide;
         want(qmm,
              "affine_qmm_t_splitk" + q + "_bm_" + std::to_string(bm) +
                  "_bn_" + std::to_string(pie::metal::kQmmSplitBN),
              &out.qmm_t_splitk[w]);
+        want(qmm,
+             "affine_qmm_t_splitk_f32" + q + "_bm_" + std::to_string(bm) +
+                 "_bn_" + std::to_string(pie::metal::kQmmSplitBN),
+             &out.qmm_t_splitk_f32[w]);
+        if (fp16_precast && quant.group == 64 && quant.bits == 4) {
+            want(qmm,
+                 "affine_qmm_t_splitk_fp16_precast" + q + "_bm_" +
+                     std::to_string(bm) + "_bn_" +
+                     std::to_string(pie::metal::kQmmSplitBN),
+                 &out.qmm_t_splitk_fp16_precast[w]);
+            want(qmm,
+                 "affine_qmm_t_splitk_fp16_precast_f32" + q + "_bm_" +
+                     std::to_string(bm) + "_bn_" +
+                     std::to_string(pie::metal::kQmmSplitBN),
+                 &out.qmm_t_splitk_fp16_precast_f32[w]);
+        }
+    }
+    if (fp16_precast && quant.group == 64 && quant.bits == 4) {
+        want(qmm, "cast_qmm_input_bfloat16_to_float16", &out.qmm_cast_bf16_f16);
     }
     if (routed) {
         // `bm` is spelled from `kMoeTileRows` rather than restated: it is the
@@ -235,12 +263,31 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     }
     want(qmm, "qmm_splitk_reduce_bfloat16", &out.qmm_splitk_reduce);
     want(qmm, "qmm_splitk_reduce_residual_bfloat16", &out.qmm_splitk_reduce_residual);
+    want(qmm, "qmm_splitk_reduce_f32_bfloat16", &out.qmm_splitk_reduce_f32);
+    want(qmm, "qmm_splitk_reduce_residual_f32_bfloat16",
+         &out.qmm_splitk_reduce_residual_f32);
     want(qmm, "affine_qmm_t_strided" + q + "_bm_16_bn_32", &out.qmm_t_strided);
     want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_16_bn_32",
          &out.qmm_t_strided_residual);
     want(qmm, "affine_qmm_t_strided" + q + "_bm_32_bn_32", &out.qmm_t_strided_wide);
     want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_32_bn_32",
          &out.qmm_t_strided_wide_residual);
+    if (fp16_strided && quant.group == 64 && quant.bits == 4) {
+        want(qmm, "affine_qmm_t_strided_fp16_precast" + q + "_bm_16_bn_32",
+             &out.qmm_t_strided_fp16_precast);
+        want(qmm, "affine_qmm_t_strided_fp16_precast" + q + "_bm_32_bn_32",
+             &out.qmm_t_strided_fp16_precast_wide);
+        want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q +
+                     "_bm_16_bn_32",
+             &out.qmm_t_strided_fp16_precast_residual);
+        want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q +
+                     "_bm_32_bn_32",
+             &out.qmm_t_strided_fp16_precast_wide_residual);
+        want(qmm, "cast_qmm_input_strided_bfloat16_to_float16",
+             &out.qmm_t_strided_cast);
+        want(qmm, "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",
+             &out.qmv_wide_strided);
+    }
     for (const MbSpec& s : specs) {
         if (!s.required && !with_d512) continue;
         want(s.file, s.fn, s.dst);

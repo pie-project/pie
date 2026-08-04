@@ -1,6 +1,6 @@
 # oracle dump: pie_cuda_driver::pipeline::generated::validate_generated_region
 # source of truth: compiler/codegen/src/cuda/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 20
+# emitter_version: 21
 # @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
 # cases: 320
 === beam_epilogue#0 singleton#0

@@ -840,9 +840,23 @@ void check_the_tiled_attention_is_told_its_row_count() {
     using pie::metal::sdpa_should_tile;
     using pie::metal::llama::launch_shape;
 
-    expect(!sdpa_should_tile(1), "a decode does not tile: one row cannot fill one");
-    expect(!sdpa_should_tile(kSdpaQueryTile - 1), "nor does a fire one row short of a tile");
-    expect(sdpa_should_tile(kSdpaQueryTile), "a fire that fills a tile does");
+    expect(!sdpa_should_tile(1, 1), "a decode does not tile: one row cannot fill one");
+    expect(!sdpa_should_tile(kSdpaQueryTile - 1, 1), "nor does a fire one row short of a tile");
+    expect(sdpa_should_tile(kSdpaQueryTile, 1), "a fire that fills a tile does");
+
+    // The row count alone cannot decide this. A fleet of members decoding one
+    // token each has the SAME rows as a prefill of the same width, and wants
+    // the opposite kernel: the tiled one walks runs of equal request, so with
+    // one row per request it stages the tile once per row and leaves all but
+    // one simdgroup idle. Measured on llama-1B that is 370 tok/s against 728.
+    expect(!sdpa_should_tile(kSdpaQueryTile, kSdpaQueryTile),
+           "a fleet of one-row members does not tile, however many members");
+    expect(!sdpa_should_tile(8 * kSdpaQueryTile, 8 * kSdpaQueryTile),
+           "nor does a bigger fleet of them");
+    expect(!sdpa_should_tile(4 * kSdpaQueryTile, kSdpaQueryTile),
+           "nor four rows each, which still leaves a run far short of a tile");
+    expect(sdpa_should_tile(2 * kSdpaQueryTile, 2),
+           "two members prefilling a tile each still tiles");
 
     LlamaGeometry g = base();
     g.paged_kv_enabled = true;

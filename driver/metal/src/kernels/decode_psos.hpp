@@ -65,13 +65,17 @@ struct MultiBatchPsos {
     Pso kv_append_paged{}; // kv_append_paged_bfloat16                  (page-table scatter write)
     // affine_qmm_t: MLX's steel quantized GEMM, for the batched decode. [0] is
     // BN=32, [1] is BN=64. Selected only above `kQmmMinBatch`.
-    // [bm_wide][bn]: 16/32 rows per block x 16/32/64 columns.
-    Pso qmm_t[2][3]{};
-    Pso qmm_t_residual[2][3]{};
+    // [bm][bn]: `kQmmBMs` rows per block x 16/32/64 columns.
+    Pso qmm_t[3][3]{};
+    // Same storage ABI, but casts each tile to FP16 before the simdgroup MMA.
+    // Instantiated only for g64/b4; dense llama uses it on M1 where FP16 is
+    // native and BF16 MMA is markedly slower.
+    Pso qmm_t_fp16_precast[3][3]{};
+    Pso qmm_t_residual[3][3]{};
     /// The same GEMM with a Linear's additive bias broadcast down the tile.
     /// gpt-oss biases every projection, so without it the batched path is a
     /// GEMM plus a dispatch that rewrites the whole output to add one vector.
-    Pso qmm_t_bias[2][3]{};
+    Pso qmm_t_bias[3][3]{};
     // affine_qmm_t_strided: the same GEMM with an explicit row pitch, for the
     // prefill, whose scratch rows are laid at a uniform `scratch_widest_elems`
     // rather than packed at `K`.
@@ -83,13 +87,26 @@ struct MultiBatchPsos {
     /// that spanned two experts would read one expert's weights for the
     /// other's rows. Three column tiles, as elsewhere.
     Pso qmm_routed[3]{};
-    Pso qmm_t_splitk[2]{};
+    Pso qmm_t_splitk[3]{};
+    Pso qmm_t_splitk_f32[3]{};
+    // FP16-compute counterparts, with bf16 or float partials respectively.
+    Pso qmm_t_splitk_fp16_precast[3]{};
+    Pso qmm_t_splitk_fp16_precast_f32[3]{};
+    Pso qmm_cast_bf16_f16{};
     Pso qmm_splitk_reduce{};
     Pso qmm_splitk_reduce_residual{};
+    Pso qmm_splitk_reduce_f32{};
+    Pso qmm_splitk_reduce_residual_f32{};
     Pso qmm_t_strided{};
     Pso qmm_t_strided_wide{};
     Pso qmm_t_strided_wide_residual{};
     Pso qmm_t_strided_residual{};
+    Pso qmm_t_strided_fp16_precast{};
+    Pso qmm_t_strided_fp16_precast_wide{};
+    Pso qmm_t_strided_fp16_precast_residual{};
+    Pso qmm_t_strided_fp16_precast_wide_residual{};
+    Pso qmm_t_strided_cast{};
+    Pso qmv_wide_strided{};
     // Row-independent prefill kernels with an explicit row pitch, so a whole
     // prompt runs as one dispatch instead of one per token.  Same arithmetic as
     // the M=1 kernels beside them -- only the row's base address is computed
@@ -120,6 +137,11 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           std::string* err = nullptr,
                           /// Compile the mixture's batched projections. Only a
                           /// checkpoint whose geometry has experts runs them.
-                          bool routed = false);
+                          bool routed = false,
+                          /// Compile dense g64/b4 BF16->FP16 staging QMMs.
+                          bool fp16_precast = false,
+                          /// Compile projection-level FP16 staging for the
+                          /// uniform-pitch Qwen prefill.
+                          bool fp16_strided = false);
 
 }  // namespace pie::metal

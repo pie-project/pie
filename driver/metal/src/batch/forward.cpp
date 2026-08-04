@@ -538,15 +538,12 @@ struct MetalExecutor::Impl {
     // The prefill's uniform scratch row pitch, in elements, for the batched
     // projection (`affine_qmm_t_strided` reads it at buffer 8).
     SlotHandle prefill_row_stride_{};
+    SlotHandle prefill_rows_{};
+    SlotHandle prefill_fp16_input_{};
     // One scan-length buffer per prompt row.  A grouped prefill carries several
     // requests, each with its own scan length, and the row's argument table is
     // what selects the segment -- so the length has to be per row too.
     std::vector<SlotHandle> prefill_scan_rows_{};
-    // Split-K partials, shared by every projection on that path: each is
-    // serialized behind its own reduce, so one buffer serves all of them.
-    SlotHandle splitk_partial_{};
-    std::vector<SlotHandle> splitk_split_{};
-    std::vector<SlotHandle> splitk_stride_{};
     // A slot whose conv history was last written by the prefill's ping-pong may
     // hold it in ConvStateOut; the paged decode writes in place and always
     // leaves it in ConvState, so only the handover needs a copy.
@@ -673,10 +670,11 @@ struct MetalExecutor::Impl {
     // command-buffer submit and completion wait per token, for a copy that is
     // ~1 us of bandwidth. Set before `run_batch_step`, consumed by its encoder.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pending_logits_stage_{};
+    /// Set when the staging copy could not be encoded into a step's own
+    /// command buffer. Recorded rather than returned because the failure is
+    /// discovered inside the encode callback, which has nowhere to fail to.
+    std::string step_stage_error_{};
     bool encode_logits_stage(StepEncoder& encoder, std::string* error);
-    bool stage_ptir_logits_rows(
-        const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rows,
-        std::string* error);
     void attach_ptir_logits_view(LogitsOut& output) const;
 
   private:
@@ -1053,7 +1051,9 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     }
     if (g_.paged_kv_enabled &&
         !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, g_.quant, /*with_d512=*/false,
-                              &load_err, g_.is_moe())) {
+                              &load_err, g_.is_moe(), /*fp16_precast=*/false,
+                              /*fp16_strided=*/!g_.is_moe() &&
+                                  g_.quant.bits == 4 && g_.quant.group == 64)) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -1066,15 +1066,22 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         ctx_->create_standalone_buffer(
             sizeof(PtirLogitsCopyParams) * kPtirLogitsCopyMaxRows);
     prefill_row_stride_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+    prefill_rows_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
     if (prefill_row_stride_.valid()) {
         *static_cast<std::int32_t*>(prefill_row_stride_.contents()) =
             static_cast<std::int32_t>(scratch_widest_elems(g_));
     }
+    if (!g_.is_moe() && g_.quant.bits == 4 && g_.quant.group == 64) {
+        prefill_fp16_input_ = ctx_->heap_alloc(
+            std::size_t(std::max(1, g_.max_tokens)) *
+            std::size_t(scratch_widest_elems(g_)) * sizeof(std::uint16_t));
+        if (!prefill_fp16_input_.valid()) {
+            if (err) *err = "allocating Qwen prefill FP16 input staging";
+            ctx_.reset();
+            return false;
+        }
+    }
     prefill_scan_rows_.clear();
-    // Widest projection row x the widest batch x the largest split.
-    splitk_partial_ = ctx_->create_standalone_buffer(
-        sizeof(std::uint16_t) * std::size_t(pie::metal::kQmmSplitMaxSplits) *
-        std::size_t(kPagedMaxForwardRequests) * std::size_t(pie::metal::kQmmSplitMaxOut));
     if (!ptir_logits_copy_pso_.valid() ||
         !ptir_logits_copy_params_.valid() ||
         !ensure_ptir_logits_rows(1, &load_err)) {
@@ -1482,25 +1489,6 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             // channels -- which saves copying every slot's whole conv slab back
             // on the host after every single token.
             alias_decode_conv_state_out(*ctx_, b_, mb_dag_);
-            // Split-K binds: the partials buffer plus this dispatch's own split
-            // count and slice stride, which depend on its shape.
-            splitk_split_.clear();
-            splitk_stride_.clear();
-            for (const Dispatch& d : mb_dag_) {
-                if (d.qmm_split <= 1 || !splitk_partial_.valid()) continue;
-                SlotHandle sp = ctx_->create_standalone_buffer(sizeof(std::int32_t));
-                SlotHandle st = ctx_->create_standalone_buffer(sizeof(std::int32_t));
-                if (!sp.valid() || !st.valid()) continue;
-                *static_cast<std::int32_t*>(sp.contents()) = d.qmm_split;
-                *static_cast<std::int32_t*>(st.contents()) =
-                    std::int32_t(qmv_out_size(d.kind, g_)) *
-                    std::int32_t(int(d.grid.y / 2u) * d.qmm_bm);
-                ctx_->arg_bind_ordinal(d.ordinal, 8, splitk_partial_);
-                ctx_->arg_bind_ordinal(d.ordinal, 9, sp);
-                ctx_->arg_bind_ordinal(d.ordinal, 10, st);
-                splitk_split_.push_back(sp);
-                splitk_stride_.push_back(st);
-            }
             prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
@@ -1527,6 +1515,10 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                 for (const Dispatch& d : prefill_dags_[0]) {
                     if (qmv_out_size(d.kind, g_) != 0) {
                         ctx_->arg_bind_ordinal(d.ordinal, 8, prefill_row_stride_);
+                        if (prefill_rows_.valid())
+                            ctx_->arg_bind_ordinal(d.ordinal, 9, prefill_rows_);
+                        if (prefill_fp16_input_.valid())
+                            ctx_->arg_bind_ordinal(d.ordinal, 12, prefill_fp16_input_);
                         continue;
                     }
                     // The row-blocked elementwise/norm kernels take the same pitch,
@@ -1861,6 +1853,12 @@ StepTiming MetalExecutor::Impl::step(
             if (ptir != nullptr && ptir->post_forward) {
                 ptir->post_forward(se);
             }
+            // The staging copy rides this buffer too, for the same reason it
+            // rides the batch paths': a second submission and a second fence
+            // per token is most of a decode's host cost, and the destination
+            // row is a bump allocation the caller made before the fire.
+            std::string stage_err;
+            if (!encode_logits_stage(se, &stage_err)) step_stage_error_ = stage_err;
         },
         sc & 1);
     ++sc;
@@ -2221,6 +2219,8 @@ bool MetalExecutor::Impl::run_prefill_step(
     // Alternate the arms fire by fire so both see the same machine, exactly as
     // the decode step does -- prefill fires are few, so without interleaving a
     // single contended window decides the answer.
+    if (prefill_rows_.valid())
+        *static_cast<std::int32_t*>(prefill_rows_.contents()) = schedule.N;
     static bool prefill_ab_flip = false;
     if (ab_enabled()) ab_set_arm(prefill_ab_flip = !prefill_ab_flip);
     // The staging copy rides this command buffer, exactly as it rides the
@@ -2257,7 +2257,7 @@ bool MetalExecutor::Impl::run_prefill_step(
         static double enc[2] = {};
         static int n[2] = {};
         const int arm = ab_enabled() && ab_arm() ? 1 : 0;
-        ms[arm] += timing.gpu_exec_ms;
+        ms[arm] += timing.gpu_ms > 0.0 ? timing.gpu_ms : timing.gpu_exec_ms;
         enc[arm] += timing.encode_ms;
         rows[arm] += double(schedule.N);
         ++n[arm];
@@ -2359,47 +2359,6 @@ bool MetalExecutor::Impl::encode_logits_stage(StepEncoder& encoder, std::string*
         Grid{static_cast<std::uint32_t>(g_.vocab),
              static_cast<std::uint32_t>(rows.size()), 1},
         Threadgroup{256, 1, 1});
-    return true;
-}
-
-bool MetalExecutor::Impl::stage_ptir_logits_rows(
-    const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rows,
-    std::string* error) {
-    if (rows.empty()) return true;
-    if (!ptir_logits_copy_pso_.valid() ||
-        rows.size() > kPtirLogitsCopyMaxRows) {
-        if (error != nullptr) *error = "PTIR logits staging is not ready";
-        return false;
-    }
-    auto* params =
-        static_cast<PtirLogitsCopyParams*>(ptir_logits_copy_params_.contents());
-    for (std::size_t i = 0; i < rows.size(); ++i) {
-        if (rows[i].second >= ptir_logits_capacity_rows_) {
-            if (error != nullptr) *error = "PTIR logits staging is not ready";
-            return false;
-        }
-        params[i] = {
-            .source_row = rows[i].first,
-            .destination_row = rows[i].second,
-            .vocab = static_cast<std::uint32_t>(g_.vocab),
-            .reserved = 0,
-        };
-    }
-    const StepTiming timing = ctx_->run_step([&](StepEncoder& encoder) {
-        encoder.set_pso(ptir_logits_copy_pso_);
-        encoder.set_argtable_ordinal(kPtirLogitsCopyOrdinal);
-        encoder.dispatch(
-            Grid{static_cast<std::uint32_t>(g_.vocab),
-                 static_cast<std::uint32_t>(rows.size()), 1},
-            Threadgroup{256, 1, 1});
-    });
-    if (!timing.succeeded()) {
-        if (error != nullptr) {
-            *error =
-                "PTIR logits copy timed out before its completion fence";
-        }
-        return false;
-    }
     return true;
 }
 
@@ -2813,10 +2772,12 @@ bool MetalExecutor::forward(const MemberForwardDesc& desc, LogitsOut& out, std::
         return false;
     }
     impl_->ptir_logits_next_row_ = 0;
-    if (!impl_->ensure_ptir_logits_rows(
-            static_cast<std::uint32_t>(
-                desc.readout_local_indices.size()),
-            err)) {
+    const SimpleFamilyEngine* simple = impl_->is_simple() ? impl_->simple_engine() : nullptr;
+    const bool device_greedy =
+        simple != nullptr && simple->paged() && simple->greedy_tokens_slot().valid();
+    if (!(desc.greedy_token_only && device_greedy) &&
+        !impl_->ensure_ptir_logits_rows(
+            static_cast<std::uint32_t>(desc.readout_local_indices.size()), err)) {
         return false;
     }
     const std::uint32_t slot = desc.has_rs_slot ? desc.rs_slot_id : 0u;
@@ -2897,10 +2858,15 @@ void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
         for (auto& e : errors) e = "PTIR callback/member count mismatch";
         return;
     }
+    const SimpleFamilyEngine* simple = impl_->is_simple() ? impl_->simple_engine() : nullptr;
+    const bool device_greedy =
+        simple != nullptr && simple->paged() && simple->greedy_tokens_slot().valid();
     std::uint32_t total_readout_rows = 0;
     for (const auto& desc : descs) {
-        total_readout_rows +=
-            static_cast<std::uint32_t>(desc.readout_local_indices.size());
+        if (!(desc.greedy_token_only && device_greedy && ptir == nullptr)) {
+            total_readout_rows +=
+                static_cast<std::uint32_t>(desc.readout_local_indices.size());
+        }
     }
     std::string staging_error;
     if (!impl_->ensure_ptir_logits_rows(total_readout_rows, &staging_error)) {
@@ -3392,6 +3358,7 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         for (auto& e : errors) e = "this family has no paged batch path";
         return false;
     }
+    const SlotHandle greedy_slot = eng->greedy_tokens_slot();
     const int page_size = eng->page_size();
     const std::uint32_t total_pages = std::uint32_t(eng->total_pages());
 
@@ -3495,10 +3462,15 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         }
         // The tail is allocated per SAMPLED row, not per token, so it has a
         // bound of its own.
-        if (csr.sample_rows.size() + d.readout_local_indices.size() >
-            std::size_t(eng->max_sampled_rows())) {
+        // The staging copy rides the forward's own command buffer and is ONE
+        // dispatch, so the sampled rows also have to fit the copy's parameter
+        // buffer. Bounding acceptance here keeps that a rejection with a number
+        // in it rather than a failure discovered mid-encode.
+        const std::size_t sampled_cap =
+            std::min<std::size_t>(std::size_t(eng->max_sampled_rows()), kPtirLogitsCopyMaxRows);
+        if (csr.sample_rows.size() + d.readout_local_indices.size() > sampled_cap) {
             reject(i, "this fire would read more than the driver's " +
-                          std::to_string(eng->max_sampled_rows()) + " logits rows");
+                          std::to_string(sampled_cap) + " logits rows");
             continue;
         }
         // `add`'s indptrs are this member's own cumulative counts, one entry
@@ -3525,6 +3497,7 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         for (const std::uint32_t local : d.readout_local_indices) {
             csr.sample_rows.push_back(row0 + local);
         }
+        if (d.greedy_token_only && greedy_slot.valid()) csr.run_argmax = true;
         accepted.push_back({i, row0});
     }
     if (accepted.empty()) return !any_rejected;
@@ -3536,8 +3509,10 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         LogitsOut& out = outs[a.member];
         out.vocab = vocab_;
         out.rows = std::uint32_t(descs[a.member].readout_local_indices.size());
-        out.device_row_offset = impl_->reserve_ptir_logits_rows(out.rows);
-        impl_->attach_ptir_logits_view(out);
+        if (!(descs[a.member].greedy_token_only && greedy_slot.valid() && ptir == nullptr)) {
+            out.device_row_offset = impl_->reserve_ptir_logits_rows(out.rows);
+            impl_->attach_ptir_logits_view(out);
+        }
     }
 
     // PTIR is told which rows are whose, and its group is finalized, BEFORE the
@@ -3565,23 +3540,50 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         }
     }
 
+    // The staging copy rides the forward's OWN command buffer, the way the
+    // paged path already does it. It used to be a second `run_step` per fire:
+    // another submit and another completion fence, at batch one once per token,
+    // for a copy worth a microsecond of bandwidth. Nothing about it depends on
+    // the forward's result -- the destination rows are a bump allocation made
+    // above -- so it is all decided here and encoded at the tail of the buffer.
+    impl_->pending_logits_stage_.clear();
+    {
+        std::uint32_t sample = 0;
+        for (const Accepted& a : accepted) {
+            const MemberForwardDesc& d = descs[a.member];
+            const bool direct =
+                (d.greedy_token_only && greedy_slot.valid() && ptir == nullptr) ||
+                                (ptir != nullptr && (*ptir)[a.member].consumes_logits_directly);
+            for (std::uint32_t r = 0; r < d.readout_local_indices.size(); ++r, ++sample) {
+                if (direct) continue;
+                impl_->pending_logits_stage_.push_back(
+                    {sample, outs[a.member].device_row_offset + r});
+            }
+        }
+    }
+
     // PTIR's device program is encoded into the SAME command buffer, before and
     // after the model, which is what makes a sampled token available without a
     // second submission.
     SimpleFamilyEngine::EncodeHook pre, post;
     const auto fire_t0 = std::chrono::steady_clock::now();
+    std::string stage_err;
     if (!hooks.empty()) {
         pre = [&](StepEncoder& se) {
             for (const PtirCommandCallbacks& cb : hooks) {
                 if (cb.pre_forward) cb.pre_forward(se);
             }
         };
-        post = [&](StepEncoder& se) {
-            for (const PtirCommandCallbacks& cb : hooks) {
-                if (cb.post_forward) cb.post_forward(se);
-            }
-        };
     }
+    post = [&](StepEncoder& se) {
+        for (const PtirCommandCallbacks& cb : hooks) {
+            if (cb.post_forward) cb.post_forward(se);
+        }
+        // A failure here leaves the buffer without the copy rather than
+        // aborting the encode: the fire is already being built, and the
+        // recorded error is what the members are failed with below.
+        (void)impl_->encode_logits_stage(se, &stage_err);
+    };
     const StepTiming timing = impl_->fire_simple(csr, pre, post);
     // Same meter as `run_batch_step`'s, on the path the simple families take.
     // Without it a question like "what bounds gpt-oss in a batch" can only be
@@ -3589,22 +3591,31 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
     // added together.
     if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
         static double gpu[33] = {};
+        static double rep[33] = {};
         static double enc[33] = {};
         static double wall[33] = {};
         static int n[33] = {};
         const int rows = int(csr.token_ids.size());
         const int lanes = rows < 33 ? rows : 32;
         gpu[lanes] += timing.gpu_exec_ms;
+        // What the GPU says it spent, as against `gpu_exec_ms`, which is
+        // commit-to-fence measured by the host and so carries the wake-up. The
+        // difference between the two is the only way to tell a slow kernel from
+        // a slow round trip, and at batch one -- where a decode is a 3 ms fire
+        // behind a fence the host has to be woken from -- that is most of the
+        // question this meter exists to answer.
+        rep[lanes] += timing.gpu_ms;
         enc[lanes] += timing.encode_ms;
         wall[lanes] +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fire_t0)
                 .count();
         if (++n[lanes] % 128 == 0) {
             std::fprintf(stderr,
-                         "[gpu] lanes=%d n=%d gpu %.4f enc %.4f wall %.4f ms"
+                         "[gpu] lanes=%d n=%d gpu %.4f (reported %.4f) enc %.4f wall %.4f ms"
                          " | gpu/row %.4f ms\n",
-                         lanes, n[lanes], gpu[lanes] / n[lanes], enc[lanes] / n[lanes],
-                         wall[lanes] / n[lanes], gpu[lanes] / n[lanes] / (rows > 0 ? rows : 1));
+                         lanes, n[lanes], gpu[lanes] / n[lanes], rep[lanes] / n[lanes],
+                         enc[lanes] / n[lanes], wall[lanes] / n[lanes],
+                         gpu[lanes] / n[lanes] / (rows > 0 ? rows : 1));
         }
     }
     if (!timing.succeeded()) {
@@ -3614,29 +3625,23 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         return false;
     }
 
-    // The logits buffer holds one row per SAMPLED row, in `csr.sample_rows`
-    // order -- not one per token. So the copy's source is the sample's index,
-    // which is the order the members were accepted in.
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> copies;
-    std::uint32_t sample = 0;
-    for (const Accepted& a : accepted) {
-        const MemberForwardDesc& d = descs[a.member];
-        const bool direct = ptir != nullptr && (*ptir)[a.member].consumes_logits_directly;
-        for (std::uint32_t r = 0; r < d.readout_local_indices.size(); ++r, ++sample) {
-            if (direct) continue;
-            copies.push_back({sample, outs[a.member].device_row_offset + r});
-        }
+    // The logits landed in the staging buffer inside the fire above.
+    impl_->pending_logits_stage_.clear();
+    if (!stage_err.empty()) {
+        for (const Accepted& a : accepted) errors[a.member] = stage_err;
+        return false;
     }
-    // `stage_ptir_logits_rows` fires one copy dispatch per call, bounded by
-    // `kPtirLogitsCopyMaxRows`; a large batch needs several.
-    for (std::size_t off = 0; off < copies.size(); off += kPtirLogitsCopyMaxRows) {
-        const std::size_t n = std::min<std::size_t>(kPtirLogitsCopyMaxRows, copies.size() - off);
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> chunk(copies.begin() + off,
-                                                                  copies.begin() + off + n);
-        std::string stage_err;
-        if (!impl_->stage_ptir_logits_rows(chunk, &stage_err)) {
-            for (const Accepted& a : accepted) errors[a.member] = stage_err;
-            return false;
+
+    if (greedy_slot.valid() && greedy_slot.contents() != nullptr) {
+        const auto* tokens = static_cast<const std::uint32_t*>(greedy_slot.contents());
+        std::uint32_t sample = 0;
+        for (const Accepted& a : accepted) {
+            LogitsOut& out = outs[a.member];
+            if (descs[a.member].greedy_token_only) {
+                out.greedy_contents = tokens;
+                out.greedy_row_offset = sample;
+            }
+            sample += out.rows;
         }
     }
 
@@ -3724,11 +3729,24 @@ bool MetalExecutor::run_member_forward(const MemberForwardDesc& desc, LogitsOut&
                 ptir->consumes_logits_directly;
             token_ptir = &token_callbacks;
         }
+        // Which of this token's rows -- at most one, since a step is one row
+        // -- is read out, decided BEFORE the step so the copy can ride its
+        // command buffer instead of costing a second submission and a second
+        // fence. The step's row is always 0; only the destination varies.
+        impl_->pending_logits_stage_.clear();
+        if (ptir == nullptr || !ptir->consumes_logits_directly) {
+            for (std::uint32_t r = 0; r < desc.readout_local_indices.size(); ++r) {
+                if (desc.readout_local_indices[r] != static_cast<std::uint32_t>(i)) continue;
+                impl_->pending_logits_stage_.push_back({0u, out.device_row_offset + r});
+            }
+        }
+        impl_->step_stage_error_.clear();
         const StepTiming timing = impl_->step(
             desc.token_ids[i],
             desc.position_ids[i],
             slot,
             token_ptir);
+        impl_->pending_logits_stage_.clear();
         if (!timing.succeeded()) {
             if (err != nullptr) {
                 *err =
@@ -3736,13 +3754,9 @@ bool MetalExecutor::run_member_forward(const MemberForwardDesc& desc, LogitsOut&
             }
             return false;
         }
-        for (std::uint32_t r = 0; r < desc.readout_local_indices.size(); ++r) {
-            if (desc.readout_local_indices[r] != static_cast<std::uint32_t>(i)) continue;
-            if (ptir != nullptr && ptir->consumes_logits_directly) continue;
-            if (!impl_->stage_ptir_logits_rows(
-                    {{0u, out.device_row_offset + r}}, err)) {
-                return false;
-            }
+        if (!impl_->step_stage_error_.empty()) {
+            if (err != nullptr) *err = impl_->step_stage_error_;
+            return false;
         }
     }
 

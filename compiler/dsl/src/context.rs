@@ -344,18 +344,40 @@ pub(crate) fn record_channel_read(ch: &ChannelRef, consume: bool, span: Span) ->
 }
 
 /// Record a channel `put` inside a stage (the value id must already match the
-/// channel's shape+dtype — the caller reshapes as needed). No auto-drain:
-/// producer programs are context-free — an unconsumed put sits in the ring
-/// (dropped at instance teardown) or back-pressures honestly at ring-full;
-/// loop-carried descriptor updates drain EXPLICITLY (`ch.take();` before the
-/// re-put). After `pipeline.close`, an already-submitted put still blocked with
-/// no attached consumer and no host role is a definite deadlock, surfaced by
-/// the fire's retry classifier.
+/// channel's shape+dtype — the caller reshapes as needed).
+///
+/// A put is a *producer* op and stays context-free for ordinary channels: an
+/// unconsumed put sits in the ring (dropped at instance teardown) or
+/// back-pressures honestly at ring-full. After `pipeline.close`, an
+/// already-submitted put still blocked with no attached consumer and no host
+/// role is a definite deadlock, surfaced by the fire's retry classifier.
+///
+/// The one exception is a channel bound to a **peeked** descriptor port
+/// ([`pie_ir::registry::Port::consumes`] false — geometry and masks). The
+/// descriptor phase reads its front without draining, so a bare re-put would
+/// grow the ring by one every fire until the port is reading a stale head
+/// behind a wall of queued updates. Such a put therefore drains first, and the
+/// author never has to know which side of `consumes()` a port falls on.
+///
+/// This is safe in every combination because take is a per-pass *flag*, not a
+/// counter (`Overlay::taken` is a `Vec<bool>`; the ring index bumps at most
+/// once per fire): a channel the guest already took explicitly is skipped
+/// here, and even a redundant take could not over-consume.
 pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
     SESSION.with_borrow_mut(|s| {
         let sess = s.as_mut().expect("session active");
         let dense = sess.intern(ch);
         let stage = sess.current.as_ref().expect("stage active").stage;
+        let (drain, elem) = {
+            let st = ch.borrow();
+            let peeked_port = !st.desc_reads.is_empty() && st.desc_takes.is_empty();
+            (peeked_port && st.prog_takes.is_empty(), st.elem_ty())
+        };
+        if drain {
+            ch.borrow_mut().prog_takes.push((stage, span));
+            let rec = sess.current.as_mut().expect("stage active");
+            rec.push(Op::ChanTake(dense), &[elem]);
+        }
         {
             ch.borrow_mut().prog_puts.push((stage, span));
         }

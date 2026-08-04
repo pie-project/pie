@@ -141,25 +141,32 @@ declare_intrinsics! {
 
 /// A PTIR stage-body op. See the module docs for the SSA model and the
 /// PSIR-v4 tag-sharing rule.
+///
+/// These docs give each op's *meaning* and deliberately never its wire tag:
+/// the tag lives on the op's [`declare_ops!`] row and nowhere else, and
+/// [`tags`] is how you read it. The variants below used to restate it, and
+/// twenty-six of the fifty-four had drifted — a second copy of a number whose
+/// whole purpose is to have one copy. `op_docs_do_not_respell_wire_tags`
+/// keeps them from growing back.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
-    /// Trace-known constant scalar (`0x81`).
+    /// Trace-known constant scalar.
     Const(Literal),
 
     // ── map (unary) ──────────────────────────────────────────────────────
-    /// Element-wise `e^x` (`0x10`), F32 only.
+    /// Element-wise `e^x`, F32 only.
     Exp(ValueId),
-    /// Element-wise natural log (`0x11`), F32 only.
+    /// Element-wise natural log, F32 only.
     Log(ValueId),
-    /// Element-wise negation (`0x12`).
+    /// Element-wise negation.
     Neg(ValueId),
-    /// Element-wise `1/x` (`0x13`), F32 only.
+    /// Element-wise `1/x`, F32 only.
     Recip(ValueId),
-    /// Element-wise absolute value (`0x14`).
+    /// Element-wise absolute value.
     Abs(ValueId),
-    /// Element-wise sign as `-1` / `0` / `+1` in the input dtype (`0x15`).
+    /// Element-wise sign as `-1` / `0` / `+1` in the input dtype.
     Sign(ValueId),
-    /// Element-wise dtype cast (`0x07`). numeric↔numeric; bool→numeric is
+    /// Element-wise dtype cast. numeric↔numeric; bool→numeric is
     /// `{0,1}`; numeric→bool is `x != 0`.
     Cast {
         /// The tensor to reinterpret.
@@ -169,43 +176,43 @@ pub enum Op {
     },
 
     // ── map (binary; scalar operand broadcasts) ─────────────────────────
-    /// Element-wise sum (`0x18`).
+    /// Element-wise sum.
     Add(ValueId, ValueId),
-    /// Element-wise difference (`0x19`).
+    /// Element-wise difference.
     Sub(ValueId, ValueId),
-    /// Element-wise product (`0x1A`).
+    /// Element-wise product.
     Mul(ValueId, ValueId),
-    /// Element-wise quotient (`0x1B`); integer division truncates.
+    /// Element-wise quotient; integer division truncates.
     Div(ValueId, ValueId),
-    /// Element-wise maximum (`0x1C`).
+    /// Element-wise maximum.
     MaxElem(ValueId, ValueId),
-    /// Element-wise minimum (`0x1D`).
+    /// Element-wise minimum.
     MinElem(ValueId, ValueId),
-    /// Remainder (`0x1F`): integer `%` for I32/U32, `fmod` for F32.
+    /// Remainder: integer `%` for I32/U32, `fmod` for F32.
     Rem(ValueId, ValueId),
 
     // ── compare / logic → Bool ───────────────────────────────────────────
-    /// Element-wise `a > b` (`0x20`).
+    /// Element-wise `a > b`.
     Gt(ValueId, ValueId),
-    /// Element-wise `a >= b` (`0x21`).
+    /// Element-wise `a >= b`.
     Ge(ValueId, ValueId),
-    /// Element-wise `a == b` (`0x22`).
+    /// Element-wise `a == b`.
     Eq(ValueId, ValueId),
-    /// Element-wise `a != b` (`0x23`).
+    /// Element-wise `a != b`.
     Ne(ValueId, ValueId),
-    /// Element-wise `a < b` (`0x24`).
+    /// Element-wise `a < b`.
     Lt(ValueId, ValueId),
-    /// Element-wise `a <= b` (`0x25`).
+    /// Element-wise `a <= b`.
     Le(ValueId, ValueId),
-    /// Element-wise conjunction (`0x28`), Bool operands.
+    /// Element-wise conjunction, Bool operands.
     And(ValueId, ValueId),
-    /// Element-wise disjunction (`0x29`), Bool operands.
+    /// Element-wise disjunction, Bool operands.
     Or(ValueId, ValueId),
-    /// Element-wise negation (`0x2A`), Bool operand.
+    /// Element-wise negation, Bool operand.
     Not(ValueId),
 
     // ── choice ───────────────────────────────────────────────────────────
-    /// Element-wise `cond ? a : b` (`0x30`).
+    /// Element-wise `cond ? a : b`.
     Select {
         /// Bool selector.
         cond: ValueId,
@@ -216,18 +223,26 @@ pub enum Op {
     },
 
     // ── reduce (last axis; per-row for rank ≥ 2) ─────────────────────────
-    /// Sum over the last axis (`0x31`), dropping it.
+    /// Sum over the last axis, dropping it.
     ReduceSum(ValueId),
-    /// Maximum over the last axis (`0x32`), dropping it.
+    /// Maximum over the last axis, dropping it.
     ReduceMax(ValueId),
-    /// Minimum over the last axis (`0x33`), dropping it.
+    /// Minimum over the last axis, dropping it.
     ReduceMin(ValueId),
-    /// Index of the maximum along the last axis (`0x34`) as U32, dropping
-    /// that axis. Ties resolve to the lower index.
+    /// Index of the maximum along the last axis as **I32**, dropping that
+    /// axis. Ties resolve to the lower index.
+    ///
+    /// I32 rather than the U32 that [`Op::TopK`] and [`Op::SortDesc`] return,
+    /// and that is a deliberate split rather than an oversight: an argmax over
+    /// logits *is* a token id, token channels are I32 end to end, and an
+    /// argmax that answered U32 would put a cast on the way out of every
+    /// sampler in the tree. The two order ops rank a row and their indices
+    /// stay positions, so they stay U32. `gather` accepts either, which is
+    /// what lets both feed it unchanged.
     ReduceArgmax(ValueId),
 
     // ── shape (metadata only) ────────────────────────────────────────────
-    /// Stretch to a larger shape (`0x38`) without moving data. Dtype
+    /// Stretch to a larger shape without moving data. Dtype
     /// preserved.
     Broadcast {
         /// The tensor to stretch.
@@ -236,27 +251,32 @@ pub enum Op {
         /// equal to the corresponding result dim.
         shape: Shape,
     },
-    /// Same numel, new dims (`0x39`). Dtype preserved.
+    /// Same numel, new dims. Dtype preserved.
     Reshape {
         /// The tensor to reinterpret.
         value: ValueId,
         /// The result shape; its `numel` must equal `value`'s.
         shape: Shape,
     },
-    /// Rank-2 transpose `[m, n] → [n, m]` (`0x3A`).
+    /// Rank-2 transpose `[m, n] → [n, m]`.
     Transpose(ValueId),
 
     // ── scan (last axis; per-row for rank ≥ 2) ───────────────────────────
-    /// Inclusive prefix sum along the last axis (`0x40`); shape preserved.
+    /// Inclusive prefix sum along the last axis; shape and dtype preserved.
+    ///
+    /// Numeric, not F32-only, and that matters: a prefix sum over lengths is
+    /// how a ragged tensor's row offsets are built, and offsets are U32. An
+    /// F32-only scan makes an author round-trip `u32 → f32 → u32`, which is
+    /// exact only below 2^24 and silently is not above it.
     CumSum(ValueId),
-    /// Inclusive prefix product along the last axis (`0x41`); shape
-    /// preserved.
+    /// Inclusive prefix product along the last axis; shape and dtype
+    /// preserved. Numeric, like [`Op::CumSum`]; integer overflow wraps.
     CumProd(ValueId),
 
     // ── order ────────────────────────────────────────────────────────────
-    /// Descending sort over `[n]` F32 → 2 results value-first (`0x50`).
+    /// Descending sort over `[n]` F32 → 2 results value-first.
     SortDesc(ValueId),
-    /// Top-k over the last axis (`0x51`): `k` is a trace-known immediate
+    /// Top-k over the last axis: `k` is a trace-known immediate
     /// (result shapes are trace-known). 2 results value-first:
     /// values F32 `[.., k]`, indices U32 `[.., k]`. Ties → lower index.
     TopK {
@@ -265,7 +285,7 @@ pub enum Op {
         /// How many entries to keep; must not exceed the last axis.
         k: u32,
     },
-    /// Sort-free top-k/top-p/min-p mask (`0x58`), per-row for rank 2.
+    /// Sort-free top-k/top-p/min-p mask, per-row for rank 2.
     PivotThreshold {
         /// F32 scores to threshold, per row for rank 2.
         input: ValueId,
@@ -274,11 +294,11 @@ pub enum Op {
     },
 
     // ── linear ───────────────────────────────────────────────────────────
-    /// `[m, k] × [k, n] → [m, n]`, F32 (`0x55`). A library kernel.
+    /// `[m, k] × [k, n] → [m, n]`, F32. A library kernel.
     MatMul(ValueId, ValueId),
 
     // ── index (axis-0 generalized; see module docs) ──────────────────────
-    /// Axis-0 gather `src[n, rest..]` by `idx S` → `[S.., rest..]` (`0x60`).
+    /// Axis-0 gather `src[n, rest..]` by `idx S` → `[S.., rest..]`.
     /// An out-of-range index yields zero.
     Gather {
         /// The tensor to read rows from.
@@ -286,14 +306,14 @@ pub enum Op {
         /// U32 axis-0 indices.
         idx: ValueId,
     },
-    /// Per-row column pick `out[i] = src[i, idx[i]]` (`0x61`, v4-exact).
+    /// Per-row column pick `out[i] = src[i, idx[i]]` (v4-exact).
     GatherRow {
         /// Rank-2 source.
         src: ValueId,
         /// One U32 column index per row of `src`.
         idx: ValueId,
     },
-    /// Axis-0 scatter that accumulates into `base` (`0x62`), result shaped
+    /// Axis-0 scatter that accumulates into `base`, result shaped
     /// like `base`. Duplicate indices all contribute; an out-of-range index
     /// is skipped.
     ScatterAdd {
@@ -304,7 +324,7 @@ pub enum Op {
         /// Values to accumulate, shaped `idx.shape ++ base.shape[1..]`.
         vals: ValueId,
     },
-    /// Axis-0 scatter that overwrites into `base` (`0x63`), result shaped
+    /// Axis-0 scatter that overwrites into `base`, result shaped
     /// like `base`. Duplicate indices resolve in index order, last wins; an
     /// out-of-range index is skipped.
     ScatterSet {
@@ -315,12 +335,12 @@ pub enum Op {
         /// Values to write, shaped `idx.shape ++ base.shape[1..]`.
         vals: ValueId,
     },
-    /// `iota(len)` → U32 `[len]` = `0..len` (`0x64`).
+    /// `iota(len)` → U32 `[len]` = `0..len`.
     Iota {
         /// Number of elements produced.
         len: u32,
     },
-    /// Packed-bitmask apply (`0x65`, v4-exact): `out[j] = bit_j(mask) ?
+    /// Packed-bitmask apply (v4-exact): `out[j] = bit_j(mask) ?
     /// logits[j] : -inf`; `mask` `[ceil(n/32)]` U32. (The PTIR-level
     /// `mask_apply(logits, bool-mask)` composed op expands to `Select`;
     /// this packed form is the wire-efficient special case, kept core.)
@@ -358,7 +378,7 @@ pub enum Op {
         window: u32,
     },
     // ── sampling ─────────────────────────────────────────────────────────
-    /// Ambient-seed noise (`0x70`, v4-exact; per-fire seed folded by the
+    /// Ambient-seed noise (v4-exact; per-fire seed folded by the
     /// runtime). Kept for epilogue-parity with shipped samplers.
     Rng {
         /// Decorrelates draws that share a fire; two ops with the same
@@ -369,7 +389,7 @@ pub enum Op {
         /// Which distribution to draw from.
         kind: RngKind,
     },
-    /// State-keyed noise (`0x71`): noise is a **pure function of the `[2]`
+    /// State-keyed noise: noise is a **pure function of the `[2]`
     /// U32 `state = [key, ctr]` tensor and the element index** — the `rng`
     /// channel discipline, which is what makes a replay bit-identical. The
     /// exact function is fixed by [`crate::rng`] and reproduced by every
@@ -384,12 +404,12 @@ pub enum Op {
     },
 
     // ── channels (the only effects) ──────────────────────────────────────
-    /// Consume: full → value, set empty (`0x90`). In-pass register rule:
+    /// Consume: full → value, set empty. In-pass register rule:
     /// a take after an in-pass put reads the pending value.
     ChanTake(ChannelIndex),
-    /// Peek: full → copy, stays full (`0x91`).
+    /// Peek: full → copy, stays full.
     ChanRead(ChannelIndex),
-    /// Fill the pending cell (`0x92`); double-put = last wins.
+    /// Fill the pending cell; double-put = last wins.
     /// Defines **0** result ids.
     ChanPut {
         /// The channel written.
@@ -399,7 +419,7 @@ pub enum Op {
     },
 
     // ── intrinsics / second-party ────────────────────────────────────────
-    /// Materialize a first-party stage-scoped value (`0xA0`). The shape and
+    /// Materialize a first-party stage-scoped value. The shape and
     /// dtype are trace-known and declared inline; the validator cross-checks
     /// them against the registry rule and the stage scope.
     IntrinsicVal {
@@ -410,7 +430,7 @@ pub enum Op {
         /// The dtype the trace expects; cross-checked at bind.
         dtype: DType,
     },
-    /// Named second-party kernel call (`0xA1`): `intrinsics::kernel::*`.
+    /// Named second-party kernel call: `intrinsics::kernel::*`.
     /// Name from the container's name table; availability + replayability
     /// checked at bind against the [`ModelProfile`](crate::registry::ModelProfile). Declares
     /// its result type; no effects beyond it.
@@ -425,7 +445,7 @@ pub enum Op {
         /// The declared result dtype.
         dtype: DType,
     },
-    /// Named configuration sink (`0xA2`): takes tensors, returns nothing,
+    /// Named configuration sink: takes tensors, returns nothing,
     /// configures THIS pass's forward. Stage-precedence checked at bind.
     /// Defines **0** result ids.
     SinkCall {
@@ -821,19 +841,36 @@ pub enum ValueSource {
 }
 
 /// Op family — the row grouping of the op table above.
+///
+/// A family is what an op *is*, not how a backend runs it: the CUDA emitter's
+/// `parallel_elementwise` set, for instance, spans `Map`, `CompareLogic`,
+/// `Choice`, `Leaf` and `Sampling`, and that is fine — a lowering grouping is
+/// the emitter's business and lives there.
+///
+/// One member is load-bearing: [`Family::Channel`] is how a pass asks "does
+/// this op have effects" without restating the three variant names, and
+/// `table_matches_op_metadata` pins it to [`Op::channel_use`]. The rest are
+/// documentation, which is exactly why they had drifted — `iota` was filed
+/// under `Index` while `Leaf`'s own doc named it, and `mask_apply_packed` was
+/// filed under `Sampling`, which draws noise, while doing a select. Both now
+/// sit where their doc says. `every_family_has_a_member` stops a family from
+/// outliving its last op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Family {
-    /// Takes no tensor operand: constants and [`Op::Iota`].
+    /// Takes no tensor operand: a trace-known constant, or the index ramp
+    /// [`Op::Iota`] that stands in for one.
     Leaf,
     /// Element-wise arithmetic over matching shapes.
     Map,
     /// Element-wise comparison and boolean logic; always yields Bool.
     CompareLogic,
-    /// Element-wise selection between two tensors.
+    /// Element-wise selection between two alternatives — [`Op::Select`]
+    /// between two tensors, [`Op::MaskApply`] between a tensor and `-inf`.
     Choice,
     /// Rearranges metadata only, never element values.
     Shape,
-    /// Reads or writes elements at computed positions.
+    /// Reads or writes elements at computed positions, or derives the
+    /// positions and position masks that address them.
     Index,
     /// Folds or scans along the last axis.
     ReduceScan,
@@ -1052,8 +1089,8 @@ declare_ops! {
     SCATTER_SET = 0x63, "scatter_set", Index, 3, 1,
         Op::ScatterSet { base: 0, idx: 1, vals: 2 }, Op::ScatterSet { .. },
         [Value, Value, Value];
-    IOTA = 0x64, "iota", Index, 0, 1, Op::Iota { len: 8 }, Op::Iota { .. }, [Imm];
-    MASK_APPLY_PACKED = 0x65, "mask_apply_packed", Sampling, 2, 1,
+    IOTA = 0x64, "iota", Leaf, 0, 1, Op::Iota { len: 8 }, Op::Iota { .. }, [Imm];
+    MASK_APPLY_PACKED = 0x65, "mask_apply_packed", Choice, 2, 1,
         Op::MaskApply { logits: 0, mask: 1 }, Op::MaskApply { .. }, [Value, Value];
     CAUSAL_MASK = 0x66, "causal_mask", Index, 1, 1,
         Op::CausalMask { positions: 0, len: 8 }, Op::CausalMask { .. }, [Value, Imm];
@@ -1116,6 +1153,75 @@ pub fn family_of(tag: u8) -> Option<Family> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No doc comment inside `pub enum Op` may spell a wire tag.
+    ///
+    /// Not a style rule. Those docs *did* carry the tags, and twenty-six of
+    /// them named a different byte than the op's [`OP_TABLE`] row — `add` was
+    /// documented `0x18` and encoded `0x10`, `select` documented `0x30` and
+    /// encoded `0x20`. Nothing failed, because nothing reads a doc comment;
+    /// the tags simply became a lie a reader has no reason to distrust, and
+    /// the module header's own "`Add` = 0x10" example contradicted the
+    /// variant three hundred lines below it.
+    ///
+    /// Rather than pin the copies to the table, this forbids the copies.
+    /// [`tags`] is the reader's answer and `declare_ops!` is the writer's, and
+    /// a hex literal that reappears here fails the build before it can drift.
+    #[test]
+    fn op_docs_do_not_respell_wire_tags() {
+        let src = include_str!("op.rs");
+        let start = src.find("pub enum Op {").expect("the op enum");
+        let end = start + src[start..].find("\n}\n").expect("the enum's end");
+
+        for (offset, line) in src[start..end].lines().enumerate() {
+            let text = line.trim();
+            if !text.starts_with("///") {
+                continue;
+            }
+            assert!(
+                !text.contains("0x"),
+                "op.rs enum line {}: `{text}` — a wire tag belongs on its \
+                 declare_ops! row, not in a doc comment",
+                offset + src[..start].lines().count()
+            );
+        }
+    }
+
+    /// Every [`Family`] names at least one [`OP_TABLE`] row.
+    ///
+    /// A family with no members is a grouping the reader has to invent a
+    /// meaning for, and the meaning they invent is what the next op gets filed
+    /// under. Walking by successor rather than over a list, for the same
+    /// reason `Backend::ALL` is walked that way: a new family does not compile
+    /// until it is given a place in the order, and the order is what this then
+    /// requires the table to populate.
+    #[test]
+    fn every_family_has_a_member() {
+        let mut family = Some(Family::Leaf);
+        let mut seen = 0usize;
+        while let Some(f) = family {
+            assert!(
+                OP_TABLE.iter().any(|row| row.family == f),
+                "{f:?} has no op — delete the family or file one under it"
+            );
+            seen += 1;
+            family = match f {
+                Family::Leaf => Some(Family::Map),
+                Family::Map => Some(Family::CompareLogic),
+                Family::CompareLogic => Some(Family::Choice),
+                Family::Choice => Some(Family::Shape),
+                Family::Shape => Some(Family::Index),
+                Family::Index => Some(Family::ReduceScan),
+                Family::ReduceScan => Some(Family::Order),
+                Family::Order => Some(Family::Linear),
+                Family::Linear => Some(Family::Sampling),
+                Family::Sampling => Some(Family::Channel),
+                Family::Channel => Some(Family::Intrinsic),
+                Family::Intrinsic => None,
+            };
+        }
+        assert_eq!(seen, 12, "the walk visits every family exactly once");
+    }
 
     #[test]
     fn op_table_sorted_and_unique() {
