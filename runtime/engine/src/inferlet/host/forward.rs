@@ -51,7 +51,6 @@ fn model_pass_kind() -> PassKind {
     }
 }
 
-
 fn page_span(
     span: pie::inferlet::working_set::PageSpan,
 ) -> Result<crate::pipeline::instance::KvPageSpan, String> {

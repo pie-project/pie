@@ -586,8 +586,7 @@ fn rs_plan_for(
     // the linear layers gather already-buffered activations and return before
     // the output projection -- so there is no per-row switch that would let a
     // computing row ride along.
-    if kinds.iter().any(|k| *k == Position::Commit)
-        && !kinds.iter().all(|k| *k == Position::Commit)
+    if kinds.iter().any(|k| *k == Position::Commit) && !kinds.iter().all(|k| *k == Position::Commit)
     {
         let row = kinds
             .iter()

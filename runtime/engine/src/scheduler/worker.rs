@@ -444,9 +444,7 @@ impl LaunchGrouping {
         // RS rows are one per request across the whole composed batch, so a
         // fire that binds recurrent state and one that does not cannot share
         // a wave: the driver would see fewer slot ids than requests.
-        if self.count != 0
-            && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows
-        {
+        if self.count != 0 && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows {
             return false;
         }
         // Custom wire masks co-batch freely with other wire-geometry fires —
