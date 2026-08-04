@@ -1927,6 +1927,111 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       tid, simd_gid, simd_lid);
 }
 
+// Qwen3.5's prefill scratch uses one uniform row pitch. Mirror the live K
+// columns into a half buffer once per projection; unlike tile-local casting,
+// this conversion is independent of the number of output tiles.
+[[kernel]] void cast_qmm_input_strided_bfloat16_to_float16(
+    const device bfloat* x [[buffer(3)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& row_stride [[buffer(8)]],
+    device half* y [[buffer(12)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  y[size_t(gid.y) * row_stride + gid.x] =
+      half(x[size_t(gid.y) * row_stride + gid.x]);
+}
+
+template <int group_size, int bits, int BM, int BK, int BN, bool WITH_RESIDUAL>
+METAL_FUNC void qmm_t_strided_fp16_precast_impl(
+    const device uint32_t* w,
+    const device bfloat* scales,
+    const device bfloat* biases,
+    const device half* x,
+    device bfloat* y,
+    const device bfloat* residual,
+    threadgroup half* Xs,
+    threadgroup half* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& row_stride,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+
+  using mma_t = mlx::steel::
+      BlockMMA<half, bfloat, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      bfloat, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = int(tid.y) * BM;
+  const int y_col = int(tid.x) * BN;
+
+  auto wl = (const device uint8_t*)w;
+  x += y_row * static_cast<int64_t>(row_stride);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  y += y_row * static_cast<int64_t>(row_stride) + y_col;
+
+  loader_x_t loader_x(x, row_stride, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  mma_op.store_result(y, row_stride);
+  if (WITH_RESIDUAL) {
+    residual += y_row * static_cast<int64_t>(row_stride) + y_col;
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint idx = simd_gid * 32u + simd_lid; idx < uint(BM * BN);
+         idx += uint(WM * WN * SIMD_SIZE)) {
+      const int r = int(idx) / BN;
+      const int c = int(idx) % BN;
+      const int64_t off = r * static_cast<int64_t>(row_stride) + c;
+      y[off] = bfloat(float(y[off]) + float(residual[off]));
+    }
+  }
+}
+
+template <int group_size, int bits, int BM, int BK, int BN, bool WITH_RESIDUAL>
+[[kernel]] void affine_qmm_t_strided_fp16_precast(
+    const device uint32_t* w [[buffer(0)]],
+    const device bfloat* scales [[buffer(1)]],
+    const device bfloat* biases [[buffer(2)]],
+    device bfloat* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const device bfloat* residual [[buffer(7)]],
+    const constant int& row_stride [[buffer(8)]],
+    const device half* x [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  qmm_t_strided_fp16_precast_impl<group_size, bits, BM, BK, BN, WITH_RESIDUAL>(
+      w, scales, biases, x, y, residual, Xs, Ws, K, N, row_stride,
+      tid, simd_gid, simd_lid);
+}
+
 #define instantiate_qmm_t_strided(gs, bm, bk, bn, b)                                     \
   template [[host_name("affine_qmm_t_strided_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
   [[kernel]] void affine_qmm_t_strided<bfloat, gs, b, bm, bk, bn>(                \
@@ -1952,6 +2057,96 @@ instantiate_qmm_t_strided(128, 32, 32, 32, 4)
 instantiate_qmm_t_strided(64, 32, 32, 32, 8)
 instantiate_qmm_t_strided(32, 32, 32, 32, 8)
 instantiate_qmm_t_strided(128, 32, 32, 32, 8)
+
+#define instantiate_qmm_t_strided_fp16_precast(bm, residual, name)           \
+  template [[host_name("affine_qmm_t_strided_fp16_precast" name              \
+                       "_bfloat16_gs_64_b_4_bm_" #bm "_bn_32")]]              \
+  [[kernel]] void affine_qmm_t_strided_fp16_precast<64, 4, bm, 32, 32, residual>(\
+      const device uint32_t*, const device bfloat*, const device bfloat*,    \
+      device bfloat*, const constant int&, const constant int&,              \
+      const device bfloat*, const constant int&, const device half*,         \
+      uint3, uint, uint);
+
+instantiate_qmm_t_strided_fp16_precast(16, false, "")
+instantiate_qmm_t_strided_fp16_precast(32, false, "")
+instantiate_qmm_t_strided_fp16_precast(16, true, "_residual")
+instantiate_qmm_t_strided_fp16_precast(32, true, "_residual")
+
+template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
+[[kernel]] void affine_qmv_wide_strided(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& row_stride [[buffer(8)]],
+    const constant int& M [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
+  constexpr int sub = 8;
+
+  const short k_lane = simd_lid % k_lanes;
+  const short sg_row = simd_lid / k_lanes;
+  const int out_row = int(tid.y) * (results_per_simdgroup * num_simdgroups) +
+      results_per_simdgroup * int(simd_gid) + int(sg_row);
+  const int vec0 = int(tid.x) * vecs_per_tg;
+  const int row = min(out_row, N - 1);
+
+  const int row_w = K * bits / 8;
+  const int row_g = K / group_size;
+  const device uint8_t* wrow = (const device uint8_t*)w + row * row_w;
+  const device T* srow = scales + row * row_g;
+  const device T* brow = biases + row * row_g;
+
+  const device T* xv[vecs_per_tg];
+  for (int v = 0; v < vecs_per_tg; ++v)
+    xv[v] = x + min(vec0 + v, M - 1) * row_stride;
+
+  float result[vecs_per_tg] = {0};
+  for (int g = k_lane; g < row_g; g += k_lanes) {
+    const float scale = float(srow[g]);
+    const float bias = float(brow[g]);
+    for (int sc = 0; sc < group_size / sub; ++sc) {
+      const int k0 = g * group_size + sc * sub;
+      const device uint8_t* wc = wrow + k0 * bits / 8;
+      float wd[sub];
+      dequantize<float, sub, bits>(wc, scale, bias, wd);
+      for (int v = 0; v < vecs_per_tg; ++v) {
+        float acc = 0;
+        for (int i = 0; i < sub; ++i) acc += float(xv[v][k0 + i]) * wd[i];
+        result[v] += acc;
+      }
+    }
+  }
+
+  for (int v = 0; v < vecs_per_tg; ++v) {
+    if constexpr (k_lanes >= 16) result[v] += simd_shuffle_down(result[v], 8);
+    if constexpr (k_lanes >= 8) result[v] += simd_shuffle_down(result[v], 4);
+    if constexpr (k_lanes >= 4) result[v] += simd_shuffle_down(result[v], 2);
+    if constexpr (k_lanes >= 2) result[v] += simd_shuffle_down(result[v], 1);
+  }
+  if (k_lane == 0 && out_row < N) {
+    for (int v = 0; v < vecs_per_tg; ++v)
+      if (vec0 + v < M)
+        y[(vec0 + v) * row_stride + out_row] = T(result[v]);
+  }
+}
+
+#define instantiate_qmv_wide_strided(v, kl)                                  \
+  template [[host_name("affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_" #v   \
+                       "_kl_" #kl)]]                                         \
+  [[kernel]] void affine_qmv_wide_strided<bfloat, 64, 4, v, kl>(            \
+      const device uint32_t*, const device bfloat*, const device bfloat*,    \
+      const device bfloat*, device bfloat*, const constant int&,             \
+      const constant int&, const constant int&, const constant int&,         \
+      uint3, uint, uint);
+
+instantiate_qmv_wide_strided(4, 8)
 
 
 // Same as `qmm_t_aligned_impl`, except the K loop runs `k_len` columns from the

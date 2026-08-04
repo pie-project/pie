@@ -368,10 +368,10 @@ template <typename T>
     constant GdnCoreParams& p [[buffer(12)]], const device uint* slot_ids [[buffer(13)]],
     constant int& row_pitch [[buffer(14)]], constant int& n_scan [[buffer(15)]],
     uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
-  const int Dk = p.Dk, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
+  const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
   const int n = int(tpig.z), t = n / Hv, hv_idx = n % Hv;
   const int slot = int(slot_ids[0]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
-  const int q_off = p.q_off, k_off = p.k_off;
+  const int q_off = p.q_off, k_off = p.k_off, v_off = p.v_off;
   const size_t pitch_t = size_t(row_pitch);
   const size_t pitch_f = size_t(row_pitch) / 2;   // fp32 scratch shares the byte pitch
   const size_t row_t = size_t(t) * pitch_t;
@@ -415,6 +415,13 @@ template <typename T>
     g[0] = exp(-exp(float(A_log[hv_idx])) * sp);
     g[1] = 1.0f / (1.0f + exp(-float(b_gate[row_t + hv_idx])));
   }
+  // The recurrent kernel's thirty-two Dk lanes all consume the same v scalar.
+  // Compute each value-channel convolution once here, while tokens are
+  // parallel, and place it after the two gate scalars in this fp32 scratch row.
+  device float* pv = pre_gate + size_t(t) * pitch_f + 2 * size_t(Hv);
+  for (int dv = dk_idx; dv < Dv; dv += 32)
+    pv[size_t(hv_idx) * Dv + dv] =
+        convsilu(v_off + hv_idx * Dv + dv);
 
   // Only the last scanned token carries the history forward.
   if (t != n_scan - 1) return;
@@ -431,6 +438,8 @@ template <typename T>
     wb(q_off + hv_idx * Dk + d);
     wb(k_off + hv_idx * Dk + d);
   }
+  for (int dv = dk_idx; dv < Dv; dv += 32)
+    wb(v_off + hv_idx * Dv + dv);
 }
 
 template <typename T>
@@ -443,13 +452,10 @@ template <typename T>
     constant GdnCoreParams& p [[buffer(10)]], const device uint* slot_ids [[buffer(11)]],
     constant int& row_pitch [[buffer(12)]], constant int& n_scan [[buffer(13)]],
     uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
-  const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
+  const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv;
   const int hv_idx = int(tpig.z), dv_idx = int(tpig.y);
   const int slot = int(slot_ids[0]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
-  const int v_off = p.v_off;
-  const size_t pitch_t = size_t(row_pitch);
   const size_t pitch_f = size_t(row_pitch) / 2;
-  const int vc = v_off + hv_idx * Dv + dv_idx;
 
   // This simdgroup owns the whole (slot, hv, dv) state row, so the scan runs in
   // registers with no ordering beyond the loop itself.
@@ -458,16 +464,10 @@ template <typename T>
   for (int i = 0; i < n_per_t; ++i) st[i] = i_state[n_per_t * dk_idx + i];
 
   for (int t = 0; t < n_scan; ++t) {
-    const size_t row_t = size_t(t) * pitch_t;
-    float acc = float(conv_b[vc]);
-    for (int j = 0; j < Kc - 1; ++j) {
-      const int idx = t - (Kc - 1) + j;
-      const float tap = idx >= 0 ? float(mixed[size_t(idx) * pitch_t + vc])
-                                 : conv_state[(slot * Kc + Kc + idx) * CDIM + vc];
-      acc += tap * float(conv_w[vc * Kc + j]);
-    }
-    acc += float(mixed[row_t + vc]) * float(conv_w[vc * Kc + (Kc - 1)]);
-    const float vval = acc / (1.0f + exp(-acc));
+    const size_t row_t = size_t(t) * size_t(row_pitch);
+    const float vval =
+        pre_gate[size_t(t) * pitch_f + 2 * size_t(Hv) +
+                 size_t(hv_idx) * Dv + dv_idx];
 
     const device float* iq = pre_q + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
     const device float* ik = pre_k + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
@@ -489,14 +489,6 @@ template <typename T>
       core_out[row_t + size_t(hv_idx) * Dv + dv_idx] = static_cast<T>(out);
   }
   for (int i = 0; i < n_per_t; ++i) i_state[n_per_t * dk_idx + i] = st[i];
-
-  if (dk_idx != 0) return;
-  for (int j = 0; j < Kc; ++j) {
-    const int idx = (n_scan - 1) - (Kc - 1) + j;
-    new_conv_state[(slot * Kc + j) * CDIM + vc] =
-        idx >= 0 ? float(mixed[size_t(idx) * pitch_t + vc])
-                 : conv_state[(slot * Kc + Kc + idx) * CDIM + vc];
-  }
 }
 
 #define instantiate_gdn_prefill(name, itype)                                    \

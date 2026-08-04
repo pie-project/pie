@@ -101,6 +101,12 @@ struct MultiBatchPsos {
     Pso qmm_t_strided_wide{};
     Pso qmm_t_strided_wide_residual{};
     Pso qmm_t_strided_residual{};
+    Pso qmm_t_strided_fp16_precast{};
+    Pso qmm_t_strided_fp16_precast_wide{};
+    Pso qmm_t_strided_fp16_precast_residual{};
+    Pso qmm_t_strided_fp16_precast_wide_residual{};
+    Pso qmm_t_strided_cast{};
+    Pso qmv_wide_strided{};
     // Row-independent prefill kernels with an explicit row pitch, so a whole
     // prompt runs as one dispatch instead of one per token.  Same arithmetic as
     // the M=1 kernels beside them -- only the row's base address is computed
@@ -133,6 +139,9 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           /// checkpoint whose geometry has experts runs them.
                           bool routed = false,
                           /// Compile dense g64/b4 BF16->FP16 staging QMMs.
-                          bool fp16_precast = false);
+                          bool fp16_precast = false,
+                          /// Compile projection-level FP16 staging for the
+                          /// uniform-pitch Qwen prefill.
+                          bool fp16_strided = false);
 
 }  // namespace pie::metal
