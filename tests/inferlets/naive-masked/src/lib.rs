@@ -91,10 +91,15 @@ async fn main(input: Input) -> Result<Output> {
     if !matches!(
         mask_mode.as_str(),
         "none" | "dense" | "structured" | "dense-prefill" | "dense-prefill-hole"
+            | "doc-isolation"
     ) {
         return Err(format!("unknown mask_mode: {mask_mode}"));
     }
-    let masked = matches!(mask_mode.as_str(), "dense" | "structured");
+    let masked = matches!(
+        mask_mode.as_str(),
+        "dense" | "structured" | "doc-isolation"
+    );
+
     let structured = mask_mode == "structured";
     let masked_prefill = matches!(mask_mode.as_str(), "dense-prefill" | "dense-prefill-hole");
     // The hole: knock column 1 out of the causal envelope for rows p >= 2.
@@ -118,6 +123,11 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
+    // The first REAL mask policy through the spatial path: RAG document
+    // isolation — the prompt's first half is a "retrieved document" the
+    // decode queries must NOT attend to; the second half plus everything
+    // generated stays visible.
+    let doc_start: u32 = if mask_mode == "doc-isolation" { n / 2 } else { 0 };
     let pool_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
     let pool_len = pool_pages * page_size;
     let slots = ws
@@ -211,9 +221,16 @@ async fn main(input: Input) -> Result<Output> {
         let klen = Channel::from(vec![n + 1; 1]).named("klen");
         let w_slot = Channel::from(vec![slot_n; 1]).named("w_slot");
         let w_off = Channel::from(vec![n % page_size; 1]).named("w_off");
-        // Causal row for the fire-0 query at position n: attend all j <= n.
-        let seed_mask: Vec<bool> = (0..pool_len).map(|j| j <= n).collect();
+        // Causal row for the fire-0 query at position n: attend all j <= n
+        // (doc-isolation additionally blocks j < doc_start).
+        let seed_mask: Vec<bool> =
+            (0..pool_len).map(|j| j >= doc_start && j <= n).collect();
         let mask = Channel::from_shaped([1, pool_len], seed_mask).named("mask");
+        let doc_row = Channel::from_shaped(
+            [pool_len],
+            (0..pool_len).map(|j| j >= doc_start).collect::<Vec<bool>>(),
+        )
+        .named("doc_row");
         let pages = Channel::from(pool_ids.clone()).named("pages");
         let page_indptr =
             Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
@@ -273,6 +290,17 @@ async fn main(input: Input) -> Result<Output> {
                     let col = iota(pool_len);
                     let base_b = broadcast(reshape(&base, [1]), [pool_len]);
                     reshape(le(&col, &base_b), [1, pool_len])
+                };
+                // doc-isolation: AND the static document-boundary row in
+                // (a seeded channel read — the causal half evolves, the
+                // document block is a constant of the request).
+                let new_mask = if doc_start > 0 {
+                    reshape(
+                        and(&reshape(new_mask, [pool_len]), &doc_row.read()),
+                        [1, pool_len],
+                    )
+                } else {
+                    new_mask
                 };
                 mask.take();
                 mask.put(&new_mask);
