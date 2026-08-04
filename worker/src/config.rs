@@ -980,13 +980,31 @@ pub struct CudaNativeDriverOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
+/// Which serving objective the driver's memory planner optimises for.
+///
+/// The planner searches a `(kv_page_size x decode_target x prefill_target)`
+/// lattice and scores each candidate. This picks the objective, and it exists
+/// because the planner **cannot infer it**: every input to that score is a
+/// static fact -- SM count, model shape, KV headroom, arena pressure -- and
+/// none of them say whether the traffic is interactive or batch.
+///
+/// `Balanced` and `Capacity` used to be spellable here and are not any more:
+///
+/// - `Balanced` is what `Auto` picks when the middle wins. Naming it added a
+///   way to pin a choice the search already makes.
+/// - `Capacity` was never a policy family. It resolved to *exactly* `Latency`'s
+///   decode and prefill targets and differed only in KV page size (32 rather
+///   than 16). That is a page-size choice wearing a policy's name, and since
+///   `kv_page_size` is now honoured it is sayable directly:
+///   `profile = "latency"` with `kv_page_size = 32`.
+///
+/// Both remain *internal* policy families that `Auto` still evaluates, so the
+/// default deployment's search is unchanged.
 pub enum CudaMemoryProfile {
     #[default]
     Auto,
     Latency,
-    Balanced,
     Throughput,
-    Capacity,
 }
 
 impl Default for CudaNativeDriverOptions {
@@ -1351,7 +1369,7 @@ device = ["cuda:0"]
 
 [model.driver.options]
 gpu_mem_utilization = 0.90
-memory_profile = "balanced"
+memory_profile = "throughput"
 runtime_quant = "fp8"
 mxfp4_moe = "routed_dequant"
 mtp_assistant_snapshot_dir = "/models/gemma4-mtp"
@@ -1362,7 +1380,7 @@ mtp_num_drafts = 6
         assert_eq!(cfg.model.driver.kind, DriverKind::CudaNative);
         let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
         assert_eq!(opts.gpu_mem_utilization, 0.90);
-        assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
+        assert_eq!(opts.memory_profile, CudaMemoryProfile::Throughput);
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.mxfp4_moe, "routed_dequant");
         assert_eq!(opts.mtp_assistant_snapshot_dir, "/models/gemma4-mtp");
@@ -1440,6 +1458,38 @@ kv_cache_dtype = "turboquant"
         assert!(err.contains("kv_cache_dtype"), "got: {err}");
         assert!(err.contains("fp8_e4m3"), "got: {err}");
         assert!(err.contains("nvfp4"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_a_retired_memory_profile() {
+        // "balanced" and "capacity" were spellable and are not any more. They
+        // must fail loudly rather than be accepted and silently mean something
+        // else -- a config written against the old set names a real intent.
+        for retired in ["balanced", "capacity"] {
+            let cuda = format!(
+                r#"
+[model]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+memory_profile = "{retired}"
+"#
+            );
+            // Note where this fails: `[model.driver.options]` is a free-form
+            // `toml::Table` in the schema, so the enum is only checked when
+            // `validate()` converts it per driver kind -- not at parse.
+            let cfg: Config = toml::from_str(&cuda).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(retired) || err.contains("memory_profile"),
+                "{retired} should be rejected; got: {err}"
+            );
+        }
     }
 
     #[test]

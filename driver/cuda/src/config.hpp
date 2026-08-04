@@ -233,14 +233,15 @@ inline Config load_config(const std::filesystem::path& path) {
         throw std::runtime_error(
             "config: [batching].gpu_mem_utilization must be in (0.0, 1.0]");
     }
+    // "balanced" and "capacity" are internal policy families that "auto"
+    // still evaluates; they are no longer nameable here. See
+    // `CudaMemoryProfile` in worker/src/config.rs for why.
     if (c.batching.memory_profile != "auto" &&
         c.batching.memory_profile != "latency" &&
-        c.batching.memory_profile != "balanced" &&
-        c.batching.memory_profile != "throughput" &&
-        c.batching.memory_profile != "capacity") {
+        c.batching.memory_profile != "throughput") {
         throw std::runtime_error(
             "config: [batching].memory_profile must be one of auto, "
-            "latency, balanced, throughput, capacity");
+            "latency, throughput");
     }
     if (c.distributed.tp_size < 1) {
         throw std::runtime_error("config: [distributed].tp_size must be >= 1");

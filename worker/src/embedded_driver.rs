@@ -372,9 +372,7 @@ pub(crate) fn write_cuda_startup_toml(
         match opts.memory_profile {
             CudaMemoryProfile::Auto => "auto",
             CudaMemoryProfile::Latency => "latency",
-            CudaMemoryProfile::Balanced => "balanced",
             CudaMemoryProfile::Throughput => "throughput",
-            CudaMemoryProfile::Capacity => "capacity",
         },
     );
     insert_int(&mut batching, "kv_page_size", opts.kv_page_size);
@@ -879,7 +877,7 @@ mod tests {
         let full_options = DriverOptions::CudaNative(CudaNativeDriverOptions {
             device: "cuda:0".to_string(),
             gpu_mem_utilization: 1.0,
-            memory_profile: CudaMemoryProfile::Capacity,
+            memory_profile: CudaMemoryProfile::Latency,
             total_pages: 1,
             ..Default::default()
         });

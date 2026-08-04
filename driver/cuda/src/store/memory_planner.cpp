@@ -141,8 +141,13 @@ std::vector<std::string> planner_policy_profiles(const std::string& profile) {
     if (!is_auto_memory_profile(profile)) {
         return {profile};
     }
-    // `auto` is not a fifth concrete layout. It evaluates the concrete
-    // policy families and chooses by the unified objective below.
+    // `auto` is not a third concrete layout. It evaluates the concrete policy
+    // families and chooses by the unified objective below.
+    //
+    // Four families, three nameable profiles: "balanced" and "capacity" stay
+    // in this search but can no longer be pinned from config. Keeping them
+    // here is what makes the value reduction free -- `auto` is the default, so
+    // narrowing its search would have changed what every deployment does.
     return {"latency", "balanced", "throughput", "capacity"};
 }
 
