@@ -813,7 +813,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         // STRUCTURAL v0 (S-1): truncated fires are eager — the graph
         // exec family is full-depth (the depth peel is the recorded
         // union rung).
-        in.planned_max_layers == 0xffffffffu;
+        in.planned_max_layers == 0xffffffffu &&
+        // ④ Act 1: banded fires are eager (per-band plans + boundary
+        // walk are not in any captured layout).
+        in.depth_band_count == 0;
     const bool use_spatial_mask = spatial_mask_enabled() &&
         in.is_pure_decode && in.have_custom_mask &&
         // AC-2/AC-4: neither lora nor hooks disarm the split — the
@@ -1338,6 +1341,9 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.lora                         = in.lora;
     fwd_in.max_layers                   = in.planned_max_layers;
     fwd_in.full_depth_rows              = in.planned_full_depth_rows;
+    fwd_in.depth_band_k                 = in.depth_band_k;
+    fwd_in.depth_band_rows              = in.depth_band_rows;
+    fwd_in.depth_band_count             = in.depth_band_count;
     if (use_spatial_mask || use_spatial_mask_mixed) {
         // The masked suffix's rebased device CSRs (pure decode: qo is the
         // identity, kv_page_indptr rebases by its page base; every other

@@ -85,6 +85,19 @@ inline AttentionWorkspace& spatial_suffix_ws() {
     return ws;
 }
 
+// ④ Act 1 (banded depth): one dedicated workspace per band slot — the
+// same same-family-planner isolation the suffix workspace exists for,
+// per band. Lazy per slot; band count is capped at 3 (frame gate).
+inline AttentionWorkspace& depth_band_ws(int i) {
+    static std::array<std::unique_ptr<AttentionWorkspace>, 3> pool;
+    auto& slot = pool[static_cast<std::size_t>(i)];
+    if (!slot) {
+        slot = std::make_unique<AttentionWorkspace>(
+            AttentionWorkspace::allocate());
+    }
+    return *slot;
+}
+
 inline bool spatial_stream_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_SPATIAL_STREAM");
@@ -802,7 +815,10 @@ void prepare_llama_like_decode_plan(
     std::uint32_t unmasked_prefix_rows,
     const std::uint32_t* mask_suffix_page_counts_h,
     const std::uint32_t* mask_suffix_last_lens_h,
-    std::uint32_t full_depth_rows)
+    std::uint32_t full_depth_rows,
+    const std::uint32_t* depth_band_k,
+    const std::uint32_t* depth_band_rows,
+    std::uint32_t depth_band_count)
 {
     // The prepare hook runs OUTSIDE any cuStreamCapture region. It updates
     // pinned/device buffers in `attn_ws` that the captured body reads via
@@ -1318,6 +1334,35 @@ void prepare_llama_like_decode_plan(
                 fwd_cfg.sliding_window < 0 &&
                 fwd_cfg.per_layer_window_left.empty(),
             cache.hnd_layout());
+    }
+    // V2 rung ④ Act 1 (banded depth): one prefix decode plan per band
+    // boundary, deepest-first, each against its own workspace. A band
+    // whose start row is 0 needs no plan — nothing lives past it and
+    // the body stops walking layers there.
+    state.depth_band_count = 0;
+    if (depth_band_count >= 2 && depth_band_count <= 3 &&
+        is_pure_decode && !have_custom_mask) {
+        for (std::uint32_t j = 0; j < depth_band_count; ++j) {
+            const std::uint32_t rows = depth_band_rows[j];
+            state.depth_band_k[j] = depth_band_k[j];
+            state.depth_band_rows[j] = rows;
+            if (rows == 0) continue;
+            if (!state.depth_band_plans[j]) {
+                state.depth_band_plans[j] = ops::make_decode_plan();
+            }
+            ops::plan_attention_flashinfer_decode(
+                *state.depth_band_plans[j], kv_page_indptr_h,
+                static_cast<int>(rows),
+                num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
+                cache.page_size(), depth_band_ws(static_cast<int>(j)),
+                /*stream=*/nullptr,
+                fwd_cfg.decode_plan_cuda_graph,
+                decode_full_attention_variant_enabled() &&
+                    fwd_cfg.sliding_window < 0 &&
+                    fwd_cfg.per_layer_window_left.empty(),
+                cache.hnd_layout());
+        }
+        state.depth_band_count = depth_band_count;
     }
 }
 
@@ -2569,7 +2614,62 @@ void llama_like_forward_paged(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
-    if (full_depth_rows != 0xffffffffu &&
+    if (plan_state.depth_band_count >= 2) {
+        // ④ Act 1 (banded depth): distinct-k bands, deepest-first. At
+        // any layer the live rows are the prefix [0, band_rows[j]) of
+        // the interval containing it (the seriation's deepest-first
+        // invariant); frozen rows ride to the one tail exactly as the
+        // S-2 union's suffix does. band_rows[j] == 0 ends the walk —
+        // nothing lives past that band (the all-truncated fire's
+        // bonus: layers past the deepest k never launch).
+        const int m = static_cast<int>(plan_state.depth_band_count);
+        if (!is_pure_decode || has_custom_mask || hooks != nullptr ||
+            !use_decode_path || use_prefill_decode_path ||
+            use_xqa_decode_path ||
+            layer_bound != cfg.num_hidden_layers) {
+            throw std::runtime_error(
+                "depth bands: prepared bands reached an unsupported "
+                "fire shape (frame/driver gate drift)");
+        }
+        if (std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
+            std::fprintf(stderr, "[depth-bands] R=%d m=%d", R, m);
+            for (int j = 0; j < m; ++j) {
+                std::fprintf(
+                    stderr, " (k=%u rows=%u)",
+                    plan_state.depth_band_k[static_cast<std::size_t>(j)],
+                    plan_state
+                        .depth_band_rows[static_cast<std::size_t>(j)]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        const int k_min = static_cast<int>(
+            plan_state.depth_band_k[static_cast<std::size_t>(m - 1)]);
+        for (int L = 0; L < k_min; ++L) {
+            run_layer(L, N, R, decode_plan, attn_ws);
+        }
+        for (int j = m - 1; j >= 0; --j) {
+            const int live = static_cast<int>(
+                plan_state.depth_band_rows[static_cast<std::size_t>(j)]);
+            if (live == 0) break;
+            const int from = static_cast<int>(
+                plan_state.depth_band_k[static_cast<std::size_t>(j)]);
+            const int to =
+                j == 0 ? cfg.num_hidden_layers
+                       : static_cast<int>(plan_state.depth_band_k
+                             [static_cast<std::size_t>(j - 1)]);
+            const ops::DecodePlanCache* band_plan =
+                plan_state.depth_band_plans[static_cast<std::size_t>(j)]
+                    .get();
+            if (band_plan == nullptr) {
+                throw std::runtime_error(
+                    "depth bands: band active but prepare built no "
+                    "plan for it");
+            }
+            for (int L = from; L < to; ++L) {
+                run_layer(L, live, live, band_plan, depth_band_ws(j));
+            }
+        }
+    } else if (full_depth_rows != 0xffffffffu &&
         (has_custom_mask || hooks != nullptr ||
          // Deployments without the decode kernel (force_prefill /
          // prefill_decode_plan) cannot run the WINDOWED range-2 (its

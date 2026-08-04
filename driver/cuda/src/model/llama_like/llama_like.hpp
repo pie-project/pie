@@ -15,6 +15,7 @@
 //   * Qwen-3.5 — hybrid full + linear-attention layers.
 //   * Gemma-4 — KV sharing across layers, per-layer embeds.
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -148,6 +149,14 @@ struct LlamaLikePlanState {
     // buffers — the mixed-fire lesson; a depth fire is never also a
     // spatial-mask fire, so the workspace is free).
     ops::DecodePlanCachePtr depth_prefix_decode_plan;
+    // V2 rung ④ Act 1 (banded depth): one PREFIX decode plan per
+    // distinct-k band (deepest-first), each against its OWN dedicated
+    // workspace (the two-plans-one-workspace lesson, per band).
+    // count == 0 = unbanded fire.
+    std::array<ops::DecodePlanCachePtr, 3> depth_band_plans;
+    std::array<std::uint32_t, 3> depth_band_k{};
+    std::array<std::uint32_t, 3> depth_band_rows{};
+    std::uint32_t depth_band_count = 0;
     // NO-DEMOTION (mixed 3-way): the plain-decode middle's DECODE plan
     // (requests [P, split_req) of a mixed fire, kvpp-rebased). The
     // seriation puts prefill lanes first, so P = the first 1-token
@@ -231,7 +240,10 @@ void prepare_llama_like_decode_plan(
     // uniform fire). When planned on a plain pure-decode fire, prepare
     // ALSO builds the prefix decode plan (requests [0, split)) into its
     // dedicated slot against the secondary workspace.
-    std::uint32_t full_depth_rows = 0xffffffffu);
+    std::uint32_t full_depth_rows = 0xffffffffu,
+    const std::uint32_t* depth_band_k = nullptr,
+    const std::uint32_t* depth_band_rows = nullptr,
+    std::uint32_t depth_band_count = 0);
 
 std::uint32_t llama_like_supergraph_graph_layout(
     const LlamaLikePlanState& state);

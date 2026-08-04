@@ -247,6 +247,11 @@ struct ForwardFn {
         // members run all L layers, the truncated suffix stops at
         // `max_layers` (one tail serves both). UINT32_MAX = uniform.
         std::uint32_t full_depth_rows = 0xffffffffu;
+        // ④ Act 1 (banded depth): distinct-k bands, deepest-first
+        // (count == 0 = unbanded; see PrepareInputs).
+        const std::uint32_t* depth_band_k = nullptr;
+        const std::uint32_t* depth_band_rows = nullptr;
+        std::uint32_t depth_band_count = 0;
     };
 
     struct PrepareInputs {
@@ -277,6 +282,14 @@ struct ForwardFn {
         // STRUCTURAL S-2: the depth union's request split (UINT32_MAX =
         // uniform); prepare builds the prefix decode plan when planned.
         std::uint32_t full_depth_rows = 0xffffffffu;
+        // V2 rung ④ Act 1 (banded depth, PIE_DEPTH_BANDS): distinct
+        // truncation bands, deepest-first (k strictly decreasing;
+        // rows[j] = the band's start row = rows still live once k[j]
+        // is passed). count == 0 = unbanded. Only set on plain
+        // pure-decode fires with >= 2 distinct k.
+        const std::uint32_t* depth_band_k = nullptr;
+        const std::uint32_t* depth_band_rows = nullptr;
+        std::uint32_t depth_band_count = 0;
         // NS-2: the masked program's RESOLVED per-suffix-lane geometry
         // (page counts / last-page lens), from the frame's spatial dense
         // pack. The suffix mask plan MUST use these — the host wire views
@@ -662,6 +675,11 @@ struct ForwardDispatchInputs {
     // STRUCTURAL S-2: the depth seriation's request split (leading
     // members at FULL depth; UINT32_MAX = uniform fire).
     std::uint32_t planned_full_depth_rows = 0xffffffffu;
+    // ④ Act 1: distinct-k depth bands, deepest-first (0 = unbanded).
+    // Banded fires are eager (graphs refuse them).
+    const std::uint32_t* depth_band_k = nullptr;
+    const std::uint32_t* depth_band_rows = nullptr;
+    std::uint32_t depth_band_count = 0;
     // Direct non-graph prefill/mixed launches may gather the requested hidden
     // rows before lm_head instead of materializing [N, vocab] logits.
     bool compact_logits = false;

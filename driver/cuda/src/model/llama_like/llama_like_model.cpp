@@ -95,7 +95,8 @@ void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
         in.unmasked_prefix_rows,
         in.mask_suffix_page_counts_h,
         in.mask_suffix_last_lens_h,
-        in.full_depth_rows);
+        in.full_depth_rows,
+        in.depth_band_k, in.depth_band_rows, in.depth_band_count);
 }
 
 void LlamaLikeModel::body(Workspace& ws,
