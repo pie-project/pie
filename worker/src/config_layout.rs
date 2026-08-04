@@ -33,10 +33,11 @@ use anyhow::{Result, bail};
 /// Section moves are listed as whole sections where the whole section moves;
 /// individual keys appear only where one key left its neighbours.
 const MOVES: &[(&str, &str)] = &[
-    // `[runtime]` is the batching policy now. The name is reused deliberately
-    // -- see `pie config migrate`, which reports every key it moves out of the
-    // old `[runtime]` precisely because the name staying put is what would
-    // otherwise make the move invisible.
+    // `[runtime]` is the batching policy now. Reusing a name for different
+    // contents is normally the worst kind of rename -- a reader assumes the two
+    // are the same thing. It is safe here only because the old file spelled
+    // this `[worker.runtime]`, and a bare `[worker]` is rejected outright: no
+    // file can carry the old meaning into the new name.
     ("runtime", "model.scheduler"),
     // The box an inferlet runs in: its walls and its size, which used to be
     // split across `[runtime]` and nothing.
@@ -129,14 +130,13 @@ pub fn reshape(file: toml::Table) -> Result<toml::Table> {
             bail!(
                 "[{retired}] is no longer part of the config: single-node pie uses \
                  the role defaults, and a distributed deployment states what it \
-                 needs in [cluster]. Run `pie config migrate`."
+                 needs in [cluster]."
             );
         }
     }
     if file.contains_key("worker") {
         bail!(
-            "[worker] is no longer a section: its contents are the file. \
-             Run `pie config migrate`."
+            "[worker] is no longer a section: its contents are the file."
         );
     }
     if file
@@ -145,8 +145,7 @@ pub fn reshape(file: toml::Table) -> Result<toml::Table> {
         .is_some_and(|t| t.contains_key("driver") || t.contains_key("scheduler"))
     {
         bail!(
-            "[model.driver] / [model.scheduler] are now [driver] and [runtime]. \
-             Run `pie config migrate`."
+            "[model.driver] / [model.scheduler] are now [driver] and [runtime]."
         );
     }
 
@@ -235,83 +234,6 @@ fn insert_at(root: &mut toml::Table, path: &str, value: toml::Value) -> Result<(
 }
 
 
-/// Rewrite a pre-2026-08 document into the current layout.
-///
-/// Returns the new document and every `(from, to)` it moved, because the
-/// listing is the point: `[runtime]` kept its name and swapped its contents, so
-/// "migrated successfully" alone would leave someone hunting for
-/// `allow_network` in a section that still exists.
-pub fn migrate_document(old: &toml::Value) -> Result<(toml::Value, Vec<(String, String)>)> {
-    /// Old file path -> new file path, for the sections and keys that moved.
-    /// Longest first, so `worker.model.driver.options` is matched before
-    /// `worker.model.driver`.
-    const OLD_TO_NEW: &[(&str, &str)] = &[
-        ("worker.model.driver.options", "driver"),
-        ("worker.model.scheduler", "runtime"),
-        ("worker.model.driver", "driver"),
-        ("worker.runtime.allow_fs", "sandbox.allow_fs"),
-        ("worker.runtime.fs_scratch_dir", "sandbox.fs_scratch_dir"),
-        ("worker.runtime.allow_network", "sandbox.allow_network"),
-        ("worker.runtime.network_allowed_hosts", "sandbox.network_allowed_hosts"),
-        ("worker.runtime.wasm_max_instances", "sandbox.max_instances"),
-        ("worker.runtime.wasm_max_memory", "sandbox.max_memory"),
-        ("worker.runtime.wasm_warm_memory", "sandbox.warm_memory"),
-        ("worker.runtime.wasm_warm_slots", "sandbox.warm_slots"),
-        ("worker.runtime.worker_threads", "server.worker_threads"),
-        ("worker.runtime.max_upload", "server.max_upload"),
-        ("worker.telemetry.enabled", "server.telemetry"),
-        ("worker.telemetry.endpoint", "server.otlp_endpoint"),
-        ("worker.telemetry.service_name", "server.service_name"),
-        ("worker.server.max_concurrent_processes", "runtime.max_concurrent_processes"),
-        ("worker.executor.max_clients", "cluster.max_clients"),
-        ("worker.offload.enabled", "cluster.offload"),
-        ("worker.offload.transfer", "cluster.transfer"),
-        ("worker.offload.prefill_min_suffix_tokens", "cluster.prefill_min_suffix_tokens"),
-        ("worker.offload.max_outstanding_per_partner", "cluster.max_outstanding_per_partner"),
-        ("worker.cluster", "cluster"),
-        ("worker.server", "server"),
-        ("worker.model", "model"),
-    ];
-
-    let mut leaves: Vec<(String, toml::Value)> = Vec::new();
-    collect_leaves(old, "", &mut leaves);
-
-    let mut out = toml::Table::new();
-    let mut moves = Vec::new();
-    for (path, value) in leaves {
-        // The retired sections carry nothing a single-node config needs, and
-        // their fields have no home in the new layout -- dropping them is the
-        // migration, so it is reported rather than done quietly.
-        if path.starts_with("controller.")
-            || path == "controller"
-            || path.starts_with("gateway.")
-            || path == "gateway"
-        {
-            moves.push((path.clone(), "dropped (role defaults)".to_string()));
-            continue;
-        }
-        let new = OLD_TO_NEW
-            .iter()
-            .find(|(old_prefix, _)| {
-                path == *old_prefix || path.starts_with(&format!("{old_prefix}."))
-            })
-            .map(|(old_prefix, new_prefix)| {
-                let rest = path[old_prefix.len()..].trim_start_matches('.');
-                if rest.is_empty() {
-                    new_prefix.to_string()
-                } else {
-                    format!("{new_prefix}.{rest}")
-                }
-            })
-            .unwrap_or_else(|| path.clone());
-        if new != path {
-            moves.push((path.clone(), new.clone()));
-        }
-        insert_at(&mut out, &new, value)?;
-    }
-    Ok((toml::Value::Table(out), moves))
-}
-
 /// Flatten a document to `(dotted path, scalar)` pairs.
 fn collect_leaves(value: &toml::Value, prefix: &str, out: &mut Vec<(String, toml::Value)>) {
     match value {
@@ -368,70 +290,11 @@ mod tests {
         let mut file = toml::Table::new();
         file.insert("controller".into(), toml::Value::Table(Default::default()));
         let err = reshape(file).unwrap_err().to_string();
-        assert!(err.contains("migrate"), "got: {err}");
+        // Names what to do instead, not only what is wrong.
+        assert!(err.contains("[cluster]"), "got: {err}");
     }
 
-    #[test]
-    fn an_old_config_migrates_with_every_value_intact() {
-        let old: toml::Value = toml::from_str(
-            r#"
-[controller]
-[gateway]
-[worker.server]
-host = "0.0.0.0"
-port = 9000
-[worker.telemetry]
-enabled = true
-[worker.runtime]
-allow_network = false
-wasm_max_memory = "8GiB"
-worker_threads = 12
-[worker.model]
-name = "prod"
-hf_repo = "Qwen/Qwen3-8B"
-[worker.model.driver]
-type = "dummy"
-device = ["cpu"]
-[worker.model.driver.options]
-vocab_size = 151936
-arch_name = "qwen3"
-[worker.model.scheduler]
-request_timeout = "300s"
-"#,
-        )
-        .unwrap();
-        let (new, moves) = migrate_document(&old).unwrap();
-        assert!(!moves.is_empty());
 
-        // Every value survives, at its new path.
-        let at = |p: &str| super::super::config_schema::lookup(&new, p).cloned();
-        assert_eq!(at("server.host"), Some("0.0.0.0".into()));
-        assert_eq!(at("server.worker_threads"), Some(toml::Value::Integer(12)));
-        assert_eq!(at("server.telemetry"), Some(toml::Value::Boolean(true)));
-        assert_eq!(at("sandbox.max_memory"), Some("8GiB".into()));
-        assert_eq!(at("sandbox.allow_network"), Some(toml::Value::Boolean(false)));
-        assert_eq!(at("runtime.request_timeout"), Some("300s".into()));
-        assert_eq!(at("driver.vocab_size"), Some(toml::Value::Integer(151936)));
-        assert_eq!(at("model.name"), Some("prod".into()));
-        // The retired sections are dropped, and the drop is reported.
-        assert!(at("controller").is_none());
-        assert!(moves.iter().any(|(from, to)| from == "controller" && to.contains("dropped")));
-
-        // And the result is a config, not just a document.
-        let rendered = toml::to_string(&new).unwrap();
-        crate::config::Config::parse(&rendered).expect("migrated config must parse");
-    }
-
-    #[test]
-    fn migrating_an_already_current_config_moves_nothing() {
-        let current: toml::Value = toml::from_str(
-            "[server]\nport = 8080\n[model]\nname = \"a\"\nhf_repo = \"x\"\n\
-             [driver]\ntype = \"dummy\"\ndevice = [\"cpu\"]\n",
-        )
-        .unwrap();
-        let (_, moves) = migrate_document(&current).unwrap();
-        assert!(moves.is_empty(), "moved: {moves:?}");
-    }
 
     #[test]
     fn driver_keys_split_into_common_and_specific() {

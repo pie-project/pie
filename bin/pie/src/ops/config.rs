@@ -49,13 +49,6 @@ pub enum ConfigCmd {
     /// Open the config in `$EDITOR`, and refuse to save something invalid.
     Edit,
 
-    /// Rewrite a pre-2026-08 config into the current section layout.
-    Migrate {
-        /// Print what would change without writing it.
-        #[arg(long)]
-        dry_run: bool,
-    },
-
     /// Write a default config file. Refuses to overwrite unless `--force`.
     Init {
         #[arg(long)]
@@ -70,7 +63,6 @@ pub fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
         ConfigCmd::Set { key, value } => set(global, key, value),
         ConfigCmd::Unset { key } => unset(global, key),
         ConfigCmd::Edit => edit(global),
-        ConfigCmd::Migrate { dry_run } => migrate(global, dry_run),
         ConfigCmd::Init { force } => init(global, force),
     }
 }
@@ -546,62 +538,6 @@ fn edit(global: &startup::GlobalArgs) -> Result<()> {
         "{} saved {}",
         crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
         crate::ui::short_path(&cfg_path)
-    );
-    Ok(())
-}
-
-/// `pie config migrate` -- move an old file into the current layout.
-///
-/// Every move is printed, and `[runtime]` is why. The section kept its name
-/// and lost all its keys: batching lives there now, and what used to be there
-/// went to `[sandbox]` and `[server]`. A migration that only said "done" would
-/// leave someone looking at a `[runtime]` that parses and wondering where
-/// `allow_network` went.
-fn migrate(global: &startup::GlobalArgs, dry_run: bool) -> Result<()> {
-    let (cfg_path, _) = startup::cli_config_path(global);
-    let content = std::fs::read_to_string(&cfg_path)
-        .map_err(|e| anyhow!("read {}: {e}", crate::ui::short_path(&cfg_path)))?;
-    let old: toml::Value = toml::from_str(&content)
-        .map_err(|e| anyhow!("parse {}: {e}", crate::ui::short_path(&cfg_path)))?;
-
-    let (migrated, moves) = pie_worker::config_layout::migrate_document(&old)?;
-    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
-    if moves.is_empty() {
-        println!("already in the current layout");
-        return Ok(());
-    }
-    let mut table = crate::ui::Table::new(
-        [crate::ui::Align::Left, crate::ui::Align::Left, crate::ui::Align::Left],
-        2,
-    );
-    for (from, to) in &moves {
-        table.push(crate::ui::Row::new(
-            crate::ui::Mark::Plain,
-            [from.clone(), "→".to_string(), to.clone()],
-        ));
-    }
-    table.print(&palette);
-
-    let rendered = toml::to_string_pretty(&migrated)
-        .map_err(|e| anyhow!("serialize migrated config: {e}"))?;
-    // Validated before it is written, for the same reason `edit` validates: a
-    // migration that produces an unparseable file has replaced a config the
-    // operator could fix with one they cannot read.
-    crate::derive::derive_standalone(&rendered).context("the migrated config does not parse")?;
-
-    if dry_run {
-        println!("\n{}(dry run; nothing written){}", palette.dim(), palette.reset());
-        return Ok(());
-    }
-    let backup = cfg_path.with_extension("toml.pre-migrate");
-    std::fs::copy(&cfg_path, &backup).map_err(|e| anyhow!("back up to {backup:?}: {e}"))?;
-    std::fs::write(&cfg_path, rendered).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
-    println!(
-        "\n{} migrated {} ({} moved); previous file kept at {}",
-        crate::ui::Mark::Did.render(&palette),
-        crate::ui::short_path(&cfg_path),
-        moves.len(),
-        crate::ui::short_path(&backup)
     );
     Ok(())
 }
