@@ -1,0 +1,69 @@
+//! What Gemma-4 binds.
+//!
+//! Ported from `driver/cuda/src/model/gemma4/gemma4_contract.hpp`. The only
+//! family the encode pipeline can scope a load to: an encode-scoped rank
+//! declares the vision and audio towers and nothing else, so it never
+//! allocates the language model — and because that is a *declaration* rather
+//! than a filter applied to a finished contract, the plan it compiles has no
+//! trace of the tensors it skipped.
+
+use pie_loader::contract::Expr;
+use pie_loader::error::Error;
+
+use crate::common::builder::{Builder, author_dense_contract};
+
+/// gemma4, gemma4_text.
+pub fn author_gemma4(b: &mut Builder<'_>) -> Result<(), Error> {
+    b.allow_encode_scope()?;
+    // The decoder is nested; the vision and audio towers are not, and they
+    // have `self_attn.q_proj.weight` of their own.
+    b.decoder_layer_prefix("model.language_model.layers.");
+    fold_router_scale(b)?;
+    author_dense_contract(b)
+}
+
+/// Fold `1/sqrt(H)` into Gemma-4's per-layer router scale.
+///
+/// The router pipeline is `rmsnorm_no_scale(x) * scale * (1/sqrt(H))`
+/// followed by a linear. Multiplying the two constants together at load time
+/// lets the forward collapse the first three steps into one
+/// rmsnorm-with-weight call, and `scale` is a `[H]` vector so the fold costs
+/// nothing to store.
+///
+/// `H` is read off the tensor rather than off the config: the fold has to
+/// use the same `H` the forward's rmsnorm does, and that one is this
+/// vector's length by construction.
+///
+/// **Rounding.** The kernel rounds to nearest-even; the host loop this
+/// replaced truncated, biasing every element down by up to one bf16 ULP. See
+/// the C++ header's note about re-recording bit-exact MoE baselines.
+///
+/// Scoped to `decoder_layer_prefix` for the reason the fused-projection pass
+/// is: Gemma-4 nests its decoder under the vision and audio towers, and a
+/// suffix match alone would fold a tower's tensor of the same name.
+fn fold_router_scale(b: &mut Builder<'_>) -> Result<(), Error> {
+    const SUFFIX: &str = ".router.scale";
+    // `tensors()` holds source names, so the bound prefix has to be mapped
+    // through `source_name` the way the fused-projection pass does.
+    let layers = b.source_name(b.decoder_layer_prefix_value());
+    for raw in b.tensors().to_vec() {
+        if !raw.name.starts_with(&layers) || !raw.name.ends_with(SUFFIX) {
+            continue;
+        }
+        if raw.shape.len() != 1 || raw.shape[0] <= 0 {
+            continue;
+        }
+        // Computed exactly as the forward would have: fp32 `sqrt`, then a
+        // reciprocal. Reordering this to `rsqrt` or to fp64 would change the
+        // last bit of every router logit.
+        let inv_sqrt_h = 1.0f32 / (raw.shape[0] as f32).sqrt();
+        b.define(
+            b.output_name(&raw.name),
+            Expr::src(&raw.name).scale(inv_sqrt_h),
+            raw.encoding.clone(),
+            Some(raw.shape.clone()),
+        );
+        b.consume(raw.id);
+    }
+    Ok(())
+}

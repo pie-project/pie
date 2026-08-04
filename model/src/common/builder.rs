@@ -22,11 +22,14 @@
 use std::collections::{HashMap, HashSet};
 
 use pie_loader::checkpoint::{CheckpointMetadata, RawTensor};
-use pie_loader::contract::{Expr, ModelContract, Scales, TensorContract};
+use pie_loader::contract::{
+    Expr, GroupContract, ModelContract, Scales, TensorContract, TensorType,
+};
 use pie_loader::error::Error;
 use pie_loader::plan::StorageTarget;
 use pie_loader::types::{
-    Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, ScaleForm, TensorId,
+    Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, ScaleForm,
+    TensorId, Visibility,
 };
 
 use super::facts::ModelFacts;
@@ -40,14 +43,14 @@ fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
 }
 
 /// The dtype a consumer sees, whatever the storage format is.
-fn logical_dtype(encoding: &Encoding) -> DType {
+pub(crate) fn logical_dtype(encoding: &Encoding) -> DType {
     match encoding {
         Encoding::Raw(dtype) => *dtype,
         Encoding::Quant(spec) => spec.logical_dtype,
     }
 }
 
-fn is_raw(encoding: &Encoding, dtype: DType) -> bool {
+pub(crate) fn is_raw(encoding: &Encoding, dtype: DType) -> bool {
     matches!(encoding, Encoding::Raw(have) if *have == dtype)
 }
 
@@ -102,7 +105,8 @@ fn runtime_quantizable_name(name: &str, scheme: QuantScheme) -> bool {
         || probe::is_expert_projection(name)
 }
 
-struct FusedCandidate<'a> {
+/// A dense join a family pass proposes; see [`Builder::fused_join_candidate`].
+pub struct FusedCandidate<'a> {
     output_name: String,
     /// The source tensors, in join order.
     parts: Vec<&'a RawTensor>,
@@ -123,7 +127,7 @@ pub struct Builder<'a> {
 
     source_prefix: String,
     decoder_layer_prefix: String,
-    shard_axis_fn: fn(&str) -> Option<u8>,
+    shard_axis_fn: fn(&str) -> Result<Option<u8>, Error>,
     extra_join_modules: Vec<String>,
     shard_embed_tokens: bool,
     replicate_lm_head: bool,
@@ -162,7 +166,7 @@ impl<'a> Builder<'a> {
             },
             source_prefix: String::new(),
             decoder_layer_prefix: "model.layers.".to_string(),
-            shard_axis_fn: probe::hf_shard_axis,
+            shard_axis_fn: default_shard_axis,
             extra_join_modules: Vec::new(),
             shard_embed_tokens: false,
             replicate_lm_head: false,
@@ -187,8 +191,19 @@ impl<'a> Builder<'a> {
         self.mxfp4_moe
     }
 
+    /// What the caller asked for, before any rule was applied. Only an
+    /// author with a reason to disagree with the device rule needs this.
+    pub fn mxfp4_moe_request(&self) -> Mxfp4MoeRequest {
+        self.policy.moe_request
+    }
+
     pub fn stream_routed_experts(&self) -> bool {
         self.policy.stream_routed_experts
+    }
+
+    /// The per-family switches the caller resolved from its environment.
+    pub fn knobs(&self) -> &super::policy::FamilyKnobs {
+        &self.policy.knobs
     }
 
     pub fn tensors(&self) -> &[&'a RawTensor] {
@@ -225,6 +240,11 @@ impl<'a> Builder<'a> {
         self.decoder_layer_prefix = prefix.to_string();
     }
 
+    /// The prefix set above, for passes that filter `tensors()` by it.
+    pub fn decoder_layer_prefix_value(&self) -> &str {
+        &self.decoder_layer_prefix
+    }
+
     /// Adopt whichever of `candidates` the checkpoint names layer 0 with.
     /// Order is preference: the first candidate the checkpoint uses wins.
     pub fn decoder_layer_prefix_any_of(&mut self, candidates: &[&str]) {
@@ -244,7 +264,7 @@ impl<'a> Builder<'a> {
     /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to
     /// the HF convention; a family whose checkpoint names the same operator
     /// differently registers its own.
-    pub fn shard_axis_fn(&mut self, f: fn(&str) -> Option<u8>) {
+    pub fn shard_axis_fn(&mut self, f: fn(&str) -> Result<Option<u8>, Error>) {
         self.shard_axis_fn = f;
     }
 
@@ -338,7 +358,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Partition an expression and its shape across ranks along `axis`.
-    fn shard(&self, expr: Expr, mut shape: Vec<i64>, axis: Option<u8>) -> (Expr, Vec<i64>) {
+    pub fn shard(&self, expr: Expr, mut shape: Vec<i64>, axis: Option<u8>) -> (Expr, Vec<i64>) {
         let world = i64::from(self.target.tp_size);
         let Some(axis) = axis else {
             return (expr, shape);
@@ -353,16 +373,16 @@ impl<'a> Builder<'a> {
         (expr.shard(axis), shape)
     }
 
-    fn shard_axis(&self, name: &str) -> Option<u8> {
+    pub fn shard_axis(&self, name: &str) -> Result<Option<u8>, Error> {
         if self.target.tp_size <= 1 {
-            return None;
+            return Ok(None);
         }
         // Shard embed_tokens on axis 0 to save per-rank memory.
         if self.shard_embed_tokens && name.ends_with(".embed_tokens.weight") {
-            return Some(0);
+            return Ok(Some(0));
         }
         if self.replicate_lm_head && name.ends_with(".lm_head.weight") {
-            return None;
+            return Ok(None);
         }
         // A companion scale splits exactly like the weight it scales, so ask
         // about the weight — here, once, before the family's own rule is
@@ -375,8 +395,10 @@ impl<'a> Builder<'a> {
             ".scale",
         ] {
             if let Some(base) = name.strip_suffix(suffix) {
-                let of_weight = (self.shard_axis_fn)(&format!("{base}.weight"));
-                return of_weight.or_else(|| (self.shard_axis_fn)(base));
+                return match (self.shard_axis_fn)(&format!("{base}.weight"))? {
+                    Some(axis) => Ok(Some(axis)),
+                    None => (self.shard_axis_fn)(base),
+                };
             }
         }
         (self.shard_axis_fn)(name)
@@ -473,7 +495,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Publish a source tensor under `output`, sharded per its name's rule.
-    fn push_direct(
+    pub fn push_direct(
         &mut self,
         raw: &RawTensor,
         output: String,
@@ -495,6 +517,40 @@ impl<'a> Builder<'a> {
             Some(shape),
         );
         self.consumed.insert(raw.id);
+    }
+
+    /// Publish `src` under `output`, relaid out by `layout`.
+    ///
+    /// `src` is an expression, not a name, because the selection a kernel
+    /// used to carry as integers — this rank's rows, the interleaved half,
+    /// the column band — is stated in the algebra now. `consume` the
+    /// checkpoint tensor separately if the generic tail should not republish
+    /// it.
+    pub fn push_repack(
+        &mut self,
+        output: String,
+        src: Expr,
+        layout: RepackLayout,
+        encoding: Encoding,
+        shape: Vec<i64>,
+    ) -> Option<usize> {
+        let node = src.repack(layout, TensorType::new(shape.clone(), encoding.clone()));
+        self.define(output, node, encoding, Some(shape))
+    }
+
+    /// Keep a published declaration out of the driver's namespace.
+    pub fn mark_internal(&mut self, index: usize) {
+        self.contract.tensors[index].visibility = Visibility::Internal;
+    }
+
+    /// Declare that entry `index` holds the scales for `of`.
+    pub fn set_scales(&mut self, index: usize, scales: Scales) {
+        self.contract.tensors[index].scales = Some(scales);
+    }
+
+    /// Add a grid of interchangeable tensor sets, written once.
+    pub fn push_group(&mut self, group: GroupContract) {
+        self.contract.groups.push(group);
     }
 
     // -- shared passes -------------------------------------------------------
@@ -641,7 +697,7 @@ impl<'a> Builder<'a> {
         self.publish_fused(chosen)
     }
 
-    fn fused_join_candidate(
+    pub fn fused_join_candidate(
         &self,
         output_name: String,
         inputs: &[String],
@@ -672,7 +728,7 @@ impl<'a> Builder<'a> {
         })
     }
 
-    fn publish_fused(&mut self, candidates: Vec<FusedCandidate<'a>>) -> Result<(), Error> {
+    pub fn publish_fused(&mut self, candidates: Vec<FusedCandidate<'a>>) -> Result<(), Error> {
         for candidate in candidates {
             // A join is only a fusion of the GEMM if every part is
             // distributed the same way. Column-parallel parts (q/k/v,
@@ -683,7 +739,7 @@ impl<'a> Builder<'a> {
             let mut all_sharded = true;
             let mut all_replicated = true;
             for raw in &candidate.parts {
-                let axis = self.shard_axis(&raw.name);
+                let axis = self.shard_axis(&raw.name)?;
                 let row_sharded = axis == Some(0);
                 all_sharded = all_sharded && row_sharded;
                 all_replicated = all_replicated && axis.is_none();
@@ -770,7 +826,7 @@ impl<'a> Builder<'a> {
                     self.push_runtime_quant(raw, raw.name.clone(), scheme)?;
                 }
                 _ => {
-                    let axis = self.shard_axis(&raw.name);
+                    let axis = self.shard_axis(&raw.name)?;
                     let defined = self.push_direct(raw, self.output_name(&raw.name), axis)?;
                     self.state_shipped_block_scales(raw, defined, scheme);
                 }
@@ -948,7 +1004,7 @@ impl<'a> Builder<'a> {
                 return fail(format!("unsupported runtime_quant scheme {other:?}"));
             }
         };
-        let axis = self.shard_axis(&raw.name);
+        let axis = self.shard_axis(&raw.name)?;
         let (expr, shape) = self.shard(Expr::src(&raw.name), raw.shape.clone(), axis);
         let encoding = Encoding::Quant(spec);
         self.define(output, expr.cast(encoding.clone()), encoding, Some(shape));
@@ -971,4 +1027,44 @@ pub fn author_dense_contract(b: &mut Builder<'_>) -> Result<(), Error> {
     b.fused_moe_gate_up_tp_slices(false)?;
     b.dense_fused_projection_joins()?;
     b.publish_remaining()
+}
+
+/// The default shard-axis rule: the HF convention, which never errors.
+///
+/// A family rule may error — DeepSeek-V4 refuses to let an unrecognized FFN
+/// weight silently replicate — so the pointer type is fallible and the
+/// default wraps the infallible convention.
+pub fn default_shard_axis(name: &str) -> Result<Option<u8>, Error> {
+    Ok(probe::hf_shard_axis(name))
+}
+
+/// The MXFP4 encoding every GPT-OSS expert tensor is declared with.
+pub fn mxfp4_encoding(channel_axis: u8) -> Encoding {
+    Encoding::Quant(QuantSpec {
+        scheme: QuantScheme::Mxfp4E2M1E8M0,
+        logical_dtype: DType::BF16,
+        bits_per_element: 4,
+        // One MXFP4 block scale covers 32 contiguous elements along K.
+        group_size: 32,
+        channel_axis: Some(Axis(channel_axis)),
+    })
+}
+
+/// The W4A16 pairing Kimi ships: 4-bit codes biased by 8, eight to a word.
+pub fn int4b8_encoding(channel_axis: u8) -> Encoding {
+    Encoding::Quant(QuantSpec {
+        scheme: QuantScheme::Int4B8,
+        logical_dtype: DType::BF16,
+        bits_per_element: 4,
+        group_size: 32,
+        channel_axis: Some(Axis(channel_axis)),
+    })
+}
+
+/// Round `value` up to a multiple of `alignment`.
+pub fn align_up(value: i64, alignment: i64) -> Result<i64, Error> {
+    if value < 0 || alignment <= 0 {
+        return fail("contract: align_up needs a non-negative value and a positive alignment");
+    }
+    Ok((value + alignment - 1) / alignment * alignment)
 }

@@ -31,14 +31,24 @@ pub mod instruct;
 pub mod multimodal;
 
 // The families, one directory per lineage.
+#[cfg(feature = "contract")]
+pub mod csm;
+#[cfg(feature = "contract")]
+pub mod deepseek_v4;
 pub mod gemma;
+#[cfg(feature = "contract")]
+pub mod glm5;
 pub mod gptoss;
 pub mod kimi;
 pub mod llama;
 pub mod mistral;
+#[cfg(feature = "contract")]
+pub mod nemotron_h;
 pub mod olmo;
 pub mod phi;
 pub mod qwen3;
+#[cfg(feature = "contract")]
+pub mod qwen3_5;
 pub mod r1;
 
 use instruct::Instruct;

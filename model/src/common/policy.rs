@@ -108,6 +108,59 @@ pub enum Naming {
     Mlx,
 }
 
+/// Env-gated per-family switches, mirrored from the driver during the
+/// migration.
+///
+/// Each of these is a `getenv` in the C++ driver today; the *reading* of the
+/// environment stays the caller's business (the driver or the CLI fills this
+/// struct), so an author never consults the environment itself and two calls
+/// with equal inputs cannot author different contracts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FamilyKnobs {
+    /// `PIE_GLM5_MOE_FLASHINFER` (default on): publish each GLM-5.2 expert's
+    /// halves as `[up | gate]`, the order flashinfer's CUTLASS grouped GEMM
+    /// reads fc1 in.
+    pub glm5_moe_gate_up_swapped: bool,
+    /// `PIE_QWEN35_FUSED_GDN_PROJ` (default off): publish the GDN qkv
+    /// projection as the first leg of a fused `in_proj_qkvz`.
+    pub qwen35_fused_gdn_projection: bool,
+    /// `PIE_QWEN35_MTP_INT8_LM_HEAD` (default off): give the speculative
+    /// head an int8 view of `lm_head` beside the main path's bf16.
+    pub qwen35_mtp_int8_lm_head: bool,
+    /// `PIE_QWEN35_MOE_FLASHINFER` (default on): publish MoE fc1 halves in
+    /// the `[up | gate]` order flashinfer's CUTLASS grouped GEMM reads.
+    pub qwen35_moe_gate_up_swapped: bool,
+    /// `PIE_QWEN35_FUSED_SHARED_SCALAR_GATE` (default off): fold the shared
+    /// expert's scalar gate row into its fused gate/up slab.
+    pub qwen35_fused_shared_scalar_gate: bool,
+    /// `PIE_KIMI_K3_MOE_FLASHINFER` (default off): the same fc1 reorder for
+    /// Kimi-K3's dequantized expert stacks.
+    pub kimi_k3_moe_gate_up_swapped: bool,
+    /// `PIE_KIMI_MOE_FLASHINFER` (default off): publish Kimi's stacked
+    /// expert halves as `[up | gate]` for flashinfer's grouped GEMM.
+    pub kimi_moe_gate_up_swapped: bool,
+    /// `PIE_NEMOTRON_DISABLE_TP_MAMBA_SHARD` inverted (default on): split
+    /// the Mamba mixers across ranks. A kill switch for bisecting a
+    /// numerical regression; flipping it changes the contract and therefore
+    /// re-plans.
+    pub nemotron_tp_mamba_sharding: bool,
+}
+
+impl Default for FamilyKnobs {
+    fn default() -> Self {
+        Self {
+            glm5_moe_gate_up_swapped: true,
+            qwen35_fused_gdn_projection: false,
+            qwen35_mtp_int8_lm_head: false,
+            qwen35_moe_gate_up_swapped: true,
+            qwen35_fused_shared_scalar_gate: false,
+            kimi_k3_moe_gate_up_swapped: false,
+            kimi_moe_gate_up_swapped: false,
+            nemotron_tp_mamba_sharding: true,
+        }
+    }
+}
+
 /// Everything one authoring call was decided by.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Policy {
@@ -123,4 +176,6 @@ pub struct Policy {
     /// Stream routed experts from the artifact instead of materializing them
     /// resident — the driver's paging mode for MoE weights.
     pub stream_routed_experts: bool,
+    /// Per-family switches; see [`FamilyKnobs`].
+    pub knobs: FamilyKnobs,
 }

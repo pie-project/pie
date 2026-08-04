@@ -39,6 +39,38 @@ pub fn author(
         }
         "mistral3" | "ministral3" | "olmo2" | "olmo3" => crate::llama::contract::author_dense,
         "phi3" => crate::llama::contract::author_phi3,
+        // ── Mixtral family: plain Mixtral needs nothing beyond the dense
+        //    rules; GPT-OSS is its own author (MXFP4 expert triplets).
+        "mixtral" => crate::llama::contract::author_dense,
+        "gpt_oss" => crate::gptoss::contract::author_gpt_oss,
+        // ── Gemma-4: nested decoder, router-scale fold, encode scoping.
+        "gemma4" | "gemma4_text" => crate::gemma::contract::author_gemma4,
+        // ── GLM-5.1: FP8 kv_b_proj dequant + per-expert stacks.
+        "glm_moe_dsa" => crate::glm5::contract::author_glm5,
+        // ── CSM: fp32 checkpoints, bf16 kernels.
+        "csm" => crate::csm::contract::author_csm,
+        // ── Qwen3.5 hybrids: GDN blocked shards; the MoE members add the
+        //    shared-expert join and per-expert stacks.
+        "qwen3_5" | "qwen3_5_text" => crate::qwen3_5::contract::author_qwen3_5,
+        // Qwen3-VL binds the plain Qwen3 text tower; its contract is the
+        // generic dense one, not the hybrid's.
+        "qwen3_vl" | "qwen3_vl_text" => crate::llama::contract::author_dense,
+        "qwen3_moe" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
+            crate::qwen3_5::contract::author_qwen3_5_moe
+        }
+        // ── Nemotron-H: Mamba2 mixers sharded band-by-band, packed experts.
+        "nemotron_h" => crate::nemotron_h::contract::author_nemotron_h,
+        // ── MLA lineage: DeepSeek-V2/V3 plain; Kimi-K2 adds the prefix,
+        //    the embed/lm_head memory trade, and the W4A16 expert stacks.
+        "deepseek_v2" | "deepseek_v3" => crate::kimi::contract::author_deepseek_mla,
+        "kimi_k2" => crate::kimi::contract::author_kimi,
+        "kimi_k3" => crate::kimi::contract_k3::author_kimi_k3,
+        // ── DeepSeek-V4: own shard rule, MXFP4 expert stacks or groups.
+        "deepseek_v4" => crate::deepseek_v4::contract::author_deepseek_v4,
+        // ── Gemma 2/3/3n bind the generic dense contract.
+        "gemma2" | "gemma3" | "gemma3_text" | "gemma3n" | "gemma3n_text" => {
+            crate::llama::contract::author_dense
+        }
         _ => return Ok(None),
     };
     let mut builder = Builder::new(metadata, facts, target, policy);
