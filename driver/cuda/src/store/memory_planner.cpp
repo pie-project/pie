@@ -258,15 +258,6 @@ int prefill_candidate_cap(const cudaDeviceProp& prop) {
     return prop.major >= 12 ? 16384 : 8192;
 }
 
-int forced_prefill_tokens() {
-    static const int tokens = [] {
-        const char* v = std::getenv("PIE_CUDA_PREFILL_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 0;
-        return std::max(0, std::atoi(v));
-    }();
-    return tokens;
-}
-
 
 }  // namespace
 
@@ -373,7 +364,7 @@ CudaMemoryPlan plan_cuda_memory(
         global_per_kv_token_bytes >= 192ull * 1024ull;
     const int auto_decode_target =
         std::min(kv_heavy_auto_model ? 256 : 512, throughput_decode_target);
-    const int forced_prefill = forced_prefill_tokens();
+    constexpr int forced_prefill = 0;
     // Qwen3-8B on L40-class TP1 has a measured prefill-shape knee above the
     // generic 8k cap: 12k keeps the initial 512-request prompt wave in a
     // faster two-chunk cadence without shrinking decode residency below R=512.

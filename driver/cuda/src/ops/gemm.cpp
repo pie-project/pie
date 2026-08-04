@@ -1676,15 +1676,7 @@ class DequantWeightCache {
     // Public only so `per_device_singleton` can build one per device; the
     // instance is still reached exclusively through `instance()`.
     DequantWeightCache() {
-        const char* v = std::getenv("PIE_FP8_DEQUANT_CACHE_GB");
-        if (v != nullptr && v[0] != '\0') {
-            const double gb = std::atof(v);
-            budget_ = gb > 0.0
-                ? static_cast<std::size_t>(gb * 1024.0 * 1024.0 * 1024.0)
-                : 0;
-            return;
-        }
-        // Self-tuning default. The singleton is built on the first FP8 GEMM,
+        // Self-tuning. The singleton is built on the first FP8 GEMM,
         // i.e. after the KV arena is sized, so "free" here is real headroom.
         // A quarter of it is enough for every block-FP8 weight in the models
         // we serve without competing with activations or graph memory.

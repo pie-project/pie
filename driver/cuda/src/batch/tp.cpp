@@ -319,13 +319,7 @@ struct TpStallWatchdog {
     std::atomic<std::uint64_t> rank0_phase_seq{0};
     std::atomic<bool> running{false};
     std::thread thread;
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_TP_WATCHDOG");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
+    static constexpr bool enabled() { return false; }
     static TpStallWatchdog& instance() {
         static TpStallWatchdog w;
         return w;
