@@ -744,16 +744,11 @@ bool forward_graph_replay_eligible(
     // occur anyway.)
 }
 
-// The unionized supergraph gate: DEFAULT ON since the width batteries
-// (multi-R + all five deployments, byte-identical A/B) went green —
-// PIE_SUPERGRAPH=0 disarms it. Fires outside the union (hooks, lora,
-// score-wanting, windowed, prefill-shaped) take their existing paths
-// untouched; the gate only reroutes union-eligible decode fires.
-// NS-2 (the spatial mask fire): eager-first gate, default OFF until the
-// ladder's batteries pass. When armed, a hook-free lora-free masked
-// pure-decode fire with a planned 0 < unmasked prefix < R splits its
-// attention: decode kernel over the prefix, custom kernel over the
-// rebased suffix. Such fires run EAGER for now (NS-3 windows the arms).
+// NS-2 (the spatial mask fire), DEFAULT ON since the ladder's sweep: a
+// hook-free lora-free masked pure-decode fire with a planned unmasked
+// prefix splits its attention — decode kernel over the prefix, custom
+// kernel over the rebased suffix — and captures/replays in split-keyed
+// execs (NS-3). PIE_SPATIAL_MASK=0 disarms.
 static bool spatial_mask_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_SPATIAL_MASK");
@@ -762,10 +757,22 @@ static bool spatial_mask_enabled() {
     return on;
 }
 
+// The unionized supergraph gate: RETIRED BY PROMOTION (NS-5). The
+// union's one live axis was the mask, and the spatial mask fire now
+// serves every plannable masked pure-decode composition by row window
+// inside ONE fire — no fire can arm the union's mask conditional
+// anymore, so the two-path exec reduces to the plain graph plus dead
+// capture weight (dual-prepare, re-key, pred upload). Default OFF;
+// PIE_SUPERGRAPH=1 re-arms it for study. The MACHINERY stays: the
+// SupergraphBuilder (capture-time conditional insertion, device
+// predicate words, handle scope rules) is exactly what the IR's
+// STRUCTURAL class needs when a genuinely different-operator axis
+// (spec verify, early exit) lands — at region granularity, per the
+// measured 250us floor.
 static bool supergraph_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_SUPERGRAPH");
-        return v == nullptr || v[0] != '0';
+        return v != nullptr && v[0] == '1';
     }();
     return on;
 }
