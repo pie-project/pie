@@ -1699,6 +1699,55 @@ std::vector<WeightBind> weight_binds(
         weights.push_back(
             {(std::uint8_t)bind::RmsResidual::W, prefix + "post_feedforward_layernorm.weight"});
         break;
+    // ── Gemma 4's mixture ──
+    // The routed branch sits BESIDE the dense FFN rather than replacing it, so
+    // the layer carries five norms and both branches' projections. mlx-lm's
+    // suffixes are `_1` for the dense branch's closing norm and `_2` for the
+    // routed one's pair; they are numbered, not named, so the switch is the
+    // only place the mapping is written down.
+    case Kernel::G4RouterNorm:
+        weights.push_back({(std::uint8_t)bind::Rms::W, prefix + "router.scale"});
+        break;
+    case Kernel::G4MoeNorm:
+        weights.push_back(
+            {(std::uint8_t)bind::Rms::W, prefix + "pre_feedforward_layernorm_2.weight"});
+        break;
+    case Kernel::G4DenseBranchNorm:
+        weights.push_back(
+            {(std::uint8_t)bind::Rms::W, prefix + "post_feedforward_layernorm_1.weight"});
+        break;
+    case Kernel::G4MoeBranchNorm:
+        weights.push_back(
+            {(std::uint8_t)bind::Rms::W, prefix + "post_feedforward_layernorm_2.weight"});
+        break;
+    case Kernel::G4Router:
+        push_quant(weights, prefix + "router.proj");
+        break;
+    // A WEIGHT on the top-k kernel, which is otherwise weightless: gemma 4
+    // rescales the selected softmax by a learned per-expert gain. The slot is
+    // the one after `Params`, which is what `router_topk_scaled` declares.
+    case Kernel::G4RouterTopK:
+        weights.push_back({(std::uint8_t)bind::GoRouterTopK::Params + 1,
+                           prefix + "router.per_expert_scale"});
+        break;
+    // One stacked tensor per projection, indexed by the routing -- `switch_glu`
+    // is mlx-lm's name for the stack, not a third module.
+    case Kernel::G4ExpertGate:
+        push_expert(weights, prefix + "experts.switch_glu.gate_proj");
+        break;
+    case Kernel::G4ExpertUp:
+        push_expert(weights, prefix + "experts.switch_glu.up_proj");
+        break;
+    case Kernel::G4ExpertDown:
+        push_expert(weights, prefix + "experts.switch_glu.down_proj");
+        break;
+    // Weightless: they move rows and sum them.
+    case Kernel::G4MoeSort:
+    case Kernel::G4MoeGather:
+    case Kernel::G4ExpertGeglu:
+    case Kernel::G4ExpertCombine:
+    case Kernel::G4BranchAdd:
+        break;
     // ── GPT-OSS ──
     // The embedding and the head are separate tensors here, and every
     // projection carries an additive bias at slot 7 alongside its quantized

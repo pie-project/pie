@@ -13,6 +13,7 @@ fewer names than this does; cosine_bisect skips whatever only one side has.
 
 Usage: gemma4_mlx_taps.py <model_path> <comma_token_ids> <out_dir>
 """
+import os
 import sys
 
 import mlx.core as mx
@@ -33,18 +34,26 @@ def main():
     h = m.embed_tokens(x) * m.embed_scale
     dump("embed", h)
 
-    ple_tok = m.embed_tokens_per_layer(x) * m.embed_tokens_per_layer_scale
-    dump("ple_tok", ple_tok)
-    ple_tok = mx.unflatten(ple_tok, -1, (cfg.num_hidden_layers, m.hidden_size_per_layer_input))
+    # The PLE stream is optional. E2B/E4B carry it; the 26B mixture sets
+    # `hidden_size_per_layer_input` to 0 and has none of these modules, so
+    # reaching for them is an AttributeError rather than an empty tensor.
+    has_ple = bool(getattr(m, "hidden_size_per_layer_input", 0))
+    ple = None
+    if has_ple:
+        ple_tok = m.embed_tokens_per_layer(x) * m.embed_tokens_per_layer_scale
+        dump("ple_tok", ple_tok)
+        ple_tok = mx.unflatten(
+            ple_tok, -1, (cfg.num_hidden_layers, m.hidden_size_per_layer_input))
 
-    ple_proj = m.per_layer_model_projection(h) * m.per_layer_projection_scale
-    dump("ple_proj", ple_proj)
-    ple_proj = mx.unflatten(ple_proj, -1, (cfg.num_hidden_layers, m.hidden_size_per_layer_input))
-    ple_proj = m.per_layer_projection_norm(ple_proj)
-    dump("ple_projnorm", ple_proj)
+        ple_proj = m.per_layer_model_projection(h) * m.per_layer_projection_scale
+        dump("ple_proj", ple_proj)
+        ple_proj = mx.unflatten(
+            ple_proj, -1, (cfg.num_hidden_layers, m.hidden_size_per_layer_input))
+        ple_proj = m.per_layer_projection_norm(ple_proj)
+        dump("ple_projnorm", ple_proj)
 
-    ple = (ple_proj + ple_tok) * m.per_layer_input_scale
-    dump("ple", ple)
+        ple = (ple_proj + ple_tok) * m.per_layer_input_scale
+        dump("ple", ple)
 
     # ── the stack ──
     # Position 0 of an empty cache: the causal mask is a no-op for one token, and
@@ -66,9 +75,12 @@ def main():
 
         if at.has_kv:
             k = at.k_proj(cur).reshape(B, S, at.n_kv_heads, hd)
-            v = at.v_proj(cur).reshape(B, S, at.n_kv_heads, hd)
             dump(f"{il}.k_proj", k)
-            dump(f"{il}.v_proj", v)
+            # K-eq-V: the full-attention layers of the 26B mixture ship no
+            # `v_proj` and take V from the k projection BEFORE k-norm and rope.
+            v = k if at.use_k_eq_v else at.v_proj(cur).reshape(B, S, at.n_kv_heads, hd)
+            if not at.use_k_eq_v:
+                dump(f"{il}.v_proj", v)
             k = at.k_norm(k)
             dump(f"{il}.k_norm", k)
             k = at.rope(k.transpose(0, 2, 1, 3))
@@ -94,6 +106,7 @@ def main():
         h = h + o
         dump(f"{il}.attn_resid", h)
 
+        resid = h
         cur = layer.pre_feedforward_layernorm(h)
         dump(f"{il}.ffn_norm", cur)
         gate = layer.mlp.gate_proj(cur)
@@ -104,10 +117,52 @@ def main():
         dump(f"{il}.geglu", act)
         d = layer.mlp.down_proj(act)
         dump(f"{il}.down_proj", d)
+
+        # The mixture sits BESIDE the dense FFN rather than replacing it: both
+        # branches read the post-attention residual, each closes with its own
+        # norm, and the sum goes through the layer's shared closing norm.
+        if getattr(layer, "enable_moe", False):
+            d = layer.post_feedforward_layernorm_1(d)
+            dump(f"{il}.g4_dense_br", d)
+
+            r = layer.router
+            rn = mx.fast.rms_norm(h, r.scale * r._root_size, r.eps)
+            dump(f"{il}.g4_router_n", rn)
+            scores = r.proj(rn)
+            dump(f"{il}.g4_router", scores)
+            if os.environ.get("PIE_TIEBREAK"):
+                # The router's scores are bf16 over 128 experts, so exact ties
+                # at the top-k boundary are common -- and mlx's `argpartition`
+                # breaks them by an order nothing defines. When the point is to
+                # compare ARITHMETIC, ties are noise: this takes the lowest
+                # index, which is what the driver's top-k does.
+                k = r.config.top_k_experts
+                idx = mx.argsort(-scores.astype(mx.float32), axis=-1)[..., :k]
+                w = mx.softmax(mx.take_along_axis(
+                    scores.astype(mx.float32), idx, axis=-1), axis=-1)
+                w = w * r.per_expert_scale[idx]
+            else:
+                idx, w = r(h)
+
+            h2 = layer.pre_feedforward_layernorm_2(h)
+            dump(f"{il}.g4_moe_n", h2)
+            h2 = layer.experts(h2, idx, w)
+            dump(f"{il}.g4_moe_out", h2)
+            h2 = layer.post_feedforward_layernorm_2(h2)
+            dump(f"{il}.g4_moe_br", h2)
+
+            d = d + h2
+            dump(f"{il}.g4_branches", d)
+
         d = layer.post_feedforward_layernorm(d)
         dump(f"{il}.ffn_postnorm", d)
-        h = h + d
+        h = resid + d
         dump(f"{il}.ffn_resid", h)
+
+        if not has_ple:
+            h = h * layer.layer_scalar
+            dump(f"{il}.layer_out", h)
+            continue
 
         g = layer.per_layer_input_gate(h)
         dump(f"{il}.ple_gate", g)

@@ -117,7 +117,7 @@ bool g4_tap_for(const gemma4::Dispatch& d, const Gemma4Geometry& g, G4Tap& out) 
     const int L = d.layer;
     const int hd = L >= 0 ? g.head_dim_of(L) : g.head_dim;
     const int q_dim = g.n_q_heads * hd;
-    const int kv_dim = g.n_kv_heads * hd;
+    const int kv_dim = g.n_kv_heads_of(L) * hd;
     const int inter = L >= 0 ? g.intermediate_of(L) : g.intermediate;
     const int ple_all = g.n_layers * g.per_layer_emb_dim;
     switch (d.kind) {
@@ -132,7 +132,11 @@ bool g4_tap_for(const gemma4::Dispatch& d, const Gemma4Geometry& g, G4Tap& out) 
         case K::QmvV:             out = {"v_proj", 4, kv_dim};           return true;
         case K::QNorm:            out = {"q_norm", 2, q_dim};            return true;
         case K::KNorm:            out = {"k_norm", 2, kv_dim};           return true;
-        case K::VNorm:            out = {"v_norm", 1, kv_dim};           return true;
+        case K::VNorm:
+        // The k-eq-V layers take V from the k projection BEFORE k-norm, so this
+        // is the same tensor under the same name -- the oracle publishes one
+        // `v_norm` per layer either way.
+        case K::VNormFromK:       out = {"v_norm", 1, kv_dim};           return true;
         case K::RopeQ:            out = {"rope_q", 0, q_dim};            return true;
         case K::RopeK:            out = {"rope_k", 0, kv_dim};           return true;
         case K::Sdpa:             out = {"sdpa", 3, q_dim};              return true;
@@ -144,6 +148,16 @@ bool g4_tap_for(const gemma4::Dispatch& d, const Gemma4Geometry& g, G4Tap& out) 
         case K::GegluTanh:        out = {"geglu", 2, inter};             return true;
         case K::QmvDown:          out = {"down_proj", 4, g.hidden};      return true;
         case K::PostFfnResidual:  out = {"ffn_resid", 2, g.hidden};      return true;
+        // ── the mixture, in TOKEN order ──
+        // The sorted tensors are deliberately untapped: their row order is the
+        // driver's own, so a dump of them would diff against nothing.
+        case K::DenseBranchNorm:  out = {"g4_dense_br", 2, g.hidden};    return true;
+        case K::RouterNorm:       out = {"g4_router_n", 2, g.hidden};    return true;
+        case K::RouterGemv:       out = {"g4_router", 4, g.n_experts};   return true;
+        case K::MoeNorm:          out = {"g4_moe_n", 2, g.hidden};       return true;
+        case K::ExpertCombine:    out = {"g4_moe_out", 2, g.hidden};     return true;
+        case K::MoeBranchNorm:    out = {"g4_moe_br", 2, g.hidden};      return true;
+        case K::BranchAdd:        out = {"g4_branches", 2, g.hidden};    return true;
         case K::PleGateGemv:      out = {"ple_gate", 4, g.per_layer_emb_dim}; return true;
         case K::PleGeglu:         out = {"ple_act", 2, g.per_layer_emb_dim};  return true;
         case K::PleProjLayerGemv: out = {"ple_back", 4, g.hidden};       return true;
@@ -164,24 +178,29 @@ bool g4_tap_for(const gemma4::Dispatch& d, const Gemma4Geometry& g, G4Tap& out) 
 /// vocabulary-wide, and only the tail runs at `head_rows`; everything else is
 /// hidden- or PLE-table-wide over every row.
 std::vector<std::size_t> g4_pool_elems(const std::vector<gemma4::Dispatch>& dag,
-                                       const Gemma4Geometry& g,
+                                       const gemma4::ScratchPlan& plan, const Gemma4Geometry& g,
                                        const gemma4::ScratchColoring& col, int rows,
                                        int head_rows) {
+    const std::vector<gemma4::ValueExtent> ext = gemma4::gemma4_value_extents(dag, plan, g);
     std::vector<std::size_t> elems(std::size_t(col.colors_used), 0);
-    for (std::size_t di = 0; di < dag.size() && di < col.per_dispatch.size(); ++di) {
-        G4Tap t{};
-        if (!g4_tap_for(dag[di], g, t)) continue;
+    // Per VALUE, not per dispatch. Sizing by dispatch takes the widest of a
+    // dispatch's buffers and applies it to all of them, which for the mixture
+    // means the sorted stack's height lands on every dense tensor sharing the
+    // dispatch -- under a golden dump's no-recycle colouring that asked for
+    // 20 GB and the heap refused it.
+    for (const gemma4::Use& u : plan.uses) {
+        if (!u.is_write) continue;
+        if (u.value < 0 || std::size_t(u.value) >= col.color_of_value.size()) continue;
+        const int c = col.color_of_value[std::size_t(u.value)];
+        if (c < 0 || c >= col.colors_used) continue;
+        const gemma4::ValueExtent& e = ext[std::size_t(u.value)];
         // The tail's tensors have one row per SAMPLED row; the body's have one
-        // per token.
-        const bool tail = gemma4::is_tail(dag[di].kind);
-        const std::size_t need =
-            std::size_t(tail ? head_rows : rows) * std::size_t(t.width);
-        for (const auto& sb : col.per_dispatch[di]) {
-            if (sb.color < 0 || sb.color >= col.colors_used) continue;
-            // Every buffer of the dispatch, not only its output: an input read
-            // at this width must be at least this wide too.
-            elems[std::size_t(sb.color)] = std::max(elems[std::size_t(sb.color)], need);
-        }
+        // per token; the expert stack one per (token, slot) pair, tile-padded.
+        const bool tail = gemma4::is_tail(dag[std::size_t(u.index)].kind);
+        const int n = e.rows_are_sorted != 0 ? gemma4::gemma4_moe_sorted_rows(g, rows)
+                                             : (tail ? head_rows : rows);
+        elems[std::size_t(c)] =
+            std::max(elems[std::size_t(c)], std::size_t(n) * std::size_t(e.elems));
     }
     for (std::size_t& e : elems) {
         if (e == 0) e = std::size_t(rows) * std::size_t(g.hidden);
@@ -283,10 +302,18 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         try {
             const auto storage = load_plan.view();
             auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
+            ExpertSlabRequest slab_req;
+            if (cfg.expert_slab_bytes > 0 && g_.is_moe() && g_.n_experts > 1) {
+                slab_req.n_experts = g_.n_experts;
+                slab_req.budget_bytes = cfg.expert_slab_bytes;
+            }
             StagedWeights staged = stage_plan_weights(
                 ctx, std::move(view), load_plan, storage.memory.persistent_bytes,
-                stream_predicate(cfg.stream_routed_experts));
+                stream_predicate(cfg.stream_routed_experts || slab_req.valid(),
+                                 slab_req.valid()),
+                slab_req);
             b_.weights = std::move(staged.weights);
+            slab_ = std::move(staged.slab);
             // Whatever the weights point into -- the pack, or the checkpoint's
             // own mapping -- must outlive them; see the
             // gpt-oss engine below.
@@ -294,6 +321,25 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging gemma4's weights: ") + e.what();
             return false;
+        }
+
+        // The dense FFN's format, read off the checkpoint rather than the
+        // config: mlx-lm's quantization predicate can single out tensors by
+        // NAME, and `config.json` records only the model-wide choice. Asked
+        // here because the PSO tables are built below and need the answer.
+        {
+            const auto view = load_plan.view();
+            for (std::size_t i = 0; i < view.tensors.len; ++i) {
+                const auto& t = view.tensors.ptr[i];
+                const std::string name(reinterpret_cast<const char*>(t.name.ptr), t.name.len);
+                if (name.find("mlp.down_proj.weight") == std::string::npos) continue;
+                const int bits = int(t.quant_bits_per_element);
+                const int group = int(t.quant_group_size);
+                if (bits != g_.quant.bits || group != g_.quant.group) {
+                    g_.ffn_quant = AffineFormat{bits, group};
+                }
+                break;
+            }
         }
 
         // Paged KV, one pool per OWNING layer: the shared tail attends pages an
@@ -305,7 +351,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             if (g_.is_kv_shared(L)) continue;
             const int hd = g_.head_dim_of(L);
             const std::size_t bytes = std::size_t(g_.total_pages) * std::size_t(g_.kv_page_size) *
-                                      std::size_t(g_.n_kv_heads) * std::size_t(hd) * 2;
+                                      std::size_t(g_.n_kv_heads_of(L)) * std::size_t(hd) * 2;
             kpages_[std::size_t(L)] = ctx.heap_alloc(bytes);
             vpages_[std::size_t(L)] = ctx.heap_alloc(bytes);
             if (!kpages_[std::size_t(L)].valid() || !vpages_[std::size_t(L)].valid()) {
@@ -317,7 +363,8 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
 
         dag_ = gemma4::build_gemma4_dag_mb(g_, /*ordinal_base=*/0, /*with_argmax=*/false);
-        const gemma4::ScratchPlan sp = gemma4::build_gemma4_scratch(dag_, g_);
+        plan_ = gemma4::build_gemma4_scratch(dag_, g_);
+        const gemma4::ScratchPlan& sp = plan_;
         // Under a tap dump every value needs its own buffer, or a later
         // dispatch overwrites the one being read.
         coloring_ = gemma4::color_gemma4_scratch(dag_, sp, /*no_recycle=*/golden_taps_enabled());
@@ -331,7 +378,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         // The projections pad their row count to a whole GEMM tile, so the pool
         // has to hold the padded count -- the padding rows are written.
         const std::vector<std::size_t> elems =
-            g4_pool_elems(dag_, g_, coloring_, gemma4::gemma4_qmm_pool_rows(max_rows_),
+            g4_pool_elems(dag_, plan_, g_, coloring_, gemma4::gemma4_qmm_pool_rows(max_rows_),
                           gemma4::gemma4_qmm_pool_rows(max_sampled_));
         for (int c = 0; c < coloring_.colors_used; ++c) {
             b_.pool[std::size_t(c)] = ctx.heap_alloc(elems[std::size_t(c)] * 2);
@@ -341,6 +388,19 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         const std::size_t io_bytes =
             std::max<std::size_t>(4096, std::size_t(g_.total_pages + max_rows_ + 8) * 4);
         for (int i = 0; i < kIoSlotCount; ++i) b_.io[i] = ctx.heap_alloc(io_bytes);
+        // The routed matvec declares a bias it does not read; see
+        // `BoundGemma4::zero_bias`. Wide enough for the widest routed output.
+        if (g_.is_moe()) {
+            b_.zero_bias =
+                ctx.heap_alloc(std::size_t(std::max(g_.hidden, g_.moe_intermediate)) * 2);
+            if (!b_.zero_bias.valid()) {
+                if (err) *err = "gemma4 routed bias allocation failed";
+                return false;
+            }
+            if (b_.zero_bias.contents() != nullptr) {
+                std::memset(b_.zero_bias.contents(), 0, b_.zero_bias.size);
+            }
+        }
         // The logits leave the pool: the sampler reads a slot of its own, so the
         // tail writes there and nothing copies afterwards. One row per SAMPLED
         // row, which is what the tail produces.
@@ -361,6 +421,23 @@ class Gemma4Engine final : public SimpleFamilyEngine {
                                   /*routed=*/false)) {
             return false;
         }
+        // A checkpoint may quantize the dense FFN and the router at a DIFFERENT
+        // width from everything else -- gemma-4-26B is 4-bit g64 everywhere but
+        // `mlp.{gate,up,down}_proj` and `router.proj`, which are 8-bit. That is
+        // not new kernels, it is a second instance of the same two tables, and
+        // `gemma4_uses_alt_quant` picks between them per dispatch. One table for
+        // both would run a 4-bit kernel over 8-bit bytes: fast, and wrong.
+        if (g_.has_alt_quant()) {
+            if (!load_decode_psos(ctx, kernels_dir, base_alt_, g_.ffn_quant,
+                                  /*with_argmax=*/false, err, /*fuse_residual=*/false,
+                                  /*gdn_prep=*/false, /*routed=*/false, /*untied=*/false)) {
+                return false;
+            }
+            if (!load_multibatch_psos(ctx, kernels_dir, mb_alt_, g_.ffn_quant,
+                                      /*with_d512=*/true, err, /*routed=*/false)) {
+                return false;
+            }
+        }
 
         gemma4::bind_gemma4_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
         bound_rows_ = 1;
@@ -380,6 +457,8 @@ class Gemma4Engine final : public SimpleFamilyEngine {
                                           : (std::uint8_t)bind::Qmv::Out;
         ctx.arg_bind_ordinal(dag_[std::size_t(tail)].ordinal, out_bind, logits_);
 
+        if (slab_ && !plan_segments(err)) return false;
+
         // The page list is the identity: this engine owns the whole pool and
         // hands it to whichever sequence is resident.
         std::vector<std::uint32_t> ids(std::size_t(g_.total_pages));
@@ -393,8 +472,10 @@ class Gemma4Engine final : public SimpleFamilyEngine {
     int vocab() const override { return g_.vocab; }
     int n_layers() const override { return g_.n_layers; }
     WeightBytes weight_bytes() const override {
-        // Gemma 4 is dense: there is no bank and nothing to discount.
-        return pie::metal::weight_bytes(b_.weights, 0, 0);
+        // The mixture members have a bank a token reads a fraction of; the
+        // dense ones pass zeroes and the rule below discounts nothing.
+        return pie::metal::weight_bytes(b_.weights, g_.is_moe() ? g_.n_experts : 0,
+                                        g_.is_moe() ? g_.experts_per_token : 0);
     }
 
     void reset() override {
@@ -468,12 +549,18 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
-        return ctx.run_step([&](StepEncoder& se) {
-            if (pre) pre(se);
+        const auto walk = [this, rows, head_rows, &pre, &post](StepEncoder& se,
+                                                               std::size_t begin,
+                                                               std::size_t end) {
+            if (begin == 0 && pre) pre(se);
             gemma4::encode_gemma4_step_mb(se, dag_, g_, rows, base_, mb_, psos_,
-                                          /*ordinal_base=*/0, head_rows);
-            if (post) post(se);
-        });
+                                          /*ordinal_base=*/0, head_rows,
+                                          g_.has_alt_quant() ? &base_alt_ : nullptr,
+                                          g_.has_alt_quant() ? &mb_alt_ : nullptr, begin, end);
+            if (end == dag_.size() && post) post(se);
+        };
+        if (paging_.active()) return paging_.fire(ctx, rows, walk);
+        return ctx.run_step([&](StepEncoder& se) { walk(se, 0, dag_.size()); });
     }
 
     SlotHandle logits_slot() const override { return logits_; }
@@ -485,7 +572,49 @@ class Gemma4Engine final : public SimpleFamilyEngine {
   private:
     static constexpr int kPageSize = 32;
 
+    /// Resolve the pool slot a scratch VALUE was coloured onto.
+    SlotHandle pool_slot_of(int value) const {
+        SlotHandle out{};
+        for (const gemma4::Use& u : plan_.uses) {
+            if (!u.is_write || u.value != value) continue;
+            if (u.index < 0 || std::size_t(u.index) >= coloring_.per_dispatch.size()) continue;
+            for (const auto& sb : coloring_.per_dispatch[std::size_t(u.index)]) {
+                if (sb.bind_index != u.bind_index) continue;
+                if (sb.color < 0 || std::size_t(sb.color) >= b_.pool.size()) continue;
+                out = b_.pool[std::size_t(sb.color)];
+            }
+        }
+        return out;
+    }
+
+    /// One cut per mixture layer, immediately after its router: the first point
+    /// at which the chosen experts exist and the last before anything reads the
+    /// bank. gemma 4 puts a DENSE branch beside the routed one, so a layer's
+    /// cut sits in the middle of its body rather than at a layer boundary --
+    /// which costs nothing here, because a cut is only where the command buffer
+    /// ends, and the dense branch is dispatched either side of it unchanged.
+    bool plan_segments(std::string* err) {
+        const std::vector<int> run_ends = gemma4::gemma4_run_ends(dag_);
+        std::vector<ExpertPaging::Cut> cuts;
+        std::size_t nth = 0;
+        for (std::size_t i = 0; i < dag_.size(); ++i) {
+            if (dag_[i].kind != gemma4::Kind::RouterTopK) continue;
+            ExpertPaging::Cut c;
+            c.end = std::size_t(run_ends[i]) + 1;
+            if (nth < plan_.expert_ids_by_layer.size()) {
+                c.ids = pool_slot_of(plan_.expert_ids_by_layer[nth]);
+            }
+            ++nth;
+            cuts.push_back(c);
+        }
+        return paging_.plan(slab_, std::move(cuts), dag_.size(), g_.n_experts,
+                            g_.experts_per_token, max_rows_, "gemma4", err);
+    }
+
     gemma4::Gemma4Geometry g_{};
+    /// The routed experts' paging cache, when a budget asked for one.
+    std::shared_ptr<ExpertSlab> slab_{};
+    ExpertPaging paging_{};
     /// Keeps the streamed weights' mapping alive; see `init`.
     std::shared_ptr<void> weight_mapping_{};
     int max_ctx_ = 0;
@@ -494,11 +623,16 @@ class Gemma4Engine final : public SimpleFamilyEngine {
     int bound_rows_ = 0;
     int bound_head_rows_ = 0;
     std::vector<gemma4::Dispatch> dag_{};
+    gemma4::ScratchPlan plan_{};
     gemma4::ScratchColoring coloring_{};
     gemma4::BoundGemma4 b_{};
     gemma4::Gemma4Psos psos_{};
     DecodeStepPsos base_{};
     MultiBatchPsos mb_{};
+    /// The same two tables at `g_.ffn_quant`, built only when the checkpoint
+    /// has a second affine format.
+    DecodeStepPsos base_alt_{};
+    MultiBatchPsos mb_alt_{};
     std::vector<SlotHandle> kpages_{};
     std::vector<SlotHandle> vpages_{};
     SlotHandle logits_{};
@@ -1447,10 +1581,15 @@ std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
     // already a set of parallel bands sharing a slot, and this is another band.
     // The llama family has no expert bias at all, so there this changes
     // nothing.
+    // `experts.` and not `mlp.experts.`: gemma 4 hangs its bank off the layer
+    // rather than off the mlp -- `experts.switch_glu.gate_proj` -- and a pattern
+    // that named the mlp was naming one family's directory layout rather than
+    // the thing being matched. No tensor outside a routed bank contains it;
+    // gemma's `router.per_expert_scale` is the near miss, and it does not.
     return [slab_paging](const std::string& n) {
         const bool bias = n.size() > 5 && n.compare(n.size() - 5, 5, ".bias") == 0;
         if (bias && !slab_paging) return false;
-        return n.find("mlp.experts.") != std::string::npos;
+        return n.find("experts.") != std::string::npos;
     };
 }
 
@@ -1485,7 +1624,7 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
             gemma4::color_gemma4_scratch(dag, sp, /*no_recycle=*/golden_taps_enabled());
         rows = gemma4::gemma4_qmm_pool_rows(rows);
         sampled = gemma4::gemma4_qmm_pool_rows(sampled);
-        for (const std::size_t e : g4_pool_elems(dag, pg, col, rows, sampled)) bytes += e * 2;
+        for (const std::size_t e : g4_pool_elems(dag, sp, pg, col, rows, sampled)) bytes += e * 2;
         bytes += std::size_t(sampled) * std::size_t(g.vocab) * 2;  // the logits slot
     } else if (family == pie::metal::model::ModelFamily::GptOss) {
         gptoss::GptOssGeometry g;

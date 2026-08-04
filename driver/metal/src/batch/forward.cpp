@@ -804,9 +804,14 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
             // family out -- see `stream_predicate`.
             break;
         case model::ModelFamily::Gemma4:
-            // Nothing to page: dense, no routed bank at all.
-            why = "gemma4: expert_slab_bytes has nothing to page -- this family is dense "
-                  "and has no routed expert bank";
+            // The family has both shapes. E2B/E4B are dense and have no bank to
+            // page; the 26B mixture has 128 experts per layer and pages exactly
+            // as the others do. Asked of the CONFIG rather than of the loaded
+            // tensors because this runs before the engine exists.
+            if (cfg.gemma4.n_experts <= 1) {
+                why = "gemma4: expert_slab_bytes has nothing to page -- this checkpoint is "
+                      "dense and has no routed expert bank";
+            }
             break;
         default:
             why = "expert_slab_bytes is only supported for the llama family";

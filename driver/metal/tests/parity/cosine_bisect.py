@@ -32,7 +32,9 @@ G4_PRE = ["embed", "ple_tok", "ple_proj", "ple_projnorm", "ple"]
 G4_LAYER = ["attn_norm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm",
             "v_norm", "rope_q", "rope_k", "sdpa", "o_proj", "attn_postnorm",
             "attn_resid", "ffn_norm", "gate_proj", "up_proj", "geglu",
-            "down_proj", "ffn_postnorm", "ffn_resid", "ple_gate", "ple_act",
+            "down_proj", "g4_dense_br", "g4_router_n", "g4_router", "g4_moe_n",
+            "g4_moe_out", "g4_moe_br", "g4_branches",
+            "ffn_postnorm", "ffn_resid", "ple_gate", "ple_act",
             "ple_back", "ple_norm", "ple_resid", "layer_out"]
 G4_TAIL = ["final_norm", "logits_raw", "logits"]
 

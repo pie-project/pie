@@ -33,6 +33,11 @@ struct BoundGemma4 {
     std::vector<SlotHandle> io;    // indexed by IoSlot
     std::vector<KvPages> kv;       // indexed by LAYER; only owning layers are filled
     std::vector<SlotHandle> pool;  // activation buffers, indexed by colour
+    /// Zeros, for the routed matvec's bias slot. The shared routed template
+    /// DECLARES a bias buffer and never reads it at BIASED=false, but Metal
+    /// still wants the slot filled -- gemma 4's expert projections have no
+    /// bias tensor to fill it with.
+    SlotHandle zero_bias{};
 };
 
 // Shared: the colouring adapter and its result are identical across families.
@@ -95,7 +100,7 @@ inline std::size_t gemma4_mask_pitch_bytes(const Gemma4Geometry& g) {
 /// layers own nothing and are not asked.
 inline std::size_t gemma4_kv_bytes_per_layer(const Gemma4Geometry& g, int layer,
                                              int max_ctx, int act_dtype_bytes) {
-    return std::size_t(g.n_kv_heads) * std::size_t(max_ctx) *
+    return std::size_t(g.n_kv_heads_of(layer)) * std::size_t(max_ctx) *
            std::size_t(g.head_dim_of(layer)) * std::size_t(act_dtype_bytes);
 }
 

@@ -325,6 +325,18 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             if (tc.contains("use_double_wide_mlp") && tc["use_double_wide_mlp"].is_boolean()) {
                 facts.g4_double_wide_mlp = tc["use_double_wide_mlp"].get<bool>();
             }
+            const auto bool_of = [](const nlohmann::json& obj, const char* key, bool& out) {
+                if (obj.contains(key) && obj[key].is_boolean()) out = obj[key].get<bool>();
+            };
+            // The mixture, and the k-eq-V attention that comes with it. Absent
+            // on every dense gemma 4, which is how the geometry tells them
+            // apart -- so these are read where they are and defaulted nowhere.
+            bool_of(tc, "enable_moe_block", facts.g4_enable_moe);
+            bool_of(tc, "attention_k_eq_v", facts.g4_attention_k_eq_v);
+            i32_of(tc, "num_experts", facts.g4_num_experts);
+            i32_of(tc, "top_k_experts", facts.g4_experts_per_token);
+            i32_of(tc, "moe_intermediate_size", facts.g4_moe_intermediate);
+            i32_of(tc, "num_global_key_value_heads", facts.g4_num_global_kv_heads);
             f32_of(tc, "final_logit_softcapping", facts.g4_final_softcap);
             // Per-attention-type rope.
             if (rp != nullptr) {
@@ -456,6 +468,12 @@ void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts&
     cfg.gemma4.rope_theta_full = facts.g4_rope_theta_full;
     cfg.gemma4.rope_theta_sliding = facts.g4_rope_theta_sliding;
     cfg.gemma4.full_partial_rotary = facts.g4_full_partial_rotary;
+    cfg.gemma4.enable_moe = facts.g4_enable_moe;
+    cfg.gemma4.n_experts = facts.g4_num_experts;
+    cfg.gemma4.experts_per_token = facts.g4_experts_per_token;
+    cfg.gemma4.moe_intermediate = facts.g4_moe_intermediate;
+    cfg.gemma4.attention_k_eq_v = facts.g4_attention_k_eq_v;
+    cfg.gemma4.n_global_kv_heads = facts.g4_num_global_kv_heads;
 }
 
 // Reading the facts out of a `pie.model/1` descriptor instead of deriving them
@@ -574,6 +592,12 @@ std::optional<ModelFacts> read_model_facts_from_descriptor(
         i32_of("num_kv_shared_layers", facts.g4_num_kv_shared_layers);
         i32_of("gemma_hidden_size_per_layer_input", facts.g4_per_layer_emb_dim);
         facts.g4_double_wide_mlp = j.value("gemma4_double_wide_mlp", false);
+        facts.g4_enable_moe = j.value("gemma4_enable_moe", false);
+        facts.g4_attention_k_eq_v = j.value("gemma4_attention_k_eq_v", false);
+        i32_of("num_experts", facts.g4_num_experts);
+        i32_of("num_experts_per_tok", facts.g4_experts_per_token);
+        i32_of("moe_intermediate_size", facts.g4_moe_intermediate);
+        i32_of("gemma4_num_global_key_value_heads", facts.g4_num_global_kv_heads);
         f32_of("gemma_final_logit_softcap", facts.g4_final_softcap);
 
         // The descriptor expands the per-attention-type rope into one entry
