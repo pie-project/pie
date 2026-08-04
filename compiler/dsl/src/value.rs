@@ -34,9 +34,29 @@ impl Tensor {
 
     /// A trace-known constant value. Accepts a scalar
     /// (`Tensor::constant(-1i32)`) or an array (`Tensor::constant([0u32, 1])`).
-    /// A body constant materializes to `Const` (scalar), `Broadcast` (uniform
-    /// vector), or `Iota`/affine (a sequence) — the closed op set has no general
-    /// vector-const op (small consts fold to immediates).
+    ///
+    /// The op set carries constants as *scalars*: `const` holds one
+    /// [`Literal`] and nothing else. So the tensor constants that lower are
+    /// exactly the ones a scalar plus one op can spell — a uniform tensor
+    /// (`broadcast`), and a `u32` affine ramp `a + b*i` (`iota`, then the
+    /// arithmetic). Anything else — a per-token logit bias, a banned-token
+    /// set, a sampling schedule — is *bulk data*, and bulk data lives in a
+    /// channel:
+    ///
+    /// ```ignore
+    /// let bias = Channel::from(vec![0.0f32, -3.5, 0.0, 12.25]).named("bias");
+    /// // ... in a stage body:
+    /// let logits = logits + bias.read();
+    /// ```
+    ///
+    /// That is not a workaround for a missing op. The op stream is a stream of
+    /// fixed-size records — it is what lets a backend emit a kernel from an op
+    /// tag alone — and a buffer of arbitrary bytes is not a record. A channel
+    /// is this system's name for a buffer the device reads, so a constant
+    /// tensor is a channel that is seeded once and never written again.
+    ///
+    /// Passing anything else here records a trace error naming the shape and
+    /// pointing at the channel.
     pub fn constant(v: impl IntoConst) -> Tensor {
         Tensor {
             inner: TensorInner::Const(v.into_const()),
@@ -350,9 +370,13 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
     }
     let poisoned = poison_id(
         alloc::format!(
-            "general vector constant {vals:?} (dtype {:?}) is not representable in the closed \
-             op set; use iota/broadcast, an arithmetic expression, or feed it through a channel",
-            c.dtype
+            "a {:?} constant of shape {:?} is bulk data, and the op set carries constants as \
+             scalars: `const` holds one literal, so only a uniform tensor (broadcast) and a u32 \
+             affine ramp a+b*i (iota) are reachable from it. Seed a channel with the values and \
+             read it in the body — `Channel::from(values)` — or build the tensor from an \
+             arithmetic expression",
+            c.dtype,
+            c.shape
         ),
         ty,
     );
