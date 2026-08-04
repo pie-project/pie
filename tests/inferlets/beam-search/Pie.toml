@@ -10,3 +10,4 @@ core = "^0.2.0"
 [parameters]
 max_tokens = {type = "int", optional = true, description = "Number of beam-search steps (default: 16, maximum: 63)"}
 beams = {type = "int", optional = true, description = "Beam width (default: 2; 1 degenerates to greedy decoding)"}
+mask = {type = "bool", optional = true, description = "False seeds the ancestry mask all-true, so every beam attends the whole span — the deliberately broken control (default: true)"}
