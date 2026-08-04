@@ -1371,6 +1371,19 @@ impl ResidencyPlanner {
                 Parked::Entry(key, notify) => {
                     self.stats.parks.fetch_add(1, Ordering::Relaxed);
                     ptrace!("park key={:?} pid={} kv={}", key, pid, demand.kv_pages);
+                    // Park census for the wave records: when the ask parked,
+                    // was the pool actually empty, or did it park only
+                    // because the FCFS fast path closes once anyone waits?
+                    let park_started_us = crate::scheduler::fire_timing_now_us();
+                    {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let acc = &crate::scheduler::GUEST_PHASES;
+                        acc.park_n.fetch_add(1, Relaxed);
+                        let (free_now, _) = self.port.device_stats();
+                        if free_now as u64 >= u64::from(demand.kv_pages) {
+                            acc.park_free_n.fetch_add(1, Relaxed);
+                        }
+                    }
                     // The park empties this lane's seat in the wait-all
                     // quorum so frames seal without it; rejoin is implicit
                     // on the lane's next accepted fire.
@@ -1394,6 +1407,15 @@ impl ResidencyPlanner {
                                 }
                                 // The collection unblocked the next head.
                                 self.poke();
+                                {
+                                    use std::sync::atomic::Ordering::Relaxed;
+                                    let acc = &crate::scheduler::GUEST_PHASES;
+                                    let waited = crate::scheduler::fire_timing_now_us()
+                                        .saturating_sub(park_started_us)
+                                        * 1_000;
+                                    acc.park_ns.fetch_add(waited, Relaxed);
+                                    acc.park_max_ns.fetch_max(waited, Relaxed);
+                                }
                                 return outcome.map(Acquired::Granted);
                             }
                             Collect::Yield => {

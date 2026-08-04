@@ -319,10 +319,28 @@ impl ProcessCtx {
             let fwd: Resource<ForwardPass> = Resource::new_borrow(*rep);
             let _ = self.ctx().table.get(&fwd)?;
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        let acc = &crate::scheduler::GUEST_PHASES;
+        let t0 = crate::scheduler::fire_timing_now_us();
         crate::inferlet::process::ensure_execution_admitted(self).await;
-        crate::inferlet::process::gate::residency_gate(self).await?;
+        let t1 = crate::scheduler::fire_timing_now_us();
+        acc.adm_ns.fetch_add(t1.saturating_sub(t0) * 1_000, Relaxed);
+        acc.adm_max_ns
+            .fetch_max(t1.saturating_sub(t0) * 1_000, Relaxed);
+        let gated = crate::inferlet::process::gate::residency_gate(self).await;
+        let t2 = crate::scheduler::fire_timing_now_us();
+        acc.resgate_ns
+            .fetch_add(t2.saturating_sub(t1) * 1_000, Relaxed);
+        acc.resgate_max_ns
+            .fetch_max(t2.saturating_sub(t1) * 1_000, Relaxed);
+        gated?;
         self.note_submit();
-        crate::pipeline::fire::submit_frame(self, on, slot_reps).await
+        let submitted = crate::pipeline::fire::submit_frame(self, on, slot_reps).await;
+        let t3 = crate::scheduler::fire_timing_now_us();
+        acc.fsub_ns.fetch_add(t3.saturating_sub(t2) * 1_000, Relaxed);
+        acc.fsub_max_ns
+            .fetch_max(t3.saturating_sub(t2) * 1_000, Relaxed);
+        submitted
     }
 }
 

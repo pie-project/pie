@@ -419,6 +419,24 @@ pub(crate) struct GuestPhaseAcc {
     pub work_ns: AtomicU64,
     pub work_max_ns: AtomicU64,
     pub n: AtomicU64,
+    /// The three awaits between token drain and fire enqueue, split so the
+    /// contended `guest_work`/post-submit budget has an owner:
+    /// `ensure_execution_admitted`, `residency_gate`, and `submit_frame`
+    /// (whose planner `acquire` park is AFTER `note_submit`, i.e. invisible
+    /// to `work_ns`).
+    pub adm_ns: AtomicU64,
+    pub adm_max_ns: AtomicU64,
+    pub resgate_ns: AtomicU64,
+    pub resgate_max_ns: AtomicU64,
+    pub fsub_ns: AtomicU64,
+    pub fsub_max_ns: AtomicU64,
+    /// Planner allocation parks inside `fsub`: count, park-with-free-pages
+    /// count (the FCFS fast path closes whenever anyone waits, even when the
+    /// pool could serve the ask), and granted-park wait time.
+    pub park_n: AtomicU64,
+    pub park_free_n: AtomicU64,
+    pub park_ns: AtomicU64,
+    pub park_max_ns: AtomicU64,
 }
 
 /// Per-lane run-ahead probe: at every seal, how deep each awaited lane's
@@ -504,6 +522,16 @@ pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
     work_ns: AtomicU64::new(0),
     work_max_ns: AtomicU64::new(0),
     n: AtomicU64::new(0),
+    adm_ns: AtomicU64::new(0),
+    adm_max_ns: AtomicU64::new(0),
+    resgate_ns: AtomicU64::new(0),
+    resgate_max_ns: AtomicU64::new(0),
+    fsub_ns: AtomicU64::new(0),
+    fsub_max_ns: AtomicU64::new(0),
+    park_n: AtomicU64::new(0),
+    park_free_n: AtomicU64::new(0),
+    park_ns: AtomicU64::new(0),
+    park_max_ns: AtomicU64::new(0),
 };
 
 pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {

@@ -4747,6 +4747,20 @@ impl BatchScheduler {
             take(&gacc.work_max_ns) / 1_000,
             take(&gacc.n),
         );
+        let (guest_adm, guest_adm_max, guest_resgate, guest_resgate_max, guest_fsub, guest_fsub_max) = (
+            take(&gacc.adm_ns) / 1_000,
+            take(&gacc.adm_max_ns) / 1_000,
+            take(&gacc.resgate_ns) / 1_000,
+            take(&gacc.resgate_max_ns) / 1_000,
+            take(&gacc.fsub_ns) / 1_000,
+            take(&gacc.fsub_max_ns) / 1_000,
+        );
+        let (alloc_park_n, alloc_park_free_n, alloc_park, alloc_park_max) = (
+            take(&gacc.park_n),
+            take(&gacc.park_free_n),
+            take(&gacc.park_ns) / 1_000,
+            take(&gacc.park_max_ns) / 1_000,
+        );
         let (retire_instances, retire_mark, retire_resolve, retire_drop, retire_emit, retire_n) = (
             take(&acc.retire_instances_ns) / 1_000,
             take(&acc.retire_mark_ns) / 1_000,
@@ -4875,6 +4889,16 @@ impl BatchScheduler {
                 ),
                 ("guest_work_max_us", guest_work_max),
                 ("guest_n", guest_n),
+                ("guest_adm_us", guest_adm),
+                ("guest_adm_max_us", guest_adm_max),
+                ("guest_resgate_us", guest_resgate),
+                ("guest_resgate_max_us", guest_resgate_max),
+                ("guest_fsub_us", guest_fsub),
+                ("guest_fsub_max_us", guest_fsub_max),
+                ("alloc_park_n", alloc_park_n),
+                ("alloc_park_free_n", alloc_park_free_n),
+                ("alloc_park_us", alloc_park),
+                ("alloc_park_max_us", alloc_park_max),
                 (
                     "guest_resume_us",
                     if guest_resume_n > 0 {
