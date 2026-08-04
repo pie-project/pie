@@ -207,6 +207,10 @@ impl WorkerHandle {
             WorkerKind::Decode(engine) => engine.shutdown().await,
             WorkerKind::Executor(executor) => executor.shutdown().await,
         }
+        // The startup TOMLs under `$PIE_HOME/standalone/<pid>` are read once at
+        // driver creation and never again, so they are dead the moment the
+        // drivers are down. The boot sweep covers the unclean exits.
+        crate::embedded_driver::remove_launch_state();
     }
 }
 
@@ -465,6 +469,11 @@ fn load_model_drivers(
     user_cfg: &config::Config,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<LoadedModelDrivers> {
+    // Process housekeeping, once per boot and before anything writes under
+    // `$PIE_HOME/standalone/<pid>`: reclaim the directories left by launches
+    // that did not exit cleanly.
+    crate::embedded_driver::sweep_stale_launch_state();
+
     // Resolve the weight-artifact directory here, before any driver startup
     // TOML is written. `$PIE_HOME` is this layer's to know: the driver has
     // never been told it, which is why the old env-var form fell back to XDG.

@@ -182,9 +182,75 @@ fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
 /// but legal — different ports) don't clobber each other's TOML or
 /// aux sockets.
 pub fn launch_state_dir() -> PathBuf {
-    crate::paths::pie_home()
-        .join("standalone")
-        .join(std::process::id().to_string())
+    launch_state_root().join(std::process::id().to_string())
+}
+
+fn launch_state_root() -> PathBuf {
+    crate::paths::pie_home().join("standalone")
+}
+
+/// Whether a process id is still running.
+///
+/// `kill(pid, 0)` delivers no signal and only reports reachability: `Ok` means
+/// alive, `EPERM` means alive but not ours, `ESRCH` means gone. Anything other
+/// than a definite `ESRCH` is treated as alive, because the cost of the two
+/// mistakes is not symmetric — a stale directory is a few bytes, deleting a
+/// live launch's startup TOML is a driver that cannot boot.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Remove `$PIE_HOME/standalone/<pid>` directories whose process is gone.
+///
+/// Each launch writes a driver startup TOML under its own pid and nothing ever
+/// removed it, so every `pie serve` left a directory behind for the life of
+/// the machine. Sweeping at boot rather than only at shutdown is what makes it
+/// bounded: the leak's whole population is launches that did NOT exit cleanly.
+///
+/// Best-effort throughout. A directory that cannot be read or removed is left
+/// alone: this runs on the boot path and must never be the reason a start
+/// fails.
+pub fn sweep_stale_launch_state() {
+    let root = launch_state_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let self_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            // Not a pid directory — not ours to reason about.
+            continue;
+        };
+        if pid == self_pid || pid_is_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            tracing::debug!(?path, %error, "could not sweep stale launch state");
+        }
+    }
+}
+
+/// Remove this process's launch state directory. Called on clean shutdown; the
+/// boot sweep is what covers the unclean ones.
+pub fn remove_launch_state() {
+    let dir = launch_state_dir();
+    if let Err(error) = std::fs::remove_dir_all(&dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(?dir, %error, "could not remove launch state");
+    }
 }
 
 // `DriverCapabilities` is owned by `pie-driver-abi` (single source of truth
@@ -946,6 +1012,35 @@ mod tests {
             vec![0, 1, 2]
         );
         assert!(launches.iter().all(|launch| launch.size == 3));
+    }
+
+    #[test]
+    fn the_sweep_reclaims_dead_pids_and_spares_live_ones() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test; PIE_HOME is read, never written, by
+        // the code under test.
+        unsafe { std::env::set_var("PIE_HOME", home.path()) };
+
+        let root = home.path().join("standalone");
+        let self_pid = std::process::id();
+        // A pid that cannot be running: pid 0 is the kernel's, never a
+        // reachable user process, so `kill(0, 0)` reports it as not ours.
+        let dead = root.join("999999999");
+        let live = root.join(self_pid.to_string());
+        let foreign = root.join("not-a-pid");
+        for d in [&dead, &live, &foreign] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("driver.toml"), "x").unwrap();
+        }
+
+        sweep_stale_launch_state();
+
+        assert!(!dead.exists(), "a dead pid's state must be reclaimed");
+        assert!(live.exists(), "the running process's own state must survive");
+        assert!(
+            foreign.exists(),
+            "a directory that is not a pid is not ours to remove"
+        );
     }
 
     #[test]
