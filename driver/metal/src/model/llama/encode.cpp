@@ -154,8 +154,7 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
     if (mb != nullptr) {
         const int m = d.kind == Kind::LmHead ? S : R;
         if (const int bn = llama_qmm_bn(d.kind, g, m); bn > 0) {
-            const int padded = llama_qmm_rows(m);
-            const int wide = qmm_bm(padded) == kQmmBMWide ? 1 : 0;
+            const int wide = qmm_bm_slot(qmm_bm(m));
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
             // No bias table: llama's projections have no bias tensor, which is
             // the one place this family is simpler than gpt-oss.
@@ -394,8 +393,10 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
         // The matvec re-reads the ENTIRE weight for every row, so on a prefill
         // it is the difference between amortizing the weights and not.
         if (const int bn = llama_qmm_bn(d.kind, g, m); bn > 0) {
-            const int padded = llama_qmm_rows(m);
-            qmm_t_dispatch(kn.N, padded, bn, qmm_bm(padded), grid, tg);
+            // The row block is asked of the BATCH, not of the padded count:
+            // padding rounds up, and a rounded-up count can land on a wider
+            // rung than the one the grid was built for.
+            qmm_t_dispatch(kn.N, llama_qmm_rows(m), bn, qmm_bm(m), grid, tg);
             return;
         }
         // One call for dense and routed alike. `slots` is the expert axis and

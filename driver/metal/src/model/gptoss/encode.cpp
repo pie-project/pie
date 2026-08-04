@@ -267,8 +267,7 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
     const int m = d.kind == Kind::LmHead ? S : N;
     if (const int bn = gptoss_qmm_bn(d.kind, g, m); bn > 0) {
-        const int padded = gptoss_qmm_rows(m);
-        const int wide = qmm_bm(padded) == kQmmBMWide ? 1 : 0;
+        const int wide = qmm_bm_slot(qmm_bm(m));
         const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
         // The LM head has no bias; every other projection here does.
         const auto& table = d.kind == Kind::LmHead ? mb.qmm_t : mb.qmm_t_bias;
@@ -293,8 +292,10 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
         // matvec re-reads the whole weight PER ROW, which on this checkpoint is
         // 318 MB a layer.
         if (const int bn = gptoss_qmm_bn(d.kind, g, m); bn > 0) {
-            const int padded = gptoss_qmm_rows(m);
-            qmm_t_dispatch(kn.N, padded, bn, qmm_bm(padded), grid, tg);
+            // The row block is asked of the BATCH, not of the padded count:
+            // padding rounds up, and a rounded-up count can land on a wider
+            // rung than the one `pso_for` picked.
+            qmm_t_dispatch(kn.N, gptoss_qmm_rows(m), bn, qmm_bm(m), grid, tg);
             return;
         }
         qmv_dispatch(kn.N, routed ? g.experts_per_token : 1, grid, tg, m);

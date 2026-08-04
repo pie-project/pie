@@ -45,11 +45,41 @@ inline constexpr int kQmmMinBatch = 12;
 // projections).  A taller block halves that work at the cost of halving the
 // threadgroup count, so it is only worth taking once the batch is wide enough
 // to have blocks to spare: at M=32, BM=32 measures 20.4ms against BM=16's 24.4.
-inline constexpr int kQmmBM = 16;
-inline constexpr int kQmmBMWide = 32;
-inline constexpr int kQmmWideMinBatch = 32;
+// The row blocks the GEMM is instantiated for, narrowest first. This is a
+// LIST rather than a narrow/wide pair because the argument above does not stop
+// at 32: a 128-row prompt at BM=32 still unpacks every weight four times, and
+// measured on an M1 Max the third rung is worth as much as the second was --
+// llama-1B prefills 1236 tok/s at BM=16, 1616 at 32 and 1936 at 64.
+// A fourth rung would need more accumulators per lane than BM=64/BN=32's
+// sixteen, which is where the register file stops paying.
+inline constexpr int kQmmBMs[] = {16, 32, 64};
+inline constexpr int kQmmBMCount = int(sizeof(kQmmBMs) / sizeof(kQmmBMs[0]));
+inline constexpr int kQmmBM = kQmmBMs[0];
+inline constexpr int kQmmBMWide = kQmmBMs[kQmmBMCount - 1];
 
-inline int qmm_bm(int N) { return N >= kQmmWideMinBatch ? kQmmBMWide : kQmmBM; }
+/// Which row block a batch of `N` rows should use, as an index into `kQmmBMs`.
+/// A block only pays for itself once the batch can fill it, so the rule is the
+/// widest rung the batch can cover. Callers pad the grid up to that rung, which
+/// is why the row count they pad to must be asked of THIS function and not of
+/// `kQmmBMWide`: padding a one-row decode to the widest block would launch 64
+/// rows of arithmetic to compute one.
+inline int qmm_bm_index(int N) {
+    int best = 0;
+    for (int i = 1; i < kQmmBMCount; ++i)
+        if (N >= kQmmBMs[i]) best = i;
+    return best;
+}
+
+inline int qmm_bm(int N) { return kQmmBMs[qmm_bm_index(N)]; }
+
+/// The reverse: which `kQmmBMs` rung a chosen row block is. Dispatch records
+/// the block it launched, not the batch it came from, so the PSO lookup has to
+/// come back the other way.
+inline int qmm_bm_slot(int bm) {
+    for (int i = 0; i < kQmmBMCount; ++i)
+        if (kQmmBMs[i] == bm) return i;
+    return 0;
+}
 
 // Output columns per threadgroup.  This GEMM is occupancy-bound, not bandwidth-
 // bound: measured standalone at the model's shapes it turns in ~380 GFLOP/s at
@@ -161,7 +191,9 @@ inline void qmm_splitk_reduce_dispatch(int out_vec, int N, Grid& g, Threadgroup&
 // weight thirty-two times.
 inline int qmm_strided_bm(int padded_rows) {
     static const bool off = std::getenv("PIE_METAL_NO_PREFILL_BM32") != nullptr;
-    return (!off && padded_rows >= kQmmWideMinBatch) ? kQmmBMWide : kQmmBM;
+    // The strided form is instantiated as a narrow/wide PAIR, not over
+    // `kQmmBMs`, so it stops at 32 whatever the aligned table grew to.
+    return (!off && padded_rows >= 32) ? 32 : kQmmBM;
 }
 
 inline int qmm_strided_rows(int N, int max_rows) {

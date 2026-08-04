@@ -65,13 +65,13 @@ struct MultiBatchPsos {
     Pso kv_append_paged{}; // kv_append_paged_bfloat16                  (page-table scatter write)
     // affine_qmm_t: MLX's steel quantized GEMM, for the batched decode. [0] is
     // BN=32, [1] is BN=64. Selected only above `kQmmMinBatch`.
-    // [bm_wide][bn]: 16/32 rows per block x 16/32/64 columns.
-    Pso qmm_t[2][3]{};
-    Pso qmm_t_residual[2][3]{};
+    // [bm][bn]: `kQmmBMs` rows per block x 16/32/64 columns.
+    Pso qmm_t[3][3]{};
+    Pso qmm_t_residual[3][3]{};
     /// The same GEMM with a Linear's additive bias broadcast down the tile.
     /// gpt-oss biases every projection, so without it the batched path is a
     /// GEMM plus a dispatch that rewrites the whole output to add one vector.
-    Pso qmm_t_bias[2][3]{};
+    Pso qmm_t_bias[3][3]{};
     // affine_qmm_t_strided: the same GEMM with an explicit row pitch, for the
     // prefill, whose scratch rows are laid at a uniform `scratch_widest_elems`
     // rather than packed at `K`.
@@ -83,7 +83,7 @@ struct MultiBatchPsos {
     /// that spanned two experts would read one expert's weights for the
     /// other's rows. Three column tiles, as elsewhere.
     Pso qmm_routed[3]{};
-    Pso qmm_t_splitk[2]{};
+    Pso qmm_t_splitk[3]{};
     Pso qmm_splitk_reduce{};
     Pso qmm_splitk_reduce_residual{};
     Pso qmm_t_strided{};
