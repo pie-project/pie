@@ -20,7 +20,9 @@
 #include "cuda_check.hpp"
 #include "distributed.hpp"
 #include "batch/forward_graph.hpp"
-#include "pie_native/launch_view.hpp"
+#include <pie/driver/fire/view.hpp>
+#include <pie/driver/fire/geometry.hpp>
+#include "pie/driver/slice.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "batch/persistent_inputs.hpp"
 #include <memory>
@@ -96,6 +98,9 @@ struct ForwardFn {
     // See ModelCapabilities::supports_hook_graph_capture (stage 6 inc 4).
     bool supports_hook_graph_capture = false;
     bool supports_supergraph = false;
+    // Mirrors `ModelCapabilities::supports_fused_lm_head_argmax`: the attached
+    // model's `body()` honours `ForwardInputs::logits_argmax_chunk_tokens`.
+    bool supports_fused_lm_head_argmax = false;
 
     // All metadata needed to execute one forward body call. Bundled as a
     // struct so adding a new field is a one-site addition rather than a
@@ -155,6 +160,20 @@ struct ForwardFn {
         // ordinary text fires (which always sample ≥ 1 row) are unaffected.
         bool emit_logits = true;
 
+        // Vocabulary slab width for the fused LM head + greedy argmax. Zero
+        // (the default) keeps the plain path that materializes [rows, vocab]
+        // logits. When set, the forward computes the logits one slab at a time
+        // into reused scratch and reduces each slab as it lands, writing token
+        // ids to `ws.sampled_tokens` and never filling `ws.logits` (§20.37).
+        // Only the driver may set this, and only after proving every epilogue
+        // is a bare greedy argmax -- see
+        // `Dispatch::launch_epilogue_is_greedy_argmax`.
+        //
+        // The width is a device+model property. It is deliberately not
+        // defaulted here: until the planner's calibration measures one, the
+        // fused path stays off rather than guessing a constant.
+        int logits_argmax_chunk_tokens = 0;
+
         // Recurrent-only commit-advance: when non-null, the forward runs ONLY
         // the linear-attn block of each linear layer (conv + recurrence,
         // write_state=true) over `total_tokens` accepted tokens, gathering each
@@ -177,6 +196,14 @@ struct ForwardFn {
         //     recurrent_state[slot_ids[r]].
         const std::uint32_t* rs_buffer_slot_ids_h    = nullptr;  // flattened CSR
         const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;  // R+1, leading 0
+        // Replayed buffered prefix: slabs, row CSR (R+1), tokens per row (R).
+        const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr;
+        const std::uint32_t* rs_buffer_read_indptr_h   = nullptr;
+        const std::uint32_t* rs_buffer_read_lens_h     = nullptr;
+        // Physical offset of logical buffer token 0, per row. A fold that
+        // lands mid-page leaves the survivors where they were, so every
+        // buffer span is `head + logical`.
+        const std::uint32_t* rs_buffer_heads_h          = nullptr;
         const std::uint32_t* rs_fold_lens_h           = nullptr;  // R
         const std::int32_t*  rs_fold_lens_d           = nullptr;  // R
         bool                 rs_buffer_write          = false;
@@ -580,7 +607,19 @@ cudaGraphExec_t capture_forward_graph_exec(
     // NS-3: the spatial split (UINT32_MAX = not a spatial fire). The
     // captured body splits its attention and reads the identity qo from
     // pi.mask_suffix_qo_indptr.
-    std::uint32_t unmasked_prefix_rows = 0xffffffffu);
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu,
+    // Upstream §20.37 (merged): selects the LM head shape recorded into
+    // the graph — 0 materialises [rows, vocab] logits, > 0 reduces each
+    // vocabulary slab to token ids. MUST agree with kGvFusedArgmax in
+    // the graph key. Defaulted 0 so the tart capture sites stand.
+    int logits_argmax_chunk_tokens = 0);
+
+// Vocabulary slab width for the fused LM head + greedy argmax (§20.37), read
+// once from `PIE_LOGITS_CHUNK_TOKENS`. Unset means off: the width has a real
+// optimum that depends on the device and the model, so guessing a default here
+// would be worse than not fusing. This is the bridge until the planner's
+// calibration measures one.
+int logits_argmax_chunk_tokens();
 
 // Env-gated (`PIE_STEP_PROFILE`) forward-body wall-clock timer. Declared here
 // (not private to batch/forward.cpp) because `enqueue_step` in
@@ -683,6 +722,8 @@ struct ForwardDispatchInputs {
     // Direct non-graph prefill/mixed launches may gather the requested hidden
     // rows before lm_head instead of materializing [N, vocab] logits.
     bool compact_logits = false;
+    // See `ForwardInputs::logits_argmax_chunk_tokens`. Zero disables.
+    int logits_argmax_chunk_tokens = 0;
     int structured_window_left = -2;
     // Explicit KV-write descriptor present (device-geometry WSlot/WOff, B2).
     // When set, the forward routes the per-layer KV append through the explicit
@@ -704,6 +745,17 @@ struct ForwardDispatchInputs {
     // the separate fold-replay dispatch instead (not this path).
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr;
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;
+    // The buffered prefix each row REPLAYS ahead of its own tokens, so the
+    // recurrence starts from `folded (+) replay(buffer)` rather than from the
+    // folded boundary alone. Null means nothing is buffered, which is the
+    // common case. The linear layers process `read_len[r] + own tokens` rows
+    // for request r; the extra rows are gathered from these slabs and their
+    // outputs are dropped.
+    const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr;
+    const std::uint32_t* rs_buffer_read_indptr_h = nullptr;
+    const std::uint32_t* rs_buffer_read_lens_h = nullptr;
+    /// Physical offset of logical buffer token 0, per row (see above).
+    const std::uint32_t* rs_buffer_heads_h = nullptr;
     const std::uint32_t* rs_fold_lens_h = nullptr;
     const std::int32_t*  rs_fold_lens_d = nullptr;
     bool                 rs_buffer_write = false;

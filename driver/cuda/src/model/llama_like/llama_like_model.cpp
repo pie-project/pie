@@ -1,6 +1,7 @@
 #include "model/llama_like/llama_like_model.hpp"
 
 #include "model/stage_hooks.hpp"
+#include "ops/gemm.hpp"
 
 #include <cstdlib>
 #include <utility>
@@ -67,6 +68,13 @@ LlamaLikeModel::LlamaLikeModel(
     caps_.supports_supergraph =
         static_cast<bool>(declared_) &&
         llama_like_supergraph_supported(declared_);
+    // `body()` below forwards the slab width, and `llama_like_forward_paged`
+    // acts on it -- but only a dense BF16 head can be reduced slab by slab, so
+    // the weight decides too. Asked once here rather than inside the forward:
+    // by then the graph key and the epilogue's token source are committed.
+    caps_.supports_fused_lm_head_argmax =
+        weights_.lm_head != nullptr &&
+        ops::lm_head_argmax_supported(*weights_.lm_head);
 }
 
 void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
@@ -174,8 +182,11 @@ void LlamaLikeModel::body(Workspace& ws,
             in.full_depth_rows);
         return;
     }
+    LlamaLikeForwardCfg fwd = fwd_cfg_;
+    fwd.logits_argmax_chunk_tokens = in.logits_argmax_chunk_tokens;
+
     llama_like_forward_paged(
-        weights_, hf_config_, fwd_cfg_, plan_,
+        weights_, hf_config_, fwd, plan_,
         ws, kv, attn_ws, cublas,
         in.token_ids, in.positions,
         in.qo_indptr_d, in.kv_page_indices_d, in.kv_page_indptr_d,

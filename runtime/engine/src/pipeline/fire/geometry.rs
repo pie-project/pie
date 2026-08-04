@@ -469,14 +469,7 @@ pub(crate) enum FireAttnMask {
         masks: Vec<crate::driver::command::EncodedMask>,
         mask_indptr: Vec<u32>,
     },
-    Device {
-        /// The mask's producing op chain statically recognizes as a
-        /// structured mask the driver lowers per lane (window override or
-        /// packed structured mask) — see [`device_mask_is_structured`]. Such
-        /// a fire co-batches; an unrecognized (genuinely dense) device mask
-        /// keeps the solo contract.
-        structured: bool,
-    },
+    Device,
 }
 
 impl FireAttnMask {
@@ -491,75 +484,11 @@ impl FireAttnMask {
                 // prefill attention path.
                 request.single_token_mode = false;
             }
-            FireAttnMask::Device { structured } => {
+            FireAttnMask::Device => {
                 request.has_user_mask = true;
-                request.structured_device_mask = structured;
             }
         }
     }
-}
-
-/// Whether the device-derived mask a fire puts on `mask_channel` statically
-/// recognizes as a structured mask the driver can lower without a dense
-/// per-cell read: the value behind the channel's LAST put, seen through
-/// reshapes, is `CausalMask`, or `SlidingWindowMask`/`SinkWindowMask` with a
-/// non-empty window (an empty window cannot ride the runtime-window ABI, so
-/// the driver reads those dense — `descriptor_resolve.hpp`'s `direct`
-/// gate). Mirrors the driver's reshape-chasing walk
-/// (`pie_native::launch::structured_mask_descriptor`, trace_query.hpp) over
-/// the Rust IR, which carries the same three opcodes; both sides must answer
-/// alike or the scheduler admits a co-batch the driver's mask-scope
-/// admission check refuses.
-pub(crate) fn device_mask_is_structured(
-    container: &TraceContainer,
-    mask_channel: u32,
-) -> bool {
-    // The last put to the mask channel, in stage order then op order — the
-    // same selection the driver's walk makes over its `puts` tables. SSA ids
-    // are stage-local (op at position `p` defines `next_id..next_id +
-    // result_count()`), so the producing stage is tracked with the value.
-    let mut selected: Option<(&pie_ir::container::StageProgram, u32)> = None;
-    for stage in &container.stages {
-        for op in &stage.ops {
-            if let Op::ChanPut { chan, value } = op
-                && *chan == mask_channel
-            {
-                selected = Some((stage, *value));
-            }
-        }
-    }
-    let Some((stage, mut value)) = selected else {
-        return false;
-    };
-    // The op defining `value` in this stage body, by the stage-local
-    // numbering rule above.
-    let producer = |value: u32| -> Option<&Op> {
-        let mut next_id = 0u32;
-        for op in &stage.ops {
-            let results = op.result_count();
-            if value >= next_id && value < next_id + results {
-                return Some(op);
-            }
-            next_id += results;
-        }
-        None
-    };
-    // Bounded by the op count: a reshape chain longer than the body would
-    // be a cycle, which validation already rejects.
-    for _ in 0..=stage.ops.len() {
-        let Some(op) = producer(value) else {
-            // A root (channel take/read, intrinsic, const): not structured.
-            return false;
-        };
-        match op {
-            Op::Reshape { value: inner, .. } => value = *inner,
-            Op::CausalMask { .. } => return true,
-            Op::SlidingWindowMask { window, .. } => return *window > 0,
-            Op::SinkWindowMask { window, .. } => return *window > 0,
-            _ => return false,
-        }
-    }
-    false
 }
 
 /// Lower an already-evaluated `AttnMask` port into one BRLE row per query.
@@ -582,12 +511,7 @@ pub(crate) fn lower_attn_mask_evaluated(
     let value = match value {
         Ok(value) => value,
         Err(_) if matches!(binding.source, PortSource::Channel(_)) => {
-            let PortSource::Channel(channel) = binding.source else {
-                unreachable!("the guard admits only channel sources");
-            };
-            return Ok(FireAttnMask::Device {
-                structured: device_mask_is_structured(container, channel),
-            });
+            return Ok(FireAttnMask::Device);
         }
         Err(error) => {
             return Err(format!(
@@ -632,45 +556,6 @@ pub(crate) fn lower_attn_mask_evaluated(
         masks,
         mask_indptr: qo_indptr.to_vec(),
     })
-}
-
-/// Mask lowering for DEVICE-GEOMETRY fires (pooled device geometry and the
-/// decode-envelope class): recognition precedes evaluation. When the mask
-/// channel's put chain statically recognizes as structured, classify
-/// [`FireAttnMask::Device`]`{ structured: true }` WITHOUT evaluating the
-/// value — even on fires where the host shadow could derive it (naive-masked
-/// / attention-sink / sliding-window-attention re-derive the mask from the
-/// host-derivable `fill` chain every fire, so evaluation-first lowers wire
-/// BRLE rows forever and the fire never leaves the wire-mask solo clauses).
-/// The driver re-derives the same structure from its adopted trace for every
-/// device-geometry program (`resolve_fire_geometry`'s `direct` gate) and
-/// never consumes the wire rows for a recognized mask (a pure-causal BRLE
-/// decodes to nothing and the window-override/pack path takes over), so the
-/// rows are dead weight solo and a solo-forcing liability composed. A
-/// seeded first-fire cell is likewise never read on this path — the trace's
-/// opcode is the mask's semantics, which is exactly the wire contract of
-/// the structured opcodes.
-///
-/// Everything unrecognized falls through to [`evaluate_attn_mask`]:
-/// host-derivable values keep wire BRLE (and today's solo clauses),
-/// device-only values keep the dense `Device { structured: false }` solo
-/// classification.
-pub(crate) fn evaluate_attn_mask_device_geometry(
-    bound: &pie_ir::validate::BoundTrace,
-    known: &mut dyn FnMut(u32) -> Option<pie_eval::interp::Value>,
-    qo_indptr: &[u32],
-) -> Result<FireAttnMask, String> {
-    if let Some(binding) = bound
-        .container
-        .ports
-        .iter()
-        .find(|binding| binding.port == Port::AttnMask)
-        && let PortSource::Channel(channel) = binding.source
-        && device_mask_is_structured(&bound.container, channel)
-    {
-        return Ok(FireAttnMask::Device { structured: true });
-    }
-    evaluate_attn_mask(bound, known, qo_indptr)
 }
 
 /// Evaluate and lower the mask against this fire's host-shadow value oracle.
@@ -1541,112 +1426,11 @@ mod tests {
         let device = vec![(Port::AttnMask, Err("device epilogue put".to_string()))];
         assert_eq!(
             lower_attn_mask_evaluated(&container, &[0, 1, 2], &device).unwrap(),
-            FireAttnMask::Device { structured: false }
+            FireAttnMask::Device
         );
         let mut plan = crate::driver::LaunchPlan::default();
-        FireAttnMask::Device { structured: false }.apply_to(&mut plan);
+        FireAttnMask::Device.apply_to(&mut plan);
         assert!(plan.has_user_mask);
         assert!(plan.masks.is_empty(), "dense device path has no wire rows");
-        assert!(!plan.structured_device_mask);
-    }
-
-    /// Extend `mask_container` with an epilogue that re-puts the mask
-    /// channel from `mask_op` (given the take-read positions value id 0),
-    /// reshaped to the mask channel's shape — naive-masked's structured
-    /// decode shape in miniature.
-    fn mask_container_with_put(mask_op: impl FnOnce(u32) -> Op) -> TraceContainer {
-        let mut container = mask_container();
-        let mask_channel = (container.channels.len() - 1) as u32;
-        let positions = container.channels.len() as u32;
-        container
-            .channels
-            .push(chan(Shape::vector(1), DType::U32));
-        // Keep the container's stage-tag order canonical (Prologue before
-        // the base Epilogue).
-        container.stages.insert(
-            0,
-            StageProgram {
-                stage: Stage::Prologue,
-                ops: vec![
-                    Op::ChanTake(positions), // value 0
-                    mask_op(0),              // value 1
-                    Op::Reshape {
-                        value: 1,
-                        shape: Shape::matrix(2, 4),
-                    }, // value 2
-                    Op::ChanPut {
-                        chan: mask_channel,
-                        value: 2,
-                    },
-                ],
-            },
-        );
-        container
-    }
-
-    /// The structured-mask walk mirrors the driver's
-    /// (`structured_mask_descriptor` + the `direct` gate): the three
-    /// structured opcodes recognize through reshapes, an empty window falls
-    /// back to dense, and a generic op chain is dense. Divergence here is a
-    /// scheduler/driver admission disagreement, so each arm is pinned.
-    #[test]
-    fn device_mask_structure_recognition_mirrors_the_driver_walk() {
-        let device = vec![(Port::AttnMask, Err("device epilogue put".to_string()))];
-        let cases: [(&str, Box<dyn FnOnce(u32) -> Op>, bool); 5] = [
-            (
-                "causal_mask",
-                Box::new(|positions| Op::CausalMask { positions, len: 8 }),
-                true,
-            ),
-            (
-                "sliding_window_mask(window>0)",
-                Box::new(|positions| Op::SlidingWindowMask {
-                    positions,
-                    len: 8,
-                    window: 3,
-                }),
-                true,
-            ),
-            (
-                "sliding_window_mask(window=0)",
-                Box::new(|positions| Op::SlidingWindowMask {
-                    positions,
-                    len: 8,
-                    window: 0,
-                }),
-                false,
-            ),
-            (
-                "sink_window_mask(window>0)",
-                Box::new(|positions| Op::SinkWindowMask {
-                    positions,
-                    len: 8,
-                    sink: 2,
-                    window: 3,
-                }),
-                true,
-            ),
-            (
-                "generic le-style chain",
-                Box::new(|positions| Op::Eq(positions, positions)),
-                false,
-            ),
-        ];
-        for (label, mask_op, expected) in cases {
-            let container = mask_container_with_put(mask_op);
-            let lowered =
-                lower_attn_mask_evaluated(&container, &[0, 1, 2], &device).unwrap();
-            assert_eq!(
-                lowered,
-                FireAttnMask::Device {
-                    structured: expected
-                },
-                "{label}"
-            );
-            let mut plan = crate::driver::LaunchPlan::default();
-            lowered.apply_to(&mut plan);
-            assert!(plan.has_user_mask, "{label}");
-            assert_eq!(plan.structured_device_mask, expected, "{label}");
-        }
     }
 }

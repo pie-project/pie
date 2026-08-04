@@ -170,13 +170,6 @@ pub struct DriverConfig {
     pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
-    pub has_lora: bool,
-    /// Site summary of the driver's traced + validated declared plan
-    /// (capabilities handshake); empty when the driver traced no plan or
-    /// the plan declares no model-structural sites. Threaded to this
-    /// driver's scheduler, which merges the sites into every fire plan
-    /// (`fire_plan::plan_fire_with_model`).
-    pub model_site_summary: pie_driver_abi::ModelSiteSummary,
     pub device_geometry_port_mask: u32,
     pub limits: crate::driver::SchedulerLimits,
     pub driver_backend: crate::driver::DriverBackend,
@@ -318,6 +311,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         }
     };
     let ptir_caps = model::PtirCaps {
+        // tart: the span-grouped adapter capability. DORMANT on the
+        // 0.3 surface until the adapter re-port (the upstream
+        // DriverConfig does not carry the handshake bit yet).
+        has_lora: false,
         has_mtp_logits: !driver_configs.is_empty()
             && driver_configs.iter().all(|d| d.has_mtp_logits),
         has_mtp_drafts: !driver_configs.is_empty()
@@ -330,7 +327,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             && driver_configs.iter().all(|d| d.has_attn_score),
         has_attn_page_mask: !driver_configs.is_empty()
             && driver_configs.iter().all(|d| d.has_attn_page_mask),
-        has_lora: !driver_configs.is_empty() && driver_configs.iter().all(|d| d.has_lora),
     };
     model::register(
         name.clone(),
@@ -374,7 +370,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
-                    model_site_summary: d.model_site_summary,
                 },
                 d.driver_backend,
             )

@@ -29,16 +29,6 @@ pub struct StepSubmission {
     /// each (a device-geometry fire's row is an empty placeholder the driver
     /// replaces with channel-resolved geometry).
     pub program_row_indptr: Vec<u32>,
-    /// V2 rung ③a: the region table (north-star-dsl.md "RUNG ③ SPEC") —
-    /// maximal runs of members sharing an axis signature and depth
-    /// operand, boundaries in WIRE rows through the attribution CSR.
-    /// Empty = no table (the words' UNPLANNED discipline); the driver
-    /// derives the scalar words from a present table and refuses drift.
-    pub region_row_indptr: Vec<u32>,
-    /// Axis bitset per region (`PIE_REGION_SIG_*`).
-    pub region_sig: Vec<u32>,
-    /// Depth operand per region (`PIE_MAX_LAYERS_FULL` = full).
-    pub region_k: Vec<u32>,
     pub logical_fire_ids: Vec<u64>,
     pub channel_expected_head: Vec<u64>,
     pub channel_expected_tail: Vec<u64>,

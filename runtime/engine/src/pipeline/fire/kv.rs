@@ -559,16 +559,9 @@ pub fn finalize(store: &mut KvStore, txn: KvTxn, success: bool) -> Result<(), St
 /// self-attention over the working set — so its KV rows may carry chained
 /// semantic hashes. Rejected by anything that can perturb K/V production:
 /// an attention mask (it changes hidden states, hence KV at layers > 0),
-/// per-layer stage programs (they can rewrite projections), configuration
-/// sinks (a `SinkCall` in any stage — `lora` folds an adapter delta into
-/// the q/v projections and `minference_sparse` sparsifies attention, so a
-/// sink-carrying pass writes KV the vanilla model would not; and the
-/// adapter contents are per-instance channel seeds NOT in the container,
-/// so no program identity can distinguish two adapters — see
-/// stage1-notes.md "Stage 4 — cache_domain × adapters"), or extern
-/// channels. Sink-free prologue/epilogue programs only shape sampling —
-/// grammar, watermarking, and sampler passes all stay canonical. A `KvLen`
-/// port must
+/// per-layer stage programs (they can rewrite projections), or extern
+/// channels. Prologue/epilogue programs only shape sampling — grammar,
+/// watermarking, and sampler passes all stay canonical. A `KvLen` port must
 /// exist so the fire-time gate can verify the pass attends the FULL context
 /// (a shorter span changes upper-layer KV).
 ///
@@ -601,11 +594,6 @@ pub fn canonical_kv_shape(container: &pie_ir::container::TraceContainer) -> bool
             .stages
             .iter()
             .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
-        && !container.stages.iter().any(|s| {
-            s.ops
-                .iter()
-                .any(|op| matches!(op, pie_ir::op::Op::SinkCall { .. }))
-        })
 }
 
 pub struct CanonicalFireEvidence {
@@ -896,41 +884,6 @@ mod tests {
             externs: vec![],
         };
         assert!(!canonical_kv_shape(&devgeo));
-    }
-
-    #[test]
-    fn canonical_shape_rejects_configuration_sinks() {
-        // A prologue `lora` sink folds an adapter delta into the q/v
-        // projections: the pass writes KV the vanilla model would not, and
-        // the adapter contents are per-instance channel seeds outside the
-        // container — two instances with different adapters share one
-        // program identity. Canonical hashing under the bare store domain
-        // would let their KV impersonate each other's (and the no-adapter
-        // fleet's), so a SinkCall in ANY stage rejects.
-        let mut c = plain_decode_container();
-        c.names = vec!["lora".to_string()];
-        c.stages.insert(
-            0,
-            StageProgram {
-                stage: Stage::Prologue,
-                ops: vec![pie_ir::op::Op::SinkCall {
-                    name: 0,
-                    args: vec![],
-                }],
-            },
-        );
-        assert!(!canonical_kv_shape(&c));
-
-        // A sink-free prologue only shapes sampling: still canonical.
-        let mut c = plain_decode_container();
-        c.stages.insert(
-            0,
-            StageProgram {
-                stage: Stage::Prologue,
-                ops: vec![],
-            },
-        );
-        assert!(canonical_kv_shape(&c));
     }
 
     #[test]

@@ -47,8 +47,15 @@ inline constexpr std::uint32_t kGvLora        = 1u << 30;
 inline constexpr std::uint32_t kGvSpatial     = 1u << 29;
 inline constexpr int           kGvLayoutShift = 4;
 
+// Upstream §20.37 (merged): the LM head either materialises logits or
+// reduces to token ids in-GEMM — different kernel sequences, different
+// captures. Rehomed to a HIGH bit: upstream gave it bit 3, which the
+// tart hook bit already owns.
+inline constexpr std::uint32_t kGvFusedArgmax = 1u << 28;
+
 inline constexpr std::uint32_t kGvFlagMask =
-    kGvSmallSpec | kGvRsVerify | kGvCustomMask | kGvHasHooks;
+    kGvSmallSpec | kGvRsVerify | kGvCustomMask | kGvHasHooks |
+    kGvFusedArgmax;
 
 // By construction: every flag is below the layout field, so no `graph_layout`
 // value can ever alias a flag bit.
@@ -58,12 +65,14 @@ static_assert(kGvFlagMask < (1u << kGvLayoutShift),
 constexpr std::uint32_t make_graph_variant(bool small_spec,
                                            bool rs_verify,
                                            bool custom_mask,
+                                           bool fused_argmax,
                                            std::uint32_t graph_layout,
                                            bool has_hooks = false) {
-    return (small_spec  ? kGvSmallSpec  : 0u) |
-           (rs_verify   ? kGvRsVerify   : 0u) |
-           (custom_mask ? kGvCustomMask : 0u) |
-           (has_hooks   ? kGvHasHooks   : 0u) |
+    return (small_spec   ? kGvSmallSpec   : 0u) |
+           (rs_verify    ? kGvRsVerify    : 0u) |
+           (custom_mask  ? kGvCustomMask  : 0u) |
+           (fused_argmax ? kGvFusedArgmax : 0u) |
+           (has_hooks    ? kGvHasHooks    : 0u) |
            (graph_layout << kGvLayoutShift);
 }
 
@@ -95,20 +104,24 @@ static_assert(gv_old_encode_for_proof(64u, false, false) ==
               "#24 precondition: OLD encoding aliased graph_layout=64 with "
               "small_spec — the latent collision this fix closes");
 // And the fix keeps them distinct.
-static_assert(make_graph_variant(false, false, false, 64u) !=
-                  make_graph_variant(true, false, false, 0u),
+static_assert(make_graph_variant(false, false, false, false, 64u) !=
+                  make_graph_variant(true, false, false, false, 0u),
               "#24 fix: graph_layout=64 must hash distinctly from small_spec");
 // Increment 4 re-proof at the new boundary (layout shift 3 -> 4): the layout
-// value whose lowest bit would land on the NEW flag (kGvHasHooks, bit 3 =
-// layout 0.5 -- i.e. the first layout value that reaches bit 3 is
-// graph_layout=1 under a hypothetical shift-3 encoding) must stay distinct
-// from the hook flag, and a hook capture must never alias a hookless one.
-static_assert(make_graph_variant(false, false, false, 1u) !=
-                  make_graph_variant(false, false, false, 0u, /*has_hooks=*/true),
+// value whose lowest bit would land on the NEW flag (kGvHasHooks, bit 3)
+// must stay distinct from the hook flag, and a hook capture must never
+// alias a hookless one.
+static_assert(make_graph_variant(false, false, false, false, 1u) !=
+                  make_graph_variant(false, false, false, false, 0u,
+                                     /*has_hooks=*/true),
               "#24 discipline: graph_layout=1 must hash distinctly from "
               "kGvHasHooks after the layout shift moved to 4");
-static_assert(make_graph_variant(false, false, false, 7u, true) !=
-                  make_graph_variant(false, false, false, 7u, false),
+static_assert(make_graph_variant(false, false, false, false, 7u, true) !=
+                  make_graph_variant(false, false, false, false, 7u, false),
               "kGvHasHooks must separate hook captures from plain ones");
+// The same property for the merged upstream flag (rehomed to bit 28).
+static_assert(make_graph_variant(false, false, false, false, 1u) !=
+                  make_graph_variant(false, false, false, true, 0u),
+              "graph_layout=1 must hash distinctly from fused_argmax");
 
 }  // namespace pie_cuda_driver

@@ -348,12 +348,12 @@ class Dispatch {
     // the compiled-plan derivation below becomes a cross-check — a
     // disagreement refuses the launch loudly.
     std::uint32_t launch_hook_free_prefix_rows(
-        const pie_native::LaunchView& view) const;
+        const pie::driver::fire::LaunchView& view) const;
 
     // The compiled-plan derivation alone (the pre-plan behavior; the
     // cross-check's second opinion).
     std::uint32_t derive_hook_free_prefix_rows(
-        const pie_native::LaunchView& view) const;
+        const pie::driver::fire::LaunchView& view) const;
 
     // Whether any program in this launch reads `AttnScore`. Capture is opt-in
     // per fire because it costs an extra `[num_q_heads, kv_len]` write inside
@@ -389,7 +389,7 @@ class Dispatch {
     // prologue. The frame queries this to decide whether to fetch and thread
     // the resolved lora table into the model body.
     bool launch_wants_lora(
-        const pie_native::LaunchView& view) const;
+        const pie::driver::fire::LaunchView& view) const;
 
     // Whether the active model's projection path can honour the `lora` sink
     // (capability `has_lora`). Default FALSE: a program naming the sink is
@@ -476,7 +476,7 @@ class Dispatch {
     // dense device mask, -1 otherwise. `allow_structured_masks` mirrors the
     // resolve path (`resolve_attention_mask`): a mask the structured-mask
     // recognizer lowers to a runtime window override is not a dense mask.
-    int dense_mask_scope_violation(const pie_native::LaunchView& view,
+    int dense_mask_scope_violation(const pie::driver::fire::LaunchView& view,
                                    bool allow_structured_masks) const;
 
     // Device-composition lowering, split along the frame pipeline: the

@@ -41,17 +41,6 @@ static PIE_LOADER_ENTRY_ANCHOR: unsafe extern "C" fn(
     *mut *mut pie_loader::ffi::PieLoaderDiagnostics,
 ) -> pie_loader::ffi::PieLoaderStatus = pie_loader::ffi::entry::pie_loader_compile_contract;
 
-/// Same story for the forward toolchain: the drivers trace a family's
-/// declaration over `pie_forward.h`, no Rust in this process calls it, and
-/// the crate-side `#[used] KEEP_ALIVE` only keeps symbols alive once the
-/// object file is in the link — this reference is what puts it there.
-#[used]
-static PIE_FORWARD_ENTRY_ANCHOR: unsafe extern "C" fn(
-    *const pie_forward::ffi::entry::PieForwardLlamaLikeFacts,
-    *mut pie_forward::ffi::PieForwardPlan,
-) -> pie_forward::ffi::entry::PieForwardStatus =
-    pie_forward::ffi::entry::pie_forward_trace_llama_like;
-
 #[cfg(feature = "driver-cuda")]
 #[repr(C)]
 struct NcclUniqueId {
@@ -468,6 +457,8 @@ fn dummy_native_options(
 
     Ok(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages,
+        // tart: no declared plan on the dummy — empty site summary.
+        model_site_summary: Default::default(),
         kv_page_size: 16,
         swap_pool_size: 0,
         vocab_size,
@@ -482,9 +473,6 @@ fn dummy_native_options(
         has_mtp_drafts: true,
         has_value_head: true,
         has_attn_score: true,
-        // The dummy driver traces no forward plan; it reports no
-        // model-structural sites (same as a real dense deployment).
-        model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,

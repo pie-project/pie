@@ -192,12 +192,12 @@ int main() {
     bool ok = true;
 
     const auto llama_fused = [&] {
-        k::launch_qkv_qk_norm_rope_write_kv_bf16(
+        k::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
             in.packed, in.q, in.k_pages, in.v_pages, in.q_weight, in.k_weight,
-            in.positions, nullptr, /*qo_indptr=*/nullptr, in.page_indices,
-            in.page_indptr, in.last_page_lens, nullptr, nullptr, in.row_valid,
-            kRows, kRows, kQHeads, kKvHeads, kHeadDim, kPageSize, false,
-            10000.0f, 1.0e-6f, in.stream);
+            in.positions, nullptr, in.page_indices, in.page_indptr,
+            in.last_page_lens, nullptr, nullptr, in.row_valid, kRows, kQHeads,
+            kKvHeads, kHeadDim, kPageSize, false, 10000.0f, 1.0e-6f,
+            in.stream);
     };
     ok &= run_graph_canary("LlamaLikeModel", in, llama_fused);
     ok &= run_graph_canary("Qwen3VLModel", in, llama_fused);

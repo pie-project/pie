@@ -54,10 +54,6 @@ pie-waker = { path = "../waker" }
 pie-tokenizer = { path = "../tokenizer" }
 pie-grammar = { path = "../grammar" }
 pie-model = { path = "../model" }
-# The fire planner's site table derives model-structural divergence sites
-# from the traced form (`scheduler::fire_plan::site_table`). A direct rlib
-# dep, same as pie-worker's: the runtime side needs no ABI to read a plan.
-pie-forward = { path = "../../forward" }
 rmp-serde = "1.3.1"
 blake3 = "1.8.5"
 num-traits = "0.2.19"

@@ -57,7 +57,6 @@ fn dummy_driver_backend(
         has_mtp_drafts: true,
         has_value_head: true,
         has_attn_score: true,
-        model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
         callback_delay_ms,
         reject_launches: false,
         reject_launches_remaining: 0,
@@ -145,9 +144,7 @@ impl MockEnv {
                 has_value_head: true,
                 has_kv_envelopes: false,
                 has_attn_page_mask: false,
-                has_lora: false,
                 has_attn_score: false,
-                model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
                 limits: SchedulerLimits {
                     max_forward_requests: 32,

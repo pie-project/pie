@@ -347,9 +347,12 @@ fn step_desc<'a>(
         channel_expected_head: u64_slice(&step.channel_expected_head),
         channel_expected_tail: u64_slice(&step.channel_expected_tail),
         channel_ticket_indptr: u32_slice(&step.channel_ticket_indptr),
-        region_row_indptr: u32_slice(&step.region_row_indptr),
-        region_sig: u32_slice(&step.region_sig),
-        region_k: u32_slice(&step.region_k),
+        // tart rung ③ (region table): DORMANT until the upstream
+        // scheduler regraft — the driver derives all plans as UNPLANNED
+        // from an empty table, the legacy discipline.
+        region_row_indptr: pie_driver_abi::PieU32Slice::default(),
+        region_sig: pie_driver_abi::PieU32Slice::default(),
+        region_k: pie_driver_abi::PieU32Slice::default(),
     }
 }
 

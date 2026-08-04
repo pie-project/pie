@@ -20,7 +20,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "launch_view.hpp"
+#include "fire/view.hpp"
 
 namespace pie_native {
 

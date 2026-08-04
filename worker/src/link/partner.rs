@@ -271,7 +271,6 @@ impl PartnerLinkManager {
                     max_page_refs: hello.capabilities.max_page_refs as usize,
                 },
                 device_geometry_port_mask: hello.capabilities.device_geometry_port_mask,
-                model_site_summary: hello.capabilities.model_site_summary.clone(),
             },
             pie_engine::driver::DriverBackend::Remote(remote),
         );
