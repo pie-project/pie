@@ -563,6 +563,11 @@ pub(crate) fn build_frame_submission(
                         group[i].request.device_resolved_geometry,
                         group[i].hook_program,
                         group[i].request.has_user_mask,
+                        // STRUCTURAL S-2 (found by AC-0: the lora x
+                        // depth pair PANICKED this parity assert — the
+                        // reference comparator must carry every
+                        // seriation term the plan's key carries).
+                        group[i].request.max_layers.is_some(),
                     )
                 });
                 order
