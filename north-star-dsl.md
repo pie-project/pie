@@ -2128,3 +2128,15 @@ composition alone: real speculative verification already participates
 in the axis fabric via the mixed fire. The remaining half — verify as
 its OWN Div::STRUCTURAL trace class (a stated verify-vs-decode union
 rather than the prefill class's shape) — stays the recorded design.
+
+## STASH COST, MEASURED (2026-08-04)
+
+The stash/restore form's waste, priced (release, R=2, 256 tok):
+windowed depth (plain+draft) 1.22s; stash depth (mask+draft) 1.54s;
+mask-without-depth reference (mask+plain) 1.46s. The stash fire pays
+~0.08s over the mask reference — the truncated row's discarded
+[k, L) compute plus two slab copies, roughly the draft row's tail
+share as predicted. VERDICT: the waste is real but SMALL at these
+shapes (5-7% of the fire); windowed range-2 stays a recorded
+optimization, justified only when truncated-row shares grow large
+(many drafts per fire) — not before the bigger rocks.
