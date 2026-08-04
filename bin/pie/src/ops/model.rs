@@ -235,10 +235,15 @@ fn download(repo_id: String, all: bool) -> Result<()> {
         .enable_all()
         .build()?;
     let label = repo_id.clone();
+    // Built out here so the result line can report what the transfer cost --
+    // the bar erases itself, so otherwise the only record of a twenty-minute
+    // download is that it ended.
+    let progress = ProgressBar::new();
+    let bar = progress.clone();
     let snapshot_path = runtime.block_on(async move {
         let client = hf_hub::HFClient::new().map_err(|e| anyhow!("init HF client: {e}"))?;
         let repo = client.model(owner, name);
-        let progress = ProgressBar::new();
+        let progress = bar;
         let allow_patterns = if all {
             None
         } else {
@@ -255,9 +260,10 @@ fn download(repo_id: String, all: bool) -> Result<()> {
         result
     })?;
     println!(
-        "{} downloaded to {}",
+        "{} downloaded to {}{}",
         crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
-        snapshot_path.display()
+        crate::ui::short_path(&snapshot_path),
+        progress.summary()
     );
 
     // Post-download compatibility check. The cache layout puts
@@ -347,11 +353,28 @@ impl ProgressBar {
     fn finish(&self) {
         self.inner.finished.store(true, Ordering::Relaxed);
         if self.inner.is_tty {
-            // Replace the bar line with a clean blank so the post-
-            // download "✓ Downloaded to …" lands on a fresh row.
+            // Replace the bar line with a clean blank so the result line lands
+            // on a fresh row.
             eprint!("\r\x1b[K");
             let _ = std::io::stderr().flush();
         }
+    }
+
+    /// What the download actually cost, for the result line.
+    ///
+    /// The bar is erased when it finishes, so without this the only record of
+    /// a twenty-minute transfer was that it had ended.
+    fn summary(&self) -> String {
+        let moved = self.inner.bytes_done.load(Ordering::Relaxed);
+        let elapsed = self.inner.started.elapsed();
+        if moved == 0 {
+            return String::new();
+        }
+        format!(
+            " ({} in {})",
+            crate::ui::bytes(moved),
+            crate::ui::duration(elapsed)
+        )
     }
 
     fn draw(&self) {
@@ -382,8 +405,18 @@ impl ProgressBar {
         let bar_width = 30usize;
         let filled = (pct * bar_width as f64).round() as usize;
         let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+        // An ETA only once there is a rate worth extrapolating from, and only
+        // when the total is known -- guessing from the first hundred
+        // milliseconds produces a number that swings by minutes and teaches a
+        // reader to ignore the field.
+        let eta = if total > done && rate > 1.0 && elapsed > 2.0 {
+            let remaining = std::time::Duration::from_secs_f64((total - done) as f64 / rate);
+            format!(" {} left", crate::ui::duration(remaining))
+        } else {
+            String::new()
+        };
         let body = format!(
-            "  {bar} {pct:>5.1}% {done} / {total} @ {rate}",
+            "  {bar} {pct:>5.1}% {done} / {total} @ {rate}{eta}",
             pct = pct * 100.0,
             done = crate::ui::bytes(done),
             total = crate::ui::bytes(total),
