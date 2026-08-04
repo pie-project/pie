@@ -2632,3 +2632,20 @@ class); repeat nondeterminism = the known execution-history floor
 (control reproduces bands-off); 0.6B wall is overhead-bound, GPU win
 prices at 7B+. This is the first capability that exists ONLY because
 the table exists — no scalar-word design could have carried n bands.
+
+## ACT 1 PRICED (2026-08-04): 1.26x at 7B, and where the win lives
+
+Prefill-family bands land (this hardware's 7B/14B are prefill-decode
+deployments: per-band planned causal prefill, identity-qo prefix,
+own workspace; staleness fix; XQA degrades with a DECLINE trace).
+The 7B numbers teach the shape of the win: mixed full+trunc is a
+WASH — weight-bandwidth-bound decode reads every layer's weights
+regardless of row count — but ALL-TRUNCATED mixed-k prices 1.26x
+(2.25 vs 2.83s, 4×k8+4×k16, 128 tok, debug), because the banded walk
+STOPS past the deepest k and a skipped layer skips its weight pass.
+Corollary for the board: banded depth's headline case is draft/
+speculative fleets (all lanes truncated, mixed k); mixed
+full+truncated fires need the row-narrowing to become compute-bound
+(large R / prefill-shaped members) before it prices. Correctness: at
+both scales the full lane byte-matches its solo run and truncated
+lanes emit layer-k class — the demotion is dead wherever bands arm.
