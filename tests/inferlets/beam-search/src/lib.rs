@@ -27,6 +27,31 @@ struct Input {
     /// Beam width. `1` degenerates to greedy decoding (the beam identity).
     #[serde(default = "default_beams")]
     beams: u32,
+    /// Fill the attention mask with per-beam ancestry. Default on.
+    ///
+    /// Setting this false seeds the mask ALL-TRUE instead, so every beam
+    /// attends the whole filled span rather than its own ancestry — a
+    /// deliberately broken beam. `KvGeometry::mask` stays `Some(&mask)` either
+    /// way and the epilogue is untouched: `or(gather(mask, parent), newpos)` is
+    /// a fixed point on an all-true mask, so permissiveness survives every step
+    /// for free. The ONLY difference between the two arms is the mask's
+    /// contents.
+    ///
+    /// It has to be the contents and not the binding. Passing `mask: None`
+    /// instead would change the kernel: an unbound AttnMask lowers to
+    /// `FireAttnMask::Omitted` rather than `Device`, so `has_user_mask` stays
+    /// false, the batch keeps `single_token_mode`, and the driver's
+    /// `has_custom_mask = (custom_mask_d != nullptr)` then routes the fire
+    /// down the XQA decode path with a different KV-write path as well. Two
+    /// arms differing in kernel would diverge on floating-point accumulation
+    /// order alone, which is indistinguishable from the mask working.
+    ///
+    /// This exists as a CONTROL because a driver that ignores `custom_mask_d`
+    /// does not fail — it returns fluent output at an ordinary speed, and
+    /// `ModelCapabilities` carries no `supports_custom_mask` flag to check
+    /// instead. Differencing the arms is the only way to establish it.
+    #[serde(default = "default_mask")]
+    mask: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -35,6 +60,10 @@ fn default_max_tokens() -> usize {
 
 fn default_beams() -> u32 {
     2
+}
+
+fn default_mask() -> bool {
+    true
 }
 
 /// Per-step disagreements between the beam pick and the raw-logit argmax.
@@ -144,6 +173,7 @@ macro_rules! define_beam_search {
 
         let max_steps = input.max_tokens;
         let b = input.beams;
+        let use_mask = input.mask;
         if b == 0 {
             return Err("beams must be at least 1".into());
         }
@@ -188,7 +218,17 @@ macro_rules! define_beam_search {
         // Shared BOS prompt at pool position 0: both beams attend it (mask), and the
         // fire-0 write descriptor lands both BOS at (page pool_ids[0], off 0) — the
         // shared prefix cell. fill = 1 (position 0 filled).
-        let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == 0)).collect();
+        //
+        // `mask = false` seeds this all-true instead of {position 0}. The
+        // epilogue's `or(gather(mask, parent), newpos)` cannot clear a bit, so
+        // an all-true seed stays all-true for the whole run and every beam
+        // attends the entire filled span. That is the broken-beam control,
+        // expressed purely as mask CONTENTS so the port binding — and with it
+        // the attention kernel and the KV-write path — is identical in both
+        // arms.
+        let init_mask: Vec<bool> = (0..B)
+            .flat_map(|_| (0..POOL).map(|p| !use_mask || p == 0))
+            .collect();
 
         // Loop-carried search and page geometry.
         let mask = Channel::from_shaped([B, POOL], init_mask).named("mask"); // [B, POOL] bool
@@ -255,6 +295,10 @@ macro_rules! define_beam_search {
         // explicit write descriptor. The pool is fixed so these carry constant values.
         // Named once because a beam fork rebinds the same geometry over a new
         // set of states.
+        // `KvGeometry::mask` is `Some(&mask)` in BOTH arms — see `Input::mask`.
+        // Binding it is what keeps `has_user_mask`, `single_token_mode`, the
+        // attention kernel and the KV-write path the same on either side of the
+        // control, leaving the mask's contents as the only variable.
         let bind_state = |fwd: &ForwardPass, rs: &[RsWorkingSet]| {
             fwd.bind_beams(
                 &ws,
@@ -423,8 +467,37 @@ macro_rules! define_beam_search {
             final_scores[best_lane]
         );
         let text = model::decode(&hypotheses[best_lane])?;
+        // Emit the returned beam's TOKEN IDS beside the text. A benchmark
+        // digests these directly; re-tokenizing `text` would not be equivalent,
+        // because detokenize→tokenize is not the identity, so a digest taken
+        // that way could agree across two genuinely different token streams.
+        let returned_tokens = hypotheses[best_lane]
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        // Peak shared-pool occupancy: cells any fire actually wrote.
+        //
+        // Not `1 + B * steps`. The write descriptors are loop-carried —
+        // epilogue j publishes the `w_slot`/`w_off`/`fill` that fire j+1
+        // consumes — and fire 0 uses the seeded values, where all B lanes write
+        // the single shared BOS cell at position 0. With exactly `steps` fires
+        // the highest flat position written is `(steps - 1) * B`, so occupancy
+        // is `1 + (steps - 1) * B`; the final epilogue's `fill` is published to
+        // a fire that never runs. `klen` agrees: derived from the same `base`,
+        // the widest span any fire consumes is also `1 + (steps - 1) * B`.
+        //
+        // DERIVED from the width and the number of steps that actually
+        // completed, not read back from the device: `fill` is loop-carried and
+        // never drained, and adding a host round-trip per step to observe it
+        // would perturb the very decode timing this figure accompanies. The
+        // step count is observed — `hypotheses` grows one token per completed
+        // step — so an early finish is reflected rather than assumed.
+        let steps_completed = hypotheses[best_lane].len();
+        let kv_cells_occupied_peak = 1 + steps_completed.saturating_sub(1) * (B as usize);
         Ok(format!(
-            "{text}\n[beam] width={B} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}",
+            "{text}\n[beam] width={B} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}\n\
+             [beam] mask={use_mask} kv_cells_occupied_peak={kv_cells_occupied_peak} returned_tokens={returned_tokens}",
             final_scores[best_lane]
         ))
 
