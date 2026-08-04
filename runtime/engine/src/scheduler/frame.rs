@@ -375,6 +375,14 @@ pub(super) struct FramePolicy {
     truncated_seqs: BTreeMap<ProcessId, u64>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
+    /// Monotonic count of accepted frame-fire arrivals — the ready-mode
+    /// quiescence signal: the gate opens early only after one full hold
+    /// cycle in which this did not move (the arrival burst has ended).
+    arrival_seq: u64,
+    /// `arrival_seq` observed at the last held gate evaluation that had a
+    /// seal candidate. `Some(seq) == arrival_seq` at the next evaluation
+    /// means no new arrival landed in between: quiesced.
+    quiesce_mark: Option<u64>,
     /// Monotonic seal counter, used only to age a lane's last implicit
     /// rejoin for the run-ahead probe.
     seal_seq: u64,
@@ -456,6 +464,8 @@ impl FramePolicy {
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
+            arrival_seq: 0,
+            quiesce_mark: None,
             seal_seq: 0,
             gate_block_from: None,
             in_flight_lanes: BTreeSet::new(),
@@ -625,6 +635,7 @@ impl FramePolicy {
         };
         frame.truncated |= late || suspended;
         frame.fires.push(fire);
+        self.arrival_seq = self.arrival_seq.wrapping_add(1);
         frame.expected = if frame.truncated {
             frame.fires.len() as u32
         } else {
@@ -1523,21 +1534,32 @@ impl FramePolicy {
                     return FramePlan::Park;
                 }
                 if seal_mode_ready() && self.have_seal_candidate() {
-                    // Ready mode: the device is idle and sealable work
-                    // exists. Open the boundary with the arrival-complete
-                    // subset instead of holding — the missing lanes join
-                    // this same boundary as fresh partitions on arrival.
-                    crate::scheduler::RUN_AHEAD
-                        .early_open
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.strict_watchdog_deadline = None;
-                    match self.seal() {
-                        Some(FramePlan::Dispatch(_)) => continue,
-                        Some(plan) => return plan,
-                        // Candidates exist but none sealed (e.g. every
-                        // ready lane is capacity-deferred): fall through
-                        // to the ordinary hold.
-                        None => {}
+                    // Ready mode, arrival-quiescence rule: open the
+                    // boundary from the arrival-complete subset only after
+                    // one full hold cycle in which NO new fire arrived —
+                    // the reactive burst has ended, so the still-missing
+                    // lanes are genuinely slow (parked, evicted, mid-grant)
+                    // and holding for them is pure device idle. Opening on
+                    // the first idle evaluation instead (no quiescence)
+                    // fragmented the waves and lost 13% (see the analysis
+                    // addendum): the burst is still landing at that point.
+                    // Pure event arithmetic — no timers, no thresholds.
+                    if self.quiesce_mark == Some(self.arrival_seq) {
+                        self.quiesce_mark = None;
+                        crate::scheduler::RUN_AHEAD
+                            .early_open
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.strict_watchdog_deadline = None;
+                        match self.seal() {
+                            Some(FramePlan::Dispatch(_)) => continue,
+                            Some(plan) => return plan,
+                            // Candidates exist but none sealed (e.g. every
+                            // ready lane is capacity-deferred): fall through
+                            // to the ordinary hold.
+                            None => {}
+                        }
+                    } else {
+                        self.quiesce_mark = Some(self.arrival_seq);
                     }
                 }
                 let deadline = self
