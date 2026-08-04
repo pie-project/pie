@@ -267,6 +267,7 @@ struct LaunchScratch {
         view.ptir_program_row_indptr = pie_native::slice_from_u32(launch.ptir_program_row_indptr.ptr, launch.ptir_program_row_indptr.len);
         view.planned_hook_free_prefix_rows = launch.planned_hook_free_prefix_rows;
         view.planned_unmasked_prefix_rows = launch.planned_unmasked_prefix_rows;
+        view.planned_max_layers = launch.planned_max_layers;
         view.ptir_kv_write_lower_bounds = pie_native::slice_from_u64(
             launch.ptir_kv_write_lower_bounds.ptr,
             launch.ptir_kv_write_lower_bounds.len);
@@ -383,6 +384,7 @@ void expand_step(
     launch.ptir_program_row_indptr = step.ptir_program_row_indptr;
     launch.planned_hook_free_prefix_rows = step.planned_hook_free_prefix_rows;
     launch.planned_unmasked_prefix_rows = step.planned_unmasked_prefix_rows;
+    launch.planned_max_layers = step.planned_max_layers;
     launch.ptir_kv_write_lower_bounds = step.ptir_kv_write_lower_bounds;
     launch.ptir_kv_write_upper_bounds = step.ptir_kv_write_upper_bounds;
     launch.logical_fire_ids = step.logical_fire_ids;

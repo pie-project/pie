@@ -343,6 +343,10 @@ fn step_desc<'a>(
         channel_ticket_indptr: u32_slice(&step.channel_ticket_indptr),
         planned_hook_free_prefix_rows: step.planned_hook_free_prefix_rows,
         planned_unmasked_prefix_rows: step.planned_unmasked_prefix_rows,
+        planned_max_layers: step
+            .plan
+            .max_layers
+            .unwrap_or(pie_driver_abi::PIE_MAX_LAYERS_FULL),
     }
 }
 

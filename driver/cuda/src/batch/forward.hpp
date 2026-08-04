@@ -238,6 +238,11 @@ struct ForwardFn {
         std::uint32_t unmasked_prefix_rows = 0xffffffffu;
         const std::uint32_t* mask_suffix_qo_indptr_d = nullptr;
         const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr;
+        // STRUCTURAL v0 (S-1): run layers [0, k) and take the head at k
+        // (UINT32_MAX = full). Truncated fires are SOLO and EAGER (graphs
+        // refuse them); the hand-written body honours the bound, the
+        // declared legs throw loudly until S-4 states the depth peel.
+        std::uint32_t max_layers = 0xffffffffu;
     };
 
     struct PrepareInputs {
@@ -644,6 +649,9 @@ struct ForwardDispatchInputs {
     bool have_custom_mask = false;
     // NS-2: planned unmasked wire-row prefix (UINT32_MAX = no split).
     std::uint32_t unmasked_prefix_rows = 0xffffffffu;
+    // STRUCTURAL v0 (S-1): run only the first k layers and take the head
+    // there (UINT32_MAX = full model; truncated steps are SOLO).
+    std::uint32_t planned_max_layers = 0xffffffffu;
     // Direct non-graph prefill/mixed launches may gather the requested hidden
     // rows before lm_head instead of materializing [N, vocab] logits.
     bool compact_logits = false;

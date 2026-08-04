@@ -988,6 +988,23 @@ pub async fn submit_pass_stamped<C: FireContext>(
         req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
             && req.qo_indptr.windows(2).all(|lane| lane[1] - lane[0] == 1);
         attn_mask.apply_to(&mut req);
+        // STRUCTURAL v0 (S-1) TEST SCAFFOLD: stamp a layer truncation on
+        // every fire from the environment until the WIT channel (the
+        // inferlet-facing `max_layers` surface, slice B) lands. The solo
+        // rule, the ABI word, and the driver's bounded body are the real
+        // channel; only this producer is temporary.
+        {
+            static DEBUG_MAX_LAYERS: std::sync::OnceLock<Option<u32>> =
+                std::sync::OnceLock::new();
+            let k = DEBUG_MAX_LAYERS.get_or_init(|| {
+                std::env::var("PIE_DEBUG_MAX_LAYERS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            });
+            if let Some(k) = k {
+                req.max_layers = Some(*k);
+            }
+        }
         crate::pipeline::offload::try_encode(&mut req).await;
         // Resource preparation is independent of token position: realize the
         // declaration once, back only its missing frontier, then snapshot the

@@ -1226,7 +1226,8 @@ void llama_like_forward_paged(
     const std::uint32_t* peel_window_d,
     std::uint32_t unmasked_prefix_rows,
     const std::uint32_t* mask_suffix_qo_indptr_d,
-    const std::uint32_t* mask_suffix_kv_page_indptr_d)
+    const std::uint32_t* mask_suffix_kv_page_indptr_d,
+    std::uint32_t max_layers)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
     // shapes; the local *_local fields just shadow the unsharded value.
@@ -1397,7 +1398,15 @@ void llama_like_forward_paged(
     bool rope_table_ready = false;
     const float* rope_table = nullptr;
 
-    for (int L = 0; L < cfg.num_hidden_layers; ++L) {
+    // STRUCTURAL v0 (S-1): a truncated fire runs layers [0, k) and the
+    // unchanged tail takes the head at layer k (logit lens). k == L is
+    // the identity by construction.
+    const int layer_bound =
+        max_layers != 0xffffffffu &&
+        max_layers < static_cast<std::uint32_t>(cfg.num_hidden_layers)
+            ? static_cast<int>(max_layers)
+            : cfg.num_hidden_layers;
+    for (int L = 0; L < layer_bound; ++L) {
         const auto& layer = w.layers[L];
 
         // Pre-norm: norm(y) → norm_x; QKV reads from norm_x.

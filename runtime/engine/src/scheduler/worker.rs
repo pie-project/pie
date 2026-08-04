@@ -365,6 +365,14 @@ impl PendingRequest {
         if self.prebuilt && self.pipeline_id.is_none() {
             return Some("prebuilt-untracked");
         }
+        // STRUCTURAL v0 (S-1): a layer-truncated request fires alone —
+        // the depth UNION (full-depth members as a prefix-row peel) is
+        // the recorded next rung, and until it lands a truncated member
+        // in a shared fire would silently run other members' rows at
+        // the wrong depth.
+        if self.request.max_layers.is_some() {
+            return Some("truncated-depth");
+        }
         if self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0) {
             return Some("multirow-zero-tokens");
         }

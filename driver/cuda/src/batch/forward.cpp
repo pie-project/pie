@@ -809,7 +809,11 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.num_images,
         in.num_clips,
         hook_blocks,
-        in.lora != nullptr);
+        in.lora != nullptr) &&
+        // STRUCTURAL v0 (S-1): truncated fires are eager — the graph
+        // exec family is full-depth (the depth peel is the recorded
+        // union rung).
+        in.planned_max_layers == 0xffffffffu;
     const bool use_spatial_mask = spatial_mask_enabled() &&
         in.is_pure_decode && in.have_custom_mask && !has_hooks &&
         in.lora == nullptr &&
@@ -1308,6 +1312,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.precomputed_embeddings       = in.precomputed_embeddings;
     fwd_in.stage_hooks                  = in.stage_hooks;
     fwd_in.lora                         = in.lora;
+    fwd_in.max_layers                   = in.planned_max_layers;
     if (use_spatial_mask || use_spatial_mask_mixed) {
         // The masked suffix's rebased device CSRs (pure decode: qo is the
         // identity, kv_page_indptr rebases by its page base; every other

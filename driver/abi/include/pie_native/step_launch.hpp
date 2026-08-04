@@ -81,6 +81,7 @@ struct StepLaunch {
     // NS-2: the scheduler's planned unmasked prefix in WIRE rows
     // (fire_plan's attention_mask site; hook-free steps only).
     // PIE_UNMASKED_PREFIX_UNPLANNED = no plan sent.
+    std::uint32_t planned_max_layers = PIE_MAX_LAYERS_FULL;
     std::uint32_t planned_unmasked_prefix_rows =
         PIE_UNMASKED_PREFIX_UNPLANNED;
 };

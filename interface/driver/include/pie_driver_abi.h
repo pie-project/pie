@@ -347,6 +347,11 @@
 #define PIE_UNMASKED_PREFIX_UNPLANNED PIE_HOOK_FREE_PREFIX_UNPLANNED
 #define PIE_HOOK_FREE_PREFIX_UNPLANNED UINT32_MAX
 
+/**
+ * [`PieStepDesc::planned_max_layers`]'s "full model" sentinel.
+ */
+#define PIE_MAX_LAYERS_FULL UINT32_MAX
+
 #define CHANNEL_TICKET_NONE UINT64_MAX
 
 #define RS_FLAG_RESET 1
@@ -1441,6 +1446,14 @@ typedef struct PieStepDesc {
    * maskless steps, or a pre-plan engine) and the driver must not split.
    */
   uint32_t planned_unmasked_prefix_rows;
+  /**
+   * STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
+   * take the head at layer `k` (the layerskip-draft class).
+   * [`PIE_MAX_LAYERS_FULL`] means the full model (every pre-S1 step).
+   * v0 truncated steps are SOLO (the scheduler's blocking rule), so one
+   * per-step word suffices until the depth union.
+   */
+  uint32_t planned_max_layers;
 } PieStepDesc;
 
 /**

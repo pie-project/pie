@@ -287,7 +287,12 @@ void llama_like_forward_paged(
     // rebased suffix CSRs (UINT32_MAX / null = fire-level mask arm).
     std::uint32_t unmasked_prefix_rows = 0xffffffffu,
     const std::uint32_t* mask_suffix_qo_indptr_d = nullptr,
-    const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr);
+    const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr,
+    // STRUCTURAL v0 (S-1): run layers [0, k) and take the head at k
+    // (UINT32_MAX = full model). The layerskip-draft / logit-lens class:
+    // the tail (final norm + lm_head) is unchanged — it simply reads
+    // layer k's hidden state.
+    std::uint32_t max_layers = 0xffffffffu);
 
 // The fire-scoped lora staging (`LoraFireState` in llama_like.cpp — the
 // adapter cast + grouping built once per fire), behind an opaque handle so

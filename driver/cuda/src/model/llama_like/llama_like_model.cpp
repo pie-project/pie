@@ -120,6 +120,9 @@ void LlamaLikeModel::body(Workspace& ws,
         (!in.has_write_desc ||
          (in.w_page_d != nullptr && in.w_off_d != nullptr)) &&
         in.runtime_window_left == -2 &&
+        // STRUCTURAL v0 (S-1): truncated fires walk the hand-written
+        // body (the depth peel is the declared legs' recorded rung).
+        in.max_layers == 0xffffffffu &&
         // The trace committed to the fused QKV binding; a workspace without
         // the packed buffer cannot honour it (same availability check the
         // hand-written `use_fused_qkv` makes).
@@ -164,7 +167,8 @@ void LlamaLikeModel::body(Workspace& ws,
         in.peel_window_d,
         in.unmasked_prefix_rows,
         in.mask_suffix_qo_indptr_d,
-        in.mask_suffix_kv_page_indptr_d);
+        in.mask_suffix_kv_page_indptr_d,
+        in.max_layers);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {

@@ -2770,6 +2770,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .have_custom_mask = s.have_custom_mask,
             .unmasked_prefix_rows =
                 s.dispatch_view.planned_unmasked_prefix_rows,
+            .planned_max_layers = s.dispatch_view.planned_max_layers,
             .compact_logits = s.compact_logits,
             .structured_window_left = s.structured_window_left,
             .has_write_desc = s.has_write_desc,

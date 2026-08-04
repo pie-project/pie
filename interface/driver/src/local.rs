@@ -1197,6 +1197,12 @@ pub struct PieStepDesc {
     /// [`PIE_UNMASKED_PREFIX_UNPLANNED`] = no plan; the driver must not
     /// split the attention.
     pub planned_unmasked_prefix_rows: u32,
+    /// STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
+    /// take the head at layer `k` (the layerskip-draft class).
+    /// [`PIE_MAX_LAYERS_FULL`] = the full model (every pre-S1 step). v0
+    /// steps carrying a truncation are SOLO (the scheduler's blocking
+    /// rule), so one per-step word suffices until the depth union.
+    pub planned_max_layers: u32,
 }
 
 /// [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
@@ -1207,6 +1213,10 @@ pub const PIE_HOOK_FREE_PREFIX_UNPLANNED: u32 = u32::MAX;
 /// [`PieStepDesc::planned_unmasked_prefix_rows`]'s "no plan sent"
 /// sentinel (zero is a legitimate planned value: an all-masked step).
 pub const PIE_UNMASKED_PREFIX_UNPLANNED: u32 = u32::MAX;
+
+/// [`PieStepDesc::planned_max_layers`]'s "full model" sentinel (zero is
+/// never a legitimate depth).
+pub const PIE_MAX_LAYERS_FULL: u32 = u32::MAX;
 
 impl Default for PieStepDesc {
     fn default() -> Self {
@@ -1264,6 +1274,7 @@ impl Default for PieStepDesc {
             channel_ticket_indptr: PieU32Slice::default(),
             planned_hook_free_prefix_rows: PIE_HOOK_FREE_PREFIX_UNPLANNED,
             planned_unmasked_prefix_rows: PIE_UNMASKED_PREFIX_UNPLANNED,
+            planned_max_layers: PIE_MAX_LAYERS_FULL,
         }
     }
 }
