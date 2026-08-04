@@ -32,7 +32,7 @@ enum Command {
     /// Boot the engine. Binds `server.host`, which is loopback by default.
     Serve,
 
-    /// The models pie serves (list / info / download / remove / convert).
+    /// The models pie serves (list / info / import / remove).
     Model {
         #[command(subcommand)]
         cmd: ops::model::ModelCmd,

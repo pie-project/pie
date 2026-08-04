@@ -496,9 +496,21 @@ fn set(global: &startup::GlobalArgs, key: String, value: String) -> Result<()> {
 /// `request_timeout 120` store an integer into a field that now wants
 /// `"120s"`.
 ///
-/// When nothing validates, the error reported is the one from the LAST
-/// candidate -- the string reading -- because that is the one whose message
-/// talks about the field's real type rather than about a type mismatch.
+/// When nothing validates, the candidate errors are not equally useful and the
+/// most useful one is reported. A reading the field could not even hold fails
+/// with serde's "invalid type", which restates the field's type and says
+/// nothing else; a reading the field DID hold and then rejected fails with the
+/// reason it was rejected. The second is the answer whenever it exists.
+///
+/// This matters for cross-field rules. `frame_size = 4` with
+/// `frame_dispatch_depth = 4` violates the staging bound, and the integer
+/// reading fails with that bound spelled out -- but the string reading fails
+/// after it with `invalid type: string "4", expected u32`, and reporting the
+/// last error made a real constraint violation read as a typo. Preferring the
+/// non-type failure keeps the earlier behaviour where it was right: `pie config
+/// set server.port abc` has only a string reading, and `request_timeout 120`
+/// wants the string reading's "not a duration" over the integer's type
+/// mismatch.
 fn typed_by_schema(
     content: &str,
     key: &str,
@@ -514,7 +526,7 @@ fn typed_by_schema(
     let parsed: toml::Value =
         toml::from_str(content).unwrap_or_else(|_| toml::Value::Table(Default::default()));
     schema_field(&parsed, &normalize_key(key))?;
-    let mut last_error = None;
+    let mut errors: Vec<anyhow::Error> = Vec::new();
     for candidate in candidates(value) {
         let mut root: toml::Value =
             toml::from_str(content).map_err(|e| anyhow!("parse config: {e}"))?;
@@ -523,15 +535,35 @@ fn typed_by_schema(
             toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
         match crate::derive::derive_standalone(&serialized) {
             Ok(_) => return Ok((serialized, candidate)),
-            Err(error) => last_error = Some(error),
+            Err(error) => errors.push(error),
         }
     }
+    // The first reading the field actually accepted and then rejected on its
+    // merits, else the last one -- which is the string reading, and the one
+    // whose type message names the field's real type.
+    let reported = match errors.iter().position(|e| !is_type_mismatch(e)) {
+        Some(i) => Some(errors.swap_remove(i)),
+        None => errors.pop(),
+    };
     // Names the failure rather than restating the command. "setting
     // worker.server.port = \"abc\"" is what the user just typed; what they need
     // to read first is that the key refused it.
-    Err(last_error
+    Err(reported
         .unwrap_or_else(|| anyhow!("no valid value"))
         .context(format!("{key} does not accept {value:?}")))
+}
+
+/// Did this candidate fail because the field cannot hold that TOML type?
+///
+/// Matched on serde's own wording (`invalid type: {found}, expected {want}`),
+/// which is what every deserializer in the config emits for the case. A
+/// mismatch is the one failure that carries no information the user did not
+/// already have -- they know what they typed, and the field's type is in `pie
+/// config list`.
+fn is_type_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|e| e.to_string().contains("invalid type:"))
 }
 
 /// Every TOML value the literal could denote, most specific first. The string
