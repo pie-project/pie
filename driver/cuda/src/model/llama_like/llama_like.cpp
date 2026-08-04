@@ -2540,7 +2540,14 @@ void llama_like_forward_paged(
         }
     };
     if (full_depth_rows != 0xffffffffu &&
-        (has_custom_mask || hooks != nullptr)) {
+        (has_custom_mask || hooks != nullptr ||
+         // Deployments without the decode kernel (force_prefill /
+         // prefill_decode_plan) cannot run the WINDOWED range-2 (its
+         // prefix dispatch is the decode plan) — the stash form serves
+         // them instead, with m_start = R (no full-depth suffix: the
+         // stash covers [t_start, R), layers [k, L) run full-N, and
+         // the discarded middle is the whole truncated tail).
+         !use_decode_path || use_prefill_decode_path)) {
         // AC-1 (mask x depth), the stash/restore form: order is
         // [plain | truncated | masked], so the full-depth rows are
         // non-contiguous {[0, t_start) ∪ [m_start, N)}. Rather than
@@ -2568,7 +2575,8 @@ void llama_like_forward_paged(
                       has_custom_mask
                           ? plan_state.spatial_mask_split
                           : R)
-                : plan_state.spatial_mask_split;
+                : (has_custom_mask ? plan_state.spatial_mask_split
+                                   : R);
         // t_start == 0 is legal: no plain block, the truncated middle
         // starts at row 0 ([truncated | masked]).
         if (layer_bound >= cfg.num_hidden_layers || t_start < 0 ||
