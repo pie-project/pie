@@ -822,11 +822,24 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     // from the host qo indptr (the suffix starts on a request
     // boundary). Prepare re-validates the shape and keeps the
     // fire-level arm when it does not hold.
-    const bool use_spatial_mask_mixed = spatial_mask_enabled() &&
+    // ARMED OFF (PIE_SPATIAL_MIXED=1 arms): the mixed SPLIT still reads
+    // placeholder host CSRs for envelope-composed masked lanes when the
+    // frame pack did not thread resolver counts (measured: illegal
+    // access with or without the side stream). The mixed FIRE itself is
+    // live and correct through the fire-level custom arm (causal-mask
+    // synthesis); the split+streams engage once the pack extension
+    // lands.
+    static const bool spatial_mixed_armed = [] {
+        const char* v = std::getenv("PIE_SPATIAL_MIXED");
+        return v != nullptr && v[0] == '1';
+    }();
+    const bool use_spatial_mask_mixed = spatial_mixed_armed &&
+        spatial_mask_enabled() &&
         !in.is_pure_decode && in.have_custom_mask && !has_hooks &&
         in.lora == nullptr &&
         in.unmasked_prefix_rows != 0xffffffffu &&
-        in.unmasked_prefix_rows > 0;
+        in.unmasked_prefix_rows > 0 &&
+        in.unmasked_prefix_rows < static_cast<std::uint32_t>(in.forward_R);
     bool run_graph = graph_eligible;
     if (!use_spatial_mask && in.is_pure_decode && in.have_custom_mask &&
         std::getenv("PIE_SPATIAL_MASK_TRACE")) {
@@ -836,6 +849,22 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                      in.forward_R, in.unmasked_prefix_rows,
                      has_hooks ? 1 : 0, in.lora != nullptr ? 1 : 0,
                      spatial_mask_enabled() ? 1 : 0);
+    }
+    if (use_spatial_mask_mixed && std::getenv("PIE_SPATIAL_MASK_TRACE")) {
+        std::fprintf(stderr,
+                     "[spatial-mask] MIXED R=%d N=%u rows_split=%u qo=[",
+                     in.forward_R,
+                     in.h_qo_forward != nullptr
+                         ? in.h_qo_forward[in.forward_R]
+                         : 0u,
+                     in.unmasked_prefix_rows);
+        for (int r = 0; r <= in.forward_R && r <= 8; ++r) {
+            std::fprintf(stderr, "%u%s",
+                         in.h_qo_forward != nullptr ? in.h_qo_forward[r]
+                                                    : 0u,
+                         r < in.forward_R ? "," : "");
+        }
+        std::fprintf(stderr, "] (prefix causal + suffix custom)\n");
     }
     if (use_spatial_mask && std::getenv("PIE_SPATIAL_MASK_TRACE")) {
         std::fprintf(stderr,
@@ -1274,23 +1303,11 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         // identity, kv_page_indptr rebases by its page base; every other
         // suffix array is a pointer offset in the body). Synchronous
         // copies: tiny, eager-only, and the host staging dies here.
-        // Mixed fires: the planned word is token rows — the REQUEST
-        // split is the request whose qo entry equals it (the seriation
-        // puts the 1-token masked suffix last, so the boundary is a
-        // request boundary; no match means the shape is off and prepare
-        // keeps the fire-level arm, so the upload is harmless).
-        int split = static_cast<int>(in.unmasked_prefix_rows);
-        if (use_spatial_mask_mixed) {
-            split = -1;
-            for (int r = 0; r <= in.forward_R; ++r) {
-                if (in.h_qo_forward[r] == in.unmasked_prefix_rows) {
-                    split = r;
-                    break;
-                }
-                if (in.h_qo_forward[r] > in.unmasked_prefix_rows) break;
-            }
-            if (split < 0) split = in.forward_R;
-        }
+        // The planned word is the REQUEST/lane index in BOTH shapes
+        // (measured live on the mixed fire: R=4 qo=[0,221,...] plans 3,
+        // the masked member's lane start) — pure-decode fires never
+        // showed the distinction (row == lane).
+        const int split = static_cast<int>(in.unmasked_prefix_rows);
         const int rs = in.forward_R - split;
         std::vector<std::uint32_t> qo(static_cast<std::size_t>(rs) + 1);
         std::vector<std::uint32_t> kvpp(static_cast<std::size_t>(rs) + 1);

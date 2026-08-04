@@ -461,6 +461,16 @@ fn spatial_mask_compose_enabled() -> bool {
     })
 }
 
+/// The mixed fire (M-1): masked envelopes composing with multi-token
+/// rows. DEFAULT OFF (`PIE_SPATIAL_MIXED=1` arms) until the driver
+/// serves the shape without the placeholder-CSR crash.
+fn spatial_mixed_compose_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("PIE_SPATIAL_MIXED").is_ok_and(|v| v == "1")
+    })
+}
+
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
     request.has_user_mask && request.masks.is_empty() && !request.structured_device_mask
 }
@@ -562,14 +572,23 @@ impl LaunchGrouping {
         if self.count != 0
             && (masked_device_geometry
                 || (wire_mask_on_device_geometry_blocks)
+                // The mixed fire (M-1, ARMED by PIE_SPATIAL_MIXED=1):
+                // multi-token rows stop blocking a spatial-composable
+                // masked envelope in either join direction — the
+                // prefill-class mask peel serves the shape. DEFAULT OFF:
+                // the newly-admitted shapes still crash in the driver
+                // (illegal access on the fire-level arm too — under
+                // investigation), so the refusals hold until that lands.
                 || (spatial_composable_masked_envelope
-                    && (self.has_multi_token
+                    && ((!spatial_mixed_compose_enabled()
+                         && self.has_multi_token)
                         || self.has_structured_mask
                         || self.has_hook_or_lora
                         || self.has_masked_device_geometry))
                 || self.has_masked_device_geometry
                 || (self.has_wire_masked_envelope
-                    && (request.has_multi_token_row()
+                    && ((!spatial_mixed_compose_enabled()
+                         && request.has_multi_token_row())
                         || request.request.structured_device_mask
                         || request.hook_program
                         || request.lora_program))
@@ -7708,8 +7727,10 @@ mod tests {
             prefill.request = dummy_prefill(64);
             assert!(
                 !grouping.accepts(&prefill, limits, 16),
-                "a chunk-prefill fire still must not join a masked \
-                 device-geometry fire"
+                "a chunk-prefill fire must not join a masked \
+                 device-geometry fire while the mixed fire is DISARMED \
+                 (PIE_SPATIAL_MIXED=1 arms M-1; the driver's mixed \
+                 shape still crashes on placeholder CSRs)"
             );
             assert!(
                 grouping.accepts(&envelope_decode(4), limits, 16),

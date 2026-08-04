@@ -833,14 +833,14 @@ void prepare_llama_like_decode_plan(
         unmasked_prefix_rows < static_cast<std::uint32_t>(total_tokens) &&
         cfg.head_dim == cfg.head_dim_kernel &&
         fwd_cfg.per_layer_window_left.empty()) {
-        int split_req = -1;
-        for (int r = 0; r <= num_requests; ++r) {
-            if (qo_indptr_h[r] == unmasked_prefix_rows) {
-                split_req = r;
-                break;
-            }
-            if (qo_indptr_h[r] > unmasked_prefix_rows) break;
-        }
+        // The planned word is the REQUEST/lane index (the engine's
+        // program-row domain — measured live: R=4 qo=[0,221,222,223,224]
+        // plans 3, the masked member's lane start, not token row 223).
+        // Pure-decode fires never showed the distinction (row == lane).
+        const int split_req =
+            unmasked_prefix_rows < static_cast<std::uint32_t>(num_requests)
+                ? static_cast<int>(unmasked_prefix_rows)
+                : -1;
         bool suffix_decode = split_req > 0 && split_req < num_requests;
         if (suffix_decode) {
             for (int r = split_req; r < num_requests; ++r) {
@@ -866,7 +866,7 @@ void prepare_llama_like_decode_plan(
                 qo_indptr_h,
                 kv_page_indptr_h,
                 kv_last_page_lens_h,
-                static_cast<int>(unmasked_prefix_rows),
+                static_cast<int>(qo_indptr_h[split_req]),
                 split_req,
                 num_q_heads_local,
                 num_kv_heads_local,
@@ -934,7 +934,7 @@ void prepare_llama_like_decode_plan(
             state.use_mask_decode_plan = true;
             state.spatial_mask_split = split_req;
             state.spatial_mask_row_split =
-                static_cast<int>(unmasked_prefix_rows);
+                static_cast<int>(qo_indptr_h[split_req]);
             return;
         }
     }
@@ -1961,11 +1961,11 @@ void llama_like_forward_paged(
                 // offsets at split_rows.
                 const int split_req = plan_state.spatial_mask_split;
                 const int split_rows = plan_state.spatial_mask_row_split;
-                if (split_rows !=
+                if (split_req !=
                     static_cast<int>(unmasked_prefix_rows)) {
                     throw std::runtime_error(
-                        "spatial mask (mixed): the planned rows and the "
-                        "prepared rows drifted");
+                        "spatial mask (mixed): the planned split and the "
+                        "prepared split drifted");
                 }
                 if (mask_suffix_qo_indptr_d == nullptr) {
                     throw std::runtime_error(
