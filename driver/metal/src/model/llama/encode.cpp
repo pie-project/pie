@@ -21,6 +21,9 @@
 
 #include "encode.hpp"
 
+#include <algorithm>
+#include <cstdlib>
+
 #include "../../model/qwen3_5/decode_dispatch.hpp"
 #include "../../model/qwen3_5/decode_dispatch_mb.hpp"
 #include "decode_consts.hpp"
@@ -157,6 +160,12 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
         if (const int bn = llama_qmm_bn(d.kind, g, m); bn > 0) {
             const int wide = qmm_bm_slot(qmm_bm(m));
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
+            // The split form first, and asked with the same `m` `launch_shape`
+            // uses: the split grid is `split` deep in z and writes partials,
+            // the plain one is not and writes the output, so disagreeing here
+            // leaves the projection's real buffer untouched.
+            if (llama_qmm_split(d.kind, g, m) > 1 && mb->qmm_t_splitk[wide].valid())
+                return mb->qmm_t_splitk[wide];
             // No bias table: llama's projections have no bias tensor, which is
             // the one place this family is simpler than gpt-oss.
             if (mb->qmm_t[wide][slot].valid()) return mb->qmm_t[wide][slot];
@@ -329,6 +338,23 @@ int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows) {
     return qmm_bn(kn.N, llama_qmm_rows(rows));
 }
 
+int llama_qmm_split(Kind k, const LlamaGeometry& g, int rows) {
+    static const bool off = std::getenv("PIE_METAL_NO_SPLITK") != nullptr;
+    if (off) return 1;
+    if (llama_qmm_bn(k, g, rows) <= 0) return 1;
+    const KN kn = qmv_kn(k, g);
+    // lm_head has thousands of output tiles of its own and needs no split; it
+    // is also the one projection whose partials would be hundreds of megabytes.
+    if (kn.N > kQmmSplitMaxOut) return 1;
+    return qmm_split_k(kn.N, llama_qmm_rows(rows), kn.K, qmm_bm(rows));
+}
+
+std::size_t llama_splitk_partial_elems(int max_rows) {
+    return std::size_t(kQmmSplitMaxSplits) *
+           std::size_t(llama_qmm_pool_rows(max_rows < 1 ? 1 : max_rows)) *
+           std::size_t(kQmmSplitMaxOut);
+}
+
 int llama_moe_pairs(const LlamaGeometry& g, int rows) {
     return (rows < 1 ? 1 : rows) * (g.is_moe() ? g.experts_per_token : 1);
 }
@@ -397,6 +423,10 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
             // The row block is asked of the BATCH, not of the padded count:
             // padding rounds up, and a rounded-up count can land on a wider
             // rung than the one the grid was built for.
+            if (const int split = llama_qmm_split(d.kind, g, m); split > 1) {
+                qmm_t_splitk_dispatch(kn.N, llama_qmm_rows(m), qmm_bm(m), split, grid, tg);
+                return;
+            }
             qmm_t_dispatch(kn.N, llama_qmm_rows(m), bn, qmm_bm(m), grid, tg);
             return;
         }
@@ -524,6 +554,36 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const 
         se.set_pso(pso_for(d, g, base, ll, mb, rows, head_rows, requests));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
+        // A split projection is TWO dispatches. The GEMM above wrote `split`
+        // partial [M, N] slices into a side buffer and left the projection's
+        // real output alone; this sums them. It rides the same argument table
+        // -- the partials, the stride and the count are bound there beside the
+        // weights -- so it needs no DAG entry of its own, which is what let
+        // this exist at all: the split is decided while walking a DAG that is
+        // already built, and nothing there can insert a dispatch.
+        if (mb != nullptr) {
+            const int m = d.kind == Kind::LmHead
+                              ? (head_rows < 1 ? (rows < 1 ? 1 : rows)
+                                               : std::min(head_rows, rows < 1 ? 1 : rows))
+                              : (rows < 1 ? 1 : rows);
+            if (llama_qmm_split(d.kind, g, m) > 1 && mb->qmm_splitk_reduce.valid()) {
+                se.barrier();
+                se.set_pso(mb->qmm_splitk_reduce);
+                se.set_argtable_ordinal(ordinal_base + d.ordinal);
+                Grid rg;
+                Threadgroup rtg;
+                qmm_splitk_reduce_dispatch(qmv_kn(d.kind, g).N, llama_qmm_rows(m), rg, rtg);
+                se.dispatch(rg, rtg);
+                // And a barrier AFTER, even though the run this dispatch
+                // belongs to would otherwise drop it. The three attention
+                // projections are one concurrency run and they share ONE
+                // partials buffer, so without this the next member's GEMM
+                // overwrites the partials this reduce is still summing. It is
+                // not a crash: it is a projection whose output is part its own
+                // and part its neighbour's.
+                se.barrier();
+            }
+        }
         // A barrier after every dispatch except inside a concurrency run: the
         // last member of a run carries it for the whole group.
         if (i + 1 >= last || run_ends[i] == static_cast<int>(i)) se.barrier();

@@ -1278,7 +1278,13 @@ class LlamaEngine final : public SimpleFamilyEngine {
             return false;
         }
 
+        // Split-K partials: the widest projection that takes a split, times the
+        // widest padded batch, times the deepest split. lm_head is excluded by
+        // `kQmmSplitMaxOut`, which is what keeps this to megabytes.
+        splitk_partial_ = ctx.heap_alloc(sizeof(float) *
+                                         llama::llama_splitk_partial_elems(max_rows_));
         llama::bind_llama_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true);
+        llama::bind_llama_splitk(ctx, dag_, g_, /*rows=*/1, splitk_partial_, splitk_keep_);
         bound_rows_ = 1;
         try {
             llama::bind_llama_dag(ctx, b_, dag_, g_, coloring_, /*ordinal_base=*/0,
@@ -1380,6 +1386,7 @@ class LlamaEngine final : public SimpleFamilyEngine {
         // and only then, because this is every dispatch's argument table.
         if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
             llama::bind_llama_consts(ctx, dag_, g_, rows, /*paged=*/true);
+            llama::bind_llama_splitk(ctx, dag_, g_, rows, splitk_partial_, splitk_keep_);
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
@@ -1478,6 +1485,12 @@ class LlamaEngine final : public SimpleFamilyEngine {
     int bound_rows_ = 0;
     int bound_head_rows_ = 0;
     SlotHandle logits_{};
+    /// The split GEMM's partial [M, N] slices, and the small constant buffers
+    /// the argument tables point at. One partials buffer serves every split
+    /// projection: they are serialized by barriers and each is reduced before
+    /// the next one runs.
+    SlotHandle splitk_partial_{};
+    std::vector<SlotHandle> splitk_keep_{};
     /// The routed experts' paging cache, when a budget asked for one.
     std::shared_ptr<ExpertSlab> slab_{};
     ExpertPaging paging_{};
