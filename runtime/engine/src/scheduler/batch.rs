@@ -670,6 +670,16 @@ pub(crate) fn build_frame_submission(
             merged_plan.max_layers = group
                 .iter()
                 .find_map(|r| r.request.max_layers);
+        } else if let Some(k) = group[0].request.max_layers {
+            // The uniform half of the PQ-tree cell: when EVERY member
+            // shares one truncation, the fire-level layer bound cuts
+            // every row — mask-compatible (the attention arms operate
+            // inside [0, k) unchanged) — so a declined SPLIT must not
+            // silently drop the members' k (found by the arc-78 probe:
+            // the wire merge discards per-member max_layers).
+            if group.iter().all(|r| r.request.max_layers == Some(k)) {
+                merged_plan.max_layers = Some(k);
+            }
         }
         steps.push(StepSubmission {
             plan: merged_plan,

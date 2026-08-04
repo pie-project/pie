@@ -40,6 +40,10 @@ struct Input {
     ///                assembles wire rows + causal fill host-side
     #[serde(default = "default_mask_mode")]
     mask_mode: String,
+    /// STRUCTURAL: run only the first k layers (fire-level uniform
+    /// truncation — composes with every mask mode).
+    #[serde(default)]
+    max_layers: Option<u32>,
 }
 
 fn default_prompt() -> String {
@@ -178,6 +182,9 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let fwd_p = ForwardPass::new();
+        if let Some(k) = input.max_layers {
+            fwd_p.set_max_layers(k)?;
+        }
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
@@ -242,6 +249,9 @@ async fn main(input: Input) -> Result<Output> {
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
 
         let fwd = ForwardPass::new();
+        if let Some(k) = input.max_layers {
+            fwd.set_max_layers(k)?;
+        }
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
