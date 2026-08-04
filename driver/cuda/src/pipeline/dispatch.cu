@@ -5245,6 +5245,92 @@ std::unique_ptr<StagedLaunch> Dispatch::begin_host(
     return launch;
 }
 
+namespace {
+
+// The churn fix (driver-only; north-star "CONSTRAINT, STATED" — the
+// runtime is untouchable): absorb transient guest lag at the LAST host
+// point before a wave commits. The engine's run-ahead expectations
+// assume consumes and ring space a guest a few ms behind has not yet
+// provided; since v14 deleted the RETRY outcome, one unready lane
+// fails its whole frame step and the failed fire's committed
+// reservations poison the instance (the churn fault, root-caused
+// 2026-08-04: 63-90% lane death under 9-lane 35ms churn). Readiness
+// is MONOTONE toward the expectations (heads advance only by prior
+// waves already on the stream and by guest takes; ring space only
+// grows), so a bounded host poll is sound: wait up to
+// PIE_CHANNEL_READY_WAIT_MS (default 25; 0 disables) for every gate
+// to hold, then proceed either way — an exhausted budget keeps
+// today's loud failure semantics.
+bool lane_tickets_ready(const std::vector<DeviceHostChannelTicket>& tickets) {
+    for (const DeviceHostChannelTicket& ticket : tickets) {
+        if (ticket.words == nullptr) continue;
+        const std::uint64_t head =
+            std::atomic_ref<const std::uint64_t>(ticket.words[0])
+                .load(std::memory_order_acquire);
+        const std::uint64_t tail =
+            std::atomic_ref<const std::uint64_t>(ticket.words[1])
+                .load(std::memory_order_acquire);
+        if ((ticket.flags & kTicketConsume) != 0 &&
+            head != ticket.expected_head) {
+            return false;
+        }
+        if ((ticket.flags & kTicketRequireInput) != 0 && !(tail > head)) {
+            return false;
+        }
+        if ((ticket.flags & kTicketPublish) != 0) {
+            const std::uint64_t same_fire_consume =
+                (ticket.flags & kTicketConsume) != 0 ? 1u : 0u;
+            if (tail != ticket.expected_tail) return false;
+            if (!(tail - head <
+                  static_cast<std::uint64_t>(ticket.cap1 - 1) +
+                      same_fire_consume)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void wait_for_wave_readiness(
+    const std::vector<std::unique_ptr<StagedLane>>& lanes) {
+    // DEFAULT OFF after measurement: a 2-minute churn soak with the
+    // wait armed (25 ms) still failed 88% of lanes across 12k waits —
+    // the dominant failure is NOT front-loaded enqueue-time lag, so
+    // the wait only added stall. Kept as an env-armed experiment
+    // (PIE_CHANNEL_READY_WAIT_MS=<ms>); the real fix is the upstream
+    // dev integration (its scheduler keeps channel-bound lanes out of
+    // shared steps — the blast-radius half of the fault).
+    static const int budget_ms = [] {
+        const char* v = std::getenv("PIE_CHANNEL_READY_WAIT_MS");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    if (budget_ms <= 0) return;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(budget_ms);
+    bool waited = false;
+    for (const auto& lane : lanes) {
+        while (!lane_tickets_ready(lane->tickets)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                if (std::getenv("PIE_READY_WAIT_TRACE") != nullptr) {
+                    std::fprintf(stderr,
+                                 "[ready-wait] budget exhausted "
+                                 "(%d ms) — proceeding to the loud "
+                                 "gate\n",
+                                 budget_ms);
+                }
+                return;
+            }
+            waited = true;
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }
+    if (waited && std::getenv("PIE_READY_WAIT_TRACE") != nullptr) {
+        std::fprintf(stderr, "[ready-wait] wave absorbed guest lag\n");
+    }
+}
+
+}  // namespace
+
 void Dispatch::begin_enqueue(StagedLaunch& launch) {
     StagedLaunch::State& state = *launch.state_;
     if (!state.active || state.device_layer != nullptr) {
@@ -5256,6 +5342,9 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
     const bool begin_timing = fire_timing::full();
     auto begin_mark = begin_timing ? fire_timing::Clock::now()
                                    : fire_timing::Clock::time_point{};
+    // The churn fix: bounded readiness absorption before this wave's
+    // expectations harden into the frame (see wait_for_wave_readiness).
+    wait_for_wave_readiness(state.lanes);
     // Registry sequence applies, in lane order, at the wave's ENQUEUE
     // position: every execution-time mirror reader (stage-metadata
     // builders, settlement prep) was written against the pre-frame-split
