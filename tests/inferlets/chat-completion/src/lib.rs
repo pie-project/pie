@@ -52,7 +52,7 @@ fn default_top_p() -> f32 {
 fn sample_token(r: &Tensor, temperature: f32, top_p: f32, vocab: u32) -> Tensor {
     let logits = intrinsics::logits(); // [1, vocab] f32 (read-out row)
     if temperature == 0.0 {
-        return cast(&reduce_argmax(&logits), dtype::i32);
+        return reduce_argmax(&logits);
     }
     let scaled = &logits / temperature.max(1e-4);
     let _ = vocab;

@@ -579,7 +579,17 @@ pub fn log(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Log, |t| t)
 }
 /// `x` converted elementwise to dtype `to`, shape preserved.
+///
+/// A cast to the dtype `x` already has is the identity, and returns `x`
+/// unchanged rather than emitting an op. Worth doing here rather than asking
+/// authors not to write it: a cast is often applied to a value whose dtype
+/// depends on which branch produced it, and "cast it and let the trace decide"
+/// should not cost a device op when the answer is "nothing to do".
 pub fn cast(x: impl AsTensor, to: DType) -> Tensor {
+    let x = Tensor::from_arg(x.to_arg());
+    if x.dtype() == to {
+        return x;
+    }
     emit_unary(
         &x,
         move |id| Op::Cast {
