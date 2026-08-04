@@ -630,6 +630,12 @@ private:
         PieLoaderExprNode node{};
         node.kind = static_cast<std::uint32_t>(kind);
         node.src = PIE_LOADER_NO_NODE;
+        // Every node-index field, not just `src`. Zero is a *valid index* —
+        // leaving `scale_by` to the zero-init turned every uniform `scale()`
+        // into a per-block multiply by node 0, which for gemma4's router
+        // fold meant `router.scale * router.scale` instead of `* 1/sqrt(H)`.
+        // The author differential is what caught it.
+        node.scale_by = PIE_LOADER_NO_NODE;
         node.step = 1;
         node.out_encoding = raw(PieLoaderDType::BF16);
         node.repack_layout = static_cast<std::uint32_t>(PieLoaderRepackLayout::None);

@@ -541,7 +541,14 @@ pub(crate) fn create_driver_backend_group(
         }
         let state_dir = local_driver_state_dir(group_id, Some(tp))?;
         let toml_path = state_dir.join("driver.toml");
-        write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp), descriptor)?;
+        write_cuda_startup_toml(
+            &toml_path,
+            opts,
+            snapshot_dir,
+            group_id,
+            Some(tp),
+            descriptor,
+        )?;
         config_blobs.push(toml_path.to_string_lossy().into_owned().into_bytes());
     }
 
