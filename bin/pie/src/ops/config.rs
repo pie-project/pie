@@ -363,34 +363,6 @@ fn remove_nested(root: &mut toml::Value, key: &str) -> Result<bool> {
     Ok(table.remove(*last).is_some())
 }
 
-/// Parse a CLI string into the most specific TOML value it represents.
-/// Order: bool → int → float → comma-list → string. Mirrors
-/// `pie_cli/config.py::_parse_value`.
-fn parse_value(s: &str) -> toml::Value {
-    match s.to_ascii_lowercase().as_str() {
-        "true" => return toml::Value::Boolean(true),
-        "false" => return toml::Value::Boolean(false),
-        _ => {}
-    }
-    if let Ok(n) = s.parse::<i64>() {
-        return toml::Value::Integer(n);
-    }
-    if let Ok(f) = s.parse::<f64>() {
-        return toml::Value::Float(f);
-    }
-    if s.contains(',') {
-        // Comma-separated list — only flatten when every element is a
-        // string. Mixed-type CSVs are rare and ambiguous; let the user
-        // hand-edit the TOML for those.
-        let elems: Vec<toml::Value> = s
-            .split(',')
-            .map(|e| toml::Value::String(e.trim().to_string()))
-            .collect();
-        return toml::Value::Array(elems);
-    }
-    toml::Value::String(s.to_string())
-}
-
 fn display_value(v: &toml::Value) -> String {
     match v {
         toml::Value::String(s) => s.clone(),
@@ -440,29 +412,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_value_preserves_type_order() {
-        match parse_value("true") {
-            toml::Value::Boolean(true) => {}
-            v => panic!("expected bool, got {v:?}"),
-        }
-        match parse_value("42") {
-            toml::Value::Integer(42) => {}
-            v => panic!("expected int, got {v:?}"),
-        }
-        // `3.14` is a deliberate toml float fixture, not an approximation of PI.
+    fn the_most_specific_reading_is_offered_first() {
+        // The order is what makes `set` type by schema rather than by shape:
+        // the schema gets to reject `true` before it is asked about "true".
+        // This used to test a `parse_value` that returned only the first of
+        // these -- a function no command had called since `set` started
+        // offering the whole list, and which its own test was keeping alive.
+        let head = |literal: &str| candidates(literal).remove(0);
+        assert_eq!(head("true"), toml::Value::Boolean(true));
+        assert_eq!(head("42"), toml::Value::Integer(42));
+        // A deliberate toml float fixture, not an approximation of PI.
         #[allow(clippy::approx_constant)]
-        match parse_value("3.14") {
-            toml::Value::Float(f) if (f - 3.14).abs() < 1e-9 => {}
-            v => panic!("expected float, got {v:?}"),
+        {
+            assert_eq!(head("3.14"), toml::Value::Float(3.14));
         }
-        match parse_value("a,b,c") {
-            toml::Value::Array(a) if a.len() == 3 => {}
-            v => panic!("expected array, got {v:?}"),
-        }
-        match parse_value("hello") {
-            toml::Value::String(s) if s == "hello" => {}
-            v => panic!("expected string, got {v:?}"),
-        }
+        assert_eq!(head("a,b,c").as_array().unwrap().len(), 3);
+        assert_eq!(head("hello"), toml::Value::String("hello".into()));
+        // An integer is also offered as a float, so a float field takes it.
+        assert!(candidates("42").contains(&toml::Value::Float(42.0)));
     }
 
     #[test]

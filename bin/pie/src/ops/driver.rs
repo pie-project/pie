@@ -14,13 +14,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Subcommand};
+use clap::Subcommand;
 
 /// `pie driver` subcommand tree.
 #[derive(Subcommand, Debug)]
 pub enum DriverCmd {
-    /// List known driver types and which appear in the loaded config.
-    List(ListArgs),
+    /// List known driver types and which the config asks for.
+    List,
 
     /// `pie driver cuda-native <action>` — embedded CUDA driver.
     #[command(name = "cuda-native")]
@@ -40,14 +40,6 @@ pub enum DriverCmd {
     },
 }
 
-#[derive(Args, Debug)]
-pub struct ListArgs {
-    /// Path to a serve config TOML. If provided, prints which driver
-    /// type the `[model]` uses.
-    #[arg(short = 'c', long)]
-    pub config: Option<PathBuf>,
-}
-
 #[derive(Subcommand, Debug)]
 pub enum EmbeddedCmd {
     /// Diagnose the embedded driver (feature-gate, GPU visibility).
@@ -55,9 +47,9 @@ pub enum EmbeddedCmd {
 }
 
 /// Top-level dispatcher.
-pub fn run(cmd: DriverCmd) -> Result<()> {
+pub fn run(cmd: DriverCmd, global: &startup::GlobalArgs) -> Result<()> {
     match cmd {
-        DriverCmd::List(args) => list(args),
+        DriverCmd::List => list(global),
 
         DriverCmd::CudaNative { action } => run_embedded("cuda_native", action),
         DriverCmd::Metal { action } => run_embedded("metal", action),
@@ -69,7 +61,7 @@ pub fn run(cmd: DriverCmd) -> Result<()> {
 // list
 // -----------------------------------------------------------------------------
 
-fn list(args: ListArgs) -> Result<()> {
+fn list(global: &startup::GlobalArgs) -> Result<()> {
     println!("Embedded drivers (compiled into this binary by feature):");
     for (name, on) in pie_worker::driver_ffi::compiled_embedded() {
         println!(
@@ -83,7 +75,12 @@ fn list(args: ListArgs) -> Result<()> {
         );
     }
 
-    if let Some(path) = args.config {
+    // Read whichever config the engine would boot from instead of asking for
+    // one. Absent is not an error here -- the compiled-in list above is still
+    // the answer to "what can this binary drive?", and the config only adds
+    // "and what is it asked to".
+    let (path, _) = startup::cli_config_path(global);
+    if path.exists() {
         let cfg = crate::derive::load_worker_config(&path)?;
         println!();
         println!("[model] in {}:", path.display());

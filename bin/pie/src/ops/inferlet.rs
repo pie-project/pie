@@ -1,7 +1,6 @@
 //! `pie inferlet info` — inspect registry inferlet metadata.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -9,7 +8,6 @@ use serde::Deserialize;
 
 use pie_engine::inferlet::program::{Manifest, ProgramName};
 
-use crate::paths;
 
 #[derive(Subcommand, Debug)]
 pub enum InferletCmd {
@@ -22,21 +20,20 @@ pub struct InfoArgs {
     /// Inferlet name, with optional version (e.g. `chat-completion`
     /// or `chat-completion@0.1.0`).
     pub inferlet: String,
-
-    /// Config TOML to use for the registry URL. Defaults to
-    /// `~/.pie/config.toml`.
-    #[arg(short = 'c', long)]
-    pub config: Option<PathBuf>,
 }
 
-pub async fn run(cmd: InferletCmd) -> Result<()> {
+pub async fn run(cmd: InferletCmd, global: &startup::GlobalArgs) -> Result<()> {
     match cmd {
-        InferletCmd::Info(args) => info(args).await,
+        InferletCmd::Info(args) => info(args, global).await,
     }
 }
 
-async fn info(args: InfoArgs) -> Result<()> {
-    let cfg_path = args.config.unwrap_or_else(paths::default_config_path);
+async fn info(args: InfoArgs, global: &startup::GlobalArgs) -> Result<()> {
+    // The global `--config` rather than a local one: this reads the registry
+    // URL out of the same config the engine would boot from, so resolving it
+    // by a different rule than the engine's could point `info` at one registry
+    // while `serve` used another.
+    let (cfg_path, _) = startup::cli_config_path(global);
     let cfg = crate::derive::load_worker_config(&cfg_path)?;
 
     // Runs on the ambient `#[tokio::main]` runtime (no nested runtime).

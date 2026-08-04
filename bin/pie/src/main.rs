@@ -36,7 +36,7 @@ enum Command {
     /// Boot the full engine in-proc on the configured client address.
     Serve,
 
-    /// Manage HuggingFace-cached models (list / pull / remove).
+    /// Manage HuggingFace-cached models (list / download / remove / optimize).
     Model {
         #[command(subcommand)]
         cmd: ops::model::ModelCmd,
@@ -60,7 +60,7 @@ enum Command {
         cmd: ops::cache::CacheCmd,
     },
 
-    /// Manage configuration (path / show / set / unset / init).
+    /// Manage configuration (show / set / unset / init).
     Config {
         #[command(subcommand)]
         cmd: ops::config::ConfigCmd,
@@ -84,10 +84,11 @@ enum Command {
         cmd: ops::driver::DriverCmd,
     },
 
-    /// Validate a standalone config TOML without booting the engine.
+    /// Validate a config TOML without booting the engine. Defaults to the
+    /// one pie would boot from.
     Check {
-        /// Path to the config TOML.
-        config: PathBuf,
+        /// Path to the config TOML. Omit to check the resolved one.
+        config: Option<PathBuf>,
         /// Print the fully parsed config after validation.
         #[arg(long)]
         debug: bool,
@@ -173,7 +174,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Inferlet { cmd } => {
             startup::init_cli(&cli.global)?;
-            ops::inferlet::run(cmd).await?;
+            ops::inferlet::run(cmd, &cli.global).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::New(args) => {
@@ -188,12 +189,13 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Driver { cmd } => {
             startup::init_cli(&cli.global)?;
-            ops::driver::run(cmd)?;
+            ops::driver::run(cmd, &cli.global)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Check { config, debug } => {
             startup::init_cli(&cli.global)?;
-            ops::diag::check(&config, debug)?;
+            let path = config.unwrap_or_else(|| startup::cli_config_path(&cli.global).0);
+            ops::diag::check(&path, debug)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Smoke { rpc, flavor } => {
