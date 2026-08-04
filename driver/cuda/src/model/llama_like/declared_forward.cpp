@@ -460,7 +460,10 @@ void llama_like_forward_declared(
     // complete): the emitter constructs the lora staging AND the hook
     // sidebands (page mask, score captures) and spells the sites,
     // brackets and corrections with constant layers.
-    if (generated_forward_enabled()) {
+    if (generated_forward_enabled() &&
+        // NO-DEMOTION: the generated prefix does not state the middle
+        // decode dispatch yet — 3-way fires walk the interpreter.
+        plan_state.mixed_mid_start < 0) {
         const auto run = [&](auto decode_fn, auto prefill_fn) {
             (is_pure_decode ? decode_fn : prefill_fn)(
                 w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
@@ -1558,6 +1561,33 @@ void llama_like_forward_declared(
                     kv_last_page_lens,
                     attn_ws, stream, /*logits_soft_cap=*/0.f,
                     sm_scale_override);
+                // NO-DEMOTION (3-way, interpreter leg): when prepare
+                // armed the middle decode plan, the causal above was
+                // RE-PLANNED to the prefill lanes [0, P) — the
+                // plain-decode middle [P, split_req) takes the decode
+                // kernel here, exactly the hand-written pairing.
+                if (mask_region == MaskRegion::Prefix &&
+                    plan_state.mixed_mid_decode_plan &&
+                    plan_state.mixed_mid_start >= 0) {
+                    const int P = plan_state.mixed_mid_start;
+                    const int mid_row =
+                        static_cast<int>(qo_indptr_h[P]);
+                    const int layer_window_left_m =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan_state.mixed_mid_decode_plan,
+                        bf16_row(attn_q, mid_row, Hq), kv_view,
+                        bf16_row(attn_out_buf, mid_row, Hq),
+                        kv_page_indices,
+                        kv_page_indptr + P,
+                        kv_last_page_lens + P,
+                        attn_ws, stream, layer_window_left_m,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                }
                 break;
             }
             }
