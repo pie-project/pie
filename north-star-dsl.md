@@ -2114,3 +2114,17 @@ cross-instance state effects — lora first-instance, masked-k8
 after-plain), true group splitting, the spec-verify STRUCTURAL
 producer, R=32-scale WEIGHT (hardware-bound), declared spatial+hook
 walker rung, windowed range-2.
+
+## SPEC-VERIFY IN THE FABRIC (2026-08-04)
+
+The speculative-decoding workload, measured against the tip: the
+cacheback inferlet runs unbroken (its multi-token VERIFY fires,
+N=30..70 at R=1, are the prefill class doing verification), and a
+verify fire CO-FIRES with a masked decode lane through the mixed
+machinery — R=2 N=67..71 mask=1 msplit=1 fires live: the verify rows
+on the causal prefix, the masked lane on the custom suffix, zero
+incidents. So the "spec-verify producer" rock is half-closed by
+composition alone: real speculative verification already participates
+in the axis fabric via the mixed fire. The remaining half — verify as
+its OWN Div::STRUCTURAL trace class (a stated verify-vs-decode union
+rather than the prefill class's shape) — stays the recorded design.
