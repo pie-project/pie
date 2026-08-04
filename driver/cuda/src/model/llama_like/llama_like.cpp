@@ -2390,7 +2390,8 @@ void llama_like_forward_paged(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
-    if (full_depth_rows != 0xffffffffu && has_custom_mask) {
+    if (full_depth_rows != 0xffffffffu &&
+        (has_custom_mask || hooks != nullptr)) {
         // AC-1 (mask x depth), the stash/restore form: order is
         // [plain | truncated | masked], so the full-depth rows are
         // non-contiguous {[0, t_start) ∪ [m_start, N)}. Rather than
@@ -2406,12 +2407,24 @@ void llama_like_forward_paged(
         // the hook-free-prefix word via fast_rows... the mask split is
         // the v0 anchor; hooked+depth composition keeps m_start = the
         // mask word since hooked lanes sort between).
-        const int m_start = plan_state.spatial_mask_split;
+        // AC-5 anchor refinement: the middle ends at the HOOKED block
+        // when hooks are present (hook_free_prefix_rows — pure decode,
+        // row == lane), else at the MASKED block; with both, the
+        // earlier (order [plain | truncated | hooked | masked]).
+        const int m_start =
+            hooks != nullptr
+                ? std::min<int>(
+                      static_cast<int>(
+                          hooks->hook_free_prefix_rows),
+                      has_custom_mask
+                          ? plan_state.spatial_mask_split
+                          : R)
+                : plan_state.spatial_mask_split;
         // t_start == 0 is legal: no plain block, the truncated middle
         // starts at row 0 ([truncated | masked]).
         if (layer_bound >= cfg.num_hidden_layers || t_start < 0 ||
             m_start <= t_start || m_start > R || !is_pure_decode ||
-            plan_state.spatial_mask_split < 0) {
+            (has_custom_mask && plan_state.spatial_mask_split < 0)) {
             throw std::runtime_error(
                 "depth union (masked): planned shape and prepared "
                 "state drifted");

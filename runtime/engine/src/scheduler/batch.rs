@@ -160,17 +160,10 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
     // after it must be masked (full-depth), every truncated member
     // contiguous. dsplit = the block's start; its end derives from the
     // mask word driver-side.
-    // AC-4: the full-depth suffix behind the truncated middle may hold
-    // hooked lanes then masked lanes (the seriation's order) — both are
-    // full-depth. The driver's stash window is anchored on the MASK
-    // word, so a hooked suffix without a masked lane behind it has no
-    // anchor and declines (safe degradation; the hook-word anchor is
-    // the recorded refinement).
-    if ordered.iter().any(|r| r.hook_program)
-        && !ordered.iter().any(|r| r.request.has_user_mask)
-    {
-        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-    }
+    // AC-4/AC-5: the full-depth suffix behind the truncated middle may
+    // hold hooked lanes then masked lanes (the seriation's order) —
+    // both are full-depth. The driver's stash window anchors on the
+    // mask word when present, the hook word otherwise.
     let masked_tail = ordered
         .iter()
         .rev()
