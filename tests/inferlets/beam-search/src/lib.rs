@@ -27,17 +27,28 @@ struct Input {
     /// Beam width. `1` degenerates to greedy decoding (the beam identity).
     #[serde(default = "default_beams")]
     beams: u32,
-    /// Bind the per-beam ancestry mask to the attention port. Default on.
+    /// Fill the attention mask with per-beam ancestry. Default on.
     ///
-    /// Setting this false leaves the whole program identical — the mask is
-    /// still evolved in the epilogue — and only stops attention from reading
-    /// it, so every beam attends the whole filled pool instead of its own
-    /// ancestry. That is a deliberately broken beam, and it exists as a
-    /// CONTROL: a driver that silently ignores `custom_mask_d` produces the
-    /// mask-off token stream while reporting success, so a benchmark can only
-    /// trust a model family whose mask-on and mask-off runs actually differ.
+    /// Setting this false seeds the mask ALL-TRUE instead, so every beam
+    /// attends the whole filled span rather than its own ancestry — a
+    /// deliberately broken beam. The port stays bound either way and the
+    /// epilogue is untouched: `or(gather(mask, parent), newpos)` is a fixed
+    /// point on an all-true mask, so permissiveness survives every step for
+    /// free. The ONLY difference between the two arms is the mask's contents.
+    ///
+    /// It has to be the contents and not the binding. Omitting the port
+    /// instead would change the kernel: an unbound AttnMask lowers to
+    /// `FireAttnMask::Omitted` rather than `Device`, so `has_user_mask` stays
+    /// false, the batch keeps `single_token_mode`, and the driver's
+    /// `has_custom_mask = (custom_mask_d != nullptr)` then routes the fire
+    /// down the XQA decode path with a different KV-write path as well. Two
+    /// arms differing in kernel would diverge on floating-point accumulation
+    /// order alone, which is indistinguishable from the mask working.
+    ///
+    /// This exists as a CONTROL because a driver that ignores `custom_mask_d`
+    /// does not fail — it returns fluent output at an ordinary speed, and
     /// `ModelCapabilities` carries no `supports_custom_mask` flag to check
-    /// instead, which is why this has to be established by differencing.
+    /// instead. Differencing the arms is the only way to establish it.
     #[serde(default = "default_mask")]
     mask: bool,
 }
@@ -135,7 +146,16 @@ async fn main(input: Input) -> Result<String> {
     // Shared BOS prompt at pool position 0: both beams attend it (mask), and the
     // fire-0 write descriptor lands both BOS at (page pool_ids[0], off 0) — the
     // shared prefix cell. fill = 1 (position 0 filled).
-    let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == 0)).collect();
+    //
+    // `mask = false` seeds this all-true instead of {position 0}. The epilogue's
+    // `or(gather(mask, parent), newpos)` cannot clear a bit, so an all-true seed
+    // stays all-true for the whole run and every beam attends the entire filled
+    // span. That is the broken-beam control, expressed purely as mask CONTENTS
+    // so the port binding — and with it the attention kernel and the KV-write
+    // path — is identical in both arms.
+    let init_mask: Vec<bool> = (0..B)
+        .flat_map(|_| (0..POOL).map(|p| !use_mask || p == 0))
+        .collect();
 
     // Loop-carried search and page geometry.
     let mask = Channel::from_shaped([B, POOL], init_mask).named("mask"); // [B, POOL] bool
@@ -203,10 +223,10 @@ async fn main(input: Input) -> Result<String> {
     // All descriptor ports channel-bound (device-geometry fire wire-form):
     // Pages ← pages, PageIndptr ← page_indptr, KvLen ← klen, WSlot/WOff ← the
     // explicit write descriptor. The pool is fixed so these carry constant values.
-    // The AttnMask port is the ONE thing `input.mask` changes: everything else
-    // about the fire, including the epilogue's mask evolution, is identical in
-    // both arms, so a mask-on/mask-off token-stream difference isolates whether
-    // attention honoured the mask and nothing else.
+    // AttnMask is bound in BOTH arms — see `Input::mask`. Binding it is what
+    // keeps `has_user_mask`, `single_token_mode`, the attention kernel and the
+    // KV-write path the same on either side of the control, leaving the mask's
+    // contents as the only variable.
     fwd.attention(
         &ws,
         ..,
@@ -217,7 +237,7 @@ async fn main(input: Input) -> Result<String> {
         &w_slot,
         &w_off,
         &pos,
-        if use_mask { Some(&mask) } else { None },
+        Some(&mask),
     )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block.
@@ -406,11 +426,25 @@ async fn main(input: Input) -> Result<String> {
         .map(|t| t.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    // Shared-pool occupancy after the run. `fill` starts at 1 (the BOS cell at
-    // pool position 0) and every step appends exactly one cell per lane, so it
-    // is monotonic and its peak is its final value. Reported by the inferlet
-    // rather than re-derived host-side so the number comes from the algorithm.
-    let kv_cells_occupied_peak = 1 + (B as usize) * max_steps;
+    // Peak shared-pool occupancy: cells any fire actually wrote.
+    //
+    // Not `1 + B * steps`. The write descriptors are loop-carried — epilogue j
+    // publishes the `w_slot`/`w_off`/`fill` that fire j+1 consumes — and fire 0
+    // uses the seeded values, where all B lanes write the single shared BOS cell
+    // at position 0. With exactly `steps` fires the highest flat position
+    // written is `(steps - 1) * B`, so occupancy is `1 + (steps - 1) * B`; the
+    // final epilogue's `fill` is published to a fire that never runs. `klen`
+    // agrees: derived from the same `base`, the widest span any fire consumes is
+    // also `1 + (steps - 1) * B`.
+    //
+    // DERIVED from the width and the number of steps that actually completed,
+    // not read back from the device: `fill` is loop-carried and never drained,
+    // and adding a host round-trip per step to observe it would perturb the very
+    // decode timing this figure accompanies. The step count is observed —
+    // `hypotheses` grows one token per completed step — so an early finish is
+    // reflected rather than assumed.
+    let steps_completed = hypotheses[best_lane].len();
+    let kv_cells_occupied_peak = 1 + steps_completed.saturating_sub(1) * (B as usize);
     Ok(format!(
         "{text}\n[beam] width={B} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}\n\
          [beam] mask={use_mask} kv_cells_occupied_peak={kv_cells_occupied_peak} returned_tokens={returned_tokens}",

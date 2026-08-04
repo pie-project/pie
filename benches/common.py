@@ -131,10 +131,12 @@ class BenchSummary:
     beam_width: int | None = None
     engine_output_tok_per_s: float | None = None
     goodput_output_tok_per_s: float | None = None
-    # Peak cells occupied in the shared KV page pool. This is the memory
-    # quantity a beam run actually varies. Device memory is not: the KV arena is
-    # pre-allocated from `gpu_mem_utilization`, so total VRAM is a config input
-    # and says nothing about the search.
+    # Peak cells occupied in the shared KV page pool: `1 + width * (steps - 1)`,
+    # DERIVED by the inferlet from the width and the steps that completed, not
+    # read back from the device. This is the memory quantity a beam run actually
+    # varies. Device memory is not: the KV arena is pre-allocated from
+    # `gpu_mem_utilization`, so total VRAM is a config input and says nothing
+    # about the search.
     kv_cells_occupied_peak: int | None = None
 
 

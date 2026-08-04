@@ -20,13 +20,17 @@ and is never accidentally compared against the engine figure.
 **A dropped mask is invisible.** `ModelCapabilities` has no
 `supports_custom_mask` flag, and a model family whose forward never reads
 `custom_mask_d` does not error — it returns fluent, plausible output at an
-entirely ordinary speed. On this branch that is not hypothetical: the `kimi`
-(deepseek_v2 / deepseek_v3 / kimi_k2), `glm5` and `deepseek_v4` families reach
-`dispatch_attention_mla_bf16`, whose only mask argument is the DSA index mask,
-honoured solely on the naive sm100 fallback and dropped on the FlashInfer FA2
-path. Timing such a run would produce a real number for a search that never
-happened. So the gate below runs FIRST, and a configuration that fails it is
-struck from the ladder rather than timed.
+entirely ordinary speed. On this branch that is not hypothetical. The `kimi`
+(deepseek_v2 / deepseek_v3 / kimi_k2) and `glm5` families reach
+`dispatch_attention_mla_bf16` — its only two call sites are
+`kimi_forward.cpp:767` and `glm5_forward.cpp:472` — whose sole mask argument is
+the DSA index mask, honoured only on the naive sm100 fallback and dropped on the
+FlashInfer FA2 path. `deepseek_v4` is excluded for a different reason: it attends
+through `dispatch_attention_flashinfer_prefill_bf16` /
+`launch_attention_compressed_paged_bf16`, not the MLA dispatch, and `custom_mask`
+appears nowhere under `driver/cuda/src/model/deepseek_v4/`. Timing any of them
+would produce a real number for a search that never happened. So the gate below
+runs FIRST, and a configuration that fails it is struck rather than timed.
 
 Ladder: Qwen3-0.6B only. The MoE rungs are kernel-blocked, not capacity-blocked
 — see the family note above — so they are not attempted here.
@@ -182,17 +186,27 @@ async def launch(client, pkg: str, *, width: int, max_tokens: int, mask: bool,
 
 async def gate(client, pkg: str, width: int, max_tokens: int,
                timeout: int) -> dict[str, Any]:
-    """Mask-on vs mask-off, by returned-beam token digest. Runs before timing.
+    """Ancestry mask vs attend-all mask, by returned-beam token digest.
 
-    Identical divergence: the two arms differ only in whether attention reads
-    the ancestry mask, so equal digests mean the mask did not reach attention
-    and the "beam" was one undifferentiated pool read.
+    Runs before timing. Both arms bind the AttnMask port; only its CONTENTS
+    differ — per-beam ancestry against all-true. Equal digests therefore mean
+    attention did not act on the contents, i.e. the "beam" was one
+    undifferentiated pool read.
+
+    The contents have to be the variable, not the binding. Omitting the port for
+    the control would leave `has_user_mask` false, keep the batch in
+    `single_token_mode`, and send the fire down the driver's XQA decode path
+    with a different KV-write path too. Two arms differing in kernel diverge on
+    floating-point accumulation order alone, and over dozens of autoregressive
+    steps one flipped near-tie in `top_k(log_softmax(logits) + scores)` is
+    enough — which would read as `diverged` whether or not the mask was ever
+    honoured, biasing the gate toward false admission.
 
     One exception is a property of beam search rather than of any driver: at
-    width 1 a single beam's ancestry IS the whole filled span, so masked and
-    unmasked attention cover the same cells and the digests must agree. That is
-    correct behaviour, not a dropped mask, and it is reported as `vacuous` so
-    the distinction is never silently collapsed into a pass or a strike.
+    width 1 a single beam's ancestry already IS the whole filled span, so the
+    two masks are the same mask and the digests must agree. That is correct
+    behaviour, not a dropped mask, and it is reported as `vacuous` so the
+    distinction is never silently collapsed into a pass or a strike.
     """
     on = await launch(client, pkg, width=width, max_tokens=max_tokens, mask=True,
                       timeout=timeout)

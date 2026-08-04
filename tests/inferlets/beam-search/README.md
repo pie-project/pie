@@ -81,9 +81,17 @@ Three lines: the decoded best hypothesis, then
 
 `returned_tokens` carries the best beam's raw token ids so a consumer can digest
 them directly; re-tokenizing the decoded text is not equivalent, because
-detokenize→tokenize is not the identity. `kv_cells_occupied_peak` is the shared
-pool's occupancy, `1 + width * steps` — `fill` starts at the BOS cell and grows
-by one cell per lane per step, so it is monotonic and peaks at its final value.
+detokenize→tokenize is not the identity.
+
+`kv_cells_occupied_peak` is the shared pool's occupancy, `1 + width * (steps - 1)`.
+The write descriptors are loop-carried — epilogue *j* publishes what fire *j+1*
+consumes — and fire 0 uses the seeded descriptors, where every lane writes the
+one shared BOS cell at position 0. So `steps` fires reach a highest flat position
+of `(steps - 1) * width`, and the last epilogue's `fill` is published to a fire
+that never runs. It is **derived** from the width and the number of steps that
+actually completed, not read back from the device: `fill` is loop-carried and
+never drained, and adding a host round-trip per step to observe it would perturb
+the decode timing this figure accompanies.
 
 ## Implementation notes
 
