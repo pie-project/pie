@@ -158,12 +158,14 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
     split as u32
 }
 
-/// The depth union's arm switch (default OFF until the union oracle
-/// passes; `PIE_DEPTH_UNION=1` arms).
+/// The depth union's arm switch — DEFAULT ON (`PIE_DEPTH_UNION=0`
+/// disarms and restores the S-1 solo rule). The union oracle and the
+/// wide battery (R=4, mixed-k decline, all-truncated control) passed
+/// on the armed boots before the flip.
 pub(crate) fn depth_union_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("PIE_DEPTH_UNION").is_ok_and(|v| v == "1")
+        !std::env::var("PIE_DEPTH_UNION").is_ok_and(|v| v == "0")
     })
 }
 
