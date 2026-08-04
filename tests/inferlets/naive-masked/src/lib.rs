@@ -44,6 +44,10 @@ struct Input {
     /// truncation — composes with every mask mode).
     #[serde(default)]
     max_layers: Option<u32>,
+    /// Step-logit probe: emit reduce_max(logits) per decode step into
+    /// `lg` — the fingerprint the state-effect oracle diffs.
+    #[serde(default)]
+    logit_probe: bool,
 }
 
 fn default_prompt() -> String {
@@ -72,6 +76,8 @@ struct Output {
     mask_mode: String,
     text: String,
     count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    lg: Vec<f32>,
 }
 
 /// One sampling step: temperature, then a Gumbel-max draw over the full vocab.
@@ -92,6 +98,8 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let mask_mode = input.mask_mode.clone();
+    let probe = input.logit_probe;
+    let mut lg: Vec<f32> = Vec::new();
     if !matches!(
         mask_mode.as_str(),
         "none" | "dense" | "structured" | "dense-prefill" | "dense-prefill-hole"
@@ -119,6 +127,7 @@ async fn main(input: Input) -> Result<Output> {
             mask_mode,
             text: String::new(),
             count: 0,
+            lg: Vec::new(),
         });
     }
 
@@ -242,6 +251,9 @@ async fn main(input: Input) -> Result<Output> {
         let page_indptr =
             Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
         let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
+        let lg_out = Channel::new([1], dtype::f32)
+            .capacity(8)
+            .named("lg_out");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
@@ -272,6 +284,9 @@ async fn main(input: Input) -> Result<Output> {
             let r = rng.take();
 
             let logits = intrinsics::logits();
+            if probe {
+                lg_out.put(&reduce_max(&logits));
+            }
             let token = step(logits, temperature, &r);
             let r_next = add(&r, iota(2));
 
@@ -339,6 +354,14 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+            if probe {
+                let v = lg_out
+                    .take()
+                    .get::<f32>()
+                    .await
+                    .map_err(|e| format!("lg_out.take: {e}"))?[0];
+                lg.push(v);
+            }
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })
@@ -351,5 +374,6 @@ async fn main(input: Input) -> Result<Output> {
         mask_mode,
         text: wit_model::decode(&generated)?,
         count: generated.len(),
+        lg,
     })
 }
