@@ -1373,7 +1373,10 @@ void llama_like_forward_declared(
                         kv_page_indptr + split,
                         kv_last_page_lens + split,
                         custom_mask_d, custom_mask_indptr_d + split,
-                        is_pure_decode ? attn_ws : spatial_suffix_attn_ws(),
+                        // Both classes now PLAN the suffix into the
+                        // dedicated workspace (the pure-decode split
+                        // overlaps on the side stream too).
+                        spatial_suffix_attn_ws(),
                         stream);
                     break;
                 }

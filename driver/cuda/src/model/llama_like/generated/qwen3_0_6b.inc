@@ -274,7 +274,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -871,7 +871,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -1468,7 +1468,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -2065,7 +2065,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -2662,7 +2662,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -3259,7 +3259,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -3856,7 +3856,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -4453,7 +4453,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -5050,7 +5050,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -5647,7 +5647,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -6244,7 +6244,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -6841,7 +6841,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -7438,7 +7438,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -8035,7 +8035,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -8632,7 +8632,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -9229,7 +9229,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -9826,7 +9826,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -10423,7 +10423,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -11020,7 +11020,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -11617,7 +11617,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -12214,7 +12214,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -12811,7 +12811,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -13408,7 +13408,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -14005,7 +14005,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -14602,7 +14602,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -15199,7 +15199,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -15796,7 +15796,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -16393,7 +16393,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {

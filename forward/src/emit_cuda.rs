@@ -1663,11 +1663,7 @@ fn emit_launch(
                     // the mixed/prefill class into the dedicated
                     // suffix workspace (its prefix causal plan owns
                     // attn_ws).
-                    let ws = if is_decode {
-                        "attn_ws"
-                    } else {
-                        "spatial_suffix_attn_ws()"
-                    };
+                    let ws = "spatial_suffix_attn_ws()";
                     b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
                     b.stmt(&format!("        *{plan_cache},"));
                     b.stmt(&format!(

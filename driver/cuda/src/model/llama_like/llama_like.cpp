@@ -883,7 +883,11 @@ void prepare_llama_like_decode_plan(
             cfg.num_key_value_heads / T,
             cfg.head_dim_kernel,
             cache.page_size(),
-            attn_ws,
+            // The dedicated suffix workspace (the two-plans lesson) —
+            // ALSO the concurrency precondition: the suffix custom
+            // dispatch now overlaps the prefix decode on the side
+            // stream, so their scratch must be disjoint.
+            spatial_suffix_ws(),
             /*stream=*/nullptr,
             fwd_cfg.decode_plan_cuda_graph,
             /*window_left=*/-1,
@@ -2018,6 +2022,26 @@ void llama_like_forward_paged(
                         "spatial mask: the planned split and the prepared "
                         "split drifted");
                 }
+                // NO-DEMOTION (the user's directive): the two kernels of
+                // this split have disjoint outputs and read-only-shared
+                // inputs, so the SUFFIX custom dispatch overlaps the
+                // prefix on the side stream (fork here, join before the
+                // shared tail). Its plan lives in the dedicated
+                // workspace, so the concurrent scratch is disjoint.
+                // Stream-capture safe: the fork/join events become
+                // graph dependencies, exactly the cross-stream capture
+                // pattern, so the split-keyed execs replay the overlap.
+                const bool side_on2 =
+                    spatial_stream_enabled() && split > 0;
+                cudaStream_t suffix_stream2 = stream;
+                SpatialSideStream* ss2 = nullptr;
+                if (side_on2) {
+                    ss2 = &spatial_side_stream();
+                    suffix_stream2 = ss2->stream;
+                    CUDA_CHECK(cudaEventRecord(ss2->fork, stream));
+                    CUDA_CHECK(cudaStreamWaitEvent(
+                        ss2->stream, ss2->fork, 0));
+                }
                 if (split > 0) {
                     if (fwd_cfg.force_prefill_path) {
                         // The deployment's decode form is the plan-free
@@ -2075,7 +2099,11 @@ void llama_like_forward_paged(
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_ws(), suffix_stream2);
+                if (side_on2) {
+                    CUDA_CHECK(cudaEventRecord(ss2->join, ss2->stream));
+                    CUDA_CHECK(cudaStreamWaitEvent(stream, ss2->join, 0));
+                }
             } else if (!is_pure_decode &&
                        plan_state.spatial_mask_split >= 0 &&
                        plan_state.spatial_mask_row_split >= 0 &&
