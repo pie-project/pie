@@ -59,7 +59,7 @@ pub fn parse_checkpoint_files(paths: &[PathBuf]) -> Result<CheckpointMetadata, E
 
 /// Verifies every tensor digest of a `.zt` artifact; returns the tensor count.
 ///
-/// The gate a destructive caller (`pie model optimize --delete-source`) runs
+/// The gate a destructive caller (`pie model convert --delete-source`) runs
 /// before destroying what the artifact was computed from. A part *without* a
 /// digest fails rather than passes: "nothing was checked" cannot justify a
 /// delete.
@@ -76,6 +76,82 @@ pub fn verify_checkpoint(path: &Path) -> Result<usize, Error> {
         count += 1;
     }
     Ok(count)
+}
+
+/// A `.zt` artifact's identity: the digest of every tensor it names, folded
+/// into one value. `None` for anything that is not a `.zt` with a manifest.
+///
+/// The manifest holds each object's own digest, and for a sharded artifact it
+/// holds the shard table — whose entries are whole-file digests. So hashing
+/// the manifest is a claim about the whole artifact, single-file or not, for
+/// the cost of reading a header. It also survives the file being moved, which
+/// an identity derived from a path does not.
+///
+/// This lives here rather than in the worker because "what identifies a
+/// checkpoint" is a question about the format, and because the worker has no
+/// business depending on zTensor directly.
+pub fn artifact_identity(path: &Path) -> Result<Option<Vec<u8>>, Error> {
+    if !path.is_file()
+        || !path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zt"))
+    {
+        return Ok(None);
+    }
+    let Some(manifest) = ztensor::manifest_of(path).map_err(Error::from)? else {
+        // A data shard carries no manifest, so it identifies nothing on its
+        // own — the root that names it does.
+        return Ok(None);
+    };
+    let mut identity = Vec::new();
+    for (name, object) in &manifest.objects {
+        identity.extend_from_slice(name.as_bytes());
+        for (part_name, part) in &object.parts {
+            identity.extend_from_slice(part_name.as_bytes());
+            if let Some(digest) = &part.digest {
+                identity.extend_from_slice(digest.as_bytes());
+            } else {
+                // Canonical form gives every part a digest; a part without one
+                // still has to contribute something, or two artifacts that
+                // differ only there would collide.
+                identity.extend_from_slice(&part.blob.length.to_le_bytes());
+            }
+        }
+    }
+    for (name, shard) in &manifest.shards {
+        identity.extend_from_slice(name.as_bytes());
+        identity.extend_from_slice(shard.digest.as_bytes());
+        identity.extend_from_slice(&shard.size.to_le_bytes());
+    }
+    Ok(Some(identity))
+}
+
+/// Reads a checkpoint's file-level attributes as a flat text map.
+///
+/// The read side of what [`CheckpointWriter`](super::write::CheckpointWriter)
+/// writes as provenance. It is a function rather than a field on
+/// [`CheckpointMetadata`] because the two answer different questions and have
+/// different readers: metadata says which tensors exist and where, which every
+/// planner needs, while attributes say where the artifact *came from*, which
+/// only `pie model list` and the re-convert skip check ask about. Charging
+/// every reader — including the FFI marshaller and sixty-odd tests that build
+/// metadata by hand — for a map they never read would be the wrong trade.
+///
+/// Attributes whose value is not text are skipped: the format allows arbitrary
+/// CBOR there and the GGUF projection uses it for whole tokenizer tables, none
+/// of which is provenance.
+pub fn read_attributes(path: &Path) -> Result<std::collections::BTreeMap<String, String>, Error> {
+    let source = Source::open(path).map_err(Error::from)?;
+    let Some(Value::Map(entries)) = source.attributes() else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    Ok(entries
+        .iter()
+        .filter_map(|(key, value)| match (key, value) {
+            (Value::Text(key), Value::Text(value)) => Some((key.clone(), value.clone())),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Turns an opened source into the loader's metadata.

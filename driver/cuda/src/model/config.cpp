@@ -320,6 +320,11 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.gemma4_num_global_key_value_heads =
         optional<int>(j, "num_global_key_value_heads",
                       cfg.num_key_value_heads);
+    // Read but not used here: the Metal driver reads them, and `pie.model/1`
+    // is generated from this struct, so this is where they enter the
+    // descriptor. Defaults match "absent" on both sides.
+    cfg.gemma4_global_head_dim = optional<int>(j, "global_head_dim", 0);
+    cfg.gemma4_double_wide_mlp = optional<bool>(j, "use_double_wide_mlp", false);
 
     // GPT-OSS knobs. The flags are inferred from `model_type` (rather
     // than from explicit fields) because HF's gpt_oss config doesn't

@@ -1,6 +1,6 @@
 //! What materializing a checkpoint as pie's own format means.
 //!
-//! `pie model optimize` rewrites any checkpoint as a `.zt` artifact, and this
+//! `pie model convert` rewrites any checkpoint as a `.zt` artifact, and this
 //! module derives the split that rewrite works from: which tensors *decode* —
 //! a blocked scheme the host executor has a decoder for, undone to the logical
 //! dtype no device kernel has to unpick — and which pass through byte for
@@ -27,6 +27,10 @@ use crate::types::{Encoding, QuantScheme};
 
 /// What materializing one checkpoint means, stated before it is done — the
 /// shape a `--dry-run` reports.
+///
+/// The three sets partition the source's objects exactly: every object is
+/// decoded, copied, or carried metadata. Nothing falls off the end — a caller
+/// that handles all three has handled the whole checkpoint.
 pub struct Materialization {
     /// Decodes the blocked tensors; covers nothing else. Empty `tensors` when
     /// nothing decodes.
@@ -35,15 +39,28 @@ pub struct Materialization {
     pub decoded: Vec<String>,
     /// Tensors that pass through byte for byte, encoding and all.
     pub passthrough: Vec<String>,
+    /// pie's own metadata objects, when the source is already a pie artifact.
+    ///
+    /// Called out as a set of its own rather than folded into `passthrough`
+    /// because the decision about them is not the loader's: a re-convert that
+    /// recompiles the tokenizer and the model descriptor wants to *drop* these
+    /// and write fresh ones, while one that only re-lays the weights wants to
+    /// carry them over. Both are right, and neither should happen by default
+    /// because the loader forgot to mention them.
+    pub meta: Vec<String>,
 }
 
-/// Splits `metadata`'s tensors into decode and passthrough, and writes the
-/// contract for the first set.
+/// Splits `metadata`'s objects into decode, passthrough and metadata, and
+/// writes the contract for the first set.
 pub fn materialize_contract(metadata: &CheckpointMetadata) -> Result<Materialization> {
     let mut decoded = Vec::new();
     let mut passthrough = Vec::new();
     let mut tensors = Vec::new();
-    for tensor in &metadata.tensors {
+    let meta = metadata
+        .meta_objects()
+        .map(|tensor| tensor.name.clone())
+        .collect();
+    for tensor in metadata.weights() {
         match &tensor.encoding {
             // The blocked schemes the host executor decodes today. More move
             // up from the passthrough arm as their decoders land.
@@ -69,6 +86,7 @@ pub fn materialize_contract(metadata: &CheckpointMetadata) -> Result<Materializa
         },
         decoded,
         passthrough,
+        meta,
     })
 }
 

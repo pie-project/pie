@@ -177,6 +177,8 @@ impl MockEnv {
                 arch_name: String::new(),
                 kv_page_size: 16,
                 tokenizer_path,
+                // A fixture snapshot, not an artifact.
+                artifact: None,
                 drivers,
                 scheduler: SchedulerConfig {
                     request_timeout_secs: 30,

@@ -398,7 +398,16 @@ fn default_max_upload_mb() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub name: String,
-    pub hf_repo: String,
+    /// What to serve: a store name (`Qwen--Qwen3-0.6B`, as `pie model list`
+    /// prints it) or a path to a `.zt` artifact. See `weights::resolve`.
+    ///
+    /// Named `hf_repo` until the store existed, and still accepted under that
+    /// name — `pie config init` has been writing it into `~/.pie/config.toml`
+    /// since long before this, and the struct is `deny_unknown_fields`, so a
+    /// bare rename would greet those users with *unknown field `hf_repo`* and
+    /// *missing field `model`* at startup rather than with a working boot.
+    #[serde(alias = "hf_repo")]
+    pub model: String,
     pub driver: DriverConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
@@ -409,6 +418,11 @@ impl ModelConfig {
         ensure!(
             !self.name.is_empty(),
             "model.name must be a non-empty string"
+        );
+        ensure!(
+            !self.model.trim().is_empty(),
+            "model.model must name a stored artifact or a path to one \
+             (`pie model list` shows what is available)"
         );
         self.driver.validate()?;
         self.scheduler.validate()?;
@@ -676,7 +690,7 @@ impl Default for MetalDriverOptions {
 #[serde(deny_unknown_fields)]
 pub struct DummyDriverOptions {
     /// Vocabulary size advertised in the caps handshake. Should match
-    /// the tokenizer at `hf_repo/tokenizer.json`. When `None` the
+    /// the tokenizer the artifact carries. When `None` the
     /// standalone reads `vocab_size` from `<snapshot_dir>/config.json`
     /// before launching the driver.
     #[serde(default)]
@@ -874,6 +888,38 @@ device = ["cpu"]
         assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
         assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    /// `model` is the name now, `hf_repo` still parses.
+    ///
+    /// Not politeness: the struct is `deny_unknown_fields` and the field is
+    /// required, so without the alias every config `pie config init` ever wrote
+    /// would fail at startup with two errors at once — *unknown field
+    /// `hf_repo`* and *missing field `model`* — instead of booting.
+    #[test]
+    fn the_old_spelling_of_the_model_key_still_parses() {
+        let with_new = MINIMAL_METAL.replace("hf_repo =", "model =");
+        assert_ne!(
+            with_new, MINIMAL_METAL,
+            "the fixture should use the old key"
+        );
+
+        let old: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        let new: Config = toml::from_str(&with_new).unwrap();
+        old.validate().unwrap();
+        new.validate().unwrap();
+        assert_eq!(old.model.model, new.model.model);
+        assert!(!new.model.model.is_empty());
+    }
+
+    /// An empty model is caught at parse rather than at driver boot, where it
+    /// would surface as a path error.
+    #[test]
+    fn an_empty_model_is_refused() {
+        let blank = MINIMAL_METAL.replace("hf_repo = \"Qwen/Qwen3-0.6B\"", "hf_repo = \"\"");
+        let cfg: Config = toml::from_str(&blank).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("model.model"), "{err}");
     }
 
     #[test]

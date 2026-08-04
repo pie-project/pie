@@ -294,6 +294,112 @@ impl BpeTable {
     fn byte_fallback(&self, byte: u8) -> Option<TokenId> {
         self.byte_fallback_ids[byte as usize]
     }
+
+    // -----------------------------------------------------------------------
+    // Canonical serialization (see `crate::canonical`)
+    // -----------------------------------------------------------------------
+
+    /// The decode table, whole — `None` where an id carries no token.
+    pub(crate) fn decode_table(&self) -> &[Option<Arc<[u8]>>] {
+        &self.id_to_bytes
+    }
+
+    /// The merge table as `(left, right, rank, merged)`, in a fixed order.
+    ///
+    /// Sorted, because the table is a hash map and its iteration order is not
+    /// stable across runs — an artifact has to be byte-reproducible.
+    pub(crate) fn merge_quads(&self) -> Vec<(TokenId, TokenId, Rank, TokenId)> {
+        let mut quads: Vec<_> = self
+            .merges
+            .iter()
+            .map(|(&(left, right), &(rank, merged))| (left, right, rank, merged))
+            .collect();
+        quads.sort_unstable_by_key(|&(left, right, _, _)| (left, right));
+        quads
+    }
+
+    pub(crate) fn byte_fallback_table(&self) -> &[Option<TokenId>; 256] {
+        &self.byte_fallback_ids
+    }
+
+    /// Whether `token_to_id` is recoverable from the decode table alone.
+    ///
+    /// It usually is, but not by construction, and the difference is what
+    /// decides whether this table can be serialized without storing the
+    /// encode map as well:
+    ///
+    /// - the tiktoken path lets two ids share a byte sequence and keeps the
+    ///   lower id, which "lowest id wins over the decode table" reproduces;
+    /// - `insert_added` can *overwrite* `id_to_bytes[id]` while leaving the
+    ///   token it displaced in `token_to_id`, which nothing can reproduce
+    ///   from the decode table because those bytes are no longer in it.
+    ///
+    /// The second case would make a round trip silently lossy, so the
+    /// serializer checks this and refuses rather than writing an artifact that
+    /// tokenizes differently from its source.
+    pub(crate) fn encode_map_is_derivable(&self) -> bool {
+        let mut derived: FxHashMap<&[u8], TokenId> =
+            FxHashMap::with_capacity_and_hasher(self.token_to_id.len(), Default::default());
+        for (id, bytes) in self.id_to_bytes.iter().enumerate() {
+            let Some(bytes) = bytes.as_deref() else {
+                continue;
+            };
+            derived.entry(bytes).or_insert(id as TokenId);
+        }
+        derived.len() == self.token_to_id.len()
+            && self
+                .token_to_id
+                .iter()
+                .all(|(bytes, &id)| derived.get(bytes.as_ref()) == Some(&id))
+    }
+
+    /// Rebuilds a table from its canonical parts.
+    ///
+    /// `token_to_id` is derived under the same "lowest id wins" rule the
+    /// tiktoken path applies, which [`encode_map_is_derivable`] guaranteed
+    /// reproduces the original exactly.
+    pub(crate) fn from_canonical(
+        vocab: Vec<Vec<u8>>,
+        merges: &[(TokenId, TokenId, Rank, TokenId)],
+        byte_fallback_ids: [Option<TokenId>; 256],
+    ) -> Result<Self> {
+        let mut token_to_id: FxHashMap<Arc<[u8]>, TokenId> =
+            FxHashMap::with_capacity_and_hasher(vocab.len(), Default::default());
+        let mut id_to_bytes = Vec::with_capacity(vocab.len());
+        for (id, bytes) in vocab.into_iter().enumerate() {
+            let bytes: Arc<[u8]> = bytes.into();
+            token_to_id.entry(bytes.clone()).or_insert(id as TokenId);
+            id_to_bytes.push(Some(bytes));
+        }
+
+        let vocab_size = u32::try_from(id_to_bytes.len()).context("BPE vocabulary is too large")?;
+        let mut table = FxHashMap::with_capacity_and_hasher(merges.len(), Default::default());
+        for &(left, right, rank, merged) in merges {
+            for id in [left, right, merged] {
+                ensure!(
+                    id < vocab_size,
+                    "merge ({left}, {right}) names token {id}, outside a vocabulary of {vocab_size}"
+                );
+            }
+            ensure!(
+                table.insert((left, right), (rank, merged)).is_none(),
+                "duplicate merge pair ({left}, {right})"
+            );
+        }
+        for id in byte_fallback_ids.iter().flatten() {
+            ensure!(
+                *id < vocab_size,
+                "byte fallback names token {id}, outside a vocabulary of {vocab_size}"
+            );
+        }
+
+        Ok(BpeTable {
+            token_to_id,
+            merges: table,
+            id_to_bytes,
+            byte_fallback_ids,
+        })
+    }
 }
 // ---------------------------------------------------------------------------
 // GPT-2 byte ↔ unicode mapping (compile-time const tables)

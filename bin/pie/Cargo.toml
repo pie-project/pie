@@ -40,9 +40,17 @@ pie-controller = { path = "../../controller" }
 pie-gateway = { path = "../../gateway" }
 pie-worker = { path = "../../worker", default-features = false }
 pie-engine = { path = "../../runtime/engine" }  # program/manifest types for `pie inferlet`
-# `pie model optimize` — the host-side load-plan executor and checkpoint
+# `pie model convert` — the host-side load-plan executor and checkpoint
 # writer. Pure Rust; needs no driver and no GPU.
 pie-loader = { path = "../../loader" }
+# The tokenizer compiler — `pie model convert` runs it once at import and
+# serializes the result into the artifact (`pie.tokenizer/1`), so the runtime
+# never parses `tokenizer.json` again.
+pie-tokenizer = { path = "../../runtime/tokenizer" }
+# The HF `config.json` normalizer — `pie model convert` runs it once and
+# writes the result as the `pie.model/1` descriptor, so the runtime and the
+# driver stop re-deriving it from HF quirks at every boot.
+pie-model-config = { path = "../../runtime/model-config" }
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.

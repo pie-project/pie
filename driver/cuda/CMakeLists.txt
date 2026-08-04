@@ -416,6 +416,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/attn_score.cu
   src/model/author_abi.cpp
   src/model/config.cpp
+  src/model/descriptor.cpp
   src/model/csm/csm.cpp
   src/model/csm/csm_backbone_forward.cu
   src/model/csm/csm_depth_decoder_forward.cu
