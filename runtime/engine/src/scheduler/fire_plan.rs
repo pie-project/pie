@@ -266,6 +266,13 @@ pub(crate) struct MemberFacts {
     /// row-window precondition, exactly as mask-last was the spatial
     /// fire's.
     pub(crate) truncated: bool,
+    /// V2 rung ④ (banded depth): the truncation's k. Inside the
+    /// truncated block the key orders DEEPEST-FIRST, so at layer l the
+    /// live rows are always a PREFIX of the block — the multi-boundary
+    /// walkers' row-window precondition, exactly as full-depth-first
+    /// was the single-boundary union's. None on untruncated members
+    /// (constant term, no effect on their order).
+    pub(crate) max_layers: Option<u32>,
     /// NO-DEMOTION: multi-token (prefill-shaped) members sort before
     /// single-token ones within each block, so a mixed fire's prefix is
     /// [prefill | plain-decode] and the plain-decode run can take the
@@ -384,6 +391,9 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
             member.custom_mask,
             member.hook_program,
             member.truncated,
+            // ④: deepest-first inside the truncated block (banded
+            // depth's prefix invariant); constant for everyone else.
+            std::cmp::Reverse(member.max_layers.unwrap_or(u32::MAX)),
             !member.multi_token,
             member.arrival,
         )
@@ -396,6 +406,7 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
             (
                 members[i].device_resolved_geometry,
                 gray_rank(axis_bits(&members[i])),
+                std::cmp::Reverse(members[i].max_layers.unwrap_or(u32::MAX)),
                 !members[i].multi_token,
                 members[i].arrival,
             )
@@ -511,6 +522,7 @@ mod tests {
             lora,
             custom_mask: false,
             truncated: false,
+            max_layers: None,
             multi_token: false,
             device_resolved_geometry,
             arrival,
@@ -523,10 +535,36 @@ mod tests {
             lora: false,
             custom_mask: true,
             truncated: false,
+            max_layers: None,
             multi_token: false,
             device_resolved_geometry: false,
             arrival,
         }
+    }
+
+    /// V2 rung ④ (banded depth): truncated members order DEEPEST-FIRST
+    /// inside their block, so at any layer l the live rows (k > l) are
+    /// a PREFIX of the block — the multi-boundary walkers' invariant.
+    #[test]
+    fn truncated_members_seriate_deepest_first() {
+        let band = |k: u32, arrival: usize| {
+            let mut m = member(false, false, false, arrival);
+            m.truncated = true;
+            m.max_layers = Some(k);
+            m
+        };
+        let members = [
+            band(8, 0),
+            band(24, 1),
+            band(16, 2),
+            member(false, false, false, 3),
+        ];
+        let plan = plan_fire_with_model(&members, &[]);
+        assert_eq!(
+            plan.member_order,
+            vec![3, 1, 2, 0],
+            "full depth first, then bands deepest-first"
+        );
     }
 
     /// NS-1: masked members seriate to the tail of their (geometry, hook)

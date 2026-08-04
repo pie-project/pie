@@ -2569,3 +2569,35 @@ rung ④'s Gray cutover (non-nesting combinations need gather). Deferred
 deliberately: per-region k COULD now arm non-uniform depth fires, but
 the depth walkers still assume one boundary — that arming belongs with
 ④'s generalized consumers.
+
+## RUNG ④ SPEC (2026-08-04): three acts
+
+Act 1 — BANDED DEPTH (non-uniform k). The seriation now orders the
+truncated block DEEPEST-FIRST (the k term landed with a pinned test),
+so at layer l the live rows are always the prefix [0, boundary(l)) —
+bands shrink monotonically. The table already carries per-region k.
+Remaining work, in order: (i) the worker's uniform_k join refusal
+relaxes behind PIE_DEPTH_BANDS (default off) for the pure-decode
+no-mask/no-hook shape; (ii) the decode walker generalizes from ONE
+depth boundary (depth_prefix_decode_plan + dsplit) to a boundary PER
+BAND — a prefix decode plan per distinct k, planned into disjoint
+attn_ws regions (the plan/workspace pairing rule extends per band);
+(iii) census increment: mixed-k co-fire vs today's solo-per-k, the
+composition win priced. The stash/restore union stays for masked
+shapes until Act 2.
+
+Act 2 — GRAY + (start,len) + GATHER. Under Gray order the hook-free
+set stops being a prefix (codes 000,001 | 101,100 straddle the hooked
+middle) — exactly why the cutover is coupled to consumers taking
+(start,len) windows and to the gather fallback for non-nesting
+residue. The staged pieces (gray_rank + sentinel, gather kernels)
+are the halves; the join is: window consumers parameterized by
+region-table lookups instead of end-anchored words, gather
+materializing any needed non-contiguous set. The sentinel keeps
+watch; first live divergence still gates the flip.
+
+Act 3 — THE STASH DIES. With (start,len) consumers and gather, the
+masked×depth stash/restore detour (D2D copies at layer k) is
+subsumed: the truncated middle is just another region whose rows
+leave the iteration space at their boundary. Delete it; re-run the
+1.32-2.25x depth pricing to capture the win.
