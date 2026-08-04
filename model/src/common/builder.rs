@@ -504,7 +504,13 @@ impl<'a> Builder<'a> {
         let axis = Self::splittable_axis(&raw.name, &raw.shape, axis);
         self.check_head_granularity(&raw.name, &raw.shape, axis)?;
         let (expr, shape) = self.shard(Expr::src(&raw.name), raw.shape.clone(), axis);
-        Ok(self.define(output, expr, raw.encoding.clone(), Some(shape)))
+        // A rank-0 tensor gets no shape prediction. The C ABI cannot tell
+        // `Some([])` from `None` — an empty slice reads back as "no claim" —
+        // so the C++ author's rank-0 `expect` lands as `None`, and matching
+        // that observable is what keeps the differential byte-exact. (gemma-4
+        // ships scalars; this is not hypothetical.)
+        let shape = if shape.is_empty() { None } else { Some(shape) };
+        Ok(self.define(output, expr, raw.encoding.clone(), shape))
     }
 
     /// Publish `expr` under `output` at the source's logical dtype, and claim

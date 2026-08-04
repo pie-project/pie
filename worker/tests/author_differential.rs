@@ -85,7 +85,15 @@ fn write_snapshot(dir: &Path, config: &str, specs: &[Spec]) {
 /// chain — including the MLA override that redefines `head_dim` as
 /// `qk_nope + qk_rope`.
 fn facts_from_config(config: &serde_json::Value) -> ModelFacts {
-    let get = |key: &str| config.get(key).and_then(serde_json::Value::as_i64);
+    // A multimodal release nests the decoder's facts under `text_config`;
+    // `config.cpp` reads through the same view.
+    let text = config.get("text_config");
+    let get = |key: &str| {
+        config
+            .get(key)
+            .or_else(|| text.and_then(|t| t.get(key)))
+            .and_then(serde_json::Value::as_i64)
+    };
     let model_type = config["model_type"]
         .as_str()
         .expect("model_type")
@@ -918,4 +926,74 @@ fn kimi_k3_bands_and_mxfp4_stacks() {
             "rms_norm_eps":1e-6}}"#
     );
     diff(&Case::new("kimi_k3", config, specs));
+}
+
+/// The real-checkpoint sweep: point `PIE_DIFF_SNAPSHOTS` at a colon-
+/// separated list of snapshot directories and every one is authored both
+/// ways from its own `config.json` and its own tensor table — no synthetic
+/// shapes, the shapes HuggingFace actually ships.
+#[test]
+fn real_snapshots_from_env() {
+    let Some(list) = std::env::var_os("PIE_DIFF_SNAPSHOTS") else {
+        eprintln!("PIE_DIFF_SNAPSHOTS unset; the real-checkpoint sweep is a no-op");
+        return;
+    };
+    for snapshot in list.to_string_lossy().split(':').filter(|s| !s.is_empty()) {
+        let dir = Path::new(snapshot);
+        let config_text = std::fs::read_to_string(dir.join("config.json"))
+            .unwrap_or_else(|err| panic!("{snapshot}: read config.json: {err}"));
+        let config: serde_json::Value = serde_json::from_str(&config_text)
+            .unwrap_or_else(|err| panic!("{snapshot}: parse config.json: {err}"));
+        let facts = facts_from_config(&config);
+        eprintln!("== {} ({}) ==", facts.model_type, snapshot);
+
+        let cpp: ModelContract = author_contract(&AuthorRequest {
+            snapshot_dir: dir,
+            runtime_quant: "",
+            mxfp4_moe_request: 0,
+            component: 0,
+            stream_routed_experts: false,
+            tp_rank: 0,
+            tp_size: 1,
+            fp8_native: false,
+            native_mxfp4_moe: false,
+        })
+        .unwrap_or_else(|err| panic!("{snapshot}: C++ author failed: {err}"));
+
+        let metadata = pie_loader::checkpoint::read::parse_checkpoint_metadata(dir)
+            .unwrap_or_else(|err| panic!("{snapshot}: reading the snapshot: {err}"));
+        let target = StorageTarget {
+            backend: BackendKind::Cuda,
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let rust = pie_model::contract::author(&facts, &metadata, &target, &Policy::default())
+            .unwrap_or_else(|err| panic!("{snapshot}: Rust author failed: {err}"))
+            .unwrap_or_else(|| panic!("{snapshot}: no Rust author for {}", facts.model_type));
+
+        let cpp_text = serde_json::to_string_pretty(&cpp).expect("serialize");
+        let rust_text = serde_json::to_string_pretty(&rust).expect("serialize");
+        if cpp_text != rust_text {
+            let divergence = cpp_text
+                .lines()
+                .zip(rust_text.lines())
+                .enumerate()
+                .find(|(_, (c, r))| c != r)
+                .map(|(line, (c, r))| format!("line {}:\n  c++ : {c}\n  rust: {r}", line + 1))
+                .unwrap_or_else(|| {
+                    format!(
+                        "c++ has {} lines, rust has {}",
+                        cpp_text.lines().count(),
+                        rust_text.lines().count()
+                    )
+                });
+            std::fs::write("/tmp/diff_cpp.json", &cpp_text).ok();
+            std::fs::write("/tmp/diff_rust.json", &rust_text).ok();
+            panic!(
+                "{snapshot}: the two authors disagree; first divergence at {divergence}\n\
+                 dumps: /tmp/diff_cpp.json /tmp/diff_rust.json"
+            );
+        }
+        eprintln!("   {} tensors, identical", rust.tensors.len());
+    }
 }
