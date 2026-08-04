@@ -16,6 +16,12 @@ use template::default_config_content;
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
+    /// Every key: what it is worth now, and what it means.
+    List {
+        /// Show only keys under this prefix, e.g. `worker.runtime`.
+        prefix: Option<String>,
+    },
+
     /// Print the config, or one value from it by dot-path. Says which file
     /// it read, and says so too when there is not one.
     Show {
@@ -46,6 +52,7 @@ pub enum ConfigCmd {
 
 pub fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
     match cmd {
+        ConfigCmd::List { prefix } => list(global, prefix),
         ConfigCmd::Show { key } => show(global, key),
         ConfigCmd::Set { key, value } => set(global, key, value),
         ConfigCmd::Unset { key } => unset(global, key),
@@ -76,6 +83,134 @@ fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
     // --force` if it failed -- overwriting your config to retry a download.
     println!("  Python inferlets also need `pie runtime install`.");
     Ok(())
+}
+
+/// `pie config list` -- the schema, not the file.
+///
+/// `show` prints what you wrote; this prints what pie will use, which is a
+/// different and usually more useful answer. A key you never set still has a
+/// value, and until now the only way to learn it was to read the Rust.
+fn list(global: &startup::GlobalArgs, prefix: Option<String>) -> Result<()> {
+    let (cfg_path, _) = startup::cli_config_path(global);
+    let file: toml::Value = match std::fs::read_to_string(&cfg_path) {
+        Ok(content) => toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?,
+        // Absent is normal; then nothing is set and every row is a default.
+        Err(_) => toml::Value::Table(Default::default()),
+    };
+
+    // Which driver the config asks for decides which option keys exist at all.
+    let driver = pie_worker::config_schema::lookup(&file, "worker.model.driver.type")
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "cuda_native" | "cuda" => Some(pie_worker::config::DriverKind::CudaNative),
+            "metal" => Some(pie_worker::config::DriverKind::Metal),
+            "dummy" => Some(pie_worker::config::DriverKind::Dummy),
+            _ => None,
+        })
+        .unwrap_or(pie_worker::config::DriverKind::Dummy);
+
+    let fields = pie_worker::config_schema::fields(driver);
+    let selected: Vec<_> = fields
+        .iter()
+        .filter(|f| match &prefix {
+            None => true,
+            Some(p) => f.key == *p || f.key.starts_with(&format!("{p}.")),
+        })
+        .collect();
+    if selected.is_empty() {
+        bail!(
+            "no keys under {:?}; `pie config list` shows all of them",
+            prefix.unwrap_or_default()
+        );
+    }
+
+    let colorize = std::io::stdout().is_terminal();
+    let (dim, bold, reset) = if colorize {
+        ("\x1b[2m", "\x1b[1m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+
+    // Column widths from the rows actually being printed, so a filtered
+    // listing is not padded out to the width of the ones it excluded.
+    let leaf = |key: &str| key.rsplit('.').next().unwrap_or(key).to_string();
+    let name_width = selected.iter().map(|f| leaf(&f.key).len()).max().unwrap_or(0);
+    let value_width = selected
+        .iter()
+        .map(|f| effective(&file, f).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(24);
+
+    // Grouped rather than printed as the walk emits them: the walk descends
+    // into `model.driver` and comes back to `model.weight_cache_dir`, so
+    // following it directly printed `[worker.model]` twice. Sections keep the
+    // order they first appear in, which is declaration order.
+    let mut order: Vec<String> = Vec::new();
+    let mut sections: std::collections::HashMap<String, Vec<&&pie_worker::config_schema::Field>> =
+        std::collections::HashMap::new();
+    for field in &selected {
+        let parent = field
+            .key
+            .rsplit_once('.')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        if !sections.contains_key(&parent) {
+            order.push(parent.clone());
+        }
+        sections.entry(parent).or_default().push(field);
+    }
+
+    for section in &order {
+        println!("\n{bold}[{section}]{reset}");
+        for field in &sections[section] {
+            // A marker rather than a colour: this is the column a person scans
+            // for -- what have I actually changed? -- and it has to survive a
+            // pipe.
+            let mark = if is_set(&file, &field.key) { "*" } else { " " };
+            println!(
+                "{mark} {:<name_width$}  {:<value_width$}  {dim}{}{reset}",
+                leaf(&field.key),
+                clip(&effective(&file, field), value_width),
+                clip(&plain(&field.doc), 64),
+            );
+        }
+    }
+    println!("\n{dim}* set in {}{reset}", cfg_path.display());
+    Ok(())
+}
+
+/// What pie will use for a field, given the file.
+fn effective(file: &toml::Value, field: &pie_worker::config_schema::Field) -> String {
+    if let Some(value) = pie_worker::config_schema::lookup(file, &field.key) {
+        return display_value(value);
+    }
+    match (&field.default, field.required) {
+        (Some(default), _) => display_value(default),
+        // Two different answers that both look like a missing value.
+        (None, true) => "(must be set)".to_string(),
+        (None, false) => "(derived)".to_string(),
+    }
+}
+
+fn is_set(file: &toml::Value, key: &str) -> bool {
+    pie_worker::config_schema::lookup(file, key).is_some()
+}
+
+/// Strip the markdown emphasis a doc comment carries for rustdoc. Backticks
+/// stay -- they read as quoting in a terminal -- but `**bold**` does not.
+fn plain(doc: &str) -> String {
+    doc.replace("**", "")
+}
+
+/// Cut to `width`, on a word boundary, with an ellipsis to say so.
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(width).collect();
+    let cut = clipped.rfind(' ').unwrap_or(clipped.len());
+    format!("{}…", clipped[..cut].trim_end())
 }
 
 fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
@@ -365,6 +500,9 @@ fn remove_nested(root: &mut toml::Value, key: &str) -> Result<bool> {
 
 fn display_value(v: &toml::Value) -> String {
     match v {
+        // An empty string is a value, and printing it as nothing makes a set
+        // key look unset.
+        toml::Value::String(s) if s.is_empty() => "\"\"".to_string(),
         toml::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
@@ -410,6 +548,48 @@ fn step<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_distinguishes_set_from_default_from_derived_from_required() {
+        use pie_worker::config_schema::Field;
+        let file: toml::Value = toml::from_str("[worker.server]\nport = 9090\n").unwrap();
+        let field = |key: &str, default: Option<toml::Value>, required: bool| Field {
+            key: key.to_string(),
+            doc: String::new(),
+            default,
+            required,
+        };
+        // The file wins over the default.
+        assert_eq!(
+            effective(&file, &field("worker.server.port", Some(toml::Value::Integer(8080)), false)),
+            "9090"
+        );
+        assert_eq!(
+            effective(&file, &field("worker.server.host", Some("127.0.0.1".into()), false)),
+            "127.0.0.1"
+        );
+        // Two ways to have no value, and they are opposite advice: one says
+        // pie works it out, the other says you must.
+        assert_eq!(
+            effective(&file, &field("worker.server.max_concurrent_processes", None, false)),
+            "(derived)"
+        );
+        assert_eq!(effective(&file, &field("worker.model.name", None, true)), "(must be set)");
+    }
+
+    #[test]
+    fn a_doc_comment_renders_without_its_rustdoc_markup() {
+        assert_eq!(plain("KV page size. **Omit to derive it.**"), "KV page size. Omit to derive it.");
+        // Backticks stay: they read as quoting rather than as markup.
+        assert_eq!(plain("`auto` follows"), "`auto` follows");
+    }
+
+    #[test]
+    fn an_empty_string_prints_as_a_value_rather_than_as_nothing() {
+        // Otherwise a key that is set to "" is indistinguishable from a blank
+        // row, which is how `weight_cache_dir` reads.
+        assert_eq!(display_value(&toml::Value::String(String::new())), "\"\"");
+    }
 
     #[test]
     fn the_most_specific_reading_is_offered_first() {
