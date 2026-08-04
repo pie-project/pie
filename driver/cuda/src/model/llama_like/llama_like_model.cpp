@@ -121,6 +121,12 @@ void LlamaLikeModel::body(Workspace& ws,
         (!in.has_write_desc ||
          (in.w_page_d != nullptr && in.w_off_d != nullptr)) &&
         in.runtime_window_left == -2 &&
+        // NO-DEMOTION v0: a 3-way mixed fire (plain-decode middle on
+        // its own decode plan) is hand-written only — the declared
+        // walkers' prefix dispatch consumes the P-replanned causal and
+        // would SKIP the middle's attention. Their 3-way is the
+        // recorded rung; until then this routing keeps them exact.
+        plan_.mixed_mid_start < 0 &&
         // STRUCTURAL S-4: truncated fires walk the declared trace when
         // the DECLARATION states the depth axis for the fire's shape
         // (pure-decode only; a truncated lane's prefill keeps the
