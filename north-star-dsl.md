@@ -1442,3 +1442,28 @@ a pattern-based env flip catches NEIGHBORING gates — the first
 attempt flipped TP_DISABLE_DEVICE_COMPOSE / STEP_PROFILE /
 HOOK_GRAPH_TRACE to default-on before the per-name pass restored
 them.
+
+## THE LADDER'S V1 IS COMPLETE (2026-08-04) — NS-5, retirement by promotion
+
+PIE_SUPERGRAPH defaults OFF: the temporal union's one live axis (the
+mask) was promoted to the spatial form, no fire can arm its
+conditional, and the exec had reduced to the plain graph plus dead
+capture weight. The machinery stays for the STRUCTURAL class. The
+directive's five items, closed in pie terms: (1) per-op member masks
+= the split's row windows, live and default; (2) edge buffers = the
+materialization the split body already honors (fused edges stay
+non-merge-points); (3) seriation = the mask-nested member sort;
+(4) the union = the Guard's fire-level mask arm dissolved into
+windowed regions, stated by the emitter; (5) N programs per fire =
+the compose relax, including the all-masked fire class.
+
+What v1 deliberately leaves open, for the record: the SCS union of
+GENUINELY separate member programs (today's members are attachment
+combinations over one model trace; a second model-structural program
+class — spec verify, early exit — is what forces the supersequence
+alignment and the conditional regions, and the retired-but-kept
+builder is its organ); PQ-tree seriation when the axes stop nesting
+(hooks x mask today nests, so the lexicographic key suffices); the
+split under XQA and padded head dims (both guarded to the fire-level
+arm); and flashinfer-side device row windows (which would collapse
+the split-keyed exec family to one exec per bucket).
