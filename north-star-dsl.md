@@ -2617,3 +2617,18 @@ already happen): serve the table's deepest-first bands with a prefix
 decode plan per boundary, behind PIE_DEPTH_BANDS until priced. The
 A/B is ready-made: today's R=4-at-full-depth fire vs the banded fire,
 same lanes.
+
+## ACT 1 LANDS (2026-08-04): banded depth, the table's first new power
+
+The mixed-k demotion measured this morning is dead (behind
+PIE_DEPTH_BANDS): the hand walker now serves distinct-k bands from the
+region table — deepest-first prefix walk, a prefix decode plan per
+boundary in its own workspace, walk STOPPING past the deepest k on
+all-truncated fires. Live: [depth-bands] R=4 m=2 fires; full lane
+byte-matches its solo; truncated lanes emit layer-k draft class
+instead of the demotion's coherent full-depth text (the banded k8
+opens exactly like depth_union's mixed-k8 — the sealed numeric
+class); repeat nondeterminism = the known execution-history floor
+(control reproduces bands-off); 0.6B wall is overhead-bound, GPU win
+prices at 7B+. This is the first capability that exists ONLY because
+the table exists — no scalar-word design could have carried n bands.
