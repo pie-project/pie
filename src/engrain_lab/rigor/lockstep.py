@@ -20,13 +20,21 @@ difference that survives every configuration.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 RESULTS = Path("results")
 OUT = RESULTS / "lockstep.json"
+
+
+def _fill_rows(matchers, bitmask, rows) -> None:
+    """One thread's share of a step, the way vLLM slices it."""
+    for row in rows:
+        matchers[row].fill_next_token_bitmask(bitmask, row)
 
 
 def main() -> int:
@@ -50,6 +58,15 @@ def main() -> int:
         "engine.",
     )
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="threads to fill XGrammar's rows with, in chunks of sixteen, "
+        "which is what vLLM does above a batch of 128. Their per-row work is "
+        "the same either way; this is the difference between counting it and "
+        "waiting for it, and serving waits.",
+    )
     parser.add_argument(
         "--distinct",
         type=int,
@@ -115,8 +132,8 @@ def main() -> int:
     report = []
     spreads = arguments.distinct or [len(pairs)]
     print(
-        f"\n{'batch':>6} {'distinct':>9} {'engrain':>12} {'xgrammar':>12} "
-        f"{'ratio':>7}"
+        f"\n{'batch':>6} {'distinct':>9} {'engrain':>12} {'xg serial':>12} "
+        f"{'xg threaded':>14} {'ratio':>7}"
     )
     for batch, distinct in ((b, d) for b in arguments.batches for d in spreads):
         spread = max(1, min(distinct, len(pairs), batch))
@@ -134,7 +151,12 @@ def main() -> int:
             device.set_grammars(assignment)
 
             bitmask = xg.allocate_token_bitmask(batch, len(tokenizer))
-            ourtimes, theirtimes = [], []
+            ourtimes, theirtimes, theirthreaded = [], [], []
+            pool_of_threads = (
+                ThreadPoolExecutor(max_workers=arguments.workers)
+                if arguments.workers > 1 and batch > 16
+                else None
+            )
             for _ in range(arguments.repeats):
                 mine = [grammar.matcher(0) for grammar, _, _ in chosen]
                 yours = [
@@ -152,30 +174,53 @@ def main() -> int:
                     device.fill_mask()[:batch].to("cpu", non_blocking=False)
                     if timed:
                         ourtimes.append((time.perf_counter() - started) * 1e6)
-                    # Theirs: one host call per row, which is their whole step.
+                    # Theirs: one host call per row, which is their whole
+                    # step - serially for the work, and over vLLM's thread
+                    # pool for the latency a serving engine actually sees.
                     started = time.perf_counter()
                     for row in range(batch):
                         yours[row].fill_next_token_bitmask(bitmask, row)
+                    serial = (time.perf_counter() - started) * 1e6
+                    started = time.perf_counter()
+                    if pool_of_threads is None:
+                        threaded = serial
+                    else:
+                        chunks = [
+                            range(at, min(at + 16, batch))
+                            for at in range(0, batch, 16)
+                        ]
+                        list(
+                            pool_of_threads.map(
+                                functools.partial(_fill_rows, yours, bitmask),
+                                chunks,
+                            )
+                        )
+                        threaded = (time.perf_counter() - started) * 1e6
                     if timed:
-                        theirtimes.append((time.perf_counter() - started) * 1e6)
+                        theirtimes.append(serial)
+                        theirthreaded.append(threaded)
                     for row, (_, _, tokens) in enumerate(chosen):
                         token = tokens[step]
                         mine[row].accept_token(token)
                         yours[row].accept_token(token)
             if not ourtimes:
                 continue
+            if pool_of_threads is not None:
+                pool_of_threads.shutdown()
             us = statistics.median(ourtimes)
             them = statistics.median(theirtimes)
+            threaded = statistics.median(theirthreaded)
             print(
                 f"{batch:>6} {spread:>9} {us:>11.1f}u {them:>11.1f}u "
-                f"{us / them:>7.2f}"
+                f"{threaded:>13.1f}u {us / threaded:>7.2f}"
             )
             report.append(
                 {
                     "batch": batch,
                     "distinct": spread,
                     "engrain_us": us,
-                    "xgrammar_us": them,
+                    "xgrammar_serial_us": them,
+                    "xgrammar_threaded_us": threaded,
                 }
             )
         finally:
