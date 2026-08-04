@@ -174,7 +174,11 @@ fn planned_unmasked_prefix_wire_rows(
     ordered: &[Box<PendingRequest>],
     row_indptr: &[u32],
 ) -> u32 {
-    if ordered.iter().any(|req| req.hook_program || req.lora_program)
+    // AC-2: lora members no longer suppress the plan — the correction
+    // applies to its spans wherever they sit in the unmasked prefix
+    // (span-grouped, window-free); hooks still do (the hook peel owns
+    // the suffix).
+    if ordered.iter().any(|req| req.hook_program)
         || !ordered.iter().any(|req| req.request.has_user_mask)
     {
         return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;

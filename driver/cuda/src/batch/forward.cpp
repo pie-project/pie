@@ -816,7 +816,9 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.planned_max_layers == 0xffffffffu;
     const bool use_spatial_mask = spatial_mask_enabled() &&
         in.is_pure_decode && in.have_custom_mask && !has_hooks &&
-        in.lora == nullptr &&
+        // AC-2: lora no longer disarms the split — the correction lands
+        // on its spans inside the (full-N shared) QKV production,
+        // upstream of the attention peel.
         in.unmasked_prefix_rows != 0xffffffffu &&
         in.unmasked_prefix_rows < static_cast<std::uint32_t>(in.forward_R);
     // THE MIXED FIRE (M-2): a prefill-shaped fire with a planned
@@ -851,6 +853,27 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                      in.forward_R, in.unmasked_prefix_rows,
                      has_hooks ? 1 : 0, in.lora != nullptr ? 1 : 0,
                      spatial_mask_enabled() ? 1 : 0);
+    }
+    // AC-0 observability: one line per fire with every axis's state —
+    // the composition truth table's raw data (PIE_FIRE_TRACE=1).
+    if (std::getenv("PIE_FIRE_TRACE") != nullptr) {
+        std::fprintf(
+            stderr,
+            "[fire] R=%d N=%d mask=%d hooks=%d lora=%d k=%d dsplit=%d "
+            "msplit=%d\n",
+            in.forward_R, in.forward_N,
+            in.have_custom_mask ? 1 : 0,
+            has_hooks ? 1 : 0,
+            in.lora != nullptr ? 1 : 0,
+            in.planned_max_layers == 0xffffffffu
+                ? -1
+                : static_cast<int>(in.planned_max_layers),
+            in.planned_full_depth_rows == 0xffffffffu
+                ? -1
+                : static_cast<int>(in.planned_full_depth_rows),
+            in.unmasked_prefix_rows == 0xffffffffu
+                ? -1
+                : static_cast<int>(in.unmasked_prefix_rows));
     }
     if (in.have_custom_mask && std::getenv("PIE_SPATIAL_MASK_TRACE")) {
         std::fprintf(stderr,

@@ -458,6 +458,10 @@ pub(crate) struct LaunchGrouping {
     /// NS-2: a member carries hooks or a lora sink (the planner sends
     /// UNPLANNED for such fires, so a wire-masked envelope must not join).
     has_hook_or_lora: bool,
+    /// AC-2: hooks alone — masked envelopes now compose with lora
+    /// lanes (the correction is not a window axis), so the spatial
+    /// refusals key on hooks specifically.
+    has_hook: bool,
 }
 
 /// NS-2 (the spatial mask fire): engine-side mirror of the driver's
@@ -578,8 +582,7 @@ impl LaunchGrouping {
             && wire_mask_on_device_geometry
             && request.request.token_ids.len() <= 1
             && !request.has_multi_token_row()
-            && !request.hook_program
-            && !request.lora_program;
+            && !request.hook_program;
         let wire_mask_on_device_geometry_blocks =
             wire_mask_on_device_geometry && !spatial_composable_masked_envelope;
         if self.count != 0
@@ -596,15 +599,14 @@ impl LaunchGrouping {
                     && ((!spatial_mixed_compose_enabled()
                          && self.has_multi_token)
                         || self.has_structured_mask
-                        || self.has_hook_or_lora
+                        || self.has_hook
                         || self.has_masked_device_geometry))
                 || self.has_masked_device_geometry
                 || (self.has_wire_masked_envelope
                     && ((!spatial_mixed_compose_enabled()
                          && request.has_multi_token_row())
                         || request.request.structured_device_mask
-                        || request.hook_program
-                        || request.lora_program))
+                        || request.hook_program))
                 || (wire_masked && self.has_structured_mask)
                 || (request.request.structured_device_mask && self.has_user_mask))
         {
@@ -696,6 +698,7 @@ impl LaunchGrouping {
             || (wire_masked_envelope && !spatial_relaxed);
         self.has_wire_masked_envelope |= spatial_relaxed;
         self.has_hook_or_lora |= request.hook_program || request.lora_program;
+        self.has_hook |= request.hook_program;
         self.has_multi_token |= request.has_multi_token_row();
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
