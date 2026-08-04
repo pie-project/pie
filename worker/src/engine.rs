@@ -519,10 +519,7 @@ fn load_model_drivers(
         // load. Sharing a directory left `.weights` files sitting in a store
         // that scans for `.zt` and silently ignored them, while `pie cache`
         // reported their size under the store's name.
-        crate::state::driver_cache_dir()
-            .join("weights")
-            .to_string_lossy()
-            .into_owned()
+        crate::state::weight_cache_dir().to_string_lossy().into_owned()
     } else {
         user_cfg.model.weight_cache_dir.clone()
     };

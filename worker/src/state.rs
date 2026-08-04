@@ -25,6 +25,16 @@ pub fn driver_cache_dir() -> PathBuf {
     crate::paths::pie_home().join("cache")
 }
 
+/// Where the driver keeps materialized device weights.
+///
+/// Defined once for the same reason `driver_cache_dir` is: this and
+/// `engine::boot` both need it, and when they were two expressions they landed
+/// on two directories -- one of them the artifact store, which is not a cache
+/// at all.
+pub fn weight_cache_dir() -> PathBuf {
+    driver_cache_dir().join("weights")
+}
+
 /// Whether an entry may be deleted to reclaim space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reclaim {
@@ -107,7 +117,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
         },
         Entry {
             name: "weights",
-            path: driver_cache_dir().join("weights"),
+            path: weight_cache_dir(),
             what: "Materialized device weights, keyed by checkpoint + config + \
                    quant scheme + TP layout + ABI version. One cold load to \
                    rebuild; valid only for this build.",
@@ -232,6 +242,7 @@ mod tests {
                 .path
         };
         assert_eq!(by_name("driver"), driver_cache_dir());
+        assert_eq!(by_name("weights"), weight_cache_dir());
         assert_eq!(
             by_name("launch"),
             crate::embedded_driver::launch_state_root()

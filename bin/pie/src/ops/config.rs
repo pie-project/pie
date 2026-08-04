@@ -506,9 +506,13 @@ fn typed_by_schema(
     // Checked first so a typo reads as a typo. Without it the candidate loop
     // runs to its last (string) reading and reports THAT failure, which for a
     // key that does not exist describes a type mismatch instead.
+    //
+    // Normalized before checking, or a superseded spelling the parser still
+    // accepts as an alias would be rejected here as unknown -- `set
+    // model.hf_repo` failing while a hand-written `hf_repo` boots fine.
     let parsed: toml::Value =
         toml::from_str(content).unwrap_or_else(|_| toml::Value::Table(Default::default()));
-    schema_field(&parsed, key)?;
+    schema_field(&parsed, &normalize_key(key))?;
     let mut last_error = None;
     for candidate in candidates(value) {
         let mut root: toml::Value =

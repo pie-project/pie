@@ -24,8 +24,6 @@
 //! the other saying what keys exist would put `pie config set` and `pie config
 //! list` at odds.
 
-use std::collections::BTreeMap;
-
 use anyhow::{Result, bail};
 
 /// `(file path, internal path)` for every key whose two spellings differ.
@@ -59,7 +57,6 @@ const MOVES: &[(&str, &str)] = &[
     // Tuning that was in `[runtime]` because `[runtime]` was where tuning went.
     ("server.worker_threads", "runtime.worker_threads"),
     ("server.max_upload", "runtime.max_upload"),
-    ("server.python_snapshot", "server.python_snapshot"),
     // Admission is scheduling.
     ("runtime.max_concurrent_processes", "server.max_concurrent_processes"),
     // Distributed serving was three sections for one deployment shape.

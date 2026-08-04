@@ -32,7 +32,7 @@ enum Command {
     /// Boot the engine. Binds `server.host`, which is loopback by default.
     Serve,
 
-    /// Manage HuggingFace-cached models (list / info / download / remove / optimize).
+    /// The models pie serves (list / info / download / remove / convert).
     Model {
         #[command(subcommand)]
         cmd: ops::model::ModelCmd,

@@ -57,8 +57,8 @@ use crate::store::kv::page_table::ReclaimQuote;
 
 /// Opt-in event markers (`PIE_CONTENTION_TRACE_EVENTS=1`): `println!`, not
 /// `tracing` — the embedded (pyo3) server installs no subscriber. The
-/// timestamp shares the fire-timing monotonic clock so planner events
-/// correlate with `PIE_FIRE_TIMING` wave records in one benchmark log.
+/// timestamp shares the fire-timing monotonic clock, which is what lets these
+/// markers be read against the scheduler's own timing records.
 ///
 /// **This is a separate switch from the periodic stall sampler**
 /// (`PIE_CONTENTION_TRACE_MS`) on purpose. The markers fire per planner
