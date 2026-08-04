@@ -112,8 +112,16 @@ pub fn cuda_standalone_toml_capped(
          device = [\"cuda:0\"]\n\
          \n\
          gpu_mem_utilization = {gpu_mem_utilization}\n\
-         total_pages = {total_pages}\n\
-         swap_pool_size = {swap_pool_size}\n"
+         {cap}\
+         swap_pool_size = {swap_pool_size}\n",
+        // Omitted rather than zeroed: `0 = derive` was retired when the
+        // sentinels went, and `max_total_pages` is an Option now -- absence IS
+        // the request to derive from gpu_mem_utilization.
+        cap = if total_pages > 0 {
+            format!("         max_total_pages = {total_pages}\n")
+        } else {
+            String::new()
+        }
     )
 }
 
@@ -126,7 +134,7 @@ pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
     run_standalone(controller, gateway, worker).await
 }
 
-/// [`boot_4090`] at an explicit `[model.scheduler] frame_dispatch_depth` — the
+/// [`boot_4090`] at an explicit `[runtime] frame_dispatch_depth` — the
 /// engine's enqueue horizon in frames. `cuda_deep_coverify` needs the engine's
 /// depth to MATCH the chain depth its carrier submits, and config is the only
 /// way to say so: the depth used to be an env var the engine silently clamped,

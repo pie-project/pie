@@ -121,7 +121,7 @@ impl ExecutorConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
             self.max_clients > 0,
-            "executor.max_clients must be greater than zero"
+            "cluster.max_clients must be greater than zero"
         );
         Ok(())
     }
@@ -170,7 +170,7 @@ impl OffloadConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
             self.max_outstanding_per_partner > 0,
-            "offload.max_outstanding_per_partner must be greater than zero"
+            "cluster.max_outstanding_per_partner must be greater than zero"
         );
         Ok(())
     }
@@ -451,7 +451,7 @@ impl Default for ServerConfig {
 impl ServerConfig {
     fn validate(&self) -> Result<()> {
         if let Some(n) = self.max_concurrent_processes {
-            ensure!(n > 0, "server.max_concurrent_processes must be > 0 if set");
+            ensure!(n > 0, "runtime.max_concurrent_processes must be > 0 if set");
         }
         Ok(())
     }
@@ -580,19 +580,19 @@ impl RuntimeConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
             self.worker_threads > 0,
-            "runtime.worker_threads must be > 0"
+            "server.worker_threads must be > 0"
         );
         ensure!(
             self.wasm_max_instances > 0,
-            "runtime.wasm_max_instances must be > 0"
+            "sandbox.max_instances must be > 0"
         );
         ensure!(
             self.wasm_max_memory.as_bytes() > 0,
-            "runtime.wasm_max_memory must be > 0"
+            "sandbox.max_memory must be > 0"
         );
         ensure!(
             self.max_upload.as_bytes() > 0,
-            "runtime.max_upload must be > 0"
+            "server.max_upload must be > 0"
         );
         Ok(())
     }
@@ -938,7 +938,7 @@ impl DriverConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.device.is_empty(),
-            "model.driver.device must be non-empty"
+            "driver.device must be non-empty"
         );
         match self.kind {
             DriverKind::CudaNative => {
@@ -1332,7 +1332,7 @@ impl CudaNativeDriverOptions {
             self.gpu_mem_utilization.is_finite()
                 && self.gpu_mem_utilization > 0.0
                 && self.gpu_mem_utilization <= 1.0,
-            "model.driver.options.gpu_mem_utilization must be finite and in (0.0, 1.0]"
+            "driver.gpu_mem_utilization must be finite and in (0.0, 1.0]"
         );
         const MXFP4: &[&str] = &[
             "auto",
@@ -1345,12 +1345,12 @@ impl CudaNativeDriverOptions {
         ];
         ensure!(
             self.mxfp4_moe.is_empty() || MXFP4.contains(&self.mxfp4_moe.as_str()),
-            "model.driver.options.mxfp4_moe must be one of {:?}",
+            "driver.mxfp4_moe must be one of {:?}",
             MXFP4
         );
         ensure!(
             self.mtp_num_drafts <= 32,
-            "model.driver.options.mtp_num_drafts must be in 0..=32"
+            "driver.mtp_num_drafts must be in 0..=32"
         );
         // Present means the operator chose a size, so a present zero is a
         // contradiction rather than a way to say "derive" -- that is what
@@ -1358,28 +1358,28 @@ impl CudaNativeDriverOptions {
         if let Some(size) = self.expert_cache {
             ensure!(
                 size.as_bytes() > 0,
-                "model.driver.options.expert_cache must be > 0; \
+                "driver.expert_cache must be > 0; \
                  omit it to derive one at startup"
             );
         }
         if let Some(size) = self.expert_host_cache {
             ensure!(
                 size.as_bytes() > 0,
-                "model.driver.options.expert_host_cache must be > 0; \
+                "driver.expert_host_cache must be > 0; \
                  omit it for no host tier"
             );
         }
         if let Some(pages) = self.max_total_pages {
             ensure!(
                 pages > 0,
-                "model.driver.options.max_total_pages must be > 0; \
+                "driver.max_total_pages must be > 0; \
                  omit it to derive from gpu_mem_utilization"
             );
         }
         if let Some(size) = self.kv_page_size {
             ensure!(
                 size > 0,
-                "model.driver.options.kv_page_size must be > 0; \
+                "driver.kv_page_size must be > 0; \
                  omit it to let the memory planner derive one"
             );
         }
