@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use pie_worker::state::{self, Reclaim};
 
-use crate::ui::{self, Mark, Palette, Stream};
+use crate::ui::{self, Align, Mark, Palette, Row, Stream, Table};
 
 #[derive(Subcommand, Debug)]
 pub enum CacheCmd {
@@ -97,38 +97,31 @@ fn list(json: bool) -> Result<()> {
     let palette = Palette::for_stream(Stream::Stdout);
     let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
 
-    let name_width = measured
-        .iter()
-        .map(|(entry, _, _)| entry.name.len())
-        .max()
-        .unwrap_or(0);
-
-    println!("{dim}pie writes under{reset} {bold}{}{reset}", home.display());
+    println!("{dim}pie writes under{reset} {bold}{}{reset}", ui::short_path(&home));
+    let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
     for (entry, exists, size) in &measured {
-        let relative = entry
-            .path
-            .strip_prefix(&home)
-            .unwrap_or(&entry.path)
-            .display()
-            .to_string();
         // An absent entry is reported rather than hidden: "pie has not written
         // this yet" and "pie does not know about this" are different answers,
         // and only the listing can tell them apart.
         let mark = if *exists { Mark::Plain } else { Mark::Absent };
-        let size_text = if *exists { ui::bytes(*size) } else { String::new() };
         let note = match entry.reclaim {
             Reclaim::Safe => "",
-            Reclaim::OnRequest => " (kept unless asked)",
-            Reclaim::Never => " (never reclaimed)",
+            Reclaim::OnRequest => "kept unless asked",
+            Reclaim::Never => "never reclaimed",
         };
-        println!(
-            "{} {:<name_width$}  {:>8}  {dim}{relative}{note}{reset}",
-            mark.render(&palette),
-            entry.name,
-            size_text,
-            name_width = name_width,
-        );
+        table.push(Row::new(
+            mark,
+            [
+                entry.name.to_string(),
+                if *exists { ui::bytes(*size) } else { String::new() },
+                // The name already says which directory this is -- five of the
+                // nine rows repeated the same word -- so the note column
+                // carries what deleting it costs instead.
+                note.to_string(),
+            ],
+        ));
     }
+    table.print(&palette);
 
     println!();
     if reclaimable == 0 && on_request == 0 {

@@ -214,6 +214,139 @@ pub fn duration(d: std::time::Duration) -> String {
     }
 }
 
+/// A path with `$HOME` written as `~`.
+///
+/// Almost every path pie prints is under the user's home, and the prefix
+/// carries no information -- it is the same on every line, and it is what
+/// pushes the part that differs off the edge of a column.
+pub fn short_path(path: &std::path::Path) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(std::path::Path::new(&home)) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tables
+// -----------------------------------------------------------------------------
+
+/// One printed row: a mark, then cells.
+pub struct Row {
+    pub mark: Mark,
+    /// Cells left to right. The last one is treated as the note column and is
+    /// what gets cut when the terminal is narrow.
+    pub cells: Vec<String>,
+}
+
+impl Row {
+    pub fn new(mark: Mark, cells: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            mark,
+            cells: cells.into_iter().collect(),
+        }
+    }
+}
+
+/// How a column is laid out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Right,
+}
+
+/// A column-aligned listing that fits the terminal.
+///
+/// Four listings each computed their own `{:<width$}`, and `doctor` computed
+/// none -- its fixed `{:<20}` key column was blown apart by the absolute
+/// config path beside it. Widths come from the rows actually being printed, so
+/// a filtered listing is not padded out to the width of the rows it excluded.
+pub struct Table {
+    aligns: Vec<Align>,
+    dim_from: usize,
+    rows: Vec<Row>,
+}
+
+impl Table {
+    /// `dim_from` is the first column that is secondary text -- paths, notes,
+    /// descriptions. Everything from there on is dimmed and the last column is
+    /// what gets cut to fit.
+    pub fn new(aligns: impl IntoIterator<Item = Align>, dim_from: usize) -> Self {
+        Self {
+            aligns: aligns.into_iter().collect(),
+            dim_from,
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, row: Row) {
+        self.rows.push(row);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Print with two spaces between columns, indented by two.
+    pub fn print(&self, p: &Palette) {
+        const GAP: usize = 2;
+        const INDENT: usize = 2;
+        let columns = self.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
+        let widths: Vec<usize> = (0..columns)
+            .map(|i| {
+                self.rows
+                    .iter()
+                    .filter_map(|r| r.cells.get(i))
+                    .map(|c| c.chars().count())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        // Everything but the last column is laid out at its natural width; the
+        // last one gets whatever is left, because cutting a note is a loss a
+        // reader can absorb and cutting a name is not.
+        let fixed: usize = INDENT
+            + 2
+            + widths.iter().take(columns.saturating_sub(1)).sum::<usize>()
+            + GAP * columns.saturating_sub(1);
+        let last_room = width().saturating_sub(fixed).max(8);
+
+        for row in &self.rows {
+            let mut line = format!("{}{} ", " ".repeat(INDENT), row.mark.render(p));
+            for (i, width) in widths.iter().enumerate() {
+                let raw = row.cells.get(i).map(String::as_str).unwrap_or("");
+                let last = i + 1 == columns;
+                let text = if last { clip(raw, last_room) } else { raw.to_string() };
+                let pad = width.saturating_sub(text.chars().count());
+                if i >= self.dim_from {
+                    line.push_str(p.dim());
+                }
+                match self.aligns.get(i).copied().unwrap_or(Align::Left) {
+                    Align::Left => {
+                        line.push_str(&text);
+                        if !last {
+                            line.push_str(&" ".repeat(pad));
+                        }
+                    }
+                    Align::Right => {
+                        line.push_str(&" ".repeat(pad));
+                        line.push_str(&text);
+                    }
+                }
+                if i >= self.dim_from {
+                    line.push_str(p.reset());
+                }
+                if !last {
+                    line.push_str(&" ".repeat(GAP));
+                }
+            }
+            println!("{}", line.trim_end());
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Machine-readable output
 // -----------------------------------------------------------------------------
@@ -337,6 +470,43 @@ mod tests {
         // A word boundary is preferred only when it is not throwing the line
         // away: "aaaa…" beats "…" for a single long word.
         assert_eq!(clip("a bbbbbbbbbbbbbbbb", 6), "a bbb…");
+    }
+
+    #[test]
+    fn a_table_pads_from_the_rows_it_prints() {
+        // Widths come from what is being shown, not from a fixed number: a
+        // filtered listing padded to the width of rows it excluded is what
+        // `doctor`'s `{:<20}` key column used to be.
+        let mut table = Table::new([Align::Left, Align::Right], 1);
+        table.push(Row::new(Mark::Plain, ["a".into(), "1".into()]));
+        table.push(Row::new(Mark::Absent, ["bbb".into(), "22".into()]));
+        assert!(!table.is_empty());
+        assert_eq!(table.rows.len(), 2);
+        // Column 0 is three wide because "bbb" is, not because anything said so.
+        let widths: Vec<usize> = (0..2)
+            .map(|i| {
+                table
+                    .rows
+                    .iter()
+                    .map(|r| r.cells[i].chars().count())
+                    .max()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(widths, vec![3, 2]);
+    }
+
+    #[test]
+    fn a_home_path_loses_the_prefix_that_carries_nothing() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        let inside = std::path::Path::new(&home).join("pie").join("config.toml");
+        assert_eq!(short_path(&inside), "~/pie/config.toml");
+        // Outside home it stays absolute -- abbreviating there would be a lie.
+        let outside = std::path::Path::new("/etc/pie.toml");
+        assert_eq!(short_path(outside), "/etc/pie.toml");
     }
 
     #[test]

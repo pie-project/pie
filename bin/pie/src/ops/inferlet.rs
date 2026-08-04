@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use pie_engine::inferlet::program::{Manifest, ProgramName, Repository};
 
-use crate::ui::{self, Palette, Stream};
+use crate::ui::{self, Align, Mark, Palette, Row, Stream, Table};
 
 
 #[derive(Subcommand, Debug)]
@@ -94,24 +94,31 @@ fn list(json: bool) -> Result<()> {
         return Ok(());
     }
     let palette = Palette::for_stream(Stream::Stdout);
-    let (dim, reset) = (palette.dim(), palette.reset());
-    let width = cached
-        .iter()
-        .map(|(name, _, _)| name.name.len() + name.version.len() + 1)
-        .max()
-        .unwrap_or(0);
+    let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
     for (name, manifest, size) in &cached {
-        let id = format!("{}@{}", name.name, name.version);
         // Descriptions are author-written and unbounded -- one in the test set
-        // runs to a paragraph on mask semantics -- so the row is cut to what is
-        // left of the terminal. `pie inferlet info` prints the whole thing.
-        let room = ui::width().saturating_sub(width + 14);
-        let description = ui::clip(
-            manifest.package.description.as_deref().unwrap_or("").lines().next().unwrap_or("").trim(),
-            room,
-        );
-        println!("  {id:<width$}  {:>8}  {dim}{description}{reset}", ui::bytes(*size));
+        // runs to a paragraph on mask semantics -- so the table cuts the last
+        // column to fit. `pie inferlet info` prints the whole thing.
+        let description = manifest
+            .package
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        table.push(Row::new(
+            Mark::Plain,
+            [
+                format!("{}@{}", name.name, name.version),
+                ui::bytes(*size),
+                description,
+            ],
+        ));
     }
+    table.print(&palette);
     Ok(())
 }
 

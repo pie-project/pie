@@ -83,7 +83,7 @@ fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
     println!(
         "{} config written to {}",
         crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
-        cfg_path.display()
+        crate::ui::short_path(&cfg_path)
     );
     // Writing a config file does not install anything. This used to fetch the
     // Python-WASM runtime here, and told you to rerun `pie config init
@@ -161,13 +161,6 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
     // Column widths from the rows actually being printed, so a filtered
     // listing is not padded out to the width of the ones it excluded.
     let leaf = |key: &str| key.rsplit('.').next().unwrap_or(key).to_string();
-    let name_width = selected.iter().map(|f| leaf(&f.key).len()).max().unwrap_or(0);
-    let value_width = selected
-        .iter()
-        .map(|f| effective(&file, f).chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(24);
 
     // Grouped rather than printed as the walk emits them: the walk descends
     // into `model.driver` and comes back to `model.weight_cache_dir`, so
@@ -190,6 +183,14 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
 
     for section in &order {
         println!("\n{bold}[{section}]{reset}");
+        let mut table = crate::ui::Table::new(
+            [
+                crate::ui::Align::Left,
+                crate::ui::Align::Left,
+                crate::ui::Align::Left,
+            ],
+            2,
+        );
         for field in &sections[section] {
             // A marker rather than a colour: this is the column a person scans
             // for -- what have I actually changed? -- and it has to survive a
@@ -198,20 +199,19 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
                 crate::ui::Mark::Chosen
             } else {
                 crate::ui::Mark::Plain
-            }
-            .render(&palette);
-            println!(
-                "{mark} {:<name_width$}  {:<value_width$}  {dim}{}{reset}",
-                leaf(&field.key),
-                crate::ui::clip(&effective(&file, field), value_width),
-                crate::ui::clip(
-                    &plain(&field.doc),
-                    crate::ui::width().saturating_sub(name_width + value_width + 6),
-                ),
-            );
+            };
+            table.push(crate::ui::Row::new(
+                mark,
+                [
+                    leaf(&field.key),
+                    effective(&file, field),
+                    plain(&field.doc),
+                ],
+            ));
         }
+        table.print(&palette);
     }
-    println!("\n{dim}• set in {}{reset}", cfg_path.display());
+    println!("\n{dim}• set in {}{reset}", crate::ui::short_path(&cfg_path));
     Ok(())
 }
 

@@ -197,6 +197,8 @@ fn list(json: bool) -> Result<()> {
 
     let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
     let (dim, reset) = (palette.dim(), palette.reset());
+    let mut table =
+        crate::ui::Table::new([crate::ui::Align::Left, crate::ui::Align::Left], 1);
     for (repo_id, ok, info) in &entries {
         // `✓` is reserved for "this command did something". A model pie can
         // serve is unremarkable; one it cannot is the row worth finding, so
@@ -206,11 +208,12 @@ fn list(json: bool) -> Result<()> {
         } else {
             crate::ui::Mark::Absent
         };
-        println!(
-            "  {} {repo_id} {dim}({info}){reset}",
-            mark.render(&palette)
-        );
+        table.push(crate::ui::Row::new(
+            mark,
+            [repo_id.clone(), info.clone()],
+        ));
     }
+    table.print(&palette);
     println!("\n{dim}{}{reset}", hub.display());
     Ok(())
 }

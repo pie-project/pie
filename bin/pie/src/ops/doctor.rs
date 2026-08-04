@@ -24,9 +24,6 @@ use crate::ui::{Mark, Palette, Stream};
 
 /// `pie doctor` entry point. Returns whether pie can boot.
 pub fn doctor(global: &startup::GlobalArgs, json: bool) -> Result<bool> {
-    // Collected first, printed second, so the two renderings cannot drift into
-    // disagreeing about the verdict -- which is the one thing a probe reads.
-    let mut checks: Vec<(&'static str, String, String, Status)> = Vec::new();
     let mut warnings = 0usize;
     let mut passes = 0usize;
     let mut failures = 0usize;
@@ -116,11 +113,24 @@ pub fn doctor(global: &startup::GlobalArgs, json: bool) -> Result<bool> {
         .map(|()| ready);
     }
 
+    let palette = Palette::for_stream(Stream::Stdout);
     for (name, checks) in &sections {
-        println!("\n[{name}]");
+        println!("\n{}[{name}]{}", palette.bold(), palette.reset());
+        let mut table = crate::ui::Table::new(
+            [crate::ui::Align::Left, crate::ui::Align::Left],
+            1,
+        );
         for (key, value, status) in checks {
-            print_check(key, value, *status);
+            table.push(crate::ui::Row::new(
+                match status {
+                    Status::Pass => Mark::Did,
+                    Status::Warn => Mark::Warn,
+                    Status::Fail => Mark::Blocked,
+                },
+                [key.clone(), value.clone()],
+            ));
         }
+        table.print(&palette);
     }
 
     println!();
@@ -146,13 +156,13 @@ fn check_config(path: &Path, origin: startup::Origin) -> Vec<(String, String, St
         return if origin == startup::Origin::Default {
             vec![(
                 "config".into(),
-                format!("none at {} — running on defaults", path.display()),
+                format!("none at {} — running on defaults", crate::ui::short_path(path)),
                 Status::Warn,
             )]
         } else {
             vec![(
                 "config".into(),
-                format!("{} does not exist ({})", path.display(), origin.describe()),
+                format!("{} does not exist ({})", crate::ui::short_path(path), origin.describe()),
                 Status::Fail,
             )]
         };
@@ -160,20 +170,20 @@ fn check_config(path: &Path, origin: startup::Origin) -> Vec<(String, String, St
 
     let combined = match crate::derive::read_config_file(path) {
         Ok(c) => c,
-        Err(e) => return vec![("config".into(), format!("{}: {e}", path.display()), Status::Fail)],
+        Err(e) => return vec![("config".into(), format!("{}: {e}", crate::ui::short_path(path)), Status::Fail)],
     };
     let worker = match crate::derive::derive_standalone(&combined) {
         Ok((_controller, _gateway, worker)) => worker,
         // `{:#}` so the chain reaches the line and column, which is the whole
         // value of being told the config is bad.
         Err(e) => {
-            return vec![("config".into(), format!("{}: {e:#}", path.display()), Status::Fail)];
+            return vec![("config".into(), format!("{}: {e:#}", crate::ui::short_path(path)), Status::Fail)];
         }
     };
 
     let mut out = vec![(
         "config".into(),
-        format!("{} parses", path.display()),
+        format!("{} parses", crate::ui::short_path(path)),
         Status::Pass,
     )];
     // The check the old `pie check` could not make and `pie smoke` made in
