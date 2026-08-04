@@ -16,10 +16,8 @@ use template::default_config_content;
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
-    /// Print which config file pie would use, and why that one.
-    Path,
-
-    /// Print the config, or one value from it by dot-path.
+    /// Print the config, or one value from it by dot-path. Says which file
+    /// it read, and says so too when there is not one.
     Show {
         /// Dot-path key (e.g. `server.port`). Omit for the whole file.
         key: Option<String>,
@@ -48,7 +46,6 @@ pub enum ConfigCmd {
 
 pub fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
     match cmd {
-        ConfigCmd::Path => path(global),
         ConfigCmd::Show { key } => show(global, key),
         ConfigCmd::Set { key, value } => set(global, key, value),
         ConfigCmd::Unset { key } => unset(global, key),
@@ -60,14 +57,6 @@ pub fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
 /// would, flag and env included.
 fn config_path(global: &startup::GlobalArgs) -> PathBuf {
     startup::cli_config_path(global).0
-}
-
-fn path(global: &startup::GlobalArgs) -> Result<()> {
-    let (path, origin) = startup::cli_config_path(global);
-    let state = if path.exists() { "" } else { " (does not exist)" };
-    println!("{}{state}", path.display());
-    println!("  from {}", origin.describe());
-    Ok(())
 }
 
 fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
@@ -90,9 +79,29 @@ fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
 }
 
 fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
-    let cfg_path = config_path(global);
+    let (cfg_path, origin) = startup::cli_config_path(global);
     if !cfg_path.exists() {
-        bail!("config file not found at {cfg_path:?} (run `pie config init`)");
+        // Absence means opposite things depending on how we got here, and
+        // this is the one moment where "which file would you use?" is worth
+        // asking -- which is why there is no separate `pie config path`.
+        //
+        // On the default path it is not an error: `Origin::Default` says
+        // outright that an absent file is normal and the engine falls back to
+        // its own defaults, so failing here reported something untrue. Named
+        // explicitly it is the opposite -- the engine treats a missing named
+        // file as fatal, so saying "running on defaults" would be the untrue
+        // one.
+        if origin == startup::Origin::Default {
+            println!("no config file at {}", cfg_path.display());
+            println!("  looked there because of {}", origin.describe());
+            println!("  pie is running on built-in defaults; `pie config init` writes them out");
+            return Ok(());
+        }
+        bail!(
+            "no config file at {} ({}); pie will not start without it",
+            cfg_path.display(),
+            origin.describe()
+        );
     }
     let content =
         std::fs::read_to_string(&cfg_path).map_err(|e| anyhow!("read {cfg_path:?}: {e}"))?;
@@ -121,6 +130,12 @@ fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
         let dim = "\x1b[2m";
         let reset = "\x1b[0m";
         println!("{dim}── {display} ──{reset}");
+        // Only when something redirected us. On the default path the origin is
+        // the answer to a question nobody asked; on the other two it is the
+        // answer to "why am I not seeing my edits?".
+        if origin != startup::Origin::Default {
+            println!("{dim}   from {}{reset}", origin.describe());
+        }
         for line in content.lines() {
             println!("{}", colorize_toml_line(line));
         }
