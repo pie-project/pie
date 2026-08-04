@@ -2257,3 +2257,24 @@ decode-kernel deployment and on a force_prefill one, at D=64
 adapter scale, under a real mask policy, and byte-neutrally against
 every pre-campaign oracle. The north star's claims, as directed,
 are now measurements.
+
+## THE REVIEW'S #1 GAP, FIRST NUMBER (2026-08-04): composition at scale
+
+The review's decisive critique — the big number (31.88x, one axis)
+and the new claim (1.18x, four axes) lived in different experiments —
+answered with the scaled product battery (bench_product_scaled.py:
+N lanes PER AXIS, geometry-driven):
+
+  Mistral-7B, R=16 (4 masked + 4 lora + 4 draft + 4 plain), 128 tok:
+    composed (default) . ~4.9s/round
+    solo regime        . ~17.9s/round
+    -> 3.66x FOR FOUR-AXIS COMPOSITION ITSELF, at 7B.
+
+Not launch-bound, not single-axis: the four-axis fabric is worth
+3.66x on a model where weights dominate. AND the scale probe paid
+twice: at 8 masked lanes/axis (R=32) the composed path hits the same
+NON-MONOTONE-kvpp planner fault the demoted A/B exposed (here as a
+placeholder underflow, kv_indptr = -671086915) — the wire-merge kvpp
+audit is now blocking BOTH the R=32 headline and the
+declined-deployment 2-way paths. Fix that, then rerun 8/axis and
+14B.
