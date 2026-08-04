@@ -25,7 +25,7 @@
 //! `compile_profile` (`runtime/tokenizer/src/loader/huggingface.rs`) only accepts the *explicit*
 //! byte-level layout — a `Sequence` of `Split(Regex, Isolated)` + `ByteLevel{use_regex:false}` — not
 //! the classic GPT-2 bare `ByteLevel{use_regex:true}`; and `has_all_byte_atoms` requires all **256**
-//! byte atoms, not just ASCII. `[worker.model.driver.options] vocab_size` must agree, or the
+//! byte atoms, not just ASCII. ``[driver] vocab_size`` must agree, or the
 //! registry rejects the `logits` intrinsic at bind time.
 
 use std::path::PathBuf;
@@ -40,7 +40,7 @@ use pie_client::client::Client;
 
 /// The one standalone TOML (`[controller]`/`[gateway]`/`[worker]` sections); `derive_standalone`
 /// splits + hands each section to its role lib's `Config::parse`. The client edge binds
-/// `[worker.server] host:port`, so the test asks for an ephemeral port there — `port = 0` — else two
+/// `[server] host:port`, so the test asks for an ephemeral port there — `port = 0` — else two
 /// concurrent tests collide on 8080. It used to ask via `[gateway] listen`, which is what actually
 /// bound before `[server] host` was wired to it; that there were two spellings is why one of them was
 /// silently winning. `worker_listen` is already forced ephemeral by compose. The worker runs the always-linked **dummy** driver against a local snapshot (no GPU, no
@@ -50,22 +50,17 @@ use pie_client::client::Client;
 /// engine-owned model profile metadata).
 fn standalone_toml(snapshot: &str) -> String {
     format!(
-        "[controller]\n\
-         \n\
-         [worker]\n\
-         \n\
-         [worker.server]\n\
+        "         [server]\n\
          port = 0\n\
          \n\
-         [worker.model]\n\
+         [model]\n\
          name = \"smoke\"\n\
          hf_repo = \"{snapshot}\"\n\
          \n\
-         [worker.model.driver]\n\
+         [driver]\n\
          type = \"dummy\"\n\
          device = [\"cpu\"]\n\
          \n\
-         [worker.model.driver.options]\n\
          vocab_size = 256\n\
          arch_name = \"qwen3\"\n"
     )

@@ -18,7 +18,7 @@ use template::default_config_content;
 pub enum ConfigCmd {
     /// Every key: what it is worth now, and what it means.
     List {
-        /// Show only keys under this prefix, e.g. `worker.runtime`.
+        /// Show only keys under this prefix, e.g. `sandbox`.
         prefix: Option<String>,
         /// Emit one JSON document instead of the table.
         #[arg(long)]
@@ -49,6 +49,13 @@ pub enum ConfigCmd {
     /// Open the config in `$EDITOR`, and refuse to save something invalid.
     Edit,
 
+    /// Rewrite a pre-2026-08 config into the current section layout.
+    Migrate {
+        /// Print what would change without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Write a default config file. Refuses to overwrite unless `--force`.
     Init {
         #[arg(long)]
@@ -63,6 +70,7 @@ pub fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
         ConfigCmd::Set { key, value } => set(global, key, value),
         ConfigCmd::Unset { key } => unset(global, key),
         ConfigCmd::Edit => edit(global),
+        ConfigCmd::Migrate { dry_run } => migrate(global, dry_run),
         ConfigCmd::Init { force } => init(global, force),
     }
 }
@@ -112,7 +120,7 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
     };
 
     // Which driver the config asks for decides which option keys exist at all.
-    let driver = pie_worker::config_schema::lookup(&file, "worker.model.driver.type")
+    let driver = pie_worker::config_schema::lookup(&file, "driver.type")
         .and_then(|v| v.as_str())
         .and_then(|s| match s {
             "cuda_native" | "cuda" => Some(pie_worker::config::DriverKind::CudaNative),
@@ -542,6 +550,62 @@ fn edit(global: &startup::GlobalArgs) -> Result<()> {
     Ok(())
 }
 
+/// `pie config migrate` -- move an old file into the current layout.
+///
+/// Every move is printed, and `[runtime]` is why. The section kept its name
+/// and lost all its keys: batching lives there now, and what used to be there
+/// went to `[sandbox]` and `[server]`. A migration that only said "done" would
+/// leave someone looking at a `[runtime]` that parses and wondering where
+/// `allow_network` went.
+fn migrate(global: &startup::GlobalArgs, dry_run: bool) -> Result<()> {
+    let (cfg_path, _) = startup::cli_config_path(global);
+    let content = std::fs::read_to_string(&cfg_path)
+        .map_err(|e| anyhow!("read {}: {e}", crate::ui::short_path(&cfg_path)))?;
+    let old: toml::Value = toml::from_str(&content)
+        .map_err(|e| anyhow!("parse {}: {e}", crate::ui::short_path(&cfg_path)))?;
+
+    let (migrated, moves) = pie_worker::config_layout::migrate_document(&old)?;
+    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
+    if moves.is_empty() {
+        println!("already in the current layout");
+        return Ok(());
+    }
+    let mut table = crate::ui::Table::new(
+        [crate::ui::Align::Left, crate::ui::Align::Left, crate::ui::Align::Left],
+        2,
+    );
+    for (from, to) in &moves {
+        table.push(crate::ui::Row::new(
+            crate::ui::Mark::Plain,
+            [from.clone(), "→".to_string(), to.clone()],
+        ));
+    }
+    table.print(&palette);
+
+    let rendered = toml::to_string_pretty(&migrated)
+        .map_err(|e| anyhow!("serialize migrated config: {e}"))?;
+    // Validated before it is written, for the same reason `edit` validates: a
+    // migration that produces an unparseable file has replaced a config the
+    // operator could fix with one they cannot read.
+    crate::derive::derive_standalone(&rendered).context("the migrated config does not parse")?;
+
+    if dry_run {
+        println!("\n{}(dry run; nothing written){}", palette.dim(), palette.reset());
+        return Ok(());
+    }
+    let backup = cfg_path.with_extension("toml.pre-migrate");
+    std::fs::copy(&cfg_path, &backup).map_err(|e| anyhow!("back up to {backup:?}: {e}"))?;
+    std::fs::write(&cfg_path, rendered).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
+    println!(
+        "\n{} migrated {} ({} moved); previous file kept at {}",
+        crate::ui::Mark::Did.render(&palette),
+        crate::ui::short_path(&cfg_path),
+        moves.len(),
+        crate::ui::short_path(&backup)
+    );
+    Ok(())
+}
+
 fn unset(global: &startup::GlobalArgs, key: String) -> Result<()> {
     let cfg_path = config_path(global);
     if !cfg_path.exists() {
@@ -645,7 +709,7 @@ mod tests {
     #[test]
     fn effective_distinguishes_set_from_default_from_derived_from_required() {
         use pie_worker::config_schema::Field;
-        let file: toml::Value = toml::from_str("[worker.server]\nport = 9090\n").unwrap();
+        let file: toml::Value = toml::from_str("[server]\nport = 9090\n").unwrap();
         let field = |key: &str, default: Option<toml::Value>, required: bool| Field {
             key: key.to_string(),
             doc: String::new(),
@@ -654,20 +718,20 @@ mod tests {
         };
         // The file wins over the default.
         assert_eq!(
-            effective(&file, &field("worker.server.port", Some(toml::Value::Integer(8080)), false)),
+            effective(&file, &field("server.port", Some(toml::Value::Integer(8080)), false)),
             "9090"
         );
         assert_eq!(
-            effective(&file, &field("worker.server.host", Some("127.0.0.1".into()), false)),
+            effective(&file, &field("server.host", Some("127.0.0.1".into()), false)),
             "127.0.0.1"
         );
         // Two ways to have no value, and they are opposite advice: one says
         // pie works it out, the other says you must.
         assert_eq!(
-            effective(&file, &field("worker.server.max_concurrent_processes", None, false)),
+            effective(&file, &field("runtime.max_concurrent_processes", None, false)),
             "(derived)"
         );
-        assert_eq!(effective(&file, &field("worker.model.name", None, true)), "(must be set)");
+        assert_eq!(effective(&file, &field("model.name", None, true)), "(must be set)");
     }
 
     #[test]
@@ -746,15 +810,13 @@ hf_repo = "Qwen/Qwen3-0.6B"
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         let original = r#"
-[worker.model]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
-[worker.model.driver]
+[driver]
 type = "dummy"
 device = ["cpu"]
-
-[worker.model.driver.options]
 vocab_size = 151936
 arch_name = "qwen3"
 "#;
@@ -762,7 +824,7 @@ arch_name = "qwen3"
 
         let err = format!(
             "{:#}",
-            typed_by_schema(original, "worker.runtime.worker_threads", "0").unwrap_err()
+            typed_by_schema(original, "server.worker_threads", "0").unwrap_err()
         );
         assert!(err.contains("worker_threads"), "got: {err}");
         // Nothing is written when nothing validates.
@@ -773,22 +835,16 @@ arch_name = "qwen3"
     /// test drives `typed_by_schema` against it.
     fn fixture() -> &'static str {
         r#"
-[controller]
-
-[gateway]
-
-[worker.server]
+[server]
 port = 8080
 
-[worker.model]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
-[worker.model.driver]
+[driver]
 type = "dummy"
 device = ["cpu"]
-
-[worker.model.driver.options]
 vocab_size = 151936
 arch_name = "qwen3"
 "#
@@ -798,27 +854,27 @@ arch_name = "qwen3"
     fn a_numeric_literal_into_a_string_field_stays_a_string() {
         // The old shape guessed from the literal and stored the integer 3 into
         // a String field. The schema is the arbiter now.
-        let (_, chosen) = typed_by_schema(fixture(), "worker.model.name", "3").unwrap();
+        let (_, chosen) = typed_by_schema(fixture(), "model.name", "3").unwrap();
         assert_eq!(chosen, toml::Value::String("3".into()));
     }
 
     #[test]
     fn a_numeric_literal_into_a_numeric_field_stays_a_number() {
-        let (_, chosen) = typed_by_schema(fixture(), "worker.server.port", "9000").unwrap();
+        let (_, chosen) = typed_by_schema(fixture(), "server.port", "9000").unwrap();
         assert_eq!(chosen, toml::Value::Integer(9000));
     }
 
     #[test]
     fn a_unit_bearing_duration_is_accepted_and_a_bare_number_is_not() {
         let (_, chosen) =
-            typed_by_schema(fixture(), "worker.model.scheduler.request_timeout", "90s").unwrap();
+            typed_by_schema(fixture(), "runtime.request_timeout", "90s").unwrap();
         assert_eq!(chosen, toml::Value::String("90s".into()));
 
         // No candidate validates: integer 120 is not a string, and "120" has
         // no unit. The error should talk about the unit, not about types.
         let err = format!(
             "{:#}",
-            typed_by_schema(fixture(), "worker.model.scheduler.request_timeout", "120")
+            typed_by_schema(fixture(), "runtime.request_timeout", "120")
                 .unwrap_err()
         );
         assert!(err.contains("unit"), "got: {err}");
@@ -835,10 +891,10 @@ arch_name = "qwen3"
     #[test]
     fn remove_nested_reports_whether_anything_was_there() {
         let mut root: toml::Value = toml::from_str(fixture()).unwrap();
-        assert!(remove_nested(&mut root, "worker.server.port").unwrap());
-        assert!(!remove_nested(&mut root, "worker.server.port").unwrap());
-        assert!(!remove_nested(&mut root, "worker.nothing.here").unwrap());
-        assert!(get_nested(&root, "worker.server.port").is_none());
-        assert!(get_nested(&root, "worker.model.name").is_some());
+        assert!(remove_nested(&mut root, "server.port").unwrap());
+        assert!(!remove_nested(&mut root, "server.port").unwrap());
+        assert!(!remove_nested(&mut root, "nothing.here").unwrap());
+        assert!(get_nested(&root, "server.port").is_none());
+        assert!(get_nested(&root, "model.name").is_some());
     }
 }

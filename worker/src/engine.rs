@@ -1101,11 +1101,9 @@ mod tests {
             name = "test"
             hf_repo = "local"
 
-            [model.driver]
+            [driver]
             type = "dummy"
             device = ["cpu"]
-
-            [model.driver.options]
             vocab_size = 32
             arch_name = "dummy"
             "#,

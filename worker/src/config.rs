@@ -50,7 +50,26 @@ impl Config {
     /// IO, no env, no clap — sourcing the string (file locate/read + env merge)
     /// is the bin layer's job (Seam 2). The role lib owns only the
     /// domain parse + validation.
+    /// Parse the operator's file.
+    ///
+    /// The file's sections are not this struct's fields -- see
+    /// [`crate::config_layout`] for why and for the mapping. Reshaping first
+    /// means everything below still sees the shape it was written against, and
+    /// the driver options still land in a `deny_unknown_fields` struct.
     pub fn parse(s: &str) -> Result<Self> {
+        let file: toml::Table = toml::from_str(s).map_err(|e| {
+            if s.contains("[[model]]") {
+                anyhow::anyhow!(
+                    "parse config: {e}\n\
+                     hint: pie serves exactly one model — use a single `[model]` table, \
+                     not a `[[model]]` list."
+                )
+            } else {
+                anyhow::anyhow!("parse config: {e}")
+            }
+        })?;
+        let reshaped = crate::config_layout::reshape(file)?;
+        let s = &toml::to_string(&reshaped).map_err(|e| anyhow::anyhow!("reshape config: {e}"))?;
         let cfg: Config = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
                 anyhow::anyhow!(
@@ -1746,10 +1765,9 @@ device = "cuda:0"
 [model]
 name = "a"
 hf_repo = "x"
-[model.driver]
+[driver]
 type = "cuda_native"
 device = ["cuda:0"]
-[model.driver.options]
 total_pages = 512
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
@@ -1768,10 +1786,9 @@ total_pages = 512
 [model]
 name = "a"
 hf_repo = "x"
-[model.driver]
+[driver]
 type = "metal"
 device = ["metal:0"]
-[model.driver.options]
 binary_path = "/opt/pie/driver"
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
@@ -1797,9 +1814,9 @@ enabled = true
 [model]
 name = "a"
 hf_repo = "x"
-[model.driver]
+[driver]
 type = "metal"
-device = ["cuda:0"]
+device = ["metal:0"]
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
         assert!(err.contains("auth"), "got: {err}");
