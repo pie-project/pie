@@ -39,7 +39,7 @@ pub fn run(cmd: CacheCmd) -> Result<()> {
 }
 
 fn list(json: bool) -> Result<()> {
-    let entries = state::entries();
+    let entries = state::entries(Some(hf_hub::resolve_cache_dir()));
     let home = pie_worker::paths::pie_home();
 
     // Measured once and reused: the size is what decides whether a row is
@@ -145,7 +145,7 @@ fn list(json: bool) -> Result<()> {
 /// flag that sweeps them in -- a single character should not stand between a
 /// person and deleting weight-sized artifacts.
 fn selected(names: &[String]) -> Result<Vec<state::Entry>> {
-    let all = state::entries();
+    let all = state::entries(Some(hf_hub::resolve_cache_dir()));
     if names.is_empty() {
         return Ok(all
             .into_iter()
@@ -242,7 +242,7 @@ mod tests {
         assert!(chosen.iter().all(|e| e.reclaim == Reclaim::Safe));
         // The expensive ones are reachable only by name. This is the whole
         // reason there is no --all.
-        assert!(chosen.iter().all(|e| e.name != "optimized"));
+        assert!(chosen.iter().all(|e| e.name != "models"));
     }
 
     #[test]
@@ -260,9 +260,24 @@ mod tests {
 
     #[test]
     fn naming_an_on_request_entry_selects_it() {
-        let chosen = selected(&["optimized".to_string()]).unwrap();
+        // `models` is the artifact store: reclaimable, but a re-download and a
+        // re-convert rather than a reload, which is why it takes naming.
+        let chosen = selected(&["models".to_string()]).unwrap();
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].reclaim, Reclaim::OnRequest);
+    }
+
+    #[test]
+    fn the_store_and_the_weight_cache_are_different_entries() {
+        // They shared `$PIE_HOME/models` until the artifact store took it: the
+        // store scans for `.zt` and silently ignored the `.weights` files
+        // beside them, while `pie cache` reported their size under the store's
+        // name. Different directories, different reclaim grades.
+        let all = state::entries(None);
+        let by = |n: &str| all.iter().find(|e| e.name == n).unwrap_or_else(|| panic!("no {n}"));
+        assert_ne!(by("models").path, by("weights").path);
+        assert_eq!(by("models").reclaim, Reclaim::OnRequest);
+        assert_eq!(by("weights").reclaim, Reclaim::Safe);
     }
 
     #[test]

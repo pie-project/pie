@@ -19,7 +19,20 @@ use crate::ops::hf::runtime_snapshot_allow_patterns;
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
     /// List the artifacts pie can serve, and any raw snapshots beside them.
-    List,
+    List {
+        /// Emit one JSON document instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show what pie knows about one stored artifact.
+    Info {
+        /// The store name, as `pie model list` prints it.
+        name: String,
+        /// Emit one JSON document instead of the report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Fetch a model by HuggingFace repo ID and convert it to a `.zt` artifact.
     Download {
         repo_id: String,
@@ -60,7 +73,8 @@ pub enum ModelCmd {
 
 pub fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
-        ModelCmd::List => list(),
+        ModelCmd::List { json } => list(json),
+        ModelCmd::Info { name, json } => info(name, json),
         ModelCmd::Download {
             repo_id,
             all,
@@ -168,7 +182,25 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
 // list
 // -----------------------------------------------------------------------------
 
-fn list() -> Result<()> {
+fn list(json: bool) -> Result<()> {
+    if json {
+        let artifacts = crate::ops::store::entries()?;
+        return crate::ui::emit_json(&serde_json::json!({
+            "store": crate::ops::store::dir(),
+            "artifacts": artifacts
+                .iter()
+                .map(|e| serde_json::json!({
+                    "name": e.name,
+                    "root": e.root,
+                    "shards": e.shards(),
+                    "bytes": e.bytes,
+                    "tensors": e.tensors,
+                    "written_by": e.written_by,
+                    "source": e.source,
+                }))
+                .collect::<Vec<_>>(),
+        }));
+    }
     let colorize = std::io::stdout().is_terminal();
     let (green, dim, reset) = if colorize {
         ("\x1b[32m", "\x1b[2m", "\x1b[0m")
@@ -241,6 +273,64 @@ fn list() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// `pie model info <name>` — one artifact, in detail.
+///
+/// About a STORE ENTRY, not a HuggingFace repo. The earlier version of this
+/// opened `models--org--name/snapshots/*/config.json` and reported an
+/// architecture, which stopped being the right question when the artifact
+/// became the thing pie serves: a repo is one way an artifact got here, and
+/// `source` below is where that is recorded.
+fn info(name: String, json: bool) -> Result<()> {
+    let Some(entry) = crate::ops::store::find(&name)? else {
+        bail!(
+            "no artifact {name:?} in the store; `pie model list` shows what is there"
+        );
+    };
+    if json {
+        return crate::ui::emit_json(&serde_json::json!({
+            "name": entry.name,
+            "root": entry.root,
+            "files": entry.files,
+            "shards": entry.shards(),
+            "bytes": entry.bytes,
+            "tensors": entry.tensors,
+            "written_by": entry.written_by,
+            "source": entry.source,
+        }));
+    }
+
+    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
+    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
+    println!("{bold}{}{reset}", entry.name);
+    let mut table =
+        crate::ui::Table::new([crate::ui::Align::Left, crate::ui::Align::Left], 1);
+    let mut row = |k: &str, v: String| {
+        table.push(crate::ui::Row::new(
+            crate::ui::Mark::Plain,
+            [k.to_string(), v],
+        ))
+    };
+    row("size", crate::ui::bytes(entry.bytes));
+    row("tensors", entry.tensors.to_string());
+    row(
+        "files",
+        match entry.shards() {
+            0 => "one".to_string(),
+            n => format!("root + {n} shards"),
+        },
+    );
+    if let Some(source) = &entry.source {
+        row("source", source.clone());
+    }
+    if let Some(written_by) = &entry.written_by {
+        row("written by", format!("pie {written_by}"));
+    }
+    row("path", crate::ui::short_path(&entry.root));
+    table.print(&palette);
+    println!("\n{dim}[model]\nmodel = \"{}\"{reset}", entry.name);
     Ok(())
 }
 

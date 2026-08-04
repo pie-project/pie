@@ -659,8 +659,11 @@ pub struct ModelConfig {
     /// Per-model rather than process-global because the artifact IS the model:
     /// it is that checkpoint's weights, already laid out for this driver, and
     /// none of it is shared with another model. Empty derives
-    /// `$PIE_HOME/models`, where the rest of pie's per-model state already
-    /// lives (cf. `$PIE_HOME/optimized`).
+    /// `$PIE_HOME/cache/weights` -- a cache, beside the driver's other ones.
+    /// NOT `$PIE_HOME/models`, which is the `.zt` artifact store: an artifact
+    /// is portable and costs a re-download to replace, while these are device
+    /// bytes for one driver, one TP layout and one ABI version, rebuilt by a
+    /// single cold load.
     ///
     /// The artifacts are the size of the weights -- tens to hundreds of GB --
     /// which is why this is a path pie cannot always pick for you. The driver
@@ -689,7 +692,7 @@ impl ModelConfig {
             self.weight_cache_dir.is_empty()
                 || Path::new(&self.weight_cache_dir).is_absolute(),
             "model.weight_cache_dir must be an absolute path (got {:?}); \
-             leave it empty for $PIE_HOME/models",
+             leave it empty for $PIE_HOME/cache/weights",
             self.weight_cache_dir
         );
         Ok(())
@@ -1540,7 +1543,8 @@ device = ["cpu"]
     fn weight_cache_dir_defaults_to_derived() {
         let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
-        // Empty means "derive $PIE_HOME/models" at the worker layer, not "off":
+        // Empty means "derive $PIE_HOME/cache/weights" at the worker layer,
+        // not "off":
         // the driver only sees off when it is handed nothing at all.
         assert_eq!(cfg.model.weight_cache_dir, "");
     }

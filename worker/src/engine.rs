@@ -513,7 +513,16 @@ fn load_model_drivers(
     // TOML is written. `$PIE_HOME` is this layer's to know: the driver has
     // never been told it, which is why the old env-var form fell back to XDG.
     let weight_cache_dir = if user_cfg.model.weight_cache_dir.is_empty() {
-        crate::paths::pie_home().join("models").to_string_lossy().into_owned()
+        // Under `cache/`, not `models/`. `models/` is the artifact store now,
+        // and these are the opposite kind of thing: device bytes for one
+        // driver, one TP layout and one ABI version, rebuilt by a single cold
+        // load. Sharing a directory left `.weights` files sitting in a store
+        // that scans for `.zt` and silently ignored them, while `pie cache`
+        // reported their size under the store's name.
+        crate::state::driver_cache_dir()
+            .join("weights")
+            .to_string_lossy()
+            .into_owned()
     } else {
         user_cfg.model.weight_cache_dir.clone()
     };

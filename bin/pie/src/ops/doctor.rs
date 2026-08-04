@@ -186,6 +186,27 @@ fn check_config(path: &Path, origin: startup::Origin) -> Vec<(String, String, St
         format!("{} parses", crate::ui::short_path(path)),
         Status::Pass,
     )];
+    // A parsing config that names a model pie cannot find is the next thing
+    // that stops a boot, and the check `pie check` could never make: the
+    // artifact store is on this disk, not in the file. `weights::resolve` is
+    // the same call the worker makes, so a pass here means the worker's will
+    // pass too.
+    match pie_worker::weights::resolve(&worker.model.model) {
+        Ok(resolved) => out.push((
+            "weights".into(),
+            match resolved {
+                pie_worker::weights::Model::Artifact(path) => {
+                    format!("artifact {}", crate::ui::short_path(&path))
+                }
+                pie_worker::weights::Model::Snapshot(path) => format!(
+                    "raw snapshot {} — `pie model convert` makes an artifact",
+                    crate::ui::short_path(&path)
+                ),
+            },
+            Status::Pass,
+        )),
+        Err(error) => out.push(("weights".into(), format!("{error}"), Status::Fail)),
+    }
     // The check the old `pie check` could not make and `pie smoke` made in
     // isolation: the config names a driver, and this binary either has it or
     // does not.
@@ -223,24 +244,7 @@ enum Status {
     Fail,
 }
 
-fn print_check(key: &str, value: &str, status: Status) {
-    let palette = Palette::for_stream(Stream::Stdout);
-    let mark = match status {
-        Status::Pass => Mark::Did,
-        Status::Warn => Mark::Warn,
-        Status::Fail => Mark::Blocked,
-    };
-    println!("  {} {:<20} {}", mark.render(&palette), key, value);
-}
 
-/// Only ever called for checks that cannot fail; the config section counts
-/// its own, because it is the only one that can block.
-fn tally(s: Status, passes: &mut usize, warnings: &mut usize) {
-    match s {
-        Status::Pass => *passes += 1,
-        Status::Warn | Status::Fail => *warnings += 1,
-    }
-}
 
 fn check_platform() -> (String, String, Status) {
     let info = format!(
