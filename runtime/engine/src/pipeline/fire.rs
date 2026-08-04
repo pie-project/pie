@@ -54,6 +54,14 @@ use pie_ir::container::HostRole;
 pub struct PendingFireQueue {
     queue: Mutex<VecDeque<PendingOp>>,
     finalizer: Arc<tokio::sync::Mutex<()>>,
+    /// Continuation-wave promise ledger: frame seqs the engine emitted ahead
+    /// that the guest has NOT yet matched with a call (emission pushes,
+    /// absorb pops front). Only these frames are eviction-cancellable — an
+    /// ABSORBED frame is one the guest believes it submitted and will
+    /// `take()` results for; cancelling it starves that take forever (the
+    /// debt only corrects future SUBMIT decisions, and a guest blocked in
+    /// take never submits again — measured as 150 s timeouts on churn/fwd1).
+    unabsorbed: Mutex<VecDeque<u64>>,
 }
 
 impl PendingFireQueue {
@@ -65,7 +73,25 @@ impl PendingFireQueue {
         Self {
             queue: Mutex::new(queue),
             finalizer: Arc::new(tokio::sync::Mutex::new(())),
+            unabsorbed: Mutex::new(VecDeque::new()),
         }
+    }
+
+    pub(crate) fn push_unabsorbed(&self, seq: u64) {
+        self.unabsorbed.lock().unwrap().push_back(seq);
+    }
+
+    /// The guest's call matched the oldest outstanding emission.
+    pub(crate) fn absorb_unabsorbed(&self) {
+        self.unabsorbed.lock().unwrap().pop_front();
+    }
+
+    pub(crate) fn unabsorbed_seqs(&self) -> std::collections::HashSet<u64> {
+        self.unabsorbed.lock().unwrap().iter().copied().collect()
+    }
+
+    pub(crate) fn remove_unabsorbed(&self, seq: u64) {
+        self.unabsorbed.lock().unwrap().retain(|&queued| queued != seq);
     }
 
     pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, VecDeque<PendingOp>>> {
@@ -813,6 +839,11 @@ enum FinalizeAction {
         fwd_rep: u32,
         instance_id: u64,
     },
+    /// Eviction-cancelled device-geometry fire: reclaim the pending grant
+    /// (the leased fresh pages were never written) without failing the pass.
+    ReclaimPendingDeviceGrant {
+        fwd_rep: u32,
+    },
 }
 
 pub(crate) struct FinalizeOutcome {
@@ -886,6 +917,19 @@ pub struct PendingFire {
     instance_id: u64,
     cells: BoundCells,
     failure: PipelineFailure,
+    /// Engine-emitted continuation (`PIE_CONT_WAVE`): eligible for the
+    /// eviction cancel sweep while still queued at the scheduler.
+    /// Guest-real fires are never cancelled.
+    synthetic: bool,
+    /// The frame seq this fire belongs to (None for unstamped submits) —
+    /// the cancel sweep counts DISTINCT cancelled frames for the credit
+    /// debt, and a frame's fires always cancel together.
+    frame_seq: Option<u64>,
+    /// The committed device-ticket values (per bound cell, reservation
+    /// order), kept so a CANCELLED op can LIFO-rewind its channel cursors.
+    /// The device never saw these positions — a queued fire transmits
+    /// nothing — so the host rewind is complete reconciliation.
+    tickets: (Vec<u64>, Vec<u64>),
 }
 
 fn prepare_bound_rs<C: FireContext>(
@@ -1092,6 +1136,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
     this: Resource<Pipeline>,
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
+    synthetic: bool,
 ) -> Anyhow<Result<(), String>> {
     {
         // Device-geometry pass (Track B): the [B,P] geometry is
@@ -1102,7 +1147,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // branch).
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
             let metered = crate::scheduler::phase_start();
-            let out = fire_device_geometry(ctx, this, fwd, frame).await;
+            let out = fire_device_geometry(ctx, this, fwd, frame, synthetic).await;
             crate::scheduler::cpu_phase_add(
                 crate::scheduler::CpuPhase::DeviceGeometrySubmit,
                 metered,
@@ -1449,6 +1494,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // launch-ready work.
         let ticket_reservation = TicketReservation::new(&cells, &accesses);
         ticket_reservation.apply_to(&mut req);
+        let tickets = (
+            ticket_reservation.heads.clone(),
+            ticket_reservation.tails.clone(),
+        );
         let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
             &scheduler,
             req,
@@ -1500,6 +1549,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 instance_id,
                 cells,
                 failure: pipeline_failure,
+                synthetic,
+                frame_seq: frame.map(|stamp| stamp.seq),
+                tickets,
             }));
         Ok(Ok(()))
     }
@@ -1546,7 +1598,7 @@ pub async fn submit_frame<C: FireContext>(
     }
     if k == 1 {
         let (_, rep) = fired[0];
-        return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None).await;
+        return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None, false).await;
     }
     if let Err(error) = validate_frame(ctx, k, &fired)? {
         return Ok(Err(error));
@@ -1564,18 +1616,33 @@ pub async fn submit_frame<C: FireContext>(
     // ordinary cadence resumes. Design: .wiki/contention/continuation-waves.md
     if cont_wave_enabled() && frame_decode_eligible(ctx, &fired)? {
         let absorbed = {
+            // Apply any eviction-cancel debt BEFORE the absorb decision:
+            // cancelled continuations were the newest emissions, and the
+            // guest resubmits oldest-first, so a plain credit decrement
+            // keeps absorb/real decisions exact in order.
+            let debt = crate::scheduler::cont_cancel_debt_take(ctx.process_id());
             let pipeline = ctx.resources().get(&this)?;
             use std::sync::atomic::Ordering;
+            for _ in 0..debt {
+                if pipeline.cont_credit.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                pipeline.cont_credit.fetch_sub(1, Ordering::AcqRel);
+            }
             if pipeline.cont_credit.load(Ordering::Acquire) > 0 {
                 pipeline.cont_credit.fetch_sub(1, Ordering::AcqRel);
+                // This call matches the oldest outstanding emission: it is
+                // now a frame the guest believes submitted, so the eviction
+                // cancel sweep must never touch it.
+                pipeline.fires.absorb_unabsorbed();
                 true
             } else {
                 false
             }
         };
         if !absorbed {
-            match submit_frame_slots(ctx, &this, &fired).await? {
-                Ok(()) => {}
+            match submit_frame_slots(ctx, &this, &fired, false).await? {
+                Ok(_) => {}
                 Err(error) => return Ok(Err(error)),
             }
         }
@@ -1609,13 +1676,17 @@ pub async fn submit_frame<C: FireContext>(
             0
         };
         for round in 0..emit {
-            match submit_frame_slots(ctx, &this, &fired).await? {
-                Ok(()) => {
+            match submit_frame_slots(ctx, &this, &fired, true).await? {
+                Ok(seq) => {
                     // Optimistic depth bump: the scheduler's arrival lands
                     // asynchronously, and without this a burst of guest
                     // submits would all see the stale pre-arrival depth.
                     depth_handle.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     let pipeline = ctx.resources().get(&this)?;
+                    // Promise ledger: this emission is unmatched until the
+                    // guest's call absorbs it — the window in which the
+                    // eviction cancel may unwind it.
+                    pipeline.fires.push_unabsorbed(seq);
                     pipeline
                         .cont_credit
                         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1646,7 +1717,9 @@ pub async fn submit_frame<C: FireContext>(
         }
         return Ok(Ok(()));
     }
-    submit_frame_slots(ctx, &this, &fired).await
+    Ok(submit_frame_slots(ctx, &this, &fired, false)
+        .await?
+        .map(|_seq| ()))
 }
 
 /// `PIE_CONT_WAVE=1`: continuation-wave mode (see `submit_frame`).
@@ -1685,7 +1758,8 @@ async fn submit_frame_slots<C: FireContext>(
     ctx: &mut C,
     this: &Resource<Pipeline>,
     fired: &[(u32, u32)],
-) -> Anyhow<Result<(), String>> {
+    synthetic: bool,
+) -> Anyhow<Result<u64, String>> {
     let (lane, seq) = {
         let pipeline = ctx.resources().get(this)?;
         if pipeline.scope.is_closed() {
@@ -1703,7 +1777,7 @@ async fn submit_frame_slots<C: FireContext>(
         };
         let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await;
+        let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp), synthetic).await;
         if !matches!(outcome, Ok(Ok(()))) && index > 0 {
             // Mid-frame failure: the fires already submitted stand and
             // execute as a truncated frame; tell the scheduler how many
@@ -1727,7 +1801,7 @@ async fn submit_frame_slots<C: FireContext>(
             Err(error) => return Err(error),
         }
     }
-    Ok(Ok(()))
+    Ok(Ok(seq))
 }
 
 /// `forward.park()`: leave the frame wait-set on `this` until it submits
@@ -2231,6 +2305,122 @@ pub async fn working_set_copy_into<C: FireContext>(
     .await
 }
 
+/// Eviction cancel (continuation-waves.md rule 5, S3): before the settle
+/// drain, request-cancel this pipeline's TAIL run of unsettled synthetic
+/// (engine-emitted) ops, let the scheduler drop the ones still queued, and
+/// unwind those — channel tickets rewound LIFO in the context that reserved
+/// them, KV txns aborted, leases dropped, no poison, no pass failure. Ops
+/// the scheduler had already posted resolve through the driver and settle
+/// normally in the drain that follows. Without this, a victim's queued
+/// continuation rides the NEXT wave and its lease extends quiescence by a
+/// full wave — the cont-mode eviction drag (park wait 2.41 → 4.56 ms
+/// measured on D/128).
+pub(crate) async fn cancel_synthetic_tail<C: FireContext>(
+    ctx: &mut C,
+    fires: &PendingFires,
+) -> Anyhow<()> {
+    if !cont_wave_enabled() {
+        return Ok(());
+    }
+    let _finalize_guard = fires.finalize_guard().await;
+    // 1. Mark the newest-first run of unsettled synthetic UNABSORBED ops.
+    //    Stop at the first op that is settled, non-synthetic, or already
+    //    absorbed (a frame the guest believes submitted — it will `take()`
+    //    those outputs, so it must execute). Absorb consumes oldest-first,
+    //    so the unabsorbed set is a suffix of the emissions and the marked
+    //    run stays a contiguous tail — which is what keeps the per-cell
+    //    ticket rewind LIFO-sound.
+    let unabsorbed = fires.unabsorbed_seqs();
+    let marked: Vec<crate::driver::WorkItemCompletion> = {
+        let queue = fires.lock().unwrap();
+        let mut marked = Vec::new();
+        for op in queue.iter().rev() {
+            let fire = match op {
+                PendingOp::Fire(fire) => fire,
+                #[cfg(test)]
+                PendingOp::TestStub => break,
+            };
+            if !fire.synthetic
+                || fire.completion.is_settled()
+                || !fire
+                    .frame_seq
+                    .is_some_and(|seq| unabsorbed.contains(&seq))
+            {
+                break;
+            }
+            fire.completion.request_evict_cancel();
+            marked.push(fire.completion.clone());
+        }
+        marked
+    };
+    if marked.is_empty() {
+        return Ok(());
+    }
+    // 2. The scheduler decides queued-vs-posted: it drops queued marked
+    //    items (resolving them Cancelled) and leaves posted ones to the
+    //    driver. Await every verdict.
+    crate::scheduler::worker::notify_cancel_sweep(ctx.process_id());
+    for completion in &marked {
+        let _ = completion.clone().await;
+    }
+    // 3. Extract the actually-cancelled ops (newest-first), rewind their
+    //    channel tickets in that order (LIFO per cell), and finalize each —
+    //    the Cancelled path aborts the KV txn, reclaims a device-geometry
+    //    fire's pending grant, and releases the lease the eviction's
+    //    quiescence waits on.
+    let mut cancelled: Vec<PendingOp> = Vec::new();
+    {
+        let mut queue = fires.lock().unwrap();
+        for index in (0..queue.len()).rev() {
+            let is_cancelled = match &queue[index] {
+                PendingOp::Fire(fire) => fire.completion.is_cancelled(),
+                #[cfg(test)]
+                PendingOp::TestStub => false,
+            };
+            if is_cancelled {
+                cancelled.push(queue.remove(index).expect("indexed op exists"));
+            }
+        }
+    }
+    let mut frames: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for op in &cancelled {
+        let fire = match op {
+            PendingOp::Fire(fire) => fire,
+            #[cfg(test)]
+            PendingOp::TestStub => continue,
+        };
+        for ((cell, &head), &tail) in fire
+            .cells
+            .iter()
+            .zip(&fire.tickets.0)
+            .zip(&fire.tickets.1)
+            .rev()
+        {
+            if !cell.lock().unwrap().rollback_device_ticket(head, tail) {
+                tracing::error!(
+                    "eviction cancel: ticket rollback lost LIFO ownership; \
+                     preserving newer reservations"
+                );
+            }
+        }
+        if let Some(seq) = fire.frame_seq {
+            frames.insert(seq);
+        }
+    }
+    // 4. The cancelled promises are withdrawn: the guest's matching calls
+    //    must now submit for real, so drop the ledger entries and bank the
+    //    credit debt for the fire path's next call (the guest's
+    //    delivered-ahead counter still counts the cancelled frames).
+    for &seq in &frames {
+        fires.remove_unabsorbed(seq);
+    }
+    crate::scheduler::cont_cancel_debt_add(ctx.process_id(), frames.len() as u64);
+    for op in cancelled {
+        finalize_op(ctx, op).await?;
+    }
+    Ok(())
+}
+
 /// Pop and finalize pipeline ops whose completions have already settled,
 /// without blocking (plan §6): submit and take/read entry call this so
 /// KV/RS transaction pins stay bounded by run-ahead depth while value
@@ -2333,6 +2523,10 @@ pub(crate) fn complete_finalize<C: FireContext>(ctx: &mut C, finalized: Finalize
             fwd_rep,
             instance_id,
         } => reclaim_device_geometry_grants(ctx, fwd_rep, instance_id),
+        FinalizeAction::ReclaimPendingDeviceGrant { fwd_rep } => {
+            let fwd: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
+            reclaim_pending_device_grant(ctx, &fwd);
+        }
     }
     drop(ws_guard);
 }
@@ -2359,7 +2553,8 @@ pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
                 *domain = Some(reason);
             }
         }
-        FinalizeAction::ReclaimDeviceGeometry { .. } => {
+        FinalizeAction::ReclaimDeviceGeometry { .. }
+        | FinalizeAction::ReclaimPendingDeviceGrant { .. } => {
             unreachable!("device-geometry fires require FireContext finalization")
         }
     }
@@ -2382,10 +2577,17 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         instance_id,
         cells,
         failure,
+        synthetic: _,
+        frame_seq: _,
+        tickets: _,
     } = fire;
     let device_geometry = matches!(&kv, FireKv::DeviceGeom { .. });
     let prior_failure = failure.lock().unwrap().clone();
-    let result = completion.await;
+    let result = completion.clone().await;
+    // Eviction cancel: the scheduler dropped this queued fire before it
+    // reached the driver. The await above resolved benignly; the KV txn
+    // must ABORT (nothing executed) and no failure may be recorded.
+    let cancelled = completion.is_cancelled();
     if crate::scheduler::fire_timing_enabled() {
         use std::sync::atomic::Ordering::Relaxed;
         let resolved = crate::scheduler::LAST_RESOLVE_US.load(Relaxed);
@@ -2397,7 +2599,7 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
             acc.resume_n.fetch_add(1, Relaxed);
         }
     }
-    let success = result.is_ok() && prior_failure.is_none();
+    let success = result.is_ok() && prior_failure.is_none() && !cancelled;
 
     let (kv_failure, rs_failure) = {
         let stores = crate::store::registry::get(model, driver);
@@ -2445,7 +2647,17 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         })
         .or(kv_failure)
         .or(rs_failure);
-    let action = if let Some(reason) = failure_reason {
+    let action = if cancelled {
+        // No poison, no pass failure: the guest resubmits this frame for
+        // real post-restore. A device-geometry fire's pending grant is
+        // reclaimed exactly as on a failed submit — the fresh pages were
+        // never written.
+        if device_geometry {
+            FinalizeAction::ReclaimPendingDeviceGrant { fwd_rep }
+        } else {
+            FinalizeAction::None
+        }
+    } else if let Some(reason) = failure_reason {
         FinalizeAction::Fail {
             fwd_rep,
             cells,
@@ -2518,6 +2730,7 @@ async fn fire_device_geometry<C: FireContext>(
     this: Resource<Pipeline>,
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
+    synthetic: bool,
 ) -> Anyhow<Result<(), String>> {
     // Contention-probe marker: when the guest's WIT call reached the host
     // (vs when its build reaches `acquire` — the delta is the build
@@ -2874,6 +3087,10 @@ async fn fire_device_geometry<C: FireContext>(
     attn_mask.apply_to(&mut req);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
+    let tickets = (
+        ticket_reservation.heads.clone(),
+        ticket_reservation.tails.clone(),
+    );
     let last_page_len = if pages.is_empty() { 0 } else { page_size };
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
@@ -2931,6 +3148,9 @@ async fn fire_device_geometry<C: FireContext>(
             instance_id,
             cells,
             failure: pipeline_failure,
+            synthetic,
+            frame_seq: frame.map(|stamp| stamp.seq),
+            tickets,
         }));
     Ok(Ok(()))
 }

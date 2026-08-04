@@ -77,6 +77,19 @@ pub(crate) fn notify_process_resume(pid: ProcessId) {
     }
 }
 
+/// The eviction cancel sweep marked `pid`'s queued synthetic continuations
+/// cancel-requested: each scheduler drops the marked items still in its
+/// queue (resolving them Cancelled) so the guest's sweep can unwind them.
+/// Posted items are left to the driver. Fire-and-forget to every driver;
+/// liveness rides the completion await in `cancel_synthetic_tail` — every
+/// marked item either drops here or resolves through the driver.
+pub(crate) fn notify_cancel_sweep(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::CancelSweep(pid));
+    }
+}
+
 /// Terminate `pid`'s lanes, fire-and-forget (queued fires are rejected).
 /// Process-keyed. The waited sibling is [`notify_process_terminate`].
 pub(crate) fn post_process_terminate(pid: ProcessId) {
@@ -578,6 +591,10 @@ enum SchedulerItem {
     Launch {
         pending: PendingRequest,
     },
+    /// Drop `pid`'s queued cancel-requested launches (eviction cancel of
+    /// synthetic continuations), resolving each Cancelled. Posted launches
+    /// are untouched — the driver resolves them.
+    CancelSweep(ProcessId),
     RegisterProgram {
         plan: ProgramRegistration,
         response: tokio::sync::oneshot::Sender<Result<u64>>,
@@ -3142,6 +3159,39 @@ impl BatchScheduler {
             }
             SchedulerItem::LanePark { lane, seq } => {
                 frame_policy.on_lane_park(lane, seq);
+            }
+            SchedulerItem::CancelSweep(pid) => {
+                // Eviction cancel: drop the pid's queued cancel-requested
+                // launches. Anything already posted resolves through the
+                // driver; anything already sealed but still queued loses its
+                // ids at the next `plan_dispatch` retain (the existing
+                // vanished-id path), so the wave posts without them.
+                let affected = pending.iter().any(|item| match item {
+                    QueuedItem::Launch(request) => {
+                        request.process_id == Some(pid)
+                            && request.completion.evict_cancel_requested()
+                    }
+                    _ => false,
+                });
+                if affected {
+                    let mut kept = VecDeque::with_capacity(pending.len());
+                    while let Some(item) = pending.pop_front() {
+                        match item {
+                            QueuedItem::Launch(request)
+                                if request.process_id == Some(pid)
+                                    && request.completion.evict_cancel_requested() =>
+                            {
+                                if let Some(stamp) = request.frame {
+                                    frame_policy
+                                        .on_fire_cancelled(stamp, request.logical_fire_id);
+                                }
+                                request.completion.resolve_cancelled();
+                            }
+                            item => kept.push_back(item),
+                        }
+                    }
+                    pending.replace(kept);
+                }
             }
             SchedulerItem::RegisterProgram { plan, response } => {
                 pending.push_back(QueuedItem::RegisterProgram { plan, response });
