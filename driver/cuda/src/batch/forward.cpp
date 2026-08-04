@@ -850,6 +850,18 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                      has_hooks ? 1 : 0, in.lora != nullptr ? 1 : 0,
                      spatial_mask_enabled() ? 1 : 0);
     }
+    if (in.have_custom_mask && std::getenv("PIE_SPATIAL_MASK_TRACE")) {
+        std::fprintf(stderr,
+                     "[spatial-mask] SHAPE R=%d N=%u pure=%d planned=%u "
+                     "mixed_gate=%d\n",
+                     in.forward_R,
+                     in.h_qo_forward != nullptr
+                         ? in.h_qo_forward[in.forward_R]
+                         : 0u,
+                     in.is_pure_decode ? 1 : 0,
+                     in.unmasked_prefix_rows,
+                     use_spatial_mask_mixed ? 1 : 0);
+    }
     if (use_spatial_mask_mixed && std::getenv("PIE_SPATIAL_MASK_TRACE")) {
         std::fprintf(stderr,
                      "[spatial-mask] MIXED R=%d N=%u rows_split=%u qo=[",
