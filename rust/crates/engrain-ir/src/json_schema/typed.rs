@@ -70,7 +70,7 @@ impl<'a> Converter<'a> {
                         (b' ' as u32, b' ' as u32),
                     ],
                 )
-                .repeat(0, None),
+                .repeat(0, self.options.max_whitespace),
             )?;
         }
         Ok(FrontendGrammar {
@@ -454,6 +454,10 @@ impl<'a> Converter<'a> {
     }
 
     fn json_string(&mut self, min: u32, max: Option<u32>) -> Result<Expr> {
+        // A schema that bounds the length is taken at its word; one that does
+        // not gets the caller's bound if there is one, and JSON's unbounded
+        // string otherwise.
+        let max = max.or(self.options.max_string);
         self.lexeme(
             "string",
             seq(vec![

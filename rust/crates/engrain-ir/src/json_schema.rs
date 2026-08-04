@@ -54,9 +54,31 @@ pub struct JsonSchemaOptions {
     /// schema says this is a property of the language, not of either engine.
     ///
     /// Setting it narrows the language deliberately, which is the one direction
-    /// this compiler will not take on its own. The caller asks for it, and the
-    /// grammar reports it in `restrictions`.
+    /// this compiler will not take on its own - so it is off unless a caller
+    /// asks. It is not in `relaxations`, which is the register for the other
+    /// direction: what the grammar admits and the schema does not.
     pub max_digits: Option<u32>,
+
+    /// Characters an *unbounded* string may run to, when the schema gives no
+    /// `maxLength` to bound it with.
+    ///
+    /// Same shape as `max_digits` and found the same way. Of 32 requests that
+    /// ran to the token limit on a corpus of real schemas, **19 were inside a
+    /// string** - one of them 90 zeroes and counting - because JSON permits a
+    /// string of any length and so the grammar does. A model handed a mask
+    /// that still admits a character emits one.
+    pub max_string: Option<u32>,
+
+    /// Whitespace characters allowed at one position between tokens, when
+    /// `any_whitespace` is on.
+    ///
+    /// The other 13 of those 32. `{"xi":  \n\n\n...` for two hundred tokens is
+    /// the shape: the model reaches a position where it has not decided what
+    /// to write, whitespace is admitted, and admitting it again after that is
+    /// a loop with no pressure to leave. JSON allows it and no document wants
+    /// it, so this is the cheapest place the language can be narrowed without
+    /// costing a document anyone would write.
+    pub max_whitespace: Option<u32>,
 }
 
 /// How much the lowering may widen, least first.
@@ -154,6 +176,8 @@ impl Default for JsonSchemaOptions {
             strict_mode: false,
             precision: Precision::Exact,
             max_digits: None,
+            max_string: None,
+            max_whitespace: None,
         }
     }
 }

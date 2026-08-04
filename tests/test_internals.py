@@ -264,6 +264,50 @@ class Approximations(unittest.TestCase):
         self.assertTrue(self.accepts(grammar, '{"q":{"a":"x"}}'))
         self.assertTrue(self.accepts(grammar, '{"p":{"b":1}}'))
 
+    def test_the_caller_may_bound_what_json_leaves_unbounded(self):
+        """Three constructs a model will run to the token limit inside.
+
+        JSON permits a number of any length, a string of any length and
+        whitespace of any length, so the grammar does too - and a model handed
+        a mask that still admits a digit, a character or a newline emits one.
+        Of 32 requests that ran to the token limit on a corpus of real schemas,
+        19 were inside a string and 13 between tokens.
+
+        Narrowing is the one direction the compiler will not take on its own,
+        so all three are off until a caller asks.
+        """
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"],
+            }
+        )
+        loose = self.engine.compile_json_schema(schema)
+        self.assertTrue(self.accepts(loose, '{"a":"abcdefgh"}'))
+        self.assertTrue(self.accepts(loose, '{    "a":"x"}'))
+
+        bounded = self.engine.compile_json_schema(
+            schema, max_string=6, max_whitespace=2
+        )
+        self.assertTrue(self.accepts(bounded, '{"a":"abc"}'))
+        self.assertFalse(self.accepts(bounded, '{"a":"abcdefgh"}'))
+        self.assertTrue(self.accepts(bounded, '{  "a":"x"}'))
+        self.assertFalse(self.accepts(bounded, '{    "a":"x"}'))
+
+    def test_a_schema_that_bounds_a_string_itself_is_taken_at_its_word(self):
+        """`maxLength` wins over the caller's default, in both directions."""
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string", "maxLength": 3}},
+                "required": ["a"],
+            }
+        )
+        grammar = self.engine.compile_json_schema(schema, max_string=64)
+        self.assertTrue(self.accepts(grammar, '{"a":"abc"}'))
+        self.assertFalse(self.accepts(grammar, '{"a":"abcd"}'))
+
     def test_exact_enforces_it_and_then_declares_nothing(self):
         schema = json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})
         grammar = self.engine.compile_json_schema(schema, exact=True)

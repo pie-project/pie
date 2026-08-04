@@ -90,6 +90,9 @@ class Compiler:
         schema: str,
         lexer_states: int | None = ...,
         exact: bool = ...,
+        max_digits: int | None = ...,
+        max_string: int | None = ...,
+        max_whitespace: int | None = ...,
     ) -> CompiledGrammar: ...
     def compile_regex(
         self, pattern: str, lexer_states: int | None = ...

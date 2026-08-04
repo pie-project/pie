@@ -44,6 +44,10 @@ pub struct Limits {
     pub exact: bool,
     /// Digits an unbounded number may run to. See `JsonSchemaOptions`.
     pub max_digits: Option<u32>,
+    /// Characters an unbounded string may run to. See `JsonSchemaOptions`.
+    pub max_string: Option<u32>,
+    /// Whitespace characters allowed at one position. See `JsonSchemaOptions`.
+    pub max_whitespace: Option<u32>,
 }
 
 impl Default for Limits {
@@ -54,6 +58,8 @@ impl Default for Limits {
             productions: DEFAULT_PRODUCTION_BUDGET,
             exact: false,
             max_digits: None,
+            max_string: None,
+            max_whitespace: None,
         }
     }
 }
@@ -227,6 +233,8 @@ pub fn compile_json_schema(
         let options = JsonSchemaOptions {
             precision,
             max_digits: limits.max_digits,
+            max_string: limits.max_string,
+            max_whitespace: limits.max_whitespace,
             ..Default::default()
         };
         match compile_at(schema, vocabulary, limits, &options) {
