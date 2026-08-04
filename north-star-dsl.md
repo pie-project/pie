@@ -2170,3 +2170,19 @@ inferlet does. The scoreboard's remaining rocks are therefore:
 R=32-scale WEIGHT (hardware-bound) and micro-items. The north star's
 STRUCTURAL claim is served by the depth union; the builder stays in
 reserve, honestly labeled.
+
+## R=32, REACHED (2026-08-04) — the WEIGHT curve extends on this hardware
+
+The "hardware-bound" label on the R=32 rock was stale: the driver's
+request cap is 256 and adapters are small. Measured (release, 128
+tok/lane, 32 DISTINCT adapters):
+
+  D=8  . 4.60x    D=16 . 6.40x    D=32 . 8.48x   (vs serialized)
+
+Thirty-two different adapters share one fire's base-weight reads —
+the README's R=32 shape, live. The curve grows monotonically but
+sub-linearly at 0.6B: the fire is launch/overhead-bound (solo 0.61s
+is mostly fixed cost at 128 tokens), so the 46x ceiling needs the
+LARGER MODEL (where base-weight reads dominate), not more lanes —
+the honest residual of that rock is now "bigger checkpoint", nothing
+else. Zero incidents at D=32.
