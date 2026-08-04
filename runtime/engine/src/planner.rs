@@ -784,6 +784,11 @@ struct Inner {
     /// Evictions in flight → what each is expected to free. Subtracted from
     /// the deficit so concurrent plans never over-evict.
     evicting: HashMap<ProcessId, EvictionMark>,
+    /// Rotation damping (Rule A as a stock): resident completions banked,
+    /// one per departure, debited one per served restore. Restores wait for
+    /// this credit unless the fleet is stalled, so the rotation rate is
+    /// bounded by the completion rate instead of riding eviction surplus.
+    completion_credit: u32,
     /// Victims whose last eviction rolled back on `HostSwapFull`. Re-picking
     /// one before host room changes is pure spin: victim selection is
     /// deterministic, so the retry re-runs the whole fence → suspend →
@@ -1166,7 +1171,23 @@ impl ResidencyPlanner {
     /// queue.
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         let (signal, removed) = self.with_inner(|inner| {
-            let signal = inner.procs.remove(&pid).map(|proc| proc.signal);
+            let departed = inner.procs.remove(&pid);
+            // Rotation damping: a RESIDENT departure is the completion
+            // event that funds one readmission (Rule A as a stock, not
+            // just a flow — measured: 33% of restores were landing within
+            // 3 ms of an evict commit, because demand-sized rounds leave
+            // surplus in the shared pool and that surplus was driving the
+            // rotation to 2× the completion rate). One completed working
+            // set funds one restored working set; no page counts, no
+            // constants. An evicted process completing while out held no
+            // pooled pages, so it funds nothing.
+            if departed
+                .as_ref()
+                .is_some_and(|proc| proc.admitted && proc.state == Residency::Resident)
+            {
+                inner.completion_credit = inner.completion_credit.saturating_add(1);
+            }
+            let signal = departed.map(|proc| proc.signal);
             inner.evicting.remove(&pid);
             inner.killing.remove(&pid);
             // Teardown returns this process's host slots (and drops it from
@@ -1638,7 +1659,19 @@ impl ResidencyPlanner {
                 }
                 match demand {
                     Some(demand) => Step::ServeAllocation { key, demand },
-                    None => Step::ServeRestore { key, pid },
+                    None => {
+                        // Rotation damping: a covered restore still waits
+                        // for a completion credit — accum surplus (often
+                        // eviction yield) must flow to allocations, not
+                        // fund readmission. `fleet_stalled` keeps the
+                        // liveness backstop: when nothing can complete, a
+                        // restore proceeds regardless.
+                        if inner.completion_credit == 0 && !inner.fleet_stalled() {
+                            return Step::Done;
+                        }
+                        inner.completion_credit = inner.completion_credit.saturating_sub(1);
+                        Step::ServeRestore { key, pid }
+                    }
                 }
             });
             match step {
