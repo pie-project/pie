@@ -57,37 +57,6 @@ use pie_ir::types::DType;
 /// channels — W0/W3). Inferlet-scoped in practice (one runtime per inferlet).
 static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 
-/// S1 groundwork (continuation-waves): global-id → cell registry so the
-/// scheduler worker can reach a lane's cells to reserve device tickets for
-/// a synthesized fire. Weak on purpose — the registry never keeps a cell
-/// alive; dead entries are pruned on lookup misses and on inserts.
-static CELL_REGISTRY: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<u64, std::sync::Weak<Mutex<ChannelCell>>>>,
-> = std::sync::LazyLock::new(Default::default);
-
-/// Register a freshly wrapped cell under its minted global id. Called at
-/// the two production Arc-wrap sites (guest channel constructor, instance
-/// prebuilt cells); test cells that never meet the scheduler skip it.
-pub(crate) fn register_cell(cell: &Arc<Mutex<ChannelCell>>) {
-    let id = cell.lock().unwrap().global_id;
-    let mut registry = CELL_REGISTRY.lock().unwrap();
-    registry.retain(|_, weak| weak.strong_count() > 0);
-    registry.insert(id, Arc::downgrade(cell));
-}
-
-/// The worker-side lookup: global channel id → live cell, if any.
-#[allow(dead_code)] // wired by S1 synthesis; registry landed with the groundwork
-pub(crate) fn cell_by_id(id: u64) -> Option<Arc<Mutex<ChannelCell>>> {
-    let mut registry = CELL_REGISTRY.lock().unwrap();
-    match registry.get(&id).and_then(std::sync::Weak::upgrade) {
-        Some(cell) => Some(cell),
-        None => {
-            registry.remove(&id);
-            None
-        }
-    }
-}
-
 /// Mint the next process-wide global channel identity.
 pub fn next_channel_id() -> u64 {
     NEXT_CHANNEL_ID.fetch_add(1, Ordering::Relaxed)

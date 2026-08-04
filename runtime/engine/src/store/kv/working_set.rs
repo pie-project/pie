@@ -175,19 +175,6 @@ impl KvSuspendHandle {
         })
     }
 
-    /// Lease-vendor for engine-synthesized fires (continuation-waves S1):
-    /// the scheduler worker holds only this weak handle, and a fire it
-    /// synthesizes must hold the same lease a guest-built fire would — the
-    /// eviction quiescence seal counts it, and the fence refuses it exactly
-    /// like the guest path. `Released` when the lifecycle is already gone.
-    #[allow(dead_code)] // wired by S1 synthesis; vendor landed with the groundwork
-    pub(crate) fn acquire_fire_lease(&self) -> Result<KvFireLease, FireLeaseError> {
-        let Some(lifecycle) = self.lifecycle.upgrade() else {
-            return Err(FireLeaseError::Released);
-        };
-        KvLifecycle::acquire_fire_lease(&lifecycle)
-    }
-
     /// Await zero fire leases. Meaningful only under a raised fence, where
     /// the count is monotone non-increasing. Returns immediately when the
     /// lifecycle is already gone (released — nothing left to protect).

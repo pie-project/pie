@@ -363,7 +363,6 @@ impl pie::inferlet::channel::HostChannel for ProcessCtx {
             Dtype::Bool => pie_ir::types::DType::Bool,
         };
         let cell = Arc::new(Mutex::new(ChannelCell::new(shape, dtype, capacity)));
-        crate::pipeline::channel::register_cell(&cell);
         Ok(self.ctx().table.push(Channel { cell, fires: None })?)
     }
 

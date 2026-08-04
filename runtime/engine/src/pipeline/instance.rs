@@ -1067,9 +1067,6 @@ mod tests {
                 })
                 .collect();
             let channel_ids: Vec<u64> = cells.iter().map(|c| c.lock().unwrap().global_id).collect();
-            for cell in &cells {
-                crate::pipeline::channel::register_cell(cell);
-            }
 
             let instance_id = next_instance_id();
             for (cell, decl) in cells.iter().zip(&decls) {

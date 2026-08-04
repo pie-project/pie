@@ -67,11 +67,7 @@ impl BoundWaitSlots {
         }
     }
 
-    /// `pub(crate)` for continuation-waves S1: the scheduler worker keeps
-    /// `Arc<BoundWaitSlots>` per instance and a synthesized fire's
-    /// completion must hold the same close-liveness lease a guest-reserved
-    /// one does.
-    pub(crate) fn acquire_completion_lease(
+    fn acquire_completion_lease(
         this: &Arc<Self>,
         completion_wait_id: u64,
     ) -> Arc<dyn crate::driver::completion::CompletionLease> {

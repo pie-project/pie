@@ -878,10 +878,6 @@ enum LaneCommit {
         pipeline_id: Option<ProcessId>,
         bound: BoundInstance,
         respond: BindRespond,
-        /// S1 groundwork: the instance's engine channel ids, retained so the
-        /// worker can reach the lane's cells (via the channel registry) when
-        /// synthesizing continuation fires.
-        channel_ids: Vec<u64>,
     },
     /// A bind control completed without creating an instance.
     BindFinished { pipeline_id: Option<ProcessId> },
@@ -1318,7 +1314,6 @@ impl DriverLane {
                     Some(driver) => match driver.bind_instance(&plan) {
                         Ok(bound) => LaneCommit::BindInstance {
                             pipeline_id,
-                            channel_ids: plan.channel_ids.clone(),
                             bound,
                             respond: BindRespond::Bind(response),
                         },
@@ -1451,7 +1446,6 @@ impl DriverLane {
                         }
                         LaneCommit::BindInstance {
                             pipeline_id,
-                            channel_ids: bind.channel_ids.clone(),
                             bound,
                             respond: BindRespond::ChannelsBind {
                                 registered,
@@ -5205,7 +5199,6 @@ impl BatchScheduler {
                     pipeline_id,
                     bound,
                     respond,
-                    channel_ids,
                 } => {
                     frame_policy.on_bind_completed(pipeline_id);
                     if instances.contains_key(&bound.instance_id) {
@@ -5230,10 +5223,7 @@ impl BatchScheduler {
                         return;
                     }
                     let instance_id = bound.instance_id;
-                    instances.insert(
-                        instance_id,
-                        TrackedInstance::from_bound(&bound, channel_ids),
-                    );
+                    instances.insert(instance_id, TrackedInstance::from_bound(&bound));
                     // Respond AFTER the insert: launch admission reads
                     // `instances` on this thread, so the guest's first fire
                     // (sent only after this response) is always admissible.
@@ -5388,21 +5378,15 @@ struct TrackedInstance {
     wait_slots: Arc<crate::driver::instance::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
-    /// S1 groundwork: the instance's engine channel ids in dense declaration
-    /// order — the worker's path to the lane's cells (channel registry) for
-    /// synthesized-fire ticket reservation.
-    #[allow(dead_code)]
-    channel_ids: Vec<u64>,
 }
 
 impl TrackedInstance {
-    fn from_bound(bound: &BoundInstance, channel_ids: Vec<u64>) -> Self {
+    fn from_bound(bound: &BoundInstance) -> Self {
         Self {
             pacing_wait_id: bound.pacing_wait_id,
             wait_slots: bound.wait_slots(),
             in_flight: 0,
             next_target_epoch: pie_waker::FIRST_COMPLETION_EPOCH,
-            channel_ids,
         }
     }
 
@@ -5804,7 +5788,6 @@ mod tests {
                     pipeline_id: None,
                     bound,
                     respond: BindRespond::Bind(response),
-                    channel_ids: Vec::new(),
                 },
             },
             &mut lane_inflight,
