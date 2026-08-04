@@ -168,7 +168,8 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           AffineFormat quant,
                           bool with_d512,
                           std::string* err,
-                          bool routed) {
+                          bool routed,
+                          bool fp16_precast) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
     const std::string q = quant.kernel_suffix();
@@ -215,6 +216,10 @@ bool load_multibatch_psos(RawMetalContext& ctx,
             const std::string suffix = q + "_bm_" + std::to_string(bm) +
                                        "_bn_" + std::to_string(bn);
             want(qmm, "affine_qmm_t" + suffix, &out.qmm_t[w][i]);
+            if (fp16_precast && quant.group == 64 && quant.bits == 4) {
+                want(qmm, "affine_qmm_t_fp16_precast" + suffix,
+                     &out.qmm_t_fp16_precast[w][i]);
+            }
             want(qmm, "affine_qmm_t_residual" + suffix, &out.qmm_t_residual[w][i]);
             want(qmm, "affine_qmm_t_bias" + suffix, &out.qmm_t_bias[w][i]);
         }
@@ -222,6 +227,25 @@ bool load_multibatch_psos(RawMetalContext& ctx,
              "affine_qmm_t_splitk" + q + "_bm_" + std::to_string(bm) +
                  "_bn_" + std::to_string(pie::metal::kQmmSplitBN),
              &out.qmm_t_splitk[w]);
+        want(qmm,
+             "affine_qmm_t_splitk_f32" + q + "_bm_" + std::to_string(bm) +
+                 "_bn_" + std::to_string(pie::metal::kQmmSplitBN),
+             &out.qmm_t_splitk_f32[w]);
+        if (fp16_precast && quant.group == 64 && quant.bits == 4) {
+            want(qmm,
+                 "affine_qmm_t_splitk_fp16_precast" + q + "_bm_" +
+                     std::to_string(bm) + "_bn_" +
+                     std::to_string(pie::metal::kQmmSplitBN),
+                 &out.qmm_t_splitk_fp16_precast[w]);
+            want(qmm,
+                 "affine_qmm_t_splitk_fp16_precast_f32" + q + "_bm_" +
+                     std::to_string(bm) + "_bn_" +
+                     std::to_string(pie::metal::kQmmSplitBN),
+                 &out.qmm_t_splitk_fp16_precast_f32[w]);
+        }
+    }
+    if (fp16_precast && quant.group == 64 && quant.bits == 4) {
+        want(qmm, "cast_qmm_input_bfloat16_to_float16", &out.qmm_cast_bf16_f16);
     }
     if (routed) {
         // `bm` is spelled from `kMoeTileRows` rather than restated: it is the
@@ -238,6 +262,9 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     }
     want(qmm, "qmm_splitk_reduce_bfloat16", &out.qmm_splitk_reduce);
     want(qmm, "qmm_splitk_reduce_residual_bfloat16", &out.qmm_splitk_reduce_residual);
+    want(qmm, "qmm_splitk_reduce_f32_bfloat16", &out.qmm_splitk_reduce_f32);
+    want(qmm, "qmm_splitk_reduce_residual_f32_bfloat16",
+         &out.qmm_splitk_reduce_residual_f32);
     want(qmm, "affine_qmm_t_strided" + q + "_bm_16_bn_32", &out.qmm_t_strided);
     want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_16_bn_32",
          &out.qmm_t_strided_residual);

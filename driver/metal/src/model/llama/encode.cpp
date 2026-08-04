@@ -53,6 +53,38 @@ using pie::metal::sdpa_paged_dispatch;
 using pie::metal::sdpa_paged_tiled_dispatch;
 using pie::metal::sdpa_should_tile;
 
+namespace {
+int llama_sdpa_simdgroups(const LlamaGeometry& g) {
+    return g.head_dim == 64 && g.kv_page_size == 32 ? 8 : 32;
+}
+
+int llama_dense_qmm_bm(int rows, int requests) {
+    // A 64-request decode fleet has enough independent rows that BM=32's
+    // extra threadgroups beat BM=64's weight reuse. A 64-token prefill is one
+    // request and keeps BM=64; row count alone cannot distinguish the two.
+    if (rows == 64 && requests >= 64) return 32;
+    return qmm_bm(rows);
+}
+
+bool llama_fp16_qmm(const LlamaGeometry& g, Kind k, int rows, int requests) {
+    return !g.is_moe() && g.quant.bits == 4 && g.quant.group == 64 &&
+           llama_qmm_bn(k, g, rows, requests) > 0;
+}
+
+bool llama_fp16_cast_before(Kind k) {
+    switch (k) {
+        case Kind::QmvQ:
+        case Kind::QmvO:
+        case Kind::QmvGate:
+        case Kind::QmvDown:
+        case Kind::LmHead:
+            return true;
+        default:
+            return false;
+    }
+}
+}
+
 Kernel shared_kind(Kind k, const LlamaGeometry& g) {
     switch (k) {
         // Tied models read the one table for both ends of the model. Untied
@@ -157,17 +189,34 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
     // same numbers `launch_shape` uses, because the two answers must agree.
     if (mb != nullptr) {
         const int m = d.kind == Kind::LmHead ? S : R;
-        if (const int bn = llama_qmm_bn(d.kind, g, m); bn > 0) {
-            const int wide = qmm_bm_slot(qmm_bm(m));
+        if (const int bn = llama_qmm_bn(d.kind, g, m, requests); bn > 0) {
+            const int split = llama_qmm_split(d.kind, g, m, requests);
+            const int wide = qmm_bm_slot(llama_dense_qmm_bm(m, requests));
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
+            // M1's native FP16 simdgroup MMA is substantially faster than
+            // BF16. Keep storage and every surrounding kernel in BF16; only
+            // the dense g64/b4 GEMM tile is cast to half on load. Routed
+            // models stay BF16 because the extra rounding can flip top-k.
+            const bool fp16 = llama_fp16_qmm(g, d.kind, m, requests);
             // The split form first, and asked with the same `m` `launch_shape`
             // uses: the split grid is `split` deep in z and writes partials,
             // the plain one is not and writes the output, so disagreeing here
             // leaves the projection's real buffer untouched.
-            if (llama_qmm_split(d.kind, g, m) > 1 && mb->qmm_t_splitk[wide].valid())
-                return mb->qmm_t_splitk[wide];
+            if (split > 1) {
+                const Pso split_pso =
+                    fp16 ? (d.kind == Kind::QmvV
+                                  ? mb->qmm_t_splitk_fp16_precast_f32[wide]
+                                  : mb->qmm_t_splitk_fp16_precast[wide])
+                         : (d.kind == Kind::QmvV
+                                  ? mb->qmm_t_splitk_f32[wide]
+                                  : mb->qmm_t_splitk[wide]);
+                if (split_pso.valid()) return split_pso;
+            }
             // No bias table: llama's projections have no bias tensor, which is
             // the one place this family is simpler than gpt-oss.
+            if (fp16 && mb->qmm_t_fp16_precast[wide][slot].valid()) {
+                return mb->qmm_t_fp16_precast[wide][slot];
+            }
             if (mb->qmm_t[wide][slot].valid()) return mb->qmm_t[wide][slot];
         }
         // Per-row IO. These two are the only kinds whose M>1 form differs in
@@ -213,7 +262,10 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             // the per-row kernel's is N, so choosing one here and shaping the
             // other there launches a thirty-second of the attention.
             if (!g.paged_kv_enabled) return ll.sdpa;
-            return sdpa_should_tile(R, requests) ? ll.sdpa_paged_tiled : ll.sdpa_paged;
+            if (sdpa_should_tile(R, requests)) return ll.sdpa_paged_tiled;
+            if (llama_sdpa_simdgroups(g) == 8 && ll.sdpa_paged_sg8.valid())
+                return ll.sdpa_paged_sg8;
+            return ll.sdpa_paged;
         // The append follows attention. Both KV kinds must agree on the ABI:
         // the binder writes page tables into slots the ring kernel reads as a
         // head stride, so a mismatch here is a scatter through a pointer made
@@ -299,10 +351,10 @@ std::vector<int> llama_run_ends(const std::vector<Dispatch>& dag) {
     return ends;
 }
 
-int llama_qmm_rows(int rows) {
+int llama_qmm_rows(int rows, int requests) {
     const int n = rows < 1 ? 1 : rows;
     if (n < kQmmMinBatch) return n;
-    const int bm = qmm_bm(n);
+    const int bm = llama_dense_qmm_bm(n, requests);
     return ((n + bm - 1) / bm) * bm;
 }
 
@@ -331,28 +383,64 @@ bool llama_is_dense_proj(Kind k) {
     }
 }
 
-int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows) {
+int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows, int requests) {
     if (!llama_is_dense_proj(k)) return 0;
     const KN kn = qmv_kn(k, g);
     if (kn.N == 0) return 0;
-    return qmm_bn(kn.N, llama_qmm_rows(rows));
+    const int bn = qmm_bn(kn.N, llama_qmm_rows(rows, requests));
+    if (k == Kind::LmHead && bn > 0) return 32;
+    return bn;
 }
 
-int llama_qmm_split(Kind k, const LlamaGeometry& g, int rows) {
+int llama_qmm_split(Kind k, const LlamaGeometry& g, int rows, int requests) {
     static const bool off = std::getenv("PIE_METAL_NO_SPLITK") != nullptr;
     if (off) return 1;
-    if (llama_qmm_bn(k, g, rows) <= 0) return 1;
+    if (llama_qmm_bn(k, g, rows, requests) <= 0) return 1;
     const KN kn = qmv_kn(k, g);
     // lm_head has thousands of output tiles of its own and needs no split; it
     // is also the one projection whose partials would be hundreds of megabytes.
     if (kn.N > kQmmSplitMaxOut) return 1;
-    return qmm_split_k(kn.N, llama_qmm_rows(rows), kn.K, qmm_bm(rows));
+    if (g.quant.bits == 4 && g.quant.group == 64 &&
+        (k == Kind::QmvGate || k == Kind::QmvUp)) {
+        const int bm = llama_dense_qmm_bm(rows, requests);
+        const int tiles =
+            (kn.N / kQmmSplitBN) *
+            ((llama_qmm_rows(rows, requests) + bm - 1) / bm);
+        // This checkpoint's gate/up grid already has 256 threadgroups. A
+        // second K partition only adds a full-output reduce; measured at
+        // batch 32 it is 1.7% slower.
+        if (tiles >= 256) return 1;
+    }
+    return qmm_split_k(kn.N, llama_qmm_rows(rows, requests), kn.K,
+                       llama_dense_qmm_bm(rows, requests));
 }
 
-std::size_t llama_splitk_partial_elems(int max_rows) {
-    return std::size_t(kQmmSplitMaxSplits) *
-           std::size_t(llama_qmm_pool_rows(max_rows < 1 ? 1 : max_rows)) *
-           std::size_t(kQmmSplitMaxOut);
+std::size_t llama_splitk_partial_elems(const LlamaGeometry& g, int max_rows) {
+    const Kind dense[] = {
+        Kind::QmvQ, Kind::QmvK, Kind::QmvV, Kind::QmvO,
+        Kind::QmvGate, Kind::QmvUp, Kind::QmvDown,
+    };
+    std::size_t one_lane = 0;
+    const int limit = max_rows < 1 ? 1 : max_rows;
+    for (int rows = 1; rows <= limit; ++rows) {
+        for (const Kind k : dense) {
+            if (g.is_moe() &&
+                (k == Kind::QmvGate || k == Kind::QmvUp || k == Kind::QmvDown)) {
+                continue;
+            }
+            for (const int requests : {1, rows}) {
+                const int split = llama_qmm_split(k, g, rows, requests);
+                if (split <= 1) continue;
+                const KN kn = qmv_kn(k, g);
+                one_lane = std::max(
+                    one_lane,
+                    std::size_t(split) *
+                        std::size_t(llama_qmm_rows(rows, requests)) *
+                        std::size_t(kn.N));
+            }
+        }
+    }
+    return std::size_t(kLlamaSplitkConcurrentLanes) * one_lane;
 }
 
 int llama_moe_pairs(const LlamaGeometry& g, int rows) {
@@ -419,15 +507,17 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
         // Once the batch fills a tile, a dense projection becomes a matmul.
         // The matvec re-reads the ENTIRE weight for every row, so on a prefill
         // it is the difference between amortizing the weights and not.
-        if (const int bn = llama_qmm_bn(d.kind, g, m); bn > 0) {
+        if (const int bn = llama_qmm_bn(d.kind, g, m, requests); bn > 0) {
             // The row block is asked of the BATCH, not of the padded count:
             // padding rounds up, and a rounded-up count can land on a wider
             // rung than the one the grid was built for.
-            if (const int split = llama_qmm_split(d.kind, g, m); split > 1) {
-                qmm_t_splitk_dispatch(kn.N, llama_qmm_rows(m), qmm_bm(m), split, grid, tg);
+            if (const int split = llama_qmm_split(d.kind, g, m, requests); split > 1) {
+                qmm_t_splitk_dispatch(kn.N, llama_qmm_rows(m, requests),
+                                      llama_dense_qmm_bm(m, requests), split, grid, tg);
                 return;
             }
-            qmm_t_dispatch(kn.N, llama_qmm_rows(m), bn, qmm_bm(m), grid, tg);
+            qmm_t_dispatch(kn.N, llama_qmm_rows(m, requests), bn,
+                           llama_dense_qmm_bm(m, requests), grid, tg);
             return;
         }
         // One call for dense and routed alike. `slots` is the expert axis and
@@ -501,6 +591,13 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
                 sdpa_paged_tiled_dispatch(g.n_q_heads, R, grid, tg);
                 return;
             }
+            if (const int sg = llama_sdpa_simdgroups(g); sg < 32) {
+                const std::uint32_t threads = std::uint32_t(sg * 32);
+                grid = Grid{std::uint32_t(g.n_q_heads) * threads,
+                            std::uint32_t(R), 1};
+                tg = Threadgroup{threads, 1, 1};
+                return;
+            }
             sdpa_paged_dispatch(g.n_q_heads, R, grid, tg);
             return;
         case Kind::SiluMul:
@@ -530,7 +627,7 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
             return;
 
         case Kind::Argmax:
-            grid = Grid{1024, 1, 1};
+            grid = Grid{1024, std::uint32_t(S), 1};
             tg = Threadgroup{1024, 1, 1};
             return;
         default:
@@ -543,11 +640,26 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
 void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const LlamaGeometry& g,
                        const DecodeStepPsos& base, const LlamaPsos& ll, int ordinal_base,
                        const MultiBatchPsos* mb, int rows, int head_rows, int requests,
-                       std::size_t begin, std::size_t end) {
+                       std::size_t begin, std::size_t end, bool run_argmax) {
     const std::vector<int> run_ends = llama_run_ends(dag);
     const std::size_t last = std::min(end, dag.size());
     for (std::size_t i = begin; i < last; ++i) {
         const Dispatch& d = dag[i];
+        if (d.kind == Kind::Argmax && !run_argmax) continue;
+        const int m = d.kind == Kind::LmHead
+                          ? (head_rows < 1 ? (rows < 1 ? 1 : rows)
+                                           : std::min(head_rows, rows < 1 ? 1 : rows))
+                          : (rows < 1 ? 1 : rows);
+        if (mb != nullptr && llama_fp16_qmm(g, d.kind, m, requests) &&
+            llama_fp16_cast_before(d.kind) && mb->qmm_cast_bf16_f16.valid()) {
+            se.set_pso(mb->qmm_cast_bf16_f16);
+            se.set_argtable_ordinal(ordinal_base + d.ordinal);
+            const std::uint32_t count =
+                std::uint32_t(llama_qmm_rows(m, requests)) *
+                std::uint32_t(qmv_kn(d.kind, g).K);
+            se.dispatch(Grid{count, 1, 1}, Threadgroup{256, 1, 1});
+            se.barrier();
+        }
         Grid grid;
         Threadgroup tg;
         launch_shape(d, g, grid, tg, rows, head_rows, requests);
@@ -562,26 +674,22 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const 
         // this exist at all: the split is decided while walking a DAG that is
         // already built, and nothing there can insert a dispatch.
         if (mb != nullptr) {
-            const int m = d.kind == Kind::LmHead
-                              ? (head_rows < 1 ? (rows < 1 ? 1 : rows)
-                                               : std::min(head_rows, rows < 1 ? 1 : rows))
-                              : (rows < 1 ? 1 : rows);
-            if (llama_qmm_split(d.kind, g, m) > 1 && mb->qmm_splitk_reduce.valid()) {
+            if (llama_qmm_split(d.kind, g, m, requests) > 1) {
+                const Pso reduce = d.kind == Kind::QmvV
+                                       ? mb->qmm_splitk_reduce_f32
+                                       : mb->qmm_splitk_reduce;
                 se.barrier();
-                se.set_pso(mb->qmm_splitk_reduce);
+                se.set_pso(reduce);
                 se.set_argtable_ordinal(ordinal_base + d.ordinal);
                 Grid rg;
                 Threadgroup rtg;
-                qmm_splitk_reduce_dispatch(qmv_kn(d.kind, g).N, llama_qmm_rows(m), rg, rtg);
+                qmm_splitk_reduce_dispatch(
+                    qmv_kn(d.kind, g).N, llama_qmm_rows(m, requests), rg, rtg);
                 se.dispatch(rg, rtg);
-                // And a barrier AFTER, even though the run this dispatch
-                // belongs to would otherwise drop it. The three attention
-                // projections are one concurrency run and they share ONE
-                // partials buffer, so without this the next member's GEMM
-                // overwrites the partials this reduce is still summing. It is
-                // not a crash: it is a projection whose output is part its own
-                // and part its neighbour's.
-                se.barrier();
+                // No trailing barrier inside a concurrency run. Its members
+                // own different partial slices, so this reduce can overlap the
+                // next member's GEMM. The ordinary run-end barrier still waits
+                // for every output before a consumer starts.
             }
         }
         // A barrier after every dispatch except inside a concurrency run: the

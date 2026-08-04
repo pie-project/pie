@@ -46,9 +46,11 @@ MetalStorageFacts query_metal_storage_facts() {
     if (device == nil) {
         throw std::runtime_error("no Metal device");
     }
+    const MTLResourceOptions options =
+        MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
     const MTLSizeAndAlign sa = [device
         heapBufferSizeAndAlignWithLength:1
-        options:MTLResourceStorageModeShared];
+        options:options];
     const long page = ::sysconf(_SC_PAGESIZE);
     return MetalStorageFacts{
         .alignment = static_cast<std::uint32_t>(std::max<NSUInteger>(1, sa.align)),
@@ -155,6 +157,7 @@ struct RawMetalContext::Impl {
     std::unordered_map<void*, size_t> external_allocations;
     bool saw_ptir_compile = false;
     bool last_ptir_fast_math_disabled = false;
+    uint64_t surfaced_feedback_error = 0;
     std::atomic<bool> force_wait_timeout_once{false};
     // Set when a wait was abandoned. Sticky: see run_steps.
     bool wedged = false;
@@ -541,6 +544,7 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(
     MTLHeapDescriptor* hd = [MTLHeapDescriptor new];
     hd.type        = MTLHeapTypePlacement;
     hd.storageMode = MTLStorageModeShared;   // UMA: contents() valid for all slots
+    hd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
     hd.size        = heap_bytes;
     I.heap = [I.dev newHeapWithDescriptor:hd];
     if (I.heap == nil) {
@@ -581,7 +585,8 @@ SlotHandle RawMetalContext::heap_alloc(size_t size, size_t align) {
     SlotHandle h;
     if (size == 0) return h;
 
-    MTLResourceOptions opts = MTLResourceStorageModeShared;
+    MTLResourceOptions opts =
+        MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
     MTLSizeAndAlign sa = [I.dev heapBufferSizeAndAlignWithLength:size options:opts];
     size_t a = align > sa.align ? align : sa.align;
     size_t off = align_up(I.bump, a);
@@ -1860,16 +1865,21 @@ GpuCommitFeedback RawMetalContext::last_commit_feedback() const {
 static void apply_commit_feedback(const RawMetalContext& ctx,
                                   uint64_t event_value,
                                   StepTiming& tm) {
-    // The fence has already been reached, so the feedback for this event is
-    // either in or about to be: the handler is dispatched asynchronously and
-    // lands within microseconds of the signal. Giving it a bounded moment is
-    // the difference between reporting what went wrong and reporting nothing --
-    // a run whose every command buffer failed out of memory came back as a
-    // clean success, because the block had not landed when this looked.
+    // The fence has already been reached, but the feedback block is dispatched
+    // asynchronously. Normal inference does not put that CPU scheduling delay
+    // on every token: the handler logs an error immediately, and run_steps
+    // promotes a late error to a sticky failure before the next submission.
+    // Tracing and the GPU meter do wait because their output specifically asks
+    // for this event's calibrated GPU timestamps.
     GpuCommitFeedback fb = ctx.last_commit_feedback();
-    for (int spin = 0; fb.event_value != event_value && spin < 200; ++spin) {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-        fb = ctx.last_commit_feedback();
+    const bool synchronous =
+        dispatch_trace_every() > 0 || getenv("PIE_METAL_GPU_METER") != nullptr ||
+        getenv("PIE_METAL_SYNC_FEEDBACK") != nullptr;
+    if (synchronous) {
+        for (int spin = 0; fb.event_value != event_value && spin < 200; ++spin) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            fb = ctx.last_commit_feedback();
+        }
     }
     if (fb.event_value != event_value) return;
     tm.gpu_ms = fb.gpu_ms;
@@ -1991,6 +2001,14 @@ StepTiming RawMetalContext::run_steps(
     auto& I = *impl_;
     StepTiming tm;
     ab &= 1;
+    const GpuCommitFeedback pending = last_commit_feedback();
+    if (pending.had_error && pending.event_value > I.surfaced_feedback_error) {
+        I.surfaced_feedback_error = pending.event_value;
+        I.wedged = true;
+        tm.gpu_error = true;
+        tm.gpu_error_text = pending.error;
+        return tm;
+    }
     if (I.wedged) {
         tm.timed_out = true;
         return tm;
@@ -2040,6 +2058,14 @@ StepTiming RawMetalContext::run_segments(
     auto& I = *impl_;
     StepTiming tm;
     ab &= 1;
+    const GpuCommitFeedback pending = last_commit_feedback();
+    if (pending.had_error && pending.event_value > I.surfaced_feedback_error) {
+        I.surfaced_feedback_error = pending.event_value;
+        I.wedged = true;
+        tm.gpu_error = true;
+        tm.gpu_error_text = pending.error;
+        return tm;
+    }
     if (I.wedged) {
         tm.timed_out = true;
         return tm;

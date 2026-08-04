@@ -62,6 +62,7 @@ struct LlamaPsos {
     /// width has no instantiation fails to COMPILE a pipeline, by name, at load.
     Pso sdpa{};
     Pso sdpa_paged{};
+    Pso sdpa_paged_sg8{};
     /// The same paged attention with the query rows tiled -- one row per
     /// simdgroup, K/V staged per threadgroup. Chosen by row count, not by
     /// model: see `sdpa_should_tile`.

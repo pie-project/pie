@@ -67,6 +67,10 @@ struct MultiBatchPsos {
     // BN=32, [1] is BN=64. Selected only above `kQmmMinBatch`.
     // [bm][bn]: `kQmmBMs` rows per block x 16/32/64 columns.
     Pso qmm_t[3][3]{};
+    // Same storage ABI, but casts each tile to FP16 before the simdgroup MMA.
+    // Instantiated only for g64/b4; dense llama uses it on M1 where FP16 is
+    // native and BF16 MMA is markedly slower.
+    Pso qmm_t_fp16_precast[3][3]{};
     Pso qmm_t_residual[3][3]{};
     /// The same GEMM with a Linear's additive bias broadcast down the tile.
     /// gpt-oss biases every projection, so without it the batched path is a
@@ -84,8 +88,15 @@ struct MultiBatchPsos {
     /// other's rows. Three column tiles, as elsewhere.
     Pso qmm_routed[3]{};
     Pso qmm_t_splitk[3]{};
+    Pso qmm_t_splitk_f32[3]{};
+    // FP16-compute counterparts, with bf16 or float partials respectively.
+    Pso qmm_t_splitk_fp16_precast[3]{};
+    Pso qmm_t_splitk_fp16_precast_f32[3]{};
+    Pso qmm_cast_bf16_f16{};
     Pso qmm_splitk_reduce{};
     Pso qmm_splitk_reduce_residual{};
+    Pso qmm_splitk_reduce_f32{};
+    Pso qmm_splitk_reduce_residual_f32{};
     Pso qmm_t_strided{};
     Pso qmm_t_strided_wide{};
     Pso qmm_t_strided_wide_residual{};
@@ -120,6 +131,8 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           std::string* err = nullptr,
                           /// Compile the mixture's batched projections. Only a
                           /// checkpoint whose geometry has experts runs them.
-                          bool routed = false);
+                          bool routed = false,
+                          /// Compile dense g64/b4 BF16->FP16 staging QMMs.
+                          bool fp16_precast = false);
 
 }  // namespace pie::metal

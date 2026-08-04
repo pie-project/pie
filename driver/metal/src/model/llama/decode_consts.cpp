@@ -328,7 +328,7 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 
 int bind_llama_splitk(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                       const LlamaGeometry& g, int rows, const SlotHandle& partials,
-                      std::vector<SlotHandle>& keep) {
+                      std::vector<SlotHandle>& keep, int requests) {
     keep.clear();
     if (!partials.valid()) return 0;
     const int R = rows < 1 ? 1 : rows;
@@ -341,16 +341,27 @@ int bind_llama_splitk(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         SlotHandle k, st, sp;
     };
     std::vector<Triple> seen;
-    for (const Dispatch& d : dag) {
+    const std::vector<int> run_ends = llama_run_ends(dag);
+    std::size_t run_begin = 0;
+    const std::size_t slice_elems =
+        llama_splitk_partial_elems(g, R) / std::size_t(kLlamaSplitkConcurrentLanes);
+    const std::size_t slice_bytes = sizeof(float) * slice_elems;
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        const Dispatch& d = dag[i];
+        if (i == 0 || run_ends[i] != run_ends[i - 1] ||
+            dag[i].layer != dag[i - 1].layer) {
+            run_begin = i;
+        }
         // `rows`, not the sampled head row count: lm_head is the one kind
         // whose GEMM runs on fewer rows, and it never splits -- its output is
         // the vocabulary, which is past `kQmmSplitMaxOut` on every checkpoint
         // here and would need partials of hundreds of megabytes.
-        const int split = llama_qmm_split(d.kind, g, R);
+        const int split = llama_qmm_split(d.kind, g, R, requests);
         if (split <= 1) continue;
         const KN kn = qmv_kn(d.kind, g);
         const Triple want{std::int32_t(kn.K / split),
-                          std::int32_t(kn.N) * std::int32_t(llama_qmm_rows(R)),
+                          std::int32_t(kn.N) *
+                              std::int32_t(llama_qmm_rows(R, requests)),
                           std::int32_t(split), {}, {}, {}};
         Triple* hit = nullptr;
         for (Triple& t : seen) {
@@ -374,13 +385,51 @@ int bind_llama_splitk(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             seen.push_back(t);
             hit = &seen.back();
         }
-        ctx.arg_bind_ordinal(d.ordinal, 8, partials);
+        const std::size_t lane = i - run_begin;
+        if (lane >= std::size_t(kLlamaSplitkConcurrentLanes)) continue;
+        ctx.arg_bind_ordinal(d.ordinal, 8, partials, lane * slice_bytes);
         ctx.arg_bind_ordinal(d.ordinal, 9, hit->k);
         ctx.arg_bind_ordinal(d.ordinal, 10, hit->st);
         ctx.arg_bind_ordinal(d.ordinal, 11, hit->sp);
         ++count;
     }
     return count;
+}
+
+int bind_llama_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                        const LlamaGeometry& g, int rows, int head_rows, int requests,
+                        const SlotHandle& staging, std::vector<SlotHandle>& keep) {
+    keep.clear();
+    if (!staging.valid() || g.is_moe() || g.quant.bits != 4 || g.quant.group != 64) return 0;
+    const int R = rows < 1 ? 1 : rows;
+    const int S = head_rows < 1 ? R : std::min(head_rows, R);
+    std::vector<std::pair<std::int32_t, SlotHandle>> counts;
+    int bound = 0;
+    for (const Dispatch& d : dag) {
+        const int m = d.kind == Kind::LmHead ? S : R;
+        if (llama_qmm_bn(d.kind, g, m, requests) <= 0) continue;
+        const KN kn = qmv_kn(d.kind, g);
+        const std::int32_t elems =
+            std::int32_t(llama_qmm_rows(m, requests)) * std::int32_t(kn.K);
+        SlotHandle count;
+        for (const auto& entry : counts) {
+            if (entry.first == elems) {
+                count = entry.second;
+                break;
+            }
+        }
+        if (!count.valid()) {
+            count = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            if (!count.valid()) continue;
+            *static_cast<std::int32_t*>(count.contents()) = elems;
+            counts.push_back({elems, count});
+            keep.push_back(count);
+        }
+        ctx.arg_bind_ordinal(d.ordinal, 12, staging);
+        ctx.arg_bind_ordinal(d.ordinal, 13, count);
+        ++bound;
+    }
+    return bound;
 }
 
 }  // namespace pie::metal::llama

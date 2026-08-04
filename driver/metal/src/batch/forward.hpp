@@ -117,6 +117,11 @@ struct MemberForwardDesc {
     std::uint32_t query_len = 0;
     std::uint32_t key_len = 0;
     std::uint32_t kv_len = 0;
+    // Prefer the device's exact greedy token for every readout row and skip
+    // full-logits staging when the family supports it. Other families retain
+    // the existing logits path, so this is an optimization request, not a
+    // capability requirement.
+    bool greedy_token_only = false;
 };
 
 // f32 logits materialized for this fire's readout rows, in
@@ -133,6 +138,10 @@ struct LogitsOut {
     std::uint64_t device_gpu_address = 0;
     std::uint64_t device_bytes = 0;
     std::uint32_t device_row_offset = 0;
+    // Optional Shared-storage device-greedy result. Valid until the next fire,
+    // like the logits view; `greedy_row_offset` selects this member's rows.
+    const std::uint32_t* greedy_contents = nullptr;
+    std::uint32_t greedy_row_offset = 0;
 };
 
 struct PtirCommandCallbacks {

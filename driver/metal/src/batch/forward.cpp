@@ -2751,10 +2751,12 @@ bool MetalExecutor::forward(const MemberForwardDesc& desc, LogitsOut& out, std::
         return false;
     }
     impl_->ptir_logits_next_row_ = 0;
-    if (!impl_->ensure_ptir_logits_rows(
-            static_cast<std::uint32_t>(
-                desc.readout_local_indices.size()),
-            err)) {
+    const SimpleFamilyEngine* simple = impl_->is_simple() ? impl_->simple_engine() : nullptr;
+    const bool device_greedy =
+        simple != nullptr && simple->paged() && simple->greedy_tokens_slot().valid();
+    if (!(desc.greedy_token_only && device_greedy) &&
+        !impl_->ensure_ptir_logits_rows(
+            static_cast<std::uint32_t>(desc.readout_local_indices.size()), err)) {
         return false;
     }
     const std::uint32_t slot = desc.has_rs_slot ? desc.rs_slot_id : 0u;
@@ -2835,10 +2837,15 @@ void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
         for (auto& e : errors) e = "PTIR callback/member count mismatch";
         return;
     }
+    const SimpleFamilyEngine* simple = impl_->is_simple() ? impl_->simple_engine() : nullptr;
+    const bool device_greedy =
+        simple != nullptr && simple->paged() && simple->greedy_tokens_slot().valid();
     std::uint32_t total_readout_rows = 0;
     for (const auto& desc : descs) {
-        total_readout_rows +=
-            static_cast<std::uint32_t>(desc.readout_local_indices.size());
+        if (!(desc.greedy_token_only && device_greedy && ptir == nullptr)) {
+            total_readout_rows +=
+                static_cast<std::uint32_t>(desc.readout_local_indices.size());
+        }
     }
     std::string staging_error;
     if (!impl_->ensure_ptir_logits_rows(total_readout_rows, &staging_error)) {
@@ -3330,6 +3337,7 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         for (auto& e : errors) e = "this family has no paged batch path";
         return false;
     }
+    const SlotHandle greedy_slot = eng->greedy_tokens_slot();
     const int page_size = eng->page_size();
     const std::uint32_t total_pages = std::uint32_t(eng->total_pages());
 
@@ -3468,6 +3476,7 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         for (const std::uint32_t local : d.readout_local_indices) {
             csr.sample_rows.push_back(row0 + local);
         }
+        if (d.greedy_token_only && greedy_slot.valid()) csr.run_argmax = true;
         accepted.push_back({i, row0});
     }
     if (accepted.empty()) return !any_rejected;
@@ -3479,8 +3488,10 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         LogitsOut& out = outs[a.member];
         out.vocab = vocab_;
         out.rows = std::uint32_t(descs[a.member].readout_local_indices.size());
-        out.device_row_offset = impl_->reserve_ptir_logits_rows(out.rows);
-        impl_->attach_ptir_logits_view(out);
+        if (!(descs[a.member].greedy_token_only && greedy_slot.valid() && ptir == nullptr)) {
+            out.device_row_offset = impl_->reserve_ptir_logits_rows(out.rows);
+            impl_->attach_ptir_logits_view(out);
+        }
     }
 
     // PTIR is told which rows are whose, and its group is finalized, BEFORE the
@@ -3519,7 +3530,9 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         std::uint32_t sample = 0;
         for (const Accepted& a : accepted) {
             const MemberForwardDesc& d = descs[a.member];
-            const bool direct = ptir != nullptr && (*ptir)[a.member].consumes_logits_directly;
+            const bool direct =
+                (d.greedy_token_only && greedy_slot.valid() && ptir == nullptr) ||
+                                (ptir != nullptr && (*ptir)[a.member].consumes_logits_directly);
             for (std::uint32_t r = 0; r < d.readout_local_indices.size(); ++r, ++sample) {
                 if (direct) continue;
                 impl_->pending_logits_stage_.push_back(
@@ -3596,6 +3609,19 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
     if (!stage_err.empty()) {
         for (const Accepted& a : accepted) errors[a.member] = stage_err;
         return false;
+    }
+
+    if (greedy_slot.valid() && greedy_slot.contents() != nullptr) {
+        const auto* tokens = static_cast<const std::uint32_t*>(greedy_slot.contents());
+        std::uint32_t sample = 0;
+        for (const Accepted& a : accepted) {
+            LogitsOut& out = outs[a.member];
+            if (descs[a.member].greedy_token_only) {
+                out.greedy_contents = tokens;
+                out.greedy_row_offset = sample;
+            }
+            sample += out.rows;
+        }
     }
 
     for (const Accepted& a : accepted) {

@@ -177,34 +177,38 @@ void check_tiling_agrees(const char* who, const LlamaGeometry& g) {
     int disagreed = 0;
     int gemm_rows_seen = 0;
     for (int rows = 1; rows <= 64; ++rows) {
-        for (const Dispatch& d : dag) {
-            const int m = d.kind == Kind::LmHead ? rows : rows;
-            const int bn = llama_qmm_bn(d.kind, g, m);
-            if (bn == 0) continue;
-            ++gemm_rows_seen;
-            // `launch_shape` builds its grid from exactly these; recompute them
-            // the way `pso_for` does and require the same answer.
-            Grid grid{};
-            Threadgroup tg{};
-            launch_shape(d, g, grid, tg, rows, rows);
-            Grid want{};
-            Threadgroup want_tg{};
-            // The row block comes from the BATCH. Asking it of the padded count
-            // is a different question once there are three rungs -- 40 rows pad
-            // to 64, and 64 answers "BM=64" while the grid was built for 32.
-            //
-            // And the split comes first, because a split projection launches a
-            // grid that is `split` deep in z against a pipeline that writes
-            // partials: choosing the split here and the plain grid there leaves
-            // the projection's real output buffer untouched.
-            if (const int split = llama_qmm_split(d.kind, g, m); split > 1) {
-                qmm_t_splitk_dispatch(qmv_kn(d.kind, g).N, llama_qmm_rows(m), qmm_bm(m), split,
-                                      want, want_tg);
-            } else {
-                qmm_t_dispatch(qmv_kn(d.kind, g).N, llama_qmm_rows(m), bn,
-                               qmm_bm(m), want, want_tg);
+        for (const int requests : {1, rows == 64 ? 64 : 1}) {
+            for (const Dispatch& d : dag) {
+                const int m = rows;
+                const int bn = llama_qmm_bn(d.kind, g, m, requests);
+                if (bn == 0) continue;
+                ++gemm_rows_seen;
+                // `launch_shape` builds its grid from exactly these; recompute them
+                // the way `pso_for` does and require the same answer.
+                Grid grid{};
+                Threadgroup tg{};
+                launch_shape(d, g, grid, tg, rows, rows, requests);
+                Grid want{};
+                Threadgroup want_tg{};
+                // The row block comes from the BATCH. Asking it of the padded count
+                // is a different question once there are three rungs -- 40 rows pad
+                // to 64, and 64 answers "BM=64" while the grid was built for 32.
+                //
+                // And the split comes first, because a split projection launches a
+                // grid that is `split` deep in z against a pipeline that writes
+                // partials: choosing the split here and the plain grid there leaves
+                // the projection's real output buffer untouched.
+                const int bm = rows == 64 && requests == 64 ? 32 : qmm_bm(m);
+                if (const int split = llama_qmm_split(d.kind, g, m, requests); split > 1) {
+                    qmm_t_splitk_dispatch(qmv_kn(d.kind, g).N,
+                                          llama_qmm_rows(m, requests), bm, split,
+                                          want, want_tg);
+                } else {
+                    qmm_t_dispatch(qmv_kn(d.kind, g).N,
+                                   llama_qmm_rows(m, requests), bn, bm, want, want_tg);
+                }
+                if (!same(grid, want) || !same(tg, want_tg)) ++disagreed;
             }
-            if (!same(grid, want) || !same(tg, want_tg)) ++disagreed;
         }
     }
     expect(gemm_rows_seen > 0, std::string(who) + ": the GEMM engages somewhere in 1..64 rows");
