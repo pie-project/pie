@@ -2187,22 +2187,53 @@ impl ResidencyPlanner {
     /// oversubscription.
     fn supply_stalled(&self) -> bool {
         let (free, _) = self.port.device_stats();
-        if free > 0 {
-            return false;
-        }
         self.with_inner(|inner| {
             if inner.kill_in_flight() {
                 return false;
             }
-            let Some((_, head)) = inner.unmet_head() else {
+            if inner.unmet_head().is_none() {
                 return false;
-            };
-            // Evictions already in flight are pages on their way back, so
-            // they count as supply exactly the way `accum` does — this is
-            // the same arithmetic `victim_set` uses to size its deficit.
-            // Only the shortfall THEY cannot cover justifies another round.
+            }
+            // Demand-exact over the WHOLE queued allocation demand, not just
+            // the head's ask. The old `free == 0 && head short` form started
+            // supply only after demand had already parked: free hovered at
+            // ~1 page, every 1-page boundary ask parked first (measured
+            // 614 parks/s against 39 evictions/s with 716 deferrals/s — the
+            // rung was evaluated constantly and deferred 18:1), and ~5 of
+            // the ~95 resident lanes were absent from every wave. Summing
+            // queued allocation demand orders the round as soon as the
+            // queue outgrows what free + accumulation + in-flight evictions
+            // can serve, so the free list runs slightly ahead of the
+            // boundary-ask stream and asks are served without parking.
+            // Restore demand is deliberately EXCLUDED: an eviction may not
+            // fund a restore (Rule A) — restores are funded by completions.
+            // And only SINGLE-PAGE asks (the allocation quantum — decode
+            // page-boundary asks, 87% of parks) are counted: the runway
+            // exists for the small-ask stream. Summing larger asks ordered
+            // overlapping rounds in tiny-pool regimes where the demand can
+            // never be co-resident (onefits: 58 starvation kills). With no
+            // quantum asks queued this reduces exactly to the previous
+            // head-shortfall predicate.
+            let queued_quantum: u32 = inner
+                .queue
+                .values()
+                .filter(|waiter| waiter.is_unmet())
+                .filter_map(|waiter| match &waiter.kind {
+                    WaitKind::Allocation { demand, .. } if demand.kv_pages == 1 => Some(1),
+                    _ => None,
+                })
+                .sum();
             let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
-            head.kv_need() > inner.accum.len() as u32 + expected
+            let supply = free + inner.accum.len() as u32 + expected;
+            if queued_quantum > supply {
+                return true;
+            }
+            // The classic liveness form: the head's own shortfall, with the
+            // pool empty.
+            free == 0
+                && inner
+                    .unmet_head()
+                    .is_some_and(|(_, head)| head.kv_need() > inner.accum.len() as u32 + expected)
         })
     }
 
