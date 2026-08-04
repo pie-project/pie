@@ -1224,6 +1224,19 @@ pub struct CudaNativeDriverOptions {
     /// normal case. One name for two meanings is a question a reader cannot
     /// answer from the file.
     pub max_total_pages: Option<u32>,
+    /// Measure the forward step on this boot instead of scoring it.
+    ///
+    /// The memory planner picks `max_forward_tokens` by scoring a candidate
+    /// lattice with an analytic model, and where that model disagreed with
+    /// reality the driver grew per-(model, GPU) special cases carrying
+    /// hand-measured constants. Setting this times the real forward body across
+    /// the budget ladder on THIS device and caches the winner, so the next boot
+    /// selects by evidence instead. **Costs seconds of startup**, so it is an
+    /// action rather than a setting: turn it on, boot once, turn it off.
+    ///
+    /// Refused for `tensor_parallel_size > 1` and for recurrent-state models,
+    /// with a reason on stderr — see `batch/planner_calibration.hpp`.
+    pub calibrate_planner: bool,
     /// Dtype weights are materialized in. Separate from `activation_dtype`:
     /// narrower weights and wider compute is a normal combination.
     pub weight_dtype: String,
@@ -1323,6 +1336,7 @@ impl Default for CudaNativeDriverOptions {
             kv_cache_dtype: "auto".to_string(),
             swap_pool_size: 0,
             max_total_pages: None,
+            calibrate_planner: false,
             weight_dtype: "bfloat16".to_string(),
             device: String::new(),
             verbose: false,

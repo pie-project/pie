@@ -15,6 +15,7 @@
 #include <toml++/toml.hpp>
 #endif
 
+#include "batch/planner_calibration.hpp"
 #include "store/kv_cache_format.hpp"
 
 namespace pie_cuda_driver {
@@ -70,6 +71,11 @@ struct BatchingConfig {
     // tiny deterministic pool can be forced (contention/preempt tests + CI),
     // independent of the forward-layout budget floor. Mirrors metal's total_pages.
     std::int64_t total_pages = 0;
+    // Time the forward step across the token-budget ladder on this boot and
+    // cache the winner, instead of selecting `max_forward_tokens` from the
+    // planner's analytic score. Costs seconds of startup; see
+    // batch/planner_calibration.hpp.
+    bool calibrate_planner = false;
 };
 
 // Tensor-parallel group geometry. Default {1, 0, ""} = single-GPU; nothing
@@ -184,6 +190,7 @@ inline Config load_config(const std::filesystem::path& path) {
             "swap_pool_size",
             "kv_cache_dtype",
             "total_pages",
+            "calibrate_planner",
         };
         for (const auto& [key, _] : *b) {
             const auto name = key.str();
@@ -232,6 +239,13 @@ inline Config load_config(const std::filesystem::path& path) {
                 "config: [batching].total_pages must be >= 0 (0 = derive from util)");
         }
         c.batching.total_pages = total_pages;
+        c.batching.calibrate_planner =
+            (*b)["calibrate_planner"].value_or(c.batching.calibrate_planner);
+        // Published here for the same reason as the cache dirs below: the
+        // memory planner and the batch engine both ask whether this boot is a
+        // calibration run, and neither is constructed anywhere that sees a
+        // `Config`.
+        set_planner_calibration_requested(c.batching.calibrate_planner);
     }
     if (auto d = tbl["distributed"].as_table()) {
         c.distributed.tp_size = static_cast<int>(

@@ -9,10 +9,17 @@
 // machine it is actually running on, and cache the result for the planner to
 // read on the next start (store/planner_profile_cache.hpp).
 //
-// Calibration is an explicit operator action (`PIE_CUDA_PLANNER_CALIBRATE=1`),
-// not something a serving process does behind your back — the sweep costs a few
-// seconds of startup and writes to `$HOME`. A process that never calibrates
-// selects exactly as it did before.
+// Calibration is an explicit operator action (`[batching] calibrate_planner`
+// in the driver's startup TOML, from `[driver] calibrate_planner` in the pie
+// config), not something a serving process does behind your back — the sweep
+// costs a few seconds of startup and writes to the profile cache. A process
+// that never calibrates selects exactly as it did before.
+//
+// It was `PIE_CUDA_PLANNER_CALIBRATE=1` until commit b38414903 deleted the env
+// var under the flag-deletion rule and left no replacement, which made the
+// whole file unreachable. The decision it carries is a real one the code cannot
+// make for itself — whether to spend startup time measuring — so it comes back
+// as config rather than as an environment variable.
 
 #include <cstddef>
 
@@ -24,6 +31,12 @@ struct BatchEngine;
 // can materialise the arenas the sweep needs without paying for them when it is
 // not going to run.
 bool planner_calibration_requested();
+
+// Publish the request. Called once by `load_config`, before anything reads it —
+// the same pattern as `mutable_cache_dir()`, and for the same reason: the
+// planner and the batch engine both ask, and neither is constructed anywhere
+// that sees a `Config`.
+void set_planner_calibration_requested(bool requested);
 
 // Sweeps the prefill token budget at the plan's own request width, times the
 // real forward body at each rung, and stores the fastest shape in the planner

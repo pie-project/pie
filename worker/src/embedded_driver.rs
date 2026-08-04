@@ -522,6 +522,13 @@ pub(crate) fn write_cuda_startup_toml(
         insert_int(&mut batching, "total_pages", pages);
     }
     insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
+    // Written only when asked for, like the derived keys above: the driver
+    // defaults it to false too, so emitting `false` would be a second spelling
+    // of an absent key. It also keeps the startup TOML saying nothing about
+    // calibration on every ordinary boot.
+    if opts.calibrate_planner {
+        insert_bool(&mut batching, "calibrate_planner", true);
+    }
     insert_table(&mut doc, "batching", batching);
 
     let mut runtime = toml::Table::new();
@@ -1197,6 +1204,9 @@ mod tests {
         );
         assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
         assert!(val["batching"].get("total_pages").is_none());
+        // An ordinary boot says nothing about calibration: it is an action an
+        // operator takes once, not a setting every startup file restates.
+        assert!(val["batching"].get("calibrate_planner").is_none());
         assert_eq!(val["batching"].as_table().unwrap().len(), 4);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         // Expert streaming is off unless an operator asks for it: for a model

@@ -180,7 +180,18 @@ bool run_shape(BatchEngine& engine,
 
 }  // namespace
 
-bool planner_calibration_requested() { return false; }
+namespace {
+// Set once by `load_config`, read by the planner and by the boot path. A plain
+// bool rather than an atomic: the write happens during config load, before any
+// thread that reads it exists.
+bool g_calibration_requested = false;
+}  // namespace
+
+bool planner_calibration_requested() { return g_calibration_requested; }
+
+void set_planner_calibration_requested(bool requested) {
+    g_calibration_requested = requested;
+}
 
 std::size_t calibrate_memory_planner(BatchEngine& engine,
                                      int tp_size,
