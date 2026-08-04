@@ -586,6 +586,17 @@ fn publish_encode_blob(
 }
 
 fn serve_encode_blob(mut stream: TcpStream) {
+    // The listener is non-blocking so the accept loop can poll for shutdown.
+    // On macOS/BSD `accept` hands that flag down to the accepted socket, while
+    // on Linux it does not — so without this the same code serves blobs one way
+    // on one platform and another way on the other. This handler is blocking by
+    // construction (four dedicated worker threads, one connection each), so put
+    // the socket back into the mode it is written for rather than leaving it to
+    // the platform.
+    if let Err(error) = stream.set_nonblocking(false) {
+        tracing::warn!(%error, "encode blob connection could not be made blocking");
+        return;
+    }
     let mut request = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     while request.len() <= 8192 && !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
@@ -622,8 +633,16 @@ fn serve_encode_blob(mut stream: TcpStream) {
             "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             bytes.len()
         );
-        let _ = stream.write_all(header.as_bytes());
-        let _ = stream.write_all(&bytes);
+        // A discarded write error here is worse than a failed fetch: the header
+        // has already promised `content-length`, so a short body reaches the
+        // peer as a well-formed response that is quietly truncated, and the
+        // content-address check on the other side is what ends up reporting it.
+        if let Err(error) = stream
+            .write_all(header.as_bytes())
+            .and_then(|()| stream.write_all(&bytes))
+        {
+            tracing::warn!(%error, len = bytes.len(), "encode blob response was not fully written");
+        }
     } else {
         let _ = stream
             .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
