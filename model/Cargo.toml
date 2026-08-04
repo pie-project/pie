@@ -1,0 +1,35 @@
+[package]
+name = "pie-model"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Model metadata, instruct chat templates, and multimodal (image/audio) host-side decode for Pie."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_model"
+path = "src/lib.rs"
+
+[features]
+# The contract aspect: family weight contracts authored here, compiled by
+# pie-loader. Off by default so chat-only consumers never pull the loader;
+# `capi` turns it on and nothing else, which is what keeps the driver link free
+# of tokenizer and (later) DSL machinery.
+contract = ["dep:pie-loader"]
+
+[dependencies]
+pie-tokenizer = { path = "../runtime/tokenizer" }
+# `default-features = false` drops the loader's testkit half — the authoring
+# side needs the algebra, never the host executor.
+pie-loader = { path = "../loader", default-features = false, optional = true }
+anyhow = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+# Host-side media decode for the model-agnostic multimodal API.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+
+[dev-dependencies]
+# The contract tests compile and verify what the authors declare, which is
+# the loader's whole job; the tests are the first caller of the pipeline the
+# capi crate will expose.
+pie-loader = { path = "../loader", default-features = false }

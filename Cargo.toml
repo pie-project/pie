@@ -19,8 +19,10 @@ members = [
     "runtime/tokenizer",
     # Constrained-decoding grammar engine (EBNF/regex/json-schema/matcher/bitmask).
     "runtime/grammar",
-    # Model metadata + instruct chat templates + multimodal host-decode.
-    "runtime/model",
+    # The model knowledge crate: what each family is, backend-blind — instruct
+    # chat templates and multimodal host-decode today; contract authoring and
+    # forward-pass programs land here as they migrate out of the drivers.
+    "model",
     # HF `config.json` normalization -> the `pie.model/1` descriptor. A leaf:
     # serde only, no driver and no runtime, so `pie model convert` can run it.
     "runtime/model-config",

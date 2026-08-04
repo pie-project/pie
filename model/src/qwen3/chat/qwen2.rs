@@ -6,7 +6,7 @@
 //!
 //! Reference: Qwen2.5 Jinja chat template.
 
-use crate::instruct::qwen3::{ChatMLConfig, QwenInstruct};
+use super::qwen3::{ChatMLConfig, QwenInstruct};
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 

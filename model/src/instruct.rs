@@ -11,24 +11,11 @@ pub struct ToolGrammar {
     pub source: String,
 }
 
-// Shared decoders
-pub mod decoders;
-
-// Model implementations
-pub mod gemma2;
-pub mod gemma3;
-pub mod gemma4;
-pub mod gptoss;
-pub mod kimi;
-pub mod llama2;
-pub mod llama3;
-pub mod mistral3;
-pub mod olmo2;
-pub mod olmo3;
-pub mod phi3;
-pub mod qwen2;
-pub mod qwen3;
-pub mod r1;
+// Shared decoders. The module lives in `common/`; re-exported here so
+// `crate::instruct::decoders` stays a valid path — it is what every template
+// imports, and the implementations moved to their family directories without
+// their imports needing to know.
+pub use crate::common::decoders;
 
 /// Events emitted by the chat decoder.
 #[derive(Debug, Clone)]
@@ -112,8 +99,14 @@ pub trait Instruct: Send + Sync {
 }
 
 /// Create the appropriate instruct implementation for the given architecture.
+///
+/// This match is the chat aspect's registry: `model_type` in, implementation
+/// out, with every N:1 reuse (nemotron_h speaking ChatML, deepseek_v4 speaking
+/// R1) stated as its own arm rather than implied by a directory. The rows
+/// dispatch on the *model type*; the family directories only organize the
+/// implementations.
 pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
-    use self::qwen3::{ChatMLConfig, QwenInstruct};
+    use crate::qwen3::chat::qwen3::{ChatMLConfig, QwenInstruct};
 
     match arch_name {
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_moe"
@@ -135,11 +128,11 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),
-        "qwen2" => Arc::new(self::qwen2::new(tokenizer)),
-        "llama2" => Arc::new(self::llama2::LlamaInstruct::new(tokenizer)),
-        "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
-        "r1" | "deepseek_v3" | "deepseek_v4" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
-        "kimi_k2" | "kimi_k25" | "kimi_k3" => Arc::new(self::kimi::KimiInstruct::new(tokenizer)),
+        "qwen2" => Arc::new(crate::qwen3::chat::qwen2::new(tokenizer)),
+        "llama2" => Arc::new(crate::llama::chat::llama2::LlamaInstruct::new(tokenizer)),
+        "llama3" | "l4ma" => Arc::new(crate::llama::chat::llama3::LlamaInstruct::new(tokenizer)),
+        "r1" | "deepseek_v3" | "deepseek_v4" => Arc::new(crate::r1::chat::R1Instruct::new(tokenizer)),
+        "kimi_k2" | "kimi_k25" | "kimi_k3" => Arc::new(crate::kimi::chat::KimiInstruct::new(tokenizer)),
         "glm_moe_dsa" => Arc::new(QwenInstruct::new(
             tokenizer,
             ChatMLConfig {
@@ -149,36 +142,36 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
             },
         )),
-        "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
-        "gemma2" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
-        "gemma3" => Arc::new(self::gemma3::Gemma3Instruct::for_variant(
+        "gptoss" | "gpt_oss" => Arc::new(crate::gptoss::chat::GptOssInstruct::new(tokenizer)),
+        "gemma2" => Arc::new(crate::gemma::chat::gemma2::GemmaInstruct::new(tokenizer)),
+        "gemma3" => Arc::new(crate::gemma::chat::gemma3::Gemma3Instruct::for_variant(
             tokenizer,
-            self::gemma3::Gemma3Variant::Gemma3,
+            crate::gemma::chat::gemma3::Gemma3Variant::Gemma3,
         )),
-        "gemma3_text" => Arc::new(self::gemma3::Gemma3Instruct::for_variant(
+        "gemma3_text" => Arc::new(crate::gemma::chat::gemma3::Gemma3Instruct::for_variant(
             tokenizer,
-            self::gemma3::Gemma3Variant::Gemma3Text,
+            crate::gemma::chat::gemma3::Gemma3Variant::Gemma3Text,
         )),
-        "gemma3n" => Arc::new(self::gemma3::Gemma3Instruct::for_variant(
+        "gemma3n" => Arc::new(crate::gemma::chat::gemma3::Gemma3Instruct::for_variant(
             tokenizer,
-            self::gemma3::Gemma3Variant::Gemma3n,
+            crate::gemma::chat::gemma3::Gemma3Variant::Gemma3n,
         )),
-        "gemma3n_text" => Arc::new(self::gemma3::Gemma3Instruct::for_variant(
+        "gemma3n_text" => Arc::new(crate::gemma::chat::gemma3::Gemma3Instruct::for_variant(
             tokenizer,
-            self::gemma3::Gemma3Variant::Gemma3nText,
+            crate::gemma::chat::gemma3::Gemma3Variant::Gemma3nText,
         )),
-        "gemma4" => Arc::new(self::gemma4::Gemma4Instruct::for_variant(
+        "gemma4" => Arc::new(crate::gemma::chat::gemma4::Gemma4Instruct::for_variant(
             tokenizer,
-            self::gemma4::Gemma4Variant::Gemma4,
+            crate::gemma::chat::gemma4::Gemma4Variant::Gemma4,
         )),
-        "gemma4_text" => Arc::new(self::gemma4::Gemma4Instruct::for_variant(
+        "gemma4_text" => Arc::new(crate::gemma::chat::gemma4::Gemma4Instruct::for_variant(
             tokenizer,
-            self::gemma4::Gemma4Variant::Gemma4Text,
+            crate::gemma::chat::gemma4::Gemma4Variant::Gemma4Text,
         )),
-        "mistral3" | "ministral3" => Arc::new(self::mistral3::MistralInstruct::new(tokenizer)),
-        "olmo2" => Arc::new(self::olmo2::Olmo2Instruct::new(tokenizer)),
-        "olmo3" => Arc::new(self::olmo3::OlmoInstruct::new(tokenizer)),
-        "phi3" => Arc::new(self::phi3::Phi3Instruct::new(tokenizer)),
+        "mistral3" | "ministral3" => Arc::new(crate::mistral::chat::MistralInstruct::new(tokenizer)),
+        "olmo2" => Arc::new(crate::olmo::chat::olmo2::Olmo2Instruct::new(tokenizer)),
+        "olmo3" => Arc::new(crate::olmo::chat::olmo3::OlmoInstruct::new(tokenizer)),
+        "phi3" => Arc::new(crate::phi::chat::Phi3Instruct::new(tokenizer)),
         _ => Arc::new(QwenInstruct::new(
             tokenizer,
             ChatMLConfig {

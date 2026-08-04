@@ -1,15 +1,45 @@
-//! Model Service - Model registration and tokenizer management
+//! What each model family is, backend-blind.
 //!
-//! This module provides model metadata and tokenizer management via a global cache.
-//! All model and tokenizer operations access the cache directly without message passing.
+//! Organized family-first: one directory per lineage (`llama/`, `qwen3/`,
+//! `gemma/`, …), one file per aspect inside it — `chat/` today; `contract.rs`
+//! and `forward.rs` as those aspects migrate out of the drivers. `common/`
+//! holds what every family shares and knows about none of them.
+//!
+//! The aspects deliberately partition the model space differently: templates
+//! split by release (llama2 vs llama3), contracts by storage schema (phi3
+//! loads as llama), forward passes by compute graph. So directories organize
+//! and never dispatch — each aspect has its own registry keyed by
+//! `model_type`, with every N:1 reuse written out as a row
+//! (`instruct::create` is the chat aspect's).
+//!
+//! This crate also still carries the model *service* — the global model/
+//! tokenizer cache below — which is runtime machinery rather than family
+//! knowledge; it is slated to move back under `runtime/` once the contract
+//! aspect lands and the crate's consumers split into knowledge-only (capi)
+//! and runtime callers.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 
+// The aspects' shared vocabulary and traits.
+pub mod common;
+#[cfg(feature = "contract")]
+pub mod contract;
 pub mod instruct;
 pub mod multimodal;
+
+// The families, one directory per lineage.
+pub mod gemma;
+pub mod gptoss;
+pub mod kimi;
+pub mod llama;
+pub mod mistral;
+pub mod olmo;
+pub mod phi;
+pub mod qwen3;
+pub mod r1;
 
 use instruct::Instruct;
 use pie_tokenizer::Tokenizer;
