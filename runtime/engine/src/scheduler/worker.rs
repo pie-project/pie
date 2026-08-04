@@ -462,12 +462,13 @@ fn spatial_mask_compose_enabled() -> bool {
 }
 
 /// The mixed fire (M-1): masked envelopes composing with multi-token
-/// rows. DEFAULT OFF (`PIE_SPATIAL_MIXED=1` arms) until the driver
-/// serves the shape without the placeholder-CSR crash.
+/// rows — the prefill-class mask peel serves the shape on all three
+/// legs. DEFAULT ON (`PIE_SPATIAL_MIXED=0` disarms and restores the
+/// pre-mixed refusals).
 fn spatial_mixed_compose_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("PIE_SPATIAL_MIXED").is_ok_and(|v| v == "1")
+        !std::env::var("PIE_SPATIAL_MIXED").is_ok_and(|v| v == "0")
     })
 }
 
@@ -7726,11 +7727,12 @@ mod tests {
             let mut prefill = dummy_launch_request(ProcessId::new_v4(), 3);
             prefill.request = dummy_prefill(64);
             assert!(
-                !grouping.accepts(&prefill, limits, 16),
-                "a chunk-prefill fire must not join a masked \
-                 device-geometry fire while the mixed fire is DISARMED \
-                 (PIE_SPATIAL_MIXED=1 arms M-1; the driver's mixed \
-                 shape still crashes on placeholder CSRs)"
+                grouping.accepts(&prefill, limits, 16),
+                "the mixed fire (default ON): a chunk-prefill fire \
+                 composes with a host-lowered masked device-geometry \
+                 fire — the prefill-class mask peel serves the shape \
+                 (prefix causal dispatch, masked 1-token suffix; \
+                 PIE_SPATIAL_MIXED=0 restores the refusal)"
             );
             assert!(
                 grouping.accepts(&envelope_decode(4), limits, 16),

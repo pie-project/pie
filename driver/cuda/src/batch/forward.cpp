@@ -822,16 +822,14 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     // from the host qo indptr (the suffix starts on a request
     // boundary). Prepare re-validates the shape and keeps the
     // fire-level arm when it does not hold.
-    // ARMED OFF (PIE_SPATIAL_MIXED=1 arms): the mixed SPLIT still reads
-    // placeholder host CSRs for envelope-composed masked lanes when the
-    // frame pack did not thread resolver counts (measured: illegal
-    // access with or without the side stream). The mixed FIRE itself is
-    // live and correct through the fire-level custom arm (causal-mask
-    // synthesis); the split+streams engage once the pack extension
-    // lands.
+    // DEFAULT ON (PIE_SPATIAL_MIXED=0 disarms): the mixed fire — a
+    // prefill-shaped masked fire splits into the prefix causal dispatch
+    // and the masked suffix custom dispatch (its own plan workspace, its
+    // own stream). All three legs serve it; numerics sit in the generic
+    // co-batch equality class (control-proven).
     static const bool spatial_mixed_armed = [] {
         const char* v = std::getenv("PIE_SPATIAL_MIXED");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     const bool use_spatial_mask_mixed = spatial_mixed_armed &&
         spatial_mask_enabled() &&

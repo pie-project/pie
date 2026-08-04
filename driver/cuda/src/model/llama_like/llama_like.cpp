@@ -2003,6 +2003,25 @@ void llama_like_forward_paged(
                         "mask plan");
                 }
                 const bool side_on = spatial_stream_enabled();
+                // Diagnostic span timing (PIE_SPATIAL_STREAM_TIMING=1):
+                // layer 0's fork->join wall, printed per fire — the
+                // overlap evidence when no profiler is installed
+                // (compare side=1 against PIE_SPATIAL_STREAM=0 runs).
+                static const bool span_timing = [] {
+                    const char* v =
+                        std::getenv("PIE_SPATIAL_STREAM_TIMING");
+                    return v != nullptr && v[0] == '1';
+                }();
+                static cudaEvent_t span_t0 = nullptr;
+                static cudaEvent_t span_t1 = nullptr;
+                const bool time_this = span_timing && L == 0;
+                if (time_this && span_t0 == nullptr) {
+                    CUDA_CHECK(cudaEventCreate(&span_t0));
+                    CUDA_CHECK(cudaEventCreate(&span_t1));
+                }
+                if (time_this) {
+                    CUDA_CHECK(cudaEventRecord(span_t0, stream));
+                }
                 cudaStream_t custom_stream = stream;
                 SpatialSideStream* ss = nullptr;
                 if (side_on) {
@@ -2040,6 +2059,18 @@ void llama_like_forward_paged(
                 if (side_on) {
                     CUDA_CHECK(cudaEventRecord(ss->join, ss->stream));
                     CUDA_CHECK(cudaStreamWaitEvent(stream, ss->join, 0));
+                }
+                if (time_this) {
+                    CUDA_CHECK(cudaEventRecord(span_t1, stream));
+                    CUDA_CHECK(cudaEventSynchronize(span_t1));
+                    float ms = 0.f;
+                    CUDA_CHECK(cudaEventElapsedTime(
+                        &ms, span_t0, span_t1));
+                    std::fprintf(
+                        stderr,
+                        "[spatial-stream] L0 attn span %.3f ms "
+                        "(side=%d)\n",
+                        ms, side_on ? 1 : 0);
                 }
             } else {
                 ops::dispatch_attention_flashinfer_prefill_custom(
