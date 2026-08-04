@@ -1615,3 +1615,82 @@ mixed-k fires (PQ-tree), truncated x mask / truncated x hooks / x
 lora (blocking rule refuses), trained exit heads (weights don't
 exist; logit-lens is the honest v0 head). Each is a recorded rung,
 not a silent gap.
+
+## THE MIXED FIRE DIRECTIVE (2026-08-04): decode + masked decode + prefill, one pass, two streams
+
+The user's target example, verbatim: one batched forward pass carrying
+custom-mask decode (the prefill kernel), causal-mask decode, and
+prefill together — with the custom-mask attention and the prefill
+attention on DIFFERENT STREAMS. Mapped onto the organs:
+
+What already exists: plain decode + prefill co-batch TODAY (the
+chunk-prefill clause in worker.rs is deliberately narrow — only
+page-mask x multitoken and mask x multitoken refuse); the driver runs
+such a fire through the PREFILL class, decode lanes as 1-token
+qo_indptr entries through the causal prefill dispatch. Streams exist
+in pieces (CudaStreamOwner, the supergraph's non-blocking stream).
+
+What blocks the example: exactly one clause — a wire-masked decode
+lane refuses multi-token groups (and conversely), because the prefill
+class's mask arm is still the FIRE-LEVEL custom dispatch: it would
+take every row through the custom kernel, and synthesizing causal
+masks for prefill rows explodes (the recorded reason for the
+refusal). The fix is the one we already know: THE MASK PEEL
+GENERALIZES TO THE PREFILL CLASS. Seriation puts masked decode rows
+last; the causal prefill dispatch serves the prefix rows (prefill
+AND plain-decode rows — v0 keeps them merged in one causal dispatch,
+the decode-kernel specialization of plain rows is a later rung); the
+custom dispatch serves the masked suffix. Same PeelWindow::
+UnmaskedPrefix word, now stated in the Prefill class arm too.
+
+THE ONE NEW INVARIANT — two split words: in a pure-decode fire,
+request index == token row, and the single planned word served both
+the CSR offset (+split requests) and the q/o row offset (bf16_row at
+split rows). In a mixed fire they DIVERGE (prefill rows contribute
+many tokens): the wire needs BOTH the unmasked-prefix REQUEST count
+(CSR/mask-indptr/last-lens offsets, suffix plan geometry) and the
+unmasked-prefix TOKEN-ROW count (q/out pointer offsets). Threading
+the second word retraces the first's exact path (batch.rs ->
+reserved ABI slot -> step_launch/launch_view -> prepare/dispatch).
+
+THE STREAM FORK (the requirement's second half): within the layer
+body, after the KV write completes, the causal prefill dispatch and
+the custom dispatch have disjoint outputs (attn_out row windows) and
+read-only-shared inputs (q, the layer's KV) — a textbook fork:
+  event E1 on main stream after KV write; stream B waits E1;
+  causal dispatch on main, custom dispatch on B; event E2 on B;
+  main waits E2 before o_proj.
+One secondary stream per context (CudaStreamOwner pattern), events
+reused per layer. Prefill-shaped fires run EAGER (no decode-graph
+capture applies), so v0 needs no graph-side stream work — capture-
+time forking (parallel graph branches) is a recorded later rung.
+
+THE LADDER:
+  M-1 engine: relax the mask x multitoken refusals for wire-BRLE
+      masked decode lanes (both join directions); seriation orders
+      [prefill | plain decode | masked decode] rows; plan BOTH split
+      words (requests + token rows); UNPLANNED stays the hooks/lora/
+      structured escape. Gate: PIE_SPATIAL_MASK (same switch — the
+      axis is the same).
+  M-2 driver: the Prefill class mask arm becomes the peel
+      (dsl::peel_masked with the causal-dispatch region and the
+      custom region); prepare builds the suffix mask plan for
+      prefill-shaped fires (the resolver-geometry pattern verbatim);
+      hand-written + interpreter + emitter learn the token-row
+      offset forms (the decode-class forms parameterized by the
+      second word). Goldens regenerate; phi3/XQA keep fire-level.
+  M-3 streams: the custom region dispatches on the secondary stream
+      between the fork/join events; ONLY when the peel is planned
+      (fire-level custom keeps the main stream). A PIE_SPATIAL_
+      STREAM=0 escape hatch for bisection.
+  M-4 the example battery: one fire holding [prefill lane, plain
+      decode lane, masked decode lane]; numerics leg (mixed ==
+      each solo's rows, the composed-fire equality class); overlap
+      leg (wall time of the fire vs =0, and an nsys trace showing
+      the two dispatches overlapped); the three-leg parity sweep.
+
+V0 exclusions, loud: plain-decode-row specialization to the decode
+kernel inside mixed fires (they ride the causal dispatch); graph
+capture of mixed fires (eager); masked x hooks/lora (UNPLANNED as
+today); multiple masked programs already work (the N-program tiling
+carries over).
