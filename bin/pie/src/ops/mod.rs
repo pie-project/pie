@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod bakery;
+pub mod cache;
 pub mod config;
 pub mod diag;
 pub mod doctor;

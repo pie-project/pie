@@ -54,6 +54,12 @@ enum Command {
         cmd: ops::auth::AuthCmd,
     },
 
+    /// Inspect what pie has written under `$PIE_HOME`.
+    Cache {
+        #[command(subcommand)]
+        cmd: ops::cache::CacheCmd,
+    },
+
     /// Manage configuration (init / show / set).
     Config {
         #[command(subcommand)]
@@ -153,6 +159,11 @@ async fn main() -> anyhow::Result<ExitCode> {
         Command::Auth { cmd } => {
             startup::init_cli(&cli.global)?;
             ops::auth::run(cmd)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Cache { cmd } => {
+            startup::init_cli(&cli.global)?;
+            ops::cache::run(cmd)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Config { cmd } => {
