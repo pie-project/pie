@@ -801,6 +801,46 @@ bool decode_fused_post_enabled() {
     return enabled;
 }
 
+// The kvpp SENTRY (the probabilistic composed-R=32 fault, 2026-08-04:
+// flashinfer's PrefillSplitQOKVIndptr asserting on kv_indptr garbage —
+// e.g. -1160232626 at entry 13 — in the first-boot window, twice
+// sighted, never under trace). Host plan inputs are validated HERE,
+// before any planner consumes them, and a violation dumps the arrays
+// UNCONDITIONALLY and refuses the fire cleanly — the heisenbug becomes
+// a self-documenting event at its next occurrence instead of a deep
+// planner assert. Cost: one R-length scan per prepare.
+static void kvpp_sentry(
+    const char* what,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests)
+{
+    for (int r = 0; r < num_requests; ++r) {
+        const bool qo_bad =
+            qo_indptr_h != nullptr && qo_indptr_h[r + 1] < qo_indptr_h[r];
+        const bool kv_bad = kv_page_indptr_h != nullptr &&
+                            kv_page_indptr_h[r + 1] < kv_page_indptr_h[r];
+        if (!qo_bad && !kv_bad) continue;
+        std::fprintf(stderr,
+                     "[kvpp-sentry] %s: NON-MONOTONE host plan input at "
+                     "lane %d of %d\n",
+                     what, r, num_requests);
+        for (int i = 0; i <= num_requests; ++i) {
+            std::fprintf(
+                stderr, "[kvpp-sentry]   [%d] qo=%d kvpp=%d\n", i,
+                qo_indptr_h != nullptr
+                    ? static_cast<std::int32_t>(qo_indptr_h[i])
+                    : -1,
+                kv_page_indptr_h != nullptr
+                    ? static_cast<std::int32_t>(kv_page_indptr_h[i])
+                    : -1);
+        }
+        throw std::runtime_error(
+            std::string("kvpp sentry: non-monotone host plan input (") +
+            what + ") — the composed-placeholder fault; arrays dumped");
+    }
+}
+
 void prepare_llama_like_decode_plan(
     LlamaLikePlanState& state,
     AttentionWorkspace& attn_ws,
@@ -1258,6 +1298,7 @@ void prepare_llama_like_decode_plan(
     }
     const int min_prefill_decode_pages =
         std::max(0, fwd_cfg.prefill_decode_min_kv_pages);
+    kvpp_sentry("prepare", qo_indptr_h, kv_page_indptr_h, num_requests);
     // ④ Act 1: bands are re-stamped per fire; a deployment branch that
     // returns early must not leave a previous fire's bands armed.
     state.depth_band_count = 0;
