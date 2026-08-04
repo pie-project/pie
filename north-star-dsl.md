@@ -2031,3 +2031,22 @@ both. The win compounds with lane counts exactly as the per-axis
 numbers measured (mask const-6%-tax vs +27%, depth 1.32-2.25x,
 correction 3.3-5.0x); the product battery's value is that ALL of it
 now happens in ONE fire. bench_product.py in the wiki.
+
+## AC-5: THE CENSUS (2026-08-04) — 12/15 subsets fire as products
+
+The formal product-space census (ac5_census.py: every non-empty
+subset of {hook, mask, lora, depth}, one lane per axis + a plain
+anchor, verdict from the fire trace):
+
+  PRODUCT: 12 of 15 — including hook+mask+lora+depth itself,
+           every mask-anchored combination, and all singles.
+  PARTIAL: 3 — hook+lora, hook+depth, hook+lora+depth: the
+           hook-with-depth cases are the RECORDED anchor decline
+           (hooked depth composes only behind a mask word today);
+           hook+lora composed in earlier boots — its PARTIAL here is
+           launch phasing at 48 tokens, not a refusal.
+  SOLO:    0. Nothing is left out of the co-batch entirely.
+
+Zero incidents across the sweep. The k+1 world is gone: the product
+space the north-star sells is measurably open on this hardware, with
+three cells waiting on the hook-word anchor refinement.
