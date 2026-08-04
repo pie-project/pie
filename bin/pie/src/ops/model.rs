@@ -18,6 +18,15 @@ use crate::ops::hf::runtime_snapshot_allow_patterns;
 
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
+    /// Show what pie knows about one cached model.
+    Info {
+        /// HuggingFace repo ID, e.g. `Qwen/Qwen3-0.6B`.
+        repo_id: String,
+        /// Emit one JSON document instead of the report.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List repo IDs already in the local HF cache.
     List {
         /// Emit one JSON document instead of the table.
@@ -46,6 +55,7 @@ pub enum ModelCmd {
 
 pub fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
+        ModelCmd::Info { repo_id, json } => info(repo_id, json),
         ModelCmd::List { json } => list(json),
         ModelCmd::Download { repo_id, all } => download(repo_id, all),
         ModelCmd::Remove { repo_id, yes } => remove(repo_id, yes),
@@ -225,6 +235,112 @@ fn list(json: bool) -> Result<()> {
     }
     table.print(&palette);
     println!("\n{dim}{}{reset}", crate::ui::short_path(&hub));
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// info
+// -----------------------------------------------------------------------------
+
+/// The snapshot directory for a cached repo, and what it weighs.
+fn snapshot_of(repo_dir: &Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(repo_dir.join("snapshots"))
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+}
+
+/// `pie model info <repo>` -- the answers `list` has no room for.
+///
+/// Deliberately about the model on THIS disk rather than about the model in the
+/// abstract: which snapshot, what it weighs, whether this build can serve it,
+/// and what to write in the config if it can. A registry lookup would be a
+/// different command, and would need the network to answer.
+fn info(repo_id: String, json: bool) -> Result<()> {
+    let (owner, name) = parse_repo_id(&repo_id)?;
+    let repo_dir = hub_dir().join(format!("models--{owner}--{name}"));
+    if !repo_dir.exists() {
+        bail!(
+            "{repo_id} is not downloaded; `pie model download {repo_id}` fetches it"
+        );
+    }
+    let snapshot = snapshot_of(&repo_dir);
+    let (servable, detail) = check_pie_compatibility(&repo_dir);
+    // The blobs, not the snapshot: the snapshot is symlinks into them, so
+    // walking it would either follow the links and double-count or report the
+    // size of the links themselves.
+    let bytes = pie_worker::state::disk_usage(&repo_dir.join("blobs"));
+    let files: Vec<String> = snapshot
+        .as_ref()
+        .and_then(|s| std::fs::read_dir(s).ok())
+        .map(|it| {
+            let mut names: Vec<String> = it
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            names.sort();
+            names
+        })
+        .unwrap_or_default();
+
+    if json {
+        return crate::ui::emit_json(&serde_json::json!({
+            "repo_id": repo_id,
+            "servable": servable,
+            // The architecture when pie can serve it, the reason when it
+            // cannot -- which is why this is not called "arch".
+            "detail": detail,
+            "snapshot": snapshot,
+            "bytes": bytes,
+            "files": files,
+        }));
+    }
+
+    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
+    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
+    println!("{bold}{repo_id}{reset}");
+    let mut table = crate::ui::Table::new(
+        [crate::ui::Align::Left, crate::ui::Align::Left],
+        1,
+    );
+    let mark = if servable {
+        crate::ui::Mark::Plain
+    } else {
+        crate::ui::Mark::Absent
+    };
+    table.push(crate::ui::Row::new(
+        mark,
+        [
+            "arch".into(),
+            if servable {
+                detail.clone()
+            } else {
+                format!("pie cannot serve this ({detail})")
+            },
+        ],
+    ));
+    table.push(crate::ui::Row::new(
+        crate::ui::Mark::Plain,
+        ["size".into(), crate::ui::bytes(bytes)],
+    ));
+    table.push(crate::ui::Row::new(
+        crate::ui::Mark::Plain,
+        [
+            "files".into(),
+            format!("{} in the snapshot", files.len()),
+        ],
+    ));
+    if let Some(snapshot) = &snapshot {
+        table.push(crate::ui::Row::new(
+            crate::ui::Mark::Plain,
+            ["snapshot".into(), crate::ui::short_path(snapshot)],
+        ));
+    }
+    table.print(&palette);
+    if servable {
+        println!("\n{dim}[model]\nhf_repo = \"{repo_id}\"{reset}");
+    }
     Ok(())
 }
 

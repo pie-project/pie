@@ -46,6 +46,9 @@ pub struct InfoArgs {
     /// Inferlet name, with optional version (e.g. `chat-completion`
     /// or `chat-completion@0.1.0`).
     pub inferlet: String,
+    /// Emit one JSON document instead of the report.
+    #[arg(long)]
+    pub json: bool,
 }
 
 pub async fn run(cmd: InferletCmd, global: &startup::GlobalArgs) -> Result<()> {
@@ -192,6 +195,32 @@ async fn info(args: InfoArgs, global: &startup::GlobalArgs) -> Result<()> {
     let program = resolve_inferlet_id(&args.inferlet, &cfg.server.registry).await?;
     let manifest = Manifest::from_url(&cfg.server.registry, &program).await?;
 
+    if args.json {
+        // The manifest as the registry serves it, plus the resolved version --
+        // which is the part the caller could not have known, since a bare name
+        // means "newest".
+        return ui::emit_json(&serde_json::json!({
+            "name": program.name,
+            "version": program.version,
+            "description": manifest.package.description,
+            "authors": manifest.package.authors,
+            "repository": manifest.package.repository,
+            "runtime": manifest.runtime,
+            "dependencies": manifest.dependencies,
+            "parameters": manifest
+                .parameters
+                .iter()
+                .map(|(name, p)| {
+                    serde_json::json!({
+                        "name": name,
+                        "type": format!("{:?}", p.param_type).to_lowercase(),
+                        "optional": p.optional,
+                        "description": p.description,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }));
+    }
     print_manifest(&program, &manifest);
     Ok(())
 }

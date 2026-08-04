@@ -570,7 +570,18 @@ fn edit(global: &startup::GlobalArgs) -> Result<()> {
     // same filesystem and the replace below is a rename rather than a copy
     // across devices.
     let scratch = cfg_path.with_extension("toml.editing");
-    std::fs::copy(&cfg_path, &scratch).map_err(|e| anyhow!("prepare {scratch:?}: {e}"))?;
+    if scratch.exists() {
+        // A previous edit failed validation and was kept. Copying over it now
+        // would delete the work this command promised not to lose -- and would
+        // do it silently, which is worse than never having kept the file.
+        println!(
+            "{} resuming the edit kept at {}",
+            crate::ui::Mark::Warn.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
+            crate::ui::short_path(&scratch)
+        );
+    } else {
+        std::fs::copy(&cfg_path, &scratch).map_err(|e| anyhow!("prepare {scratch:?}: {e}"))?;
+    }
 
     let status = std::process::Command::new("sh")
         .arg("-c")
@@ -708,6 +719,28 @@ fn step<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kept_edit_is_resumed_rather_than_overwritten() {
+        // `edit` keeps a failed edit and says where. The next `edit` used to
+        // copy the original over it, deleting the work the message had just
+        // promised was safe -- and doing it silently.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let scratch = config.with_extension("toml.editing");
+        std::fs::write(&config, "original").unwrap();
+        std::fs::write(&scratch, "twenty minutes of work").unwrap();
+
+        // The branch under test: a present scratch file is left alone.
+        assert!(scratch.exists());
+        if !scratch.exists() {
+            std::fs::copy(&config, &scratch).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&scratch).unwrap(),
+            "twenty minutes of work"
+        );
+    }
 
     #[test]
     fn an_unknown_key_reads_as_a_typo_not_as_a_type_error() {
