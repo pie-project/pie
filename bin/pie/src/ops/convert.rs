@@ -38,8 +38,9 @@ use pie_loader::checkpoint::read::parse_checkpoint_metadata;
 use pie_loader::checkpoint::write::CheckpointWriter;
 use pie_loader::checkpoint::{CheckpointMetadata, RawTensor};
 use pie_loader::contract::materialize::materialize_contract;
+use pie_loader::executor::host::Progress;
+use pie_loader::executor::sink::TensorSink;
 use pie_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
-use pie_loader::testkit::host_executor::Progress;
 use pie_loader::types::{CheckpointFormat, TensorDecl, Visibility};
 
 // The artifact's on-disk names come from whoever owns them: the loader owns
@@ -223,9 +224,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut passthrough: Vec<(&RawTensor, &str)> =
         Vec::with_capacity(materialization.passthrough.len());
     for name in &materialization.passthrough {
-        let raw = metadata.tensor_by_name(name).ok_or_else(|| {
-            anyhow!("'{name}' is in the materialization but not the checkpoint")
-        })?;
+        let raw = metadata
+            .tensor_by_name(name)
+            .ok_or_else(|| anyhow!("'{name}' is in the materialization but not the checkpoint"))?;
         let file = metadata
             .files
             .iter()
@@ -250,8 +251,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let started = std::time::Instant::now();
     let mut bar = ProgressLine::new();
 
-    // Decode phase: only the blocked tensors go through the plan executor,
-    // so only they are ever resident.
+    // Decode phase: the blocked tensors stream through the plan executor
+    // into a disk spool, one at a time. Peak memory is one tensor's working
+    // set, not the decoded set — which for an F16 checkpoint is the whole
+    // model, the case that made the old collect-everything executor a
+    // 2x-model-size boot. The spool holds the decoded bytes so the ascending
+    // merge below can still interleave them with the passthrough copies.
     let mut decode_read_bytes = 0u64;
     let decoded = if materialization.contract.tensors.is_empty() {
         None
@@ -263,9 +268,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         };
         let plan = pie_loader::plan::compile(&metadata, &materialization.contract, target)
             .map_err(|err| anyhow!("cannot compile the decode: {err}"))?;
-        let storage = pie_loader::testkit::host_executor::execute_plan_with_progress(
+        let mut spool = Spool::create(&out_file)?;
+        pie_loader::executor::host::execute_plan_into(
             &plan,
             &source.base(),
+            &mut spool,
             &mut |progress| {
                 decode_read_bytes = progress.total_read_bytes;
                 bar.render(&Progress {
@@ -276,7 +283,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             },
         )
         .map_err(|err| anyhow!("decoding failed: {err}"))?;
-        Some((plan, storage))
+        Some((plan, spool))
     };
 
     let provenance = BTreeMap::from([
@@ -288,9 +295,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         None => CheckpointWriter::create(&out_file, &provenance),
     }
     .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
+    let mut decoded = decoded;
     let written_bytes = write_artifact(
         &mut writer,
-        decoded.as_ref(),
+        decoded.as_mut(),
         &passthrough,
         &meta,
         &mut bar,
@@ -301,6 +309,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     writer
         .finish()
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
+    if let Some((_, spool)) = decoded {
+        spool.remove();
+    }
 
     println!(
         "{}: {} MB in {:.1?} → {}",
@@ -379,6 +390,84 @@ fn remove_cache_file(path: &Path) -> Result<()> {
             .with_context(|| format!("cannot delete {}", target.display()))?;
     }
     Ok(())
+}
+
+/// The decoded tensors, spooled to disk beside the artifact.
+///
+/// The executor streams tensors out in schedule order; the artifact writer
+/// needs them back in ascending-name order, interleaved with the passthrough
+/// copies. The spool is the buffer between the two orders, and it is a file
+/// rather than a map so the buffer costs disk instead of memory — the
+/// decoded set is the whole model for an F16 checkpoint.
+struct Spool {
+    path: PathBuf,
+    file: std::fs::File,
+    index: BTreeMap<String, (u64, u64)>,
+    offset: u64,
+}
+
+impl Spool {
+    fn create(out_file: &Path) -> Result<Self> {
+        // Beside the artifact, so it lands on the same filesystem the bytes
+        // are headed for anyway.
+        let path = out_file.with_extension("spool.tmp");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("cannot create spool {}", path.display()))?;
+        Ok(Self {
+            path,
+            file,
+            index: BTreeMap::new(),
+            offset: 0,
+        })
+    }
+
+    fn read(&mut self, name: &str) -> Result<Vec<u8>> {
+        let (offset, len) = *self
+            .index
+            .get(name)
+            .ok_or_else(|| anyhow!("the plan declared '{name}' but produced nothing"))?;
+        let mut bytes = vec![0u8; len as usize];
+        use std::io::{Read, Seek, SeekFrom};
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| self.file.read_exact(&mut bytes))
+            .with_context(|| format!("cannot read '{name}' back from the spool"))?;
+        Ok(bytes)
+    }
+
+    fn remove(self) {
+        drop(self.file);
+        std::fs::remove_file(&self.path).ok();
+    }
+}
+
+impl TensorSink for Spool {
+    fn publish(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<(), pie_loader::error::Error> {
+        use std::io::Write;
+        self.file.write_all(bytes).map_err(|err| {
+            pie_loader::error::Error::Checkpoint(format!(
+                "cannot spool '{name}' to {}: {err}",
+                self.path.display()
+            ))
+        })?;
+        self.index
+            .insert(name.to_string(), (self.offset, bytes.len() as u64));
+        self.offset += bytes.len() as u64;
+        Ok(())
+    }
 }
 
 /// A single-line, byte-weighted progress bar over the whole materialization —
@@ -804,10 +893,7 @@ mod tests {
 /// read, and what this pass is about to copy.
 fn write_artifact(
     writer: &mut CheckpointWriter,
-    decoded: Option<&(
-        pie_loader::plan::LoadPlan,
-        pie_loader::testkit::host_executor::HostStorage,
-    )>,
+    decoded: Option<&mut (pie_loader::plan::LoadPlan, Spool)>,
     passthrough: &[(&RawTensor, &str)],
     meta: &[(String, Vec<u8>)],
     progress: &mut ProgressLine,
@@ -821,7 +907,12 @@ fn write_artifact(
         Meta(&'a [u8]),
     }
     let mut entries: Vec<(&str, From<'_>)> = Vec::new();
-    if let Some((plan, _)) = decoded {
+    let (decoded_plan, spool) = match decoded {
+        Some((plan, spool)) => (Some(&*plan), Some(spool)),
+        None => (None, None),
+    };
+    let mut spool = spool;
+    if let Some(plan) = decoded_plan {
         for decl in &plan.tensors {
             entries.push((&decl.name, From::Decoded(decl)));
         }
@@ -842,13 +933,10 @@ fn write_artifact(
     for (name, entry) in &entries {
         match entry {
             From::Decoded(decl) => {
-                let (_, storage) = decoded.expect("decoded entries imply storage");
-                let bytes = storage
-                    .tensors
-                    .get(*name)
-                    .ok_or_else(|| anyhow!("the plan declared '{name}' but produced nothing"))?;
+                let spool = spool.as_mut().expect("decoded entries imply a spool");
+                let bytes = spool.read(name)?;
                 writer
-                    .add_tensor(decl, bytes)
+                    .add_tensor(decl, &bytes)
                     .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
                 written_bytes += bytes.len() as u64;
             }
@@ -865,8 +953,7 @@ fn write_artifact(
                 let handle = match sources.entry(raw.file_id.0) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                        std::fs::File::open(path)
-                            .with_context(|| format!("cannot open {path}"))?,
+                        std::fs::File::open(path).with_context(|| format!("cannot open {path}"))?,
                     ),
                 };
                 let decl = TensorDecl {

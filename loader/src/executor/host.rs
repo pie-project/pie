@@ -1,10 +1,12 @@
 //! Running a finished plan on the CPU, against the real checkpoint bytes.
 //!
-//! Not a production path (`architecture.md` §10.3). It exists so a plan can be
-//! executed without a GPU and its output compared against
-//! `crate::testkit::reference`, which is the only offline check that can fail
-//! because the plan moved the *wrong* bytes rather than an ill-formed number of
-//! them.
+//! Two callers, two entry points. `pie model convert` materializes artifacts
+//! through [`execute_plan_into`] — the streaming shape: every buffer is an
+//! owned allocation freed at its last use in the schedule, and each finalized
+//! tensor is handed to a [`TensorSink`] once, so peak memory is the working
+//! set rather than the output. The tests and the differential oracle
+//! (`crate::testkit::reference`) use [`execute_plan`], which keeps the whole
+//! output resident because comparing it is the point.
 //!
 //! It is the one module below `lib.rs` that opens a file, which is why it is
 //! named for what it is rather than sharing a name with the backend whose
@@ -19,7 +21,10 @@ use std::path::{Path, PathBuf};
 
 use half::{bf16, f16};
 
+use std::collections::HashSet;
+
 use crate::error::Error;
+use crate::executor::sink::{MemorySink, TensorSink};
 use crate::plan::index::{PlanIndex, instr_by_id};
 use crate::plan::{
     CONVERT_TILE_MAP_MASK, DestExtent, Extent, LoadPlan, SourceExtent, StorageInstr, TileMapKind,
@@ -101,6 +106,51 @@ pub fn execute_plan_with_progress(
     snapshot_dir: &Path,
     progress: &mut dyn FnMut(Progress<'_>),
 ) -> Result<HostStorage, Error> {
+    let mut sink = MemorySink::default();
+    let (arena, max_tile_write_bytes) = run(
+        plan,
+        snapshot_dir,
+        &mut sink,
+        progress,
+        /*stream=*/ false,
+    )?;
+    Ok(HostStorage {
+        arena,
+        tensors: sink.tensors,
+        max_tile_write_bytes,
+    })
+}
+
+/// Execute a plan, streaming each finalized tensor into `sink`.
+///
+/// The memory shape convert wants: every buffer is an owned allocation
+/// (`persistent_offset` is ignored — there is no arena), freed the moment the
+/// schedule's last reference to it has executed, and the sink receives each
+/// tensor once, in schedule order. Peak memory is the largest working set of
+/// one tensor's chain, not the output.
+///
+/// The one plan shape this refuses is a
+/// [`BulkExtentWrite`](StorageInstr::BulkExtentWrite): that instruction
+/// addresses the persistent arena by offset, and there is no arena here. The
+/// rewrite that emits it serves resident device loads; a caller holding such
+/// a plan wants [`execute_plan`].
+pub fn execute_plan_into(
+    plan: &LoadPlan,
+    snapshot_dir: &Path,
+    sink: &mut dyn TensorSink,
+    progress: &mut dyn FnMut(Progress<'_>),
+) -> Result<(), Error> {
+    run(plan, snapshot_dir, sink, progress, /*stream=*/ true)?;
+    Ok(())
+}
+
+fn run(
+    plan: &LoadPlan,
+    snapshot_dir: &Path,
+    sink: &mut dyn TensorSink,
+    progress: &mut dyn FnMut(Progress<'_>),
+    stream: bool,
+) -> Result<(Vec<u8>, usize), Error> {
     // The gate is what this executor *implements* — the convert mask — not
     // `HOST_TILE_MAP_MASK`, which is what a host-lowered plan may *advertise*.
     // A CUDA plan that carries an `Encode` is executable here too; what stays
@@ -124,25 +174,87 @@ pub fn execute_plan_with_progress(
             (file.id.0, path)
         })
         .collect::<HashMap<_, _>>();
-    let arena_len = usize::try_from(plan.memory.persistent_bytes)
-        .map_err(|_| invalid("persistent arena does not fit host address space"))?;
+    // Streaming has no arena: every buffer is owned and freed at its last
+    // use, which is the entire point of the mode.
+    let arena_len = if stream {
+        0
+    } else {
+        usize::try_from(plan.memory.persistent_bytes)
+            .map_err(|_| invalid("persistent arena does not fit host address space"))?
+    };
+    let last_use = if stream {
+        last_uses(plan)?
+    } else {
+        HashMap::new()
+    };
     let mut executor = HostExecutor {
         plan,
         index: PlanIndex::new(plan),
         files,
         arena: vec![POISON; arena_len],
         buffers: HashMap::new(),
-        tensors: HashMap::new(),
+        sink,
+        finalized: HashSet::new(),
+        stream,
+        last_use,
         max_tile_write_bytes: 0,
         progress,
         read_bytes: 0,
     };
     executor.execute()?;
-    Ok(HostStorage {
-        arena: executor.arena,
-        tensors: executor.tensors,
-        max_tile_write_bytes: executor.max_tile_write_bytes,
-    })
+    Ok((executor.arena, executor.max_tile_write_bytes))
+}
+
+/// The schedule position of each buffer's last reference, views chased.
+///
+/// A buffer read through a view is a use of the view's root, and the chain is
+/// static — [`StorageInstr::CreateView`] names both ends — so the whole
+/// analysis is one walk over the schedule. Freeing on this map is safe by
+/// construction: a position after a buffer's last recorded use cannot touch
+/// it, because touching it would have been recorded.
+fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
+    let mut roots: HashMap<BufferId, BufferId> = HashMap::new();
+    let mut last: HashMap<BufferId, usize> = HashMap::new();
+    for (position, id) in plan.schedule.iter().enumerate() {
+        let instr = instr_by_id(&plan.instrs, *id)?;
+        let mut touch = |buffer: BufferId| {
+            let mut buffer = buffer;
+            loop {
+                last.insert(buffer, position);
+                match roots.get(&buffer) {
+                    Some(root) => buffer = *root,
+                    None => break,
+                }
+            }
+        };
+        match instr {
+            StorageInstr::Allocate { buffer, .. } | StorageInstr::Fill { buffer, .. } => {
+                touch(*buffer);
+            }
+            StorageInstr::ExtentWrite { dest, .. } => touch(dest.buffer),
+            StorageInstr::BulkExtentWrite { .. } => {}
+            StorageInstr::TileMap {
+                inputs,
+                outputs,
+                dest,
+                ..
+            } => {
+                for buffer in inputs.iter().chain(outputs) {
+                    touch(*buffer);
+                }
+                if let Some(dest) = dest {
+                    touch(dest.buffer);
+                }
+            }
+            StorageInstr::CreateView { input, output, .. } => {
+                touch(*input);
+                touch(*output);
+                roots.insert(*output, *input);
+            }
+            StorageInstr::Finalize { tensor, .. } => touch(*tensor),
+        }
+    }
+    Ok(last)
 }
 
 struct HostExecutor<'a, 'p> {
@@ -154,7 +266,14 @@ struct HostExecutor<'a, 'p> {
     files: HashMap<u32, PathBuf>,
     arena: Vec<u8>,
     buffers: HashMap<BufferId, BufferLoc>,
-    tensors: HashMap<String, Vec<u8>>,
+    sink: &'p mut dyn TensorSink,
+    /// Names already published, because finalizing one twice is a plan bug
+    /// the executor reports rather than a sink's problem to detect.
+    finalized: HashSet<String>,
+    /// Streaming: no arena, owned buffers, freed at last use.
+    stream: bool,
+    /// Filled only when streaming; see [`last_uses`].
+    last_use: HashMap<BufferId, usize>,
     max_tile_write_bytes: usize,
     progress: &'p mut dyn FnMut(Progress<'_>),
     read_bytes: u64,
@@ -181,7 +300,7 @@ fn decode_gguf_q4_0_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
 
 impl HostExecutor<'_, '_> {
     fn execute(&mut self) -> Result<(), Error> {
-        for id in &self.plan.schedule {
+        for (position, id) in self.plan.schedule.iter().enumerate() {
             let instr = instr_by_id(&self.plan.instrs, *id)?.clone();
             // Accounted before the match consumes the instruction, reported
             // after its work is done.
@@ -209,6 +328,13 @@ impl HostExecutor<'_, '_> {
                     dest_offset,
                     ..
                 } => {
+                    if self.stream {
+                        return Err(invalid(
+                            "streaming execution has no persistent arena for this \
+                             BulkExtentWrite to target; run this plan through \
+                             execute_plan instead",
+                        ));
+                    }
                     let bytes = self.read_extent(&source)?;
                     self.write_arena(dest_offset, &bytes)?;
                 }
@@ -229,10 +355,17 @@ impl HostExecutor<'_, '_> {
                 }
                 StorageInstr::Finalize { tensor, name, .. } => {
                     let bytes = self.buffer_bytes(tensor)?.to_vec();
-                    if self.tensors.insert(name.clone(), bytes).is_some() {
+                    if !self.finalized.insert(name.clone()) {
                         return Err(invalid(format!("tensor '{name}' was finalized twice")));
                     }
+                    self.sink.publish(&name, &bytes)?;
                 }
+            }
+            if self.stream {
+                // Everything whose last reference just executed is dead;
+                // dropping it here is what makes peak memory the working set.
+                self.buffers
+                    .retain(|buffer, _| self.last_use.get(buffer) != Some(&position));
             }
             self.read_bytes += consumed;
             (self.progress)(Progress {
@@ -247,7 +380,9 @@ impl HostExecutor<'_, '_> {
     fn allocate(&mut self, id: BufferId) -> Result<(), Error> {
         let decl = self.plan.buffer(id)?;
         let len = checked_usize(decl.bytes)?;
-        let loc = if let Some(offset) = decl.persistent_offset {
+        let loc = if !self.stream
+            && let Some(offset) = decl.persistent_offset
+        {
             let offset = checked_usize(offset)?;
             let end = offset
                 .checked_add(len)

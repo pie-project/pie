@@ -16,6 +16,7 @@ pub mod checkpoint;
 pub mod contract;
 pub mod dump;
 pub mod error;
+pub mod executor;
 pub mod extent;
 pub mod plan;
 #[cfg(feature = "testkit")]

@@ -13,5 +13,9 @@
 //! ABI into `pie-loader-capi` (`capi/src/contract_writer.rs`): the graph it
 //! writes is the ABI crate's vocabulary, not the compiler's.
 
-pub mod host_executor;
 pub mod reference;
+
+/// The executor moved to [`crate::executor::host`] when `pie model convert`
+/// became its production caller; this alias keeps the old path reading while
+/// callers migrate.
+pub use crate::executor::host as host_executor;
