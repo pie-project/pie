@@ -2,7 +2,7 @@
 //
 // This is the half of expert paging that decides whether a streamed model is
 // CORRECT, as opposed to whether it is fast, and it is testable with no device
-// because the slab is a pointer and a stride. What it has to get right:
+// because the slabs are pointers and strides. What it has to get right:
 //
 //   * the band arithmetic -- slot `s` must hold expert `e`'s bytes and not its
 //     neighbour's, which is the failure that would read as a quality
@@ -10,12 +10,18 @@
 //   * eviction -- a re-paged expert must come back byte-identical, because a
 //     slab that returns a stale slot is a model that answers differently
 //     depending on how many experts happened to fit;
-//   * the flattening -- two banks with the same expert index are two different
-//     experts, and a collision there would silently serve layer 0's weights to
-//     layer 7.
+//   * the layer axis -- two layers with the same expert index are two
+//     different experts, and a collision there would silently serve layer 0's
+//     weights to layer 7;
+//   * the parallel bands -- ONE slot number has to mean the same expert for
+//     `gate_proj` and for `down_proj` at once, because the kernels index all
+//     of them with a single `expert_ids` buffer. That is the claim a
+//     one-tensor-per-cache design cannot make, and it is checked here on
+//     tensors with DIFFERENT band sizes so that a shared stride could not
+//     accidentally satisfy it.
 //
-// The bytes are made distinguishable per (bank, expert) so that any of those
-// three failures produces a wrong byte rather than a plausible one.
+// The bytes are made distinguishable per (tensor, layer, expert) so that any
+// of those failures produces a wrong byte rather than a plausible one.
 
 #include <cstdint>
 #include <cstdio>
@@ -24,8 +30,8 @@
 
 #include "loader/expert_slab.hpp"
 
-using pie::metal::ExpertBank;
 using pie::metal::ExpertSlab;
+using pie::metal::SlabTensor;
 
 namespace {
 int g_pass = 0, g_fail = 0;
@@ -35,22 +41,16 @@ bool expect(bool ok, const std::string& what) {
     return ok;
 }
 
-constexpr std::uint32_t kBanks = 3;
-constexpr std::uint32_t kArity = 4;
-constexpr std::uint64_t kBand = 64;
+constexpr std::uint32_t kLayers = 3;
+constexpr std::uint32_t kExperts = 4;
+// Two kinds on purpose, and deliberately unequal: a slot has to mean one
+// expert across both, which a shared stride would make untestable.
+constexpr std::uint64_t kBand[2] = {64, 96};
+constexpr std::size_t kKinds = 2;
 
-/// A byte that names its own (bank, expert, position), so a misread is visible.
-std::uint8_t byte_of(std::uint32_t bank, std::uint32_t expert, std::uint64_t i) {
-    return static_cast<std::uint8_t>((bank * 37u + expert * 11u + i) & 0xFFu);
-}
-
-bool slot_holds(const ExpertSlab& slab, std::uint32_t slot,
-                std::uint32_t bank, std::uint32_t expert) {
-    const std::uint8_t* got = slab.slot_data(slot);
-    for (std::uint64_t i = 0; i < kBand; ++i) {
-        if (got[i] != byte_of(bank, expert, i)) return false;
-    }
-    return true;
+/// A byte that names its own (kind, layer, expert, position).
+std::uint8_t byte_of(std::size_t t, std::uint32_t layer, std::uint32_t expert, std::uint64_t i) {
+    return static_cast<std::uint8_t>((t * 101u + layer * 37u + expert * 11u + i) & 0xFFu);
 }
 
 int finish(const char* name) {
@@ -62,51 +62,78 @@ int finish(const char* name) {
 int main() {
     std::printf("[expert slab: bounded slots paged from a checkpoint]\n");
 
-    // One "file": every bank's bands laid out back to back, each bank starting
-    // at its own offset, exactly as the banks sit in a converted checkpoint.
-    std::vector<std::uint8_t> file(std::size_t(kBanks) * kArity * kBand);
-    std::vector<ExpertBank> banks;
-    for (std::uint32_t b = 0; b < kBanks; ++b) {
-        const std::uint64_t base = std::uint64_t(b) * kArity * kBand;
-        for (std::uint32_t e = 0; e < kArity; ++e) {
-            for (std::uint64_t i = 0; i < kBand; ++i) {
-                file[std::size_t(base + e * kBand + i)] = byte_of(b, e, i);
+    // Two "files", one per tensor kind: every layer's experts back to back,
+    // exactly as a routed bank sits in a converted checkpoint.
+    std::vector<std::uint8_t> file[kKinds];
+    std::vector<SlabTensor> tensors;
+    for (std::size_t t = 0; t < kKinds; ++t) {
+        file[t].resize(std::size_t(kLayers) * kExperts * kBand[t]);
+        SlabTensor s;
+        s.suffix = t == 0 ? "mlp.experts.gate_proj" : "mlp.experts.down_proj";
+        s.band_bytes = kBand[t];
+        for (std::uint32_t l = 0; l < kLayers; ++l) {
+            const std::uint64_t base = std::uint64_t(l) * kExperts * kBand[t];
+            for (std::uint32_t e = 0; e < kExperts; ++e) {
+                for (std::uint64_t i = 0; i < kBand[t]; ++i) {
+                    file[t][std::size_t(base + e * kBand[t] + i)] = byte_of(t, l, e, i);
+                }
             }
+            s.layer_base.push_back(file[t].data() + base);
         }
-        banks.push_back(ExpertBank{file.data(), base, kBand, kArity,
-                                   "layer" + std::to_string(b)});
+        tensors.push_back(std::move(s));
     }
 
+    const auto holds = [&](const ExpertSlab& slab, std::uint32_t slot,
+                           std::uint32_t layer, std::uint32_t expert) {
+        for (std::size_t t = 0; t < kKinds; ++t) {
+            const std::uint8_t* got = slab.slot_data(t, slot);
+            for (std::uint64_t i = 0; i < kBand[t]; ++i) {
+                if (got[i] != byte_of(t, layer, expert, i)) return false;
+            }
+        }
+        return true;
+    };
+
     // Two slots against twelve experts: everything interesting is an eviction.
-    std::vector<std::uint8_t> slab_mem(2 * kBand, 0u);
-    ExpertSlab slab(banks, slab_mem.data(), 2);
+    std::vector<std::uint8_t> mem[kKinds];
+    std::vector<std::uint8_t*> bases;
+    for (std::size_t t = 0; t < kKinds; ++t) {
+        mem[t].assign(std::size_t(2 * kBand[t]), 0u);
+        bases.push_back(mem[t].data());
+    }
+    ExpertSlab slab(tensors, kExperts, bases, 2);
 
     expect(slab.num_slots() == 2, "the slab holds the two slots it was budgeted");
     expect(!slab.fully_resident(),
            "two slots against twelve experts is not fully resident");
-    expect(slab.slab_bytes() == 2 * kBand, "the slab is slots x band");
+    expect(slab.slot_bytes() == kBand[0] + kBand[1],
+           "a slot costs every routed tensor of one expert, not one of them");
 
-    // Same expert index in three different banks. If the flattening collided,
-    // these would share a slot and two of the three checks would read another
-    // layer's bytes.
+    // The claim a per-tensor cache cannot make: ONE slot number, both tensors,
+    // and the tensors have different band sizes so no shared stride can be
+    // hiding the answer.
+    slab.end_batch();
+    const std::uint32_t s0 = slab.ensure_resident(1, 2);
+    expect(holds(slab, s0, 1, 2),
+           "one slot number means the same expert for BOTH routed tensors");
+
+    // Same expert index in three different layers. If the layer axis collapsed,
+    // these would share a slot and two of the three would read another layer.
     bool distinct = true;
-    std::vector<std::uint32_t> slots;
-    for (std::uint32_t b = 0; b < kBanks; ++b) {
+    for (std::uint32_t l = 0; l < kLayers; ++l) {
         slab.end_batch();  // a fresh batch, or the third acquire has no victim
-        const std::uint32_t s = slab.ensure_resident(b, 2);
-        slots.push_back(s);
-        if (!slot_holds(slab, s, b, 2)) distinct = false;
+        const std::uint32_t s = slab.ensure_resident(l, 2);
+        if (!holds(slab, s, l, 2)) distinct = false;
     }
-    expect(distinct, "expert 2 of each bank pages in as ITS OWN bytes");
+    expect(distinct, "expert 2 of each layer pages in as ITS OWN bytes");
 
-    // A hit does not copy: ask for something already there and watch the
-    // page-in count stand still.
+    // A hit does not copy.
     slab.end_batch();
     const std::uint64_t before = slab.misses();
-    const std::uint32_t again = slab.ensure_resident(kBanks - 1, 2);
+    const std::uint32_t again = slab.ensure_resident(kLayers - 1, 2);
     expect(slab.misses() == before && slab.hits() > 0,
            "an expert already in a slot is a hit, not a second copy");
-    expect(slot_holds(slab, again, kBanks - 1, 2), "and the hit's bytes are still right");
+    expect(holds(slab, again, kLayers - 1, 2), "and the hit's bytes are still right");
 
     // Eviction and return. Fill both slots, push both out, then ask for the
     // first one back and require it byte-identical.
@@ -118,12 +145,10 @@ int main() {
     slab.ensure_resident(0, 3);
     slab.end_batch();
     const std::uint32_t revived = slab.ensure_resident(0, 0);
-    expect(slot_holds(slab, revived, 0, 0),
+    expect(holds(slab, revived, 0, 0),
            "an evicted expert comes back byte-identical, not stale");
 
-    // The slab is bounded in the way that matters: paging twelve experts
-    // through two slots never grew it.
-    expect(slab.slab_bytes() == 2 * kBand,
+    expect(slab.slab_bytes() == 2 * (kBand[0] + kBand[1]),
            "paging every expert through two slots did not grow the slab");
 
     // More experts at once than there are slots is a configuration error, not
@@ -141,22 +166,26 @@ int main() {
 
     // A budget that holds everything reports it, so the caller can skip the
     // routing readback that streaming otherwise pays for every layer.
-    std::vector<std::uint8_t> big(std::size_t(kBanks) * kArity * kBand, 0u);
-    ExpertSlab whole(banks, big.data(), kBanks * kArity);
-    expect(whole.fully_resident(),
-           "a slab budgeted for every expert says so");
+    std::vector<std::uint8_t> big[kKinds];
+    std::vector<std::uint8_t*> big_bases;
+    for (std::size_t t = 0; t < kKinds; ++t) {
+        big[t].assign(std::size_t(kLayers) * kExperts * kBand[t], 0u);
+        big_bases.push_back(big[t].data());
+    }
+    ExpertSlab whole(tensors, kExperts, big_bases, kLayers * kExperts);
+    expect(whole.fully_resident(), "a slab budgeted for every expert says so");
 
-    // A bank whose bands are a different size cannot share a slot stride, and
-    // saying so beats serving half an expert.
-    std::vector<ExpertBank> mismatched = banks;
-    mismatched[1].band_bytes = kBand / 2;
+    // A tensor that does not span every mixture layer would make (layer,
+    // expert) mean a different expert for it than for its siblings.
+    std::vector<SlabTensor> ragged = tensors;
+    ragged[1].layer_base.pop_back();
     bool rejected = false;
     try {
-        ExpertSlab bad(mismatched, slab_mem.data(), 2);
+        ExpertSlab bad(ragged, kExperts, bases, 2);
     } catch (const std::exception&) {
         rejected = true;
     }
-    expect(rejected, "banks that disagree on band size are refused");
+    expect(rejected, "a routed tensor missing a layer is refused");
 
     return finish("expert_slab_test");
 }
