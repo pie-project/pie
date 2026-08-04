@@ -268,6 +268,17 @@ int main(int argc, char** argv) {
     }
     const int n_prompt = argc > 2 ? std::atoi(argv[2]) : 128;
     const int n_decode = argc > 3 ? std::atoi(argv[3]) : 64;
+    // Concurrent sequences for the throughput block at the end. One means the
+    // block does not run at all, and -- more importantly -- that none of the
+    // sizing below changes, so every number this harness has ever printed
+    // stays comparable with every number it prints now. A fleet needs a wider
+    // request limit, a wider fire and n times the ring, and all three feed the
+    // scratch sizer.
+    const int n_seqs = [] {
+        const char* e = std::getenv("PIE_BENCH_TPUT");
+        const int v = e != nullptr ? std::atoi(e) : 1;
+        return v > 1 ? v : 1;
+    }();
 
     if (ckpt.empty() || !exists(ckpt)) {
         std::printf("llama_bench: SKIP (no checkpoint at '%s')\n", ckpt.c_str());
@@ -285,12 +296,17 @@ int main(int argc, char** argv) {
     cfg.snapshot_dir = ckpt;
     cfg.vocab_size = facts.vocab_size;
     // The timing prompt, or the long gate below -- whichever fire is wider.
+    // The timing prompt, the long gate, or a whole decoding fleet in one fire
+    // -- whichever is widest.
     cfg.max_forward_tokens =
         std::uint32_t(std::max<std::size_t>(std::size_t(std::max(n_prompt, 32)),
                                             long_gate_prompt().size()));
+    if (std::uint32_t(n_seqs) > cfg.max_forward_tokens) {
+        cfg.max_forward_tokens = std::uint32_t(n_seqs);
+    }
     // Two: the batch check below fires a pair in ONE pass, and a driver set up
     // for one request would refuse it rather than answer it wrongly.
-    cfg.max_forward_requests = 2;
+    cfg.max_forward_requests = std::uint32_t(std::max(2, n_seqs));
     cfg.kv_page_size = 32;
     // Off by default, so the numbers below stay comparable with every earlier
     // run. Turned on it maps the routed expert bank instead of copying it, and
@@ -309,9 +325,11 @@ int main(int argc, char** argv) {
     // 64-request fleet and does not scale with the model: at 48 layers it is
     // 13 GiB of KV, which beside a 17 GiB checkpoint does not fit a 32 GiB
     // machine at all. A stopwatch that cannot load the model measures nothing.
-    cfg.max_ctx_tokens = std::uint32_t(
-        std::max<std::size_t>(std::size_t(std::max(n_prompt + n_decode, 1)),
-                              long_gate_prompt().size() + 8) + 64);
+    cfg.max_ctx_tokens =
+        std::uint32_t(std::max<std::size_t>(std::size_t(std::max(n_prompt + n_decode, 1)),
+                                            long_gate_prompt().size() + 8) +
+                      64) *
+        std::uint32_t(n_seqs);
     fill_family_geometry(cfg, facts);
     const BenchShape shape = bench_shape(cfg);
     std::printf("  %s [%s]: %d layers, hidden %d, %d/%d heads x %d", cfg.model_type.c_str(),
@@ -905,6 +923,70 @@ int main(int argc, char** argv) {
     }
     const double pipelined_s = now_s() - t2;
 
+    // ── throughput ──
+    //
+    // The figures above are LATENCY: one sequence, one token at a time, the
+    // host in the loop. A server is not that shape. `PIE_BENCH_TPUT=n` fires n
+    // independent sequences in ONE forward and feeds every member its own
+    // greedy token, which is what a batched sampler does and the only form
+    // comparable to mlx-lm's batch generation.
+    //
+    // Every member gets its own sequence id and its own pages out of one
+    // counter -- the ring is one pool and nothing here frees -- and its own
+    // recurrent slot, because a hybrid family's linear-attention state does not
+    // live in the KV pages and two members sharing a slot compute each other's
+    // history.
+    double tput_tps = 0.0;
+    if (n_seqs > 1) {
+        const std::size_t nf = std::size_t(n_seqs);
+        std::vector<Seq> fleet(nf);
+        std::uint32_t fpage = 0;
+        bool bad = false;
+        for (int i = 0; i < n_seqs && !bad; ++i) {
+            fleet[std::size_t(i)].id = std::uint32_t(100 + i);
+            fleet[std::size_t(i)].tokens = prompt;
+            fleet[std::size_t(i)].tokens.resize(std::size_t(n_prompt + n_decode), 1u);
+            fleet[std::size_t(i)].rs_slot = exec.rs_slots() > 0 ? i % exec.rs_slots() : 0;
+            // Prefilled one at a time and UNTIMED. What is being measured is
+            // the decode fleet; folding a prefill into it would report one
+            // number for two regimes.
+            if (fire(exec, fleet[std::size_t(i)], std::uint32_t(n_prompt), page_size, fpage) < 0) {
+                bad = true;
+            }
+        }
+        if (!bad) {
+            const double t3 = now_s();
+            for (int step = 0; step < n_decode && !bad; ++step) {
+                std::vector<MemberForwardDesc> descs;
+                descs.reserve(nf);
+                for (int i = 0; i < n_seqs; ++i) {
+                    descs.push_back(desc_for(fleet[std::size_t(i)], 1, page_size, fpage,
+                                             exec.rs_slots()));
+                }
+                std::vector<LogitsOut> outs(nf);
+                std::vector<std::uint8_t> ok(nf, 0);
+                std::vector<std::string> errs(nf);
+                exec.forward_batch(descs, outs, ok, errs);
+                for (int i = 0; i < n_seqs; ++i) {
+                    if (ok[std::size_t(i)] == 0) {
+                        std::printf("  FAIL  throughput fire: %s\n", errs[std::size_t(i)].c_str());
+                        bad = true;
+                        break;
+                    }
+                    Seq& m = fleet[std::size_t(i)];
+                    const int t = argmax_of(outs[std::size_t(i)], 0);
+                    m.next_position += 1;
+                    if (m.next_position < m.tokens.size()) m.tokens[m.next_position] = std::uint32_t(t);
+                }
+            }
+            if (!bad) {
+                const double tput_s = now_s() - t3;
+                tput_tps = double(n_decode) * double(n_seqs) / tput_s;
+            }
+        }
+        if (bad) return 1;
+    }
+
     const double prefill_tps = double(n_prompt) / prefill_s;
     const double decode_tps = double(n_decode) / decode_s;
     std::printf("  prefill: %d tok in %.4f s  =  %.1f tok/s\n", n_prompt, prefill_s, prefill_tps);
@@ -914,6 +996,10 @@ int main(int argc, char** argv) {
                 "scheduler's ceiling, NOT comparable]\n",
                 n_decode, pipelined_s, double(n_decode) / pipelined_s,
                 1000.0 * pipelined_s / double(n_decode));
+    if (tput_tps > 0.0) {
+        std::printf("  tput   : %d seqs x %d tok  =  %.1f tok/s  (%.1f tok/s per seq)\n", n_seqs,
+                    n_decode, tput_tps, tput_tps / double(n_seqs));
+    }
 
     // Decode at batch one reads (almost) every weight once per token, so
     // tokens/s times bytes-read is the bandwidth actually achieved. Stating it

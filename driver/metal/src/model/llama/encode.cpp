@@ -145,7 +145,8 @@ Kernel pso_kind(Kind k) {
 }
 
 Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& base,
-            const LlamaPsos& ll, const MultiBatchPsos* mb, int rows, int head_rows) {
+            const LlamaPsos& ll, const MultiBatchPsos* mb, int rows, int head_rows,
+            int requests) {
     const int R = rows < 1 ? 1 : rows;
     const int S = head_rows < 1 ? R : (head_rows < R ? head_rows : R);
 
@@ -203,7 +204,7 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             // the per-row kernel's is N, so choosing one here and shaping the
             // other there launches a thirty-second of the attention.
             if (!g.paged_kv_enabled) return ll.sdpa;
-            return sdpa_should_tile(R) ? ll.sdpa_paged_tiled : ll.sdpa_paged;
+            return sdpa_should_tile(R, requests) ? ll.sdpa_paged_tiled : ll.sdpa_paged;
         // The append follows attention. Both KV kinds must agree on the ABI:
         // the binder writes page tables into slots the ring kernel reads as a
         // head stride, so a mismatch here is a scatter through a pointer made
@@ -351,7 +352,7 @@ int llama_moe_qmm_bn(Kind k, const LlamaGeometry& g, int rows) {
 }
 
 void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadgroup& tg,
-                  int rows, int head_rows) {
+                  int rows, int head_rows, int requests) {
     const int R = rows < 1 ? 1 : rows;
     // The tail runs on the rows the sampler will READ, which `RowGather`
     // compacted to a dense prefix. The head is `hidden * vocab` per row, so on
@@ -466,7 +467,7 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
             // The row axis is `grid.y`, which at R == 1 is the M=1 shape
             // unchanged -- the ring kernel reads y as the query's sequence
             // index and a decode has exactly one.
-            if (sdpa_should_tile(R)) {
+            if (sdpa_should_tile(R, requests)) {
                 sdpa_paged_tiled_dispatch(g.n_q_heads, R, grid, tg);
                 return;
             }
@@ -511,16 +512,16 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
 
 void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const LlamaGeometry& g,
                        const DecodeStepPsos& base, const LlamaPsos& ll, int ordinal_base,
-                       const MultiBatchPsos* mb, int rows, int head_rows, std::size_t begin,
-                       std::size_t end) {
+                       const MultiBatchPsos* mb, int rows, int head_rows, int requests,
+                       std::size_t begin, std::size_t end) {
     const std::vector<int> run_ends = llama_run_ends(dag);
     const std::size_t last = std::min(end, dag.size());
     for (std::size_t i = begin; i < last; ++i) {
         const Dispatch& d = dag[i];
         Grid grid;
         Threadgroup tg;
-        launch_shape(d, g, grid, tg, rows, head_rows);
-        se.set_pso(pso_for(d, g, base, ll, mb, rows, head_rows));
+        launch_shape(d, g, grid, tg, rows, head_rows, requests);
+        se.set_pso(pso_for(d, g, base, ll, mb, rows, head_rows, requests));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
         // A barrier after every dispatch except inside a concurrency run: the

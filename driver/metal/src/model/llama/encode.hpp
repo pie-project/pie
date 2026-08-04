@@ -44,7 +44,7 @@ Kernel pso_kind(Kind k);
 /// not a crash -- it is wrong numbers.
 Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& base,
             const LlamaPsos& ll, const MultiBatchPsos* mb = nullptr, int rows = 1,
-            int head_rows = 1);
+            int head_rows = 1, int requests = 1);
 
 /// Its grid and threadgroup, over `rows` tokens.
 ///
@@ -58,7 +58,7 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
 /// for the sampler. It is not `rows`: a prefill samples a few of its tokens and
 /// the head is the most expensive dispatch in the step.
 void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadgroup& tg,
-                  int rows = 1, int head_rows = 1);
+                  int rows = 1, int head_rows = 1, int requests = 1);
 
 /// A dense projection's GEMM row count, padded up to a whole BM tile so the
 /// matmul engages at any batch rather than only at exact multiples of one. The
@@ -108,7 +108,7 @@ std::vector<int> llama_run_ends(const std::vector<Dispatch>& dag);
 void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                        const LlamaGeometry& g, const DecodeStepPsos& base, const LlamaPsos& ll,
                        int ordinal_base = 0, const MultiBatchPsos* mb = nullptr, int rows = 1,
-                       int head_rows = 1, std::size_t begin = 0,
+                       int head_rows = 1, int requests = 1, std::size_t begin = 0,
                        std::size_t end = ~std::size_t(0));
 
 }  // namespace pie::metal::llama
