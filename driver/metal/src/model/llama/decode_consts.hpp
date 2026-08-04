@@ -42,10 +42,10 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 /// Bind the split-K side of every dense projection that takes one.
 ///
 /// Three numbers per dispatch, all of which change with `rows`: where the
-/// partial slices go (ordinal 8, one buffer shared by every split projection
-/// -- they are serialized by barriers and each is reduced before the next
-/// runs), how long a K partition is (ordinal 9) and how far apart the slices
-/// sit (ordinal 10), plus the partition count the reduce sums (ordinal 11).
+/// partial slices go (ordinal 8), how long a K partition is (ordinal 9) and how
+/// far apart the slices sit (ordinal 10), plus the partition count the reduce
+/// sums (ordinal 11). One allocation is divided into concurrency lanes so a
+/// reduce can overlap the next independent projection's GEMM.
 ///
 /// `keep` receives the small constant buffers; the caller owns them for as long
 /// as the argument tables point at them. Buffers are shared between dispatches
@@ -55,6 +55,11 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 /// Returns how many dispatches were split, which is what a test can pin.
 int bind_llama_splitk(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                       const LlamaGeometry& g, int rows, const SlotHandle& partials,
-                      std::vector<SlotHandle>& keep);
+                      std::vector<SlotHandle>& keep, int requests = 1);
+
+/// Bind the one-per-source BF16->FP16 staging used by dense g64/b4 QMMs.
+int bind_llama_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                        const LlamaGeometry& g, int rows, int head_rows, int requests,
+                        const SlotHandle& staging, std::vector<SlotHandle>& keep);
 
 }  // namespace pie::metal::llama

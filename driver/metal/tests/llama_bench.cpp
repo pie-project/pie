@@ -90,7 +90,8 @@ struct Seq {
 /// `n` new tokens starting at the sequence's current position, reading only the
 /// last row -- the descriptor the runtime builds for a fire.
 MemberForwardDesc desc_for(Seq& s, std::uint32_t n, std::uint32_t page_size,
-                           std::uint32_t& next_free_page, std::uint32_t rs_slots = 0) {
+                           std::uint32_t& next_free_page, std::uint32_t rs_slots = 0,
+                           bool greedy_token_only = false) {
     MemberForwardDesc d;
     d.sequence_id = s.id;
     d.requires_paged = true;
@@ -116,6 +117,7 @@ MemberForwardDesc desc_for(Seq& s, std::uint32_t n, std::uint32_t page_size,
     d.kv_last_page_lens = {end % page_size == 0 ? page_size : end % page_size};
     d.readout_local_indices = {n - 1};
     d.sampling_indptr = {0u, 1u};
+    d.greedy_token_only = greedy_token_only;
     // A hybrid family carries per-sequence linear-attention state that is NOT
     // in the KV pages. The slot is where that state lives, and a sequence that
     // starts at position zero has none to read yet -- it RESETS, and every
@@ -152,11 +154,27 @@ float widen(std::uint16_t h) {
 /// the host-side argmax over the vocabulary is already part of what is being
 /// measured and a 150k-element copy per step would not be.
 int argmax_of(const LogitsOut& out, std::uint32_t row) {
+    if (out.device_contents == nullptr) {
+        if (out.greedy_contents != nullptr && row < out.rows) {
+            return int(out.greedy_contents[out.greedy_row_offset + row]);
+        }
+        std::printf("  FAIL  no logits or device argmax for row %u\n", row);
+        return -1;
+    }
     const std::uint16_t* bf = bf16_row(out, row);
     int best = 0;
     float bv = widen(bf[0]);
     for (std::uint32_t i = 1; i < out.vocab; ++i) {
         if (const float v = widen(bf[i]); v > bv) { bv = v; best = int(i); }
+    }
+    if (out.greedy_contents != nullptr && row < out.rows &&
+        out.greedy_contents[out.greedy_row_offset + row] != std::uint32_t(best)) {
+        std::printf("  FAIL  device argmax row %u says %u, host scan says %d\n",
+                    row, out.greedy_contents[out.greedy_row_offset + row], best);
+        return -1;
+    }
+    if (out.greedy_contents != nullptr && row < out.rows) {
+        return int(out.greedy_contents[out.greedy_row_offset + row]);
     }
     return best;
 }
@@ -174,8 +192,9 @@ std::vector<float> row_of(const LogitsOut& out, std::uint32_t row) {
 /// work and not the enqueue. Returns the greedy token, or -1 on failure.
 int fire(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
          std::uint32_t& next_free_page, bool want_token = false,
-         LogitsOut* staged = nullptr) {
-    MemberForwardDesc d = desc_for(s, n, page_size, next_free_page, exec.rs_slots());
+         LogitsOut* staged = nullptr, bool greedy_token_only = false) {
+    MemberForwardDesc d =
+        desc_for(s, n, page_size, next_free_page, exec.rs_slots(), greedy_token_only);
     LogitsOut out;
     std::string err;
     if (!exec.forward(d, out, &err)) {
@@ -905,7 +924,8 @@ int main(int argc, char** argv) {
     // as such rather than quoted as the decode speed.
     const double t1 = now_s();
     for (int i = 0; i < n_decode; ++i) {
-        const int t = fire(exec, s, 1, page_size, next_page, /*want_token=*/true);
+        const int t = fire(exec, s, 1, page_size, next_page, /*want_token=*/true,
+                           /*staged=*/nullptr, /*greedy_token_only=*/true);
         if (t < 0) return 1;
         if (s.next_position < s.tokens.size()) s.tokens[s.next_position] = std::uint32_t(t);
     }
@@ -971,7 +991,7 @@ int main(int argc, char** argv) {
                 descs.reserve(nf);
                 for (int i = 0; i < n_seqs; ++i) {
                     descs.push_back(desc_for(fleet[std::size_t(i)], 1, page_size, fpage,
-                                             exec.rs_slots()));
+                                             exec.rs_slots(), /*greedy_token_only=*/true));
                 }
                 std::vector<LogitsOut> outs(nf);
                 int first_tok = -1;

@@ -1273,7 +1273,8 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits>
+    short bits,
+    typename D = T>
 struct QuantizedBlockLoader {
   static_assert(
       BCOLS <= group_size,
@@ -1302,7 +1303,7 @@ struct QuantizedBlockLoader {
   const short bi;
   const short bj;
 
-  threadgroup T* dst;
+  threadgroup D* dst;
   const device uint8_t* src;
   const device T* scales;
   const device T* biases;
@@ -1312,7 +1313,7 @@ struct QuantizedBlockLoader {
       const device T* scales_,
       const device T* biases_,
       const int src_ld_,
-      threadgroup T* dst_,
+      threadgroup D* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]])
       : src_ld(src_ld_),
@@ -1335,10 +1336,10 @@ struct QuantizedBlockLoader {
       return;
     }
 
-    T scale = *scales;
-    T bias = *biases;
+    D scale = static_cast<D>(*scales);
+    D bias = static_cast<D>(*biases);
     for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits>(
+      dequantize<D, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
     }
   }
@@ -1350,22 +1351,22 @@ struct QuantizedBlockLoader {
 
     if (reduction_dim == 1 && bi >= src_tile_dim.x) {
       for (int i = 0; i < n_reads * pack_factor; i++) {
-        dst[i] = T(0);
+        dst[i] = D(0);
       }
       return;
     }
 
     if (reduction_dim == 0 && bi >= src_tile_dim.y) {
       for (int i = 0; i < n_reads * pack_factor; i++) {
-        dst[i] = T(0);
+        dst[i] = D(0);
       }
       return;
     }
 
-    T scale = *scales;
-    T bias = *biases;
+    D scale = static_cast<D>(*scales);
+    D bias = static_cast<D>(*biases);
     for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits>(
+      dequantize<D, pack_factor, bits>(
           (device uint8_t*)(src + i * bytes_per_pack),
           scale,
           bias,
@@ -1484,6 +1485,93 @@ METAL_FUNC void qmm_t_aligned_impl(
   } else {
     mma_op.store_result(y, N);
   }
+}
+
+template <typename P, int group_size, int bits, int BM, int BK, int BN>
+METAL_FUNC void qmm_t_fp16_precast_impl(
+    const device uint32_t* w,
+    const device bfloat* scales,
+    const device bfloat* biases,
+    const device half* x,
+    device P* y,
+    threadgroup half* Xs,
+    threadgroup half* Ws,
+    const constant int& K,
+    const constant int& k_len,
+    const constant int& N,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+
+  using mma_t = mlx::steel::
+      BlockMMA<half, P, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      bfloat, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = int(tid.y) * BM;
+  const int y_col = int(tid.x) * BN;
+
+  auto wl = (const device uint8_t*)w;
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  for (int k = 0; k < k_len; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  mma_op.store_result(y, N);
+}
+
+// Dense g64/b4 keeps the model ABI in BF16 but stages each projection source
+// once. Casting inside every output tile repeated the same conversion N/BN
+// times (128 times for gate/up); the tiny staging pass removes that multiplier.
+[[kernel]] void cast_qmm_input_bfloat16_to_float16(
+    const device bfloat* x [[buffer(3)]],
+    device half* y [[buffer(12)]],
+    const constant int& count [[buffer(13)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (int(gid) < count) y[gid] = half(x[gid]);
+}
+
+template <int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_fp16_precast(
+    const device uint32_t* w [[buffer(0)]],
+    const device bfloat* scales [[buffer(1)]],
+    const device bfloat* biases [[buffer(2)]],
+    device bfloat* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const device half* x [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, K, N, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
@@ -1695,6 +1783,24 @@ instantiate_qmm_t(64, 64, 32, 64, 8)
 instantiate_qmm_t(32, 64, 32, 64, 8)
 instantiate_qmm_t(128, 64, 32, 64, 8)
 
+#define instantiate_qmm_t_fp16_precast(bm, bn)                              \
+  template [[host_name("affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_"   \
+                       #bm "_bn_" #bn)]]                                     \
+  [[kernel]] void affine_qmm_t_fp16_precast<64, 4, bm, 32, bn>(             \
+      const device uint32_t*, const device bfloat*, const device bfloat*,    \
+      device bfloat*, const constant int&, const constant int&,              \
+      const device half*, uint3, uint, uint);
+
+instantiate_qmm_t_fp16_precast(16, 16)
+instantiate_qmm_t_fp16_precast(16, 32)
+instantiate_qmm_t_fp16_precast(16, 64)
+instantiate_qmm_t_fp16_precast(32, 16)
+instantiate_qmm_t_fp16_precast(32, 32)
+instantiate_qmm_t_fp16_precast(32, 64)
+instantiate_qmm_t_fp16_precast(64, 16)
+instantiate_qmm_t_fp16_precast(64, 32)
+instantiate_qmm_t_fp16_precast(64, 64)
+
 // ── Strided form, for the prefill ────────────────────────────────────────────
 // Identical to the aligned kernel above except that the row pitch of `x`, `y`
 // and `residual` is given separately from `K`/`N`.
@@ -1850,13 +1956,13 @@ instantiate_qmm_t_strided(128, 32, 32, 32, 8)
 
 // Same as `qmm_t_aligned_impl`, except the K loop runs `k_len` columns from the
 // bases the caller advanced, while the row pitches still come from the full K.
-template <typename T, int group_size, int bits, int BM, int BK, int BN>
+template <typename T, typename P, int group_size, int bits, int BM, int BK, int BN>
 METAL_FUNC void qmm_t_splitk_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x,
-    device float* y,
+    device P* y,
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
@@ -1871,15 +1977,8 @@ METAL_FUNC void qmm_t_splitk_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  // The partials are FLOAT, not the activation type. An unsplit GEMM keeps the
-  // whole K sum in a float accumulator and rounds once; a split one rounds
-  // every partition. Rounding a bf16 partial throws away eight mantissa bits
-  // `split_k` times over, and the loss is not academic: it moved a router
-  // logit enough to flip a top-k selection in llama_numerics_test's routed
-  // geometry. Float partials cost twice the bandwidth on a pass that is 3.5%
-  // of a decode fire, and make the split as accurate as the whole.
   using mma_t = mlx::steel::
-      BlockMMA<T, float, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+      BlockMMA<T, P, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
@@ -1934,17 +2033,20 @@ METAL_FUNC void qmm_t_splitk_impl(
 // quarter of the parallelism they had room for.
 //
 // Each threadgroup takes one K partition and writes its own [M, N] slice; the
-// reduce below sums the slices.  Partials are FLOAT (see the note inside).
+// reduce below sums the slices. Most projections use bf16 partials because the
+// side-buffer traffic is otherwise a visible second pass over the output. The
+// V projection uses the float instantiation: rounding each partition there
+// moved a routed model's next-layer top-k choice in llama_numerics_test.
 // The K sum is reassociated into `split_k` contiguous blocks -- pairwise rather
 // than strictly sequential, which is the better-conditioned order, but it does
 // mean this is not bit-identical to the unsplit kernel.
-template <typename T, int group_size, int bits, int BM, int BK, int BN>
+template <typename T, typename P, int group_size, int bits, int BM, int BK, int BN>
 [[kernel]] void affine_qmm_t_splitk(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales   [[buffer(1)]],
     const device T* biases   [[buffer(2)]],
     const device T* x        [[buffer(3)]],
-    device float* y          [[buffer(8)]],  // [split_k, M, N], FLOAT
+    device P* y              [[buffer(8)]],  // [split_k, M, N]
     const constant int& K    [[buffer(5)]],
     const constant int& N    [[buffer(6)]],
     const constant int& k_partition_size [[buffer(9)]],
@@ -1969,19 +2071,52 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 
   // The impl walks `K` columns from the bases above, so pass the partition
   // length as its K -- the row pitches (K_w, K_g) come from the real K.
-  qmm_t_splitk_impl<T, group_size, bits, BM, BK, BN>(
+  qmm_t_splitk_impl<T, P, group_size, bits, BM, BK, BN>(
+      (const device uint32_t*)wl, scales, biases, x, y, Xs, Ws, K,
+      k_partition_size, N, tid, simd_gid, simd_lid);
+}
+
+template <typename P, int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_splitk_fp16_precast(
+    const device uint32_t* w [[buffer(0)]],
+    const device bfloat* scales [[buffer(1)]],
+    const device bfloat* biases [[buffer(2)]],
+    device P* y [[buffer(8)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& k_partition_size [[buffer(9)]],
+    const constant int& split_k_partition_stride [[buffer(10)]],
+    const device half* x [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+
+  const int k_start = int(tid.z) * k_partition_size;
+  x += k_start;
+  auto wl = (const device uint8_t*)w;
+  wl += k_start * bytes_per_pack / pack_factor;
+  scales += k_start / group_size;
+  biases += k_start / group_size;
+  y += int64_t(tid.z) * split_k_partition_stride;
+
+  qmm_t_fp16_precast_impl<P, group_size, bits, BM, BK, BN>(
       (const device uint32_t*)wl, scales, biases, x, y, Xs, Ws, K,
       k_partition_size, N, tid, simd_gid, simd_lid);
 }
 
 // Sum the split_k slices and write the activation type, folding in the block
 // residual the fused projection would otherwise have applied.
-template <typename T, bool WITH_RESIDUAL>
+template <typename T, typename P, bool WITH_RESIDUAL>
 [[kernel]] void qmm_splitk_reduce(
     device T* y                 [[buffer(4)]],
     const constant int& N       [[buffer(6)]],
     const device T* residual    [[buffer(7)]],
-    const device float* partial [[buffer(8)]],
+    const device P* partial     [[buffer(8)]],
     const constant int& stride  [[buffer(10)]],
     // NOT buffer(9). One argument table serves BOTH halves of a split
     // projection, and 9 is the GEMM's `k_partition_size`, the partition LENGTH
@@ -1998,14 +2133,18 @@ template <typename T, bool WITH_RESIDUAL>
   y[o] = static_cast<T>(acc);
 }
 
-#define instantiate_qmm_t_splitk(gs, bm, bk, bn, b)                                    \
-  template [[host_name("affine_qmm_t_splitk_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm         \
-                       "_bn_" #bn)]]                                            \
-  [[kernel]] void affine_qmm_t_splitk<bfloat, gs, b, bm, bk, bn>(               \
+#define instantiate_qmm_t_splitk_named(name, ptype, gs, bm, bk, bn, b)          \
+  template [[host_name("affine_qmm_t_splitk_" #name "_gs_" #gs "_b_" #b        \
+                       "_bm_" #bm "_bn_" #bn)]]                                  \
+  [[kernel]] void affine_qmm_t_splitk<bfloat, ptype, gs, b, bm, bk, bn>(        \
       const device uint32_t*, const device bfloat*, const device bfloat*,       \
-      const device bfloat*, device float*, const constant int&,                 \
+      const device bfloat*, device ptype*, const constant int&,                 \
       const constant int&, const constant int&, const constant int&,            \
       uint3, uint, uint);
+
+#define instantiate_qmm_t_splitk(gs, bm, bk, bn, b)                              \
+  instantiate_qmm_t_splitk_named(bfloat16, bfloat, gs, bm, bk, bn, b)           \
+  instantiate_qmm_t_splitk_named(f32_bfloat16, float, gs, bm, bk, bn, b)
 
 instantiate_qmm_t_splitk(64, 16, 32, 32, 4)
 instantiate_qmm_t_splitk(32, 16, 32, 32, 4)
@@ -2026,12 +2165,36 @@ instantiate_qmm_t_splitk(64, 64, 32, 32, 8)
 instantiate_qmm_t_splitk(32, 64, 32, 32, 8)
 instantiate_qmm_t_splitk(128, 64, 32, 32, 8)
 
+#define instantiate_qmm_t_splitk_fp16_precast(name, ptype, bm)              \
+  template [[host_name("affine_qmm_t_splitk_fp16_precast_" #name            \
+                       "_gs_64_b_4_bm_" #bm "_bn_32")]]                      \
+  [[kernel]] void affine_qmm_t_splitk_fp16_precast<ptype, 64, 4, bm, 32, 32>(\
+      const device uint32_t*, const device bfloat*, const device bfloat*,    \
+      device ptype*, const constant int&, const constant int&,               \
+      const constant int&, const constant int&, const device half*,          \
+      uint3, uint, uint);
+
+instantiate_qmm_t_splitk_fp16_precast(bfloat16, bfloat, 16)
+instantiate_qmm_t_splitk_fp16_precast(bfloat16, bfloat, 32)
+instantiate_qmm_t_splitk_fp16_precast(bfloat16, bfloat, 64)
+instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 16)
+instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 32)
+instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 64)
+
 
 template [[host_name("qmm_splitk_reduce_bfloat16")]] [[kernel]] void
-qmm_splitk_reduce<bfloat, false>(device bfloat*, const constant int&,
-                                 const device bfloat*, const device float*,
-                                 const constant int&, const constant int&, uint2);
+qmm_splitk_reduce<bfloat, bfloat, false>(
+    device bfloat*, const constant int&, const device bfloat*, const device bfloat*,
+    const constant int&, const constant int&, uint2);
 template [[host_name("qmm_splitk_reduce_residual_bfloat16")]] [[kernel]] void
-qmm_splitk_reduce<bfloat, true>(device bfloat*, const constant int&,
-                                const device bfloat*, const device float*,
-                                const constant int&, const constant int&, uint2);
+qmm_splitk_reduce<bfloat, bfloat, true>(
+    device bfloat*, const constant int&, const device bfloat*, const device bfloat*,
+    const constant int&, const constant int&, uint2);
+template [[host_name("qmm_splitk_reduce_f32_bfloat16")]] [[kernel]] void
+qmm_splitk_reduce<bfloat, float, false>(
+    device bfloat*, const constant int&, const device bfloat*, const device float*,
+    const constant int&, const constant int&, uint2);
+template [[host_name("qmm_splitk_reduce_residual_f32_bfloat16")]] [[kernel]] void
+qmm_splitk_reduce<bfloat, float, true>(
+    device bfloat*, const constant int&, const device bfloat*, const device float*,
+    const constant int&, const constant int&, uint2);

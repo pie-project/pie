@@ -63,7 +63,7 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
 /// A dense projection's GEMM row count, padded up to a whole BM tile so the
 /// matmul engages at any batch rather than only at exact multiples of one. The
 /// padding rows compute discardable values into pool rows nothing reads.
-int llama_qmm_rows(int rows);
+int llama_qmm_rows(int rows, int requests = 1);
 
 /// The pool's row count: the widest padding any batch up to `max_rows` can ask
 /// for, which is what the scratch must be sized against.
@@ -91,7 +91,7 @@ int llama_moe_qmm_bn(Kind k, const LlamaGeometry& g, int rows);
 bool llama_is_dense_proj(Kind k);
 
 /// The GEMM's column tile for a dense projection, or 0 to keep the matvec.
-int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows);
+int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows, int requests = 1);
 
 /// The K partitions a dense projection's GEMM takes, or 1 for no split.
 ///
@@ -104,13 +104,15 @@ int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows);
 /// One question in one place: `pso_for`, `launch_shape`, `encode_llama_step`
 /// and `bind_llama_splitk` must all give the same answer, or the GEMM writes
 /// partials with a stride the reduce does not read back.
-int llama_qmm_split(Kind k, const LlamaGeometry& g, int rows);
+int llama_qmm_split(Kind k, const LlamaGeometry& g, int rows, int requests = 1);
+
+inline constexpr int kLlamaSplitkConcurrentLanes = 3;
 
 /// Elements the split GEMM's partials buffer must hold for a batch up to
-/// `max_rows`: the deepest split, times the widest padded batch, times the
-/// widest output that takes a split. Asked here so the sizer and the stride the
-/// binder writes come from the same constants.
-std::size_t llama_splitk_partial_elems(int max_rows);
+/// `max_rows`: one maximum-sized slice per member of the widest concurrency
+/// run. Q/K/V need three independent slices so one projection's reduce can
+/// overlap the next projection's GEMM.
+std::size_t llama_splitk_partial_elems(const LlamaGeometry& g, int max_rows);
 
 /// `run_ends[i]`: the last position of the concurrency run containing `i`. What
 /// the colourer needs to know about which barriers the encoder will drop.
@@ -128,6 +130,6 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                        const LlamaGeometry& g, const DecodeStepPsos& base, const LlamaPsos& ll,
                        int ordinal_base = 0, const MultiBatchPsos* mb = nullptr, int rows = 1,
                        int head_rows = 1, int requests = 1, std::size_t begin = 0,
-                       std::size_t end = ~std::size_t(0));
+                       std::size_t end = ~std::size_t(0), bool run_argmax = true);
 
 }  // namespace pie::metal::llama
