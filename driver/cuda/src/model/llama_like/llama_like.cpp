@@ -869,6 +869,18 @@ void prepare_llama_like_decode_plan(
         if (!state.mask_decode_plan) {
             state.mask_decode_plan = ops::make_prefill_plan();
         }
+        if (std::getenv("PIE_KVPP_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[kvpp-sfx] R=%d split=%d rs=%d counts=%d sfx=[",
+                         num_requests, split, rs,
+                         mask_suffix_page_counts_h != nullptr ? 1 : 0);
+            for (int i = 0; i <= rs; ++i)
+                std::fprintf(stderr, "%u,", kvpp_suffix[i]);
+            std::fprintf(stderr, "] host_tail=[");
+            for (int i = split; i <= num_requests; ++i)
+                std::fprintf(stderr, "%u,", kv_page_indptr_h[i]);
+            std::fprintf(stderr, "]\n");
+        }
         const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         ops::plan_attention_flashinfer_prefill_bf16(
             *state.mask_decode_plan,
@@ -934,6 +946,16 @@ void prepare_llama_like_decode_plan(
             }
         }
         if (suffix_decode) {
+            if (std::getenv("PIE_KVPP_TRACE") != nullptr) {
+                std::fprintf(stderr, "[kvpp] R=%d split_req=%d qo=[", 
+                             num_requests, split_req);
+                for (int r = 0; r <= num_requests; ++r)
+                    std::fprintf(stderr, "%u,", qo_indptr_h[r]);
+                std::fprintf(stderr, "] kvpp=[");
+                for (int r = 0; r <= num_requests; ++r)
+                    std::fprintf(stderr, "%u,", kv_page_indptr_h[r]);
+                std::fprintf(stderr, "]\n");
+            }
             const int rs = num_requests - split_req;
             const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
             const int num_q_heads_local = cfg.num_attention_heads / T;

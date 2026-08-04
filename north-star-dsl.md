@@ -2278,3 +2278,21 @@ placeholder underflow, kv_indptr = -671086915) — the wire-merge kvpp
 audit is now blocking BOTH the R=32 headline and the
 declined-deployment 2-way paths. Fix that, then rerun 8/axis and
 14B.
+
+## THE HEADLINE (2026-08-04): four-axis composition, 5.9x at 7B / R=32
+
+The review's #1 experiment, completed at full scale (8 lanes PER AXIS:
+8 masked + 8 lora + 8 draft + 8 plain = 32 lanes, Mistral-7B,
+128 tok, release):
+
+  composed (default) . 5.13-5.30s/round
+  solo regime        . 29.8-31.1s/round
+  -> 5.9x FOR THE FOUR-AXIS FABRIC ITSELF
+
+With R=16's 3.66x, the composition claim now scales: 1.18x (0.6B,
+5 lanes) -> 3.66x (7B, 16) -> 5.9x (7B, 32). The big number and the
+new claim live in one experiment. The R=32 kvpp fault did NOT
+reproduce across five traced rounds this boot (suffix plans all
+monotone, counts-sourced) — re-filed as PROBABILISTIC (first-boot
+window suspected), with the kvpp dumps (PIE_KVPP_TRACE) now permanent
+instrumentation for the next occurrence.
