@@ -21,6 +21,9 @@ members = [
     "runtime/grammar",
     # Model metadata + instruct chat templates + multimodal host-decode.
     "runtime/model",
+    # HF `config.json` normalization -> the `pie.model/1` descriptor. A leaf:
+    # serde only, no driver and no runtime, so `pie model convert` can run it.
+    "runtime/model-config",
     # Shared process skeleton (paths, config sourcing, tracing/metrics, signals,
     # CLI skeleton). Depends on no role lib. Lives under `bin/` because it also
     # ships the `pie-env` command; the bins import its lib as `startup`.
@@ -93,9 +96,14 @@ rust-version = "1.91"
 # dance: `ztensor` owns the container format and its validation,
 # `ztensor-compat` owns the foreign-format projections.
 #
-# 2.1 rewrote the crate surface: the modules follow the spec's layers, object
-# builders are scoped, and `Source::provenance` replaced the two half-questions
-# that preceded it.
+# 2.1 is published, so this is an ordinary version requirement again. It was a
+# revision-pinned git dependency while the two were developed together, which
+# `Cargo.lock` not being tracked here made necessary: a branch would have
+# resolved to whatever v2's tip was at clone time, and v2 moved under us.
+#
+# What 2.1 changed: the modules follow the spec's layers (`format` is L0+L1 and
+# opens no file, `provide` is the projection face), object builders are scoped,
+# and `Source::provenance` replaced the two half-questions before it.
 [workspace.dependencies]
 ztensor = "2.1"
 ztensor-compat = "2.1"

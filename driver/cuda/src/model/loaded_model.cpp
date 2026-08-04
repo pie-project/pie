@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
@@ -15,6 +16,7 @@
 #include "ops/gemm.hpp"
 #include "loader/load_plan_bridge.hpp"
 #include "loader/load_plan_executor.hpp"
+#include "model/descriptor.hpp"
 #include "model/registry.hpp"
 #include "model/weight_artifact_cache.hpp"
 #include "tensor.hpp"
@@ -145,9 +147,27 @@ LoadedModel LoadedModel::load(
     };
 
     const std::filesystem::path snapshot{boot_cfg.model.snapshot_dir};
-    log_stage("parse hf config begin");
-    e.hf_ = parse_hf_config(snapshot / "config.json");
-    log_stage("parse hf config done");
+    if (!boot_cfg.model.descriptor.empty()) {
+        // The artifact carried its model config already normalized, so there
+        // is nothing to derive here. See model/descriptor.hpp.
+        log_stage("read model descriptor begin");
+        std::ifstream in(boot_cfg.model.descriptor);
+        if (!in) {
+            throw std::runtime_error("cannot open model descriptor: " +
+                                     boot_cfg.model.descriptor);
+        }
+        std::ostringstream buffer;
+        buffer << in.rdbuf();
+        e.hf_ = parse_pie_model_descriptor(buffer.str());
+        log_stage("read model descriptor done");
+    } else {
+        // A snapshot that predates the artifact format. The whole of
+        // `parse_hf_config` exists for this branch, and it goes when the
+        // descriptor has been proven on real hardware.
+        log_stage("parse hf config begin");
+        e.hf_ = parse_hf_config(snapshot / "config.json");
+        log_stage("parse hf config done");
+    }
 
     // Bind to the requested CUDA device before we allocate anything.
     int dev_id = 0;

@@ -111,7 +111,7 @@ pub fn cuda_standalone_toml_capped(
          \n\
          [worker.model]\n\
          name = \"qwen3\"\n\
-         hf_repo = \"{hf_repo}\"\n\
+         model = \"{hf_repo}\"\n\
          \n\
          [worker.model.driver]\n\
          type = \"cuda_native\"\n\
@@ -218,7 +218,7 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
          \n\
          [worker.model]\n\
          name = \"default\"\n\
-         hf_repo = \"{hf_repo}\"\n\
+         model = \"{hf_repo}\"\n\
          \n\
          [worker.model.driver]\n\
          type = \"cuda_native\"\n\
@@ -272,7 +272,7 @@ pub fn dummy_standalone_toml(hf_repo: &str) -> String {
          \n\
          [worker.model]\n\
          name = \"qwen3\"\n\
-         hf_repo = \"{hf_repo}\"\n\
+         model = \"{hf_repo}\"\n\
          \n\
          [worker.model.driver]\n\
          type = \"dummy\"\n\

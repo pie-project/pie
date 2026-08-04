@@ -19,7 +19,7 @@ use crate::types::{Axis, DType, Encoding, QuantGranularity, RepackLayout, ScaleF
 
 pub mod compile;
 pub mod infer;
-pub mod normalize;
+pub mod materialize;
 pub mod rewrite;
 
 /// A tensor-valued expression.

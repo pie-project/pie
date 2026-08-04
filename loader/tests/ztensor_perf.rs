@@ -106,7 +106,7 @@ fn reading_a_checkpoint_through_ztensor_stays_within_budget() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Reading the `.zt` artifact `optimize` writes, against reading the
+/// Reading the `.zt` artifact `convert` writes, against reading the
 /// safetensors it replaced. The manifest is CBOR rather than JSON and the
 /// reader validates every blob reference, so this is the number that decides
 /// whether the artifact format costs anything at load.

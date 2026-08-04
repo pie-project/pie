@@ -138,7 +138,18 @@ pub struct ModelConfig {
     pub name: String,
     pub arch_name: String,
     pub kv_page_size: usize,
+    /// The tokenizer file, for a model served from a HuggingFace snapshot.
+    ///
+    /// Only consulted when `artifact` is `None`. A served `.zt` carries its
+    /// tokenizer compiled, so there is no file to point at — this then holds
+    /// the artifact's own path, which is what the diagnostics want anyway.
     pub tokenizer_path: PathBuf,
+    /// Compiled metadata lifted out of a `.zt` artifact.
+    ///
+    /// Present means the runtime reads the tokenizer and the model facts from
+    /// here instead of parsing `tokenizer.json` and probing `config.json` at
+    /// every boot — which is the whole point of the artifact.
+    pub artifact: Option<pie_model::ArtifactMetadata>,
     pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
@@ -264,6 +275,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         arch_name,
         kv_page_size,
         tokenizer_path,
+        artifact,
         drivers: driver_configs,
         scheduler,
     } = config.model;
@@ -319,6 +331,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         rs_caps,
         ptir_caps,
         tokenizer_path.clone(),
+        artifact,
     )?;
 
     let arena_kv_pages: Vec<usize> = driver_configs.iter().map(|d| d.total_pages).collect();
@@ -592,8 +605,11 @@ fn verify_config(config: &Config) -> Result<()> {
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
 
     let model = &config.model;
+    // An artifact carries its tokenizer inside it, so there is no file to
+    // check for — the artifact itself was already opened to lift the metadata
+    // out.
     ensure!(
-        model.tokenizer_path.exists(),
+        model.artifact.is_some() || model.tokenizer_path.exists(),
         "Model {:?}: tokenizer not found at {:?}",
         model.name,
         model.tokenizer_path

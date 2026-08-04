@@ -274,7 +274,7 @@ struct StartupBanner {
 impl StartupBanner {
     fn from_config(cfg: &config::Config) -> Self {
         let m = &cfg.model;
-        let model = format!("{} ({})", m.name, m.hf_repo);
+        let model = format!("{} ({})", m.name, m.model);
         let driver = m.driver.kind.as_str().to_string();
         let device = {
             let device = m.driver.device.join(", ");
@@ -353,6 +353,9 @@ struct LoadedModelDrivers {
     encode_identity: pie_driver_abi::ModelIdentity,
     kv_handle: Option<pie_driver_abi::KvHandle>,
     drivers: ModelDrivers,
+    /// The artifact's compiled metadata, read once while resolving the model.
+    /// `None` for a legacy snapshot.
+    artifact: Option<pie_model::ArtifactMetadata>,
 }
 
 struct LoadedPartnerMetadata {
@@ -401,7 +404,30 @@ fn model_identity(
     })
 }
 
+/// The identity of a `.zt` artifact, or `None` for anything else.
+///
+/// The loader answers what identifies a checkpoint; this only folds its answer
+/// into the 32-byte shape the identity plumbing expects.
+fn manifest_digest(path: &Path) -> Result<Option<[u8; 32]>> {
+    let identity = pie_loader::checkpoint::zt::artifact_identity(path)
+        .map_err(|err| anyhow!("reading the identity of {path:?}: {err}"))?;
+    Ok(identity.map(|bytes| *blake3::hash(&bytes).as_bytes()))
+}
+
 fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
+    // A `.zt` artifact already has an identity, and it is a better one than
+    // anything derivable here: the manifest digest covers every tensor, the
+    // compiled tokenizer and the model descriptor together, and for a sharded
+    // artifact it reaches the shards through their entries in the shard table.
+    // It also survives the file being moved, which the path-derived answer
+    // below does not.
+    if let Some(digest) = manifest_digest(snapshot_dir)? {
+        return Ok(digest);
+    }
+
+    // Legacy snapshots. The revision in `snapshots/<rev>/` is HF's own content
+    // identity, so it beats re-hashing gigabytes; falling through to the walk
+    // is the last resort.
     let components = snapshot_dir.components().collect::<Vec<_>>();
     for pair in components.windows(2) {
         if pair[0].as_os_str() == "snapshots" {
@@ -465,6 +491,7 @@ fn load_model_drivers(
     user_cfg: &config::Config,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<LoadedModelDrivers> {
+    let mut artifact: Option<pie_model::ArtifactMetadata> = None;
     let (driver_groups, snapshot_dir) = {
         let m = &user_cfg.model;
         let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;
@@ -494,8 +521,15 @@ fn load_model_drivers(
         let ResolvedFlavor::Embedded(flavor) = resolved;
         let mut embedded_base_opts = preflight::build_embedded_options(m, flavor)?;
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
-        let snapshot_dir = weights::resolve(&m.hf_repo)
-            .with_context(|| format!("resolving hf_repo for model {:?}", m.name))?;
+        let resolved_model = weights::resolve(&m.model)
+            .with_context(|| format!("resolving the model for {:?}", m.name))?;
+        // Opened once, here. The drivers get the compiled model config beside
+        // their startup TOML; the runtime gets the whole of it. Neither
+        // re-opens the artifact, and neither re-decides what it is.
+        artifact = resolved_model
+            .metadata()
+            .with_context(|| format!("reading the artifact for {:?}", m.name))?;
+        let snapshot_dir = resolved_model.path().to_path_buf();
         let mut group_drivers: Vec<GroupDriver> = Vec::with_capacity(topology.len());
         for (group_idx, group) in topology.iter().enumerate() {
             group_drivers.push(create_driver_group(
@@ -505,6 +539,7 @@ fn load_model_drivers(
                 flavor,
                 &embedded_base_opts,
                 &snapshot_dir,
+                artifact.as_ref().map(|a| a.descriptor.as_slice()),
                 tp_degree,
                 component,
             )?);
@@ -529,9 +564,10 @@ fn load_model_drivers(
     let artifact_digest = if user_cfg.cluster.controller.is_some() || user_cfg.offload.enabled {
         model_artifact_digest(&snapshot_dir)?
     } else {
-        *blake3::hash(user_cfg.model.hf_repo.as_bytes()).as_bytes()
+        *blake3::hash(user_cfg.model.model.as_bytes()).as_bytes()
     };
     Ok(LoadedModelDrivers {
+        artifact,
         model: user_cfg.model.name.clone(),
         full_identity: model_identity(
             user_cfg,
@@ -566,10 +602,11 @@ async fn boot_engine(
         encode_identity,
         kv_handle,
         drivers,
+        artifact,
     } = load_model_drivers(user_cfg, pie_driver_abi::ModelComponent::Full)?;
 
-    let boot_cfg =
-        translate::build(user_cfg, drivers).context("translating to bootstrap::Config")?;
+    let boot_cfg = translate::build(user_cfg, drivers, artifact)
+        .context("translating to bootstrap::Config")?;
 
     let boot = pie_engine::bootstrap::bootstrap(boot_cfg)
         .await
@@ -914,6 +951,7 @@ fn create_driver_group(
     flavor: Flavor,
     base_opts: &DriverOptions,
     snapshot_dir: &Path,
+    descriptor: Option<&[u8]>,
     tp_degree: usize,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<GroupDriver> {
@@ -925,6 +963,7 @@ fn create_driver_group(
             return crate::embedded_driver::create_driver_backend_group(
                 &rank_opts,
                 snapshot_dir,
+                descriptor,
                 group_idx,
                 &tp_launches,
                 component,
@@ -950,8 +989,15 @@ fn create_driver_group(
     let device = group_driver(m, group_idx, first_driver_idx)?;
     let opts = embedded_opts_for_device(base_opts, device);
 
-    crate::embedded_driver::create_driver_backend(&opts, snapshot_dir, group_idx, None, component)
-        .with_context(|| format!("creating driver for model {:?} group {group_idx}", m.name,))
+    crate::embedded_driver::create_driver_backend(
+        &opts,
+        snapshot_dir,
+        descriptor,
+        group_idx,
+        None,
+        component,
+    )
+    .with_context(|| format!("creating driver for model {:?} group {group_idx}", m.name,))
 }
 
 fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> DriverOptions {
@@ -1046,6 +1092,56 @@ mod tests {
     }
 
     #[test]
+    fn an_artifacts_identity_is_its_contents_and_survives_a_move() {
+        use pie_loader::checkpoint::write::CheckpointWriter;
+        use pie_loader::types::{DType, Encoding, TensorDecl, TensorId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let write = |path: &std::path::Path, bytes: &[u8]| {
+            let mut writer = CheckpointWriter::create(path, &Default::default()).unwrap();
+            writer
+                .add_tensor(
+                    &TensorDecl {
+                        id: TensorId(0),
+                        name: "w".to_string(),
+                        shape: vec![bytes.len() as i64],
+                        encoding: Encoding::Raw(DType::U8),
+                        alignment: 1,
+                        visibility: Default::default(),
+                    },
+                    bytes,
+                )
+                .unwrap();
+            writer.finish().unwrap();
+        };
+
+        let a = dir.path().join("a.zt");
+        let b = dir.path().join("nested").join("b.zt");
+        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+        write(&a, &[1u8, 2, 3, 4]);
+        write(&b, &[1u8, 2, 3, 4]);
+
+        // Same contents, different names and directories — same identity. The
+        // path-derived answer this replaced could not say that, which is what
+        // made a relocated artifact look like a different model.
+        assert_eq!(
+            model_artifact_digest(&a).unwrap(),
+            model_artifact_digest(&b).unwrap()
+        );
+
+        // Different contents, same name shape — different identity.
+        let c = dir.path().join("c.zt");
+        write(&c, &[9u8, 9, 9, 9]);
+        assert_ne!(
+            model_artifact_digest(&a).unwrap(),
+            model_artifact_digest(&c).unwrap()
+        );
+
+        // A non-artifact still goes down the legacy path rather than erroring.
+        assert!(super::manifest_digest(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
     fn model_identity_uses_snapshot_revision_or_file_contents() {
         let root = tempfile::tempdir().unwrap();
         let revision = "0123456789abcdef";
@@ -1071,7 +1167,7 @@ mod tests {
             r#"
             [model]
             name = "test"
-            hf_repo = "local"
+            model = "local"
 
             [model.driver]
             type = "dummy"

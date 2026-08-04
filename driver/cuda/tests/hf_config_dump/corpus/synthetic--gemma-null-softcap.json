@@ -1,0 +1,14 @@
+{
+  "architectures": [
+    "Gemma2ForCausalLM"
+  ],
+  "attn_logit_softcapping": null,
+  "final_logit_softcapping": null,
+  "hidden_size": 128,
+  "max_position_embeddings": 2048,
+  "model_type": "gemma2",
+  "num_attention_heads": 8,
+  "num_hidden_layers": 4,
+  "sliding_window": 256,
+  "vocab_size": 1000
+}

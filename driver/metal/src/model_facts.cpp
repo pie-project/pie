@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -455,6 +456,173 @@ void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts&
     cfg.gemma4.rope_theta_full = facts.g4_rope_theta_full;
     cfg.gemma4.rope_theta_sliding = facts.g4_rope_theta_sliding;
     cfg.gemma4.full_partial_rotary = facts.g4_full_partial_rotary;
+}
+
+// Reading the facts out of a `pie.model/1` descriptor instead of deriving them
+// from `config.json`.
+//
+// The descriptor is flat and already normalized -- no `text_config` to step
+// into, no alternate spellings, no per-family defaulting -- so every read here
+// is one key.
+//
+// Returns nullopt when there is no descriptor to read, and the caller then
+// parses `config.json` whole. It is all or nothing per model: half the facts
+// normalized and half probed from files is the exact skew the artifact exists
+// to remove.
+//
+// `global_head_dim` and `use_double_wide_mlp` are read by this driver and by
+// no other, and they are in the descriptor anyway -- `pie.model/1` is the
+// artifact's model config, not one driver's. They arrive under their
+// `HfConfig` field names, `gemma4_*`, because the schema is generated from
+// that struct.
+std::optional<ModelFacts> read_model_facts_from_descriptor(
+    const std::string& descriptor_path) {
+    if (descriptor_path.empty()) return std::nullopt;
+    std::ifstream f(descriptor_path);
+    if (!f) return std::nullopt;
+
+    nlohmann::json j;
+    try {
+        f >> j;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    if (j.value("version", std::string{}) != "pie.model/1") return std::nullopt;
+
+    ModelFacts facts;
+    const auto u32_of = [&j](const char* key, std::uint32_t& out) {
+        if (j.contains(key) && j[key].is_number_integer()) {
+            out = j[key].get<std::uint32_t>();
+        }
+    };
+    const auto i32_of = [&j](const char* key, int& out) {
+        if (j.contains(key) && j[key].is_number_integer()) {
+            out = j[key].get<int>();
+        }
+    };
+    const auto f32_of = [&j](const char* key, float& out) {
+        if (j.contains(key) && j[key].is_number()) {
+            out = j[key].get<float>();
+        }
+    };
+
+    facts.model_type = j.value("model_type", std::string{});
+    u32_of("vocab_size", facts.vocab_size);
+    u32_of("max_position_embeddings", facts.max_model_len);
+    f32_of("rope_theta", facts.rope_theta);
+    f32_of("partial_rotary_factor", facts.partial_rotary_factor);
+
+    // `arch_name` is `architectures[0]` verbatim in the descriptor; this driver
+    // keys on the lowercased stem, so apply the same reduction it applies to
+    // `config.json`.
+    std::string arch = j.value("arch_name", std::string{});
+    for (auto& c : arch) c = static_cast<char>(std::tolower(c));
+    const std::string suffix = "forcausallm";
+    if (arch.size() > suffix.size() &&
+        arch.compare(arch.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        arch.erase(arch.size() - suffix.size());
+    }
+    if (!arch.empty()) facts.arch_name = arch;
+
+    if (j.value("linear_num_value_heads", 0) > 0) facts.has_linear_attn = true;
+    if (j.contains("layer_types") && j["layer_types"].is_array()) {
+        for (const auto& t : j["layer_types"]) {
+            if (t.is_string() && t.get<std::string>() == "linear_attention") {
+                facts.has_linear_attn = true;
+                break;
+            }
+        }
+    }
+
+    if (facts.model_type == "gpt_oss") {
+        i32_of("num_hidden_layers", facts.go_num_hidden_layers);
+        i32_of("hidden_size", facts.go_hidden_size);
+        i32_of("vocab_size", facts.go_vocab_size);
+        i32_of("num_attention_heads", facts.go_num_attention_heads);
+        i32_of("num_key_value_heads", facts.go_num_key_value_heads);
+        i32_of("head_dim", facts.go_head_dim);
+        i32_of("sliding_window", facts.go_sliding_window);
+        // The descriptor folds `num_local_experts` / `num_experts` /
+        // `n_routed_experts` into one field at import.
+        i32_of("num_experts", facts.go_num_local_experts);
+        i32_of("num_experts_per_tok", facts.go_num_experts_per_tok);
+        i32_of("intermediate_size", facts.go_intermediate_size);
+        f32_of("rms_norm_eps", facts.go_rms_norm_eps);
+        f32_of("swiglu_limit", facts.go_swiglu_limit);
+        f32_of("rope_theta", facts.go_rope_theta);
+        // YaRN's four, already resolved out of `rope_scaling`.
+        f32_of("rope_factor", facts.go_rope_factor);
+        f32_of("rope_beta_fast", facts.go_rope_beta_fast);
+        f32_of("rope_beta_slow", facts.go_rope_beta_slow);
+        i32_of("rope_original_max_position", facts.go_rope_original_max_position);
+    }
+
+    if (facts.model_type == "gemma4" || facts.model_type == "gemma4_text") {
+        i32_of("num_hidden_layers", facts.g4_num_hidden_layers);
+        i32_of("hidden_size", facts.g4_hidden_size);
+        i32_of("intermediate_size", facts.g4_intermediate_size);
+        i32_of("num_attention_heads", facts.g4_num_attention_heads);
+        i32_of("num_key_value_heads", facts.g4_num_key_value_heads);
+        i32_of("head_dim", facts.g4_head_dim);
+        i32_of("gemma4_global_head_dim", facts.g4_global_head_dim);
+        // `sliding_window` is -1 in the descriptor when the config omits it,
+        // where reading `config.json` would leave this 0. Guard so "absent"
+        // means the same thing on both paths.
+        if (j.value("sliding_window", -1) > 0) {
+            i32_of("sliding_window", facts.g4_sliding_window);
+        }
+        i32_of("num_kv_shared_layers", facts.g4_num_kv_shared_layers);
+        i32_of("gemma_hidden_size_per_layer_input", facts.g4_per_layer_emb_dim);
+        facts.g4_double_wide_mlp = j.value("gemma4_double_wide_mlp", false);
+        f32_of("gemma_final_logit_softcap", facts.g4_final_softcap);
+
+        // The descriptor expands the per-attention-type rope into one entry
+        // per layer at import, so the per-type values come back by looking at
+        // the first layer of each type rather than by re-reading nested JSON.
+        if (j.contains("layer_types") && j["layer_types"].is_array()) {
+            const auto& types = j["layer_types"];
+            const auto at = [&j](const char* key, std::size_t i, float& out) {
+                if (j.contains(key) && j[key].is_array() && i < j[key].size() &&
+                    j[key][i].is_number()) {
+                    out = j[key][i].get<float>();
+                }
+            };
+            std::vector<int> full;
+            // Each type's values come from the *first* layer of that type, and
+            // the two are tracked independently: keying the sliding read off
+            // "no full layer yet" would miss a stack that opens with one.
+            bool saw_full = false;
+            bool saw_sliding = false;
+            for (std::size_t i = 0; i < types.size(); ++i) {
+                if (!types[i].is_string()) continue;
+                const std::string t = types[i].get<std::string>();
+                if (t == "full_attention") {
+                    if (!saw_full) {
+                        at("gemma_per_layer_rope_theta", i, facts.g4_rope_theta_full);
+                        at("gemma_per_layer_partial_rotary_factor", i,
+                           facts.g4_full_partial_rotary);
+                        saw_full = true;
+                    }
+                    full.push_back(static_cast<int>(i));
+                } else if (t == "sliding_attention" && !saw_sliding) {
+                    at("gemma_per_layer_rope_theta", i, facts.g4_rope_theta_sliding);
+                    saw_sliding = true;
+                }
+            }
+            // Same schedule check the `config.json` path makes: the interval is
+            // the distance between the first two full layers, and an irregular
+            // stack is refused (-1) rather than silently mis-scheduled.
+            if (!full.empty()) {
+                const int interval = full[0] + 1;
+                bool regular = true;
+                for (std::size_t k = 0; k < full.size(); ++k) {
+                    regular = regular && full[k] == static_cast<int>(k + 1) * interval - 1;
+                }
+                facts.g4_full_attn_interval = regular ? interval : -1;
+            }
+        }
+    }
+    return facts;
 }
 
 }  // namespace pie::metal

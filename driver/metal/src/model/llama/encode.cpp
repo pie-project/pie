@@ -510,9 +510,11 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
 
 void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const LlamaGeometry& g,
                        const DecodeStepPsos& base, const LlamaPsos& ll, int ordinal_base,
-                       const MultiBatchPsos* mb, int rows, int head_rows) {
+                       const MultiBatchPsos* mb, int rows, int head_rows, std::size_t begin,
+                       std::size_t end) {
     const std::vector<int> run_ends = llama_run_ends(dag);
-    for (std::size_t i = 0; i < dag.size(); ++i) {
+    const std::size_t last = std::min(end, dag.size());
+    for (std::size_t i = begin; i < last; ++i) {
         const Dispatch& d = dag[i];
         Grid grid;
         Threadgroup tg;
@@ -522,7 +524,7 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const 
         se.dispatch(grid, tg);
         // A barrier after every dispatch except inside a concurrency run: the
         // last member of a run carries it for the whole group.
-        if (i + 1 >= dag.size() || run_ends[i] == static_cast<int>(i)) se.barrier();
+        if (i + 1 >= last || run_ends[i] == static_cast<int>(i)) se.barrier();
     }
 }
 

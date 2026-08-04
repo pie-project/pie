@@ -248,6 +248,14 @@ struct HfConfig {
     // standard `num_key_value_heads` and have their own v_proj.
     bool gemma4_attention_k_eq_v = false;
     int  gemma4_num_global_key_value_heads = 0;
+    // Two more Gemma-4 keys this driver does not read, carried because
+    // `pie.model/1` is generated from this struct and the Metal driver does
+    // read them: the full-attention head width (sliding layers use `head_dim`)
+    // and whether the MLP is double-wide. Without them a Metal artifact would
+    // have to fall back to `config.json` for the whole family, which is the
+    // half-normalized state the descriptor exists to avoid.
+    int  gemma4_global_head_dim = 0;
+    bool gemma4_double_wide_mlp = false;
 
     // GPT-OSS-specific knobs. Inert on every other model.
     //   * `swiglu_limit` — clipping threshold applied to gate values

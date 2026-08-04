@@ -11,6 +11,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -81,11 +82,25 @@ struct RuntimeConfig {
 
 struct ModelConfig {
     std::string hf_path;
+
+    // Path to a `pie.model/1` descriptor: HuggingFace's `config.json`
+    // normalized once at import, written beside this TOML by the worker.
+    //
+    // Empty for a snapshot that predates the artifact format, in which case
+    // `read_model_facts` parses `hf_path/config.json` as before. Same
+    // arrangement as the CUDA driver's `ModelConfig::descriptor`.
+    std::string descriptor;
+
     std::string backend = "metal:0";
     // Page routed experts in from a mapping rather than keeping them
     // resident. Off by default: it trades resident memory for page faults,
     // which only pays when the weights do not comfortably fit.
     bool stream_routed_experts = false;
+    // How many bytes the routed experts may occupy on the device. Zero keeps
+    // the whole bank resident. Non-zero is the only setting under which a
+    // model can exceed the machine, and it costs a submit-and-wait per
+    // mixture layer -- set it when the alternative is not running at all.
+    std::uint64_t expert_slab_bytes = 0;
 };
 
 struct BatchingConfig {
@@ -112,10 +127,14 @@ Config load_config(const std::filesystem::path& path) {
     Config config;
     if (auto model = tbl["model"].as_table()) {
         config.model.hf_path = (*model)["hf_path"].value_or(std::string{});
+        config.model.descriptor = (*model)["descriptor"].value_or(std::string{});
         config.model.backend = (*model)["backend"].value_or(config.model.backend);
         config.model.stream_routed_experts =
             (*model)["stream_routed_experts"].value_or(
                 config.model.stream_routed_experts);
+        config.model.expert_slab_bytes = std::uint64_t(
+            (*model)["expert_slab_bytes"].value_or(
+                std::int64_t(config.model.expert_slab_bytes)));
     }
     if (auto batching = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {
@@ -546,7 +565,14 @@ class Context::Impl {
         // `load.runtime_quant` and `load.mxfp4_moe` are deliberately not read:
         // this driver binds what the checkpoint holds. They were plumbed through
         // three layers to an author that never looked at them.
-        facts_ = read_model_facts(cfg_.model.hf_path);
+        // An artifact carries its model config already normalized; a snapshot
+        // does not, and `read_model_facts` derives it as before.
+        if (auto from_descriptor =
+                read_model_facts_from_descriptor(cfg_.model.descriptor)) {
+            facts_ = std::move(*from_descriptor);
+        } else {
+            facts_ = read_model_facts(cfg_.model.hf_path);
+        }
         std::string error;
         if (!ensure_executor(error)) {
             std::cerr << "[pie-driver-metal] load_model: " << error << "\n";
@@ -2120,6 +2146,7 @@ class Context::Impl {
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
         setup_cfg.stream_routed_experts = cfg_.model.stream_routed_experts;
+        setup_cfg.expert_slab_bytes = cfg_.model.expert_slab_bytes;
         fill_family_geometry(setup_cfg, facts_);
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):

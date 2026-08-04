@@ -11,7 +11,7 @@
 #include <string_view>
 #include <vector>
 
-#include "loader/group_slot_index.hpp"
+#include <pie_loader/group_slot_index.hpp>
 
 namespace {
 
@@ -24,7 +24,7 @@ void check(bool ok, std::string_view what) {
     }
 }
 
-using pie_cuda_driver::GroupSlotIndex;
+using pie_loader::GroupSlotIndex;
 
 // An unfilled slot is not "least recently used at time zero" -- it is empty,
 // and filling it costs nothing. Every free slot has to be spent before the

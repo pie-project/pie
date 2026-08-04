@@ -157,7 +157,13 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Config { cmd } => {
             startup::init_cli(&cli.global)?;
-            ops::config::run(cmd)?;
+            // `config init` downloads the Python runtime through
+            // `reqwest::blocking`, which builds a tokio runtime of its own and
+            // drops it when the client goes. Dropping a runtime inside an async
+            // one is what produced "Cannot drop a runtime in a context where
+            // blocking is not allowed" on every `pie config init`. Same
+            // treatment as `model` and `runtime install`.
+            tokio::task::spawn_blocking(move || ops::config::run(cmd)).await??;
             Ok(ExitCode::SUCCESS)
         }
         Command::Inferlet { cmd } => {

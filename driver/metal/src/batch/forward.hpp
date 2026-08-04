@@ -349,6 +349,18 @@ struct SetupConfig {
     // `PIE_METAL_STREAM_EXPERTS` here, which meant setting the config on a
     // Metal backend did nothing and said nothing.
     bool stream_routed_experts = false;
+    /// How many bytes the routed experts may occupy on the device. Zero means
+    /// the whole bank stays resident, which is what every model that fits
+    /// should do.
+    ///
+    /// Non-zero is the only setting under which a model can exceed the
+    /// machine, and it is a different mechanism from `stream_routed_experts`
+    /// rather than a stronger version of it: streaming maps the bank and every
+    /// mapped page is WIRED, so it bounds nothing. A budget turns mapping off
+    /// and pages the experts through a slab of this size instead, which costs
+    /// a submit-and-wait per mixture layer. Set it only when the alternative
+    /// is not running at all.
+    std::uint64_t expert_slab_bytes = 0;
     // Which storage schema to author against. It selects a contract on this
     // side of the loader call and never crosses it (§10.4).
     std::string model_type;

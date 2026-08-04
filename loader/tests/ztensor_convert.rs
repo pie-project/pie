@@ -1,7 +1,7 @@
-//! The optimize path, end to end: a checkpoint in, a `.zt` artifact out, and
+//! The convert path, end to end: a checkpoint in, a `.zt` artifact out, and
 //! the artifact read back as a checkpoint.
 //!
-//! `pie model optimize` writes what the engine will later load, so the two
+//! `pie model convert` writes what the engine will later load, so the two
 //! halves have to agree about more than shapes: the bytes a plan addresses in
 //! the artifact must be the bytes the executor produced. These tests run the
 //! write and the read against each other and compare payloads, not just
@@ -18,7 +18,7 @@ use pie_loader::types::{
 };
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zt_optimize_{tag}_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("zt_convert_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -51,11 +51,11 @@ fn bytes_at(metadata: &pie_loader::checkpoint::CheckpointMetadata, name: &str) -
     out
 }
 
-/// A model of the shapes `optimize` actually produces — plain dtypes decoded
+/// A model of the shapes `convert` actually produces — plain dtypes decoded
 /// from a blocked checkpoint, several tensors, mixed widths — written and read
 /// back with every payload compared.
 #[test]
-fn an_optimized_artifact_reads_back_byte_for_byte() {
+fn a_converted_artifact_reads_back_byte_for_byte() {
     let dir = tmpdir("artifact");
     let path = dir.join("model.zt");
 
@@ -76,8 +76,8 @@ fn an_optimized_artifact_reads_back_byte_for_byte() {
     let d_bias = decl("model.bias", vec![64], Encoding::Raw(DType::U8));
 
     let mut provenance = BTreeMap::new();
-    provenance.insert("pie_optimize".to_string(), "normalize".to_string());
-    provenance.insert("pie_optimize_source".to_string(), "deadbeef".to_string());
+    provenance.insert("pie_convert".to_string(), "normalize".to_string());
+    provenance.insert("pie_convert_source".to_string(), "deadbeef".to_string());
 
     write_zt(
         &path,
