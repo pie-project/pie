@@ -49,6 +49,12 @@ struct SpatialSideStream {
     cudaStream_t stream = nullptr;
     cudaEvent_t fork = nullptr;
     cudaEvent_t join = nullptr;
+    // The THIRD lane (no-demotion 3-way): the plain-decode middle's
+    // stream, forked/joined alongside the custom's — causal(main) ∥
+    // decode(stream2) ∥ custom(stream).
+    cudaStream_t stream2 = nullptr;
+    cudaEvent_t fork2 = nullptr;
+    cudaEvent_t join2 = nullptr;
     SpatialSideStream() {
         CUDA_CHECK(cudaStreamCreateWithFlags(
             &stream, cudaStreamNonBlocking));
@@ -56,6 +62,12 @@ struct SpatialSideStream {
             &fork, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(
             &join, cudaEventDisableTiming));
+        CUDA_CHECK(cudaStreamCreateWithFlags(
+            &stream2, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &fork2, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &join2, cudaEventDisableTiming));
     }
 };
 
@@ -2304,6 +2316,18 @@ void llama_like_forward_paged(
                     const int P = plan_state.mixed_mid_start;
                     const int mid_row =
                         static_cast<int>(qo_indptr_h[P]);
+                    // The third lane: the middle's decode overlaps the
+                    // causal on its OWN stream (its plan region in
+                    // attn_ws is the decode family's — disjoint from
+                    // the causal's prefill region; outputs disjoint by
+                    // rows).
+                    cudaStream_t mid_stream = stream;
+                    if (side_on && ss != nullptr) {
+                        mid_stream = ss->stream2;
+                        CUDA_CHECK(cudaEventRecord(ss->fork2, stream));
+                        CUDA_CHECK(cudaStreamWaitEvent(
+                            ss->stream2, ss->fork2, 0));
+                    }
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.mixed_mid_decode_plan,
                         bf16_row(attn_q, mid_row, Hq), kv_view,
@@ -2311,8 +2335,14 @@ void llama_like_forward_paged(
                         kv_page_indices,
                         kv_page_indptr + P,
                         kv_last_page_lens + P,
-                        attn_ws, stream, layer_window_left,
+                        attn_ws, mid_stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, sm_scale_override);
+                    if (side_on && ss != nullptr) {
+                        CUDA_CHECK(cudaEventRecord(
+                            ss->join2, ss->stream2));
+                        CUDA_CHECK(cudaStreamWaitEvent(
+                            stream, ss->join2, 0));
+                    }
                 }
                 if (side_on) {
                     CUDA_CHECK(cudaEventRecord(ss->join, ss->stream));
