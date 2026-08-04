@@ -30,6 +30,10 @@ struct Input {
     /// Drain the two instrumentation channels the algorithm inferlets carry.
     #[serde(default)]
     stats: bool,
+    /// STRUCTURAL v0: run only the first k transformer layers (the
+    /// layerskip-draft / logit-lens class). None = the full model.
+    #[serde(default)]
+    max_layers: Option<u32>,
 }
 
 fn default_prompt() -> String {
@@ -135,6 +139,9 @@ async fn main(input: Input) -> Result<Output> {
         let s2_out_p = Channel::new([1], dtype::f32).named("s2_out_p");
 
         let fwd_p = ForwardPass::new();
+        if let Some(k) = input.max_layers {
+            fwd_p.set_max_layers(k)?;
+        }
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
@@ -212,6 +219,9 @@ async fn main(input: Input) -> Result<Output> {
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
 
         let fwd = ForwardPass::new();
+        if let Some(k) = input.max_layers {
+            fwd.set_max_layers(k)?;
+        }
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,

@@ -169,6 +169,9 @@ pub struct ForwardBindings {
     pub readout: Option<u32>,
     pub rs_ws: Vec<u32>,
     pub rs_mode: RsMode,
+    /// STRUCTURAL v0 (S-1): layer truncation for this pass's fires
+    /// (None = full model).
+    pub max_layers: Option<u32>,
 }
 
 /// How a pass treats the recurrent state of its bound working sets — the
@@ -307,6 +310,9 @@ pub struct BoundForwardPass {
     /// How this pass treats that recurrent state: fold in-forward (default),
     /// buffer without folding, or replay buffered tokens into the fold.
     pub rs_mode: RsMode,
+    /// STRUCTURAL v0 (S-1): layer truncation for this pass's fires
+    /// (None = full model). Copied from the builder at program-attach.
+    pub max_layers: Option<u32>,
     /// Whether the currently bound writable declaration has performed its
     /// one-shot COW against the sharing shape visible at first submit.
     pub kv_declaration_realized: bool,
@@ -1113,6 +1119,7 @@ mod tests {
                 kv_declaration: KvDeclaration::all(),
                 rs_ws: Vec::new(),
                 rs_mode: RsMode::default(),
+                max_layers: None,
                 kv_declaration_realized: false,
                 failed: None,
                 devgeo: None,

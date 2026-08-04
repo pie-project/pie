@@ -882,6 +882,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             ws_rep,
             rs_reps,
             rs_mode,
+            pass_max_layers,
             kv_declaration,
             kv_declaration_realized,
             fwd_rep,
@@ -970,6 +971,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.kv_ws,
                 p.rs_ws.clone(),
                 p.rs_mode.clone(),
+                p.max_layers,
                 p.kv_declaration,
                 p.kv_declaration_realized,
                 fwd.rep(),
@@ -988,11 +990,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
             && req.qo_indptr.windows(2).all(|lane| lane[1] - lane[0] == 1);
         attn_mask.apply_to(&mut req);
-        // STRUCTURAL v0 (S-1) TEST SCAFFOLD: stamp a layer truncation on
-        // every fire from the environment until the WIT channel (the
-        // inferlet-facing `max_layers` surface, slice B) lands. The solo
-        // rule, the ABI word, and the driver's bounded body are the real
-        // channel; only this producer is temporary.
+        // STRUCTURAL v0 (S-1): the pass's declared layer truncation
+        // (forward-pass.set-max-layers). The env override remains as the
+        // battery scaffold — it wins when set, so a whole boot can be
+        // driven at depth k without inferlet changes.
+        req.max_layers = pass_max_layers;
         {
             static DEBUG_MAX_LAYERS: std::sync::OnceLock<Option<u32>> =
                 std::sync::OnceLock::new();
@@ -2078,9 +2080,14 @@ async fn fire_device_geometry<C: FireContext>(
     // order), so a recurrent-state device-geometry pass runs ahead too.
     let timing_enabled = ctx.fire_timing_requested();
 
-    let (ws_rep, rs_reps, rs_mode) = {
+    let (ws_rep, rs_reps, rs_mode, pass_max_layers) = {
         let pass = ctx.resources().get(&fwd)?;
-        (pass.kv_ws, pass.rs_ws.clone(), pass.rs_mode.clone())
+        (
+            pass.kv_ws,
+            pass.rs_ws.clone(),
+            pass.rs_mode.clone(),
+            pass.max_layers,
+        )
     };
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
@@ -2391,6 +2398,22 @@ async fn fire_device_geometry<C: FireContext>(
     // in a multi-program batch requires solo retry"): the wave poisoned and
     // the dead lanes leaked pages (Stage 2 verdict, liveness seam 2).
     req.device_resolved_geometry = true;
+    // STRUCTURAL v0 (S-1): the pass's declared truncation rides the
+    // device-geometry (chained decode) path too — same env override
+    // discipline as the wire path.
+    req.max_layers = pass_max_layers;
+    {
+        static DEBUG_MAX_LAYERS: std::sync::OnceLock<Option<u32>> =
+            std::sync::OnceLock::new();
+        let k = DEBUG_MAX_LAYERS.get_or_init(|| {
+            std::env::var("PIE_DEBUG_MAX_LAYERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        });
+        if let Some(k) = k {
+            req.max_layers = Some(*k);
+        }
+    }
     rs_prepared.apply_to(&mut req);
     attn_mask.apply_to(&mut req);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
