@@ -154,7 +154,10 @@ async fn remove(args: TargetArgs) -> Result<()> {
                 .filter(|name| name.name == args.inferlet)
                 .collect();
             match matching.len() {
-                0 => bail!("{} is not downloaded", args.inferlet),
+                0 => bail!(
+                    "{} is not downloaded; `pie inferlet list` shows what is",
+                    args.inferlet
+                ),
                 1 => matching.into_iter().next().unwrap(),
                 _ => {
                     let versions: Vec<String> =

@@ -442,9 +442,12 @@ fn typed_by_schema(
             Err(error) => last_error = Some(error),
         }
     }
+    // Names the failure rather than restating the command. "setting
+    // worker.server.port = \"abc\"" is what the user just typed; what they need
+    // to read first is that the key refused it.
     Err(last_error
         .unwrap_or_else(|| anyhow!("no valid value"))
-        .context(format!("setting {key} = {value:?}")))
+        .context(format!("{key} does not accept {value:?}")))
 }
 
 /// Every TOML value the literal could denote, most specific first. The string

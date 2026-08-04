@@ -163,7 +163,10 @@ fn selected(names: &[String]) -> Result<Vec<state::Entry>> {
             })?
             .clone();
         if entry.reclaim == Reclaim::Never {
-            bail!("{name} is authored, not derived, and is never cleared");
+            bail!(
+                "{name} is authored, not derived, and is never cleared; \
+                 delete it yourself if you mean to"
+            );
         }
         chosen.push(entry);
     }

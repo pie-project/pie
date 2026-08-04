@@ -10,7 +10,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use pie_bin::{compose, derive, ops};
+use pie_bin::{compose, derive, ops, ui};
 /// Top-level `pie` invocation. The shared global flags (`--config`,
 /// `--log-level`, `--metrics-addr`) are flattened from `startup`.
 #[derive(Parser, Debug)]
@@ -100,9 +100,42 @@ fn die_quietly_on_closed_pipe() {
 #[cfg(not(unix))]
 fn die_quietly_on_closed_pipe() {}
 
+/// Render a failure the way the rest of the CLI renders everything else.
+///
+/// anyhow's default is `Error: <context>` followed by a `Caused by:` list,
+/// which puts the least specific line first and in the one position a reader
+/// actually looks. `pie config set worker.server.port abc` led with "setting
+/// worker.server.port = \"abc\"" -- a restatement of the command -- and buried
+/// "invalid type: string" under a heading.
+///
+/// Same glyph vocabulary as everything else: `✗` is what blocks.
+fn report(error: &anyhow::Error) {
+    let palette = ui::Palette::for_stream(ui::Stream::Stderr);
+    eprintln!("{} {error}", ui::Mark::Blocked.render(&palette));
+    for cause in error.chain().skip(1) {
+        // Indented and dim: the chain is why, and the first line is what.
+        // Line by line, because a cause can be several -- a TOML parse error
+        // carries its own snippet, and letting those start at column 0 put the
+        // detail outside the block it belongs to.
+        for line in cause.to_string().lines() {
+            eprintln!("  {}{line}{}", palette.dim(), palette.reset());
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<ExitCode> {
+async fn main() -> ExitCode {
     die_quietly_on_closed_pipe();
+    match run().await {
+        Ok(code) => code,
+        Err(error) => {
+            report(&error);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve => serve(cli.global).await,
