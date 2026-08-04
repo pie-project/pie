@@ -2472,3 +2472,30 @@ one trace per model; family.rs post-processing deleted. ③ signature-
 table ABI replaces the scalar words. ④ Gray cutover + gather fallback
 live; stash/restore deleted. Each rung ends at the same bar: solo
 oracle byte-equal, census 15/15 PRODUCT, S-B identity, zero incidents.
+
+## V2 RUNGS ①–② LAND (2026-08-04)
+
+Rung ① (8f40c8832): the seam surface — dsl::seam {Cap, Def; attn.q,
+attn.out, attn.qv, in, out}, seam_observe / seam_adapter_qv; family.rs
+states seams instead of mechanisms. Rung ②a (1ee386841): the depth
+axis moves INTO the body — m.depth_window() before the layer loop with
+its deployment gate beside it, roles assigned at RECORD time by the
+builder; the family.rs paint-over (the review's sharpest exhibit) is
+deleted. Rung ②b (2b44c6725): the Decode and Prefill attention arms —
+222 lines, two structures — collapse into ONE dispatch statement keyed
+on the window operand's class (window_one vs ragged) plus deployment
+facts; the two arms were one structure wearing two names.
+
+All three rungs: goldens byte-identical (23/23 across five families ×
+both classes). Live bar re-run at the tip (debug, 0.6B): canonical
+3/3, solo oracle BYTE-EQUAL to the pre-campaign reference, S-B
+identity, census 15/15 PRODUCT, zero incidents. Two ops notes: the
+census instrument NEEDS PIE_FIRE_TRACE=1 in the boot env (a no-trace
+log reads as 15×SOLO), and its geometry argv must match the model
+(d_out=2048 for 0.6B q — wrong geometry reads as lora-lane errors).
+
+The class parameter now survives only as llama_like_cuda's
+instantiation index. Rung ③ (the signature-table ABI; the window class
+becomes a PER-ROW operand and the dispatch statement a region table)
+is the next structural act, and rung ④ (Gray+gather cutover, stash
+deletion) closes the ladder.
