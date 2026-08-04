@@ -1277,6 +1277,65 @@ class StackDeeperThanTheBlock(unittest.TestCase):
         )
 
 
+class TheFootprintIsKnownBeforeItIsPaid(unittest.TestCase):
+    """A serving engine has to budget, and budgeting needs the number first.
+
+    Everything a batch allocates is decided by quantities the pool already
+    knows once its grammars are admitted - the replay window and the readings
+    are computed from each grammar's tables, the mask width from the
+    vocabulary, and the configuration ceiling is a policy the caller set. So
+    the size is a function, not a discovery.
+
+    This is the test that keeps it one: a prediction that drifts from what it
+    predicts is worse than no prediction, because it will be believed.
+    """
+
+    def setUp(self):
+        _requirements()
+
+    def test_the_prediction_matches_the_allocation(self):
+        import torch as _torch
+
+        from engrain._engine import DeviceGrammar
+
+        compiler = support.Compiler(VOCABULARY)
+        grammars = [
+            compiler.compile_json_schema(self._schema(index)) for index in range(6)
+        ]
+        for configs in (8, 32):
+            pool = DeviceGrammar(max_configs=configs)
+            for grammar in grammars:
+                pool.admit(grammar)
+            for batch in (16, 128):
+                predicted = pool.footprint(batch)["total"]
+                held = pool.new_batch(batch)
+                actual = 0
+                for name in dir(held):
+                    if name.startswith("__"):
+                        continue
+                    value = getattr(held, name, None)
+                    if isinstance(value, _torch.Tensor) and value.is_cuda:
+                        actual += value.numel() * value.element_size()
+                self.assertAlmostEqual(
+                    predicted / actual,
+                    1.0,
+                    delta=0.02,
+                    msg=f"{configs} configurations, batch {batch}: "
+                    f"predicted {predicted} against {actual}",
+                )
+
+    @staticmethod
+    def _schema(index):
+        names = [f"p{index}_{n}" for n in range(1 + index % 3)]
+        return json.dumps(
+            {
+                "type": "object",
+                "properties": {name: {"type": "string"} for name in names},
+                "required": names,
+            }
+        )
+
+
 class TheConfigurationCeilingCanStartSmall(unittest.TestCase):
     """Every per-configuration array is `batch x configurations x something`.
 

@@ -6,7 +6,9 @@ depth, and hiding the lower ones behind a private name would only mean everyone
 imported `engrain._engine` anyway.
 
     Compiler              the compiler without the device arena around it
-    DeviceGrammar         the pool: admission, eviction, the arena
+    DeviceGrammar         the pool: admission, eviction, the arena, and
+                          `footprint(batch)`, which says what a batch will
+                          allocate before it allocates it
     DeviceBatch           the batch: the kernels and the graph, directly
     pack_configurations   parse states to the wire format the batch takes
 

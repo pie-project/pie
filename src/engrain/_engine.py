@@ -3413,6 +3413,59 @@ class DeviceGrammar:
     def new_batch(self, batch: int, rollback: int = 0) -> DeviceBatch:
         return DeviceBatch(self, batch, rollback)
 
+    def footprint(self, batch: int, rollback: int = 0) -> dict[str, int]:
+        """Exactly what a batch of this size will allocate, before it is built.
+
+        Every number this depends on is known once the grammars are admitted:
+        `window` and `max_readings` are computed from each grammar's tables at
+        admission, `mask_words` from the vocabulary, and `max_configs` is a
+        policy the caller set. So a serving engine can be told what a batch
+        costs when a request arrives rather than when the allocation fails -
+        which is the difference between budgeting and discovering.
+
+        Checked against the allocation itself by a test, because a prediction
+        that drifts from what it predicts is worse than none.
+        """
+        rows = batch * self.max_configs
+        # The same clamp the batch applies: a configuration offering more
+        # candidates than the commit can keep has already said everything that
+        # can be kept.
+        slots = rows * min(self.max_readings * self.paths, self.max_configs)
+        words = self.mask_words or (self.vocab_size + 31) // 32
+        memo_configs = min(self.max_configs, _MEMO_CONFIGS)
+        memo_stride = min(self.max_stack, _MEMO_DEPTH)
+        memo_slots = _memo_slots(
+            words * 4 + memo_configs * (8 + memo_stride * 4) + 16
+        )
+        blocks = _sweep_blocks(batch)
+        replayers = max(
+            blocks,
+            (blocks + _CANDIDATE_THREADS - 1) // _CANDIDATE_THREADS
+            * _CANDIDATE_THREADS,
+        )
+        sizes = {
+            "admitted": rows * self.max_groups_per_state,
+            "stack": rows * self.max_stack * 4,
+            "old_stack": rows * self.max_stack * 4,
+            # Two replay scratches, one for the sweep and one for the advance,
+            # each two windows per replayer.
+            "scratch": 2 * replayers * 2 * self.window * 4,
+            "memo_mask": memo_slots * words * 4,
+            "memo_stack": memo_slots * memo_configs * memo_stride * 4,
+            "cand_window": batch * max(self.window, _CANDIDATE_ARENA) * 4,
+            "cand_at": slots * 4,
+            "cand_depth": slots * 4,
+            "cand_floor": slots * 4,
+            "cand_lexer": slots * 4,
+            "mask": batch * words * 4,
+            "group_given": rows * _GROUP_FILTER * 4,
+            # Everything else is per row or per sequence and small beside these:
+            # lexer states, depths, counts, offsets, the memo's own indices.
+            "the rest": rows * 24 + batch * 32 + memo_slots * memo_configs * 8,
+        }
+        sizes["total"] = sum(sizes.values())
+        return sizes
+
 
 class DeviceBatch:
     """Per-sequence parser state, in device memory."""
