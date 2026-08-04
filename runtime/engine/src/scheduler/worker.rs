@@ -4913,6 +4913,7 @@ impl BatchScheduler {
                 ("cont_ok", take(&gacc.cont_ok)),
                 ("cont_fail", take(&gacc.cont_fail)),
                 ("cont_reprime", take(&gacc.cont_reprime)),
+                ("cont_cool", take(&gacc.cont_cool)),
                 (
                     "guest_resume_us",
                     if guest_resume_n > 0 {

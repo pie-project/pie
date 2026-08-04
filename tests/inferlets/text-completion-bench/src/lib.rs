@@ -310,11 +310,11 @@ async fn $name(
     let (window_fires, out_capacity) = match input.run_ahead_frames {
         Some(r) => {
             let w = r.max(1) * live_slots;
-            (w, w + 1 + 3 * live_slots)
+            (w, w + 1 + 7 * live_slots)
         }
         None => {
             let cap = channel_capacity();
-            (cap - 1, cap + 3 * live_slots)
+            (cap - 1, cap + 7 * live_slots)
         }
     };
     let out = Channel::new([1], dtype::i32)

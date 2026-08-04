@@ -444,6 +444,8 @@ pub(crate) struct GuestPhaseAcc {
     pub cont_fail: AtomicU64,
     /// Extra continuations emitted on a scheduler prime hint.
     pub cont_reprime: AtomicU64,
+    /// Submits absorbed without re-arm on a cool hint (net −1 inventory).
+    pub cont_cool: AtomicU64,
 }
 
 /// Per-lane run-ahead probe: at every seal, how deep each awaited lane's
@@ -551,6 +553,57 @@ fn prime_hints() -> &'static std::sync::Mutex<std::collections::HashSet<ProcessI
     HINTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// The symmetric cool-down set: lanes that retired with SURPLUS inventory
+/// (>= 2 complete frames queued). The fire path absorbs such a lane's next
+/// submit WITHOUT re-arming (net −1), so continuation credit oscillates
+/// around an equilibrium instead of ratcheting up (every reprime would
+/// otherwise be a permanent extra frame — over-execution at request end
+/// and unbounded ring exposure, the s6 failure).
+fn cool_hints() -> &'static std::sync::Mutex<std::collections::HashSet<ProcessId>> {
+    static HINTS: OnceLock<std::sync::Mutex<std::collections::HashSet<ProcessId>>> =
+        OnceLock::new();
+    HINTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Live per-lane frame-queue depth, owner-keyed — the continuation
+/// emission gate's ground truth. Maintained by the frame policy (+1 on a
+/// NEW frame's first arrival, −1 on seal-pop, removed on lane purge), read
+/// lock-free by the fire path. Unlike any credit counter this cannot
+/// diverge from reality: a park that lets a queued frame seal early is
+/// simply a −1 the fire path sees on its next call.
+fn cont_qdepth_map()
+-> &'static std::sync::Mutex<std::collections::HashMap<ProcessId, Arc<std::sync::atomic::AtomicI64>>>
+{
+    static MAP: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<ProcessId, Arc<std::sync::atomic::AtomicI64>>>,
+    > = OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn cont_qdepth_handle(pid: ProcessId) -> Arc<std::sync::atomic::AtomicI64> {
+    cont_qdepth_map()
+        .lock()
+        .unwrap()
+        .entry(pid)
+        .or_default()
+        .clone()
+}
+
+pub(crate) fn cont_qdepth_bump(pid: ProcessId, delta: i64) {
+    cont_qdepth_handle(pid).fetch_add(delta, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Absolute re-sync at each wave-boundary census: corrects any drift from
+/// pops the delta bookkeeping does not cover (park retirements, empty-frame
+/// drops, truncations) within one wave.
+pub(crate) fn cont_qdepth_set(pid: ProcessId, depth: i64) {
+    cont_qdepth_handle(pid).store(depth, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn cont_qdepth_forget(pid: ProcessId) {
+    cont_qdepth_map().lock().unwrap().remove(&pid);
+}
+
 pub(crate) fn prime_hint_mark(pids: impl IntoIterator<Item = ProcessId>) {
     let mut hints = prime_hints().lock().unwrap();
     hints.extend(pids);
@@ -558,6 +611,15 @@ pub(crate) fn prime_hint_mark(pids: impl IntoIterator<Item = ProcessId>) {
 
 pub(crate) fn prime_hint_take(pid: ProcessId) -> bool {
     prime_hints().lock().unwrap().remove(&pid)
+}
+
+pub(crate) fn cool_hint_mark(pids: impl IntoIterator<Item = ProcessId>) {
+    let mut hints = cool_hints().lock().unwrap();
+    hints.extend(pids);
+}
+
+pub(crate) fn cool_hint_take(pid: ProcessId) -> bool {
+    cool_hints().lock().unwrap().remove(&pid)
 }
 
 pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
@@ -584,6 +646,7 @@ pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
     cont_ok: AtomicU64::new(0),
     cont_fail: AtomicU64::new(0),
     cont_reprime: AtomicU64::new(0),
+    cont_cool: AtomicU64::new(0),
 };
 
 pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {

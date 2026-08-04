@@ -1579,45 +1579,70 @@ pub async fn submit_frame<C: FireContext>(
                 Err(error) => return Ok(Err(error)),
             }
         }
-        match submit_frame_slots(ctx, &this, &fired).await? {
-            Ok(()) => {
-                let pipeline = ctx.resources().get(&this)?;
-                pipeline
-                    .cont_credit
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                crate::scheduler::GUEST_PHASES
-                    .cont_ok
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Err(error) => {
-                crate::scheduler::GUEST_PHASES
-                    .cont_fail
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                static FIRST: std::sync::Once = std::sync::Once::new();
-                FIRST.call_once(|| {
-                    tracing::warn!(%error, "continuation submit failed (first occurrence)");
-                });
+        // Inventory-gated emission (see continuation-waves.md): the target
+        // is ONE complete frame queued at the scheduler per lane at every
+        // wave boundary. The gate reads the scheduler's LIVE per-lane queue
+        // depth (arrival +1, seal −1, absolute re-sync each wave census) —
+        // the one metric that cannot diverge from reality; every credit
+        // scheme tried before it ratcheted to its cap and starved (s5–s7).
+        // `cont_credit` stays as absorb bookkeeping and a ring-exposure
+        // safety cap. Emissions per call ≤ 2; overshoot from arrival lag
+        // self-corrects on the next call via the same gate.
+        let pid = ctx.process_id();
+        let _ = crate::scheduler::cool_hint_take(pid);
+        let _ = crate::scheduler::prime_hint_take(pid);
+        let depth_handle = crate::scheduler::cont_qdepth_handle(pid);
+        let credit_now = {
+            let pipeline = ctx.resources().get(&this)?;
+            pipeline
+                .cont_credit
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        let depth_now = depth_handle.load(std::sync::atomic::Ordering::Acquire);
+        let emit = if credit_now >= 5 {
+            0
+        } else if depth_now <= 0 {
+            2
+        } else if depth_now == 1 {
+            1
+        } else {
+            0
+        };
+        for round in 0..emit {
+            match submit_frame_slots(ctx, &this, &fired).await? {
+                Ok(()) => {
+                    // Optimistic depth bump: the scheduler's arrival lands
+                    // asynchronously, and without this a burst of guest
+                    // submits would all see the stale pre-arrival depth.
+                    depth_handle.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let pipeline = ctx.resources().get(&this)?;
+                    pipeline
+                        .cont_credit
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let acc = &crate::scheduler::GUEST_PHASES;
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if round == 0 {
+                        acc.cont_ok.fetch_add(1, Relaxed);
+                    } else {
+                        acc.cont_reprime.fetch_add(1, Relaxed);
+                    }
+                }
+                Err(error) => {
+                    crate::scheduler::GUEST_PHASES
+                        .cont_fail
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    static FIRST: std::sync::Once = std::sync::Once::new();
+                    FIRST.call_once(|| {
+                        tracing::warn!(%error, "continuation submit failed (first occurrence)");
+                    });
+                    break;
+                }
             }
         }
-        // Re-prime: the scheduler flagged this lane as retiring with zero
-        // inventory (a park or eviction consumed its queued frame while it
-        // could not produce). One extra continuation here is the only
-        // moment production can exceed one frame per settle; credit is
-        // capped at 2 and the ring is sized for it.
-        if crate::scheduler::prime_hint_take(ctx.process_id()) {
-            let credit = {
-                let pipeline = ctx.resources().get(&this)?;
-                pipeline.cont_credit.load(std::sync::atomic::Ordering::Acquire)
-            };
-            if credit < 2 && matches!(submit_frame_slots(ctx, &this, &fired).await?, Ok(())) {
-                let pipeline = ctx.resources().get(&this)?;
-                pipeline
-                    .cont_credit
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                crate::scheduler::GUEST_PHASES
-                    .cont_reprime
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if emit == 0 {
+            crate::scheduler::GUEST_PHASES
+                .cont_cool
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         return Ok(Ok(()));
     }

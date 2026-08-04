@@ -623,6 +623,11 @@ impl FramePolicy {
                     };
                     cell.fetch_add(1, Ordering::Relaxed);
                 }
+                if crate::pipeline::fire::cont_wave_enabled()
+                    && let Some(owner) = lane.owner.or(owner)
+                {
+                    crate::scheduler::cont_qdepth_bump(owner, 1);
+                }
                 lane.frames.push_back(PendingFrame {
                     seq: stamp.seq,
                     expected: stamp.fires,
@@ -725,6 +730,7 @@ impl FramePolicy {
             let acc = &crate::scheduler::RUN_AHEAD;
             let cont = crate::pipeline::fire::cont_wave_enabled();
             let mut hints: Vec<ProcessId> = Vec::new();
+            let mut cools: Vec<ProcessId> = Vec::new();
             let (mut r0, mut r1, mut r2) = (0u64, 0u64, 0u64);
             for state in self.lanes.values().filter(|state| state.awaited) {
                 let complete = state
@@ -740,7 +746,12 @@ impl FramePolicy {
                         }
                     }
                     1 => r1 += 1,
-                    _ => r2 += 1,
+                    _ => {
+                        r2 += 1;
+                        if cont && let Some(owner) = state.owner {
+                            cools.push(owner);
+                        }
+                    }
                 }
             }
             acc.retq0.fetch_add(r0, Ordering::Relaxed);
@@ -748,6 +759,9 @@ impl FramePolicy {
             acc.retq2.fetch_add(r2, Ordering::Relaxed);
             if !hints.is_empty() {
                 crate::scheduler::prime_hint_mark(hints);
+            }
+            if !cools.is_empty() {
+                crate::scheduler::cool_hint_mark(cools);
             }
         }
         for lane in lanes {
@@ -1160,6 +1174,7 @@ impl FramePolicy {
             // whatever the guest queued behind it, so `len - 1` is this
             // lane's run-ahead in frames.
             let acc = &crate::scheduler::RUN_AHEAD;
+            let cont = crate::pipeline::fire::cont_wave_enabled();
             let (mut n, mut a0, mut a1, mut a2) = (0u64, 0u64, 0u64, 0u64);
             for lane in self.lanes.values().filter(|lane| lane.awaited) {
                 n += 1;
@@ -1167,6 +1182,9 @@ impl FramePolicy {
                     0 | 1 => a0 += 1,
                     2 => a1 += 1,
                     _ => a2 += 1,
+                }
+                if cont && let Some(owner) = lane.owner {
+                    crate::scheduler::cont_qdepth_set(owner, lane.frames.len() as i64);
                 }
             }
             acc.lanes.fetch_add(n, Ordering::Relaxed);
@@ -1268,6 +1286,11 @@ impl FramePolicy {
                 }
                 members.insert(lane_id);
                 lane.frames.pop_front();
+                if crate::pipeline::fire::cont_wave_enabled()
+                    && let Some(owner) = lane.owner
+                {
+                    crate::scheduler::cont_qdepth_bump(owner, -1);
+                }
             }
             if fire_waves.is_empty() {
                 // Nothing sealable. Retry only if a frame that turned out to
