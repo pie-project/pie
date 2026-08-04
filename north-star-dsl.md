@@ -1859,3 +1859,23 @@ folds every draft into rows of ONE fire (layers [0,k) shared full-N,
 number sits inside the measured bracket, with the scaling shape
 demonstrated. 1783 union fires across the ON benches; S-B identity
 oracle green on the release build. Battery: .wiki/tart/bench_depth.py.
+
+## THE CORRECTION CLASS, PRICED AT SCALE (2026-08-04)
+
+Release, L40S, Qwen3-0.6B, 128 tok/lane, D concurrent lora lanes each
+carrying its OWN adapter contents (per-instance channel seeds — swap
+is re-seed, the §6.5 contract):
+
+  solo mean 0.78s
+  D=4 . wall 0.94s -> 3.32x vs serialized (83% of ideal)
+  D=8 . wall 1.24s -> 5.04x vs serialized (63% of ideal)
+
+D distinct adapters share one fire's base-weight reads through the
+span-grouped correction — the WEIGHT-sharing thesis at request
+granularity, measured. The README's 46x sits at R=32 on larger
+models; the curve's shape here (sub-linear wall, efficiency easing as
+launch/prefill overheads accrue) is the expected road to it. With
+this, all three README classes have live numbers: CORRECTION
+3.3-5.0x @ D<=8, STRUCTURAL 1.32-2.25x @ D<=7, and the spatial mask
+merge's constant ~6% co-batch tax (vs the solo regime's +27%).
+Battery: .wiki/tart/bench_lora_scale.py.
