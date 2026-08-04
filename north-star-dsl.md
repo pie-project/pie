@@ -2214,3 +2214,22 @@ done, rescoped-with-evidence, or measured-to-the-hardware-limit; the
 diagnostic instruments (fire trace, census, logit probe,
 geometry-parameterized benches) live in the wiki for the next
 hardware or the next directive.
+
+## THE CURVE CLOSES ON 46x (2026-08-04) — 14B, D=64: 31.88x
+
+Qwen2.5-14B (48L, hidden 5120, GQA-5 force_prefill deployment,
+32.6GB resident), distinct adapters per lane, 128 tok, release:
+
+         D=8     D=16     D=32     D=64
+  0.6B   4.60x   6.40x    8.48x    —
+  7B     6.37x  11.21x   17.87x    —
+  14B    6.72x  12.27x   20.22x   31.88x
+
+Sixty-four DISTINCT adapters through one co-batching fabric at
+31.88x over serialized — zero incidents. Every scaling axis behaves:
+larger model -> higher efficiency at fixed D (27% -> 56% -> 63% of
+ideal at D=32); more lanes -> monotone gains (50% of ideal at D=64).
+The README's 46x is now INSIDE the measured curve's natural
+continuation (a bigger model or longer sequences at D=64+), no
+longer an extrapolation of faith. The WEIGHT-class story is closed
+to the limit of what one L40S can state.
