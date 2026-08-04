@@ -1909,3 +1909,51 @@ Sequencing note: land the driver's multi-sink parse FIRST behind the
 existing single-sink behavior (a second sink refuses loudly today —
 verify, then extend), then the validator, then the sdk lift — the
 same driver-first discipline every axis campaign used.
+
+## THE AXIS-COMPOSITION DIRECTIVE (2026-08-04) — the product, not the sum
+
+The user's critique, adopted whole as the governing directive: an AXIS
+is one dimension along which co-batched rows of ONE fire diverge. Four
+are live — hook (Peel{HookFreePrefix}), mask (Peel{UnmaskedPrefix}),
+correction (span-grouped lora), depth (depth_window) — and every one
+of them works ALONE. Composition (two+ axes diverging in one fire) is
+refused everywhere, so the reachable program space is k+1, not 2^k.
+The north-star sells the PRODUCT. And the standing seriation has never
+actually been tested: it holds only because one axis fires at a time.
+
+The two structural truths the campaign builds on:
+
+1. CORRECTION IS NOT A WINDOW AXIS. Lora spans are per-lane and
+   arbitrary (the grouped GEMM takes disjoint spans); it needs no
+   contiguity and composes with anything in principle. Its refusals
+   (mask x lora, depth x lora UNPLANNED) are pure conservatism — the
+   cheapest relaxations on the board.
+2. THE WINDOW AXES NEED (start, len), NOT (prefix, suffix). Two
+   suffix-hungry axes (mask wants masked-last, depth wants
+   truncated-last) cannot both have the suffix — but the driver's
+   window arithmetic (CSR + start, rows = len) never actually needed
+   end == N. Generalizing every window word to a contiguous
+   [start, end) makes two-axis seriation SOLVABLE by ordering
+   [plain | masked | truncated | hooked]: the mask window is a MIDDLE
+   window, the depth tail stays a suffix, the full-depth prefix stays
+   a prefix, and pairwise disjointness satisfies consecutive-ones
+   without a PQ-tree until sets overlap (a member on BOTH axes) —
+   which v0 refuses loudly and the PQ-tree rung later splits.
+
+THE COMPOSE LADDER (AC):
+  AC-0 the truth table — measure the CURRENT pairwise matrix live
+       (which pairs compose, refuse, or silently solo) so every later
+       rung moves a measured cell, not an assumed one.
+  AC-1 the vocabulary — window words become (start, len) everywhere
+       (engine planning + ABI + the three walkers); the seriation
+       emits the canonical nest order and per-axis windows; overlap
+       (a row on two window axes) refuses loudly.
+  AC-2 correction x mask — the cheapest pair: lora members ride the
+       unmasked prefix; the planned-word UNPLANNED-on-lora term
+       drops; the correction applies to its spans as always.
+  AC-3 correction x depth, then mask x depth — the first two-window
+       fire (middle mask window + depth suffix).
+  AC-4 hook x {correction, mask, depth}.
+  AC-5 triples and the 2^k battery: one fire holding
+       [plain, masked, lora, draft] — the user's R=4 example — and
+       the product-space census.
