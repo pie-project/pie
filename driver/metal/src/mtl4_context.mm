@@ -404,7 +404,17 @@ RawMetalContext::~RawMetalContext() {
     }
 }
 
+static std::atomic<size_t> g_working_set_override{0};
+
+void RawMetalContext::set_device_working_set_bytes_for_test(size_t bytes) {
+    g_working_set_override.store(bytes, std::memory_order_relaxed);
+}
+
 size_t RawMetalContext::device_working_set_bytes() {
+    if (const size_t forced = g_working_set_override.load(std::memory_order_relaxed);
+        forced != 0) {
+        return forced;
+    }
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     return dev == nil ? 0 : size_t(dev.recommendedMaxWorkingSetSize);
 }

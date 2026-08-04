@@ -296,6 +296,34 @@ int main(int argc, char** argv) {
     }
     std::printf("\n");
 
+    // Before the real setup: the same setup against a device that has been told
+    // it will hold 256 MiB. Every checkpoint this harness is pointed at runs
+    // this, so between them it covers BOTH setup paths -- `setup_simple` for
+    // llama, qwen3, gemma4 and gpt-oss, and qwen3.5's own -- which is the point.
+    // The capacity refusal was written for qwen3.5 and only qwen3.5 performed
+    // it; the other path created the heap, copied the weights in, and let the
+    // first command buffer come back with an unreadable out-of-memory. A check
+    // one caller makes is not a check the driver makes.
+    //
+    // This costs nothing: the refusal happens before a byte is allocated.
+    {
+        RawMetalContext::set_device_working_set_bytes_for_test(256u << 20);
+        MetalExecutor probe;
+        std::string too_big;
+        const bool set_up = probe.setup(cfg, &too_big);
+        RawMetalContext::set_device_working_set_bytes_for_test(0);
+        if (set_up) {
+            std::printf("  FAIL  setup succeeded on a device that said it would hold 256 MiB\n");
+            return 1;
+        }
+        if (too_big.find("does not fit this GPU") == std::string::npos) {
+            std::printf("  FAIL  refused, but not for want of room: %s\n", too_big.c_str());
+            return 1;
+        }
+        std::printf("  PASS  refused before allocating when the model does not fit: %s\n",
+                    too_big.c_str());
+    }
+
     MetalExecutor exec;
     std::string err;
     const double t_load0 = now_s();

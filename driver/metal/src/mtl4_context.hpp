@@ -193,6 +193,14 @@ class RawMetalContext {
     /// with "The operation couldn't be completed", whose underlying error,
     /// three levels down, is `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
     static size_t device_working_set_bytes();
+
+    /// Test hook: make `device_working_set_bytes` answer `bytes` instead of
+    /// asking the device, or 0 to ask it again. A refusal that fires when a
+    /// model is too big for the GPU cannot otherwise be exercised on a GPU the
+    /// models fit on -- and the alternative, trusting that the check is wired
+    /// into every setup path because it was written once, is exactly how
+    /// `setup_simple` came to have no check at all.
+    static void set_device_working_set_bytes_for_test(size_t bytes);
     ~RawMetalContext();
 
     RawMetalContext(const RawMetalContext&)            = delete;

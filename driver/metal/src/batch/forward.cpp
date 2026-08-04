@@ -713,6 +713,52 @@ void write_u32(const SlotHandle& s, uint32_t v) {
     std::memcpy(s.contents(), &v, sizeof(v));
 }
 
+// Both setup paths compute a heap size and an elastic budget, and the line
+// after that is where arithmetic turns into spending. A model that does not
+// fit does NOT fail at that line -- the heap is created, nineteen gigabytes
+// are copied into it over forty-six seconds, every bind succeeds, and the
+// first command buffer comes back with "The operation couldn't be completed",
+// whose real error is three `NSUnderlyingError` levels down:
+// `kIOGPUCommandBufferCallbackErrorOutOfMemory`. Asking the device what it
+// will hold is one call, and it turns three quarters of a minute and an
+// unreadable failure into a sentence with numbers in it.
+//
+// This lives here, rather than at either call site, because it was written at
+// one of them: qwen3.5 got the check when a 35B mixture would not load, and
+// `setup_simple` -- llama, qwen3, gemma and gpt-oss, which is most of what
+// runs -- had none at all. A refusal that only one caller performs is not a
+// refusal the driver makes.
+//
+// On the accuracy of the arithmetic being checked: measured on Qwen3.5-35B-A3B
+// the plan wanted 22.59 GiB and the device reported 22.61 GiB allocated at the
+// first dispatch. The sizing is right to twenty megabytes. What is optimistic
+// is `recommendedMaxWorkingSetSize` itself -- on this M1 Max it is 24.96 GiB,
+// a flat 78% of the 32 GiB the machine has, taking no account of the 6 GiB the
+// kernel had wired down by the time prefill ran. So a plan can clear this bar
+// and still exhaust the machine. The bar is a ceiling, not a promise, and this
+// refusal is written to catch the models that are plainly over it rather than
+// to predict the ones that are close.
+bool fits_on_this_gpu(std::size_t heap_bytes,
+                      std::size_t elastic_bytes,
+                      std::size_t resident_weights,
+                      std::string* err) {
+    const std::size_t limit = RawMetalContext::device_working_set_bytes();
+    if (limit == 0) return true;  // the device would not say; do not invent one
+    const std::size_t want = heap_bytes + elastic_bytes;
+    if (want <= limit) return true;
+    if (err) {
+        const auto gib = [](std::size_t b) {
+            return std::to_string(double(b) / (1024.0 * 1024.0 * 1024.0)).substr(0, 5);
+        };
+        *err = "this model does not fit this GPU: it needs " + gib(want) +
+               " GiB resident (" + gib(resident_weights) + " GiB of weights, " +
+               gib(elastic_bytes) + " GiB of KV, state and scratch) and the device "
+               "will hold " + gib(limit) + " GiB. A shorter context shrinks the KV; "
+               "the weights do not shrink.";
+    }
+    return false;
+}
+
 }  // namespace
 
 bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
@@ -736,6 +782,8 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
         streams ? std::size_t(streamable_plan_bytes(load_plan, streams)) : 0;
     const std::size_t heap_bytes = (weights > streamed ? weights - streamed : weights) +
                                    SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
+    // `create` here takes no elastic budget, so the whole ask is the heap.
+    if (!fits_on_this_gpu(heap_bytes, 0, weights, err)) return false;
     ctx_ = RawMetalContext::create(heap_bytes);
     if (!ctx_) {
         if (err) *err = "RawMetalContext::create failed";
@@ -855,30 +903,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
         plan_.kv_pool_bytes + (taps ? 0u : scratch_pool_bytes);
 
-    // Everything above is arithmetic; the next line starts spending. A model
-    // that does not fit does NOT fail here -- the heap is created, nineteen
-    // gigabytes are copied into it over forty-six seconds, every bind
-    // succeeds, and the first command buffer comes back with "The operation
-    // couldn't be completed", whose real error is three `NSUnderlyingError`
-    // levels down: `kIOGPUCommandBufferCallbackErrorOutOfMemory`. Asking the
-    // device what it will hold is one call, and it turns three quarters of a
-    // minute and an unreadable failure into a sentence with numbers in it.
-    if (const size_t limit = RawMetalContext::device_working_set_bytes(); limit > 0) {
-        const size_t want = heap_bytes + elastic_budget;
-        if (want > limit) {
-            if (err) {
-                const auto gib = [](size_t b) {
-                    return std::to_string(double(b) / (1024.0 * 1024.0 * 1024.0)).substr(0, 5);
-                };
-                *err = "this model does not fit this GPU: it needs " + gib(want) +
-                       " GiB resident (" + gib(resident_weights) + " GiB of weights, " +
-                       gib(elastic_budget) + " GiB of KV, state and scratch) and the device "
-                       "will hold " + gib(limit) + " GiB. A shorter context shrinks the KV; "
-                       "the weights do not shrink.";
-            }
-            return false;
-        }
-    }
+    if (!fits_on_this_gpu(heap_bytes, elastic_budget, resident_weights, err)) return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
     if (!ctx_) {
