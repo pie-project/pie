@@ -2810,3 +2810,34 @@ only (the gate already names its reason). Risk note: (a) bounds
 run-ahead depth to the ring capacity per generation channel — the
 measured run-ahead speedups should be re-priced after the fix with
 cap1 sized accordingly.
+
+## CONSTRAINT, STATED (2026-08-04): tart is a DRIVER feature
+
+The user's standing rule, now explicit: RUNTIME SCHEDULING MUST NOT
+CHANGE — tart's machinery belongs driver-side. Consequences:
+
+1. THE CHURN-FAULT BLUEPRINT IS REVISED. The engine-side admission
+   backpressure sketched above is WITHDRAWN. The driver-side fix: a
+   BOUNDED READINESS WAIT at the staging/prepare gate — the pinned
+   ticket words (dispatch.cu's StagedLane tickets) are host-readable,
+   and the driver can poll head/tail against expectations for a small
+   bounded window before declaring the lane uncommitted, absorbing
+   transient guest lag (the tight-stagger spark) with ZERO engine
+   changes. The reservation-leak cascade then never starts for the
+   transient class; genuine failures keep today's per-instance
+   semantics. Engine files stay untouched.
+2. THIS SESSION'S ENGINE TOUCHES, INVENTORIED against the rule:
+   the V2 arc's direction already complies in spirit — rung ③ MOVED
+   plan derivation OUT of the engine INTO the driver (batch.rs net
+   -272 lines; the driver derives, the engine only carries the region
+   table as data). ABI/submission edits are data carriage, not
+   scheduling. ONE genuine scheduling touch stands: the deepest-first
+   k term in the seriation key (fire_plan.rs, +38 lines with
+   MemberFacts.max_layers) — behavior-neutral for every uniform-k
+   fire, ordering-relevant only for mixed-k truncated lanes, and it
+   is what banded depth's prefix invariant rests on. FLAGGED for the
+   user's ruling: keep (small, neutral, load-bearing for bands) or
+   rework bands to tolerate arbitrary order via the region table
+   (the driver already reads per-region k — a driver-side sort of
+   band DISPATCH order is possible; the rows themselves cannot be
+   reordered driver-side).
