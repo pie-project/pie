@@ -677,9 +677,30 @@ bool go_tap_for(const gptoss::Dispatch& d, const GptOssGeometry& g, GoTap& out) 
 void dump_go_taps(const std::vector<gptoss::Dispatch>& dag, const GptOssGeometry& g,
                   const gptoss::ScratchColoring& col, const std::vector<SlotHandle>& pool,
                   const SlotHandle& logits, int rows, int head_rows) {
+    std::vector<const std::int32_t*> perm_of(std::size_t(g.n_layers), nullptr);
+    for (std::size_t di = 0; di < dag.size() && di < col.per_dispatch.size(); ++di) {
+        const gptoss::Dispatch& d = dag[di];
+        if (d.kind != gptoss::Kind::ExpertSort || d.layer < 0) continue;
+        for (const auto& sb : col.per_dispatch[di]) {
+            if (sb.bind_index != (std::uint8_t)bind::MoeRouteSort::Perm) continue;
+            if (sb.color < 0 || std::size_t(sb.color) >= pool.size()) continue;
+            perm_of[std::size_t(d.layer)] =
+                static_cast<const std::int32_t*>(pool[std::size_t(sb.color)].contents());
+        }
+    }
     dump_taps_from(
         dag, col, pool, logits, rows, head_rows,
-        [&](const gptoss::Dispatch& d, Tap& t) { return go_tap_for(d, g, t); },
+        [&](const gptoss::Dispatch& d, Tap& t) {
+            if (!go_tap_for(d, g, t)) return false;
+            if (gptoss::is_expert_sorted(d.kind) && d.layer >= 0 &&
+                std::size_t(d.layer) < perm_of.size() &&
+                perm_of[std::size_t(d.layer)] != nullptr) {
+                t.perm = perm_of[std::size_t(d.layer)];
+                t.perm_rows = gptoss::gptoss_moe_sorted_rows(g, rows);
+                t.slots = g.experts_per_token;
+            }
+            return true;
+        },
         [](const gptoss::Dispatch& d) { return gptoss::is_tail(d.kind); });
 }
 
@@ -700,6 +721,10 @@ int go_kind_width(gptoss::Kind k, const GptOssGeometry& g) {
         case K::RouterGemv:               return std::max(g.hidden, g.n_experts);
         // The ids are 4-byte ints, so they count double against a bf16 slot.
         case K::RouterTopK:               return std::max(g.n_experts, 2 * g.experts_per_token);
+        case K::ExpertSort:               return 2 * g.experts_per_token;
+        case K::ExpertGather:             return g.hidden;
+        // The exact sorted-row extent is applied in `go_pool_elems`; these are
+        // the per-row widths used for the M=1 floor.
         case K::ExpertGate: case K::ExpertUp: return std::max(g.hidden, stack);
         case K::ExpertSwiGlu:             return stack;
         case K::ExpertDown:               return std::max(stack, down);
@@ -733,8 +758,37 @@ std::vector<std::size_t> go_pool_elems(const std::vector<gptoss::Dispatch>& dag,
         // The tail's tensors have one row per SAMPLED row; the body's have one
         // per token.
         const bool tail = gptoss::is_tail(kind);
-        const std::size_t need = std::size_t(tail ? head_rows : rows) *
-                                 std::size_t(go_kind_width(kind, g));
+        const std::size_t sorted =
+            std::size_t(gptoss::gptoss_moe_sorted_rows(g, rows));
+        std::size_t need = std::size_t(tail ? head_rows : rows) *
+                           std::size_t(go_kind_width(kind, g));
+        switch (kind) {
+            case K::ExpertSort:
+                need = 2 * std::max(sorted,
+                                    std::size_t(rows * g.experts_per_token));
+                break;
+            case K::ExpertGather:
+                need = sorted * std::size_t(g.hidden);
+                break;
+            case K::ExpertGate:
+            case K::ExpertUp:
+                need = sorted *
+                       std::size_t(std::max(g.hidden, g.intermediate));
+                break;
+            case K::ExpertSwiGlu:
+                need = sorted * std::size_t(g.intermediate);
+                break;
+            case K::ExpertDown:
+                need = sorted *
+                       std::size_t(std::max(g.intermediate, g.hidden));
+                break;
+            case K::ExpertCombine:
+                need = std::max(sorted * std::size_t(g.hidden),
+                                std::size_t(rows) * std::size_t(g.hidden));
+                break;
+            default:
+                break;
+        }
         for (const auto& sb : col.per_dispatch[di]) {
             if (sb.color < 0 || sb.color >= col.colors_used) continue;
             elems[std::size_t(sb.color)] = std::max(elems[std::size_t(sb.color)], need);
@@ -793,11 +847,8 @@ class GptOssEngine final : public SimpleFamilyEngine {
             return false;
         }
 
-        // Paged KV. gpt-oss has no M>1 path -- its MoE picks experts per ROW,
-        // so a batched routed matmul is a different kernel rather than a wider
-        // launch -- but paging is orthogonal to that: what it buys is SEVERAL
-        // SEQUENCES, each attending its own page list, instead of one ring that
-        // the second sequence clobbers.
+        // Paged KV. The sorted MoE is a true M>1 path: rows are grouped by
+        // expert, then the native MXFP4 routed GEMM serves each run.
         g_.paged_kv_enabled = true;
         g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : 32;
         const int ps = g_.kv_page_size;
@@ -932,10 +983,9 @@ class GptOssEngine final : public SimpleFamilyEngine {
     }
 
     bool paged() const override { return true; }
-    /// A fire of R rows is R PASSES, not one wider one: gpt-oss has no M>1
-    /// path, because its MoE picks experts per row. So the row budget costs
-    /// time rather than memory, and what paging buys is that those passes may
-    /// belong to different sequences.
+    /// A fire of R rows is one wider pass. The routed bank sorts its
+    /// (row, expert) pairs before the GEMM, while paging keeps each request's
+    /// KV history independent.
     int max_rows() const override { return max_rows_; }
     int max_sampled_rows() const override { return max_sampled_; }
     int page_size() const override { return g_.kv_page_size; }

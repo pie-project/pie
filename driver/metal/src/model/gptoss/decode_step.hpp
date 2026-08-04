@@ -45,6 +45,11 @@ enum class Kind : std::uint8_t {
     /// top-k over those logits, then softmax over the k that survive. Emits both
     /// the chosen expert ids and their normalized weights.
     RouterTopK,
+    /// Expert-major reordering. At decode tile_rows=1 and the routed matvecs
+    /// consume the four sorted rows; at a wide fire each expert run pads to a
+    /// GEMM tile and amortizes one weight read across its rows.
+    ExpertSort,
+    ExpertGather,
     /// The three routed projections. Each reads `experts_per_token` expert
     /// slices selected by `RouterTopK`, not a fixed weight.
     ExpertGate, ExpertUp,
@@ -119,24 +124,8 @@ inline std::vector<Dispatch> build_gptoss_dag(const GptOssGeometry& g, bool with
         emit(Kind::FfnNorm, L, sliding);
         emit(Kind::RouterGemv, L, sliding);
         emit(Kind::RouterTopK, L, sliding);
-        // NO ExpertSort/ExpertGather, unlike llama's mixture and gemma4's.
-        // The three routed projections below therefore stay MATVECS at every
-        // batch size: each (row, slot) pair re-reads its expert's weight
-        // instead of a sorted run of rows amortizing one read.
-        //
-        // Measured, PIE_METAL_DISPATCH_TRACE on a 128-token prefill: 89% of
-        // the fire is mxfp4_qmv_routed_bias. The dense projections here have
-        // been a GEMM since the batched path landed and cost 6%. With top-4
-        // over 32 experts a 128-row prompt sends ~16 rows to each expert, so
-        // the sorted form would read each weight once rather than sixteen
-        // times.
-        //
-        // It is not wired because the GEMM does not exist for this codec:
-        // affine_qmm_t_routed dequantizes through QuantizedBlockLoader, whose
-        // `scale * code + bias` is linear and MXFP4's E8M0 lookup is not --
-        // the same reason the matvec needed a separate codec. Closing it means
-        // an MXFP4 block loader, a routed GEMM over it, and the sort/gather/
-        // scatter stage this DAG has never emitted.
+        emit(Kind::ExpertSort, L, sliding);
+        emit(Kind::ExpertGather, L, sliding);
         emit(Kind::ExpertGate, L, sliding);
         emit(Kind::ExpertUp, L, sliding);
         emit(Kind::ExpertSwiGlu, L, sliding);
@@ -150,6 +139,12 @@ inline std::vector<Dispatch> build_gptoss_dag(const GptOssGeometry& g, bool with
     emit(Kind::LmHead, -1, false);
     if (with_argmax) emit(Kind::Argmax, -1, false);
     return dag;
+}
+
+inline bool is_expert_sorted(Kind k) {
+    return k == Kind::ExpertGather || k == Kind::ExpertGate ||
+           k == Kind::ExpertUp || k == Kind::ExpertSwiGlu ||
+           k == Kind::ExpertDown;
 }
 
 struct DagStats {
