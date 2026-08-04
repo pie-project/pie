@@ -717,6 +717,29 @@ impl FramePolicy {
     /// and a live one is charged for engine latency. Re-arming from each
     /// retirement is monotonically safe under both.
     pub fn on_frame_retired(&mut self, lanes: impl IntoIterator<Item = ProcessId>) {
+        // Completion-time queue census: how many frames each awaited lane
+        // holds at the moment a wave retires — the scheduler-side truth
+        // about whether run-ahead inventory exists when the device needs
+        // the next wave (arrival-time sampling can't see this).
+        {
+            let acc = &crate::scheduler::RUN_AHEAD;
+            let (mut r0, mut r1, mut r2) = (0u64, 0u64, 0u64);
+            for state in self.lanes.values().filter(|state| state.awaited) {
+                let complete = state
+                    .frames
+                    .iter()
+                    .filter(|frame| frame.is_complete())
+                    .count();
+                match complete {
+                    0 => r0 += 1,
+                    1 => r1 += 1,
+                    _ => r2 += 1,
+                }
+            }
+            acc.retq0.fetch_add(r0, Ordering::Relaxed);
+            acc.retq1.fetch_add(r1, Ordering::Relaxed);
+            acc.retq2.fetch_add(r2, Ordering::Relaxed);
+        }
         for lane in lanes {
             self.in_flight_lanes.remove(&lane);
             if let Some(state) = self.lanes.get_mut(&lane) {
@@ -1162,6 +1185,16 @@ impl FramePolicy {
                     continue;
                 }
                 if mid_boundary && lane.fired_this_boundary {
+                    // Continuation waves: a lane's resubmission is its NEXT
+                    // wave's frame — sealing it into the current boundary
+                    // consumes the one-frame inventory the mode exists to
+                    // hold (each boundary would eat the prefetch and the
+                    // fleet re-locks to frame-per-settle). Strict one frame
+                    // per lane per boundary preserves it; the frame seals
+                    // the instant the next boundary opens.
+                    if crate::pipeline::fire::cont_wave_enabled() {
+                        continue;
+                    }
                     continuing.push(*lane_id);
                 } else {
                     fresh.push(*lane_id);

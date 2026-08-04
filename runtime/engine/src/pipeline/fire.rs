@@ -1551,8 +1551,98 @@ pub async fn submit_frame<C: FireContext>(
     if let Err(error) = validate_frame(ctx, k, &fired)? {
         return Ok(Err(error));
     }
+    // Continuation waves (`PIE_CONT_WAVE=1`): a device-resolved decode frame
+    // is a deterministic continuation of the previous one (same passes,
+    // token device-carried), so the engine keeps ONE frame submitted ahead
+    // of the guest's calls. A call that finds credit is absorbed — its
+    // content already went out as the previous call's continuation — and
+    // re-arms the next continuation. Production decouples from the guest's
+    // settle-clocked drain loop, which is what lets every lane hold a
+    // complete frame at wave retirement (`ra_retq*`: 82% held zero without
+    // this). A continuation that fails (declaration cap at budget end,
+    // closed pipeline) is skipped silently: credit stays 0 and the guest's
+    // ordinary cadence resumes. Design: .wiki/contention/continuation-waves.md
+    if cont_wave_enabled() && frame_decode_eligible(ctx, &fired)? {
+        let absorbed = {
+            let pipeline = ctx.resources().get(&this)?;
+            use std::sync::atomic::Ordering;
+            if pipeline.cont_credit.load(Ordering::Acquire) > 0 {
+                pipeline.cont_credit.fetch_sub(1, Ordering::AcqRel);
+                true
+            } else {
+                false
+            }
+        };
+        if !absorbed {
+            match submit_frame_slots(ctx, &this, &fired).await? {
+                Ok(()) => {}
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+        match submit_frame_slots(ctx, &this, &fired).await? {
+            Ok(()) => {
+                let pipeline = ctx.resources().get(&this)?;
+                pipeline
+                    .cont_credit
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                crate::scheduler::GUEST_PHASES
+                    .cont_ok
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(error) => {
+                crate::scheduler::GUEST_PHASES
+                    .cont_fail
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| {
+                    tracing::warn!(%error, "continuation submit failed (first occurrence)");
+                });
+            }
+        }
+        return Ok(Ok(()));
+    }
+    submit_frame_slots(ctx, &this, &fired).await
+}
+
+/// `PIE_CONT_WAVE=1`: continuation-wave mode (see `submit_frame`).
+pub(crate) fn cont_wave_enabled() -> bool {
+    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_CONT_WAVE").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+/// Whether every live slot of this frame is a device-resolved decode pass —
+/// the continuation-eligibility test: such a frame's successor is a pure
+/// re-submission of the same passes.
+fn frame_decode_eligible<C: FireContext>(
+    ctx: &mut C,
+    fired: &[(u32, u32)],
+) -> Result<bool, anyhow::Error> {
+    for &(_, rep) in fired {
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        let pass = ctx.resources().get(&fwd)?;
+        let eligible = pass
+            .bound()
+            .ok()
+            .is_some_and(|bound| bound.decode_envelope.is_some());
+        if !eligible {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// One whole frame's worth of stamped submissions: draw the lane's next
+/// frame seq and submit every live slot in order (the pre-refactor body of
+/// [`submit_frame`]).
+async fn submit_frame_slots<C: FireContext>(
+    ctx: &mut C,
+    this: &Resource<Pipeline>,
+    fired: &[(u32, u32)],
+) -> Anyhow<Result<(), String>> {
     let (lane, seq) = {
-        let pipeline = ctx.resources().get(&this)?;
+        let pipeline = ctx.resources().get(this)?;
         if pipeline.scope.is_closed() {
             return Ok(Err("pipeline: pipeline is closed".to_string()));
         }

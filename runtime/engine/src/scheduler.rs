@@ -439,6 +439,9 @@ pub(crate) struct GuestPhaseAcc {
     pub park_max_ns: AtomicU64,
     /// Head-harmless free-list bypass grants (`PIE_ALLOC_FAST_SMALL=1`).
     pub fast_small_n: AtomicU64,
+    /// Continuation-wave submits (`PIE_CONT_WAVE=1`): armed / failed-skipped.
+    pub cont_ok: AtomicU64,
+    pub cont_fail: AtomicU64,
 }
 
 /// Per-lane run-ahead probe: at every seal, how deep each awaited lane's
@@ -462,6 +465,11 @@ pub(crate) struct RunAheadAcc {
     /// Ready-mode (`PIE_SEAL_MODE=ready`) early boundary opens: seals taken
     /// with awaited lanes still missing because the device was idle.
     pub early_open: AtomicU64,
+    /// Completion-time lane queue census (`on_frame_retired`): awaited lanes
+    /// holding 0 / 1 / >=2 arrival-complete frames when a wave retires.
+    pub retq0: AtomicU64,
+    pub retq1: AtomicU64,
+    pub retq2: AtomicU64,
     /// Implicit rejoins (parked lane accepted a fire) since the last wave.
     pub rejoins: AtomicU64,
     /// Awaited lanes seen blocking the gate, summed over gate evaluations.
@@ -502,6 +510,9 @@ pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
     arrq1: AtomicU64::new(0),
     arrq2: AtomicU64::new(0),
     early_open: AtomicU64::new(0),
+    retq0: AtomicU64::new(0),
+    retq1: AtomicU64::new(0),
+    retq2: AtomicU64::new(0),
     rejoins: AtomicU64::new(0),
     blocking: AtomicU64::new(0),
     blk_owed: AtomicU64::new(0),
@@ -547,6 +558,8 @@ pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
     park_ns: AtomicU64::new(0),
     park_max_ns: AtomicU64::new(0),
     fast_small_n: AtomicU64::new(0),
+    cont_ok: AtomicU64::new(0),
+    cont_fail: AtomicU64::new(0),
 };
 
 pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {

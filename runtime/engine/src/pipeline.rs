@@ -62,6 +62,12 @@ pub struct Pipeline {
     /// Per-lane frame sequence for Vesuvius frame submission (k > 1): each
     /// `forward.submit` frame on this pipeline takes the next number.
     pub(crate) frame_seq: std::sync::atomic::AtomicU64,
+    /// Continuation-wave credit (`PIE_CONT_WAVE=1`): frames the engine has
+    /// already submitted AHEAD of the guest's calls. A guest submit that
+    /// finds credit > 0 is absorbed (its content is the continuation the
+    /// engine emitted during the previous call) and re-arms one more
+    /// continuation. See `.wiki/contention/continuation-waves.md`.
+    pub(crate) cont_credit: std::sync::atomic::AtomicU64,
 }
 
 impl Pipeline {
@@ -78,6 +84,7 @@ impl Pipeline {
                     .is_none_or(|fires| fires.lock().unwrap().is_empty())
             }),
             frame_seq: std::sync::atomic::AtomicU64::new(0),
+            cont_credit: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

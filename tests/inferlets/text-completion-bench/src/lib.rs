@@ -297,14 +297,24 @@ async fn $name(
     //
     // `run_ahead_frames` overrides the depth for sweeps only; it is stated
     // in frames, and the ring grows with it.
+    // Under continuation waves (PIE_CONT_WAVE=1) the engine keeps one frame
+    // submitted ahead of this guest's window, so the take-side ring holds up
+    // to live_slots extra results. The pad is unconditional: a spare frame of
+    // ring cells is behavior-neutral without the mode (measured — analysis.md
+    // §9 #18/#19) and required with it.
+    // A full frame of margin (window + this frame's puts) plus the staging
+    // margin the engine's conservative ticket check wants: 2*live_slots
+    // beyond the advertised capacity, or the continuation is silently
+    // skipped at the reader-cell validation (observed: cap+k engaged only
+    // 12% of frames; borderline by exactly the staging margin).
     let (window_fires, out_capacity) = match input.run_ahead_frames {
         Some(r) => {
             let w = r.max(1) * live_slots;
-            (w, w + 1)
+            (w, w + 1 + 2 * live_slots)
         }
         None => {
             let cap = channel_capacity();
-            (cap - 1, cap)
+            (cap - 1, cap + 2 * live_slots)
         }
     };
     let out = Channel::new([1], dtype::i32)

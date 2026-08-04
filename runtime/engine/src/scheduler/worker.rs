@@ -4709,11 +4709,14 @@ impl BatchScheduler {
             take(&racc.ahead1),
             take(&racc.ahead2),
         );
-        let (ra_arrq0, ra_arrq1, ra_arrq2, ra_early_open) = (
+        let (ra_arrq0, ra_arrq1, ra_arrq2, ra_early_open, ra_retq0, ra_retq1, ra_retq2) = (
             take(&racc.arrq0),
             take(&racc.arrq1),
             take(&racc.arrq2),
             take(&racc.early_open),
+            take(&racc.retq0),
+            take(&racc.retq1),
+            take(&racc.retq2),
         );
         let (ra_rejoins, ra_blocking, ra_block_us) = (
             take(&racc.rejoins),
@@ -4907,6 +4910,8 @@ impl BatchScheduler {
                 ("alloc_park_us", alloc_park),
                 ("alloc_park_max_us", alloc_park_max),
                 ("alloc_fast_small_n", alloc_fast_small),
+                ("cont_ok", take(&gacc.cont_ok)),
+                ("cont_fail", take(&gacc.cont_fail)),
                 (
                     "guest_resume_us",
                     if guest_resume_n > 0 {
@@ -4926,6 +4931,9 @@ impl BatchScheduler {
                 ("ra_arrq1", ra_arrq1),
                 ("ra_arrq2", ra_arrq2),
                 ("ra_early_open", ra_early_open),
+                ("ra_retq0", ra_retq0),
+                ("ra_retq1", ra_retq1),
+                ("ra_retq2", ra_retq2),
                 ("ra_rejoins", ra_rejoins),
                 ("ra_blocking", ra_blocking),
                 ("ra_blk_owed", ra_blk_owed),
