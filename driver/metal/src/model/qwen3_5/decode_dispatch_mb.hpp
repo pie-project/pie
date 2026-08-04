@@ -273,7 +273,26 @@ inline constexpr int kSdpaQueryTile = 32;
 // where the per-row kernel gives it a threadgroup, so below a full tile it is
 // strictly worse: at one row it would run one simdgroup of the thirty-two the
 // other kernel would have used. A fire earns the tiled shape by filling a tile.
-inline bool sdpa_should_tile(int N) { return N >= kSdpaQueryTile; }
+/// Whether a fire's attention should use the tiled kernel rather than the
+/// per-row one.
+///
+/// NOT a row count. The tiled kernel walks RUNS OF EQUAL REQUEST inside each
+/// 32-row tile, staging that run's keys into threadgroup memory and letting
+/// only the run's own simdgroups read them -- so its whole advantage is rows
+/// that share a key span, and its cost is a serial pass per run. A prefill is
+/// all one run and wins outright. A fleet of decodes is the opposite shape:
+/// thirty-two rows, thirty-two runs, one simdgroup live per pass and the tile
+/// staged thirty-two times. Measured on llama-1B, batch 32, that is 370 tok/s
+/// tiled against 728 per-row, and batch 64 is 480 against 915.
+///
+/// Asking only `N >= kSdpaQueryTile` could not tell those apart, because the
+/// two fires have the SAME row count. The request count is what separates
+/// them, and the caller already has it: `qo_indptr` is one entry per request
+/// plus a terminator.
+inline bool sdpa_should_tile(int rows, int requests) {
+    const int r = requests > 0 ? requests : 1;
+    return rows / r >= kSdpaQueryTile;
+}
 
 // sdpa_paged_tiled: one threadgroup per (q_head, tile of kSdpaQueryTile rows).
 // grid=(n_q_heads*1024, ceil(N/QT), 1), tg=(1024,1,1). The grid rounds UP, so
