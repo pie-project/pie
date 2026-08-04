@@ -234,6 +234,23 @@ fn emit_class_fn(
         b.line("            \"depth union (generated): planned split without \"");
         b.line("            \"a usable prefix plan (gate drift)\");");
         b.line("    }");
+        b.line("    // ④ Act 1 (banded depth): >= 2 distinct-k bands from the");
+        b.line("    // prepare's stamp; per-layer scopes below resolve the");
+        b.line("    // band containing their static layer. Banded fires");
+        b.line("    // derive max_layers FULL, so the union logic stays idle.");
+        b.line("    const int band_count =");
+        b.line("        static_cast<int>(plan_state.depth_band_count);");
+        b.line("    const bool depth_banded = band_count >= 2;");
+        b.line("    if (depth_banded) {");
+        b.line("        for (int j = 0; j < band_count; ++j) {");
+        b.line("            if (plan_state.depth_band_rows[j] > 0 &&");
+        b.line("                !plan_state.depth_band_plans[j]) {");
+        b.line("                throw std::runtime_error(");
+        b.line("                    \"depth bands (generated): stamped band \"");
+        b.line("                    \"without a usable prefix plan\");");
+        b.line("            }");
+        b.line("        }");
+        b.line("    }");
     }
     b.line("    const int H = cfg.hidden_size;");
     b.line("    const int Hq = cfg.num_attention_heads * cfg.head_dim;");
@@ -508,12 +525,31 @@ fn emit_range_scoped(
                 b.stmt(&format!(
                     "const bool depth_tail = depth_k <= {l};"
                 ));
-                b.stmt("if (!depth_tail || depth_union) {");
+                // ④ banded: resolve this static layer's band (deepest
+                // first — the first band whose k the layer reached).
+                b.stmt("int band_j = -1; int band_live = total_tokens;");
+                b.stmt("if (depth_banded) {");
+                b.stmt("    for (int j = 0; j < band_count; ++j) {");
+                b.stmt(&format!(
+                    "        if ({l} >= static_cast<int>(plan_state.depth_band_k[j])) {{"
+                ));
+                b.stmt("            band_live = static_cast<int>(");
+                b.stmt("                plan_state.depth_band_rows[j]);");
+                b.stmt("            band_j = j;");
+                b.stmt("            break;");
+                b.stmt("        }");
+                b.stmt("    }");
+                b.stmt("    if (band_live == total_tokens) band_j = -1;");
+                b.stmt("}");
+                b.stmt("(void)band_j;");
                 b.stmt(
-                    "const int N = depth_tail ? depth_split : total_tokens;",
+                    "if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {",
                 );
                 b.stmt(
-                    "const int R = depth_tail ? depth_split : num_requests;",
+                    "const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);",
+                );
+                b.stmt(
+                    "const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);",
                 );
                 b.stmt("(void)N; (void)R;");
             }
@@ -1603,7 +1639,9 @@ fn emit_launch(
                 // STRUCTURAL S-4 (role-stated): the trace SAYS this
                 // launch swaps to the prefix plan on union tail layers
                 // — the emitter spells what the vocabulary states.
-                b.stmt("const ops::DecodePlanCache* depth_dp = depth_tail");
+                b.stmt("const ops::DecodePlanCache* depth_dp = band_j >= 0");
+                b.stmt("    ? plan_state.depth_band_plans[band_j].get()");
+                b.stmt("    : depth_tail");
                 b.stmt("    ? plan_state.depth_prefix_decode_plan.get()");
                 b.stmt("    : plan_state.decode_plan.get();");
                 b.stmt("if (depth_dp == nullptr) {");
@@ -1640,7 +1678,8 @@ fn emit_launch(
                 b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                 b.stmt("        attn_page_indices, attn_page_indptr,");
                 b.stmt("        attn_last_page_lens,");
-                b.stmt("        depth_tail ? spatial_suffix_attn_ws() : attn_ws,");
+                b.stmt("        band_j >= 0 ? depth_band_attn_ws_public(band_j)");
+                b.stmt("        : depth_tail ? spatial_suffix_attn_ws() : attn_ws,");
                 b.stmt("        stream, layer_window_left,");
                 b.stmt(&format!(
                     "        /*logits_soft_cap=*/0.f, {scale});"

@@ -460,10 +460,7 @@ void llama_like_forward_declared(
     // complete): the emitter constructs the lora staging AND the hook
     // sidebands (page mask, score captures) and spells the sites,
     // brackets and corrections with constant layers.
-    if (generated_forward_enabled() &&
-        // ④: the static forms have no banded walk — banded fires keep
-        // the interpreter.
-        plan_state.depth_band_count < 2) {
+    if (generated_forward_enabled()) {
         const auto run = [&](auto decode_fn, auto prefill_fn) {
             (is_pure_decode ? decode_fn : prefill_fn)(
                 w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
