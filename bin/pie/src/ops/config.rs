@@ -20,6 +20,9 @@ pub enum ConfigCmd {
     List {
         /// Show only keys under this prefix, e.g. `worker.runtime`.
         prefix: Option<String>,
+        /// Emit one JSON document instead of the table.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print the config, or one value from it by dot-path. Says which file
@@ -52,7 +55,7 @@ pub enum ConfigCmd {
 
 pub fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
     match cmd {
-        ConfigCmd::List { prefix } => list(global, prefix),
+        ConfigCmd::List { prefix, json } => list(global, prefix, json),
         ConfigCmd::Show { key } => show(global, key),
         ConfigCmd::Set { key, value } => set(global, key, value),
         ConfigCmd::Unset { key } => unset(global, key),
@@ -94,7 +97,7 @@ fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
 /// `show` prints what you wrote; this prints what pie will use, which is a
 /// different and usually more useful answer. A key you never set still has a
 /// value, and until now the only way to learn it was to read the Rust.
-fn list(global: &startup::GlobalArgs, prefix: Option<String>) -> Result<()> {
+fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Result<()> {
     let (cfg_path, _) = startup::cli_config_path(global);
     let file: toml::Value = match std::fs::read_to_string(&cfg_path) {
         Ok(content) => toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?,
@@ -126,6 +129,30 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>) -> Result<()> {
             "no keys under {:?}; `pie config list` shows all of them",
             prefix.unwrap_or_default()
         );
+    }
+
+    if json {
+        return crate::ui::emit_json(&serde_json::json!(
+            selected
+                .iter()
+                .map(|field| serde_json::json!({
+                    "key": field.key,
+                    "doc": field.doc,
+                    // Three states a consumer has to tell apart, so they are
+                    // three fields rather than one nullable value: what pie
+                    // will use, whether the file said so, and whether the file
+                    // must.
+                    // The TYPED value, not the string the table shows:
+                    // `null` here means pie derives it, and `required` is what
+                    // separates that from "the file must say".
+                    "value": pie_worker::config_schema::lookup(&file, &field.key)
+                        .cloned()
+                        .or_else(|| field.default.clone()),
+                    "set": is_set(&file, &field.key),
+                    "required": field.required,
+                }))
+                .collect::<Vec<_>>()
+        ));
     }
 
     let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);

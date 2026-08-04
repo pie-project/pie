@@ -14,7 +14,11 @@ use crate::ui::{self, Mark, Palette, Stream};
 #[derive(Subcommand, Debug)]
 pub enum CacheCmd {
     /// Show what pie has written, where, and how much of it there is.
-    List,
+    List {
+        /// Emit one JSON document instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Delete what pie can rebuild. With no names, everything safe to lose.
     Clear {
@@ -29,17 +33,14 @@ pub enum CacheCmd {
 
 pub fn run(cmd: CacheCmd) -> Result<()> {
     match cmd {
-        CacheCmd::List => list(),
+        CacheCmd::List { json } => list(json),
         CacheCmd::Clear { names, yes } => clear(names, yes),
     }
 }
 
-fn list() -> Result<()> {
+fn list(json: bool) -> Result<()> {
     let entries = state::entries();
     let home = pie_worker::paths::pie_home();
-
-    let palette = Palette::for_stream(Stream::Stdout);
-    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
 
     // Measured once and reused: the size is what decides whether a row is
     // worth a person's attention, and walking a weight-sized tree twice to
@@ -56,6 +57,45 @@ fn list() -> Result<()> {
             (entry, exists, size)
         })
         .collect();
+
+    let reclaimable: u64 = measured
+        .iter()
+        .filter(|(entry, _, _)| entry.reclaim == Reclaim::Safe)
+        .map(|(_, _, size)| *size)
+        .sum();
+    let on_request: u64 = measured
+        .iter()
+        .filter(|(entry, _, _)| entry.reclaim == Reclaim::OnRequest)
+        .map(|(_, _, size)| *size)
+        .sum();
+
+    if json {
+        return ui::emit_json(&serde_json::json!({
+            "home": home,
+            "entries": measured
+                .iter()
+                .map(|(entry, exists, size)| serde_json::json!({
+                    "name": entry.name,
+                    "path": entry.path,
+                    "what": entry.what,
+                    // The word the CLI uses, not the enum's Rust spelling: a
+                    // consumer should be able to pass it back to `clear`.
+                    "reclaim": match entry.reclaim {
+                        Reclaim::Safe => "safe",
+                        Reclaim::OnRequest => "on-request",
+                        Reclaim::Never => "never",
+                    },
+                    "exists": exists,
+                    "bytes": size,
+                }))
+                .collect::<Vec<_>>(),
+            "reclaimable_bytes": reclaimable,
+            "on_request_bytes": on_request,
+        }));
+    }
+
+    let palette = Palette::for_stream(Stream::Stdout);
+    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
 
     let name_width = measured
         .iter()
@@ -90,16 +130,6 @@ fn list() -> Result<()> {
         );
     }
 
-    let reclaimable: u64 = measured
-        .iter()
-        .filter(|(entry, _, _)| entry.reclaim == Reclaim::Safe)
-        .map(|(_, _, size)| *size)
-        .sum();
-    let on_request: u64 = measured
-        .iter()
-        .filter(|(entry, _, _)| entry.reclaim == Reclaim::OnRequest)
-        .map(|(_, _, size)| *size)
-        .sum();
     println!();
     if reclaimable == 0 && on_request == 0 {
         // "0B reclaimable, 0B more if asked" reads as a failure to find

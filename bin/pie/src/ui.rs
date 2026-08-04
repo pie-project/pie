@@ -65,7 +65,10 @@ impl Palette {
         }
     }
 
-    /// Colour forced on or off, for tests and for a future `--color`.
+    /// Colour forced on or off. For tests: there is deliberately no
+    /// `--color` flag, because `NO_COLOR` plus the TTY check already answer
+    /// the question and a three-way switch would be one more thing to get
+    /// wrong.
     pub fn forced(on: bool) -> Self {
         Self { on }
     }
@@ -209,6 +212,24 @@ pub fn duration(d: std::time::Duration) -> String {
     } else {
         format!("{}ms", d.as_millis())
     }
+}
+
+// -----------------------------------------------------------------------------
+// Machine-readable output
+// -----------------------------------------------------------------------------
+
+/// Print a value as the command's entire stdout, and nothing else.
+///
+/// Every `--json` path goes through here so the contract is one sentence: one
+/// JSON document per invocation, on stdout, with the human rendering
+/// suppressed entirely. A listing that printed a table *and* a document would
+/// be parseable by nobody.
+///
+/// Pretty-printed unconditionally. `jq` does not care, and a person checking
+/// what the shape is does.
+pub fn emit_json(value: &serde_json::Value) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------

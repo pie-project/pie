@@ -19,7 +19,11 @@ use crate::ops::hf::runtime_snapshot_allow_patterns;
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
     /// List repo IDs already in the local HF cache.
-    List,
+    List {
+        /// Emit one JSON document instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Download a model snapshot by HuggingFace repo ID.
     Download {
         repo_id: String,
@@ -42,7 +46,7 @@ pub enum ModelCmd {
 
 pub fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
-        ModelCmd::List => list(),
+        ModelCmd::List { json } => list(json),
         ModelCmd::Download { repo_id, all } => download(repo_id, all),
         ModelCmd::Remove { repo_id, yes } => remove(repo_id, yes),
         ModelCmd::Optimize(args) => crate::ops::optimize::run(args),
@@ -147,7 +151,7 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
 // list
 // -----------------------------------------------------------------------------
 
-fn list() -> Result<()> {
+fn list(json: bool) -> Result<()> {
     let hub = hub_dir();
     if !hub.exists() {
         println!("(no HuggingFace cache at {})", hub.display());
@@ -166,6 +170,23 @@ fn list() -> Result<()> {
         })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if json {
+        return crate::ui::emit_json(&serde_json::json!({
+            "hub": hub,
+            "models": entries
+                .iter()
+                .map(|(repo_id, servable, info)| serde_json::json!({
+                    "repo_id": repo_id,
+                    "servable": servable,
+                    // The architecture when pie can serve it, the reason when
+                    // it cannot -- which is why the field is not called
+                    // "arch".
+                    "detail": info,
+                }))
+                .collect::<Vec<_>>(),
+        }));
+    }
 
     if entries.is_empty() {
         println!("nothing downloaded yet");

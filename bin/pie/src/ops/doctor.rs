@@ -23,69 +23,116 @@ use anyhow::Result;
 use crate::ui::{Mark, Palette, Stream};
 
 /// `pie doctor` entry point. Returns whether pie can boot.
-pub fn doctor(global: &startup::GlobalArgs) -> Result<bool> {
+pub fn doctor(global: &startup::GlobalArgs, json: bool) -> Result<bool> {
+    // Collected first, printed second, so the two renderings cannot drift into
+    // disagreeing about the verdict -- which is the one thing a probe reads.
+    let mut checks: Vec<(&'static str, String, String, Status)> = Vec::new();
     let mut warnings = 0usize;
     let mut passes = 0usize;
     let mut failures = 0usize;
 
-    println!("Pie standalone — environment doctor\n");
-
-    // ── System ────────────────────────────────────────────────────────────
-    println!("[system]");
-    let (key, value, status) = check_platform();
-    print_check(&key, &value, status);
-    tally(status, &mut passes, &mut warnings);
-
-    // ── GPUs ──────────────────────────────────────────────────────────────
-    println!("\n[gpus]");
-    for (key, value, status) in check_gpus() {
-        print_check(&key, &value, status);
-        tally(status, &mut passes, &mut warnings);
+    if !json {
+        println!("Pie standalone — environment doctor\n");
     }
 
-    // ── Embedded drivers ──────────────────────────────────────────────────
-    println!("\n[embedded drivers]");
-    for (name, on) in pie_worker::driver_ffi::compiled_embedded() {
-        let (val, st) = if on {
-            ("compiled in".to_string(), Status::Pass)
-        } else {
-            // A driver you did not build is not a fault until the config asks
-            // for it -- which the section below is what checks.
-            ("not compiled (build with --features driver-{})".replace("{}", &name.replace('_', "-")), Status::Warn)
-        };
-        print_check(name, &val, st);
-        tally(st, &mut passes, &mut warnings);
-    }
+    // Sections collected first, rendered second, so the table and the JSON
+    // cannot drift into disagreeing about the verdict -- which is the one
+    // thing a readiness probe reads.
+    let mut sections: Vec<(&'static str, Vec<(String, String, Status)>)> = Vec::new();
 
-    // ── Config ────────────────────────────────────────────────────────────
-    // Last, because its verdict depends on everything above: whether the
-    // config is servable is a question about this binary and this machine, not
-    // about the file alone.
-    println!("\n[config]");
+    sections.push(("system", vec![check_platform()]));
+    sections.push(("gpus", check_gpus()));
+    sections.push((
+        "drivers",
+        pie_worker::driver_ffi::compiled_embedded()
+            .iter()
+            .map(|(name, on)| {
+                if *on {
+                    (name.to_string(), "compiled in".to_string(), Status::Pass)
+                } else {
+                    // A driver you did not build is not a fault until the
+                    // config asks for it -- which the config section checks.
+                    // The cargo feature, which is NOT the driver name with
+                    // its underscore swapped: `cuda_native` builds from
+                    // `driver-cuda`, and the derived spelling named a feature
+                    // that does not exist.
+                    let feature = match *name {
+                        "cuda_native" => "driver-cuda",
+                        "metal" => "driver-metal",
+                        "dummy" => "driver-dummy",
+                        other => other,
+                    };
+                    (
+                        name.to_string(),
+                        format!("not compiled (build with --features {feature})"),
+                        Status::Warn,
+                    )
+                }
+            })
+            .collect(),
+    ));
+    // Last, because its verdict depends on everything above: whether a config
+    // is servable is a question about this binary and this machine, not about
+    // the file alone.
     let (path, origin) = startup::cli_config_path(global);
-    for (key, value, status) in check_config(&path, origin) {
-        print_check(&key, &value, status);
-        match status {
-            Status::Pass => passes += 1,
-            Status::Warn => warnings += 1,
-            Status::Fail => failures += 1,
+    sections.push(("config", check_config(&path, origin)));
+
+    for (_, checks) in &sections {
+        for (_, _, status) in checks {
+            match status {
+                Status::Pass => passes += 1,
+                Status::Warn => warnings += 1,
+                Status::Fail => failures += 1,
+            }
+        }
+    }
+    let ready = failures == 0;
+
+    if json {
+        return crate::ui::emit_json(&serde_json::json!({
+            "ready": ready,
+            "passed": passes,
+            "warnings": warnings,
+            "blocking": failures,
+            "sections": sections
+                .iter()
+                .map(|(name, checks)| serde_json::json!({
+                    "section": name,
+                    "checks": checks
+                        .iter()
+                        .map(|(key, value, status)| serde_json::json!({
+                            "check": key,
+                            "detail": value,
+                            "status": match status {
+                                Status::Pass => "pass",
+                                Status::Warn => "warn",
+                                Status::Fail => "blocking",
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .map(|()| ready);
+    }
+
+    for (name, checks) in &sections {
+        println!("\n[{name}]");
+        for (key, value, status) in checks {
+            print_check(key, value, *status);
         }
     }
 
-    // ── Summary ───────────────────────────────────────────────────────────
     println!();
-    if failures > 0 {
-        let plural = if warnings == 1 { "" } else { "s" };
+    let plural = if warnings == 1 { "" } else { "s" };
+    if !ready {
         println!("✗ pie cannot boot here ({failures} blocking, {warnings} warning{plural}).");
-        return Ok(false);
-    }
-    if warnings > 0 {
-        let plural = if warnings == 1 { "" } else { "s" };
+    } else if warnings > 0 {
         println!("! Ready, with warnings ({passes} passed, {warnings} warning{plural}).");
     } else {
         println!("✓ Ready ({passes} checks).");
     }
-    Ok(true)
+    Ok(ready)
 }
 
 /// Parse the config and say whether this binary could serve it.

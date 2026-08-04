@@ -63,7 +63,11 @@ enum Command {
     },
 
     /// Will pie run here, and with this config? Exits non-zero if not.
-    Doctor,
+    Doctor {
+        /// Emit one JSON document instead of the report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `pie runtime` — provision the embedded Python-WASM runtime. The download IO
@@ -130,11 +134,11 @@ async fn main() -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Doctor => {
+        Command::Doctor { json } => {
             startup::init_cli(&cli.global)?;
             // The exit code IS the answer -- `pie doctor && pie serve` should
             // be a thing an operator can write.
-            Ok(match ops::doctor::doctor(&cli.global)? {
+            Ok(match ops::doctor::doctor(&cli.global, json)? {
                 true => ExitCode::SUCCESS,
                 false => ExitCode::FAILURE,
             })

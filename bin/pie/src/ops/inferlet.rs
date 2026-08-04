@@ -18,7 +18,11 @@ use crate::ui::{self, Palette, Stream};
 #[derive(Subcommand, Debug)]
 pub enum InferletCmd {
     /// List the inferlets already downloaded.
-    List,
+    List {
+        /// Emit one JSON document instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Show manifest metadata and accepted input parameters.
     Info(InfoArgs),
@@ -46,7 +50,7 @@ pub struct InfoArgs {
 
 pub async fn run(cmd: InferletCmd, global: &startup::GlobalArgs) -> Result<()> {
     match cmd {
-        InferletCmd::List => list(),
+        InferletCmd::List { json } => list(json),
         InferletCmd::Info(args) => info(args, global).await,
         InferletCmd::Download(args) => download(args, global).await,
         InferletCmd::Remove(args) => remove(args).await,
@@ -67,9 +71,23 @@ fn open(registry_url: String) -> Repository {
     repo
 }
 
-fn list() -> Result<()> {
+fn list(json: bool) -> Result<()> {
     let repo = open(String::new());
     let cached = repo.cached();
+    if json {
+        return ui::emit_json(&serde_json::json!(
+            cached
+                .iter()
+                .map(|(name, manifest, size)| serde_json::json!({
+                    "name": name.name,
+                    "version": name.version,
+                    "description": manifest.package.description,
+                    "bytes": size,
+                }))
+                .collect::<Vec<_>>()
+        ));
+    }
+
     if cached.is_empty() {
         println!("nothing downloaded yet");
         println!("  inferlets arrive on first use, or with `pie inferlet download <name>`");
