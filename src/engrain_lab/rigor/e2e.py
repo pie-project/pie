@@ -212,6 +212,8 @@ def main() -> int:
     parser.add_argument("--memory", type=float, default=0.45)
     arguments = parser.parse_args()
 
+    import jsonschema
+
     from vllm import LLM, SamplingParams
     from vllm.sampling_params import StructuredOutputsParams
 
@@ -309,18 +311,19 @@ def main() -> int:
                 document = json.loads(output.outputs[0].text.strip())
             except Exception:  # noqa: BLE001
                 continue
-            # Over a corpus of real schemas the cheap key check does not apply,
-            # so parseability is what is counted and the soundness harness is
-            # what checks the schema. A schema whose root is not an object is
-            # perfectly legal and its document is then a scalar, which has no
-            # keys to check - counting it as parseable is the whole claim here.
-            required = schema.get("required") if isinstance(schema, dict) else None
-            if (
-                required is None
-                or not isinstance(document, dict)
-                or set(document) >= set(required)
-            ):
-                valid += 1
+            # The schema itself, not a check of the root's `required` keys.
+            # That cheaper test cannot see a violation anywhere below the root,
+            # so it reported no change from a lowering that measurably enforced
+            # more - which is exactly the kind of blindness that makes a
+            # measurement worse than none.
+            try:
+                jsonschema.validate(document, schema)
+            except jsonschema.ValidationError:
+                continue
+            except Exception:  # noqa: BLE001
+                # An invalid schema is not the engine's failure to report.
+                pass
+            valid += 1
 
         row = {
             "batch": batch,

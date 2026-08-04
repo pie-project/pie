@@ -1,13 +1,13 @@
 {
   "schemas": 194,
   "levels": {
-    "Shadowed": 188,
-    "Merged": 6
+    "Shadowed": 193,
+    "Merged": 1
   },
   "walks_per_schema": 8,
   "blame": {
     "engrain": {
-      "required": 89,
+      "required": 150,
       "anyOf": 10,
       "dependencies": 2
     },
@@ -23,12 +23,12 @@
   "engines": {
     "engrain": {
       "walks": 1545,
-      "complete": 759,
-      "valid": 658,
-      "over_accepted": 101,
-      "completion_rate": 0.4912621359223301,
-      "validity_given_complete": 0.8669301712779973,
-      "aggregate_validity": 0.42588996763754045
+      "complete": 823,
+      "valid": 661,
+      "over_accepted": 162,
+      "completion_rate": 0.5326860841423948,
+      "validity_given_complete": 0.8031591737545565,
+      "aggregate_validity": 0.427831715210356
     },
     "xgrammar": {
       "walks": 1552,

@@ -928,25 +928,33 @@ impl<'a> Converter<'a> {
 /// How many required properties an order-free object will enumerate subsets
 /// of when `additionalProperties` leaves the names open.
 ///
-/// This is the single most expensive number in the front end. Past it
-/// `required` is not enforced at all, and `required` is what rejects 92% of
+/// Past it `required` is not enforced, and `required` is what rejects 92% of
 /// the documents this engine admits and the schema does not - far ahead of
-/// `anyOf` at 10 and `dependencies` at 2.
+/// `anyOf` at 10 and `dependencies` at 2. So raising it was tried, and it is
+/// not the fix.
 ///
-/// Seven, not four. Each subset is a parse the matcher carries at once,
-/// because an open object's declared name can also be read as a generic key,
-/// so the ceiling here is the configuration budget rather than grammar size:
-/// 2^7 is 128, which is exactly what a batch carries. Four covered 94.4% of
-/// the objects in JSONSchemaBench but left 10.9% of its *schemas* with at
-/// least one object unenforced; going to seven took over-acceptance from 153
-/// walks to 101 and validity-given-completion from 80.4% to 86.7%, for no
-/// measurable compile time (p50 123.6 ms against 120.7) and 6.7% more table.
-pub const UNORDERED_REQUIRED_BUDGET_OPEN: usize = 7;
+/// Each subset is a parse the matcher carries at once, because an open
+/// object's declared name can also be read as a generic key, so the ceiling
+/// here is the configuration budget rather than grammar size. Four covers
+/// 94.4% of the objects in JSONSchemaBench, though only 89.1% of its
+/// *schemas*. Seven - with ten for the closed case - took over-acceptance from
+/// 153 random walks to 101 and validity-given-completion from 80.4% to 86.7%
+/// for no compile time, and then end to end, over 409 corpus schemas at batch
+/// 512 with each document validated against its own schema rather than
+/// walked, produced **exactly the same 195 valid documents of 512** and cost
+/// 15% of the throughput. Raising only the closed budget, which carries no
+/// runtime configurations at all, also produced exactly 195.
+///
+/// A random walk is uniform over the mask and a model is not. The walk
+/// harness generates the deeply nested `required` violations these subsets
+/// catch; the model does not generate them in the first place. The subsets are
+/// paid for on every step and collected on almost none.
+pub const UNORDERED_REQUIRED_BUDGET_OPEN: usize = 4;
 
 /// The same, for objects whose property names are a closed set. Nothing forks
 /// there, so the subsets are grammar states rather than live configurations
 /// and the budget is bounded by size alone, which is why it is higher.
-pub const UNORDERED_REQUIRED_BUDGET_CLOSED: usize = 10;
+pub const UNORDERED_REQUIRED_BUDGET_CLOSED: usize = 6;
 
 
 
