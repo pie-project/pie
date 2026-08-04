@@ -1989,3 +1989,16 @@ Engine side: the depth planner admits masked members (they are
 FULL-DEPTH — the suffix after the truncated block must be all-masked,
 the middle all-truncated); m_start (= the truncated block's end)
 derives from the mask word when planned, else N — NO new ABI word.
+
+## AC-4 NUMERICS (2026-08-04): the four-axis fire's outputs hold class
+
+The five-lane battery (plain, snapkv, lora, masked, draft) against
+solos, 46 four-axis fires in the boot: every lane returns COHERENT
+text (the masked lane keeps its canonical head; no garbage anywhere),
+every lane diverges from solo within the established co-batch
+GEMM-rounding class (long common prefixes for plain/mask; the k=8
+draft's short prefix matches its known noise sensitivity — low-depth
+logits amplify small numeric shifts, observed since AC-3's
+lora x depth pair). No crashes, no drift throws. The STEP-LEVEL logit
+comparison (solo vs composed, first-divergence attribution per axis
+machinery) is the recorded strengthening rung.
