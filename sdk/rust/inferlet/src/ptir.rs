@@ -636,11 +636,6 @@ pub struct PageGrant {
 }
 
 impl PageGrant {
-    /// First granted index.
-    pub fn start(&self) -> u32 {
-        self.start
-    }
-
     /// The granted WorkingSet-relative page indexes (contiguous).
     pub fn ids(&self) -> &[u32] {
         &self.ids
@@ -1668,14 +1663,16 @@ pub mod shared_prelude {
     pub use pie_dsl::Stage;
     pub use pie_dsl::dtype;
     pub use pie_dsl::intrinsics;
+    /// The arithmetic intrinsics are deliberately absent: `+ - * / %` and
+    /// unary `-` are their spelling, and one spelling is the point.
     pub use pie_dsl::value::{
-        AsTensor, Tensor, abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum,
-        div, entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel,
-        gumbel_max, iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul,
-        max_elem, min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge,
-        rank_le, recip, reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng,
-        row_membership, scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
-        sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
+        Tensor, abs, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, entropy,
+        entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota,
+        l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem,
+        ne, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, recip, reduce_argmax,
+        reduce_max, reduce_min, reduce_sum, reshape, rng, row_membership, scalar_gather,
+        scatter_add, scatter_set, select, sign, sink_window_mask, sliding_window_mask, softmax,
+        sort_desc, top_k, transpose,
     };
     pub use std::ops::ControlFlow;
 }
