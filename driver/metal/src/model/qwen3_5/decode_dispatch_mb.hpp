@@ -135,16 +135,13 @@ inline int qmm_bn(int out_vec, int N) {
 // point independently.  A projection to hidden (N=1024, 32 tiles) takes a split
 // of 16, gate/up (N=3584, 112 tiles) takes 4, and lm_head has 7760 tiles of its
 // own and takes none.
-// MLX targets 512 threadgroups here, which is right for the hardware it was
-// tuned on and 7% wrong for this one: swept on an M1 Max, the decode step is
-// 29.0ms at 64, 24.7 at 128, 24.7 at 256 and 26.1 at 512, and an interleaved
-// A/B against MLX's value reads 86.85ms to 93.61ms at 32 lanes.  256 sits in
-// the middle of the flat region rather than on its edge.
-//
-// The shape of the curve is the reason: past the point where the machine is
-// full, more partitions only add reduce traffic, and a 32-core M1 Max fills at
-// a lower count than the parts MLX tunes for.
-inline constexpr int kQmmSplitTargetTgs = 256;
+// 512 is MLX's number and it is this machine's too. An earlier sweep here
+// preferred 256 and was measured against qwen3.5's split path, which never
+// dispatched its reduce -- it was timing a kernel that computed the wrong
+// answer, so the curve it drew was not this GEMM's curve. Re-swept on llama-1B
+// at 32 lanes with the reduce in place: 741 tok/s at 128, 873 at 256, 887 at
+// 512, 886 at 1024, 876 at 2048. Flat from 512 on, so take its near edge.
+inline constexpr int kQmmSplitTargetTgs = 512;
 inline constexpr int kQmmSplitBN = 32;
 inline constexpr int kQmmSplitMaxSplits = 16;
 // The widest projection that takes this path.  lm_head has enough output tiles
@@ -156,13 +153,18 @@ inline constexpr int kQmmSplitMaxOut = 8192;
 // groups, or it reads into the next group's scales.
 inline int qmm_split_k(int out_vec, int N, int K, int bm) {
     if (out_vec % kQmmSplitBN != 0 || bm <= 0) return 1;
-    // Count the batch in units of the NARROW row block, not the one this
-    // dispatch happens to use.  A wide block covers twice the rows in one
-    // threadgroup, so counting by it would call a 32-row batch as parallel as a
-    // 16-row one and split both the same -- measured at 32 lanes that costs
-    // 8% (32.37ms split against 29.86 unsplit), where at 16 lanes splitting
-    // wins 11% (18.29 against 20.50).
-    const int tiles = (out_vec / kQmmSplitBN) * ((N + kQmmBM - 1) / kQmmBM);
+    // Count the tiles the SPLIT dispatch will actually launch: `kQmmSplitBN`
+    // wide and `bm` tall, which is the grid `qmm_t_splitk_dispatch` builds.
+    //
+    // This used to count rows in units of `kQmmBM`, the NARROWEST block, on the
+    // theory that a wide block is twice as parallel and should be split half as
+    // deep. That is backwards -- a wide block covers twice the rows in ONE
+    // threadgroup, so it produces half the tiles and needs MORE split, not less
+    // -- and the numbers that appeared to support it were measured on qwen3.5's
+    // split path, which never dispatched its reduce and so was timing the
+    // wrong answer. Counting honestly is worth 741 -> 870 tok/s at 32 lanes on
+    // llama-1B.
+    const int tiles = (out_vec / kQmmSplitBN) * ((N + bm - 1) / bm);
     static const int target = [] {
         const char* e = std::getenv("PIE_METAL_SPLIT_TGS");
         return e ? std::atoi(e) : kQmmSplitTargetTgs;

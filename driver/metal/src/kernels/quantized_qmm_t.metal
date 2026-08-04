@@ -1856,7 +1856,7 @@ METAL_FUNC void qmm_t_splitk_impl(
     const device T* scales,
     const device T* biases,
     const device T* x,
-    device T* y,
+    device float* y,
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
@@ -1871,8 +1871,15 @@ METAL_FUNC void qmm_t_splitk_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
+  // The partials are FLOAT, not the activation type. An unsplit GEMM keeps the
+  // whole K sum in a float accumulator and rounds once; a split one rounds
+  // every partition. Rounding a bf16 partial throws away eight mantissa bits
+  // `split_k` times over, and the loss is not academic: it moved a router
+  // logit enough to flip a top-k selection in llama_numerics_test's routed
+  // geometry. Float partials cost twice the bandwidth on a pass that is 3.5%
+  // of a decode fire, and make the split as accurate as the whole.
   using mma_t = mlx::steel::
-      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+      BlockMMA<T, float, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
@@ -1927,7 +1934,7 @@ METAL_FUNC void qmm_t_splitk_impl(
 // quarter of the parallelism they had room for.
 //
 // Each threadgroup takes one K partition and writes its own [M, N] slice; the
-// reduce below sums the slices.  Partials are the activation type, as in MLX.
+// reduce below sums the slices.  Partials are FLOAT (see the note inside).
 // The K sum is reassociated into `split_k` contiguous blocks -- pairwise rather
 // than strictly sequential, which is the better-conditioned order, but it does
 // mean this is not bit-identical to the unsplit kernel.
@@ -1937,7 +1944,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
     const device T* scales   [[buffer(1)]],
     const device T* biases   [[buffer(2)]],
     const device T* x        [[buffer(3)]],
-    device T* y              [[buffer(8)]],   // [split_k, M, N], act dtype
+    device float* y          [[buffer(8)]],  // [split_k, M, N], FLOAT
     const constant int& K    [[buffer(5)]],
     const constant int& N    [[buffer(6)]],
     const constant int& k_partition_size [[buffer(9)]],
@@ -1974,9 +1981,12 @@ template <typename T, bool WITH_RESIDUAL>
     device T* y                 [[buffer(4)]],
     const constant int& N       [[buffer(6)]],
     const device T* residual    [[buffer(7)]],
-    const device T* partial     [[buffer(8)]],
-    const constant int& split_k [[buffer(9)]],
+    const device float* partial [[buffer(8)]],
     const constant int& stride  [[buffer(10)]],
+    // NOT buffer(9). One argument table serves BOTH halves of a split
+    // projection, and 9 is the GEMM's `k_partition_size`, the partition LENGTH
+    // rather than the partition COUNT.
+    const constant int& split_k [[buffer(11)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int col = int(gid.x);
   if (col >= N) return;
@@ -1993,7 +2003,7 @@ template <typename T, bool WITH_RESIDUAL>
                        "_bn_" #bn)]]                                            \
   [[kernel]] void affine_qmm_t_splitk<bfloat, gs, b, bm, bk, bn>(               \
       const device uint32_t*, const device bfloat*, const device bfloat*,       \
-      const device bfloat*, device bfloat*, const constant int&,                \
+      const device bfloat*, device float*, const constant int&,                 \
       const constant int&, const constant int&, const constant int&,            \
       uint3, uint, uint);
 
@@ -2019,9 +2029,9 @@ instantiate_qmm_t_splitk(128, 64, 32, 32, 8)
 
 template [[host_name("qmm_splitk_reduce_bfloat16")]] [[kernel]] void
 qmm_splitk_reduce<bfloat, false>(device bfloat*, const constant int&,
-                                 const device bfloat*, const device bfloat*,
+                                 const device bfloat*, const device float*,
                                  const constant int&, const constant int&, uint2);
 template [[host_name("qmm_splitk_reduce_residual_bfloat16")]] [[kernel]] void
 qmm_splitk_reduce<bfloat, true>(device bfloat*, const constant int&,
-                                const device bfloat*, const device bfloat*,
+                                const device bfloat*, const device float*,
                                 const constant int&, const constant int&, uint2);

@@ -39,4 +39,22 @@ KN qmv_kn(Kind k, const LlamaGeometry& g);
 int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                       const LlamaGeometry& g, int rows = 1, bool paged = false);
 
+/// Bind the split-K side of every dense projection that takes one.
+///
+/// Three numbers per dispatch, all of which change with `rows`: where the
+/// partial slices go (ordinal 8, one buffer shared by every split projection
+/// -- they are serialized by barriers and each is reduced before the next
+/// runs), how long a K partition is (ordinal 9) and how far apart the slices
+/// sit (ordinal 10), plus the partition count the reduce sums (ordinal 11).
+///
+/// `keep` receives the small constant buffers; the caller owns them for as long
+/// as the argument tables point at them. Buffers are shared between dispatches
+/// that want the same triple, which on this family means one per projection
+/// shape rather than one per layer.
+///
+/// Returns how many dispatches were split, which is what a test can pin.
+int bind_llama_splitk(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                      const LlamaGeometry& g, int rows, const SlotHandle& partials,
+                      std::vector<SlotHandle>& keep);
+
 }  // namespace pie::metal::llama

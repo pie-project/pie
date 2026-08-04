@@ -326,4 +326,61 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
     return count;
 }
 
+int bind_llama_splitk(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                      const LlamaGeometry& g, int rows, const SlotHandle& partials,
+                      std::vector<SlotHandle>& keep) {
+    keep.clear();
+    if (!partials.valid()) return 0;
+    const int R = rows < 1 ? 1 : rows;
+    int count = 0;
+    // Dispatches that want the same three numbers share one set of buffers.
+    // llama's layers are uniform, so this is one set per projection SHAPE --
+    // seven for a dense checkpoint -- rather than one per layer.
+    struct Triple {
+        std::int32_t part, stride, split;
+        SlotHandle k, st, sp;
+    };
+    std::vector<Triple> seen;
+    for (const Dispatch& d : dag) {
+        // `rows`, not the sampled head row count: lm_head is the one kind
+        // whose GEMM runs on fewer rows, and it never splits -- its output is
+        // the vocabulary, which is past `kQmmSplitMaxOut` on every checkpoint
+        // here and would need partials of hundreds of megabytes.
+        const int split = llama_qmm_split(d.kind, g, R);
+        if (split <= 1) continue;
+        const KN kn = qmv_kn(d.kind, g);
+        const Triple want{std::int32_t(kn.K / split),
+                          std::int32_t(kn.N) * std::int32_t(llama_qmm_rows(R)),
+                          std::int32_t(split), {}, {}, {}};
+        Triple* hit = nullptr;
+        for (Triple& t : seen) {
+            if (t.part == want.part && t.stride == want.stride && t.split == want.split) {
+                hit = &t;
+                break;
+            }
+        }
+        if (hit == nullptr) {
+            Triple t = want;
+            t.k = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            t.st = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            t.sp = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            if (!t.k.valid() || !t.st.valid() || !t.sp.valid()) continue;
+            *static_cast<std::int32_t*>(t.k.contents()) = t.part;
+            *static_cast<std::int32_t*>(t.st.contents()) = t.stride;
+            *static_cast<std::int32_t*>(t.sp.contents()) = t.split;
+            keep.push_back(t.k);
+            keep.push_back(t.st);
+            keep.push_back(t.sp);
+            seen.push_back(t);
+            hit = &seen.back();
+        }
+        ctx.arg_bind_ordinal(d.ordinal, 8, partials);
+        ctx.arg_bind_ordinal(d.ordinal, 9, hit->k);
+        ctx.arg_bind_ordinal(d.ordinal, 10, hit->st);
+        ctx.arg_bind_ordinal(d.ordinal, 11, hit->sp);
+        ++count;
+    }
+    return count;
+}
+
 }  // namespace pie::metal::llama

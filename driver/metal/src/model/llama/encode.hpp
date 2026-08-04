@@ -93,6 +93,25 @@ bool llama_is_dense_proj(Kind k);
 /// The GEMM's column tile for a dense projection, or 0 to keep the matvec.
 int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows);
 
+/// The K partitions a dense projection's GEMM takes, or 1 for no split.
+///
+/// A decode fleet is the shape that needs this: 32 rows fill exactly one row
+/// block, so the whole GEMM is `out/BN` threadgroups -- one per core on an
+/// M1 Max -- and the machine idles. Splitting K hands each partition its own
+/// threadgroup and a reduce sums them. MLX sends every transposed non-batched
+/// decode down this path for the same reason.
+///
+/// One question in one place: `pso_for`, `launch_shape`, `encode_llama_step`
+/// and `bind_llama_splitk` must all give the same answer, or the GEMM writes
+/// partials with a stride the reduce does not read back.
+int llama_qmm_split(Kind k, const LlamaGeometry& g, int rows);
+
+/// Elements the split GEMM's partials buffer must hold for a batch up to
+/// `max_rows`: the deepest split, times the widest padded batch, times the
+/// widest output that takes a split. Asked here so the sizer and the stride the
+/// binder writes come from the same constants.
+std::size_t llama_splitk_partial_elems(int max_rows);
+
 /// `run_ends[i]`: the last position of the concurrency run containing `i`. What
 /// the colourer needs to know about which barriers the encoder will drop.
 std::vector<int> llama_run_ends(const std::vector<Dispatch>& dag);
