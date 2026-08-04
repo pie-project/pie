@@ -447,6 +447,8 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/kimi/kimi_model.cpp
   src/model/llama_like/llama_like.cpp
   src/model/llama_like/declared_forward.cpp
+  src/model/hook_sideband_arena.cpp
+  src/batch/supergraph.cu
   src/model/llama_like/llama_like_model.cpp
   src/model/llama_like/mistral3.cpp
   src/model/llama_like/qwen3.cpp
@@ -460,7 +462,6 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/qwen3_5/qwen3_5.cpp
   src/model/qwen3_5/qwen3_5_config.cpp
   src/model/qwen3_5/qwen3_5_forward.cpp
-  src/model/qwen3_5/declared_forward.cpp
   src/model/qwen3_5/qwen3_5_model.cpp
   src/model/qwen3_5/qwen3_5_moe.cpp
   src/model/qwen3_5/qwen3_5_moe_forward.cpp

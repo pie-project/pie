@@ -71,6 +71,17 @@ fn pie_loader_include_dir() -> PathBuf {
     PathBuf::from(dir)
 }
 
+/// Directory holding `pie_forward.h`, the cbindgen-generated view of the
+/// forward toolchain's FFI (tart). The native drivers trace a family's
+/// declaration at cold start and execute the traced form.
+fn pie_forward_include_dir() -> std::path::PathBuf {
+    let dir = std::env::var("DEP_PIE_FORWARD_INCLUDE").expect(
+        "pie-forward's build.rs did not emit cargo:include — \
+                 check that `links = \"pie_forward\"` is set in forward/Cargo.toml",
+    );
+    std::path::PathBuf::from(dir)
+}
+
 // -----------------------------------------------------------------------------
 // driver/metal — MLX-free raw-Metal driver (Apple Silicon, macOS-only)
 // -----------------------------------------------------------------------------
@@ -218,7 +229,8 @@ fn driver_cmake_config(driver_dir: &Path, out_subdir: &str, build_target: &str) 
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
         .define("PIE_DRIVER_ABI_INCLUDE_DIR", pie_driver_abi_include_dir())
-        .define("PIE_LOADER_INCLUDE_DIR", pie_loader_include_dir());
+        .define("PIE_LOADER_INCLUDE_DIR", pie_loader_include_dir())
+        .define("PIE_FORWARD_INCLUDE_DIR", pie_forward_include_dir());
     cfg
 }
 

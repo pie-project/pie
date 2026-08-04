@@ -41,6 +41,18 @@ static PIE_LOADER_ENTRY_ANCHOR: unsafe extern "C" fn(
     *mut *mut pie_loader::ffi::PieLoaderDiagnostics,
 ) -> pie_loader::ffi::PieLoaderStatus = pie_loader::ffi::entry::pie_loader_compile_contract;
 
+/// Same story for the forward toolchain (tart): the drivers trace a
+/// family's declaration over `pie_forward.h`, no Rust in this process
+/// calls it, and the crate-side `#[used] KEEP_ALIVE` only keeps symbols
+/// alive once the object file is in the link — this reference is what
+/// puts it there.
+#[used]
+static PIE_FORWARD_ENTRY_ANCHOR: unsafe extern "C" fn(
+    *const pie_forward::ffi::entry::PieForwardLlamaLikeFacts,
+    *mut pie_forward::ffi::PieForwardPlan,
+) -> pie_forward::ffi::entry::PieForwardStatus =
+    pie_forward::ffi::entry::pie_forward_trace_llama_like;
+
 #[cfg(feature = "driver-cuda")]
 #[repr(C)]
 struct NcclUniqueId {
