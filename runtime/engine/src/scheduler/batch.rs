@@ -138,7 +138,8 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
         // class, refused as safe degradation for now).
         if req.hook_program
             || (req.lora_program && req.request.max_layers.is_some())
-            || req.request.has_user_mask
+            // AC-1: a lane on BOTH window axes is the PQ-tree class.
+            || (req.request.has_user_mask && req.request.max_layers.is_some())
             || req.request.token_ids.len() > ordered.len()
             || req
                 .request
@@ -154,8 +155,18 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
             }
         }
     }
-    let split = ordered.len() - truncated;
-    if ordered[split..]
+    // AC-1 order [plain | truncated | masked]: the truncated block is a
+    // MIDDLE window ending where the masked suffix starts; every member
+    // after it must be masked (full-depth), every truncated member
+    // contiguous. dsplit = the block's start; its end derives from the
+    // mask word driver-side.
+    let masked_tail = ordered
+        .iter()
+        .rev()
+        .take_while(|r| r.request.has_user_mask)
+        .count();
+    let split = ordered.len() - masked_tail - truncated;
+    if ordered[split..ordered.len() - masked_tail]
         .iter()
         .any(|r| r.request.max_layers.is_none())
     {

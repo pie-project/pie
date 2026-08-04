@@ -2380,7 +2380,46 @@ void llama_like_forward_paged(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
-    if (full_depth_rows != 0xffffffffu) {
+    if (full_depth_rows != 0xffffffffu && has_custom_mask) {
+        // AC-1 (mask x depth), the stash/restore form: order is
+        // [plain | truncated | masked], so the full-depth rows are
+        // non-contiguous {[0, t_start) ∪ [m_start, N)}. Rather than
+        // window every kernel, layers [k, L) run FULL-N — the
+        // truncated middle computes discarded garbage (its [k, L) KV
+        // slabs are dead weight its own re-runs never read) — with the
+        // residual stream's truncated rows STASHED at layer k and
+        // RESTORED before the tail, so the one tail reads layer-k
+        // hidden for the truncated rows and layer-L for everyone else.
+        const int t_start = static_cast<int>(full_depth_rows);
+        const int m_start = plan_state.spatial_mask_split;
+        // t_start == 0 is legal: no plain block, the truncated middle
+        // starts at row 0 ([truncated | masked]).
+        if (layer_bound >= cfg.num_hidden_layers || t_start < 0 ||
+            m_start <= t_start || m_start > R || !is_pure_decode ||
+            plan_state.spatial_mask_split < 0) {
+            throw std::runtime_error(
+                "depth union (masked): planned shape and prepared "
+                "state drifted");
+        }
+        static DeviceBuffer<std::uint8_t> stash;
+        const std::size_t bytes =
+            static_cast<std::size_t>(m_start - t_start) * H * 2;
+        if (stash.size() < bytes) {
+            stash = DeviceBuffer<std::uint8_t>(bytes);
+        }
+        for (int L = 0; L < layer_bound; ++L) {
+            run_layer(L, N, R, decode_plan, attn_ws);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            stash.data(), bf16_row(ws.y.data(), t_start, H), bytes,
+            cudaMemcpyDeviceToDevice, stream));
+        for (int L = layer_bound; L < cfg.num_hidden_layers; ++L) {
+            run_layer(L, N, R, decode_plan, attn_ws);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            bf16_row(ws.y.data(), t_start, H), stash.data(), bytes,
+            cudaMemcpyDeviceToDevice, stream));
+    } else if (full_depth_rows != 0xffffffffu) {
         // The depth union (S-2): layers [0, k) run every row, layers
         // [k, L) run the full-depth prefix only, and the unchanged
         // full-N tail below is BOTH heads (the suffix rows' hidden
