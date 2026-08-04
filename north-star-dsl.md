@@ -1784,3 +1784,61 @@ prefix/prompt tuning is the KV axis (learned pages), not a correction.
 Composition: the form's structure hash joins the seriation key —
 same-form adapters span-group exactly as lora does today, cross-form
 v0 solo, later a row window like every axis before it.
+
+## DESIGN FINAL (2026-08-04): fwd.adapter(site, |x, y| expr) — the seat is the builder, the body is PTIR
+
+Converged with the user over three rounds. The earlier note's two
+candidate surfaces merge: the DSL-sink generality was right about the
+PAYLOAD (an open expression, not a closed WIT variant — VeRA/DoRA and
+future compositions without WIT churn), and the builder-method
+instinct was right about the SEAT (adapters are pass-level
+configuration, not traced-program plumbing the guest should hand-roll).
+The house already holds the reconciliation: prologue/epilogue are
+builder methods that TRACE CLOSURES into container regions — adapter
+is their sibling. So:
+
+  fwd.adapter(Site::Q, |x, y| y + mm(b.read(), mm(a.read(), x)));
+
+- SEAT: an sdk ForwardPass method beside prologue/epilogue (noun
+  style, one call per site). WIT UNCHANGED — the container carries
+  the region, exactly as it carries prologue/epilogue.
+- BODY: a per-site ADAPTER REGION (new region kind) over the closed
+  op set {mm-by-channel, scale, add, reshape} with x/y as
+  SYMBOLIC-DIM tensors (SiteIn/SiteOut resolved at bind against the
+  ModelProfile — the lora-probe D_OUT hardcoding dies). The validator
+  checks the op set; the compiler classifies structure into the
+  span-grouped CORRECTION lowerings and refuses the unknown loudly;
+  the region's structure hash joins the composition key.
+- The honest trade, recorded: rank rides channel shapes, so a rank
+  change re-traces the container (cheap, guest-side; a new identity
+  bucket). v1 extends symbolic dims to channel declarations' rank
+  axis, completing "swap adapter = re-seed" for rank too.
+- kernel::lora becomes the deprecated special case of the low-rank
+  form; §6.5's span-grouped lowering stays the execution organ.
+
+## S-2/S-3 DESIGN (2026-08-04): the depth union executes with ONE tail
+
+The load-bearing discovery for the FullDepthPrefix peel: seriate
+full-depth members first, truncated last, and then
+
+  layers [0, k)   run FULL-N (every row, exactly today's body);
+  layers [k, L)   run over the PREFIX rows only (row-major
+                  activations make the prefix contiguous: GEMMs/norms
+                  just take N' = prefix tokens; attention takes a
+                  prefix-request plan);
+  the tail        (final norm + lm_head) runs FULL-N, UNCHANGED.
+
+No hidden-state stash, no second head: layers [k, L) never write the
+suffix rows, so the suffix's x is FROZEN at its layer-k value and the
+one full-N tail IS the logit-lens head for the truncated rows while
+being the ordinary head for the full rows. The union costs two loop
+bounds and a prefix plan.
+
+Wire: the fire-level k word (planned_max_layers) becomes the SUFFIX's
+uniform k; a new planned_full_depth_rows request-split word rides the
+same appended-word pattern (UNPLANNED = uniform fire, today's solo
+shape). v0 blocking: truncated members compose ONLY with plain
+full-depth decode (no masks/hooks/lora/mixed-k — each a recorded
+later rung), which makes the second plan workspace reusable: a depth
+fire is never also a spatial-mask fire, so the dedicated secondary
+workspace serves both mutually-exclusive shapes.
