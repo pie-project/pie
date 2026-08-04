@@ -2002,3 +2002,14 @@ logits amplify small numeric shifts, observed since AC-3's
 lora x depth pair). No crashes, no drift throws. The STEP-LEVEL logit
 comparison (solo vs composed, first-divergence attribution per axis
 machinery) is the recorded strengthening rung.
+
+## RELEASE REGRESSION POST-AC (2026-08-04): the campaign holds on the default path
+
+The release build carrying the whole AC campaign (seriation reorder,
+every relax, stash/restore, the four-axis machinery), no-env boot:
+canonical masked solo 3/3, S-B identity (k=28 byte-equal) and
+determinism, the solo oracle BYTE-EQUAL to the pre-campaign reference
+(the one diff was an uninstalled inferlet, not numerics), the
+five-lane product battery green with 40 four-axis fires, 0
+panics/illegal. The axis-composition campaign is stable at release on
+the default path.
