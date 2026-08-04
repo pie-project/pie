@@ -115,6 +115,27 @@ class BenchSummary:
     intertoken_p50_ms: float | None = None
     intertoken_p99_ms: float | None = None
     intertoken_max_ms: float | None = None
+    # Beam-search dimensions (present only for beam runs; see beam_bench.py).
+    #
+    # A beam decode has two defensible token counts and quoting one alone is
+    # misleading in opposite directions: the engine advances `beam_width`
+    # hypotheses per step, but only ONE of them is ever returned. So a beam run
+    # reports both, always, and never a bare figure:
+    #   engine_output_tok_per_s  — every beam the engine advanced. What the
+    #                              hardware did.
+    #   goodput_output_tok_per_s — the returned beam only. What the caller got.
+    # `output_tok_per_s` above is the goodput figure for a beam run, because
+    # `RequestResult.output_tokens` counts tokens the request actually emitted.
+    # That keeps the shared field comparable across engines: a non-beam baseline
+    # is compared against goodput, never against the engine figure.
+    beam_width: int | None = None
+    engine_output_tok_per_s: float | None = None
+    goodput_output_tok_per_s: float | None = None
+    # Peak cells occupied in the shared KV page pool. This is the memory
+    # quantity a beam run actually varies. Device memory is not: the KV arena is
+    # pre-allocated from `gpu_mem_utilization`, so total VRAM is a config input
+    # and says nothing about the search.
+    kv_cells_occupied_peak: int | None = None
 
 
 def percentile(xs: list[float], q: float) -> float | None:
@@ -271,6 +292,13 @@ def print_summary(s: BenchSummary) -> None:
             f"intertoken p50/p99/max: {s.intertoken_p50_ms:.2f} / "
             f"{s.intertoken_p99_ms:.2f} / {s.intertoken_max_ms:.2f} ms"
         )
+    if s.beam_width is not None:
+        # Both denominators, always. Printing one alone invites the reader to
+        # take it for the other.
+        print(f"beam width:        {s.beam_width}")
+        print(f"engine tok/sec:    {s.engine_output_tok_per_s:.2f}  (all {s.beam_width} beams)")
+        print(f"goodput tok/sec:   {s.goodput_output_tok_per_s:.2f}  (returned beam only)")
+        print(f"kv cells peak:     {s.kv_cells_occupied_peak}")
     # Speculation counters live in the config blob, sourced from the
     # server's `model_status` query. Only printed when present so
     # baseline runs (no speculation capability) stay quiet.
