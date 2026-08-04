@@ -44,6 +44,10 @@ const GENERATE: &str = "generate@0.1.0";
 /// because there is nothing to overlap it with.
 const FLEET: usize = 8;
 
+/// Fleets per candidate. Three is the smallest count that gives a median an
+/// outlier cannot move and a spread that means anything.
+const REPEATS: usize = 3;
+
 /// The candidates this test drives. Deliberately few and deliberately spread:
 /// the point is that the knobs MOVE and keep working, not that the space is
 /// covered. `k=1` and `k=4` are the extremes of the guest contract, and the
@@ -102,12 +106,13 @@ async fn a_sweep_measures_many_candidates_against_one_resident_model() -> Result
 
     let mut rounds = Vec::new();
     for (index, knobs) in probe_candidates().into_iter().enumerate() {
-        let round = sweep::measure(&addr, GENERATE, &inputs, knobs)
+        let round = sweep::measure(&addr, GENERATE, &inputs, knobs, REPEATS)
             .await
             .with_context(|| format!("round {index} ({knobs})"))?;
         eprintln!(
-            "[sweep-e2e] round {index}: {knobs} -> {:.1} tok/s  p95 {:.1} ms  failed {}",
+            "[sweep-e2e] round {index}: {knobs} -> {:.1} tok/s ±{:.1}%  p95 {:.1} ms  failed {}",
             round.throughput_tok_s,
+            round.throughput_rel_sigma * 100.0,
             round.lane_p95_us as f64 / 1_000.0,
             round.failed_lanes,
         );
@@ -147,10 +152,16 @@ async fn a_sweep_measures_many_candidates_against_one_resident_model() -> Result
     //     engine degrades as rounds accumulate, the sweep ranks position rather
     //     than configuration and every conclusion from it is worthless.
     //
-    //     The bound is loose on purpose. This is a same-machine repeat of a
-    //     whole fleet, not a microbenchmark, and the measured per-rung noise on
-    //     this box is around 1%; 25% catches a systematic slide without turning
-    //     into a flake on a busy host.
+    //     The bound is loose on purpose: this catches a systematic slide, not a
+    //     small one. Observed on an L40S at three repeats per candidate: 3.4%,
+    //     against 45% before `sweep::warmup` existed.
+    //
+    //     Note what the gap between this 3.4% and the rounds' own reported
+    //     spread (1.2-2.7%) means. Repeats run back to back, so they share
+    //     whatever state the machine is in and measure only the within-burst
+    //     variation; the between-round variation is larger. `Round::beats` is
+    //     therefore somewhat over-confident, and interleaving candidates rather
+    //     than batching their repeats is the fix. Not built.
     let first = rounds[0].throughput_tok_s;
     let last = rounds[3].throughput_tok_s;
     let drift = (last - first).abs() / first.max(f64::EPSILON);

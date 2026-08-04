@@ -51,14 +51,26 @@ impl std::fmt::Display for Knobs {
     }
 }
 
-/// What one round measured.
+/// What one candidate measured, across its repeats.
 pub struct Round {
     pub knobs: Knobs,
+    /// Median throughput across repeats. Median rather than mean because one
+    /// slow fleet — a host hiccup, a stray process — should not move the
+    /// estimate, and with a handful of repeats it easily would.
     pub throughput_tok_s: f64,
+    /// Spread as a fraction of the median. This is the number that decides
+    /// whether a difference between two candidates is real, so it is carried
+    /// rather than discarded: at the serving level the noise floor measured
+    /// ~6% on an L40S while the gap between k=2 and k=4 was ~2.4%, and a
+    /// ranking that ignores that is reporting noise.
+    pub throughput_rel_sigma: f64,
+    /// Median of the per-repeat p95s.
     pub lane_p95_us: u128,
-    /// Lanes that returned nothing. Non-zero means this round is not a
-    /// measurement, and the caller must not rank it against one that is.
+    /// Lanes that returned nothing, summed over repeats. Non-zero means this
+    /// is not a measurement, and the caller must not rank it against one that
+    /// is.
     pub failed_lanes: usize,
+    pub repeats: usize,
 }
 
 impl Round {
@@ -68,6 +80,41 @@ impl Round {
     pub fn is_measurement(&self) -> bool {
         self.failed_lanes == 0
     }
+
+    /// Is this candidate faster than `other` by more than the two of them can
+    /// explain by noise?
+    ///
+    /// The same rule the driver's own sweep uses after `fe8d85040`: combine the
+    /// two candidates' spreads in quadrature and require the gap to clear it.
+    /// Anything closer than that is a coin flip that will land the other way on
+    /// the next run, and reporting it as a win is how a sweep produces
+    /// confident garbage.
+    pub fn beats(&self, other: &Round) -> bool {
+        if !self.is_measurement() || !other.is_measurement() {
+            return false;
+        }
+        let gap = (self.throughput_tok_s - other.throughput_tok_s)
+            / other.throughput_tok_s.max(f64::EPSILON);
+        let noise = (self.throughput_rel_sigma.powi(2) + other.throughput_rel_sigma.powi(2)).sqrt();
+        gap > noise
+    }
+}
+
+/// Median of a sample set, and the spread as a fraction of it.
+fn median_and_rel_sigma(samples: &[f64]) -> (f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    if samples.len() < 2 || median <= 0.0 {
+        return (median, 0.0);
+    }
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let variance =
+        samples.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / (samples.len() - 1) as f64;
+    (median, variance.sqrt() / median)
 }
 
 /// Run the load once and throw the result away.
@@ -99,17 +146,40 @@ pub async fn warmup(addr: &str, program: &str, inputs: &[String]) -> Result<()> 
 /// finds the engine idle and its `reconfigure` succeeds. A caller that leaves
 /// guests running between rounds gets a refusal rather than a silently
 /// mis-attributed measurement, which is the intended failure.
-pub async fn measure(addr: &str, program: &str, inputs: &[String], knobs: Knobs) -> Result<Round> {
+pub async fn measure(
+    addr: &str,
+    program: &str,
+    inputs: &[String],
+    knobs: Knobs,
+    repeats: usize,
+) -> Result<Round> {
+    // Once per candidate, not once per repeat: the knobs are what the repeats
+    // hold fixed, and re-applying them between identical fleets would only add
+    // a way for the sweep to fail.
     pie_engine::scheduler::reconfigure(knobs.frame_size, knobs.submit_depth, knobs.dispatch_depth)
         .map_err(anyhow::Error::from)
         .with_context(|| format!("apply {knobs}"))?;
 
-    let run = fleet::run(addr, program, inputs).await;
+    let repeats = repeats.max(1);
+    let mut throughputs = Vec::with_capacity(repeats);
+    let mut p95s = Vec::with_capacity(repeats);
+    let mut failed_lanes = 0;
+    for _ in 0..repeats {
+        let run = fleet::run(addr, program, inputs).await;
+        throughputs.push(run.throughput_tok_s());
+        p95s.push(run.lane_percentile_us(95) as f64);
+        failed_lanes += run.failed_lanes();
+    }
+
+    let (throughput_tok_s, throughput_rel_sigma) = median_and_rel_sigma(&throughputs);
+    let (lane_p95, _) = median_and_rel_sigma(&p95s);
     Ok(Round {
         knobs,
-        throughput_tok_s: run.throughput_tok_s(),
-        lane_p95_us: run.lane_percentile_us(95),
-        failed_lanes: run.failed_lanes(),
+        throughput_tok_s,
+        throughput_rel_sigma,
+        lane_p95_us: lane_p95 as u128,
+        failed_lanes,
+        repeats,
     })
 }
 
@@ -171,27 +241,64 @@ mod tests {
         assert!(narrow.iter().all(|k| k.steps_in_flight() < 5));
     }
 
+    fn round(knobs: Knobs, tok_s: f64, rel_sigma: f64, failed: usize) -> Round {
+        Round {
+            knobs,
+            throughput_tok_s: tok_s,
+            throughput_rel_sigma: rel_sigma,
+            lane_p95_us: 0,
+            failed_lanes: failed,
+            repeats: 3,
+        }
+    }
+
+    const BASE: Knobs = Knobs { frame_size: 2, submit_depth: 3, dispatch_depth: 2 };
+
+    #[test]
+    fn a_gap_smaller_than_the_noise_is_not_a_win() {
+        // The measured case: 6% round-to-round noise against a 2.4% gap between
+        // k=2 and k=4. Calling that a win produces a ranking that lands the
+        // other way on the next run.
+        let a = round(BASE, 1296.0, 0.06, 0);
+        let b = round(BASE, 1265.0, 0.06, 0);
+        assert!(!a.beats(&b), "2.4% gap under 8.5% combined noise");
+
+        // A 3.4x collapse is not ambiguous, and the rule must not be so
+        // conservative that it misses one.
+        let slow = round(BASE, 375.0, 0.06, 0);
+        assert!(b.beats(&slow), "k=1 collapse must register");
+    }
+
+    #[test]
+    fn quieter_measurements_resolve_smaller_gaps() {
+        // The point of repeats: the same 2.4% gap becomes a real result once
+        // the spread comes down.
+        let a = round(BASE, 1296.0, 0.005, 0);
+        let b = round(BASE, 1265.0, 0.005, 0);
+        assert!(a.beats(&b));
+    }
+
+    #[test]
+    fn a_failed_round_never_beats_anything() {
+        // Fewer lanes finishing raises tokens per second, so a broken round
+        // can post the best number. It must not be allowed to rank at all.
+        let broken = round(BASE, 4000.0, 0.001, 2);
+        let good = round(BASE, 1265.0, 0.01, 0);
+        assert!(!broken.beats(&good));
+        assert!(!good.beats(&broken));
+    }
+
+    #[test]
+    fn the_median_ignores_one_bad_fleet() {
+        // A host hiccup in one repeat should move the spread, not the estimate.
+        let (median, sigma) = median_and_rel_sigma(&[1200.0, 1210.0, 400.0]);
+        assert_eq!(median, 1200.0);
+        assert!(sigma > 0.3, "the outlier has to show up somewhere: {sigma}");
+    }
+
     #[test]
     fn a_round_with_a_dead_lane_does_not_rank() {
-        // The trap this guards: fewer lanes finishing can RAISE tokens per
-        // second, so a broken configuration can look like the winner.
-        let good = Round {
-            knobs: Knobs { frame_size: 2, submit_depth: 3, dispatch_depth: 2 },
-            throughput_tok_s: 100.0,
-            lane_p95_us: 10,
-            failed_lanes: 0,
-        };
-        let broken = Round {
-            failed_lanes: 1,
-            throughput_tok_s: 400.0,
-            ..Round {
-                knobs: good.knobs,
-                throughput_tok_s: 0.0,
-                lane_p95_us: 0,
-                failed_lanes: 0,
-            }
-        };
-        assert!(good.is_measurement());
-        assert!(!broken.is_measurement());
+        assert!(round(BASE, 100.0, 0.01, 0).is_measurement());
+        assert!(!round(BASE, 400.0, 0.01, 1).is_measurement());
     }
 }
