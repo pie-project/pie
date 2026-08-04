@@ -37,6 +37,10 @@ tool = ["pie-loader/testkit"]
 # `default-features = false` keeps the compiler's testkit out of a driver
 # link; the `tool` feature turns it back on for the CLI alone.
 pie-loader = { path = "..", default-features = false }
+# The contract authors: `pie_loader_compile_model` resolves model_type
+# through pie_model::contract. `contract` alone, so the driver link never
+# carries the chat aspect's tokenizer or image decoders.
+pie-model = { path = "../../model", default-features = false, features = ["contract"] }
 serde_json = "1.0"
 
 [dev-dependencies]

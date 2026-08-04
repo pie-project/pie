@@ -12,21 +12,24 @@ name = "pie_model"
 path = "src/lib.rs"
 
 [features]
-# The contract aspect: family weight contracts authored here, compiled by
-# pie-loader. Off by default so chat-only consumers never pull the loader;
-# `capi` turns it on and nothing else, which is what keeps the driver link free
-# of tokenizer and (later) DSL machinery.
+# One feature per aspect, because the aspects pull different worlds: `chat`
+# needs the tokenizer (and the model service around it), `contract` needs the
+# loader's algebra, `forward` will need the DSL. A consumer links only the
+# aspect it reads — the ABI crate builds with `contract` alone, so a driver
+# link never carries the tokenizer or the image decoders.
+default = ["chat"]
+chat = ["dep:pie-tokenizer", "dep:anyhow", "dep:serde_json", "dep:image"]
 contract = ["dep:pie-loader"]
 
 [dependencies]
-pie-tokenizer = { path = "../runtime/tokenizer" }
+pie-tokenizer = { path = "../runtime/tokenizer", optional = true }
 # `default-features = false` drops the loader's testkit half — the authoring
 # side needs the algebra, never the host executor.
 pie-loader = { path = "../loader", default-features = false, optional = true }
-anyhow = "1.0"
-serde_json = { version = "1.0", features = ["preserve_order"] }
+anyhow = { version = "1.0", optional = true }
+serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
 # Host-side media decode for the model-agnostic multimodal API.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"], optional = true }
 
 [dev-dependencies]
 # The contract tests compile and verify what the authors declare, which is
@@ -34,3 +37,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # in the ABI crate, the same pipeline a driver boot runs.
 pie-loader = { path = "../loader", default-features = false }
 pie-loader-capi = { path = "../loader/capi", default-features = false }
+serde_json = { version = "1.0", features = ["preserve_order"] }

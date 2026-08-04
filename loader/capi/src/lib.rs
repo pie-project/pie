@@ -30,6 +30,7 @@ pub mod checkpoint;
 pub mod contract;
 pub mod contract_writer;
 pub mod entry;
+pub mod model;
 pub mod types;
 pub mod view;
 pub mod weight_store;

@@ -937,6 +937,58 @@ struct PieLoaderPlan {
   void *owner;
 };
 
+/// The config facts a family needs beyond the checkpoint itself. Mirrors
+/// [`ModelFacts`]; strings are borrowed for the call.
+struct PieLoaderModelFactsView {
+  /// `model_type` from `config.json` — the key the author registry
+  /// dispatches on.
+  PieLoaderBytes model_type;
+  /// `quantization_config.quant_method`, empty for an unquantized
+  /// checkpoint.
+  PieLoaderBytes quant_method;
+  uint32_t num_hidden_layers;
+  uint32_t num_experts;
+  uint32_t head_dim;
+  uint32_t mamba_groups;
+};
+
+/// The per-family switches, wire form. Mirrors [`FamilyKnobs`] field for
+/// field; the caller reads its environment and fills these, so an author
+/// never consults the environment and equal requests author equal contracts.
+struct PieLoaderFamilyKnobs {
+  bool glm5_moe_gate_up_swapped;
+  bool qwen35_fused_gdn_projection;
+  bool qwen35_mtp_int8_lm_head;
+  bool qwen35_moe_gate_up_swapped;
+  bool qwen35_fused_shared_scalar_gate;
+  bool kimi_k3_moe_gate_up_swapped;
+  bool kimi_moe_gate_up_swapped;
+  bool nemotron_tp_mamba_sharding;
+};
+
+/// Everything one authoring-and-compiling call is decided by.
+struct PieLoaderModelRequest {
+  /// The checkpoint, already open: authoring reads the same tensor table
+  /// the compile does, which is what makes the contract and the plan
+  /// provably about one parse.
+  const PieLoaderCheckpoint *checkpoint;
+  PieLoaderTargetSpec target;
+  PieLoaderModelFactsView facts;
+  /// `Projections` wire value: 0 fused, 1 in-place.
+  uint32_t projections;
+  /// `Naming` wire value: 0 HF, 1 MLX.
+  uint32_t naming;
+  /// `RuntimeQuant` wire value, already resolved against the device:
+  /// 0 none, 1 fp8, 2 int8, 3 mxfp4.
+  uint32_t runtime_quant;
+  /// `Mxfp4MoeRequest` wire value: 0 auto, 1 routed, 2 native, 3 bf16.
+  uint32_t moe_request;
+  /// `Component` wire value: 0 full, 1 text, 2 encode.
+  uint32_t component;
+  bool stream_routed_experts;
+  PieLoaderFamilyKnobs knobs;
+};
+
 /// An artifact open for writing.
 ///
 /// Freed by [`pie_loader_weight_store_publish`] or
@@ -1089,6 +1141,16 @@ void pie_loader_release(PieLoaderPlan *plan);
 /// `diags` is null or a pointer produced by this module that has not already been
 /// released.
 void pie_loader_release_diagnostics(PieLoaderDiagnostics *diags);
+
+/// Author this model's contract and compile it into a plan, in one call.
+///
+/// # Safety
+///
+/// `req` and everything its pointers reach must be live for the call.
+/// `out_plan` is a writable slot; `out_diags` is null or a writable slot.
+PieLoaderStatus pie_loader_compile_model(const PieLoaderModelRequest *req,
+                                         PieLoaderPlan **out_plan,
+                                         PieLoaderDiagnostics **out_diags);
 
 /// Open an artifact for `key` at `path`.
 ///

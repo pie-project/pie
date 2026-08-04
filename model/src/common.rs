@@ -6,6 +6,7 @@
 //! contract author is parameterized by — and never a fact about one family's
 //! checkpoints or templates. Those facts live in the family's own directory.
 
+#[cfg(feature = "chat")]
 pub mod decoders;
 
 // The contract aspect's vocabulary and toolkit. Behind the feature so

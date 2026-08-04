@@ -92,12 +92,12 @@ unsafe impl Sync for PieLoaderDiagnostics {}
 
 /// Collects diagnostics during a call, then publishes them as one allocation.
 #[derive(Default)]
-struct DiagnosticSink {
+pub(super) struct DiagnosticSink {
     entries: Vec<(PieLoaderSeverity, String)>,
 }
 
 impl DiagnosticSink {
-    fn error(&mut self, message: impl Into<String>) {
+    pub(super) fn error(&mut self, message: impl Into<String>) {
         self.entries
             .push((PieLoaderSeverity::Error, message.into()));
     }
@@ -106,7 +106,7 @@ impl DiagnosticSink {
         self.entries.is_empty()
     }
 
-    fn publish(self) -> *mut PieLoaderDiagnostics {
+    pub(super) fn publish(self) -> *mut PieLoaderDiagnostics {
         if self.entries.is_empty() {
             return std::ptr::null_mut();
         }
@@ -137,7 +137,7 @@ impl DiagnosticSink {
 /// # Safety
 ///
 /// `out` is either null or a writable `*mut PieLoaderDiagnostics`.
-unsafe fn emit(out: *mut *mut PieLoaderDiagnostics, diags: *mut PieLoaderDiagnostics) {
+pub(super) unsafe fn emit(out: *mut *mut PieLoaderDiagnostics, diags: *mut PieLoaderDiagnostics) {
     if out.is_null() {
         unsafe { release_diagnostics(diags) };
         return;
@@ -250,7 +250,7 @@ pub(super) unsafe fn as_str<'a>(value: &'a PieLoaderBytes, field: &str) -> Resul
 ///
 /// Written exhaustively rather than with a wildcard so that adding a variant to
 /// [`Error`] forces this decision to be made again.
-fn compile_error_status(err: &Error) -> PieLoaderStatus {
+pub(super) fn compile_error_status(err: &Error) -> PieLoaderStatus {
     match err {
         Error::Contract(_)
         | Error::Shard(_)
@@ -659,10 +659,11 @@ unsafe impl Sync for EntryAddr {}
 /// final link rather than anywhere near this file (`architecture.md` §3.4).
 /// `#[used]` keeps the table, and the table keeps the functions.
 #[used]
-static KEEP_ALIVE: [EntryAddr; 6] = [
+static KEEP_ALIVE: [EntryAddr; 7] = [
     EntryAddr(pie_loader_open_checkpoint as *const ()),
     EntryAddr(pie_loader_close_checkpoint as *const ()),
     EntryAddr(pie_loader_compile_contract as *const ()),
+    EntryAddr(crate::model::pie_loader_compile_model as *const ()),
     EntryAddr(pie_loader_verify_contract as *const ()),
     EntryAddr(pie_loader_release as *const ()),
     EntryAddr(pie_loader_release_diagnostics as *const ()),

@@ -9,4 +9,5 @@
 //! when that aspect lands, but speaks this lineage's chat format; that reuse is
 //! a registry row, not a copy.
 
+#[cfg(feature = "chat")]
 pub mod chat;

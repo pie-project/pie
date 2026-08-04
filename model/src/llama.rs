@@ -11,6 +11,7 @@
 //! contract registry state those N:1 mappings explicitly — a directory here is
 //! organization for humans, never the key the machine dispatches on.
 
+#[cfg(feature = "chat")]
 pub mod chat;
 #[cfg(feature = "contract")]
 pub mod contract;
