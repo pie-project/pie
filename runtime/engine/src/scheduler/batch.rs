@@ -560,6 +560,7 @@ pub(crate) fn build_frame_submission(
                 lora: req.lora_program,
                 custom_mask: req.request.has_user_mask,
                 truncated: req.request.max_layers.is_some(),
+                multi_token: req.request.qo_indptr.windows(2).any(|w| w[1] - w[0] > 1),
                 device_resolved_geometry: req.request.device_resolved_geometry,
                 arrival,
             })
@@ -595,6 +596,11 @@ pub(crate) fn build_frame_submission(
                         // reference comparator must carry every
                         // seriation term the plan's key carries).
                         group[i].request.max_layers.is_some(),
+                        !group[i]
+                            .request
+                            .qo_indptr
+                            .windows(2)
+                            .any(|w| w[1] - w[0] > 1),
                     )
                 });
                 order

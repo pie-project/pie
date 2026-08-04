@@ -964,6 +964,76 @@ void prepare_llama_like_decode_plan(
                 /*causal_mask=*/true,
                 /*custom_mask=*/false);
             state.use_prefill_plan = true;
+            // NO-DEMOTION: split the prefix again — prefill lanes
+            // first (the seriation's multi_token term), then the
+            // plain-decode middle [P, split_req), which gets the
+            // DECODE kernel instead of demoting to the causal prefill.
+            // P derives from the host qo (first width-1 request).
+            state.mixed_mid_decode_plan.reset();
+            state.mixed_mid_start = -1;
+            {
+                int P = split_req;
+                for (int r = 0; r < split_req; ++r) {
+                    if (qo_indptr_h[r + 1] - qo_indptr_h[r] == 1) {
+                        P = r;
+                        break;
+                    }
+                }
+                const int mid = split_req - P;
+                if (mid > 0 && P > 0 && !fwd_cfg.force_prefill_path &&
+                    !fwd_cfg.use_prefill_decode_plan) {
+                    // Middle decode plan over requests [P, split_req):
+                    // kvpp rebased to the middle's page base (the
+                    // suffix-plan pattern, third application). Decode
+                    // and prefill plan REGIONS are disjoint within one
+                    // workspace (the NS-2 precedent), so attn_ws holds
+                    // the prefix-causal + this decode plan together.
+                    std::vector<std::uint32_t> kvpp_mid(
+                        static_cast<std::size_t>(mid) + 1);
+                    const std::uint32_t mid_base = kv_page_indptr_h[P];
+                    for (int i = 0; i <= mid; ++i) {
+                        kvpp_mid[static_cast<std::size_t>(i)] =
+                            kv_page_indptr_h[P + i] - mid_base;
+                    }
+                    if (!state.mixed_mid_decode_plan) {
+                        state.mixed_mid_decode_plan =
+                            ops::make_decode_plan();
+                    }
+                    ops::plan_attention_flashinfer_decode(
+                        *state.mixed_mid_decode_plan, kvpp_mid.data(),
+                        mid, num_q_heads_local, num_kv_heads_local,
+                        cfg.head_dim_kernel, cache.page_size(), attn_ws,
+                        /*stream=*/nullptr,
+                        fwd_cfg.decode_plan_cuda_graph,
+                        decode_full_attention_variant_enabled() &&
+                            fwd_cfg.sliding_window < 0 &&
+                            fwd_cfg.per_layer_window_left.empty(),
+                        cache.hnd_layout());
+                    state.mixed_mid_start = P;
+                    // Re-plan the prefix CAUSAL to the prefill lanes
+                    // only (requests [0, P), tokens qo[P]) — the middle
+                    // now belongs to the decode kernel.
+                    ops::plan_attention_flashinfer_prefill_bf16(
+                        *state.prefill_plan,
+                        qo_indptr_h,
+                        kv_page_indptr_h,
+                        kv_last_page_lens_h,
+                        static_cast<int>(qo_indptr_h[P]),
+                        P,
+                        num_q_heads_local,
+                        num_kv_heads_local,
+                        cfg.head_dim_kernel,
+                        cache.page_size(),
+                        attn_ws,
+                        /*stream=*/nullptr,
+                        fwd_cfg.decode_plan_cuda_graph,
+                        fwd_cfg.sliding_window,
+                        /*full_attention_variant=*/false,
+                        cache.hnd_layout(),
+                        /*causal_mask=*/true,
+                        /*custom_mask=*/false);
+                }
+            }
             // The suffix mask plan: identity qo over the 1-token rows,
             // page geometry from the resolver counts when threaded
             // (composed envelopes) or the host CSR slice (wire lanes) —
@@ -2193,6 +2263,28 @@ void llama_like_forward_paged(
                     kv_last_page_lens,
                     attn_ws, stream, /*logits_soft_cap=*/0.f,
                     sm_scale_override);
+                // NO-DEMOTION: the plain-decode middle takes the DECODE
+                // kernel (its own plan over requests [P, split_req),
+                // kvpp-rebased; q/out at row qo[P] — pure-decode middle
+                // so row == request there). Same-stream after the
+                // causal launch (both read-only on q/KV; outputs
+                // disjoint) — the async launches already overlap on
+                // the device; the side stream stays the custom's.
+                if (plan_state.mixed_mid_decode_plan &&
+                    plan_state.mixed_mid_start >= 0) {
+                    const int P = plan_state.mixed_mid_start;
+                    const int mid_row =
+                        static_cast<int>(qo_indptr_h[P]);
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan_state.mixed_mid_decode_plan,
+                        bf16_row(attn_q, mid_row, Hq), kv_view,
+                        bf16_row(attn_out_buf, mid_row, Hq),
+                        kv_page_indices,
+                        kv_page_indptr + P,
+                        kv_last_page_lens + P,
+                        attn_ws, stream, layer_window_left,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                }
                 if (side_on) {
                     CUDA_CHECK(cudaEventRecord(ss->join, ss->stream));
                     CUDA_CHECK(cudaStreamWaitEvent(stream, ss->join, 0));

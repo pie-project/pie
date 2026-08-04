@@ -266,6 +266,11 @@ pub(crate) struct MemberFacts {
     /// row-window precondition, exactly as mask-last was the spatial
     /// fire's.
     pub(crate) truncated: bool,
+    /// NO-DEMOTION: multi-token (prefill-shaped) members sort before
+    /// single-token ones within each block, so a mixed fire's prefix is
+    /// [prefill | plain-decode] and the plain-decode run can take the
+    /// DECODE kernel instead of demoting to the general causal prefill.
+    pub(crate) multi_token: bool,
     /// Device-resolved (chained-decode envelope) geometry: composes as the
     /// ordered suffix sub-batch, never interleaved with wire members.
     pub(crate) device_resolved_geometry: bool,
@@ -349,6 +354,7 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
             member.custom_mask,
             member.hook_program,
             member.truncated,
+            !member.multi_token,
             member.arrival,
         )
     });
@@ -449,6 +455,7 @@ mod tests {
             lora,
             custom_mask: false,
             truncated: false,
+            multi_token: false,
             device_resolved_geometry,
             arrival,
         }
@@ -460,6 +467,7 @@ mod tests {
             lora: false,
             custom_mask: true,
             truncated: false,
+            multi_token: false,
             device_resolved_geometry: false,
             arrival,
         }

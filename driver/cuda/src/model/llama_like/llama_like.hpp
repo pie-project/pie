@@ -148,6 +148,12 @@ struct LlamaLikePlanState {
     // buffers — the mixed-fire lesson; a depth fire is never also a
     // spatial-mask fire, so the workspace is free).
     ops::DecodePlanCachePtr depth_prefix_decode_plan;
+    // NO-DEMOTION (mixed 3-way): the plain-decode middle's DECODE plan
+    // (requests [P, split_req) of a mixed fire, kvpp-rebased). The
+    // seriation puts prefill lanes first, so P = the first 1-token
+    // request; -1 = no middle (all-prefill prefix or shape declined).
+    ops::DecodePlanCachePtr mixed_mid_decode_plan;
+    int mixed_mid_start = -1;
     // NS-2: when >= 0, this fire's attention splits at this REQUEST
     // index — the prefix plans cover requests [0, split),
     // mask_decode_plan covers the REBASED suffix. -1 = fire-level
