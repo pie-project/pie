@@ -512,6 +512,14 @@ target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/loader)
 add_test(NAME heap_layout_slot_test COMMAND heap_layout_slot_test)
 
+# The slab is a pointer and a stride, deliberately, so its eviction rule and
+# its band arithmetic are provable with no device and no checkpoint.
+add_executable(expert_slab_test tests/expert_slab_test.cpp)
+target_include_directories(expert_slab_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${PIE_LOADER_INCLUDE_DIR})
+add_test(NAME expert_slab_test COMMAND expert_slab_test)
+
 if(PIE_LOADER_STATICLIB)
   add_executable(paged_batch_validation_test tests/paged_batch_validation_test.cpp)
   target_include_directories(paged_batch_validation_test PRIVATE
