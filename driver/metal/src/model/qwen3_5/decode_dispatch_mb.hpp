@@ -52,6 +52,16 @@ inline constexpr int kQmmMinBatch = 12;
 // llama-1B prefills 1236 tok/s at BM=16, 1616 at 32 and 1936 at 64.
 // A fourth rung would need more accumulators per lane than BM=64/BN=32's
 // sixteen, which is where the register file stops paying.
+//
+// The other three axes were swept at this rung and none of them moved, so the
+// list is where the tuning is:
+//   BK=64  is SLOWER (1647 vs 1817 on llama-1B) and illegal below gs=64 --
+//          QuantizedBlockLoader asserts BCOLS <= group_size, so a gs=32
+//          checkpoint cannot compile it at all.
+//   WM=4   is SLOWER (1714). Splitting a 64-row block four ways puts each lane
+//          back to sixteen accumulators, and it does not help: the 32 that
+//          WM=2 spends are not what the kernel is short of.
+//   BN=32  is slower than 64 at this rung, so `qmm_bn`'s argument survives.
 inline constexpr int kQmmBMs[] = {16, 32, 64};
 inline constexpr int kQmmBMCount = int(sizeof(kQmmBMs) / sizeof(kQmmBMs[0]));
 inline constexpr int kQmmBM = kQmmBMs[0];
