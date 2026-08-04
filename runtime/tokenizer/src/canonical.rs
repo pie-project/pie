@@ -297,7 +297,7 @@ impl Tokenizer {
         ensure!(
             descriptor.version == VERSION,
             "this artifact's tokenizer is {:?}, and this build reads {VERSION}; \
-             regenerate it with `pie model convert --force`",
+             regenerate it with `pie model import --force`",
             descriptor.version
         );
 

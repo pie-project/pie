@@ -41,11 +41,9 @@ pub enum ModelCmd {
     Remove {
         /// The store name, as `pie model list` prints it.
         name: String,
+        /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Also delete the HF snapshot the artifact was converted from.
-        #[arg(long)]
-        staging: bool,
     },
 }
 
@@ -54,7 +52,7 @@ pub fn run(cmd: ModelCmd) -> Result<()> {
         ModelCmd::List { json } => list(json),
         ModelCmd::Info { name, json } => info(name, json),
         ModelCmd::Import(args) => crate::ops::convert::run(args),
-        ModelCmd::Remove { name, yes, staging } => remove(name, yes, staging),
+        ModelCmd::Remove { name, yes } => remove(name, yes),
     }
 }
 
@@ -184,7 +182,7 @@ fn list(json: bool) -> Result<()> {
     let artifacts = crate::ops::store::entries()?;
     println!("Artifacts ({}):", crate::ops::store::dir().display());
     if artifacts.is_empty() {
-        println!("  {dim}(none — `pie model download <org>/<name>`){reset}");
+        println!("  {dim}(none — `pie model import <org>/<name>`){reset}");
     }
     for entry in &artifacts {
         let shards = match entry.shards() {
@@ -559,51 +557,33 @@ fn format_bytes(n: u64) -> String {
 // remove
 // -----------------------------------------------------------------------------
 
-fn remove(name: String, skip_confirm: bool, staging: bool) -> Result<()> {
-    let entry = crate::ops::store::find(&name)?;
-    // A store name and a repo ID are different spellings of the same model
-    // (`Qwen/Qwen3-0.6B` ↔ `Qwen--Qwen3-0.6B`), and users will type either.
-    let repo_id = name.replace("--", "/");
-    let staging_dir =
-        crate::ops::store::staging_dir(&repo_id).or_else(|| crate::ops::store::staging_dir(&name));
-
-    if entry.is_none() && !(staging && staging_dir.is_some()) {
+/// Delete one artifact from the store.
+///
+/// Only the artifact. Reclaiming the HuggingFace snapshot it was converted
+/// from used to be a `--staging` flag here; it is `pie cache clear snapshots`,
+/// which knows about every snapshot rather than the one beside this artifact,
+/// asks before deleting, and reports what it got back. A command that removes
+/// a model has no business deciding what else its origin is worth keeping.
+fn remove(name: String, skip_confirm: bool) -> Result<()> {
+    let Some(entry) = crate::ops::store::find(&name)? else {
         bail!(
             "no artifact named {name:?} in {}",
             crate::ops::store::dir().display()
         );
-    }
+    };
 
-    let mut what = Vec::new();
-    let mut bytes = 0u64;
-    if let Some(entry) = &entry {
-        let files = entry.files.len();
-        what.push(format!(
-            "artifact {name} ({}, {files} file(s))",
-            crate::ops::store::format_bytes(entry.bytes)
-        ));
-        bytes += entry.bytes;
-    }
-    if staging {
-        if let Some(dir) = &staging_dir {
-            let staged = crate::ops::store::staging_bytes(dir);
-            what.push(format!(
-                "its HF snapshot ({})",
-                crate::ops::store::format_bytes(staged)
-            ));
-            bytes += staged;
-        }
-    }
+    let bytes = entry.bytes;
+    let what = format!(
+        "artifact {name} ({}, {} file(s))",
+        crate::ops::store::format_bytes(bytes),
+        entry.files.len()
+    );
 
     if !skip_confirm {
         if !std::io::stdin().is_terminal() {
             bail!("remove requires confirmation; rerun with `pie model remove {name} --yes`");
         }
-        eprint!(
-            "Remove {} ({} total)? [y/N] ",
-            what.join(" and "),
-            crate::ops::store::format_bytes(bytes)
-        );
+        eprint!("Remove {what}? [y/N] ");
         let _ = std::io::stderr().flush();
         let mut answer = String::new();
         std::io::stdin()
@@ -615,19 +595,10 @@ fn remove(name: String, skip_confirm: bool, staging: bool) -> Result<()> {
         }
     }
 
-    if let Some(entry) = &entry {
-        crate::ops::store::remove(entry)?;
-    }
-    if staging {
-        if let Some(dir) = &staging_dir {
-            std::fs::remove_dir_all(dir)
-                .map_err(|e| anyhow!("cannot delete {}: {e}", dir.display()))?;
-        }
-    }
+    crate::ops::store::remove(&entry)?;
     println!(
-        "✓ Removed {} ({} reclaimed)",
-        what.join(" and "),
-        crate::ops::store::format_bytes(bytes)
+        "{} removed {what}",
+        crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout))
     );
     Ok(())
 }

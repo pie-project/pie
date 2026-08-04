@@ -623,7 +623,7 @@ fn dummy_native_options(
 ///
 /// The GGUF refusal that used to live here is gone with the reason for it.
 /// It existed because the LoadPlan executors could not decode GGUF's blocked
-/// schemes at load time — but `pie model convert` decodes them at import now,
+/// schemes at load time — but `pie model import` decodes them now,
 /// so what reaches a driver is a `.zt` either way and there is no format left
 /// to refuse. A `.gguf` handed straight to `serve` still fails, one step later
 /// and with a better message: convert it first.
@@ -635,7 +635,7 @@ fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
     }
     Err(anyhow!(
         "model {snapshot_dir:?} is neither a .zt artifact nor a snapshot directory; \
-         `pie model convert` writes the former"
+         `pie model import` writes the former"
     ))
 }
 
@@ -1064,7 +1064,7 @@ mod tests {
     ///
     /// This used to pin a GGUF-specific refusal, which existed because the
     /// LoadPlan executors could not decode GGUF's blocked schemes at load
-    /// time. `pie model convert` decodes them at import now, so a served model
+    /// time. `pie model import` decodes them now, so a served model
     /// is a `.zt` whatever it started as, and the refusal has nothing left to
     /// name. A `.gguf` handed straight to `serve` is still rejected — as one
     /// of the things that is not an artifact, with the fix in the message.
@@ -1083,7 +1083,7 @@ mod tests {
         let gguf = tmp.path().join("model.gguf");
         std::fs::write(&gguf, b"GGUF").unwrap();
         let error = validate_snapshot_dir(&gguf).unwrap_err().to_string();
-        assert!(error.contains("pie model convert"), "{error}");
+        assert!(error.contains("pie model import"), "{error}");
 
         let error = validate_snapshot_dir(&tmp.path().join("nope"))
             .unwrap_err()

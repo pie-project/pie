@@ -3,8 +3,7 @@
 //! The worker never downloads and never converts (R3). What it resolves is a
 //! name or a path to something already on disk, and under this plan that
 //! something is one `.zt` artifact: weights, compiled tokenizer and compiled
-//! model descriptor together, written by `pie model download` or
-//! `pie model convert`.
+//! model descriptor together, written by `pie model import`.
 //!
 //! Two forms, told apart by shape rather than by what happens to exist:
 //!
@@ -85,7 +84,7 @@ impl Model {
     }
 }
 
-/// `$PIE_HOME/models/` — the store `pie model download` writes into.
+/// `$PIE_HOME/models/` — the store `pie model import` writes into.
 fn store_dir() -> PathBuf {
     crate::paths::pie_home().join("models")
 }
@@ -121,7 +120,7 @@ pub fn resolve(model: &str) -> Result<Model> {
         return Ok(Model::Artifact(by_repo_id));
     }
     bail!(
-        "no model {model:?} in {}; `pie model download {model}` fetches and converts one, \
+        "no model {model:?} in {}; `pie model import {model}` fetches and converts one, \
          and `pie model list` shows what is there",
         store_dir().display()
     )
@@ -211,7 +210,7 @@ mod tests {
     #[test]
     fn a_missing_name_says_how_to_get_one() {
         let err = resolve("definitely-not-a-model").unwrap_err().to_string();
-        assert!(err.contains("pie model download"), "{err}");
+        assert!(err.contains("pie model import"), "{err}");
         let err = resolve("./nowhere.zt").unwrap_err().to_string();
         assert!(err.contains("does not exist"), "{err}");
         assert!(resolve("").is_err());

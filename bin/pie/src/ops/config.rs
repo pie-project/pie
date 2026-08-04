@@ -51,6 +51,7 @@ pub enum ConfigCmd {
 
     /// Write a default config file. Refuses to overwrite unless `--force`.
     Init {
+        /// Overwrite an existing config file.
         #[arg(long)]
         force: bool,
     },

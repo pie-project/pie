@@ -1,4 +1,5 @@
-//! `pie model convert` — rewrite any checkpoint as pie's canonical artifact.
+//! `pie model import` — rewrite any checkpoint as pie's canonical artifact,
+//! fetching it first when the source is a repo ID that is not here yet.
 //!
 //! The conversion engine. Format diversity is handled here, once, and never
 //! again: what the runtime serves is always one `.zt` file, so the question

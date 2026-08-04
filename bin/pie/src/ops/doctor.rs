@@ -199,7 +199,7 @@ fn check_config(path: &Path, origin: startup::Origin) -> Vec<(String, String, St
                     format!("artifact {}", crate::ui::short_path(&path))
                 }
                 pie_worker::weights::Model::Snapshot(path) => format!(
-                    "raw snapshot {} — `pie model convert` makes an artifact",
+                    "raw snapshot {} — `pie model import` makes an artifact",
                     crate::ui::short_path(&path)
                 ),
             },

@@ -21,7 +21,7 @@ use std::io::IsTerminal;
 ///
 /// It matters: the download bar draws to stderr, so deciding its colour from
 /// `stdout().is_terminal()` -- as the code here used to -- got the answer from
-/// the wrong file descriptor. `pie model download > log` would keep colouring.
+/// the wrong file descriptor. `pie model import > log` would keep colouring.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stream {
     Stdout,

@@ -4,7 +4,7 @@
 //! boot, by an ~850-line C++ normalizer with 25 `model_type` conditionals
 //! (`driver/cuda/src/model/config.cpp`) *and* independently by two smaller
 //! Rust probes that must agree with it by coincidence. This crate answers it
-//! once, at `pie model convert`, and writes the answer into the artifact as
+//! once, at `pie model import`, and writes the answer into the artifact as
 //! the `pie.model/1` descriptor.
 //!
 //! What makes that safe to do is not care, it is the differential test:
