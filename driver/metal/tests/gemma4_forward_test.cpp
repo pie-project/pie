@@ -356,7 +356,7 @@ int main(int argc, char** argv) {
     Gemma4Psos psos;
     DecodeStepPsos base;
     if (!build_gemma4_psos(*ctx, kernels_dir, g, psos, &err) ||
-        !load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/false, &err)) {
+        !load_decode_psos(*ctx, kernels_dir, base, g.quant, /*with_argmax=*/false, &err)) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }

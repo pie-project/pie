@@ -11,6 +11,7 @@
 
 #include <string>
 
+#include "affine_format.hpp"
 #include "decode_step.hpp"
 #include "mtl4_context.hpp"
 
@@ -23,6 +24,13 @@ namespace pie::metal {
 bool load_decode_psos(RawMetalContext& ctx,
                       const std::string& kernels_dir,
                       DecodeStepPsos& out,
+                      /// The checkpoint's affine width and group. REQUIRED, and
+                      /// deliberately ahead of the optional flags: when these
+                      /// were two defaulted trailing ints, call sites passed
+                      /// the width and let the group fall back to 64. That
+                      /// compiles, binds, dispatches, and answers wrongly. One
+                      /// value with no default cannot be half-supplied.
+                      AffineFormat quant,
                       bool with_argmax = false,
                       std::string* err = nullptr,
                       bool fuse_residual = false,
@@ -38,16 +46,7 @@ bool load_decode_psos(RawMetalContext& ctx,
                       /// table that claimed them unconditionally would hand it
                       /// a valid gs_64/b_4 PSO for a checkpoint that is
                       /// neither, and a wrong-but-valid PSO is silent.
-                      bool untied = false,
-                      /// The affine width the checkpoint's config declares.
-                      /// Every quantized entrypoint here is named with it, so a
-                      /// width with no instantiation fails to build a pipeline
-                      /// rather than reading the bytes at the wrong stride.
-                      int quant_bits = 4,
-                      /// And the group it declares, for the same reason: a
-                      /// g64 pipeline over a g32 checkpoint is not a load
-                      /// error, it is scales applied to the wrong weights.
-                      int quant_group_size = 64);
+                      bool untied = false);
 
 // ── M>1 multi-batch PSOs (beta, multi-batch lane) ─────────────────────────────
 // The 4 kernel kinds whose M>1 form differs from the M=1 PSO (the rest just grid-widen
@@ -114,12 +113,13 @@ struct MultiBatchPsos {
 bool load_multibatch_psos(RawMetalContext& ctx,
                           const std::string& kernels_dir,
                           MultiBatchPsos& out,
+                          /// The checkpoint's affine width and group; see
+                          /// `load_decode_psos` for why it has no default.
+                          AffineFormat quant,
                           bool with_d512 = false,
                           std::string* err = nullptr,
                           /// Compile the mixture's batched projections. Only a
                           /// checkpoint whose geometry has experts runs them.
-                          bool routed = false,
-                          int quant_bits = 4,
-                          int quant_group_size = 64);
+                          bool routed = false);
 
 }  // namespace pie::metal

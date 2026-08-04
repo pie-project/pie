@@ -146,8 +146,9 @@ int main(int argc, char** argv) {
         std::printf("[whole step resolves]\n");
         pie::metal::DecodeStepPsos base;
         std::string base_err;
-        const bool base_ok = pie::metal::load_decode_psos(*ctx, kernels_dir, base,
-                                                          /*with_argmax=*/true, &base_err);
+        const bool base_ok = pie::metal::load_decode_psos(
+            *ctx, kernels_dir, base, pie::metal::AffineFormat{4, 64},
+            /*with_argmax=*/true, &base_err);
         expect(base_ok, "the shared decode PSOs compile: " + (base_ok ? std::string("ok")
                                                                      : base_err));
         if (base_ok) {
@@ -217,7 +218,8 @@ int main(int argc, char** argv) {
             pie::metal::MultiBatchPsos mb;
             std::string mb_err;
             const bool mb_ok = pie::metal::load_multibatch_psos(
-                *ctx, kernels_dir, mb, /*with_d512=*/true, &mb_err);
+                *ctx, kernels_dir, mb, pie::metal::AffineFormat{4, 64},
+                /*with_d512=*/true, &mb_err);
             expect(mb_ok, "the multi-batch PSOs compile: " + (mb_ok ? std::string("ok")
                                                                     : mb_err));
             if (mb_ok) {

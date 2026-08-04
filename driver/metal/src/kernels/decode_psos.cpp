@@ -48,21 +48,16 @@ std::vector<PsoSpec> specs(const std::string& embed_gather_fn, const std::string
 bool load_decode_psos(RawMetalContext& ctx,
                       const std::string& kernels_dir,
                       DecodeStepPsos& out,
+                      AffineFormat quant,
                       bool with_argmax,
                       std::string* err,
                       bool fuse_residual,
                       bool gdn_prep,
                       bool routed,
-                      bool untied,
-                      int quant_bits,
-                      int quant_group_size) {
+                      bool untied) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
-    // Every quantized entrypoint is `<base>_bfloat16_gs_<group>_b_<width>`.
-    // Both are the checkpoint's, not literals, for the same reason the head
-    // width is: a pipeline built for the wrong one does not fail, it answers.
-    const std::string q = "_bfloat16_gs_" + std::to_string(quant_group_size) + "_b_" +
-                          std::to_string(quant_bits);
+    const std::string q = quant.kernel_suffix();
     const std::string embed_gather_fn = "embed_gather_4bit" + q;
     const std::string qmv_fast_fn = "affine_qmv_fast" + q;
     const std::string qmv_residual_fn = "affine_qmv_fast_residual" + q;
@@ -170,15 +165,13 @@ bool load_decode_psos(RawMetalContext& ctx,
 bool load_multibatch_psos(RawMetalContext& ctx,
                           const std::string& kernels_dir,
                           MultiBatchPsos& out,
+                          AffineFormat quant,
                           bool with_d512,
                           std::string* err,
-                          bool routed,
-                          int quant_bits,
-                          int quant_group_size) {
+                          bool routed) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
-    const std::string q = "_bfloat16_gs_" + std::to_string(quant_group_size) + "_b_" +
-                          std::to_string(quant_bits);
+    const std::string q = quant.kernel_suffix();
     const std::string embed_mb_fn = "embed_gather_mb_4bit" + q;
     struct MbSpec { std::string file; std::string fn; Pso* dst; bool required; };
     const MbSpec specs[] = {

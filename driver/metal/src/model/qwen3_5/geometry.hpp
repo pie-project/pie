@@ -1,5 +1,7 @@
 #pragma once
 
+#include "kernels/affine_format.hpp"
+
 #include <cstddef>
 
 namespace pie::metal {
@@ -14,18 +16,10 @@ struct DecodeGeometry {
     int n_q_heads = 8;
     int n_kv_heads = 2;
     int head_dim = 256;
-    /// The affine quantization width every kernel name here is spelled with.
-    /// The checkpoint's `config.json` states it; g64/b8 and g128/b4 pack to
-    /// identical shapes, so the tensors cannot. A width with no instantiation
-    /// fails to build a pipeline BY NAME rather than reading the bytes at the
-    /// wrong stride and returning a fluent wrong answer.
-    int quant_bits = 4;
-    /// The affine quantization GROUP every kernel name here is spelled with.
-    /// Same reasoning as the width, and the same failure mode: g64/b8 and
-    /// g128/b4 pack to identical shapes, so reading a g32 checkpoint with a
-    /// g64 pipeline is not a load error -- it is scales applied to the wrong
-    /// sixty-four weights, which reads as fluent text that is not the model's.
-    int quant_group_size = 64;
+    /// The affine width and group every quantized kernel name here is spelled
+    /// with. See `AffineFormat`: they are one fact, the config states it, and
+    /// a pipeline built for the wrong pair answers instead of failing.
+    AffineFormat quant{4, 64};
     int rotary_dims = 64;     // derived from partial_rotary_factor * head_dim
     float rope_theta = 1e7f;  // `config.json`'s rope_parameters overrides
     int mrope_section[3] = {11, 11, 10};

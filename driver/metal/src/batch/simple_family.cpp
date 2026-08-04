@@ -58,8 +58,8 @@ bool gemma4_geometry(const SetupConfig& cfg, gemma4::Gemma4Geometry& g, int max_
                      std::string* err) {
     if (!gemma4::geometry_from_facts(cfg.gemma4, g, err)) return false;
     if (cfg.vocab_size != 0) g.vocab = static_cast<int>(cfg.vocab_size);
-    if (cfg.quant_bits != 0) g.quant_bits = cfg.quant_bits;
-    if (cfg.quant_group_size != 0) g.quant_group_size = cfg.quant_group_size;
+    if (cfg.quant_bits != 0) g.quant.bits = cfg.quant_bits;
+    if (cfg.quant_group_size != 0) g.quant.group = cfg.quant_group_size;
     g.kv_max_ctx = max_ctx;
     return true;
 }
@@ -81,8 +81,8 @@ bool llama_geometry(const SetupConfig& cfg, llama::LlamaGeometry& g, int max_ctx
                     std::string* err) {
     if (!llama::geometry_from_facts(cfg.llama, g, err)) return false;
     if (cfg.vocab_size != 0) g.vocab = static_cast<int>(cfg.vocab_size);
-    if (cfg.quant_bits != 0) g.quant_bits = cfg.quant_bits;
-    if (cfg.quant_group_size != 0) g.quant_group_size = cfg.quant_group_size;
+    if (cfg.quant_bits != 0) g.quant.bits = cfg.quant_bits;
+    if (cfg.quant_group_size != 0) g.quant.group = cfg.quant_group_size;
     g.kv_max_ctx = max_ctx;
     return true;
 }
@@ -356,13 +356,13 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
 
         if (!gemma4::build_gemma4_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err,
+        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/false, err,
                               /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false, g_.quant_bits, g_.quant_group_size)) {
+                              /*untied=*/false)) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/true, err,
-                                  /*routed=*/false, g_.quant_bits, g_.quant_group_size)) {
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/true, err,
+                                  /*routed=*/false)) {
             return false;
         }
 
@@ -732,8 +732,17 @@ class GptOssEngine final : public SimpleFamilyEngine {
         }
 
         if (!gptoss::build_gptoss_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err)) return false;
+        // b4/g64, NOT the (mxfp4, 32) pair gpt-oss's config declares globally.
+        // That global is overridden back to affine g64 by nearly every tensor,
+        // and this shared table only ever compiles the affine entrypoints --
+        // gpt-oss's own mxfp4 kernels are named explicitly in `gptoss/kernels.cpp`.
+        // This used to be the parameter's default, which meant the driver was
+        // making the same choice without saying so.
+        const AffineFormat kGptOssBase{/*bits=*/4, /*group=*/64};
+        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, /*with_argmax=*/false, err))
+            return false;
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, kGptOssBase, /*with_d512=*/false, err))
+            return false;
 
         gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
         bound_rows_ = 1;
@@ -1082,13 +1091,13 @@ class LlamaEngine final : public SimpleFamilyEngine {
         }
 
         if (!llama::build_llama_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err,
+        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/false, err,
                               /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false, g_.quant_bits, g_.quant_group_size)) {
+                              /*untied=*/false)) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err,
-                                  /*routed=*/false, g_.quant_bits, g_.quant_group_size)) {
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/false, err,
+                                  /*routed=*/false)) {
             return false;
         }
 
