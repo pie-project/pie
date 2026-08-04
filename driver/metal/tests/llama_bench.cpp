@@ -366,30 +366,36 @@ int main(int argc, char** argv) {
             /// no experts is also Qwen3-1.7B, and the 3B ran that row's
             /// answer and failed while being right.
             int n_layers, n_experts, quant_bits, hidden;
+            /// The affine group. Part of the key because it is part of the
+            /// answer: the same weights at g32 and at g64 are different
+            /// numbers, and a table that could not tell them apart would have
+            /// compared a g32 run against a g64 continuation and called a
+            /// correct driver wrong.
+            int quant_group;
             std::vector<int> want;
             /// The continuation of `long_gate_prompt()`, empty if unknown.
             std::vector<int> want_long;
         };
         const std::vector<Known> known{
             // " Tokyo. The capital of the", then "The capital of France is Paris"
-            {"Qwen3-1.7B", 28, 0, 4, 2048, {26194, 13, 576, 6722, 315, 279},
+            {"Qwen3-1.7B", 28, 0, 4, 2048, 64, {26194, 13, 576, 6722, 315, 279},
              {785, 6722, 315, 9625, 374, 12095}},
             // " Tokyo. The capital of Brazil", then the sentence again
-            {"Qwen3-30B-A3B", 48, 128, 4, 2048, {26194, 13, 576, 6722, 315, 15948},
+            {"Qwen3-30B-A3B", 48, 128, 4, 2048, 64, {26194, 13, 576, 6722, 315, 15948},
              {785, 6722, 315, 9625, 374, 12095}},
             // Qwen3.5 tokenizes these ids differently -- its vocabulary is
             // 248320, not Qwen3's 151936 -- so the continuation is a different
             // sentence in the same shape. The gate is on IDS, which is what the
             // driver and mlx-lm both consume, so the disagreement about what
             // they spell is not the gate's business.
-            {"Qwen3.5-0.8B", 24, 0, 4, 1024, {12095, 13, 576, 6722, 315, 198},
+            {"Qwen3.5-0.8B", 24, 0, 4, 1024, 64, {12095, 13, 576, 6722, 315, 198},
              {785, 6722, 315, 9625, 374, 12095}},
             // Llama-3.2-1B reads these ids as its own vocabulary's text, not
             // the sentence Qwen spells, so the continuation is a different
             // sentence -- and it is the only entry here whose rotation comes
             // from a TABLE (`rope_scaling: llama3`, factor 32) rather than a
             // geometric series, which is the thing this row gates.
-            {"Llama-3.2-1B", 16, 0, 4, 2048, {12095, 13, 1115, 374, 279, 1890},
+            {"Llama-3.2-1B", 16, 0, 4, 2048, 64, {12095, 13, 1115, 374, 279, 1890},
              {785, 6722, 315, 9625, 374, 12095}},
             // Gemma 4 E2B. Its 262144-entry vocabulary reads these ids as
             // nothing in particular, so the continuation is not a sentence --
@@ -398,7 +404,7 @@ int main(int argc, char** argv) {
             // other does: two attention widths in one stack (256 sliding, 512
             // full), a KV-shared tail, per-layer embeddings, and a softcapped
             // logit -- none of which any other entry exercises at all.
-            {"Gemma-4-E2B", 35, 0, 4, 1536, {56971, 55353, 374, 56971, 55353, 374},
+            {"Gemma-4-E2B", 35, 0, 4, 1536, 64, {56971, 55353, 374, 56971, 55353, 374},
              {785, 6722, 48352, 6722, 48352, 6722}},
             // gpt-oss-20b. The only MXFP4 checkpoint here, and the row that
             // says the driver reads openai's format rather than converting it:
@@ -407,21 +413,48 @@ int main(int argc, char** argv) {
             // re-quantized it affine-U4 -- sixteen levels times a power of two
             // forced through a 15-step grid, so the two runs did not hold the
             // same weights and no row could exist. They do now.
-            {"gpt-oss-20b", 24, 32, 4, 2880, {13, 279, 410, 12038, 410, 25},
+            // Keyed at 32 because that is what its `quantization` block declares --
+            // a global mxfp4 g32 that most of its tensors then override back to
+            // affine g64. The key is what the config says, not what any one
+            // tensor is, which is the same thing every other row's group means.
+            {"gpt-oss-20b", 24, 32, 4, 2880, 32, {13, 279, 410, 12038, 410, 25},
              {785, 6722, 315, 9625, 1455, 12095}},
             // The same Llama-3.2-1B at 8 bits. It is here because it is the
             // only row that exercises a width other than 4 across a WHOLE
             // model -- the embedding gather, every projection, the batched
             // prefill matmul and the untied head. gpt-oss's 8-bit router
             // covers one dense matvec and nothing else.
-            {"Llama-3.2-1B-8bit", 16, 0, 8, 2048, {12095, 13, 420, 6722, 315, 6323},
+            {"Llama-3.2-1B-8bit", 16, 0, 8, 2048, 64, {12095, 13, 420, 6722, 315, 6323},
              {785, 6722, 315, 9625, 374, 12095}},
             // Llama-3.2-3B. Same family and the same llama3 rope table as the
             // 1B, at 24 query heads over 8 kv heads with head_dim 128 -- the
             // 1B is 32/8 at 64 -- so it is the row that says the geometry is
             // read rather than assumed. It reads these ids as version numbers,
             // and " 1.0.0" is what mlx-lm produces too.
-            {"Llama-3.2-3B", 28, 0, 4, 3072, {220, 16, 13, 15, 13, 15},
+            {"Llama-3.2-3B", 28, 0, 4, 3072, 64, {220, 16, 13, 15, 13, 15},
+             {785, 6722, 315, 9625, 374, 12095}},
+            // The same Llama-3.2-1B at group 32 and at group 128. They are the
+            // only rows whose group is not 64, and 64 was a constant baked into
+            // the codec, into every `instantiate_qmm_t`, and into a
+            // `"_gs_64_b_"` literal in each of llama's, gemma4's and qwen3.5's
+            // PSO builders until these two existed. A g64 pipeline over a g32
+            // checkpoint is not a load failure: before this it produced token
+            // 3504, six times over, from scales applied to the wrong weights.
+            //
+            // They are not published -- mlx-community ships this model at g64 --
+            // but they are two commands from what is:
+            //
+            //   mlx_lm.convert --hf-path <the published 4bit> --mlx-path /tmp/bf16 -d
+            //   mlx_lm.convert --hf-path /tmp/bf16 --mlx-path ~/.pie-bench/llama-1b-gs32 \
+            //                  -q --q-group-size 32 --q-bits 4
+            //
+            // and the same with 128. Their continuations are mlx-lm's own on
+            // those files, which is the only reference that means anything:
+            // requantizing changes the weights, so the g64 answer is not the
+            // answer here, and both differ from it in the last token.
+            {"Llama-3.2-1B-g32", 16, 0, 4, 2048, 32, {12095, 13, 1115, 374, 279, 1193},
+             {785, 6722, 315, 9625, 374, 12095}},
+            {"Llama-3.2-1B-g128", 16, 0, 4, 2048, 128, {12095, 13, 1115, 374, 279, 1193},
              {785, 6722, 315, 9625, 374, 12095}},
         };
         //
@@ -435,7 +468,8 @@ int main(int argc, char** argv) {
         for (const Known& k : known) {
             if (k.n_layers == shape.n_layers && k.n_experts == shape.n_experts &&
                 k.hidden == shape.hidden &&
-                k.quant_bits == (cfg.quant_bits != 0 ? cfg.quant_bits : 4)) {
+                k.quant_bits == (cfg.quant_bits != 0 ? cfg.quant_bits : 4) &&
+                k.quant_group == (cfg.quant_group_size != 0 ? cfg.quant_group_size : 64)) {
                 ref = &k;
                 break;
             }

@@ -57,7 +57,11 @@ template <typename T, int group_size, int bits>
 instantiate_embed(float32, float, 64, 4)
 instantiate_embed(float16, half, 64, 4)
 instantiate_embed(bfloat16, bfloat, 64, 4)
+instantiate_embed(bfloat16, bfloat, 32, 4)
+instantiate_embed(bfloat16, bfloat, 128, 4)
 instantiate_embed(bfloat16, bfloat, 64, 8)
+instantiate_embed(bfloat16, bfloat, 32, 8)
+instantiate_embed(bfloat16, bfloat, 128, 8)
 
 // ── Scaled variant (gemma4): out[k] = embed_scale * dequant(row, k). ─────────────
 // gemma4 multiplies the gathered embedding by a constant (embed_tokens: sqrt(hidden);
@@ -96,7 +100,11 @@ template <typename T, int group_size, int bits>
 instantiate_embed_scaled(float32, float, 64, 4)
 instantiate_embed_scaled(float16, half, 64, 4)
 instantiate_embed_scaled(bfloat16, bfloat, 64, 4)
+instantiate_embed_scaled(bfloat16, bfloat, 32, 4)
+instantiate_embed_scaled(bfloat16, bfloat, 128, 4)
 instantiate_embed_scaled(bfloat16, bfloat, 64, 8)
+instantiate_embed_scaled(bfloat16, bfloat, 32, 8)
+instantiate_embed_scaled(bfloat16, bfloat, 128, 8)
 
 // ── M>1 batched gather (multi-batch lane). ───────────────────────────────────
 // One thread per (channel k, token row m); token m gathers row id[m] (per-row IO
@@ -133,7 +141,11 @@ template <typename T, int group_size, int bits>
 instantiate_embed_mb(float32, float, 64, 4)
 instantiate_embed_mb(float16, half, 64, 4)
 instantiate_embed_mb(bfloat16, bfloat, 64, 4)
+instantiate_embed_mb(bfloat16, bfloat, 32, 4)
+instantiate_embed_mb(bfloat16, bfloat, 128, 4)
 instantiate_embed_mb(bfloat16, bfloat, 64, 8)
+instantiate_embed_mb(bfloat16, bfloat, 32, 8)
+instantiate_embed_mb(bfloat16, bfloat, 128, 8)
 
 // gemma4 scaled batched variant.
 template <typename T, int group_size, int bits>
@@ -169,4 +181,8 @@ template <typename T, int group_size, int bits>
 instantiate_embed_scaled_mb(float32, float, 64, 4)
 instantiate_embed_scaled_mb(float16, half, 64, 4)
 instantiate_embed_scaled_mb(bfloat16, bfloat, 64, 4)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 32, 4)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 128, 4)
 instantiate_embed_scaled_mb(bfloat16, bfloat, 64, 8)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 32, 8)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 128, 8)

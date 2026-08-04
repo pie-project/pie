@@ -54,13 +54,15 @@ bool load_decode_psos(RawMetalContext& ctx,
                       bool gdn_prep,
                       bool routed,
                       bool untied,
-                      int quant_bits) {
+                      int quant_bits,
+                      int quant_group_size) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
-    // Every quantized entrypoint is `<base>_bfloat16_gs_64_b_<width>`. The
-    // width is the checkpoint's, not a literal, for the same reason the head
+    // Every quantized entrypoint is `<base>_bfloat16_gs_<group>_b_<width>`.
+    // Both are the checkpoint's, not literals, for the same reason the head
     // width is: a pipeline built for the wrong one does not fail, it answers.
-    const std::string q = "_bfloat16_gs_64_b_" + std::to_string(quant_bits);
+    const std::string q = "_bfloat16_gs_" + std::to_string(quant_group_size) + "_b_" +
+                          std::to_string(quant_bits);
     const std::string embed_gather_fn = "embed_gather_4bit" + q;
     const std::string qmv_fast_fn = "affine_qmv_fast" + q;
     const std::string qmv_residual_fn = "affine_qmv_fast_residual" + q;
@@ -171,10 +173,12 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           bool with_d512,
                           std::string* err,
                           bool routed,
-                          int quant_bits) {
+                          int quant_bits,
+                          int quant_group_size) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
-    const std::string q = "_bfloat16_gs_64_b_" + std::to_string(quant_bits);
+    const std::string q = "_bfloat16_gs_" + std::to_string(quant_group_size) + "_b_" +
+                          std::to_string(quant_bits);
     const std::string embed_mb_fn = "embed_gather_mb_4bit" + q;
     struct MbSpec { std::string file; std::string fn; Pso* dst; bool required; };
     const MbSpec specs[] = {

@@ -762,12 +762,23 @@ StagedWeights stage_plan_weights(
         const auto scheme = tensor.quant_scheme;
         const int bits = int(tensor.quant_bits_per_element);
         const int group = int(tensor.quant_group_size);
+        // The affine group is an axis now, not a constant: `quantized_qmv`,
+        // `embed_gather` and `quantized_qmm_t` all instantiate at 32, 64 and
+        // 128, so the width and the group are two independent choices rather
+        // than the one pair g64/b4 every kernel name used to be spelled with.
+        //
+        // Still necessary and not sufficient, in the same way the width is.
+        // The ROUTED matvec takes its group from its codec, which is fixed at
+        // 64 because only g64 mixtures are published, so a routed checkpoint
+        // at another group passes here and fails where its pipeline is built,
+        // by name. That is the same place a width with no instantiation fails.
+        const bool affine_group = group == 32 || group == 64 || group == 128;
         const bool readable =
             scheme == pie_loader::PieLoaderQuantScheme::None ||
             (scheme == pie_loader::PieLoaderQuantScheme::MlxAffineU4 && bits == 4 &&
-             group == 64) ||
+             affine_group) ||
             (scheme == pie_loader::PieLoaderQuantScheme::Int8Asymmetric && bits == 8 &&
-             group == 64) ||
+             affine_group) ||
             (scheme == pie_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0 && bits == 4 &&
              group == 32);
         if (!readable) {
@@ -775,7 +786,8 @@ StagedWeights stage_plan_weights(
                 "no metal kernel here reads '" + std::string(reinterpret_cast<const char*>(tensor.name.ptr), tensor.name.len) +
                 "': scheme " + std::to_string(int(scheme)) + " at g" + std::to_string(group) +
                 "/b" + std::to_string(bits) +
-                ". The kernels read MLX affine-U4 g64/b4, MXFP4 g32/b4, and 8-bit g64.");
+                ". The kernels read MLX affine at b4 or b8 over g32, g64 or g128, "
+                "and MXFP4 g32/b4.");
         }
     }
     std::unordered_map<std::uint32_t, SlotHandle> buffers;

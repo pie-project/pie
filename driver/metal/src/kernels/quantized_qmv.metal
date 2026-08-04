@@ -265,7 +265,11 @@ template <typename T, int group_size, int bits>
 instantiate_qmv_fast(float32, float, 64, 4)
 instantiate_qmv_fast(float16, half, 64, 4)
 instantiate_qmv_fast(bfloat16, bfloat, 64, 4)
+instantiate_qmv_fast(bfloat16, bfloat, 32, 4)
+instantiate_qmv_fast(bfloat16, bfloat, 128, 4)
 instantiate_qmv_fast(bfloat16, bfloat, 64, 8)
+instantiate_qmv_fast(bfloat16, bfloat, 32, 8)
+instantiate_qmv_fast(bfloat16, bfloat, 128, 8)
 
 #define instantiate_qmv_fast_residual(name, itype, gs, b)                       \
   template [[host_name("affine_qmv_fast_residual_" #name "_gs_" #gs "_b_" #b)]] \
@@ -277,7 +281,11 @@ instantiate_qmv_fast(bfloat16, bfloat, 64, 8)
 instantiate_qmv_fast_residual(float32, float, 64, 4)
 instantiate_qmv_fast_residual(float16, half, 64, 4)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 64, 4)
+instantiate_qmv_fast_residual(bfloat16, bfloat, 32, 4)
+instantiate_qmv_fast_residual(bfloat16, bfloat, 128, 4)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 64, 8)
+instantiate_qmv_fast_residual(bfloat16, bfloat, 32, 8)
+instantiate_qmv_fast_residual(bfloat16, bfloat, 128, 8)
 
 // ── Narrow-K variant (gemma4) ────────────────────────────────────────────────
 // Identical math and identical launch shape; one pack per thread instead of two,
@@ -311,7 +319,11 @@ template <typename T, int group_size, int bits>
 instantiate_qmv_narrow(float32, float, 64, 4)
 instantiate_qmv_narrow(float16, half, 64, 4)
 instantiate_qmv_narrow(bfloat16, bfloat, 64, 4)
+instantiate_qmv_narrow(bfloat16, bfloat, 32, 4)
+instantiate_qmv_narrow(bfloat16, bfloat, 128, 4)
 instantiate_qmv_narrow(bfloat16, bfloat, 64, 8)
+instantiate_qmv_narrow(bfloat16, bfloat, 32, 8)
+instantiate_qmv_narrow(bfloat16, bfloat, 128, 8)
 
 // ── The two 4-bit codecs, as one axis ───────────────────────────────────────
 //
@@ -326,6 +338,12 @@ template <typename T, int BITS>
 struct AffineQ {
   typedef T scale_t;
   MLX_MTL_CONST int bits = BITS;
+  // Fixed, unlike the templated `group_size` of `qmv_fast` and `qmm_t` above.
+  // This codec is only reached by the gpt-oss/routed matvec, and the only
+  // checkpoints that dispatch it are published at 64 -- so a group axis here
+  // would be one nothing on disk can exercise. A routed checkpoint at another
+  // group fails when its pipeline is built, by name, which is where the width
+  // has always failed too.
   MLX_MTL_CONST int group_size = 64;
   MLX_MTL_CONST bool zero_point = true;
   static METAL_FUNC float scale_of(scale_t s) { return float(s); }

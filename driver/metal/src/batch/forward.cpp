@@ -947,14 +947,15 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     std::string load_err;
     if (!load_decode_psos(*ctx_, kernels_dir, psos_, /*with_argmax=*/false, &load_err,
                           fuse_residual_, gdn_prep_, g_.is_moe(),
-                          /*untied=*/!g_.tied_embeddings, g_.quant_bits)) {
+                          /*untied=*/!g_.tied_embeddings, g_.quant_bits,
+                          g_.quant_group_size)) {
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
     }
     if (g_.paged_kv_enabled &&
         !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, /*with_d512=*/false, &load_err,
-                              g_.is_moe(), g_.quant_bits)) {
+                              g_.is_moe(), g_.quant_bits, g_.quant_group_size)) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -2402,6 +2403,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     if (family == model::ModelFamily::Qwen35) {
         std::string gerr;
         if (cfg.quant_bits != 0) geom.quant_bits = cfg.quant_bits;
+        if (cfg.quant_group_size != 0) geom.quant_group_size = cfg.quant_group_size;
         if (!geometry_from_facts(cfg.qwen35, geom, &gerr)) {
             if (err != nullptr) *err = gerr;
             return false;

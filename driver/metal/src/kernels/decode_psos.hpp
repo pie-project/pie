@@ -43,7 +43,11 @@ bool load_decode_psos(RawMetalContext& ctx,
                       /// Every quantized entrypoint here is named with it, so a
                       /// width with no instantiation fails to build a pipeline
                       /// rather than reading the bytes at the wrong stride.
-                      int quant_bits = 4);
+                      int quant_bits = 4,
+                      /// And the group it declares, for the same reason: a
+                      /// g64 pipeline over a g32 checkpoint is not a load
+                      /// error, it is scales applied to the wrong weights.
+                      int quant_group_size = 64);
 
 // ── M>1 multi-batch PSOs (beta, multi-batch lane) ─────────────────────────────
 // The 4 kernel kinds whose M>1 form differs from the M=1 PSO (the rest just grid-widen
@@ -115,6 +119,7 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           /// Compile the mixture's batched projections. Only a
                           /// checkpoint whose geometry has experts runs them.
                           bool routed = false,
-                          int quant_bits = 4);
+                          int quant_bits = 4,
+                          int quant_group_size = 64);
 
 }  // namespace pie::metal
