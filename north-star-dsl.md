@@ -1879,3 +1879,33 @@ this, all three README classes have live numbers: CORRECTION
 3.3-5.0x @ D<=8, STRUCTURAL 1.32-2.25x @ D<=7, and the spatial mask
 merge's constant ~6% co-batch tax (vs the solo regime's +27%).
 Battery: .wiki/tart/bench_lora_scale.py.
+
+## DESIGN (2026-08-04): adapter per-site pairs — the multi-site rung
+
+Recon truth: the ENGINE needs almost nothing — its lora involvement is
+one boolean fact (`declares_lora_sink` -> `launch.lora_program`; the
+canonical-KV rejection already treats ANY sink stage as
+non-canonical). The (A, B) contents flow driver-side through the
+frame's channel machinery. So the rung is:
+
+1. COMPILER: the validator's lora region gate admits MULTIPLE lora
+   sink calls per pass, each `(a, b, site_bits)` — with the v1 rule
+   that the union of site bit-sets across calls is DISJOINT (one pair
+   per site; overlapping sites refuse at validation, not at fire).
+2. DRIVER: the sink parse builds a PER-SITE table —
+   `LoraFireState { per_site: [(site, A, B, R_site, d_out_site)] }` —
+   and the correction applies per consumed site with that site's pair
+   (span-grouped per site; the q+v case stops needing a packed
+   layout). The staging arena grows per-site slots; the exec
+   fingerprint folds the per-site shape vector.
+3. SDK: `ForwardPass::adapter` lifts the one-per-pass restriction to
+   one-per-SITE (each call emits its own sink); the classifier stays.
+4. ORACLE: q+v adapter with distinct shapes (2048/1024 on
+   Qwen3-0.6B), zero-B identity per site, single-site parity with
+   today's path, and the lora-probe "documented next step" note
+   retires.
+
+Sequencing note: land the driver's multi-sink parse FIRST behind the
+existing single-sink behavior (a second sink refuses loudly today —
+verify, then extend), then the validator, then the sdk lift — the
+same driver-first discipline every axis campaign used.
