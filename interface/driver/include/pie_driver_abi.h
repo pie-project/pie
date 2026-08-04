@@ -340,20 +340,50 @@
 #define PIE_STAGE_REQUIRES_LORA (1 << 7)
 
 /**
+ * [`PieStepDesc::region_sig`] bit: the region's members carry
+ * multi-token qo windows (the ragged window class).
+ */
+#define PIE_REGION_SIG_MULTI_TOKEN (1 << 0)
+
+/**
+ * [`PieStepDesc::region_sig`] bit: attention-stage hook programs.
+ */
+#define PIE_REGION_SIG_HOOK (1 << 1)
+
+/**
+ * [`PieStepDesc::region_sig`] bit: a user (custom) attention mask.
+ */
+#define PIE_REGION_SIG_MASK (1 << 2)
+
+/**
+ * [`PieStepDesc::region_sig`] bit: a depth truncation (the region's k
+ * is `region_k`).
+ */
+#define PIE_REGION_SIG_TRUNCATED (1 << 3)
+
+/**
  * [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
  * sentinel. Not zero: zero is a legitimate planned value ("no fast
  * prefix" — an all-hooked step).
  */
-#define PIE_UNMASKED_PREFIX_UNPLANNED PIE_HOOK_FREE_PREFIX_UNPLANNED
 #define PIE_HOOK_FREE_PREFIX_UNPLANNED UINT32_MAX
 
 /**
- * [`PieStepDesc::planned_max_layers`]'s "full model" sentinel.
+ * [`PieStepDesc::planned_unmasked_prefix_rows`]'s "no plan sent"
+ * sentinel (zero is a legitimate planned value: an all-masked step).
+ */
+#define PIE_UNMASKED_PREFIX_UNPLANNED UINT32_MAX
+
+/**
+ * [`PieStepDesc::planned_max_layers`]'s "full model" sentinel (zero is
+ * never a legitimate depth).
  */
 #define PIE_MAX_LAYERS_FULL UINT32_MAX
 
 /**
- * [`PieStepDesc::planned_full_depth_rows`]'s "no depth split" sentinel.
+ * [`PieStepDesc::planned_full_depth_rows`]'s "no depth split" sentinel
+ * (zero would mean an all-truncated composed fire, a legal future
+ * value).
  */
 #define PIE_FULL_DEPTH_UNPLANNED UINT32_MAX
 
@@ -1444,19 +1474,19 @@ typedef struct PieStepDesc {
    */
   uint32_t planned_hook_free_prefix_rows;
   /**
-   * NS-2 (the spatial mask fire): the scheduler-planned count of leading
-   * wire rows whose members carry NO user mask. The seriation nests the
-   * mask key under hooks, so the value is meaningful only for hook-free
-   * steps; [`PIE_UNMASKED_PREFIX_UNPLANNED`] means no plan (hooked or
-   * maskless steps, or a pre-plan engine) and the driver must not split.
+   * NS-2: the scheduler-planned count of leading wire rows whose
+   * members carry NO user mask (meaningful only on hook-free steps;
+   * the seriation nests mask under hooks).
+   * [`PIE_UNMASKED_PREFIX_UNPLANNED`] = no plan; the driver must not
+   * split the attention.
    */
   uint32_t planned_unmasked_prefix_rows;
   /**
    * STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
    * take the head at layer `k` (the layerskip-draft class).
-   * [`PIE_MAX_LAYERS_FULL`] means the full model (every pre-S1 step).
-   * v0 truncated steps are SOLO (the scheduler's blocking rule), so one
-   * per-step word suffices until the depth union.
+   * [`PIE_MAX_LAYERS_FULL`] = the full model (every pre-S1 step). v0
+   * steps carrying a truncation are SOLO (the scheduler's blocking
+   * rule), so one per-step word suffices until the depth union.
    */
   uint32_t planned_max_layers;
   /**
@@ -1466,6 +1496,27 @@ typedef struct PieStepDesc {
    * fire; the driver must not depth-split.
    */
   uint32_t planned_full_depth_rows;
+  /**
+   * V2 rung ③a (north-star-dsl.md "RUNG ③ SPEC"): the region table —
+   * the seriation's output stated ONCE. Region `r` spans wire rows
+   * `[region_row_indptr[r], region_row_indptr[r+1])`;
+   * `region_sig[r]` is the axis bitset ([`PIE_REGION_SIG_MULTI_TOKEN`]
+   * etc.); `region_k[r]` is the depth operand
+   * ([`PIE_MAX_LAYERS_FULL`] = full model). Empty = no table sent
+   * (the words' UNPLANNED discipline). While the scalar words above
+   * survive, the driver DERIVES them from a present table and
+   * refuses the launch on drift — the cross-check discipline.
+   */
+  struct PieU32Slice region_row_indptr;
+  /**
+   * Axis bitset per region (see [`PieStepDesc::region_row_indptr`]).
+   */
+  struct PieU32Slice region_sig;
+  /**
+   * Depth operand per region (see
+   * [`PieStepDesc::region_row_indptr`]).
+   */
+  struct PieU32Slice region_k;
 } PieStepDesc;
 
 /**

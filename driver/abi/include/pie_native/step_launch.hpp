@@ -85,6 +85,12 @@ struct StepLaunch {
     std::uint32_t planned_full_depth_rows = PIE_FULL_DEPTH_UNPLANNED;
     std::uint32_t planned_unmasked_prefix_rows =
         PIE_UNMASKED_PREFIX_UNPLANNED;
+    // V2 rung 3a: the region table (north-star-dsl.md "RUNG 3 SPEC") —
+    // the seriation's output stated once; the planned words above are
+    // its derivations, cross-checked at prepare. Empty = no table.
+    PieU32Slice region_row_indptr;
+    PieU32Slice region_sig;
+    PieU32Slice region_k;
 };
 
 }  // namespace pie_native

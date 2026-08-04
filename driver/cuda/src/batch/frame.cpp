@@ -822,6 +822,74 @@ bool plan_inputs_identical(
            same(a.h_kvpi_forward, b.h_kvpi_forward, a.kvpi_len);
 }
 
+// V2 rung 3a (north-star-dsl.md "RUNG 3 SPEC"): a present region table
+// must DERIVE the planned scalar words — the cross-check discipline
+// (the planned_hook_free precedent): drift refuses the launch, because
+// a wrong table would misroute every region consumer the moment the
+// words die in 3c. The table states FACTS (which members carry an
+// axis); the words state PLANS (which splits the scheduler armed) — so
+// each check runs only when its word is planned, and a table richer
+// than the plan (a declined split whose members still carry the axis)
+// is legal, never drift.
+void verify_region_table(const pie_native::LaunchView& view) {
+    if (view.region_row_indptr.empty()) return;  // no table sent
+    const std::uint32_t* ind = view.region_row_indptr.data();
+    const std::size_t nregions = view.region_row_indptr.size() - 1;
+    if (view.region_sig.size() != nregions ||
+        view.region_k.size() != nregions) {
+        throw std::runtime_error(
+            "region table: parallel slice lengths disagree");
+    }
+    for (std::size_t r = 0; r < nregions; ++r) {
+        if (ind[r + 1] <= ind[r]) {
+            throw std::runtime_error(
+                "region table: bounds not strictly ascending");
+        }
+    }
+    constexpr std::uint32_t kUnplanned = 0xffffffffu;
+    const auto first_row_with = [&](std::uint32_t bit) -> std::uint32_t {
+        for (std::size_t r = 0; r < nregions; ++r) {
+            if (view.region_sig.data()[r] & bit) return ind[r];
+        }
+        return kUnplanned;
+    };
+    const std::uint32_t total = ind[nregions];
+    if (view.planned_hook_free_prefix_rows != kUnplanned) {
+        const std::uint32_t derived = first_row_with(PIE_REGION_SIG_HOOK);
+        const std::uint32_t expect =
+            derived == kUnplanned ? total : derived;
+        if (view.planned_hook_free_prefix_rows != expect) {
+            throw std::runtime_error(
+                "region table drift: hook-free prefix disagrees with "
+                "the planned word");
+        }
+    }
+    if (view.planned_unmasked_prefix_rows != kUnplanned &&
+        view.planned_unmasked_prefix_rows !=
+            first_row_with(PIE_REGION_SIG_MASK)) {
+        throw std::runtime_error(
+            "region table drift: unmasked prefix disagrees with the "
+            "planned word");
+    }
+    if (view.planned_full_depth_rows != kUnplanned &&
+        view.planned_full_depth_rows !=
+            first_row_with(PIE_REGION_SIG_TRUNCATED)) {
+        throw std::runtime_error(
+            "region table drift: full-depth split disagrees with the "
+            "planned word");
+    }
+    if (view.planned_max_layers != kUnplanned) {
+        for (std::size_t r = 0; r < nregions; ++r) {
+            if ((view.region_sig.data()[r] & PIE_REGION_SIG_TRUNCATED) &&
+                view.region_k.data()[r] != view.planned_max_layers) {
+                throw std::runtime_error(
+                    "region table drift: a truncated region's k "
+                    "disagrees with planned_max_layers");
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void prepare_step(
@@ -831,6 +899,7 @@ void prepare_step(
     const PreparedStep* previous) {
     PreparedStep::Impl& s = *step.impl();
     s.view = &view;
+    verify_region_table(view);
     const bool dbg_fire = fire_timing::full();
     s.timing.enabled = dbg_fire;
     s.timing.uncaught = std::uncaught_exceptions();

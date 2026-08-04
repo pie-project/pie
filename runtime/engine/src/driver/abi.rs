@@ -348,6 +348,9 @@ fn step_desc<'a>(
             .max_layers
             .unwrap_or(pie_driver_abi::PIE_MAX_LAYERS_FULL),
         planned_full_depth_rows: step.planned_full_depth_rows,
+        region_row_indptr: u32_slice(&step.region_row_indptr),
+        region_sig: u32_slice(&step.region_sig),
+        region_k: u32_slice(&step.region_k),
     }
 }
 

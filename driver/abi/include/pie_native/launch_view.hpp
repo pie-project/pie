@@ -115,6 +115,11 @@ struct LaunchView {
     std::uint32_t planned_full_depth_rows = PIE_FULL_DEPTH_UNPLANNED;
     std::uint32_t planned_unmasked_prefix_rows =
         PIE_UNMASKED_PREFIX_UNPLANNED;
+    // V2 rung 3a: the region table — regions [indptr[r], indptr[r+1])
+    // in wire rows, axis bitset PIE_REGION_SIG_*, depth operand k.
+    Slice<std::uint32_t> region_row_indptr;
+    Slice<std::uint32_t> region_sig;
+    Slice<std::uint32_t> region_k;
     // The batch carries a GUEST-supplied custom mask (vs engine-synthesized
     // causal BRLE rows, which accompany every wire prefill and are safely
     // dropped when a composed batch runs the standard causal path).

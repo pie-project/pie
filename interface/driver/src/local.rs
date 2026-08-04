@@ -1208,7 +1208,36 @@ pub struct PieStepDesc {
     /// `planned_max_layers`). [`PIE_FULL_DEPTH_UNPLANNED`] = a uniform
     /// fire; the driver must not depth-split.
     pub planned_full_depth_rows: u32,
+    /// V2 rung ③a (north-star-dsl.md "RUNG ③ SPEC"): the region table —
+    /// the seriation's output stated ONCE. Region `r` spans wire rows
+    /// `[region_row_indptr[r], region_row_indptr[r+1])`;
+    /// `region_sig[r]` is the axis bitset ([`PIE_REGION_SIG_MULTI_TOKEN`]
+    /// etc.); `region_k[r]` is the depth operand
+    /// ([`PIE_MAX_LAYERS_FULL`] = full model). Empty = no table sent
+    /// (the words' UNPLANNED discipline). While the scalar words above
+    /// survive, the driver DERIVES them from a present table and
+    /// refuses the launch on drift — the cross-check discipline.
+    pub region_row_indptr: PieU32Slice,
+    /// Axis bitset per region (see [`PieStepDesc::region_row_indptr`]).
+    pub region_sig: PieU32Slice,
+    /// Depth operand per region (see
+    /// [`PieStepDesc::region_row_indptr`]).
+    pub region_k: PieU32Slice,
 }
+
+/// [`PieStepDesc::region_sig`] bit: the region's members carry
+/// multi-token qo windows (the ragged window class).
+pub const PIE_REGION_SIG_MULTI_TOKEN: u32 = 1 << 0;
+
+/// [`PieStepDesc::region_sig`] bit: attention-stage hook programs.
+pub const PIE_REGION_SIG_HOOK: u32 = 1 << 1;
+
+/// [`PieStepDesc::region_sig`] bit: a user (custom) attention mask.
+pub const PIE_REGION_SIG_MASK: u32 = 1 << 2;
+
+/// [`PieStepDesc::region_sig`] bit: a depth truncation (the region's k
+/// is `region_k`).
+pub const PIE_REGION_SIG_TRUNCATED: u32 = 1 << 3;
 
 /// [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
 /// sentinel. Not zero: zero is a legitimate planned value ("no fast
@@ -1286,6 +1315,9 @@ impl Default for PieStepDesc {
             planned_unmasked_prefix_rows: PIE_UNMASKED_PREFIX_UNPLANNED,
             planned_max_layers: PIE_MAX_LAYERS_FULL,
             planned_full_depth_rows: PIE_FULL_DEPTH_UNPLANNED,
+            region_row_indptr: PieU32Slice::default(),
+            region_sig: PieU32Slice::default(),
+            region_k: PieU32Slice::default(),
         }
     }
 }

@@ -268,7 +268,10 @@ fn contract_source() -> String {
         planned_hook_free_prefix_rows,
         planned_unmasked_prefix_rows,
         planned_max_layers,
-        planned_full_depth_rows
+        planned_full_depth_rows,
+        region_row_indptr,
+        region_sig,
+        region_k
     );
     contract!(out, PieStepDescSlice, ptr, len);
     contract!(

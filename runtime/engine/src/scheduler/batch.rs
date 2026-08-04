@@ -179,6 +179,56 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
     split as u32
 }
 
+/// V2 rung ③a (north-star-dsl.md "RUNG ③ SPEC"): the region table —
+/// the seriation's output stated ONCE, from which the planned scalar
+/// words become derivations. Regions are maximal runs of members
+/// sharing an axis signature (`PIE_REGION_SIG_*`: multi_token, hook,
+/// mask, truncated — exactly the seriation's vocabulary) and a depth
+/// operand k; boundaries are WIRE rows through the attribution CSR.
+/// Declined (empty) when the step carries no attribution to convert
+/// through, or when any member owns zero wire rows (a device-geometry
+/// placeholder — its facts occupy no rows, so a table would state
+/// regions the row scan can't confirm): the words' UNPLANNED
+/// discipline, table-shaped.
+fn planned_region_table(
+    ordered: &[Box<PendingRequest>],
+    row_indptr: &[u32],
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    if row_indptr.len() != ordered.len() + 1
+        || row_indptr.windows(2).any(|w| w[1] <= w[0])
+    {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let mut indptr: Vec<u32> = vec![row_indptr[0]];
+    let mut sigs: Vec<u32> = Vec::new();
+    let mut ks: Vec<u32> = Vec::new();
+    for (member, req) in ordered.iter().enumerate() {
+        let sig = u32::from(
+            req.request
+                .qo_indptr
+                .windows(2)
+                .any(|w| w[1] - w[0] > 1),
+        ) * pie_driver_abi::PIE_REGION_SIG_MULTI_TOKEN
+            | u32::from(req.hook_program) * pie_driver_abi::PIE_REGION_SIG_HOOK
+            | u32::from(req.request.has_user_mask) * pie_driver_abi::PIE_REGION_SIG_MASK
+            | u32::from(req.request.max_layers.is_some())
+                * pie_driver_abi::PIE_REGION_SIG_TRUNCATED;
+        let k = req
+            .request
+            .max_layers
+            .unwrap_or(pie_driver_abi::PIE_MAX_LAYERS_FULL);
+        let end = row_indptr[member + 1];
+        if sigs.last() == Some(&sig) && ks.last() == Some(&k) {
+            *indptr.last_mut().expect("indptr starts nonempty") = end;
+        } else {
+            sigs.push(sig);
+            ks.push(k);
+            indptr.push(end);
+        }
+    }
+    (indptr, sigs, ks)
+}
+
 /// The depth union's arm switch — DEFAULT ON (`PIE_DEPTH_UNION=0`
 /// disarms and restores the S-1 solo rule). The union oracle and the
 /// wide battery (R=4, mixed-k decline, all-truncated control) passed
@@ -687,6 +737,8 @@ pub(crate) fn build_frame_submission(
                 merged_plan.max_layers = Some(k);
             }
         }
+        let (region_row_indptr, region_sig, region_k) =
+            planned_region_table(&group, &build.program_row_indptr);
         steps.push(StepSubmission {
             plan: merged_plan,
             roster_rows,
@@ -697,6 +749,9 @@ pub(crate) fn build_frame_submission(
             planned_hook_free_prefix_rows,
             planned_unmasked_prefix_rows,
             planned_full_depth_rows,
+            region_row_indptr,
+            region_sig,
+            region_k,
             logical_fire_ids: build.logical_fire_ids,
             channel_expected_head: build.channel_expected_head,
             channel_expected_tail: build.channel_expected_tail,
