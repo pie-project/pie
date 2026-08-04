@@ -2331,3 +2331,19 @@ seam. Staged honestly, like Gray:
   fragments that still refuse contiguity.
 - WHAT IS IN THE TREE ALREADY: the kernels, the seriation sentinel,
   and this design note binding the three.
+
+## THE SCALE TABLE COMPLETES (2026-08-04): 14B, R=32 — 5.8x
+
+With a 15s post-boot settle (the register-death reproduces only in
+the immediate post-boot window — refiled as a boot-window artifact,
+root cause an open observation), the 14B four-axis product A/B lands:
+
+  model/shape        composed   solo      x
+  0.6B, 5 lanes      1.06s      1.29s     1.18
+  7B,   R=16         4.9s       17.9s     3.66
+  7B,   R=32         5.2s       30.4s     5.9
+  14B,  R=32         10.3s      59.4s     5.8
+
+The composition claim is now measured at three model scales and holds
+its ~6x at both 7B and 14B (both firmly weight-bound at R=32) — the
+review's decisive gap is closed at every scale this hardware serves.
