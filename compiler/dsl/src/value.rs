@@ -34,9 +34,29 @@ impl Tensor {
 
     /// A trace-known constant value. Accepts a scalar
     /// (`Tensor::constant(-1i32)`) or an array (`Tensor::constant([0u32, 1])`).
-    /// A body constant materializes to `Const` (scalar), `Broadcast` (uniform
-    /// vector), or `Iota`/affine (a sequence) — the closed op set has no general
-    /// vector-const op (small consts fold to immediates).
+    ///
+    /// The op set carries constants as *scalars*: `const` holds one
+    /// [`Literal`] and nothing else. So the tensor constants that lower are
+    /// exactly the ones a scalar plus one op can spell — a uniform tensor
+    /// (`broadcast`), and a `u32` affine ramp `a + b*i` (`iota`, then the
+    /// arithmetic). Anything else — a per-token logit bias, a banned-token
+    /// set, a sampling schedule — is *bulk data*, and bulk data lives in a
+    /// channel:
+    ///
+    /// ```ignore
+    /// let bias = Channel::from(vec![0.0f32, -3.5, 0.0, 12.25]).named("bias");
+    /// // ... in a stage body:
+    /// let logits = logits + bias.read();
+    /// ```
+    ///
+    /// That is not a workaround for a missing op. The op stream is a stream of
+    /// fixed-size records — it is what lets a backend emit a kernel from an op
+    /// tag alone — and a buffer of arbitrary bytes is not a record. A channel
+    /// is this system's name for a buffer the device reads, so a constant
+    /// tensor is a channel that is seeded once and never written again.
+    ///
+    /// Passing anything else here records a trace error naming the shape and
+    /// pointing at the channel.
     pub fn constant(v: impl IntoConst) -> Tensor {
         Tensor {
             inner: TensorInner::Const(v.into_const()),
@@ -350,9 +370,13 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
     }
     let poisoned = poison_id(
         alloc::format!(
-            "general vector constant {vals:?} (dtype {:?}) is not representable in the closed \
-             op set; use iota/broadcast, an arithmetic expression, or feed it through a channel",
-            c.dtype
+            "a {:?} constant of shape {:?} is bulk data, and the op set carries constants as \
+             scalars: `const` holds one literal, so only a uniform tensor (broadcast) and a u32 \
+             affine ramp a+b*i (iota) are reachable from it. Seed a channel with the values and \
+             read it in the body — `Channel::from(values)` — or build the tensor from an \
+             arithmetic expression",
+            c.dtype,
+            c.shape
         ),
         ty,
     );
@@ -579,7 +603,17 @@ pub fn log(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Log, |t| t)
 }
 /// `x` converted elementwise to dtype `to`, shape preserved.
+///
+/// A cast to the dtype `x` already has is the identity, and returns `x`
+/// unchanged rather than emitting an op. Worth doing here rather than asking
+/// authors not to write it: a cast is often applied to a value whose dtype
+/// depends on which branch produced it, and "cast it and let the trace decide"
+/// should not cost a device op when the answer is "nothing to do".
 pub fn cast(x: impl AsTensor, to: DType) -> Tensor {
+    let x = Tensor::from_arg(x.to_arg());
+    if x.dtype() == to {
+        return x;
+    }
     emit_unary(
         &x,
         move |id| Op::Cast {
@@ -916,11 +950,14 @@ pub fn reduce_argmax(x: impl AsTensor) -> Tensor {
         ValueType::new(reduce_shape(t.shape), DType::I32)
     })
 }
-/// Inclusive prefix sum along the last axis; `F32` only, shape preserved.
+/// Inclusive prefix sum along the last axis; numeric, shape and dtype
+/// preserved. Integer lanes scan in their own dtype and wrap on overflow, so
+/// a `u32` offset scan stays exact past 2^24.
 pub fn cumsum(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumSum, |t| t)
 }
-/// Inclusive prefix product along the last axis; `F32` only, shape preserved.
+/// Inclusive prefix product along the last axis; numeric, shape and dtype
+/// preserved. Integer lanes wrap on overflow.
 pub fn cumprod(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumProd, |t| t)
 }

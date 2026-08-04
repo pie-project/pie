@@ -55,7 +55,7 @@ pub use validate::validate_singleton_plan;
 
 /// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes, so the
 /// driver's pipeline cache keys on it.
-pub const METAL_M1_EMITTER_VERSION: u16 = 35;
+pub const METAL_M1_EMITTER_VERSION: u16 = 36;
 
 /// `kMetalM1MaxChannels` — the single-lane readiness/commit kernels bind one
 /// `words_N` buffer per channel starting at buffer 2, and Metal's highest

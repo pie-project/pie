@@ -1,8 +1,10 @@
 # oracle dump: pie_cuda_driver::pipeline::generated::emit_fused_region_cuda_verbatim
 # source of truth: compiler/codegen/src/cuda/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 20
+# emitter_version: 21
 # @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
 # cases: 36
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: cumsum/cumprod widened from F32-only to every numeric dtype; the m1 runtime's scan block now branches on the operand dtype instead of loading every lane through m1_load_f. The oracle dumps change only because that block is embedded verbatim in every emitted source -- no emitted structure moved, and the f32 path is byte-for-byte the arithmetic the oracle recorded.
 === beam_epilogue#0 singleton#0
 entry_name: ptir_fused_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -10,7 +12,7 @@ ok: true
 error: 
 entry_name: ptir_fused_b4fadd8446eb58dd_r0
 op_tag: 0x00
-source: bytes=87547 prefix=@runtime tail_bytes=42270
+source: bytes=88505 prefix=@runtime tail_bytes=42270
 
 
 struct PtirLaneTableHeader {
@@ -1208,7 +1210,7 @@ ok: true
 error: 
 entry_name: ptir_fused_b4fadd8446eb58dd_r0
 op_tag: 0x00
-source: bytes=91419 prefix=@runtime tail_bytes=46142
+source: bytes=92377 prefix=@runtime tail_bytes=46142
 
 
 struct PtirLaneTableHeader {
@@ -2532,7 +2534,7 @@ ok: true
 error: 
 entry_name: ptir_fused_f4e949004f50e90e_r0
 op_tag: 0x00
-source: bytes=87547 prefix=@runtime tail_bytes=42270
+source: bytes=88505 prefix=@runtime tail_bytes=42270
 
 
 struct PtirLaneTableHeader {
@@ -3730,7 +3732,7 @@ ok: true
 error: 
 entry_name: ptir_fused_f4e949004f50e90e_r0
 op_tag: 0x00
-source: bytes=92629 prefix=@runtime tail_bytes=47352
+source: bytes=93587 prefix=@runtime tail_bytes=47352
 
 
 struct PtirLaneTableHeader {
@@ -5040,7 +5042,7 @@ ok: true
 error: 
 entry_name: ptir_fused_4f4b856e5ef3e8b4_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -6240,7 +6242,7 @@ ok: true
 error: 
 entry_name: ptir_fused_4f4b856e5ef3e8b4_r0
 op_tag: 0x00
-source: bytes=96788 prefix=@runtime tail_bytes=51511
+source: bytes=97746 prefix=@runtime tail_bytes=51511
 
 
 struct PtirLaneTableHeader {
@@ -7667,7 +7669,7 @@ ok: true
 error: 
 entry_name: ptir_fused_d01f407b22863878_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -8867,7 +8869,7 @@ ok: true
 error: 
 entry_name: ptir_fused_d01f407b22863878_r0
 op_tag: 0x00
-source: bytes=89699 prefix=@runtime tail_bytes=44422
+source: bytes=90657 prefix=@runtime tail_bytes=44422
 
 
 struct PtirLaneTableHeader {
@@ -10110,7 +10112,7 @@ ok: true
 error: 
 entry_name: ptir_fused_f2566cc0c1e0529a_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -11310,7 +11312,7 @@ ok: true
 error: 
 entry_name: ptir_fused_f2566cc0c1e0529a_r0
 op_tag: 0x00
-source: bytes=91722 prefix=@runtime tail_bytes=46445
+source: bytes=92680 prefix=@runtime tail_bytes=46445
 
 
 struct PtirLaneTableHeader {
@@ -12598,7 +12600,7 @@ ok: true
 error: 
 entry_name: ptir_fused_6612fe00a51d7edc_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -13798,7 +13800,7 @@ ok: true
 error: 
 entry_name: ptir_fused_6612fe00a51d7edc_r0
 op_tag: 0x00
-source: bytes=90897 prefix=@runtime tail_bytes=45620
+source: bytes=91855 prefix=@runtime tail_bytes=45620
 
 
 struct PtirLaneTableHeader {
@@ -15077,7 +15079,7 @@ ok: true
 error: 
 entry_name: ptir_fused_101abcfb79b08b89_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -16277,7 +16279,7 @@ ok: true
 error: 
 entry_name: ptir_fused_101abcfb79b08b89_r0
 op_tag: 0x00
-source: bytes=91441 prefix=@runtime tail_bytes=46164
+source: bytes=92399 prefix=@runtime tail_bytes=46164
 
 
 struct PtirLaneTableHeader {
@@ -17569,7 +17571,7 @@ ok: true
 error: 
 entry_name: ptir_fused_963137d4ffed0445_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -18769,7 +18771,7 @@ ok: true
 error: 
 entry_name: ptir_fused_963137d4ffed0445_r0
 op_tag: 0x00
-source: bytes=93029 prefix=@runtime tail_bytes=47752
+source: bytes=93987 prefix=@runtime tail_bytes=47752
 
 
 struct PtirLaneTableHeader {
@@ -20118,7 +20120,7 @@ ok: true
 error: 
 entry_name: ptir_fused_82921040f7bc2612_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -21318,7 +21320,7 @@ ok: true
 error: 
 entry_name: ptir_fused_82921040f7bc2612_r0
 op_tag: 0x00
-source: bytes=88691 prefix=@runtime tail_bytes=43414
+source: bytes=89649 prefix=@runtime tail_bytes=43414
 
 
 struct PtirLaneTableHeader {
@@ -22544,7 +22546,7 @@ ok: true
 error: 
 entry_name: ptir_fused_14f667a41eb30669_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -23744,7 +23746,7 @@ ok: true
 error: 
 entry_name: ptir_fused_14f667a41eb30669_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -24944,7 +24946,7 @@ ok: true
 error: 
 entry_name: ptir_fused_dff3bc6795a9dcdf_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -26144,7 +26146,7 @@ ok: true
 error: 
 entry_name: ptir_fused_dff3bc6795a9dcdf_r0
 op_tag: 0x00
-source: bytes=97797 prefix=@runtime tail_bytes=52520
+source: bytes=98755 prefix=@runtime tail_bytes=52520
 
 
 struct PtirLaneTableHeader {
@@ -27658,7 +27660,7 @@ ok: true
 error: 
 entry_name: ptir_fused_09a2719886970a85_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -28858,7 +28860,7 @@ ok: true
 error: 
 entry_name: ptir_fused_09a2719886970a85_r0
 op_tag: 0x00
-source: bytes=95512 prefix=@runtime tail_bytes=50235
+source: bytes=96470 prefix=@runtime tail_bytes=50235
 
 
 struct PtirLaneTableHeader {
@@ -30260,7 +30262,7 @@ ok: true
 error: 
 entry_name: ptir_fused_4cf3882bf2fff913_r0
 op_tag: 0x00
-source: bytes=87627 prefix=@runtime tail_bytes=42350
+source: bytes=88585 prefix=@runtime tail_bytes=42350
 
 
 struct PtirLaneTableHeader {
@@ -31460,7 +31462,7 @@ ok: true
 error: 
 entry_name: ptir_fused_4cf3882bf2fff913_r0
 op_tag: 0x00
-source: bytes=100881 prefix=@runtime tail_bytes=55604
+source: bytes=101839 prefix=@runtime tail_bytes=55604
 
 
 struct PtirLaneTableHeader {
@@ -32973,7 +32975,7 @@ ok: true
 error: 
 entry_name: ptir_fused_1752e0dfb0bf5827_r0
 op_tag: 0x00
-source: bytes=87547 prefix=@runtime tail_bytes=42270
+source: bytes=88505 prefix=@runtime tail_bytes=42270
 
 
 struct PtirLaneTableHeader {
@@ -34171,7 +34173,7 @@ ok: true
 error: 
 entry_name: ptir_fused_1752e0dfb0bf5827_r0
 op_tag: 0x00
-source: bytes=103762 prefix=@runtime tail_bytes=58485
+source: bytes=104720 prefix=@runtime tail_bytes=58485
 
 
 struct PtirLaneTableHeader {
@@ -35775,7 +35777,7 @@ ok: true
 error: 
 entry_name: ptir_fused_dc132d209d85d958_r0
 op_tag: 0x00
-source: bytes=87547 prefix=@runtime tail_bytes=42270
+source: bytes=88505 prefix=@runtime tail_bytes=42270
 
 
 struct PtirLaneTableHeader {
@@ -36973,7 +36975,7 @@ ok: true
 error: 
 entry_name: ptir_fused_dc132d209d85d958_r0
 op_tag: 0x00
-source: bytes=87547 prefix=@runtime tail_bytes=42270
+source: bytes=88505 prefix=@runtime tail_bytes=42270
 
 
 struct PtirLaneTableHeader {
@@ -38171,7 +38173,7 @@ ok: true
 error: 
 entry_name: ptir_fused_92d86f95b487e729_r0
 op_tag: 0x00
-source: bytes=87547 prefix=@runtime tail_bytes=42270
+source: bytes=88505 prefix=@runtime tail_bytes=42270
 
 
 struct PtirLaneTableHeader {
@@ -39369,7 +39371,7 @@ ok: true
 error: 
 entry_name: ptir_fused_92d86f95b487e729_r0
 op_tag: 0x00
-source: bytes=88079 prefix=@runtime tail_bytes=42802
+source: bytes=89037 prefix=@runtime tail_bytes=42802
 
 
 struct PtirLaneTableHeader {
@@ -40580,7 +40582,7 @@ ok: true
 error: 
 entry_name: ptir_fused_9eda8aa42400c4c2_r0
 op_tag: 0x00
-source: bytes=87690 prefix=@runtime tail_bytes=42413
+source: bytes=88648 prefix=@runtime tail_bytes=42413
 
 
 struct PtirLaneTableHeader {
@@ -41780,7 +41782,7 @@ ok: true
 error: 
 entry_name: ptir_fused_9eda8aa42400c4c2_r0
 op_tag: 0x00
-source: bytes=90931 prefix=@runtime tail_bytes=45654
+source: bytes=91889 prefix=@runtime tail_bytes=45654
 
 
 struct PtirLaneTableHeader {
@@ -43060,7 +43062,7 @@ ok: true
 error: 
 entry_name: ptir_fused_a297c60f7a5de47e_r0
 op_tag: 0x00
-source: bytes=87547 prefix=@runtime tail_bytes=42270
+source: bytes=88505 prefix=@runtime tail_bytes=42270
 
 
 struct PtirLaneTableHeader {
@@ -44258,7 +44260,7 @@ ok: true
 error: 
 entry_name: ptir_fused_a297c60f7a5de47e_r0
 op_tag: 0x00
-source: bytes=87547 prefix=@runtime tail_bytes=42270
+source: bytes=88505 prefix=@runtime tail_bytes=42270
 
 
 struct PtirLaneTableHeader {

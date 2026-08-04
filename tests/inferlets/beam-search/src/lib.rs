@@ -334,7 +334,7 @@ macro_rules! define_beam_search {
             out.put(&tok_i);
             out_par.put(&parent);
             out_scr.put(&s);
-            out_greedy.put(&reshape(cast(reduce_argmax(&logits), dtype::i32), [B]));
+            out_greedy.put(&reshape(reduce_argmax(&logits), [B]));
             pool_ids_ch.put(&pids);
         });
 
