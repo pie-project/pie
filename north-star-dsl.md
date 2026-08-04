@@ -2013,3 +2013,21 @@ determinism, the solo oracle BYTE-EQUAL to the pre-campaign reference
 five-lane product battery green with 40 four-axis fires, 0
 panics/illegal. The axis-composition campaign is stable at release on
 the default path.
+
+## THE PRODUCT, PRICED (2026-08-04): the four-axis regime vs solo
+
+Release, warm rounds, the five-lane product workload (plain + snapkv
++ lora + masked + draft, 128 tok/lane):
+
+  composed (default) . 1.06s/round
+  solo regime        . 1.29s/round   (PIE_SPATIAL_MASK=0 +
+                                      PIE_DEPTH_UNION=0 — masked and
+                                      truncated lanes solo-fire)
+  -> 1.22x on the five-lane mix
+
+Modest by design at this shape: only two of five lanes leave the
+co-batch in the solo regime, and the hook x lora pair composed in
+both. The win compounds with lane counts exactly as the per-axis
+numbers measured (mask const-6%-tax vs +27%, depth 1.32-2.25x,
+correction 3.3-5.0x); the product battery's value is that ALL of it
+now happens in ONE fire. bench_product.py in the wiki.
