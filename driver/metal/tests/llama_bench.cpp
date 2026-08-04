@@ -422,7 +422,16 @@ int main(int argc, char** argv) {
     // An arbitrary but fixed token stream. What is being timed is arithmetic on
     // weights, and that cost does not depend on which tokens they are.
     std::vector<std::uint32_t> prompt;
-    for (int i = 0; i < n_prompt; ++i) prompt.push_back(std::uint32_t((i * 137 + 11) % 100000));
+    // The real sentence, repeated to length. This used to be `(i*137+11) %
+    // 100000` -- ids that spell nothing -- and that left the logits nearly flat,
+    // so the greedy argmax was a coin flip and any comparison of two token
+    // streams was unfalsifiable: the fleet check below read "agrees for 1 of 64
+    // steps" on a driver that was perfectly correct. These kernels' timing is
+    // data-independent (fixed loop bounds, no early exit), so the change costs
+    // the comparison against mlx-lm nothing and buys the check its teeth.
+    while (int(prompt.size()) < n_prompt)
+        prompt.insert(prompt.end(), kGatePrompt.begin(), kGatePrompt.end());
+    prompt.resize(std::size_t(n_prompt));
 
     // ── does it compute the right thing at all? ──
     //
@@ -955,6 +964,7 @@ int main(int argc, char** argv) {
             }
         }
         if (!bad) {
+            std::vector<int> fleet_diverged(nf, -1);
             const double t3 = now_s();
             for (int step = 0; step < n_decode && !bad; ++step) {
                 std::vector<MemberForwardDesc> descs;
@@ -964,6 +974,7 @@ int main(int argc, char** argv) {
                                              exec.rs_slots()));
                 }
                 std::vector<LogitsOut> outs(nf);
+                int first_tok = -1;
                 std::vector<std::uint8_t> ok(nf, 0);
                 std::vector<std::string> errs(nf);
                 exec.forward_batch(descs, outs, ok, errs);
@@ -975,6 +986,35 @@ int main(int argc, char** argv) {
                     }
                     Seq& m = fleet[std::size_t(i)];
                     const int t = argmax_of(outs[std::size_t(i)], 0);
+                    // Members are identical sequences in ONE fire through ONE
+                    // kernel, so they are not merely close -- they are the same
+                    // arithmetic and must agree exactly. This catches a fire
+                    // that mixes rows up between members, which comparing each
+                    // member to a differently-shaped reference cannot.
+                    if (i == 0) {
+                        first_tok = t;
+                    } else if (t != first_tok) {
+                        std::printf("  FAIL  members of one fire disagree at step %d: "
+                                    "member %d says %d, member 0 says %d\n",
+                                    step, i, t, first_tok);
+                        bad = true;
+                        break;
+                    }
+                    // Every member was given the SAME prompt, so the fleet is n
+                    // copies of the sequence the latency loop above already
+                    // decoded alone. That makes the fleet's tokens checkable
+                    // for free against a reference this file already holds --
+                    // and a throughput number off a wrong forward is not a
+                    // throughput number. The batched GEMM is a different kernel
+                    // than the batch-1 GEMV so the two are not bit-identical
+                    // and a late greedy flip on near-tied logits is fair; a
+                    // member that leaves the reference in the first few steps
+                    // is not.
+                    const std::size_t ref = std::size_t(n_prompt + 1 + step);
+                    if (ref < s.tokens.size() && fleet_diverged[std::size_t(i)] < 0 &&
+                        std::uint32_t(t) != s.tokens[ref]) {
+                        fleet_diverged[std::size_t(i)] = step;
+                    }
                     m.next_position += 1;
                     if (m.next_position < m.tokens.size()) m.tokens[m.next_position] = std::uint32_t(t);
                 }
@@ -982,6 +1022,21 @@ int main(int argc, char** argv) {
             if (!bad) {
                 const double tput_s = now_s() - t3;
                 tput_tps = double(n_decode) * double(n_seqs) / tput_s;
+                int worst = n_decode;
+                for (int i = 0; i < n_seqs; ++i) {
+                    const int d = fleet_diverged[std::size_t(i)];
+                    if (d >= 0 && d < worst) worst = d;
+                }
+                // A fleet member that never matches the reference is a broken
+                // forward, not a rounding difference.
+                if (worst == 0) {
+                    std::printf("  FAIL  the fleet decodes a different token than the "
+                                "same prompt does alone, from its very first step\n");
+                    bad = true;
+                } else {
+                    std::printf("  PASS  fleet agrees with the single-sequence decode for "
+                                "%d of %d steps\n", worst, n_decode);
+                }
             }
         }
         if (bad) return 1;
