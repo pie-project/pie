@@ -182,6 +182,18 @@ impl M {
         self.lower.as_ref().map(|(c, class)| (c, *class))
     }
 
+    /// V2 rung ②: the body STATES the depth axis (with its deployment
+    /// gate beside it, like the mask peel's) instead of a caller
+    /// painting roles on after the trace. Must precede the layer loop;
+    /// recording assigns each layer-tagged op's [`DepthRole`] — the
+    /// flashinfer decode dispatch swaps to the depth prefix plan on
+    /// union tail layers, everything else windows.
+    ///
+    /// [`DepthRole`]: crate::trace::DepthRole
+    pub fn depth_window(&self) {
+        self.t.with(None, |b| b.declare_depth_window());
+    }
+
     pub fn embed(&self) -> Val {
         let id = self.t.with(None, |b| b.embed("embed", self.f.hidden));
         Val {

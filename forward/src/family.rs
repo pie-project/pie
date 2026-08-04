@@ -57,37 +57,7 @@ pub fn llama_like_cuda(
     cuda: &LlamaLikeCudaFacts,
     class: FireClass,
 ) -> ForwardPlan {
-    let mut plan = llama_like_text(facts, Some((cuda, class)));
-    // STRUCTURAL S-3: the lowered Decode class states the depth axis
-    // (see [`ForwardPlan::depth_window`]) exactly where its body can
-    // honour it — the same deployment gate as the mask peel's.
-    plan.depth_window = class == FireClass::Decode
-        && !cuda.xqa_decode
-        && !cuda.head_dim_padded;
-    if plan.depth_window {
-        // PROMOTED (the review's depth-IR gap): each op's role under
-        // the axis is stated as serialized vocabulary the goldens pin.
-        // Layer-tagged ops are Windowed; the flashinfer decode dispatch
-        // additionally swaps to the depth prefix plan on union tail
-        // layers.
-        for op in &mut plan.ops {
-            if op.layer.is_none() {
-                continue;
-            }
-            op.depth_role = Some(
-                match &op.kind {
-                    crate::trace::OpKind::Launch { kernel, .. }
-                        if kernel
-                            == "dispatch_attention_flashinfer_decode" =>
-                    {
-                        crate::trace::DepthRole::PrefixPlanSwap
-                    }
-                    _ => crate::trace::DepthRole::Windowed,
-                },
-            );
-        }
-    }
-    plan
+    llama_like_text(facts, Some((cuda, class)))
 }
 
 /// THE one llama_like text (north-star-dsl.md): computation and kernel
@@ -112,6 +82,17 @@ fn llama_like_text(
                 .filter(|(_, class)| *class == class_want)
                 .map(|(c, _)| c)
         };
+
+        // STRUCTURAL S-3, stated IN THE BODY (V2 rung ②; formerly the
+        // post-trace paint-over the review named): the lowered Decode
+        // class declares the depth axis exactly where its body can
+        // honour it — the same deployment gate as the mask peel's.
+        // Recording assigns each layer-tagged op's role from here on.
+        if cuda_of(FireClass::Decode)
+            .is_some_and(|c| !c.xqa_decode && !c.head_dim_padded)
+        {
+            m.depth_window();
+        }
 
         // The fused decode-QKV arm's predicate: the model-fact terms
         // here, the load-time backend terms on the facts struct — term
