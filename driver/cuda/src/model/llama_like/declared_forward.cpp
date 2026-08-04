@@ -1217,16 +1217,16 @@ void llama_like_forward_declared(
                 if (mask_region == MaskRegion::Prefix) {
                     // The UnmaskedPrefix peel's prefix region (NS-4 in
                     // the IR): the plain rows `[0, split)` against the
-                    // recursively-prepared prefix decode plan — RAW
-                    // CSR base addressing, no hook page views (the
-                    // engine plans UNPLANNED for hooked fires, so a
-                    // planned split never composes with the sideband
-                    // brackets).
+                    // recursively-prepared prefix decode plan. AC-4:
+                    // hooked lanes ride this prefix, so the dispatch
+                    // consumes the ATTN page views (hook-narrowed when
+                    // sites ran; aliases of the raw CSRs otherwise).
+                    resolve_masked_pages(/*takes_paged_decode=*/true);
                     ops::dispatch_attention_flashinfer_decode(
                         *decode_plan,
                         attn_q, kv_view, attn_out_buf,
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, sm_scale_override);
                     break;

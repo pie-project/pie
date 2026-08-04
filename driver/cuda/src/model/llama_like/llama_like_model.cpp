@@ -121,11 +121,6 @@ void LlamaLikeModel::body(Workspace& ws,
         (!in.has_write_desc ||
          (in.w_page_d != nullptr && in.w_off_d != nullptr)) &&
         in.runtime_window_left == -2 &&
-        // AC-4 v0: a hooked SPATIAL fire keeps the hand-written body
-        // (the declared spatial branch does not consult the hook page
-        // views yet — its recorded rung).
-        !(in.unmasked_prefix_rows != 0xffffffffu &&
-          in.stage_hooks != nullptr) &&
         // STRUCTURAL S-4: truncated fires walk the declared trace when
         // the DECLARATION states the depth axis for the fire's shape
         // (pure-decode only; a truncated lane's prefill keeps the
