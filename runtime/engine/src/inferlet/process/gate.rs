@@ -50,17 +50,8 @@ pub(crate) async fn residency_gate(ctx: &mut ProcessCtx) -> Result<()> {
 }
 
 /// Finalize every pending pipeline op of this process, in submit order.
-///
-/// Both callers are eviction paths (the non-resident residency gate and the
-/// planner's Yield back-off), so the continuation-wave cancel sweep runs
-/// first: undispatched synthetic continuations are unwound instead of riding
-/// the next wave, which is what keeps the victim's lease quiescence inside
-/// the CURRENT wave (continuation-waves.md rule 5 / S3).
 pub(crate) async fn drain_pending_fires(ctx: &mut ProcessCtx) -> Result<()> {
     let pipelines = ctx.residency_pipelines();
-    for fires in &pipelines {
-        crate::pipeline::fire::cancel_synthetic_tail(ctx, fires).await?;
-    }
     for fires in pipelines {
         crate::pipeline::fire::finalize_all(ctx, &fires, false).await?;
     }

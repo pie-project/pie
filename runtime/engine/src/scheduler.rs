@@ -636,41 +636,6 @@ pub(crate) fn cont_qdepth_set(pid: ProcessId, depth: i64) {
 
 pub(crate) fn cont_qdepth_forget(pid: ProcessId) {
     cont_qdepth_map().lock().unwrap().remove(&pid);
-    cont_cancel_debt_map().lock().unwrap().remove(&pid);
-}
-
-/// Continuation frames the eviction cancel unwound, per process: the guest's
-/// delivered-ahead credit (`Pipeline::cont_credit`) still counts them, so the
-/// fire path drains this debt into the credit at its next call — before the
-/// absorb decision — which restores the exact tail-of-promise-queue
-/// arithmetic (cancelled frames are always the newest emissions; the guest
-/// resubmits oldest-first).
-fn cont_cancel_debt_map()
--> &'static std::sync::Mutex<std::collections::HashMap<ProcessId, Arc<std::sync::atomic::AtomicU64>>>
-{
-    static MAP: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<ProcessId, Arc<std::sync::atomic::AtomicU64>>>,
-    > = OnceLock::new();
-    MAP.get_or_init(Default::default)
-}
-
-pub(crate) fn cont_cancel_debt_add(pid: ProcessId, frames: u64) {
-    if frames == 0 {
-        return;
-    }
-    cont_cancel_debt_map()
-        .lock()
-        .unwrap()
-        .entry(pid)
-        .or_default()
-        .fetch_add(frames, std::sync::atomic::Ordering::AcqRel);
-}
-
-pub(crate) fn cont_cancel_debt_take(pid: ProcessId) -> u64 {
-    let handle = cont_cancel_debt_map().lock().unwrap().get(&pid).cloned();
-    handle.map_or(0, |debt| {
-        debt.swap(0, std::sync::atomic::Ordering::AcqRel)
-    })
 }
 
 pub(crate) fn prime_hint_mark(pids: impl IntoIterator<Item = ProcessId>) {

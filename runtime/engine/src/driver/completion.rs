@@ -595,12 +595,6 @@ impl Drop for SubmissionCompletion {
 const WORK_ITEM_RESOLUTION_PENDING: u32 = 0;
 const WORK_ITEM_RESOLUTION_SUCCESS: u32 = 1;
 const WORK_ITEM_RESOLUTION_FAILED: u32 = 2;
-/// Resolved by the scheduler DROPPING a queued, never-posted work item on a
-/// cancel request (continuation-wave eviction cancel). Not a failure: the
-/// submitting side finalizes by unwinding its reservations — no poison, no
-/// pass failure — so `result()` reports Ok and `is_cancelled()` carries the
-/// distinction.
-const WORK_ITEM_RESOLUTION_CANCELLED: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkItemAttemptOutcome {
@@ -615,13 +609,6 @@ struct WorkItemCompletionState {
     terminal: OwnedTerminalCell,
     resolution: AtomicU32,
     cancel_requested: AtomicBool,
-    /// Eviction-cancel mark (continuation-wave sweep) — DISTINCT from
-    /// `cancel_requested` on purpose: that flag makes scheduler ADMISSION
-    /// reject the fire with an error (poisoning its readers), which is
-    /// right for a process abort and fatally wrong for an eviction — the
-    /// victim lives on and resubmits. Only the CancelSweep drop path reads
-    /// this one, and it resolves benignly.
-    evict_cancel_requested: AtomicBool,
     native_retired: AtomicBool,
     message: Mutex<Option<String>>,
     guard: Option<Arc<dyn CompletionLease>>,
@@ -636,7 +623,6 @@ impl WorkItemCompletionState {
             terminal: OwnedTerminalCell::new(),
             resolution: AtomicU32::new(WORK_ITEM_RESOLUTION_PENDING),
             cancel_requested: AtomicBool::new(false),
-            evict_cancel_requested: AtomicBool::new(false),
             // Unknown until the scheduler either retires an accepted native
             // attempt or explicitly proves the request was never submitted.
             native_retired: AtomicBool::new(false),
@@ -697,31 +683,8 @@ impl WorkItemCompletionState {
         self.cancel_requested.store(true, Ordering::Release);
     }
 
-    /// The scheduler honoured a cancel request by dropping the queued item
-    /// before it ever reached the driver. Marks native-retired (nothing was
-    /// submitted) and resolves the completion benignly.
-    fn resolve_cancelled(&self) {
-        self.native_retired.store(true, Ordering::Release);
-        self.resolution
-            .store(WORK_ITEM_RESOLUTION_CANCELLED, Ordering::Release);
-        // See `resolve_success`: unconditional doorbell.
-        let _ = WakerTable::global().wake(self.slot);
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.resolution.load(Ordering::Acquire) == WORK_ITEM_RESOLUTION_CANCELLED
-    }
-
     fn cancel_requested(&self) -> bool {
         self.cancel_requested.load(Ordering::Acquire)
-    }
-
-    fn request_evict_cancel(&self) {
-        self.evict_cancel_requested.store(true, Ordering::Release);
-    }
-
-    fn evict_cancel_requested(&self) -> bool {
-        self.evict_cancel_requested.load(Ordering::Acquire)
     }
 
     fn mark_native_retired(&self) {
@@ -737,9 +700,6 @@ impl WorkItemCompletionState {
                 None
             }
             WORK_ITEM_RESOLUTION_SUCCESS => Some(Ok(())),
-            // Cancelled is benign to awaiters: the submitting side reads
-            // `is_cancelled()` and unwinds instead of publishing.
-            WORK_ITEM_RESOLUTION_CANCELLED => Some(Ok(())),
             WORK_ITEM_RESOLUTION_FAILED => Some(Err(anyhow!(
                 self.message
                     .lock()
@@ -862,25 +822,6 @@ impl WorkItemCompletion {
 
     pub(crate) fn cancel_requested(&self) -> bool {
         self.state.cancel_requested()
-    }
-
-    /// See [`WorkItemCompletionState::request_evict_cancel`] — the benign
-    /// eviction-sweep mark, invisible to scheduler admission.
-    pub(crate) fn request_evict_cancel(&self) {
-        self.state.request_evict_cancel();
-    }
-
-    pub(crate) fn evict_cancel_requested(&self) -> bool {
-        self.state.evict_cancel_requested()
-    }
-
-    /// See [`WorkItemCompletionState::resolve_cancelled`].
-    pub(crate) fn resolve_cancelled(&self) {
-        self.state.resolve_cancelled();
-    }
-
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.state.is_cancelled()
     }
 
     pub(crate) fn mark_native_retired(&self) {

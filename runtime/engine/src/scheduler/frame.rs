@@ -659,32 +659,6 @@ impl FramePolicy {
         }
     }
 
-    /// The worker dropped a queued cancelled fire (eviction cancel of a
-    /// synthetic continuation): remove it from its unsealed frame so no
-    /// seal picks it. The frame self-completes at whatever remains; one
-    /// emptied of live fires is garbage-collected by the seal loop's
-    /// empty-front drop. A frame already sealed has left `lanes` — the
-    /// dispatch-side vanished-id retain covers it — so a miss here is
-    /// silent by design.
-    pub fn on_fire_cancelled(&mut self, stamp: FrameStamp, fire_id: u64) {
-        let Some(lane) = self.lanes.get_mut(&stamp.lane) else {
-            return;
-        };
-        let Some(at) = lane.frames.iter().position(|frame| frame.seq == stamp.seq) else {
-            return;
-        };
-        let frame = &mut lane.frames[at];
-        frame.fires.retain(|fire| fire.fire_id != Some(fire_id));
-        if frame.fires.is_empty() && !frame.park {
-            // A frame's fires cancel together, so the emptied husk goes now
-            // rather than lingering for a seal's empty-front drop.
-            lane.frames.remove(at);
-        } else {
-            frame.truncated = true;
-            frame.expected = frame.fires.len() as u32;
-        }
-    }
-
     /// The host failed a frame mid-submit: only `submitted` fires exist.
     pub fn on_frame_truncated(&mut self, lane: ProcessId, seq: u64, submitted: u32) {
         if let Some(lane) = self.lanes.get_mut(&lane)
