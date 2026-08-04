@@ -170,7 +170,9 @@ const PARAMS: &str = "\
     const LoraTable* lora,\n\
     const std::uint32_t* peel_window_d,\n\
     std::uint32_t unmasked_prefix_rows,\n\
-    const std::uint32_t* mask_suffix_qo_indptr_d";
+    const std::uint32_t* mask_suffix_qo_indptr_d,\n\
+    std::uint32_t declared_max_layers,\n\
+    std::uint32_t declared_full_depth_rows";
 
 fn emit_class_fn(
     plan: &ForwardPlan,
@@ -208,6 +210,31 @@ fn emit_class_fn(
     }
     b.line("    const int N = total_tokens;");
     b.line("    const int R = num_requests;");
+    if plan.depth_window {
+        b.line("    // STRUCTURAL S-4: the depth axis, stated by the trace");
+        b.line("    // (ForwardPlan::depth_window) — per-layer scopes below");
+        b.line("    // shadow N/R on tail layers; uniform truncation skips");
+        b.line("    // them and the unchanged epilogue is the logit-lens head.");
+        b.line("    const int depth_k =");
+        b.line("        declared_max_layers != 0xffffffffu &&");
+        b.line("        declared_max_layers <");
+        b.line("            static_cast<std::uint32_t>(cfg.num_hidden_layers)");
+        b.line("            ? static_cast<int>(declared_max_layers)");
+        b.line("            : cfg.num_hidden_layers;");
+        b.line("    const bool depth_union =");
+        b.line("        depth_k < cfg.num_hidden_layers &&");
+        b.line("        declared_full_depth_rows != 0xffffffffu;");
+        b.line("    const int depth_split = depth_union");
+        b.line("        ? static_cast<int>(declared_full_depth_rows)");
+        b.line("        : N;");
+        b.line("    if (depth_union &&");
+        b.line("        (depth_split <= 0 || depth_split >= R ||");
+        b.line("         !plan_state.depth_prefix_decode_plan)) {");
+        b.line("        throw std::runtime_error(");
+        b.line("            \"depth union (generated): planned split without \"");
+        b.line("            \"a usable prefix plan (gate drift)\");");
+        b.line("    }");
+    }
     b.line("    const int H = cfg.hidden_size;");
     b.line("    const int Hq = cfg.num_attention_heads * cfg.head_dim;");
     b.line("    const int Hk = cfg.num_key_value_heads * cfg.head_dim;");
@@ -361,7 +388,10 @@ fn emit_class_fn(
         b.line("        cublas.set_stream(stream);");
         b.line("    }");
     } else {
-        emit_range(&mut b, plan, facts, cuda, is_decode, None, 0, plan.ops.len(), None);
+        emit_range_scoped(
+            &mut b, plan, facts, cuda, is_decode, None, 0, plan.ops.len(),
+            None, plan.depth_window,
+        );
     }
     b.line("}");
     b.out
@@ -438,9 +468,57 @@ fn emit_range(
     end: usize,
     win: Option<Win>,
 ) {
+    emit_range_scoped(b, plan, facts, cuda, is_decode, sg, start, end, win, false)
+}
+
+/// STRUCTURAL S-4: `track_layers` (the ONE top-level call of a
+/// depth-window trace) wraps each layer's ops in a scope that shadows
+/// N/R — tail layers (static L >= runtime depth_k) run at depth_split
+/// on a union fire and are skipped entirely on a uniform truncated
+/// fire; the layer-untagged epilogue stays full-N (the logit-lens
+/// head). Regions recurse WITHOUT tracking: they are layer-local and
+/// inherit the enclosing scope.
+#[allow(clippy::too_many_arguments)]
+fn emit_range_scoped(
+    b: &mut Body,
+    plan: &ForwardPlan,
+    facts: &LlamaLikeFacts,
+    cuda: &LlamaLikeCudaFacts,
+    is_decode: bool,
+    sg: Option<SgValuation>,
+    start: usize,
+    end: usize,
+    win: Option<Win>,
+    track_layers: bool,
+) {
     let mut i = start;
+    let mut cur_layer: Option<u32> = None;
+    let close_scope = |b: &mut Body| {
+        b.stmt("}");
+        b.stmt("}");
+    };
     while i < end {
         let op = &plan.ops[i];
+        if track_layers && op.layer != cur_layer {
+            if cur_layer.is_some() {
+                close_scope(b);
+            }
+            if let Some(l) = op.layer {
+                b.stmt("{");
+                b.stmt(&format!(
+                    "const bool depth_tail = depth_k <= {l};"
+                ));
+                b.stmt("if (!depth_tail || depth_union) {");
+                b.stmt(
+                    "const int N = depth_tail ? depth_split : total_tokens;",
+                );
+                b.stmt(
+                    "const int R = depth_tail ? depth_split : num_requests;",
+                );
+                b.stmt("(void)N; (void)R;");
+            }
+            cur_layer = op.layer;
+        }
         if let OpKind::Peel {
             prefix_ops,
             tail_ops,
@@ -620,8 +698,14 @@ fn emit_range(
             i = region + *else_ops as usize;
             continue;
         }
-        emit_op(b, op, plan, facts, cuda, is_decode, win);
+        emit_op(
+            b, op, plan, facts, cuda, is_decode, win,
+            plan.depth_window && sg.is_none(),
+        );
         i += 1;
+    }
+    if track_layers && cur_layer.is_some() {
+        close_scope(b);
     }
 }
 
@@ -671,6 +755,7 @@ fn emit_op(
     cuda: &LlamaLikeCudaFacts,
     is_decode: bool,
     win: Option<Win>,
+    depth_active: bool,
 ) {
     let _ = plan;
     match &op.kind {
@@ -978,7 +1063,10 @@ fn emit_op(
             kernel,
             weights,
             state,
-        } => emit_launch(b, kernel, weights, state.as_ref(), op, facts, cuda, is_decode, win),
+        } => emit_launch(
+            b, kernel, weights, state.as_ref(), op, facts, cuda,
+            is_decode, win, depth_active,
+        ),
         OpKind::HookSite { stage, layer } => {
             // The interpreter's site handler, transliterated with the
             // stage and layer as constants. Null hooks skip everything
@@ -1077,6 +1165,7 @@ fn emit_launch(
     cuda: &LlamaLikeCudaFacts,
     is_decode: bool,
     win: Option<Win>,
+    depth_active: bool,
 ) {
     // Padded head dim (Phi-3): the attention consumes the zero-padded
     // `dk` staging copies and the softmax keeps the real-dim scale —
@@ -1471,10 +1560,25 @@ fn emit_launch(
             // Per-layer window resolution is RUNTIME cfg reads
             // (per_layer_window_left / sliding_window) — placement-
             // independent, so post-norm deployments emit it unchanged.
-            b.stmt("if (!plan_state.decode_plan) {");
-            b.stmt("    throw std::runtime_error(");
-            b.stmt("        \"generated forward: prepare built no decode plan\");");
-            b.stmt("}");
+            if depth_active {
+                // STRUCTURAL S-4: a depth-tail layer's attention pairs
+                // the PREFIX plan with its dedicated workspace (the
+                // plan/workspace pairing rule); `depth_tail` is the
+                // enclosing layer scope's static-L bool.
+                b.stmt("const ops::DecodePlanCache* depth_dp = depth_tail");
+                b.stmt("    ? plan_state.depth_prefix_decode_plan.get()");
+                b.stmt("    : plan_state.decode_plan.get();");
+                b.stmt("if (depth_dp == nullptr) {");
+                b.stmt("    throw std::runtime_error(");
+                b.stmt("        \"generated forward: prepare built no decode \"");
+                b.stmt("        \"plan for this depth range\");");
+                b.stmt("}");
+            } else {
+                b.stmt("if (!plan_state.decode_plan) {");
+                b.stmt("    throw std::runtime_error(");
+                b.stmt("        \"generated forward: prepare built no decode plan\");");
+                b.stmt("}");
+            }
             b.stmt(&format!("{{"));
             b.stmt(&format!(
                 "    auto kv_view = cache.layer_view({layer});"
@@ -1492,15 +1596,28 @@ fn emit_launch(
                 "            ? fwd_cfg.per_layer_window_left[{layer}]"
             ));
             b.stmt("            : fwd_cfg.sliding_window;");
-            b.stmt("    ops::dispatch_attention_flashinfer_decode(");
-            b.stmt("        *plan_state.decode_plan,");
-            b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
-            b.stmt("        attn_page_indices, attn_page_indptr,");
-            b.stmt("        attn_last_page_lens,");
-            b.stmt("        attn_ws, stream, layer_window_left,");
-            b.stmt(&format!(
-                "        /*logits_soft_cap=*/0.f, {scale});"
-            ));
+            if depth_active {
+                b.stmt("    ops::dispatch_attention_flashinfer_decode(");
+                b.stmt("        *depth_dp,");
+                b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
+                b.stmt("        attn_page_indices, attn_page_indptr,");
+                b.stmt("        attn_last_page_lens,");
+                b.stmt("        depth_tail ? spatial_suffix_attn_ws() : attn_ws,");
+                b.stmt("        stream, layer_window_left,");
+                b.stmt(&format!(
+                    "        /*logits_soft_cap=*/0.f, {scale});"
+                ));
+            } else {
+                b.stmt("    ops::dispatch_attention_flashinfer_decode(");
+                b.stmt("        *plan_state.decode_plan,");
+                b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
+                b.stmt("        attn_page_indices, attn_page_indptr,");
+                b.stmt("        attn_last_page_lens,");
+                b.stmt("        attn_ws, stream, layer_window_left,");
+                b.stmt(&format!(
+                    "        /*logits_soft_cap=*/0.f, {scale});"
+                ));
+            }
             strip(b);
             b.stmt("}");
         }
