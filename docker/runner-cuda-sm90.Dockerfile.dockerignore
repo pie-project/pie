@@ -1,0 +1,45 @@
+# Build context for docker/runner-cuda-sm90.Dockerfile.
+#
+# A deny-list, unlike the allow-list the test-time-bench template uses. That
+# template's images are named by a hash of an enumerated file set, so it has to
+# know exactly which paths are inputs. This build compiles a Cargo workspace with
+# `cargo install --path bin/pie`, whose input is the whole tree; an allow-list
+# would have to restate the workspace and would silently break on any new crate.
+#
+# Excluded here is only what must not reach a build: local build output, secrets,
+# and directories large enough to slow the context upload for no benefit.
+
+.git
+.gitignore
+
+# Rust and CMake output, at the root and in any nested crate.
+target
+**/target
+
+# Node output under website/ and the SDK tooling.
+**/node_modules
+
+# Local logs and scratch.
+logs
+**/*.log
+
+# Never ship credentials into a build context.
+**/*.env
+**/*.key
+**/*.pem
+**/*.p12
+**/id_rsa*
+**/id_ed25519*
+
+# The ignore files themselves are not build inputs.
+**/*.dockerignore
+
+# Neither is the build tooling. pie is compiled from the Cargo workspace, and the
+# Dockerfile is read by the client through -f rather than out of the context, so
+# excluding these changes nothing about what gets built. Leaving them in couples
+# the recipe to the cache key of `COPY . .`, which means editing a comment in this
+# Dockerfile recompiles the CUDA driver from scratch — 31 minutes for no reason.
+#
+# docker/runpod-sshd-entrypoint.sh deliberately stays: the runtime stage COPYs it.
+docker/*.Dockerfile
+scripts/build-runner-image.sh
