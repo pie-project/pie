@@ -164,11 +164,10 @@ std::vector<int> derive_kv_page_size_candidates(
     const pie_cuda_driver::Config& cfg,
     const pie_cuda_driver::HfConfig& /*hf*/,
     const cudaDeviceProp& /*prop*/) {
-    if (const char* forced = std::getenv("PIE_CUDA_KV_PAGE_SIZE")) {
-        const int v = std::atoi(forced);
-        if (v > 0) {
-            return {v};
-        }
+    // A pinned page size is a single-candidate lattice: the operator has
+    // already made the choice this search exists to make.
+    if (cfg.batching.kv_page_size > 0) {
+        return {static_cast<int>(cfg.batching.kv_page_size)};
     }
     std::vector<int> xs;
     const int tp_size = std::max(1, cfg.distributed.tp_size);

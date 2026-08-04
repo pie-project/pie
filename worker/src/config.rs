@@ -908,6 +908,14 @@ pub struct CudaNativeDriverOptions {
 
     pub gpu_mem_utilization: f64,
     pub memory_profile: CudaMemoryProfile,
+    /// KV page size in tokens. **0 = let the driver's memory planner derive
+    /// one** by scoring candidates against the memory profile, which is what
+    /// every deployment has been getting: this field reached the driver but
+    /// the planner never read it, so only the (now deleted)
+    /// `PIE_CUDA_KV_PAGE_SIZE` could pin it. A non-zero value now pins it, and
+    /// the planner searches a single-candidate lattice.
+    ///
+    /// Same 0-means-derive convention as `total_pages` below.
     pub kv_page_size: u32,
     pub kv_cache_dtype: String,
     pub swap_pool_size: u32,
@@ -987,7 +995,9 @@ impl Default for CudaNativeDriverOptions {
             binary_path: String::new(),
             gpu_mem_utilization: 0.90,
             memory_profile: CudaMemoryProfile::Auto,
-            kv_page_size: 32,
+            // 0 = derive. This is the behaviour every deployment already had:
+            // the planner ignored the field, so 32 was never actually pinned.
+            kv_page_size: 0,
             kv_cache_dtype: "auto".to_string(),
             swap_pool_size: 0,
             total_pages: 0,
@@ -1015,10 +1025,6 @@ impl CudaNativeDriverOptions {
                 && self.gpu_mem_utilization > 0.0
                 && self.gpu_mem_utilization <= 1.0,
             "model.driver.options.gpu_mem_utilization must be finite and in (0.0, 1.0]"
-        );
-        ensure!(
-            self.kv_page_size > 0,
-            "model.driver.options.kv_page_size must be > 0"
         );
         const MXFP4: &[&str] = &[
             "auto",
@@ -1362,8 +1368,33 @@ mtp_num_drafts = 6
         assert_eq!(opts.mtp_assistant_snapshot_dir, "/models/gemma4-mtp");
         assert_eq!(opts.mtp_num_drafts, 6);
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
-        assert_eq!(opts.kv_page_size, 32); // default
+        // 0 = derive: the planner scores candidates unless pinned.
+        assert_eq!(opts.kv_page_size, 0);
         assert_eq!(opts.kv_cache_dtype, "auto"); // default
+    }
+
+    #[test]
+    fn kv_page_size_pins_the_planner_when_set() {
+        // Before this landed the field reached the driver and the planner
+        // ignored it: only PIE_CUDA_KV_PAGE_SIZE could pin a page size. A
+        // non-zero value now means the operator has made the choice the
+        // planner's candidate search exists to make.
+        let toml = r#"
+[model]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+kv_page_size = 16
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().unwrap();
+        let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
+        assert_eq!(opts.kv_page_size, 16);
     }
 
     #[test]

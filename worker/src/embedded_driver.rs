@@ -966,7 +966,9 @@ mod tests {
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
-        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
+        // 0 = derive: the driver's memory planner scores candidates unless
+        // the operator pins one.
+        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 0);
         assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
             val["batching"]["gpu_mem_utilization"].as_float().unwrap(),

@@ -46,7 +46,9 @@ struct ModelConfig {
 struct BatchingConfig {
     double gpu_mem_utilization = 0.90;
     std::string memory_profile = "auto";
-    std::uint32_t kv_page_size = 32;
+    // 0 = let the memory planner derive and score candidates; >0 pins it.
+    // Mirrors `total_pages`, which uses the same 0-means-derive convention.
+    std::uint32_t kv_page_size = 0;
     // Pinned host KV slots for swap-out. 0 = swap disabled.
     std::uint32_t swap_pool_size = 0;
     // KV cache storage format. "auto" preserves the historical bf16 cache.
@@ -180,10 +182,11 @@ inline Config load_config(const std::filesystem::path& path) {
             (*b)["memory_profile"].value_or(c.batching.memory_profile);
         const auto kv_page_size =
             (*b)["kv_page_size"].value_or<int64_t>(c.batching.kv_page_size);
-        if (kv_page_size <= 0 ||
+        if (kv_page_size < 0 ||
             kv_page_size > std::numeric_limits<std::uint32_t>::max()) {
             throw std::runtime_error(
-                "config: [batching].kv_page_size must be in [1, u32::MAX]");
+                "config: [batching].kv_page_size must be in [0, u32::MAX] "
+                "(0 = derive)");
         }
         c.batching.kv_page_size =
             static_cast<std::uint32_t>(kv_page_size);
