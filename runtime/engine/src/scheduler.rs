@@ -452,6 +452,11 @@ pub(crate) struct RunAheadAcc {
     pub ahead1: AtomicU64,
     /// Two or more queued behind.
     pub ahead2: AtomicU64,
+    /// Arrival-time lane queue depth when a NEW frame starts arriving:
+    /// 0 / 1 / >=2 frames already queued (frame.rs `record_arrival`).
+    pub arrq0: AtomicU64,
+    pub arrq1: AtomicU64,
+    pub arrq2: AtomicU64,
     /// Implicit rejoins (parked lane accepted a fire) since the last wave.
     pub rejoins: AtomicU64,
     /// Awaited lanes seen blocking the gate, summed over gate evaluations.
@@ -488,6 +493,9 @@ pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
     ahead0: AtomicU64::new(0),
     ahead1: AtomicU64::new(0),
     ahead2: AtomicU64::new(0),
+    arrq0: AtomicU64::new(0),
+    arrq1: AtomicU64::new(0),
+    arrq2: AtomicU64::new(0),
     rejoins: AtomicU64::new(0),
     blocking: AtomicU64::new(0),
     blk_owed: AtomicU64::new(0),

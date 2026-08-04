@@ -586,6 +586,20 @@ impl FramePolicy {
         let frame = match lane.frames.iter_mut().find(|frame| frame.seq == stamp.seq) {
             Some(frame) => frame,
             None => {
+                // Arrival-time queue depth: how many frames this lane already
+                // has queued when a NEW frame starts arriving. 0 = the lane
+                // runs frame-to-frame (reactive); >=1 = real run-ahead depth
+                // at the scheduler. Distinguishes guest pacing from every
+                // downstream suspect (ring, staging, seal).
+                {
+                    let acc = &crate::scheduler::RUN_AHEAD;
+                    let cell = match lane.frames.len() {
+                        0 => &acc.arrq0,
+                        1 => &acc.arrq1,
+                        _ => &acc.arrq2,
+                    };
+                    cell.fetch_add(1, Ordering::Relaxed);
+                }
                 lane.frames.push_back(PendingFrame {
                     seq: stamp.seq,
                     expected: stamp.fires,
