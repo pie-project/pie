@@ -1842,3 +1842,20 @@ full-depth decode (no masks/hooks/lora/mixed-k — each a recorded
 later rung), which makes the second plan workspace reusable: a depth
 fire is never also a spatial-mask fire, so the dedicated secondary
 workspace serves both mutually-exclusive shapes.
+
+## S-5: THE STRUCTURAL CLASS, PRICED (2026-08-04)
+
+Release A/B on the L40S (Qwen3-0.6B/28L, 256 tok/lane, 1 full lane +
+D layerskip-draft lanes at k=8, union ON = default vs
+PIE_DEPTH_UNION=0 = drafts solo-fire):
+
+  D=3 . ON ~1.27s  OFF ~1.68s  -> 1.32x
+  D=7 . ON ~1.35s  OFF ~3.04s  -> 2.25x
+
+The union's win GROWS with the draft count — the solo regime pays D
+separate k-layer fires serialized against the shared fire, the union
+folds every draft into rows of ONE fire (layers [0,k) shared full-N,
+[k,L) prefix-only, one tail). The README's 1.53x STRUCTURAL-class
+number sits inside the measured bracket, with the scaling shape
+demonstrated. 1783 union fires across the ON benches; S-B identity
+oracle green on the release build. Battery: .wiki/tart/bench_depth.py.
