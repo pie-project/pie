@@ -784,6 +784,41 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // So the ask falls from the model to the dense weights plus the budget,
     // which is what lets a model bigger than the GPU be admitted.
     const bool slab = cfg.expert_slab_bytes > 0;
+    // Asked BEFORE the sizing, because the sizing below already believes the
+    // budget: it takes the paging rule for what must be resident on the
+    // strength of this field alone. A family that cannot page then reached the
+    // fit check having had its bank subtracted from the ask and the budget
+    // added to the heap, and refused with "this model does not fit" -- true,
+    // but about the wrong thing, and it never reached the engine that knew the
+    // real reason. One site, before either number is computed, so the message
+    // is the reason.
+    if (slab) {
+        const char* why = nullptr;
+        switch (family) {
+        case model::ModelFamily::Llama:
+            break;
+        case model::ModelFamily::GptOss:
+            // It has a routed bank, but every expert also carries a BIAS that
+            // stays resident and is indexed by the very buffer paging
+            // renumbers into slot space -- so it would read one expert's bias
+            // beside another's weights. Fluent wrong tokens, not a failure.
+            why = "gpt-oss: expert_slab_bytes is not supported -- its per-expert bias is "
+                  "indexed by the routing decision that paging renumbers";
+            break;
+        case model::ModelFamily::Gemma4:
+            // Nothing to page: dense, no routed bank at all.
+            why = "gemma4: expert_slab_bytes has nothing to page -- this family is dense "
+                  "and has no routed expert bank";
+            break;
+        default:
+            why = "expert_slab_bytes is only supported for the llama family";
+            break;
+        }
+        if (why) {
+            if (err) *err = why;
+            return false;
+        }
+    }
     const auto streams =
         SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts || slab);
     // Not gated on `streams`: a checkpoint that places its tensors where a

@@ -620,21 +620,6 @@ class GptOssEngine final : public SimpleFamilyEngine {
         if (!gptoss_geometry(cfg, g_, max_ctx, err)) return false;
         max_ctx_ = max_ctx;
 
-        if (cfg.expert_slab_bytes > 0) {
-            // Not silently ignored, and not silently wired either. gpt-oss
-            // gives every expert its own BIAS, which stays resident and is
-            // indexed by the same buffer the routed matvec reads. Paging the
-            // weights renumbers that buffer into slot space, so the bias would
-            // be read for a different expert than the weight beside it -- a
-            // divergence that produces fluent wrong tokens rather than a
-            // failure. The llama family has no such bias (`zero_bias`), which
-            // is why it is wired and this is not.
-            if (err) {
-                *err = "gpt-oss: expert_slab_bytes is not supported here -- its per-expert "
-                       "bias is indexed by the routing decision that paging renumbers";
-            }
-            return false;
-        }
         try {
             const auto storage = load_plan.view();
             auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
