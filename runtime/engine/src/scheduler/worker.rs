@@ -4739,6 +4739,13 @@ impl BatchScheduler {
             take(&racc.miss_start),
             racc.miss_max.swap(0, std::sync::atomic::Ordering::Relaxed),
         );
+        let (ra_exec_evals, ra_exec_blk_owed, ra_exec_blk_empty, ra_exec_blk_partial) = (
+            take(&racc.exec_evals),
+            take(&racc.exec_blk_owed),
+            take(&racc.exec_blk_empty),
+            take(&racc.exec_blk_partial),
+        );
+        let (ra_exec_held, ra_seal_exec) = (take(&racc.exec_held), take(&racc.seal_exec));
         let (ra_plan_calls, ra_plan_us, ra_freed_poke, ra_freed_skip) = (
             take(&racc.plan_calls),
             take(&racc.plan_ns) / 1000,
@@ -4941,6 +4948,12 @@ impl BatchScheduler {
                 ("ra_blk_owed", ra_blk_owed),
                 ("ra_blk_empty", ra_blk_empty),
                 ("ra_blk_partial", ra_blk_partial),
+                ("ra_exec_evals", ra_exec_evals),
+                ("ra_exec_blk_owed", ra_exec_blk_owed),
+                ("ra_exec_blk_empty", ra_exec_blk_empty),
+                ("ra_exec_blk_partial", ra_exec_blk_partial),
+                ("ra_exec_held", ra_exec_held),
+                ("ra_seal_exec", ra_seal_exec),
                 ("ra_leave_close", ra_leave_close),
                 ("ra_leave_hit", ra_leave_hit),
                 ("ra_leave_removed", ra_leave_removed),

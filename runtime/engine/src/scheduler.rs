@@ -503,6 +503,20 @@ pub(crate) struct RunAheadAcc {
     /// Gate evaluations where exactly one lane blocked — the seal pinned on a
     /// single member.
     pub pin_n: AtomicU64,
+    /// The same gate census, restricted to evaluations taken WHILE a wave was
+    /// executing (`plan_dispatch`'s `executing` flag). This is the S3
+    /// discriminator: a gate that holds mid-execution can seal, build and
+    /// driver-submit the next wave before completion, so `exec_held` counts
+    /// chain opportunities and `exec_blk_*` names who denies them.
+    pub exec_evals: AtomicU64,
+    pub exec_blk_owed: AtomicU64,
+    pub exec_blk_empty: AtomicU64,
+    pub exec_blk_partial: AtomicU64,
+    /// Gate held (no awaited lane missing) while a wave was executing.
+    pub exec_held: AtomicU64,
+    /// Boundary-opening seals taken while a wave was executing — the next
+    /// wave was sealed before the current one completed (the chain engaged).
+    pub seal_exec: AtomicU64,
 }
 
 pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
@@ -535,6 +549,12 @@ pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
     block_ns: AtomicU64::new(0),
     block_episodes: AtomicU64::new(0),
     pin_n: AtomicU64::new(0),
+    exec_evals: AtomicU64::new(0),
+    exec_blk_owed: AtomicU64::new(0),
+    exec_blk_empty: AtomicU64::new(0),
+    exec_blk_partial: AtomicU64::new(0),
+    exec_held: AtomicU64::new(0),
+    seal_exec: AtomicU64::new(0),
 };
 
 /// `fire_timing_now_us` of the most recent scheduler retire resolve, used to

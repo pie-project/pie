@@ -577,7 +577,10 @@ impl FramePolicy {
         let lane = self.lanes.entry(stamp.lane).or_insert_with(|| LaneState {
             owner,
             awaited: !suspended,
-            parked: false,
+            // A lane born under its owner's suspension is not a member, but
+            // it must become one on its first post-restore fire — the same
+            // implicit-rejoin latch every park-shaped exit carries.
+            parked: suspended,
             leashed: false,
             clock_from: None,
             frames: VecDeque::new(),
@@ -593,10 +596,12 @@ impl FramePolicy {
         // Implicit rejoin: a parked lane returns to the quorum on its next
         // accepted fire. Atomic with the fire on purpose — an explicit join
         // would reopen the window this whole contract closes (a member that
-        // has joined but not yet submitted).
-        if lane.parked {
+        // has joined but not yet submitted). A fire racing the suspend
+        // broadcast must NOT consume the latch: the lane is leaving, and
+        // spending `parked` here would strand it un-awaited after restore.
+        if lane.parked && !suspended {
             lane.parked = false;
-            lane.awaited = !suspended;
+            lane.awaited = true;
             lane.rejoin_seal = seal_seq;
             crate::scheduler::RUN_AHEAD
                 .rejoins
@@ -975,6 +980,18 @@ impl FramePolicy {
             self.truncated_seqs.remove(&lane);
         } else if let Some(state) = self.lanes.get_mut(&lane) {
             state.awaited = false;
+            // The leave is a PARK, not a verdict: both callers (the planner's
+            // allocation park and a graceful pipeline close) promise "rejoin
+            // is implicit on the next accepted fire". A drained lane keeps
+            // that promise through removal + re-creation (recreated awaited),
+            // but a lane that stays for its queued frames used to keep
+            // `parked` clear — so `record_arrival`'s rejoin branch never ran
+            // and the lane FREE-RODE outside the wait-set for the rest of its
+            // life (measured: ra_rejoins == 0 across whole contended runs,
+            // seal-time awaited count decaying 108 -> ~55 while ~90 lanes
+            // stayed resident). Latching `parked` restores the contract; a
+            // closed pipeline never fires again, so for it the flag is inert.
+            state.parked = true;
             self.truncate_incomplete(lane);
             let drained = self
                 .lanes
@@ -1031,6 +1048,12 @@ impl FramePolicy {
         for lane_id in owned {
             if let Some(lane) = self.lanes.get_mut(&lane_id) {
                 lane.awaited = false;
+                // Same rejoin contract as the park-shaped leave: a lane kept
+                // for its queued frames must re-enter the wait-set on its
+                // first post-restore fire, and only the `parked` latch makes
+                // `record_arrival` do that. The suspend mark below keeps the
+                // latch from being consumed by a fire racing the broadcast.
+                lane.parked = true;
             }
             self.truncate_incomplete(lane_id);
             let drained = self
@@ -1566,6 +1589,19 @@ impl FramePolicy {
                 acc.blk_partial.fetch_add(blk_partial, Ordering::Relaxed);
                 acc.gate_evals.fetch_add(1, Ordering::Relaxed);
                 acc.miss_max.fetch_max(missing as u64, Ordering::Relaxed);
+                if executing {
+                    // The S3 discriminator: while the device is busy, a held
+                    // gate is a chance to seal/build/submit the next wave
+                    // early; a blocked one names the lanes denying it.
+                    acc.exec_evals.fetch_add(1, Ordering::Relaxed);
+                    acc.exec_blk_owed.fetch_add(blk_owed, Ordering::Relaxed);
+                    acc.exec_blk_empty.fetch_add(blk_empty, Ordering::Relaxed);
+                    acc.exec_blk_partial
+                        .fetch_add(blk_partial, Ordering::Relaxed);
+                    if missing == 0 {
+                        acc.exec_held.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 if missing == 1 && blocking_pin {
                     acc.pin_n.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1668,7 +1704,16 @@ impl FramePolicy {
             // any drain barrier: a seal never excludes a busy lane, because
             // it waits for every lane's submission instead.
             match self.seal() {
-                Some(FramePlan::Dispatch(_)) => continue,
+                Some(FramePlan::Dispatch(_)) => {
+                    if executing {
+                        // The next wave sealed while the device was still
+                        // busy with the current one: the chain engaged.
+                        crate::scheduler::RUN_AHEAD
+                            .seal_exec
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
                 Some(plan) => return plan,
                 // Ready lanes exist but none can seal (all busy in an
                 // executing round partition): retirements re-decide.
