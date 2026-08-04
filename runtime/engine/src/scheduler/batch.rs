@@ -130,8 +130,14 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
     }
     let mut k: Option<u32> = None;
     for req in ordered.iter() {
+        // AC-3 (lora x depth): an UNTRUNCATED lora member rides the
+        // full-depth prefix freely — the correction is span-grouped and
+        // window-free, and the seriation keeps it out of the truncated
+        // tail. A single lane carrying BOTH axes still declines (its
+        // correction span would cross the depth window — the PQ-tree
+        // class, refused as safe degradation for now).
         if req.hook_program
-            || req.lora_program
+            || (req.lora_program && req.request.max_layers.is_some())
             || req.request.has_user_mask
             || req.request.token_ids.len() > ordered.len()
             || req
