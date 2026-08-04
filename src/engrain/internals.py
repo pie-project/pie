@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from engrain._engrain import Compiler, pack_configurations
 from engrain.device import (
+    ConfigurationsExceeded,
     DeviceBatch,
     DeviceGrammar,
     ResidentTables,
@@ -29,6 +30,7 @@ from engrain.device import (
 
 __all__ = [
     "Compiler",
+    "ConfigurationsExceeded",
     "DeviceBatch",
     "DeviceGrammar",
     "ResidentTables",

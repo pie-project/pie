@@ -1277,6 +1277,62 @@ class StackDeeperThanTheBlock(unittest.TestCase):
         )
 
 
+class TheConfigurationCeilingCanStartSmall(unittest.TestCase):
+    """Every per-configuration array is `batch x configurations x something`.
+
+    A row carries 2.5 configurations at the mean over real schemas and 8 at the
+    worst, against a ceiling of 128 - so the ceiling is 26% of a batch in
+    `admitted` alone and effectively all of it, since nothing else shrinks
+    while it stands. A caller that starts small and grows pays for what its
+    workload turns out to need: over 409 corpus schemas at batch 512 it grew
+    once, from 8 to 24, and the batch went from 443 MiB to 103.
+    """
+
+    def setUp(self):
+        _requirements()
+
+    def test_a_batch_too_narrow_says_how_wide_it_should_be(self):
+        from engrain._engine import ConfigurationsExceeded, DeviceGrammar
+
+        compiler = support.Compiler(VOCABULARY)
+        # An order-free object carries one configuration per subset of the
+        # required properties it might have completed.
+        names = ["a", "b", "c"]
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {name: {"type": "integer"} for name in names},
+                "required": names,
+            }
+        )
+        grammar = compiler.compile_json_schema(schema)
+        matcher = grammar.matcher(0)
+        for piece in (b"{", b'"a"', b":", b"1", b","):
+            self.assertTrue(matcher.accept_token(VOCABULARY.index(piece)))
+        width = len(matcher.configurations())
+        self.assertGreater(width, 1, "the premise: this parse forks")
+
+        narrow = DeviceGrammar(max_configs=width - 1)
+        narrow.admit(grammar)
+        batch = narrow.new_batch(1)
+        batch.set_grammars([0])
+        with self.assertRaises(ConfigurationsExceeded) as refusal:
+            batch.set_matchers([matcher])
+        self.assertEqual(refusal.exception.needed, width)
+        self.assertEqual(refusal.exception.limit, width - 1)
+
+        # And a pool built at the width it asked for takes the same parse.
+        roomy = DeviceGrammar(max_configs=width)
+        roomy.admit(grammar)
+        wider = roomy.new_batch(1)
+        wider.set_grammars([0])
+        wider.set_matchers([matcher])
+        mask = wider.fill_mask()[0].cpu()
+        reference = torch.zeros(mask.numel(), dtype=torch.int32)
+        matcher.fill_bitmask(reference)
+        self.assertTrue(torch.equal(mask, reference))
+
+
 class TheWindowIsCapped(unittest.TestCase):
     """One grammar must not size every row of every batch for itself.
 

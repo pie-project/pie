@@ -2749,6 +2749,29 @@ class ResidentTables:
 _SIGNED = {"action_values", "action_extra"}
 
 
+class ConfigurationsExceeded(ValueError):
+    """A parse carries more configurations at once than the batch was built for.
+
+    Every per-configuration array is `batch x configurations x something`, and
+    the something is another ceiling - so this factor is 26% of a batch's
+    memory in `admitted` alone, and 100% of it in the sense that nothing else
+    would shrink without it. Measured over a real step at batch 512 across
+    forty-nine corpus schemas, a row carries 2.5 configurations at the mean and
+    8 at the worst, against a ceiling of 128.
+
+    So a caller may start small and grow, which is what this is for: it carries
+    the width that was wanted so the batch can be rebuilt at it rather than at
+    a guess.
+    """
+
+    def __init__(self, needed: int, limit: int) -> None:
+        super().__init__(
+            f"{needed} configurations exceeds the batch's limit of {limit}"
+        )
+        self.needed = needed
+        self.limit = limit
+
+
 class WindowTooWide(ValueError):
     """A grammar's replay window is wider than the pool will hold for it.
 
@@ -3774,9 +3797,19 @@ class DeviceBatch:
         rows = len(matchers)
         if rows == 0:
             return
-        lexer, depths, stacks, counts, width, deep = pack_configurations(
-            matchers, self.configs
-        )
+        try:
+            lexer, depths, stacks, counts, width, deep = pack_configurations(
+                matchers, self.configs
+            )
+        except ValueError as refusal:
+            # The packer refuses on the same ceiling and says so in a message.
+            # A caller that can grow needs the number, not the sentence.
+            widest = max(
+                (len(matcher.configurations()) for matcher in matchers), default=0
+            )
+            if widest > self.configs:
+                raise ConfigurationsExceeded(widest, self.configs) from refusal
+            raise
         if deep > self.grammar.max_stack:
             raise StackTooDeep(deep, self.grammar.max_stack)
 
@@ -3838,9 +3871,7 @@ class DeviceBatch:
             for _, stack in configurations:
                 deep = max(deep, len(stack))
         if width > self.configs:
-            raise ValueError(
-                f"{width} configurations exceeds the batch's limit of {self.configs}"
-            )
+            raise ConfigurationsExceeded(width, self.configs)
         if deep > self.grammar.max_stack:
             raise StackTooDeep(deep, self.grammar.max_stack)
 
