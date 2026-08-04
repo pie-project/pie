@@ -1539,3 +1539,79 @@ structurally rather than hiding it. Gains scale with R and with model
 size (the fire is launch-bound at 1B/R<=8; the weight-read term the
 merge deletes is the one that grows). Bench + table:
 .wiki/tart/bench_spatial_results.md, scratchpad bench_spatial.py.
+
+## ADMISSION RETRACTION + THE STRUCTURAL CLASS V0 DESIGN (2026-08-04)
+
+Retraction first, measured: the board's "engine admissions serialize —
+no R=3 co-fire ever forms" is FALSE for the current engine. Release,
+256 tok/lane, same-instant launches: 4 lanes form 128 R=4 split=3
+co-fires, 8 lanes form 128 R=8 split=7 — full composition through the
+entire overlap window; the solo tail is the masked lane OUTLIVING the
+plains. Composition rate is governed by lifetime overlap, nothing
+else. (The old finding belonged to the capped-flip battery era; short
+64-token lanes under-compose because they finish inside the prefill
+stagger.) The scheduler needs no fix; the 6%-vs-27% merge win applies
+whenever lifetimes overlap.
+
+With that closed, the frontier is the review's two remaining X rows
+(Supergraph = DAG, union pass): both blocked on a SECOND program
+class. Design for its v0, grounded in the organs that exist:
+
+THE CLASS: fixed-k layer-truncated decode ("layerskip draft" — logit
+lens over layer k's hidden state; a real drafting technique, and
+later the self-speculative drafter's verify counterpart). Chosen over
+spec-verify (drafter is bravo's) and confidence-exit (dynamic k is a
+PER-ROW branch — not a fire-plannable window) because fixed k gives a
+STATIC second class: the trace differs from the full class in WHICH
+OPS RUN, not in any per-fire value — exactly Div::STRUCTURAL
+(fire_plan.rs already carries the vocabulary).
+
+THE KEY INSIGHT — the union stays in Peel vocabulary: seriate members
+by depth (full-depth first, truncated last) and the structural
+divergence is ANOTHER ROW WINDOW. At layer k the fire splits: layers
+[k, L) + final norm + lm_head run over the full-depth prefix rows
+[0, n_full); the truncated tail rows take final norm + lm_head
+(logit-lens head) at layer k. That is a Peel whose regions differ in
+OPS (they always could — the hook peel's regions already do) and
+whose window is a third axis: PeelWindow::FullDepthPrefix. No DAG
+machinery, no SCS alignment, no conditional regions needed — the
+supersequence of "layers [0,k) ++ head" and "layers [0,L) ++ head"
+IS the full trace with one peel at k. The kept SupergraphBuilder
+stays in reserve for classes that DON'T prefix-share (true SCS); the
+PQ-tree moment arrives only when a third axis crosses (mask x depth
+in one fire, hooks x depth, or two distinct k values).
+
+THE LADDER (mirroring NS-2's, rung by rung):
+  S-1 the channel: a `max_layers` (k) request field, client ->
+      engine request -> MemberFacts (the Stage-4 lora channel
+      pattern); v0 restricts a fire to ONE k (scheduler refuses
+      mixed-k composition — lowest-order blocking rule).
+  S-2 seriation + wire: sort key gains the depth bit (full first,
+      truncated last, before hooks in the order — depth nests
+      OUTSIDE mask/hooks in v0 by REFUSING their composition with
+      truncated members at all: truncated lanes are plain decode
+      only); a planned `full_depth_rows` wire word beside
+      planned_unmasked_prefix_rows (same reserved-slot pattern).
+  S-3 the trace: Peel { window: FullDepthPrefix } at layer k in the
+      DECLARATION — prefix region = layers [k,L)+norm+lm_head ops,
+      tail region = norm+lm_head-at-k ops (the logit-lens head reuses
+      the final norm weights in v0 — stated plainly so parity is
+      honest). K is a TRACE-TIME constant per deployment-variant
+      (v0: one k per model config, e.g. L/2), so traces stay static;
+      per-request k is v1+ (it re-keys the trace, the same way
+      deployments do).
+  S-4 driver: prepare plans logits rows for both regions; the
+      interpreter/emitter walk the depth peel exactly as the mask
+      peel (region markers, windowed call forms — the attention/MLP
+      launches need only their existing row-window forms since the
+      prefix region is a contiguous row prefix at every layer).
+  S-5 verification: truncated solo == full solo prefix layers
+      byte-check at k (logit-lens oracle), mixed fire == the two
+      solos' logits row-for-row, then graphs (split-keyed on
+      (n_full, k)), then the README's 1.53x-class measurement.
+
+V0 exclusions, stated loudly: dynamic/confidence k (per-row branch),
+mixed-k fires (PQ-tree), truncated x mask / truncated x hooks / x
+lora (blocking rule refuses), trained exit heads (weights don't
+exist; logit-lens is the honest v0 head). Each is a recorded rung,
+not a silent gap.
