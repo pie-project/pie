@@ -59,8 +59,9 @@ fn cuda_moe_decodes_the_same_tokens_streamed_or_resident() {
         let result = common::spawn_inferlet(
             "text-completion-bench",
             &std::env::var("PIE_CUDA_TEST_PROMPT_JSON").unwrap_or_else(|_| {
-            r#"{"prompt":"The capital of France is","max_tokens":16,"temperature":0.0}"#.to_string()
-        }),
+                r#"{"prompt":"The capital of France is","max_tokens":16,"temperature":0.0}"#
+                    .to_string()
+            }),
         )
         .await;
         let text = result.expect("inferlet errored on cuda");

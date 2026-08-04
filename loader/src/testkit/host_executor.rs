@@ -643,7 +643,7 @@ impl HostExecutor<'_, '_> {
                 let mut out: u32 = 0;
                 for (k, &value) in word.iter().enumerate() {
                     let code = (((value as f32) - bias) / scale)
-                        .round_ties_even()
+                        .round()
                         .clamp(0.0, 15.0) as u32;
                     out |= code << (k * 4);
                 }
@@ -1954,15 +1954,23 @@ fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
 ///    consumer never sees the difference -- but a producer that "fixed" the sign
 ///    would place the codes on the other end of the group's range.
 ///  * **The endpoint is snapped, not the scale.** `scale` is recomputed as
-///    `edge / rint(edge / scale)` so that the dominant endpoint lands exactly on
+///    `edge / round(edge / scale)` so that the dominant endpoint lands exactly on
 ///    a code, which is what keeps the largest magnitude in the group exact.
+///  * **`w_max` starts at zero**, not at negative infinity, so a group whose
+///    values are all negative is quantized over the range up to zero rather
+///    than up to its own largest element. Nothing about the arithmetic suggests
+///    this; it is simply what MLX does.
+///  * **The rounding is half AWAY FROM ZERO**, not half to even. That one
+///    choice was the whole of an 8.2% disagreement with `mx.quantize` on an
+///    MXFP4-derived expert bank, whose values sit on half-integers by
+///    construction, and it is why every mismatch was by exactly one.
 ///  * **`eps` floors the scale** so a constant group -- every expert bias row
 ///    that is all zeros, for one -- divides by `1e-7` instead of by zero.
 fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
     const N_BINS: f32 = 15.0;
     const EPS: f32 = 1e-7;
     let mut w_min = f32::INFINITY;
-    let mut w_max = f32::NEG_INFINITY;
+    let mut w_max = 0.0f32;
     for &value in values {
         let value = value as f32;
         w_min = w_min.min(value);
@@ -1974,7 +1982,7 @@ fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
         scale = -scale;
     }
     let edge = if mask { w_min } else { w_max };
-    let q0 = (edge / scale).round_ties_even();
+    let q0 = (edge / scale).round();
     let mut bias = 0.0f32;
     if q0 != 0.0 {
         scale = edge / q0;

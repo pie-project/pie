@@ -43,6 +43,22 @@ void dump_golden_bf16(const std::string& name,
                       int width,
                       std::size_t row_stride_elems);
 
+// Write one bf16 tensor that the expert sort REORDERED, restoring the layout it
+// had before the sort: `[rows, slots * width]`, slot-major, which is what every
+// reference and every bisect already speaks.
+//
+// `perm` is the sort's own output -- its within-expert order is decided by
+// atomics and is not reproducible on the host, so it is read rather than
+// recomputed. `perm[p]` is the (token, slot) pair stored at row `p`, or -1 for
+// a padding row. Pairs the sort never wrote stay zero.
+void dump_golden_bf16_sorted(const std::string& name,
+                             const void* bf16,
+                             const std::int32_t* perm,
+                             int stored_rows,
+                             int rows,
+                             int slots,
+                             int width);
+
 // The exact token ids this pass ran, so the reference can be regenerated on them.
 void dump_golden_tokens(const std::uint32_t* ids, int n);
 

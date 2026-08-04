@@ -3,6 +3,14 @@ interface working-set {
     use types.{error};
     use pipeline.{pipeline};
 
+    // A working set exposes only what is TRUE OF ITSELF: its extent, its
+    // shape, its lineage. Driver constants that merely happen to be reachable
+    // through it -- KV page size, folded-state byte size, buffered RS page
+    // size -- live on `model` instead. The engine serves exactly one model, so
+    // a per-resource copy could never disagree with the global; it would just
+    // be a second name for one fact, and callers would have to know that the
+    // two agree.
+
     // A contiguous, half-open span [start, start + len) of WorkingSet-relative
     // page indexes. The ONLY references that ever cross this API are these
     // relative indexes — never physical page ids.
@@ -43,9 +51,6 @@ interface working-set {
     // working set ever observes another's mutation.
     resource kv-working-set {
         constructor();
-
-        // Tokens per KV page for this working set's model/driver.
-        page-size: func() -> u32;
 
         // Current logical extent in pages, including reserved space whose
         // pages have not been written yet.
@@ -111,14 +116,8 @@ interface working-set {
     resource rs-working-set {
         constructor();
 
-        // Size in bytes of one folded recurrent-state object for this model.
-        state-size: func() -> u64;
-
         // Current number of buffered page slots.
         buffer-size: func() -> u32;
-
-        // Tokens per buffered RS page for this working set's model/driver.
-        buffer-page-size: func() -> u32;
 
         // Append `n` fresh buffered page slots; returns the contiguous range.
         // Slots are materialized lazily on their first write.

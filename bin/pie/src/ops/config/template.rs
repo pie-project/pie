@@ -46,7 +46,7 @@ telemetry = false
 
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/models
 "#;
 

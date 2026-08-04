@@ -24,6 +24,7 @@ struct RmsParams {
   uint axis_size;   // feature dim (hidden), e.g. 1024
   uint w_stride;    // weight stride along axis (1 for contiguous)
   uint plus_one;    // 1 => effective gain is (1.0f + weight) [Gemma/qwen3.5]
+  float gain;       // constant multiplier on the weight; 1.0 unless stated
 };
 
 template <typename T, int N_READS>
@@ -79,13 +80,15 @@ template <typename T, int N_READS>
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+      T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
       out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+        T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
         out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
       }
     }
@@ -151,13 +154,15 @@ template <typename T, int N_READS>
   out += row_base + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+      T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
       out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+        T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
         out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
       }
     }
@@ -170,8 +175,6 @@ template <typename T, int N_READS>
       const device itype*, const device itype*, device itype*,          \
       constant RmsParams&, constant int&, uint, uint, uint, uint);
 
-instantiate_rms_strided_row(float32, float, 4)
-instantiate_rms_strided_row(float16, half, 4)
 instantiate_rms_strided_row(bfloat16, bfloat, 4)
 
 #define instantiate_rms_single_row(name, itype, n_reads)               \
@@ -180,8 +183,6 @@ instantiate_rms_strided_row(bfloat16, bfloat, 4)
       const device itype*, const device itype*, device itype*,          \
       constant RmsParams&, uint, uint, uint, uint);
 
-instantiate_rms_single_row(float32, float, 4)
-instantiate_rms_single_row(float16, half, 4)
 instantiate_rms_single_row(bfloat16, bfloat, 4)
 
 // ── Fused norm + residual (+ optional layer scalar) — gemma4 ─────────────────
@@ -263,7 +264,8 @@ METAL_FUNC void rms_residual_impl(
   out += row + lid * N_READS;
   for (int i = 0; i < N_READS; i++) {
     if (lid * N_READS + N_READS <= axis_size || (lid * N_READS + i) < axis_size) {
-      const float wv = p.plus_one ? (1.0f + float(w[w_stride * i])) : float(w[w_stride * i]);
+      const float wv = p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                         : float(w[w_stride * i]));
       const float normed = wv * (float(x[i]) * local_inv_mean[0]);
       out[i] = static_cast<T>((normed + float(r[i])) * scale);
     }
@@ -317,6 +319,4 @@ template <typename T, int N_READS>
       constant RmsParams&, const device itype*, const device itype*,     \
       uint, uint, uint, uint);
 
-instantiate_rms_residual(float32, float, 4)
-instantiate_rms_residual(float16, half, 4)
 instantiate_rms_residual(bfloat16, bfloat, 4)

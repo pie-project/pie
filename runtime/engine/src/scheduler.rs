@@ -105,6 +105,24 @@ impl ControlCompletion {
 }
 
 // =============================================================================
+/// Host `CLOCK_MONOTONIC` timestamp used by scheduler timing records and the
+/// opt-in guest/client ledger clock.
+/// Callers guard this with [`fire_timing_enabled`] so disabled builds do not
+/// execute an `Instant::now()` on the hot path.
+pub(crate) fn fire_timing_now_us() -> u64 {
+    ledger_monotonic_ns() / 1_000
+}
+
+pub(crate) fn ledger_monotonic_ns() -> u64 {
+    let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, value.as_mut_ptr()) };
+    assert_eq!(status, 0, "CLOCK_MONOTONIC is unavailable");
+    let value = unsafe { value.assume_init() };
+    (value.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(value.tv_nsec as u64)
+}
+
 // Scheduler handle registry (moved out of `driver/registry.rs`)
 // =============================================================================
 

@@ -147,6 +147,10 @@ async fn run() -> anyhow::Result<ExitCode> {
         }
         Command::Config { cmd } => {
             startup::init_cli(&cli.global)?;
+            // Not `spawn_blocking`: `config init` used to download the
+            // Python-WASM runtime through `reqwest::blocking`, which builds a
+            // tokio runtime and drops it inside this one. Writing a config file
+            // no longer reaches the network, so there is nothing to isolate.
             ops::config::run(cmd, &cli.global)?;
             Ok(ExitCode::SUCCESS)
         }

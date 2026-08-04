@@ -128,6 +128,7 @@ ScratchPlan build_gptoss_scratch(const std::vector<Dispatch>& dag, const GptOssG
                 // Two outputs, and both are read by something else: the ids by
                 // all three routed matvecs, the weights by the combine.
                 expert_ids = fresh();
+                plan.expert_ids_by_layer.push_back(expert_ids);
                 expert_w = fresh();
                 rd(o, bi::TopkLogits, router_logits);
                 wr(o, bi::TopkIds, expert_ids);

@@ -40,24 +40,10 @@ std::size_t slice_offset(const Dispatch& d, const Gemma4Geometry& g, std::uint8_
 
 }  // namespace
 
-ScratchColoring color_gemma4_scratch(const std::vector<Dispatch>& dag, const ScratchPlan& plan,
-                                     bool no_recycle) {
-    std::vector<pie::metal::scratch::Use> uses;
-    uses.reserve(plan.uses.size());
-    for (const Use& u : plan.uses) {
-        uses.push_back({u.index, u.bind_index, u.value, u.is_write});
-    }
-    const auto colored = pie::metal::scratch::color_live_ranges(uses, gemma4_run_ends(dag),
-                                                               plan.value_count, no_recycle);
-    ScratchColoring out;
-    out.colors_used = colored.colors_used;
-    out.hazard_free = colored.hazard_free;
-    out.per_dispatch.resize(dag.size());
-    for (const Use& u : plan.uses) {
-        out.per_dispatch[std::size_t(u.index)].push_back(
-            {u.bind_index, colored.color[std::size_t(u.value)]});
-    }
-    return out;
+ScratchColoring color_gemma4_scratch(const std::vector<Dispatch>& dag,
+                                    const ScratchPlan& plan, bool no_recycle) {
+    return model::color_family_scratch(dag.size(), plan.uses, gemma4_run_ends(dag),
+                                       plan.value_count, no_recycle);
 }
 
 void bind_gemma4_dag(RawMetalContext& ctx, const BoundGemma4& b, const std::vector<Dispatch>& dag,
@@ -113,6 +99,13 @@ void bind_gemma4_dag(RawMetalContext& ctx, const BoundGemma4& b, const std::vect
                 bind_slot(ctx, ord, (std::uint8_t)bind::Sdpa::N, io(IoSlot::SeqLen));
                 break;
             }
+            // Declared by the shared routed template, never read at
+            // BIASED=false. See `BoundGemma4::zero_bias`.
+            case Kind::ExpertGate:
+            case Kind::ExpertUp:
+            case Kind::ExpertDown:
+                bind_slot(ctx, ord, (std::uint8_t)bind::GoQmv::Bias, b.zero_bias);
+                break;
             case Kind::RowGather:
                 bind_slot(ctx, ord, (std::uint8_t)bind::RowGather::Rows,
                           io(IoSlot::SampleRows));
@@ -174,6 +167,13 @@ void bind_gemma4_dag_mb(RawMetalContext& ctx, const BoundGemma4& b,
             case Kind::RopeQ:
             case Kind::RopeK:
                 bind_row(ord, (std::uint8_t)bind::Rope::Position, IoSlot::Position);
+                break;
+            // Declared by the shared routed template, never read at
+            // BIASED=false. See `BoundGemma4::zero_bias`.
+            case Kind::ExpertGate:
+            case Kind::ExpertUp:
+            case Kind::ExpertDown:
+                bind_slot(ctx, ord, (std::uint8_t)bind::GoQmv::Bias, b.zero_bias);
                 break;
             // NOT row-offset: it indexes the fire's rows, so it reads the slot
             // whole.

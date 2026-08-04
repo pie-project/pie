@@ -252,7 +252,10 @@ fn build(artifact: Artifact) -> Result<*mut PieLoaderWeightStore, String> {
     for (index, tensor) in tensors.iter().enumerate() {
         let bytes = arena.artifact.bytes(index).map_err(|e| e.to_string())?;
         let (data, nbytes) = (bytes.as_ptr(), bytes.len() as u64);
-        let file_offset = arena.artifact.file_offset(index).map_err(|e| e.to_string())?;
+        let file_offset = arena
+            .artifact
+            .file_offset(index)
+            .map_err(|e| e.to_string())?;
         let name = arena.store_str(&tensor.name);
         let runtime_dtype = arena.store_str(&tensor.runtime_dtype);
         let shape = arena.store_shape(&tensor.shape);
@@ -314,7 +317,10 @@ fn build(artifact: Artifact) -> Result<*mut PieLoaderWeightStore, String> {
         owner: std::ptr::null_mut(),
     };
     let owner = Box::into_raw(Box::new(arena)).cast::<c_void>();
-    Ok(Box::into_raw(Box::new(PieLoaderWeightStore { owner, ..header })))
+    Ok(Box::into_raw(Box::new(PieLoaderWeightStore {
+        owner,
+        ..header
+    })))
 }
 
 /// # Safety
@@ -880,11 +886,8 @@ mod tests {
                 PieLoaderStatus::Ok
             );
             let message = pie_loader_weight_store_error(writer);
-            let message = std::str::from_utf8(std::slice::from_raw_parts(
-                message.ptr,
-                message.len,
-            ))
-            .unwrap();
+            let message =
+                std::str::from_utf8(std::slice::from_raw_parts(message.ptr, message.len)).unwrap();
             assert!(
                 message.contains("declared as 8"),
                 "unhelpful message: {message}"

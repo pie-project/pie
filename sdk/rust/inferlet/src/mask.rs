@@ -54,22 +54,16 @@ pub fn pack_allowed(vocab: usize, allowed: &[u32]) -> Vec<u32> {
     mask
 }
 
-/// Compose two packed masks by word-wise bitwise-AND (`acc &= other`): the
-/// intersection of the allowed sets — the AND of multiple constraints, and the
-/// packed-bit analog of the old `brle_and`. Both must be the same word count.
-#[inline]
-pub fn and_into(acc: &mut [u32], other: &[u32]) {
-    debug_assert_eq!(acc.len(), other.len(), "mask word-count mismatch");
-    for (a, b) in acc.iter_mut().zip(other) {
-        *a &= *b;
+/// Expand a packed mask into one `bool` per token — the allocating inverse of
+/// [`bit_allowed`], for callers that scan the whole vocabulary anyway. An empty
+/// `packed` means the constraint is inactive, so everything is allowed.
+pub fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
+    if packed.is_empty() {
+        return vec![true; vocab as usize];
     }
-}
-
-/// Convert a bf16 bit pattern to `f32` exactly as the driver does
-/// (`__uint_as_float(h << 16)`): bf16 is the high 16 bits of an `f32`.
-#[inline]
-pub fn bf16_hi_to_f32(h: u16) -> f32 {
-    f32::from_bits((h as u32) << 16)
+    (0..vocab as usize)
+        .map(|j| bit_allowed(packed, j))
+        .collect()
 }
 
 /// Argmax over `logits` with the packed mask applied — the host reference for

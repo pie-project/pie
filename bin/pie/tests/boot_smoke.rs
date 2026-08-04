@@ -55,7 +55,7 @@ fn standalone_toml(snapshot: &str) -> String {
          \n\
          [model]\n\
          name = \"smoke\"\n\
-         hf_repo = \"{snapshot}\"\n\
+         model = \"{snapshot}\"\n\
          \n\
          [driver]\n\
          type = \"dummy\"\n\

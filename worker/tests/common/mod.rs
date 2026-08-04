@@ -57,8 +57,7 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
     // comparing across two processes -- one boot per process is the harness's
     // standing constraint.
     let streaming = if std::env::var("PIE_CUDA_TEST_STREAM_EXPERTS").as_deref() == Ok("1") {
-        let gb = std::env::var("PIE_CUDA_TEST_EXPERT_CACHE_GB")
-            .unwrap_or_else(|_| "0".to_string());
+        let gb = std::env::var("PIE_CUDA_TEST_EXPERT_CACHE_GB").unwrap_or_else(|_| "0".to_string());
         {
             let host = std::env::var("PIE_CUDA_TEST_EXPERT_HOST_CACHE_GB")
                 .ok()
@@ -91,7 +90,7 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
          \n\
          [model]\n\
          name = \"default\"\n\
-         hf_repo = \"{snapshot_path}\"\n\
+         model = \"{snapshot_path}\"\n\
          \n\
          [model.driver]\n\
          type = \"cuda_native\"\n\

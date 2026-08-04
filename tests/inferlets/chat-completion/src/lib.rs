@@ -7,9 +7,8 @@
 //! The host reads each sampled token for streaming detokenization and stop-token
 //! handling; the sampled token itself remains device-carried into the next pass.
 
-use inferlet::ptir::Taken;
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16; // tokens per pool page
@@ -50,12 +49,12 @@ fn default_top_p() -> f32 {
 /// `r` is the taken `[2]` u32 rng state (`[key, ctr]`) driving the Gumbel noise.
 /// Returns the sampled token `[1]` i32. Zero temperature is exact greedy
 /// decoding; positive temperatures use nucleus sampling.
-fn sample_token(r: &Taken, temperature: f32, top_p: f32, vocab: u32) -> Tensor {
+fn sample_token(r: &Tensor, temperature: f32, top_p: f32, vocab: u32) -> Tensor {
     let logits = intrinsics::logits(); // [1, vocab] f32 (read-out row)
     if temperature == 0.0 {
         return cast(&reduce_argmax(&logits), dtype::i32);
     }
-    let scaled = div(&logits, temperature.max(1e-4));
+    let scaled = &logits / temperature.max(1e-4);
     let _ = vocab;
     nucleus_sample(&scaled, top_p, r)
 }
@@ -69,7 +68,7 @@ async fn main(input: Input) -> Result<String> {
         return Err("temperature must be finite".into());
     }
 
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
 
     let temperature = input.temperature;
     let top_p = input.top_p;
@@ -92,9 +91,7 @@ async fn main(input: Input) -> Result<String> {
     let pool = pool_pages * PAGE_T;
 
     let ws = WorkingSet::new();
-    let slots = ws
-        .reserve(pool_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    let slots = ws.reserve(pool_pages).context("ws.reserve")?;
     let pool_ids = slots.ids().to_vec();
 
     // ── ONE PIPELINE (R4-4): prefill and decode are one sequential stream.
@@ -105,8 +102,8 @@ async fn main(input: Input) -> Result<String> {
     let g0 = {
         let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
         let toks_p = Channel::from(prompt_i32).named("toks_p"); // [N] i32 (seeded)
-        let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-        let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+        let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+        let positions_p = Channel::from_iter(0..n).named("positions_p");
 
         // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
         let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
@@ -127,44 +124,40 @@ async fn main(input: Input) -> Result<String> {
             .flat_map(|i| (0..pool).map(move |j| j <= i))
             .collect();
         let mask_p = Channel::from_shaped([n, pool], mask_pv).named("mask_p");
-        let rng_p = Channel::from(vec![0x51ed_u32, 0]).named("rng_p");
+        let rng_p = Channel::from([0x51ed_u32, 0]).named("rng_p");
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
-            ..,
-            ..,
-            &klen_p,
-            &pages_p,
-            &page_indptr_p,
-            &w_slot_p,
-            &w_off_p,
-            &positions_p,
-            Some(&mask_p),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: Some(&mask_p),
+            },
         )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
             let tok = sample_token(&r, temperature, top_p, vocab);
-            let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
+            let r_next = &r + iota(2); // advance ctr: [key, ctr+1]
             g0_ch.put(&tok);
             rng_p.put(&r_next);
         });
 
-        fwd_p
-            .submit(&pipe)
-            .map_err(|e| format!("prefill submit: {e}"))?;
+        fwd_p.submit(&pipe).context("prefill submit")?;
         // max_tokens == 1: the prefill spends the whole budget, so it was
         // the stream's last submit — finish() right after it (F7).
-        g0_ch
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("g0 take: {e}"))?[0]
+        g0_ch.take_host::<i32>().await?
     };
 
-    let mut chat_dec = chat::Decoder::new();
+    let chat_dec = chat::Decoder::new();
     let mut text = String::new();
     let mut done = stop.contains(&(g0 as u32));
     if !stop.contains(&(g0 as u32)) {
@@ -203,41 +196,43 @@ async fn main(input: Input) -> Result<String> {
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("out");
-    let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
-    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+    let rng = Channel::from([0x9e37_u32, 0]).named("rng");
+    let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
     fwd.attention(
         &ws,
-        ..,
-        (n / ws.page_size())..,
-        &klen,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &pos,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (n / kv_page_size())..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &pos,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         // TAKES + compute first, PUTS last (value-id discipline).
-        let base = fill.take().tensor(); // [1] u32 — position this fire writes
-        let pids = pool_ids_ch.take().tensor();
+        let base = fill.take(); // [1] u32 — position this fire writes
+        let pids = pool_ids_ch.take();
         let r = rng.take();
 
         let tok = sample_token(&r, temperature, top_p, vocab); // [1] i32
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
 
-        let logical_slot = div(&base, PAGE_T);
+        let logical_slot = &base / PAGE_T;
         let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = rem(&base, PAGE_T);
-        let klen_v = add(&base, 1u32);
-        let next_free = add(&base, 1u32);
+        let w_off_v = &base % PAGE_T;
+        let klen_v = &base + 1u32;
+        let next_free = &base + 1u32;
         let pages_v = reshape(&pids, [pool_pages]);
         // Page count tracks the new kv length, never the pool size.
-        let page_count = div(add(&klen_v, PAGE_T - 1), PAGE_T);
-        let pidx_v = mul(iota(2), broadcast(&page_count, [2]));
+        let page_count = (&klen_v + (PAGE_T - 1)) / PAGE_T;
+        let pidx_v = iota(2) * broadcast(&page_count, [2]);
 
         // Device-resolved geometry is loop-carried: the host never drains
         // these rings, so the graph has to take before it puts or the
@@ -268,11 +263,7 @@ async fn main(input: Input) -> Result<String> {
         max_tokens.saturating_sub(1) // g0 already emitted
     };
     run_ahead(&pipe, &fwd, budget, async || {
-        let t = out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("out.take: {e}"))?;
+        let t = out.take_host::<Vec<i32>>().await?;
         let token = *t.first().unwrap_or(&0) as u32;
         if stop.contains(&token) {
             return Ok(ControlFlow::Break(()));
