@@ -316,6 +316,9 @@ enum class GdnCoreRecurrent : uint8_t {
     Params       = 10, // GdnCoreParams& (constant)
     SlotOfToken  = 11, // u32[N] — append-only slotted-MB variant only
 };
+// The prefill recurrent scan reuses these argument-table ordinals but reads
+// only RecurrentState, CoreOut, PreQ/PreK/PreGate, Params, and SlotOfToken;
+// buffers 0/1/4/5/9 belong only to the per-token recurrent kernel.
 
 // gated RMSNorm (GDN; golden `gdn_core` = post-norm): Out = (1+0)·rmsnorm(X)·silu(Z)
 // over V_d per V_head. W = gate_norm_w (RAW, F32, NO +1). Buffer 4 = GatedRmsParams

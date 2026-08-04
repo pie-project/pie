@@ -10,6 +10,7 @@
 
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg}
 #include "mtl4_context.hpp"
+#include "../../kernels/gdn_params.h"
 #include "../shared_kernels.hpp"
 
 namespace pie::metal {
@@ -25,10 +26,23 @@ struct GatedRmsParams {  // gated_rms.metal:20  (buffer 4)
     float eps;
     uint32_t vd;         // value-head dim (reduction axis)
 };
-struct GdnCoreParams {   // gdn_core.metal:39  (buffer 11)
-    int32_t Dk, Dv, Hk, Hv, conv_dim, Kc, q_off, k_off, v_off;
-    float   eps, inv_sqrt_dk;
-};
+static_assert(sizeof(GdnCoreParams) == 44);
+
+GdnCoreParams gdn_core_params(const DecodeGeometry& g) {
+    return {
+        g.gdn_k_dim,
+        g.gdn_v_dim,
+        g.gdn_k_heads,
+        g.gdn_v_heads,
+        g.gdn_conv_dim,
+        g.gdn_conv_k,
+        0,
+        g.gdn_k_heads * g.gdn_k_dim,
+        2 * g.gdn_k_heads * g.gdn_k_dim,
+        g.eps,
+        1.0f / std::sqrt(float(g.gdn_k_dim)),
+    };
+}
 
 // Bind a POD constant value into a fresh resident slot at (ordinal, bind_index).
 template <class V>
@@ -226,31 +240,19 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
 
             case Kernel::GdnPrep: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       /*q_off*/0, /*k_off*/g.gdn_k_heads * g.gdn_k_dim,
-                                       /*v_off*/2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnPrep::Params, gp, &count);
                 break;
             }
 
             case Kernel::GdnPrepSlotted: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       0, g.gdn_k_heads * g.gdn_k_dim,
-                                       2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnPrep::Params, gp, &count);
                 break;
             }
 
             case Kernel::GdnCore: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       /*q_off*/0, /*k_off*/g.gdn_k_heads * g.gdn_k_dim,
-                                       /*v_off*/2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 const uint8_t pbuf = gdn_prep ? (uint8_t)bind::GdnCoreRecurrent::Params
                                               : (uint8_t)bind::GdnCore::Params;
                 bind_const<GdnCoreParams>(ctx, ord, pbuf, gp, &count);
@@ -258,11 +260,7 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             }
 
             case Kernel::GdnCoreSlotted: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       0, g.gdn_k_heads * g.gdn_k_dim,
-                                       2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnCoreRecurrent::Params,
                                           gp, &count);
                 break;
