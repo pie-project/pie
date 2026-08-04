@@ -2081,3 +2081,36 @@ mix, consistent with the pre-anchor 1.22x (the hook cells' wins ride
 shapes this small battery barely exercises; the per-axis numbers
 remain the scaling story). The A/B stands as the campaign's standing
 perf regression: composed strictly dominates at every measured shape.
+
+## SESSION LEDGER (2026-08-04) — where the north star stands
+
+What EXECUTES BY DEFAULT at this tip, all verified live on the L40S:
+
+- FOUR AXES, ONE FIRE: hook, mask, correction, depth compose pairwise
+  and jointly (census 15/15 PRODUCT on debug, 14/15 at release with
+  one phasing artifact; 4-axis fires routine). Order
+  [plain | truncated | hooked | masked]; the depth middle
+  stash/restores; the mask suffix splits; corrections span-group;
+  hooks peel. Composed strictly dominates solo at every measured
+  shape (1.18-1.22x on the small five-lane mix; per-axis: mask
+  const-6% tax vs +27%, depth 1.32-2.25x, correction 3.3-5.0x,
+  stream overlap 17%/layer).
+- THREE IR AXES: Peel{HookFreePrefix}, Peel{UnmaskedPrefix},
+  depth_window — each stated in the declaration, walked by the
+  interpreter, spelled by the emitter, referenced by the hand-written
+  body. Goldens pin all three.
+- THE ADAPTER SURFACE: fwd.adapter(site, |x,y| expr) with three
+  validated forms (LoRA byte-parity, IA3 ones-identity, DoRA
+  composite-identity), per-site pairs, arity-selected wire.
+- REAL POLICY: doc-isolation (RAG contamination block) — blinding
+  proven solo AND under composition.
+- SAFETY CLOSURES: both-axes lanes never drop k (uniform stamp +
+  k-uniformity grouping); every remaining refusal is loud or a
+  recorded safe degradation.
+
+OPEN, with entry points recorded in memory arcs 77-81: the
+step-logit oracle (top target: the two known NUMERIC-class
+cross-instance state effects — lora first-instance, masked-k8
+after-plain), true group splitting, the spec-verify STRUCTURAL
+producer, R=32-scale WEIGHT (hardware-bound), declared spatial+hook
+walker rung, windowed range-2.
