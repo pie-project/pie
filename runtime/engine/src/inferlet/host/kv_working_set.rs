@@ -202,9 +202,6 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         on: Resource<Pipeline>,
     ) -> Result<Result<Resource<KvWorkingSet>, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // S1: copy-on-write can rewrite translation entries behind a cloned
-        // plan's snapshot — continuation synthesis refuses forked processes.
-        crate::scheduler::mark_forked(self.id());
         let ws = match scoped_working_set(self, &this, &on)? {
             Ok(ws) => ws,
             Err(error) => return Ok(Err(error)),

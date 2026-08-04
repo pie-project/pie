@@ -74,11 +74,6 @@ pub(crate) fn register_residency(pid: uuid::Uuid, residency: Weak<Mutex<ProcessR
 
 pub(crate) fn unregister_residency(pid: uuid::Uuid) {
     RESIDENCIES.write().unwrap().remove(&pid);
-    // The scheduler's pid-keyed side tables die with the process: the
-    // continuation-wave queue-depth/cancel-debt mirrors (previously never
-    // forgotten — a slow leak) and the S1 fork mark.
-    crate::scheduler::cont_qdepth_forget(pid);
-    crate::scheduler::forget_forked(pid);
 }
 
 fn with_residency<R: Default>(pid: uuid::Uuid, f: impl FnOnce(&mut ProcessResidency) -> R) -> R {
