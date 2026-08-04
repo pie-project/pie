@@ -70,6 +70,29 @@ impl Round {
     }
 }
 
+/// Run the load once and throw the result away.
+///
+/// **Not optional, and not test scaffolding.** Measured on an L40S: the first
+/// round of a sweep came in at 844 tok/s and the identical configuration
+/// measured 1228 tok/s when it ran again at the end — 45% apart, with the
+/// candidates in between judged against whichever position they happened to
+/// occupy. A sweep without this ranks round order.
+///
+/// It is a separate call rather than something [`measure`] does silently,
+/// because a warmup folded into every round would pay the cost N times and
+/// hide it. The first round is the one that is different; the rest are not.
+pub async fn warmup(addr: &str, program: &str, inputs: &[String]) -> Result<()> {
+    let run = fleet::run(addr, program, inputs).await;
+    if run.failed_lanes() > 0 {
+        anyhow::bail!(
+            "{} of {} lanes failed during warmup; the fleet cannot run here at all",
+            run.failed_lanes(),
+            inputs.len()
+        );
+    }
+    Ok(())
+}
+
 /// Set the knobs, run the load, report.
 ///
 /// Every lane connects fresh and retires before this returns, so the next call
