@@ -22,8 +22,8 @@
 //! round after a partial acceptance drafts from a stale tail and typically
 //! re-corrects in one round; correctness always comes from verification.
 
-use inferlet::ptir::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
+use inferlet::chat;
+use inferlet::ptir::attention::prelude::*;
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
@@ -80,57 +80,48 @@ async fn main(input: Input) -> Result<String> {
     let ws = WorkingSet::new();
     let max_extent = n + input.max_tokens as u32 + (channel_capacity() as u32 + 1) * w;
     let max_pages = max_extent.div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let pipeline = Pipeline::new();
 
     // ── Prefill: host-known prompt, one fire ────────────────────────────
-    let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let prefill_indptr = Channel::from(vec![0u32, n]).named("prefill_indptr");
-    let prefill_positions = Channel::from((0..n).collect::<Vec<_>>()).named("prefill_positions");
-    let prefill_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("prefill_pages");
+    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
+    let prefill_indptr = Channel::from([0u32, n]).named("prefill_indptr");
+    let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
+    let prefill_pages = Channel::from_iter(0..max_pages).named("prefill_pages");
     let prefill_page_indptr =
-        Channel::from(vec![0u32, n.div_ceil(PAGE_T)]).named("prefill_page_indptr");
-    let prefill_w_slot =
-        Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("prefill_w_slot");
-    let prefill_w_off =
-        Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("prefill_w_off");
+        Channel::from([0u32, n.div_ceil(PAGE_T)]).named("prefill_page_indptr");
+    let prefill_w_slot = Channel::from_iter((0..n).map(|p| p / PAGE_T)).named("prefill_w_slot");
+    let prefill_w_off = Channel::from_iter((0..n).map(|p| p % PAGE_T)).named("prefill_w_off");
     let seed_out = Channel::new([1], dtype::i32).named("seed");
     let drafts_out = Channel::new([k], dtype::i32).named("drafts");
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
-    let prefill_kv_len = Channel::from(vec![n]).named("prefill_kv_len");
+    let prefill_kv_len = Channel::from([n]).named("prefill_kv_len");
     prefill.attention(
         &ws,
-        ..,
-        ..,
-        &prefill_kv_len,
-        &prefill_pages,
-        &prefill_page_indptr,
-        &prefill_w_slot,
-        &prefill_w_off,
-        &prefill_positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &prefill_kv_len,
+            pages: &prefill_pages,
+            page_indptr: &prefill_page_indptr,
+            w_slot: &prefill_w_slot,
+            w_off: &prefill_w_off,
+            positions: &prefill_positions,
+            mask: None,
+        },
     )?;
     prefill.epilogue(move || {
         seed_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
         drafts_out.put(reduce_argmax(intrinsics::mtp_logits(k)));
     });
-    prefill
-        .submit(&pipeline)
-        .map_err(|e| format!("prefill: {e}"))?;
+    prefill.submit(&pipeline).context("prefill")?;
 
-    let seed = seed_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read prefill seed: {e}"))?[0] as u32;
+    let seed = seed_out.take_host::<i32>().await? as u32;
     let seed_drafts = drafts_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read prefill drafts: {e}"))?
+        .take_host::<Vec<i32>>()
+        .await?
         .into_iter()
         .map(|token| token as u32)
         .collect::<Vec<_>>();
@@ -139,10 +130,10 @@ async fn main(input: Input) -> Result<String> {
     let mut window0 = vec![seed];
     window0.extend_from_slice(&seed_drafts);
     let window = Channel::from(pad_tokens(&window0, w as usize)).named("window");
-    let len = Channel::from(vec![n]).named("len");
-    let kv_len = Channel::from((1..=w).map(|row| n + row).collect::<Vec<_>>()).named("kv_len");
-    let embed_indptr = Channel::from((0..=w).collect::<Vec<_>>()).named("embed_indptr");
-    let positions = Channel::from((n..n + w).collect::<Vec<_>>()).named("positions");
+    let len = Channel::from([n]).named("len");
+    let kv_len = Channel::from_iter((1..=w).map(|row| n + row)).named("kv_len");
+    let embed_indptr = Channel::from_iter(0..=w).named("embed_indptr");
+    let positions = Channel::from_iter(n..n + w).named("positions");
     let tiled_pages: Vec<u32> = (0..w).flat_map(|_| 0..max_pages).collect();
     let pages = Channel::from_shaped([w, max_pages], tiled_pages).named("pages");
     let mut initial_page_indptr = vec![0u32];
@@ -151,9 +142,9 @@ async fn main(input: Input) -> Result<String> {
             .push(initial_page_indptr.last().copied().unwrap() + length.div_ceil(PAGE_T));
     }
     let page_indptr = Channel::from(initial_page_indptr).named("page_indptr");
-    let w_slot = Channel::from((n..n + w).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("w_slot");
-    let w_off = Channel::from((n..n + w).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("w_off");
-    let readout = Channel::from((0..w).collect::<Vec<_>>()).named("readout");
+    let w_slot = Channel::from_iter((n..n + w).map(|p| p / PAGE_T)).named("w_slot");
+    let w_off = Channel::from_iter((n..n + w).map(|p| p % PAGE_T)).named("w_off");
+    let readout = Channel::from_iter(0..w).named("readout");
     let stopped = Channel::from_shaped([1u32], vec![false]).named("stopped");
     let committed_out = Channel::new([w], dtype::i32)
         .capacity(channel_capacity() as u32)
@@ -164,31 +155,32 @@ async fn main(input: Input) -> Result<String> {
     fwd.readout(&readout)?;
     fwd.attention(
         &ws,
-        ..,
-        (n / PAGE_T)..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (n / PAGE_T)..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     let stage_stop_tokens = stop_tokens.clone();
     fwd.epilogue(move || {
-        let win = window.take().tensor();
-        let base = len.take().tensor();
-        kv_len.take();
-        let stop_prev = stopped.take().tensor();
-        let neg1_w = broadcast(Tensor::constant(TOKEN_PAD), [w]);
+        let win = window.take();
+        let base = len.take();
+        let stop_prev = stopped.take();
+        let neg1_w = broadcast(TOKEN_PAD, [w]);
 
         // Verify: row i holds the truth for window slot i + 1. A draft is
         // accepted while every draft before it matched (cumprod prefix).
         let targets = reduce_argmax(intrinsics::logits());
-        let drafts = gather(&win, add(iota(k), 1u32));
+        let drafts = gather(&win, iota(k) + 1u32);
         let truth = gather(&targets, iota(k));
-        let acc = cumprod(cast(eq(&drafts, &truth), DType::F32));
-        let m = reshape(cast(reduce_sum(&acc), DType::U32), [1]);
+        let acc = cumprod(cast(eq(&drafts, &truth), dtype::f32));
+        let m = reshape(cast(reduce_sum(&acc), dtype::u32), [1]);
 
         // Committed this round: slot 0 plus the accepted prefix, `-1`-padded
         // to the envelope; all `-1` on post-stop fires.
@@ -199,25 +191,18 @@ async fn main(input: Input) -> Result<String> {
 
         // Stop once any committed token is a stop token: later fires carry
         // all-`-1` windows and the frozen length below.
-        let mut eos_hit = broadcast(Tensor::constant(false), [w]);
+        let mut eos_hit = broadcast(false, [w]);
         for &stop in &stage_stop_tokens {
-            eos_hit = or(&eos_hit, eq(&committed, Tensor::constant(stop as i32)));
+            eos_hit = or(&eos_hit, eq(&committed, stop as i32));
         }
-        let eos_any = ne(
-            reduce_max(cast(&eos_hit, DType::U32)),
-            Tensor::constant(0u32),
-        );
+        let eos_any = ne(reduce_max(cast(&eos_hit, dtype::u32)), 0u32);
         let stop_next = or(&stop_prev, reshape(eos_any, [1]));
         stopped.put(&stop_next);
 
         // Loop-carry: the length advances by the accepted count only —
         // rejected drafts stay above it and are overwritten next fire.
-        let advance = select(
-            &stop_prev,
-            broadcast(Tensor::constant(0u32), [1]),
-            add(&m, 1u32),
-        );
-        let next_base = add(&base, &advance);
+        let advance = select(&stop_prev, broadcast(0u32, [1]), &m + 1u32);
+        let next_base = &base + &advance;
 
         // Next window: the correction/bonus token followed by fresh MTP
         // drafts, or all `-1` once stopped.
@@ -225,31 +210,25 @@ async fn main(input: Input) -> Result<String> {
         let drafts_next = reduce_argmax(intrinsics::mtp_logits(k));
         let win_next = scatter_set(
             scatter_set(&neg1_w, Tensor::constant(vec![0u32]), &x_next),
-            add(iota(k), 1u32),
+            iota(k) + 1u32,
             &drafts_next,
         );
         let stop_next_w = broadcast(&stop_next, [w]);
         let next_window = select(&stop_next_w, &neg1_w, &win_next);
-        let next_live = ne(&next_window, Tensor::constant(TOKEN_PAD));
-        let next_live_u32 = cast(&next_live, DType::U32);
-        let next_live_f32 = cast(&next_live, DType::F32);
-        let next_rank = cast(sub(cumsum(&next_live_f32), &next_live_f32), DType::U32);
-        let next_positions = add(broadcast(&next_base, [w]), &next_rank);
+        let next_live = ne(&next_window, TOKEN_PAD);
+        let next_live_u32 = cast(&next_live, dtype::u32);
+        let next_rank = cumsum(&next_live_u32) - &next_live_u32;
+        let next_positions = broadcast(&next_base, [w]) + &next_rank;
 
-        let next_kv_len = add(&next_positions, &next_live_u32);
-        let page_counts = div(add(&next_kv_len, PAGE_T - 1), PAGE_T);
-        let page_tail = cast(cumsum(cast(&page_counts, DType::F32)), DType::U32);
-        let next_page_indptr = scatter_set(
-            broadcast(Tensor::constant(0u32), [w + 1]),
-            add(iota(w), 1u32),
-            &page_tail,
-        );
+        let next_kv_len = &next_positions + &next_live_u32;
+        let page_counts = next_kv_len.div_ceil(PAGE_T);
+        let page_tail = cumsum(&page_counts);
+        let next_page_indptr = scatter_set(broadcast(0u32, [w + 1]), iota(w) + 1u32, &page_tail);
         len.put(&next_base);
         kv_len.put(&next_kv_len);
         positions.put(&next_positions);
-        w_slot.put(div(&next_positions, PAGE_T));
-        w_off.put(rem(&next_positions, PAGE_T));
-        page_indptr.take();
+        w_slot.put(&next_positions / PAGE_T);
+        w_off.put(&next_positions % PAGE_T);
         page_indptr.put(&next_page_indptr);
         window.put(&next_window);
     });
@@ -262,11 +241,7 @@ async fn main(input: Input) -> Result<String> {
     // Every verify round commits at least one token, so `max_tokens` bounds
     // the number of rounds.
     run_ahead(&pipeline, &fwd, input.max_tokens, async || {
-        let round = committed_out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("read committed round: {e}"))?;
+        let round = committed_out.take_host::<Vec<i32>>().await?;
         let live = unpad_tokens(&round);
         if live.is_empty() {
             return Ok(ControlFlow::Continue(()));
@@ -297,5 +272,5 @@ async fn main(input: Input) -> Result<String> {
         "mtp-speculative-decoding: rounds={rounds} drafted={drafted} accepted={accepted} \
          acceptance_rate={acceptance_rate:.3}"
     );
-    wit_model::decode(&generated)
+    model::decode(&generated)
 }

@@ -20,7 +20,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "pie_native/launch/op_table.hpp"
+#include "pie/driver/launch/op_table.hpp"
 #include <rng_contract.generated.h>
 #include "pipeline/tier0/tier0_kernels.cuh"  // for the BinKind/UnKind/... enums (host-safe)
 

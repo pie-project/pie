@@ -1,0 +1,32 @@
+{
+  "alignment": 1,
+  "tensors": [
+    {
+      "name": "w",
+      "expr": {
+        "Cast": {
+          "src": { "Src": "raw" },
+          "to": {
+            "Quant": {
+              "scheme": "Mxfp4E2M1E8M0",
+              "logical_dtype": "BF16",
+              "bits_per_element": 4,
+              "group_size": 32,
+              "channel_axis": 1
+            }
+          }
+        }
+      },
+      "shape": [2, 32],
+      "encoding": {
+        "Quant": {
+          "scheme": "Mxfp4E2M1E8M0",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": 1
+        }
+      }
+    }
+  ]
+}

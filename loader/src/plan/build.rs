@@ -64,12 +64,31 @@ pub fn build(
     contract: &ModelContract,
     target: StorageTarget,
 ) -> Result<LoadPlan> {
+    build_instance(metadata, contract, target, None)
+}
+
+/// [`build`], resolved as one instance of a group.
+///
+/// `instance` is what the group's index nodes stand for. `None` is the resident
+/// contract, where an index node is a contract error rather than a number --
+/// which is why this takes an `Option` instead of defaulting to zero.
+pub fn build_instance(
+    metadata: &CheckpointMetadata,
+    contract: &ModelContract,
+    target: StorageTarget,
+    instance: Option<u32>,
+) -> Result<LoadPlan> {
     let sources = Sources::new(metadata);
     let partition = Partition::new(target.tp_rank, target.tp_size);
+    let resolver = Resolver::new(&sources, partition);
+    let resolver = match instance {
+        Some(index) => resolver.for_instance(index),
+        None => resolver,
+    };
     let mut builder = Builder {
         sources: &sources,
         program: LoadPlan::empty(target),
-        resolver: Resolver::new(&sources, partition),
+        resolver,
         values: HashMap::new(),
         finalized: HashSet::new(),
         alignment: contract.alignment.max(1),
@@ -143,6 +162,11 @@ pub fn build(
         builder.program.attachments.push(QuantAttachment {
             tensor: of,
             scale_tensor: TensorId(index as u32),
+            // A checkpoint that ships an affine triplet ships its zero points as
+            // a tensor of their own, which the contract declares in its own
+            // right; only an encode the loader performs generates one, and only
+            // that path has an id to record here.
+            zero_point_tensor: None,
             granularity: scales.granularity,
             group_size: scales.group_size,
             channel_axis: scales.channel_axis,
@@ -281,12 +305,19 @@ impl Builder<'_> {
                         },
                         Vec::new(),
                     ),
-                    ScaleFactor::PerGroup { by, group, axis } => {
+                    ScaleFactor::PerBlock { by } => {
+                        // Written down here because here is where both shapes
+                        // are known and neither executor should have to trust
+                        // that it reconstructed the same ratio the type checker
+                        // did. `infer` has already required equal rank and an
+                        // exact division on every axis.
+                        let operand = self.resolver.infer(src, &contract.name)?;
+                        let factor_ty = self.resolver.infer(by, &contract.name)?;
+                        let blocks = block_sizes(&operand.shape, &factor_ty.shape)?;
                         let factors = self.scale_factors(by, &contract.name)?;
                         (
                             TransformSpec {
-                                scale_group: *group,
-                                scale_axis: axis.0,
+                                scale_blocks: blocks,
                                 from: source_scheme(&elements),
                                 ..TransformSpec::default()
                             },
@@ -328,7 +359,13 @@ impl Builder<'_> {
             // `specialize` has already rewritten every shard into this rank's
             // slice, so this case is unreachable. It is listed with the
             // fragment it belongs to rather than made an exception.
-            | Expr::Shard { .. } => (self.affine(&expr, &decl)?, decl),
+            | Expr::Shard { .. }
+            // The two group nodes are unreachable here for the same reason and
+            // one step earlier: `specialize` resolves an instance's name and
+            // its band before typing, so by the time a group plan is lowered
+            // they are a `Src` and a `Slice`.
+            | Expr::SrcIndexed(_)
+            | Expr::Select { .. } => (self.affine(&expr, &decl)?, decl),
         };
 
         check_declared_encoding(contract, &decl)?;
@@ -920,27 +957,57 @@ impl Builder<'_> {
         };
         let layout = ScaleLayout::for_encode(spec.scheme, &decl.shape)
             .map_err(|err| annotate(err, &decl.name))?;
-        let id = TensorId(self.next_generated_tensor);
-        self.next_generated_tensor = self.next_generated_tensor.saturating_add(1);
+        // Both metadata tensors are allocated before the attachment is pushed,
+        // because the attachment has to name the zero point and an affine weight
+        // whose zero point is unnamed is not a weight with a defaulted offset --
+        // it is one no kernel can dequantize.
+        let scales = self.generated_metadata_decl(decl, &layout, layout.suffix)?;
+        let zero_point = match layout.zero_point_suffix {
+            Some(suffix) => Some(self.generated_metadata_decl(decl, &layout, suffix)?),
+            None => None,
+        };
         // Stated here because here is where both halves are known. The
         // granularity is the encode kernel's, describing the layout it writes,
         // not anything readable off `spec`.
         self.program.attachments.push(QuantAttachment {
             tensor: decl.id,
-            scale_tensor: id,
+            scale_tensor: scales.id,
+            zero_point_tensor: zero_point.as_ref().map(|decl| decl.id),
             granularity: layout.granularity,
             group_size: layout.group_size,
             channel_axis: layout.channel_axis,
             scale_form: layout.scale_form,
         });
-        Ok(vec![TensorDecl {
+        // Order is the encode instruction's output order, after the weight: a
+        // kernel writing three tensors is told which is which by position.
+        let mut out = vec![scales];
+        out.extend(zero_point);
+        Ok(out)
+    }
+
+    /// One of the tensors an encode publishes beside its output, named and
+    /// numbered. Split out of `quant_metadata_outputs` only because an affine
+    /// scheme needs two of them and a borrow cannot be held across both.
+    fn generated_metadata_decl(
+        &mut self,
+        weight: &TensorDecl,
+        layout: &ScaleLayout,
+        suffix: &str,
+    ) -> Result<TensorDecl> {
+        let name = layout
+            .naming
+            .apply(&weight.name, suffix)
+            .map_err(|err| annotate(err, &weight.name))?;
+        let id = TensorId(self.next_generated_tensor);
+        self.next_generated_tensor = self.next_generated_tensor.saturating_add(1);
+        Ok(TensorDecl {
             id,
-            name: format!("{}{}", decl.name, layout.suffix),
-            shape: layout.shape,
-            encoding: layout.encoding,
+            name,
+            shape: layout.shape.clone(),
+            encoding: layout.encoding.clone(),
             alignment: self.alignment,
             visibility: Visibility::Public,
-        }])
+        })
     }
 
     fn tile_map(
@@ -1191,6 +1258,32 @@ impl Builder<'_> {
 ///
 /// `None` says the elements are already numbers and only the multiply is
 /// wanted; `Some` says they have to be unpacked first, and names how.
+/// Elements of the operand per factor, on each axis.
+///
+/// `infer_scale_per_block` has already checked equal rank and an exact
+/// division, so a failure here is a compiler fault rather than a bad contract.
+fn block_sizes(operand: &[i64], factors: &[i64]) -> Result<Vec<i64>> {
+    if operand.len() != factors.len() {
+        return Err(Error::Internal(
+            "scale factors of a different rank should have been rejected by infer".to_string(),
+        ));
+    }
+    operand
+        .iter()
+        .zip(factors)
+        .map(|(&extent, &count)| {
+            if count <= 0 || extent % count != 0 {
+                return Err(Error::Internal(
+                    "scale factors that do not block the operand should have been \
+                     rejected by infer"
+                        .to_string(),
+                ));
+            }
+            Ok(extent / count)
+        })
+        .collect()
+}
+
 fn source_scheme(encoding: &Encoding) -> Option<QuantScheme> {
     match encoding {
         Encoding::Quant(spec) => Some(spec.scheme),
@@ -1209,12 +1302,53 @@ struct ScaleLayout {
     /// Appended to the weight's declared name. Two conventions, inherited from
     /// what the drivers already look for.
     suffix: &'static str,
+    /// The zero point's suffix, for an affine scheme, or `None` for a symmetric
+    /// one. Its shape and encoding are the scales' -- an affine scheme offsets
+    /// exactly the groups it scales -- so only the name differs and only the
+    /// name is stated.
+    zero_point_suffix: Option<&'static str>,
+    /// Whether the suffixes extend the weight's name or replace its last
+    /// component.
+    ///
+    /// Both conventions are in the wild and neither is derivable: a scheme whose
+    /// encoder was written here names `w` and `w_scale`, while MLX names the
+    /// triplet `w.weight`, `w.scales`, `w.biases` -- siblings, not descendants.
+    /// A driver binding a converted checkpoint looks the shipped names up, so an
+    /// encode that produced descendants would publish tensors correct in every
+    /// respect except findable.
+    naming: MetaNaming,
     shape: Vec<i64>,
     encoding: Encoding,
     granularity: QuantGranularity,
     group_size: u32,
     channel_axis: u32,
     scale_form: ScaleForm,
+}
+
+/// Where a generated metadata tensor's name is rooted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetaNaming {
+    /// `w` publishes `w<suffix>`.
+    Extend,
+    /// `w.weight` publishes `w<suffix>`. Refused, rather than silently treated
+    /// as [`Self::Extend`], for a declaration not ending in `.weight`: the
+    /// scheme's whole naming convention rests on that component being there.
+    ReplaceWeight,
+}
+
+impl MetaNaming {
+    fn apply(self, name: &str, suffix: &str) -> Result<String> {
+        match self {
+            Self::Extend => Ok(format!("{name}{suffix}")),
+            Self::ReplaceWeight => match name.strip_suffix(".weight") {
+                Some(stem) => Ok(format!("{stem}{suffix}")),
+                None => Err(Error::Contract(format!(
+                    "'{name}' is encoded into a scheme whose scales are named \
+                     beside a '.weight', but its declared name does not end in one"
+                ))),
+            },
+        }
+    }
 }
 
 impl ScaleLayout {
@@ -1236,6 +1370,8 @@ impl ScaleLayout {
         match scheme {
             QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric => Ok(Self {
                 suffix: "_scale_inv",
+                zero_point_suffix: None,
+                naming: MetaNaming::Extend,
                 // `[rows]` of F32, one per output channel.
                 shape: vec![*rows],
                 encoding: Encoding::Raw(DType::F32),
@@ -1256,12 +1392,41 @@ impl ScaleLayout {
                 }
                 Ok(Self {
                     suffix: "_scale",
+                    zero_point_suffix: None,
+                    naming: MetaNaming::Extend,
                     shape: vec![*rows, cols / 32],
                     encoding: Encoding::Raw(DType::U8),
                     granularity: QuantGranularity::PerGroup,
                     group_size: 32,
                     channel_axis: 1,
                     scale_form: ScaleForm::RawE8M0,
+                })
+            }
+            // MLX's affine U4: 64 columns under one BF16 scale AND one BF16
+            // zero point, so an element is `code * scale + zero`. The two are
+            // shaped alike and written by one kernel pass -- the pass that found
+            // each group's min and max had to see both to produce either.
+            //
+            // `.scales` and `.biases` are MLX's own names, and the drivers that
+            // read a converted checkpoint already look for exactly those, so an
+            // encoded weight is bindable by the code that binds a shipped one.
+            QuantScheme::MlxAffineU4 => {
+                if cols % 64 != 0 {
+                    return Err(Error::Contract(format!(
+                        "encoding to MLX affine U4 groups 64 columns under one \
+                         scale, but the output has {cols}"
+                    )));
+                }
+                Ok(Self {
+                    suffix: ".scales",
+                    zero_point_suffix: Some(".biases"),
+                    naming: MetaNaming::ReplaceWeight,
+                    shape: vec![*rows, cols / 64],
+                    encoding: Encoding::Raw(DType::BF16),
+                    granularity: QuantGranularity::PerGroup,
+                    group_size: 64,
+                    channel_axis: 1,
+                    scale_form: ScaleForm::Bf16AffineFactors,
                 })
             }
             other => Err(Error::Contract(format!(

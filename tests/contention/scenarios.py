@@ -28,6 +28,26 @@ run to count as passing. Contracts are deliberately loose on numbers
 
 Counter names are keys of the ``[planner-trace]`` line that ``bootstrap.rs``
 emits when ``PIE_CONTENTION_TRACE_MS`` is set.
+
+``--swap-pool-size`` is a HOST-PINNED allocation (``cudaMallocHost`` in
+``driver/cuda/src/store/swap_pool.cpp``, taken up front for every layer), so
+it is not free headroom: pinned pages can be neither swapped nor reclaimed.
+Size it from measured demand, not "generously". The scenarios here used to ask
+for 8192-16384 pages against device pools of 12-256, which took the server to
+32.3 GB RSS and pushed the host into reclaim -- ``/proc/pressure/memory``
+``full avg10`` hit 66% during a run against 0.11% idle. The engine convoys
+badly on that: a thread that stalls in the allocator while holding the global
+KV store mutex freezes every lane behind it, and the KV lock trace
+(``PIE_KV_LOCK_TRACE=1``) caught single ``create_working_set`` calls holding it
+for 1.07s, 1.55s and 5.74s. Downstream that reads as 9-18 lanes falling silent
+at once, ``[frame-stall]``, and ``submit deadline exceeded`` -- i.e. it looks
+exactly like an engine scheduling bug. Every scenario that was flaky used
+16384; none that used <= 512 ever was.
+
+Measured peak use at 1024 is 12 pages (churn), 4 (churn_extreme), 108 (soak),
+215 (mixed_head), so 1024 is still 4.7x the worst case. Right-sizing took the
+suite from five flaky scenarios to 17/17, churn from 15-44s to 8.1s, and
+churn_extreme from 10.8-33.6s to 11.1s on all four repeats.
 """
 
 from __future__ import annotations
@@ -115,29 +135,35 @@ SCENARIOS: list[Scenario] = [
         # so three tries make a false "never fired" ~0.5% likely.
         repeat=3,
     ),
-    # Same path with the fleet four times wider than the pool can fund. Most
-    # of it is killed by the starvation rung, which is fine — the point is
-    # that the survivors still finish and `evict_rollbacks` stays bounded
-    # while eviction and the starvation rung run against each other.
+    # Same path with the fleet four times wider than the pool can fund. This
+    # used to require `starved`: most of the fleet was killed by the
+    # starvation rung and the point was that the survivors still finished.
+    # Making eviction a liveness rung (cebea17e4) retired that outcome on
+    # purpose — an unfundable fleet now PARKS to host DRAM instead of having
+    # requests destroyed — so the whole 256 completes with `starved` at 0
+    # (measured: parks 1837, serves 1808, evictions 24, failed 0). Requiring
+    # a kill here would pin a defect the planner deliberately removed, so the
+    # contract asserts the good outcome instead: everyone finishes, and
+    # eviction still runs against the rung with `evict_rollbacks` bounded.
     # `swapfull` is NOT required here: whether the host pool is actually
-    # refused a swap-out before the rung kills the victim is a race
-    # (observed 202 hits on one run, 0 on the next), and a flaky assertion
-    # is worse than no assertion. `tinyswap` above pins that path instead.
+    # refused a swap-out is a race (observed 202 hits on one run, 0 on the
+    # next), and a flaky assertion is worse than no assertion. `tinyswap`
+    # above pins that path instead.
     Scenario(
         name="tinyswap_thrash",
-        target="eviction racing the starvation rung on an unfundable fleet",
+        target="eviction parking an unfundable fleet instead of killing it",
         args=["--total-pages", "256", "--swap-pool-size", "32",
               "--num-requests", "256", "--concurrency", "64",
               "--max-tokens", "128"],
-        contract=Contract(max_wall_s=120, min_completed=16,
-                          require_counters=("starved", "evictions"),
+        contract=Contract(max_wall_s=120, min_completed=256, max_failed=0,
+                          require_counters=("parks", "evictions"),
                           max_counters={"evict_rollbacks": _ROLLBACK_CAP}),
     ),
     # ---- every page shared: ReclaimQuote -> AllShared -> NoEligibleVictim --
     Scenario(
         name="allshared",
         target="Starved{NoEligibleVictim}",
-        args=["--total-pages", "256", "--swap-pool-size", "8192",
+        args=["--total-pages", "256", "--swap-pool-size", "1024",
               "--num-requests", "128", "--concurrency", "64",
               "--max-tokens", "64", "--shared-prefix-words", "900",
               "--no-unique-prompts"],
@@ -145,9 +171,11 @@ SCENARIOS: list[Scenario] = [
                           max_counters={"evict_rollbacks": _ROLLBACK_CAP}),
         warmup=1,
     ),
-    # Guards the narrow-epoch side effect of a rejected frame-seal fix: with
-    # the rebind escape applied unconditionally (`PIE_FRAME_REBIND_ESCAPE=1`)
-    # this served 12/128 with 116 starvation kills.
+    # Guards the narrow-epoch side effect of a rejected frame-seal fix: dropping
+    # idle members from the wait-set unconditionally (the old
+    # `PIE_FRAME_REBIND_ESCAPE=1` mode, since deleted along with the escape
+    # itself) served 12/128 here with 116 starvation kills. The seal now waits
+    # for every member, which is what keeps this scenario dense.
     #
     # The fleet does NOT fit: the shared prefix is 61 pages, so a 256-page
     # pool funds FOUR processes at a time out of 64. The correct outcome is
@@ -171,11 +199,43 @@ SCENARIOS: list[Scenario] = [
         warmup=1,
         repeat=3,
     ),
+    # ---- the destruction cascade: victims that free nothing ----------------
+    #
+    # PRIVATE (unshared) long prompts, no swap, and a fleet several times
+    # larger than the pool can hold. Every process that gets a prefill in
+    # holds its whole prompt privately; the rest park on their FIRST ask and
+    # therefore hold NOTHING.
+    #
+    # That is the shape that exposed the cascade (§20.40). The starvation
+    # rung picked "the youngest parked allocation" without asking whether
+    # destroying it returns any pages, and the youngest are systematically
+    # the ones parked on their first ask. Measured on a 3x-oversubscribed
+    # pool: 752 wedge kills, 737 of them (98%) on `NoReclaim::HoldsNothing`,
+    # freeing zero pages each, so the wedge survived every one of them and
+    # the rung fired again on the next-youngest. 752 of 1024 requests were
+    # destroyed to reclaim nothing, while the ~190 processes that actually
+    # held the entire pool were never touched.
+    #
+    # The contract is therefore a BOUND ON KILLS, not zero: with no swap the
+    # pool genuinely wedges and a holder must be destroyed to break it. What
+    # must not come back is destroying the waiting queue. `starved` must stay
+    # non-zero so the scenario cannot rot into a run that never reaches the
+    # rung at all.
+    Scenario(
+        name="noswap_cascade",
+        target="starvation victim selection: kills must free pages",
+        args=["--total-pages", "512", "--swap-pool-size", "0",
+              "--num-requests", "192", "--concurrency", "96",
+              "--max-tokens", "64", "--shared-prefix-words", "600"],
+        contract=Contract(max_wall_s=180, min_completed=160, max_failed=32,
+                          require_counters=("parks", "starved")),
+        repeat=2,
+    ),
     # ---- head's own held pages plus its ask exceed the pool ----------------
     Scenario(
         name="hog",
         target="Hog",
-        args=["--total-pages", "40", "--swap-pool-size", "8192",
+        args=["--total-pages", "40", "--swap-pool-size", "1024",
               "--num-requests", "32", "--concurrency", "16",
               "--max-tokens", "512"],
         contract=Contract(max_wall_s=180, min_completed=32, max_failed=0),
@@ -184,7 +244,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="impossible",
         target="Impossible",
-        args=["--total-pages", "16", "--swap-pool-size", "8192",
+        args=["--total-pages", "16", "--swap-pool-size", "1024",
               "--num-requests", "16", "--concurrency", "8",
               "--max-tokens", "1024"],
         contract=Contract(max_wall_s=120, min_completed=0),
@@ -193,7 +253,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="churn",
         target="arrival storm / fleet turnover",
-        args=["--total-pages", "192", "--swap-pool-size", "16384",
+        args=["--total-pages", "192", "--swap-pool-size", "1024",
               "--num-requests", "2048", "--concurrency", "512",
               "--max-tokens", "32"],
         contract=Contract(max_wall_s=240, min_completed=2048, max_failed=0),
@@ -205,7 +265,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="churn_extreme",
         target="extreme turnover / rebind-seal deadlock",
-        args=["--total-pages", "96", "--swap-pool-size", "16384",
+        args=["--total-pages", "96", "--swap-pool-size", "1024",
               "--num-requests", "4096", "--concurrency", "1024",
               "--max-tokens", "16", "--max-model-len", "1536"],
         contract=Contract(max_wall_s=300, min_completed=4096, max_failed=0),
@@ -225,7 +285,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="onefits",
         target="1-resident pool, maximum thrash",
-        args=["--total-pages", "12", "--swap-pool-size", "8192",
+        args=["--total-pages", "12", "--swap-pool-size", "1024",
               "--num-requests", "64", "--concurrency", "32",
               "--max-tokens", "128"],
         contract=Contract(max_wall_s=180, min_completed=64, max_failed=0,
@@ -236,7 +296,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="mixed_head",
         target="head-of-line blocking + heterogeneity",
-        args=["--total-pages", "128", "--swap-pool-size", "16384",
+        args=["--total-pages", "128", "--swap-pool-size", "1024",
               "--num-requests", "256", "--concurrency", "128",
               "--max-tokens", "512", "--mixed-phase",
               "--mixed-long-prompt-words", "800",
@@ -247,7 +307,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="fwd1",
         target="forward serialization vs planner",
-        args=["--total-pages", "128", "--swap-pool-size", "16384",
+        args=["--total-pages", "128", "--swap-pool-size", "1024",
               "--num-requests", "128", "--concurrency", "64",
               "--max-tokens", "64", "--max-forward-requests", "1"],
         contract=Contract(max_wall_s=180, min_completed=128, max_failed=0),
@@ -272,7 +332,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="soak",
         target="sustained pressure soak",
-        args=["--total-pages", "160", "--swap-pool-size", "16384",
+        args=["--total-pages", "160", "--swap-pool-size", "1024",
               "--num-requests", "4096", "--concurrency", "256",
               "--max-tokens", "96"],
         contract=Contract(max_wall_s=420, min_completed=4096, max_failed=0,

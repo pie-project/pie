@@ -429,9 +429,7 @@ mod tests {
         };
         assert_eq!(
             second,
-            // The put's producer is `Op::Eq`, not a structured-mask opcode,
-            // so this is the dense (solo) device classification.
-            crate::pipeline::fire::geometry::FireAttnMask::Device { structured: false }
+            crate::pipeline::fire::geometry::FireAttnMask::Device
         );
     }
 

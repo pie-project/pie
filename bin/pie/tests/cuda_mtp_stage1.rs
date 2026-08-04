@@ -5,12 +5,13 @@
 //! This is FUNCTIONAL cross-backend parity + an HONEST throughput number — NOT a
 //! claimed perf win (mac-master: MTP is a perf LOSS at K=1, tied 248K lm_head).
 //!
-//! K (native draft tokens) is `PIE_MTP_DRAFT_TOKENS` (clamp 0..32, read once at
-//! driver init — entry.cpp:106; K=0 disables the drafter = the non-spec
-//! baseline). Because it is a per-PROCESS static, spec vs non-spec is a
-//! CROSS-INVOCATION comparison (run twice, K=0 then K=2), NOT two boots in one
-//! process. Each run records `{k, tokens, elapsed}` to a temp file; the second
-//! run reads the first and cross-checks.
+//! K (native draft tokens) is `[model.driver.options].mtp_num_drafts` (clamp
+//! 0..32; K=0 disables the drafter = the non-spec baseline), which this suite
+//! picks from `PIE_MTP_DRAFT_TOKENS` as a harness parameter. Only the first
+//! boot in a process succeeds, so spec vs non-spec is a CROSS-INVOCATION
+//! comparison (run twice, K=0 then K=2), NOT two boots in one process. Each run
+//! records `{k, tokens, elapsed}` to a temp file; the second run reads the first
+//! and cross-checks.
 //!
 //! De-risk battery (see the session MTP-Stage-1 plan):
 //!   * T1 GREEDY PARITY (host, hard) — spec output == non-spec output,
@@ -225,10 +226,7 @@ async fn run_generate(
 async fn mtp_native_drafter_de_risk() -> Result<()> {
     common::init_trace();
 
-    let k: u32 = std::env::var("PIE_MTP_DRAFT_TOKENS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
+    let k = common::mtp_draft_tokens(0);
     eprintln!("[mtp-stage1] K (PIE_MTP_DRAFT_TOKENS) = {k}");
 
     // Build the greedy-decode inferlet. Qwen3.5-0.8B is a GDN/hybrid model whose
@@ -245,7 +243,7 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
         .success();
     anyhow::ensure!(ok, "wasm build failed for {gdn_pkg}");
 
-    let pie = common::boot_4090_mtp().await?;
+    let pie = common::boot_4090_mtp(k).await?;
     eprintln!(
         "[mtp-stage1] booted Qwen3.5-0.8B, listen_addr={}",
         pie.listen_addr

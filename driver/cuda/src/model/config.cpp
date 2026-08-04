@@ -55,6 +55,15 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     const auto view = pie_driver_common::hf_config_json_view(j_root);
     const auto& j = view.text;
     cfg.model_type = view.text_or_outer_model_type();
+    // Kimi-K3's text tower calls itself `kimi_linear`, which is also the
+    // model_type of the standalone Kimi-Linear checkpoints -- a different
+    // architecture (no attention residuals, no latent MoE, rotated MLA).
+    // The outer shell is the only thing that distinguishes them, so keep
+    // the outer name as the arch key rather than registering a row for a
+    // model_type this driver cannot actually serve.
+    if (view.outer_model_type == "kimi_k3") {
+        cfg.model_type = "kimi_k3";
+    }
 
     cfg.hidden_size              = require<int>(j, "hidden_size", path_str);
     // `intermediate_size` is normally a scalar, but Gemma-3n stores a
@@ -89,7 +98,8 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.qk_rope_head_dim         = optional<int>(j, "qk_rope_head_dim", 0);
     cfg.v_head_dim               = optional<int>(j, "v_head_dim", 0);
     if ((cfg.model_type == "kimi_k2" || cfg.model_type == "deepseek_v2" ||
-         cfg.model_type == "deepseek_v3" || cfg.model_type == "glm_moe_dsa") &&
+         cfg.model_type == "deepseek_v3" || cfg.model_type == "glm_moe_dsa" ||
+         cfg.model_type == "kimi_k3") &&
         cfg.qk_nope_head_dim > 0 && cfg.qk_rope_head_dim > 0) {
         // MLA attention has a query/key width that is independent from the
         // value width and from hidden_size / num_heads. Keep `head_dim` as
@@ -310,6 +320,11 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.gemma4_num_global_key_value_heads =
         optional<int>(j, "num_global_key_value_heads",
                       cfg.num_key_value_heads);
+    // Read but not used here: the Metal driver reads them, and `pie.model/1`
+    // is generated from this struct, so this is where they enter the
+    // descriptor. Defaults match "absent" on both sides.
+    cfg.gemma4_global_head_dim = optional<int>(j, "global_head_dim", 0);
+    cfg.gemma4_double_wide_mlp = optional<bool>(j, "use_double_wide_mlp", false);
 
     // GPT-OSS knobs. The flags are inferred from `model_type` (rather
     // than from explicit fields) because HF's gpt_oss config doesn't
@@ -425,6 +440,87 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.attn_output_gate        = optional<bool>(j, "attn_output_gate",
                                                  cfg.model_type == "qwen3_5" ||
                                                  cfg.model_type == "qwen3_5_text");
+
+    // ── Kimi-K3 ─────────────────────────────────────────────────────
+    // Everything below reads from `text_config`, which the view above has
+    // already stepped into; `cfg.model_type` was pinned to the outer
+    // `kimi_k3` name at the top of this function.
+    if (cfg.model_type == "kimi_k3") {
+        // K3 spells its expert counts `num_experts` / `num_experts_per_token`
+        // and its routing groups `num_expert_group`, none of which the
+        // generic block above reads.
+        cfg.num_experts_per_tok = optional<int>(j, "num_experts_per_token",
+                                                cfg.num_experts_per_tok);
+        cfg.n_group = optional<int>(j, "num_expert_group", cfg.n_group);
+        cfg.n_shared_experts = optional<int>(j, "num_shared_experts",
+                                             cfg.n_shared_experts);
+        cfg.norm_topk_prob = optional<bool>(j, "moe_renormalize",
+                                            cfg.norm_topk_prob);
+        cfg.moe_router_activation_func =
+            optional<std::string>(j, "moe_router_activation_func", "sigmoid");
+        cfg.routed_expert_hidden_size =
+            optional<int>(j, "routed_expert_hidden_size", 0);
+        cfg.latent_moe_use_norm = optional<bool>(j, "latent_moe_use_norm", false);
+        cfg.attn_res_block_size = optional<int>(j, "attn_res_block_size", 0);
+        cfg.mla_use_nope = optional<bool>(j, "mla_use_nope", false);
+        cfg.mla_output_gate = optional<bool>(j, "mla_use_output_gate", false);
+        if (optional<std::string>(j, "hidden_act", "") == "situ") {
+            cfg.situ_beta = optional<float>(j, "activation_situ_beta", 1.f);
+            cfg.situ_linear_beta =
+                optional<float>(j, "activation_situ_linear_beta", 0.f);
+        }
+        // `shared_experts` is one MLP `num_shared_experts` wide, not
+        // `num_shared_experts` separate MLPs.
+        if (cfg.n_shared_experts > 0 && cfg.moe_intermediate_size > 0) {
+            cfg.shared_expert_intermediate_size =
+                cfg.n_shared_experts * cfg.moe_intermediate_size;
+        }
+
+        if (j.contains("linear_attn_config") && j["linear_attn_config"].is_object()) {
+            const auto& la = j["linear_attn_config"];
+            const int heads = optional<int>(la, "num_heads", 0);
+            const int dim = optional<int>(la, "head_dim", 0);
+            // KDA is not grouped: Q, K and V all carry `num_heads` heads of
+            // `head_dim`, so the Qwen3.5 key/value split collapses.
+            cfg.linear_num_value_heads = heads;
+            cfg.linear_num_key_heads   = heads;
+            cfg.linear_key_head_dim    = dim;
+            cfg.linear_value_head_dim  = dim;
+            cfg.linear_conv_kernel_dim =
+                optional<int>(la, "short_conv_kernel_size", 0);
+            cfg.kda_gate_lower_bound = optional<float>(la, "gate_lower_bound", 0.f);
+            cfg.kda_full_rank_gate = optional<bool>(la, "use_full_rank_gate", false);
+
+            // `kda_layers` / `full_attn_layers` are **1-indexed** -- HF's
+            // `KimiLinearConfig.is_kda_layer` tests `layer_idx + 1`. Reading
+            // them 0-indexed silently shifts the whole hybrid pattern by one
+            // layer, which still loads and still runs.
+            if (cfg.layer_types.empty() && la.contains("kda_layers") &&
+                la["kda_layers"].is_array()) {
+                std::vector<bool> is_kda(
+                    static_cast<std::size_t>(cfg.num_hidden_layers), false);
+                for (const auto& v : la["kda_layers"]) {
+                    const int zero_based = v.get<int>() - 1;
+                    if (zero_based < 0 || zero_based >= cfg.num_hidden_layers) {
+                        throw std::runtime_error(
+                            "config.json (" + path_str + "): linear_attn_config."
+                            "kda_layers entry " + std::to_string(v.get<int>()) +
+                            " is out of range for " +
+                            std::to_string(cfg.num_hidden_layers) + " layers "
+                            "(the list is 1-indexed)");
+                    }
+                    is_kda[static_cast<std::size_t>(zero_based)] = true;
+                }
+                cfg.layer_types.reserve(
+                    static_cast<std::size_t>(cfg.num_hidden_layers));
+                for (int i = 0; i < cfg.num_hidden_layers; ++i) {
+                    cfg.layer_types.push_back(
+                        is_kda[static_cast<std::size_t>(i)] ? "linear_attention"
+                                                            : "full_attention");
+                }
+            }
+        }
+    }
 
     // Partial RoPE (Qwen3.5). HF stores it under `rope_parameters` for
     // qwen3_5 (single dict, not per-layer-type) and at the top level for

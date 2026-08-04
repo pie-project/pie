@@ -25,16 +25,31 @@ use crate::pipeline::channel::{BoundCells, ChannelCell, ChannelError};
 use crate::pipeline::fire::lease::DevGeo;
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
-use crate::pipeline::instance::{AttentionBinding, BoundForwardPass, EmbedBinding, RsMode};
+use crate::pipeline::instance::{
+    AttentionBinding, BoundForwardPass, EmbedBinding, PassKind, RsGeometryBinding,
+};
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
 
 use pie_ir::container::{HostRole, PortSource, TraceContainer};
 use pie_ir::registry::Port;
+use pie_ir::types::DType;
 
 use super::pie;
 
 type Anyhow<T> = anyhow::Result<T>;
+
+/// Which forward interface this model requires. Must stay in lockstep with
+/// `model.pass-kind()` (`host/model.rs`) -- that call is how a guest picks its
+/// interface, and `core_gate` is how the host proves the pick was right.
+fn model_pass_kind() -> PassKind {
+    let model = pie_model::model();
+    match (model.kv_page_size() > 0, model.rs_caps().state_size > 0) {
+        (_, false) => PassKind::Attention,
+        (true, true) => PassKind::Hybrid,
+        (false, true) => PassKind::Recurrent,
+    }
+}
 
 fn page_span(
     span: pie::inferlet::working_set::PageSpan,
@@ -55,8 +70,32 @@ fn validate_descriptor_bindings(
     channel_reps: &[u32],
     expected: &[(Port, Option<u32>)],
 ) -> Result<(), String> {
+    validate_bindings(container, channel_reps, expected, false)
+}
+
+/// The RS geometry ports, which are OPTIONAL: a pass always binds
+/// `rs-geometry`, but a program only traces the buffer addressing when it
+/// actually addresses the buffer. Absent-but-attached is therefore legal here
+/// and an error for the KV family. Present-but-mismatched is an error for both.
+fn validate_optional_descriptor_bindings(
+    container: &TraceContainer,
+    channel_reps: &[u32],
+    expected: &[(Port, Option<u32>)],
+) -> Result<(), String> {
+    validate_bindings(container, channel_reps, expected, true)
+}
+
+fn validate_bindings(
+    container: &TraceContainer,
+    channel_reps: &[u32],
+    expected: &[(Port, Option<u32>)],
+    optional: bool,
+) -> Result<(), String> {
     for &(port, expected_rep) in expected {
         let binding = container.ports.iter().find(|binding| binding.port == port);
+        if optional && binding.is_none() {
+            continue;
+        }
         match (binding, expected_rep) {
             (None, None) => {}
             (None, Some(_)) => {
@@ -252,11 +291,21 @@ async fn materialize_channel(
     }
 }
 
-impl pie::inferlet::forward::Host for ProcessCtx {
-    /// Frame submission (`forward.submit(on, slots)`): exactly
-    /// `model.frame-size()` ordered slots; slot i executes in wave i; `none`
-    /// is a no-op. Delegates to [`crate::pipeline::fire::submit_frame`].
-    async fn submit(
+/// The `channel` interface declares no free functions — only the `channel`
+/// resource — but `add_to_linker` still requires the interface-level `Host`
+/// bound, so this impl is empty by construction.
+impl pie::inferlet::channel::Host for ProcessCtx {}
+
+impl ProcessCtx {
+    /// Frame submission (`submit(on, slots)`): exactly `model.frame-size()`
+    /// ordered slots; slot i executes in wave i; `none` is a no-op. Delegates
+    /// to [`crate::pipeline::fire::submit_frame`].
+    ///
+    /// Duplicated in WIT across all three forward interfaces, implemented once
+    /// here. A frame is monomorphic in its slot type, which is exactly what
+    /// keeps a hybrid's recurrent-only fire and its normal fire in the same
+    /// frame while keeping an attention-only pass out of it entirely.
+    async fn core_submit(
         &mut self,
         on: Resource<crate::pipeline::Pipeline>,
         slots: Vec<Option<Resource<ForwardPass>>>,
@@ -276,7 +325,7 @@ impl pie::inferlet::forward::Host for ProcessCtx {
     }
 }
 
-impl pie::inferlet::forward::HostChannel for ProcessCtx {
+impl pie::inferlet::channel::HostChannel for ProcessCtx {
     async fn new(
         &mut self,
         shape: Vec<u32>,
@@ -338,7 +387,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
     }
 }
 
-impl pie::inferlet::forward::HostChannelWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
+impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
     /// The direct-wake await point (plan §4.5): while the cell is empty,
     /// non-blockingly drain already-settled pipeline ops (their KV/RS txns
     /// finalize here, bounding pin float), then park on the channel's reader
@@ -361,13 +410,42 @@ impl pie::inferlet::forward::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
     }
 }
 
-impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
-    async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
+/// The single host implementation behind all three WIT forward interfaces.
+///
+/// WIT duplicates `embed` / `readout` / `program` / `submit` across `forward`,
+/// `forward-recurrent`, and `forward-hybrid` so that cross-kind states are
+/// UNREPRESENTABLE in the guest surface (forward_refactor.md D3). That is a
+/// statement about the interface, not about the implementation: all three map
+/// their `forward-pass` resource to this one Rust type, so the three trait
+/// impls below are thin delegations to these methods and the binding logic
+/// exists exactly once.
+impl ProcessCtx {
+    async fn core_new(&mut self, kind: PassKind) -> Anyhow<Resource<ForwardPass>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        Ok(self.ctx().table.push(ForwardPass::new())?)
+        Ok(self.ctx().table.push(ForwardPass::new(kind))?)
     }
 
-    async fn embed(
+    /// The interface-selection gate. `constructor()` is infallible in WIT, so
+    /// the check lands on the first state-binding call instead -- which is
+    /// still before anything is attached, and is the call whose SIGNATURE is
+    /// the thing that differs.
+    fn core_gate(&mut self, this: &Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
+        let kind = self.ctx().table.get(this)?.kind;
+        let actual = model_pass_kind();
+        if kind != actual {
+            return Ok(Err(format!(
+                "this model's forward pass is `{}`, but the pass was built through the `{}` \
+                 interface; use `{}` instead. Attention-only state algorithms are not valid on \
+                 a folded recurrent state.",
+                actual.name(),
+                kind.interface(),
+                actual.interface(),
+            )));
+        }
+        Ok(Ok(()))
+    }
+
+    async fn core_embed(
         &mut self,
         this: Resource<ForwardPass>,
         tokens: Resource<Channel>,
@@ -392,7 +470,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn attention(
+    async fn core_attention(
         &mut self,
         this: Resource<ForwardPass>,
         kv_working_set: Resource<KvWorkingSet>,
@@ -406,6 +484,9 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         positions: Resource<Channel>,
         mask: Option<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
         let readable = match page_span(readable_pages) {
             Ok(span) => span,
             Err(error) => return Ok(Err(error)),
@@ -445,7 +526,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn readout(
+    async fn core_readout(
         &mut self,
         this: Resource<ForwardPass>,
         indices: Resource<Channel>,
@@ -464,13 +545,13 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn program(
+    async fn core_program(
         &mut self,
         this: Resource<ForwardPass>,
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (embed, attention, readout, rs_working_sets, rs_mode, max_layers) = {
+        let (embed, attention, readout, rs_working_sets, rs_fold_len, rs_fold_len_rep) = {
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -495,8 +576,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     .copied()
                     .map(Resource::new_borrow)
                     .collect::<Vec<Resource<RsWorkingSet>>>(),
-                pass.bindings.rs_mode.clone(),
-                pass.bindings.max_layers,
+                pass.bindings.rs_fold_len.clone(),
+                pass.bindings.rs_geom.map(|geom| geom.fold_len),
             )
         };
         let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
@@ -570,6 +651,18 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 validate_descriptor_bindings(&prog.bound.container, &channel_reps, &expected)
             {
                 return Ok(Err(error));
+            }
+            // Optional: a pass that folds everything unconditionally has
+            // nothing to compute and claims no port, so the traced program
+            // legitimately lacks this binding.
+            if let Some(fold_len) = rs_fold_len_rep {
+                if let Err(error) = validate_optional_descriptor_bindings(
+                    &prog.bound.container,
+                    &channel_reps,
+                    &[(Port::RsFoldLen, Some(fold_len))],
+                ) {
+                    return Ok(Err(error));
+                }
             }
             let mut cells: BoundCells = Vec::with_capacity(channels.len());
             for (i, ch) in channels.iter().enumerate() {
@@ -963,8 +1056,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 kv_ws: ws_rep,
                 kv_declaration: crate::pipeline::instance::KvDeclaration { readable, writable },
                 rs_ws: rs_reps,
-                rs_mode,
-                max_layers,
+                rs_fold_len,
                 kv_declaration_realized: false,
                 failed: None,
                 devgeo,
@@ -1000,123 +1092,33 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         }
     }
 
-    async fn set_rs_mode(
-        &mut self,
-        this: Resource<ForwardPass>,
-        mode: pie::inferlet::forward::RsMode,
-    ) -> Anyhow<Result<(), String>> {
-        let caps = pie_model::model().rs_caps();
-        let mode = match mode {
-            pie::inferlet::forward::RsMode::Fold => RsMode::Fold,
-            pie::inferlet::forward::RsMode::Buffer(start_token) => {
-                if caps.state_size == 0 {
-                    return Ok(Err(
-                        "pipeline: rs-mode: a pure-attention model has no recurrent state to \
-                         buffer"
-                            .to_string(),
-                    ));
-                }
-                let page = caps.buffer_page_size;
-                if page == 0 {
-                    return Ok(Err(
-                        "pipeline: rs-mode: this model reports no RS buffer page size".to_string(),
-                    ));
-                }
-                // The driver fills a request's slabs page-major FROM SLAB
-                // ZERO of the listed CSR span, so an unaligned start would
-                // silently shift every token within its slab.
-                if start_token % page != 0 {
-                    return Ok(Err(format!(
-                        "pipeline: rs-mode: buffered write starts at token {start_token}, which \
-                         is not a multiple of the RS buffer page size {page}"
-                    )));
-                }
-                RsMode::Buffer { start_token }
-            }
-            pie::inferlet::forward::RsMode::FoldBuffered(tokens) => {
-                if caps.state_size == 0 {
-                    return Ok(Err(
-                        "pipeline: rs-mode: a pure-attention model has no recurrent state to fold"
-                            .to_string(),
-                    ));
-                }
-                if tokens.is_empty() {
-                    return Ok(Err(
-                        "pipeline: rs-mode: fold-buffered needs one length per bound \
-                         recurrent-state working set"
-                            .to_string(),
-                    ));
-                }
-                RsMode::FoldBuffered { tokens }
-            }
-        };
-        let bound_rows = {
-            let pass = self.ctx().table.get(&this)?;
-            if pass.is_bound() {
-                pass.bound().map(|bound| bound.rs_ws.len()).unwrap_or(0)
-            } else {
-                pass.bindings.rs_ws.len()
-            }
-        };
-        if let RsMode::FoldBuffered { tokens } = &mode
-            && bound_rows != 0
-            && tokens.len() != bound_rows
-        {
-            return Ok(Err(format!(
-                "pipeline: rs-mode: fold-buffered supplied {} length(s) for {bound_rows} bound \
-                 recurrent-state working set(s)",
-                tokens.len()
-            )));
-        }
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            match pass.bound_mut() {
-                Ok(bound) => bound.rs_mode = mode,
-                Err(error) => return Ok(Err(error)),
-            }
-        } else {
-            pass.bindings.rs_mode = mode;
-        }
-        Ok(Ok(()))
-    }
-
-    async fn set_max_layers(
-        &mut self,
-        this: Resource<ForwardPass>,
-        max_layers: u32,
-    ) -> Anyhow<Result<(), String>> {
-        // STRUCTURAL v0 (S-1): the layerskip-draft depth. Zero is
-        // meaningless; values at or above the model's depth are the
-        // identity by the driver's bound. Settable before or after
-        // program-attach, like rs-mode.
-        if max_layers == 0 {
-            return Ok(Err(
-                "pipeline: max-layers: zero layers is not a model".to_string(),
-            ));
-        }
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            match pass.bound_mut() {
-                Ok(bound) => bound.max_layers = Some(max_layers),
-                Err(error) => return Ok(Err(error)),
-            }
-        } else {
-            pass.bindings.max_layers = Some(max_layers);
-        }
-        Ok(Ok(()))
-    }
-
-    async fn set_rs_working_sets(
+    async fn core_set_rs_working_sets(
         &mut self,
         this: Resource<ForwardPass>,
         rs_working_sets: Vec<Resource<RsWorkingSet>>,
+        geometry: RsGeometryBinding,
     ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
+        if rs_working_sets.is_empty() {
+            return Ok(Err(
+                "forward pass recurrent-state binding needs one working set per request"
+                    .to_string(),
+            ));
+        }
+        let fold_len = match self.read_fold_len(&geometry, rs_working_sets.len())? {
+            Ok(lens) => lens,
+            Err(error) => return Ok(Err(error)),
+        };
         if !self.ctx().table.get(&this)?.is_bound() {
             for resource in &rs_working_sets {
                 let _ = self.ctx().table.get(resource)?;
             }
-            self.ctx().table.get_mut(&this)?.bindings.rs_ws =
-                rs_working_sets.iter().map(Resource::rep).collect();
+            let pass = self.ctx().table.get_mut(&this)?;
+            pass.bindings.rs_ws = rs_working_sets.iter().map(Resource::rep).collect();
+            pass.bindings.rs_geom = Some(geometry);
+            pass.bindings.rs_fold_len = fold_len;
             return Ok(Ok(()));
         }
         let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
@@ -1192,12 +1194,71 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             .replace_rs_working_sets(reps)
             .map_err(|error| format!("pipeline: {error}"));
         if result.is_ok() {
-            self.ctx().table.get_mut(&this)?.bindings.rs_ws = replacement;
+            let pass = self.ctx().table.get_mut(&this)?;
+            pass.bindings.rs_ws = replacement;
+            pass.bindings.rs_geom = Some(geometry);
+            pass.bindings.rs_fold_len = fold_len.clone();
+            if let Ok(bound) = pass.bound_mut() {
+                bound.rs_fold_len = fold_len;
+            }
         }
         Ok(result)
     }
 
-    async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
+    /// The host-known value of `rs-geometry.fold-len`, one entry per bound
+    /// working set.
+    ///
+    /// `Ok(None)` when the channel carries no host-known seed. That is not an
+    /// error: it means a stage computes the fold length ON DEVICE, and the
+    /// value reaches the driver through the `rs_fold_len` descriptor port
+    /// instead of through this host. The host then keeps only an UPPER BOUND
+    /// on the folded boundary — see `store::rs::Occupancy` — which is
+    /// the whole point of making the field a channel
+    /// (`.wiki/designs/linear-state-programming-model.md` §4.2): a speculative
+    /// decode's accepted count never round-trips through the host between the
+    /// fire that computes it and the fire that folds it.
+    fn read_fold_len(
+        &mut self,
+        geometry: &RsGeometryBinding,
+        rows: usize,
+    ) -> Anyhow<Result<Option<Vec<u32>>, String>> {
+        let resource: Resource<Channel> = Resource::new_borrow(geometry.fold_len);
+        let cell = self.ctx().table.get(&resource)?.cell.clone();
+        let cell = cell.lock().unwrap();
+        if !matches!(cell.dtype, DType::U32 | DType::I32) {
+            return Ok(Err(format!(
+                "forward pass: rs-geometry.fold-len must be a u32/i32 channel, got {:?}",
+                cell.dtype
+            )));
+        }
+        let Ok(bytes) = cell.peek_seed() else {
+            return Ok(Ok(None));
+        };
+        if bytes.len() % 4 != 0 {
+            return Ok(Err(format!(
+                "forward pass: rs-geometry.fold-len holds {} byte(s), which is not a whole number \
+                 of 32-bit values",
+                bytes.len()
+            )));
+        }
+        let mut lens: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        if lens.len() == 1 && rows > 1 {
+            lens = vec![lens[0]; rows];
+        }
+        if lens.len() != rows {
+            return Ok(Err(format!(
+                "forward pass: rs-geometry.fold-len supplies {} value(s) for {rows} bound \
+                 recurrent-state working set(s)",
+                lens.len()
+            )));
+        }
+        Ok(Ok(Some(lens)))
+    }
+
+    async fn core_drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
         // A pass can be dropped before its pipeline. Drain the shared FIFO first
         // so every callback, mirror publication, and KV/RS transaction completes
         // before raw mirror pointers are detached or pages become reusable.
@@ -1223,6 +1284,209 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             bound.close_native();
         }
         Ok(())
+    }
+}
+
+/// Shared body of the three `HostForwardPass` impls. Everything except the
+/// state-binding call and the fold-mode methods is IDENTICAL by construction --
+/// the WIT duplication exists to make cross-kind states unrepresentable in the
+/// guest, not to fork the host.
+macro_rules! forward_pass_common {
+    ($iface:ident, $kind:expr) => {
+        async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
+            self.core_new($kind).await
+        }
+
+        async fn embed(
+            &mut self,
+            this: Resource<ForwardPass>,
+            tokens: Resource<Channel>,
+            indptr: Resource<Channel>,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_embed(this, tokens, indptr).await
+        }
+
+        async fn readout(
+            &mut self,
+            this: Resource<ForwardPass>,
+            indices: Resource<Channel>,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_readout(this, indices).await
+        }
+
+        async fn program(
+            &mut self,
+            this: Resource<ForwardPass>,
+            container_bytes: Vec<u8>,
+            channels: Vec<Resource<Channel>>,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_program(this, container_bytes, channels).await
+        }
+
+        async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
+            self.core_drop(this).await
+        }
+    };
+}
+
+/// Converts an interface-local `rs-geometry` record into the host binding.
+/// Written as a macro rather than a trait because each interface generates its
+/// OWN nominally distinct record type (D8): they are structurally identical
+/// today, and adding a field to one must not move the other's ABI.
+macro_rules! rs_geometry_binding {
+    ($self:ident, $geom:expr) => {{
+        let geom = $geom;
+        let buffer = match page_span(geom.buffer) {
+            Ok(span) => span,
+            Err(error) => return Ok(Err(error)),
+        };
+        let _ = $self.ctx().table.get(&geom.fold_len)?;
+        RsGeometryBinding {
+            fold_len: geom.fold_len.rep(),
+            buffer,
+        }
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// pie:inferlet/forward — attention only.
+// ---------------------------------------------------------------------------
+
+impl pie::inferlet::forward::Host for ProcessCtx {
+    async fn submit(
+        &mut self,
+        on: Resource<crate::pipeline::Pipeline>,
+        slots: Vec<Option<Resource<ForwardPass>>>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_submit(on, slots).await
+    }
+
+    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
+        crate::pipeline::fire::park_frame(self, on)
+    }
+}
+
+impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
+    forward_pass_common!(forward, PassKind::Attention);
+
+    async fn attention(
+        &mut self,
+        this: Resource<ForwardPass>,
+        kv: Resource<crate::store::kv::working_set::KvWorkingSet>,
+        geom: pie::inferlet::forward::KvGeometry,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_attention(
+            this,
+            kv,
+            geom.readable_pages,
+            geom.writable_pages,
+            geom.kv_len,
+            geom.pages,
+            geom.page_indptr,
+            geom.w_slot,
+            geom.w_off,
+            geom.positions,
+            geom.mask,
+        )
+        .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pie:inferlet/forward-recurrent — folded recurrent state only.
+// ---------------------------------------------------------------------------
+
+impl pie::inferlet::forward_recurrent::Host for ProcessCtx {
+    async fn submit(
+        &mut self,
+        on: Resource<crate::pipeline::Pipeline>,
+        slots: Vec<Option<Resource<ForwardPass>>>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_submit(on, slots).await
+    }
+
+    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
+        crate::pipeline::fire::park_frame(self, on)
+    }
+}
+
+impl pie::inferlet::forward_recurrent::HostForwardPass for ProcessCtx {
+    forward_pass_common!(forward_recurrent, PassKind::Recurrent);
+
+    async fn attention(
+        &mut self,
+        this: Resource<ForwardPass>,
+        rs: Vec<Resource<RsWorkingSet>>,
+        geom: pie::inferlet::forward_recurrent::RsGeometry,
+    ) -> Anyhow<Result<(), String>> {
+        let geometry = rs_geometry_binding!(self, geom);
+        self.core_set_rs_working_sets(this, rs, geometry).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pie:inferlet/forward-hybrid — attention and recurrent layers in one forward.
+// ---------------------------------------------------------------------------
+
+impl pie::inferlet::forward_hybrid::Host for ProcessCtx {
+    async fn submit(
+        &mut self,
+        on: Resource<crate::pipeline::Pipeline>,
+        slots: Vec<Option<Resource<ForwardPass>>>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_submit(on, slots).await
+    }
+
+    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
+        crate::pipeline::fire::park_frame(self, on)
+    }
+}
+
+impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
+    forward_pass_common!(forward_hybrid, PassKind::Hybrid);
+
+    async fn attention(
+        &mut self,
+        this: Resource<ForwardPass>,
+        kv: Option<pie::inferlet::forward_hybrid::KvBinding>,
+        rs: Vec<Resource<RsWorkingSet>>,
+        rs_geom: pie::inferlet::forward_hybrid::RsGeometry,
+    ) -> Anyhow<Result<(), String>> {
+        let Some(kv) = kv else {
+            // The WIT admits `none` so that a recurrent-only commit fire is
+            // expressible without inventing dummy attention geometry.
+            // The bound-pass representation still requires a KV working set
+            // (`BoundForwardPass.kv_ws`), so wiring that arm end to end is
+            // follow-up work; today a commit fire binds KV like any
+            // other and this is the honest error rather than a silent
+            // half-bound pass.
+            return Ok(Err(
+                "forward pass: a hybrid pass with no attention binding is not supported yet; \
+                 bind the KV working set even for a recurrent-only fire"
+                    .to_string(),
+            ));
+        };
+        let geometry = rs_geometry_binding!(self, rs_geom);
+        let geom = kv.geometry;
+        if let Err(error) = self
+            .core_attention(
+                Resource::new_borrow(this.rep()),
+                kv.working_set,
+                geom.readable_pages,
+                geom.writable_pages,
+                geom.kv_len,
+                geom.pages,
+                geom.page_indptr,
+                geom.w_slot,
+                geom.w_off,
+                geom.positions,
+                geom.mask,
+            )
+            .await?
+        {
+            return Ok(Err(error));
+        }
+        self.core_set_rs_working_sets(this, rs, geometry).await
     }
 }
 

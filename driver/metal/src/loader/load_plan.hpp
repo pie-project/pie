@@ -14,11 +14,19 @@ namespace pie::metal {
 
 using LoadPlan = pie_loader::LoadPlan;
 
-/// This driver implements no tile transforms, so the loader may emit none; it
-/// must reach every layout with copies alone. `backend::metal` states the same
-/// thing from the Rust side. See the CUDA header for why the mask lives beside
-/// the kernels rather than in the loader's SDK.
-inline constexpr std::uint32_t kMetalTileMapMask = 0;
+/// What this driver's load-time kernels implement, and therefore what the loader
+/// is allowed to emit. The loader has no opinion of its own: it refuses a
+/// transform outside this set rather than emitting one the executor would then
+/// have to reject. Stated here, beside those kernels, so the cross-check stays
+/// one-sided.
+///
+/// `Scale` decodes a block-scaled scheme to values and `Cast` re-encodes those
+/// values as the affine-U4 the matvecs read; together they are what lets the
+/// published MXFP4 gpt-oss checkpoint load without an offline conversion. The
+/// three this driver does not implement -- `Reblock`, `Repack` and the fused
+/// kinds -- are layouts no kernel here wants.
+inline constexpr std::uint32_t kMetalTileMapMask =
+    pie_loader::kTileMapCast | pie_loader::kTileMapEncode | pie_loader::kTileMapScale;
 
 /// This driver's storage capability. One definition, two readers: the device
 /// facts JSON published at create time, and the target spec supplied with every

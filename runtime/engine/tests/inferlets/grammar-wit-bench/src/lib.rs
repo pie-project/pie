@@ -3,8 +3,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use inferlet::inference::Grammar;
-use inferlet::{Constrain, Ebnf, Matcher, Result, Schema, serde_json};
+use inferlet::grammar::{Grammar, Matcher};
+use inferlet::serde_json;
+use inferlet::{Context, Result};
 
 const GRAMMAR: &str = "root ::= [a-z]*";
 const ACCEPTED_TOKEN_ID: u32 = b'a' as u32;
@@ -42,9 +43,9 @@ async fn main(input: String) -> Result<String> {
         .unwrap_or_else(default_rounds)
         .max(1);
 
-    let mut rejection_probe = Ebnf(r#"root ::= "a""#).build_constraint()?;
-    if rejection_probe.advance(&[3]).is_ok() {
-        return Err("GrammarConstraint::advance swallowed a rejected token".to_string());
+    let rejection_probe = Matcher::new(&Grammar::from_ebnf(r#"root ::= "a""#)?);
+    if rejection_probe.accept_tokens(&[3]).is_ok() {
+        return Err("Matcher::accept_tokens swallowed a rejected token".to_string());
     }
 
     let grammar = Grammar::from_ebnf(GRAMMAR)?;
@@ -77,7 +78,7 @@ async fn main(input: String) -> Result<String> {
         for _ in 0..iterations {
             matcher
                 .accept_tokens(black_box(&[ACCEPTED_TOKEN_ID]))
-                .map_err(|error| format!("accept-tokens: {error:?}"))?;
+                .context("accept-tokens")?;
         }
         accept_samples.push(per_call(start.elapsed().as_nanos(), iterations));
 
@@ -87,7 +88,7 @@ async fn main(input: String) -> Result<String> {
             black_box(matcher.mask());
             matcher
                 .accept_tokens(black_box(&[ACCEPTED_TOKEN_ID]))
-                .map_err(|error| format!("mask+accept: {error:?}"))?;
+                .context("mask+accept")?;
         }
         combined_samples.push(per_call(start.elapsed().as_nanos(), iterations));
     }

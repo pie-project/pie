@@ -86,7 +86,7 @@ fn greedy_argmax_tier0_matches_golden() {
         w_off.put(Tensor::constant([0u32]));
         out.put(t);
     });
-    let _ = out.take(); // host-reader signal (marks `out` HostRole::Reader)
+    out.note_host_take(); // host-reader signal (marks `out` HostRole::Reader)
 
     let traced = b.build().expect("greedy builds");
     let bound = bound(&traced, 8, 4, 2);
@@ -198,7 +198,7 @@ fn build_section3() -> Traced {
     // Host-endpoint signals: mask is host-written each step, out is host-read
     // (the host-loop `mask.put(..)` / `out.take()` — mark Writer/Reader).
     mask.put(vec![true; V32 as usize]);
-    let _ = out.take();
+    out.note_host_take();
     b.build().expect("section3 builds")
 }
 

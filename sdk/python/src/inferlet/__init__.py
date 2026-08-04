@@ -1,129 +1,58 @@
 """
 Pie Inferlet SDK — Python bindings for the Pie runtime.
 
-Quickstart::
+STATUS: the forward-pass surface is NOT available from Python yet.
 
-    from inferlet import Context, Sampler, model
+The runtime's guest-facing forward-pass surface was replaced: the old
+`pie:core/inference` interface, which exposed a fixed host-side sampler
+(`Sampler.argmax()`, probes, `Generator`), is gone. In its place the guest
+traces a program and ships canonical PTIR container bytes through one of
+`pie:inferlet/forward`, `forward-recurrent`, or `forward-hybrid`.
 
-    ctx = Context()
+Nothing in this package can produce those bytes. The Rust SDK does it with
+`compiler/dsl` (the tracing eDSL) and `compiler/ir` (the container encoder);
+neither has a Python counterpart, and the encoder has to agree with the Rust
+one byte for byte. Porting it is its own project — see `forward_refactor.md`
+section 10.4 and the tracking note in `scripts/check-sdk-interfaces.sh`.
 
-    ctx.system("You are helpful.").user("What is 2 + 2?")
-    text = await ctx.generate(Sampler.argmax(), max_tokens=64).collect_text()
+So the modules that were built on the removed interface — `context`,
+`forward`, `generation`, `sample`, `grammar`, `tools`, `adapter`, `runtime`,
+`zo`, `spec` — have been deleted rather than left importing a surface that no
+longer exists. They were not usable; they only looked usable.
 
-Three-layer surface:
+What is here is the part of the SDK that survives the move unchanged: the
+non-forward interfaces, whose WIT definitions came through the split intact.
 
-* :class:`Context` — KV cache + chat fillers + ``forward()`` / ``generate()``.
-* :class:`Forward` (``ctx.forward()``) — single forward-pass primitive
-  with auto page management. For prefill / scoring / custom loops.
-* :class:`Generator` (``ctx.generate()``) — multi-step state machine
-  over Forward. Iterate with ``async for step in gen``, or use
-  ``await gen.collect_text() / .collect_tokens() / .collect_json()``.
+    from inferlet import model, session, chat, reasoning
 
-Streaming decoders for chat / reasoning / tools live as independent
-modules — compose by hand, no implicit suppression::
+`grammar` and `tools` DO exist as interfaces in the new world, but under
+different shapes (`pie:inferlet/grammar`, `pie:inferlet/tools`) than the
+deleted modules of those names targeted. They come back with the port, not
+before.
 
-    from inferlet import chat, reasoning, tools
+The generated `bindings/` tree is current: it is regenerated from
+`interface/inferlet/` with
 
-    chat_dec = chat.Decoder()
-    async for step in gen:
-        out = await step.execute()
-        match chat_dec.feed(out.tokens):
-            case chat.Event.Delta(text=t): print(t, end="")
-            case chat.Event.Done(text=full): break
-            case _: pass
+    componentize-py -d interface/inferlet -w inferlet bindings <out>
 
-Constraint specs (:class:`JsonSchema`, :class:`AnyJson`, :class:`Regex`,
-:class:`Ebnf`) implement the :class:`Schema` protocol — duck-typed, so
-your own grammar source class plugs in by adding a ``build_constraint``
-method. No inheritance required.
+and every interface in the world above is present there. Only the
+hand-written layer is missing.
 """
 
 from __future__ import annotations
 
-# --- Core ---
-from . import model
-from .sample import (
-    Distribution,
-    Entropy,
-    Logits,
-    Logprob,
-    Logprobs,
-    Sampler,
-)
-from .forward import Forward, Output, ProbeHandle, SampleHandle
-from .generation import GenStep, Generator
-from .context import Context
-
-# --- Decoders + tools (sub-modules; users import as `inferlet.chat`, etc.) ---
 from . import chat
+from . import model
 from . import reasoning
-from . import tools
-
-# --- Constraint surface ---
-from .grammar import (
-    AnyJson,
-    Constraint,
-    Ebnf,
-    Grammar,
-    GrammarConstraint,
-    JsonSchema,
-    Matcher,
-    Regex,
-    Schema,
-)
-
-# --- Speculation ---
-from .spec import Speculator
-
-# --- Runtime / IO ---
-from . import runtime
 from . import session
-from . import zo
-
-# --- Adapter ---
-from .adapter import Adapter
-
+from . import tokenizer
 
 __all__ = [
-    # Core
-    "Context",
-    "model",
-    "Adapter",
-    # Forward primitive
-    "Forward",
-    "Output",
-    "SampleHandle",
-    "ProbeHandle",
-    # Generator
-    "Generator",
-    "GenStep",
-    # Sampler / Probe
-    "Sampler",
-    "Logits",
-    "Distribution",
-    "Logprob",
-    "Logprobs",
-    "Entropy",
-    # Decoders + tools
     "chat",
+    "model",
     "reasoning",
-    "tools",
-    # Constraints
-    "Schema",
-    "JsonSchema",
-    "AnyJson",
-    "Regex",
-    "Ebnf",
-    "Constraint",
-    "GrammarConstraint",
-    "Grammar",
-    "Matcher",
-    # Speculation
-    "Speculator",
-    # Runtime / IO
-    "runtime",
     "session",
-    "zo",
+    "tokenizer",
 ]
 
 

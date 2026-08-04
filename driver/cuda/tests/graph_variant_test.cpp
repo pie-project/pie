@@ -39,15 +39,20 @@ int main() {
           "OLD encoding ALIASES graph_layout=128 with rs_verify");
 
     // ── 2. The FIX keeps those distinct ──
-    check(make_graph_variant(false, false, false, 64u) !=
-              make_graph_variant(true, false, false, 0u),
+    check(make_graph_variant(false, false, false, false, 64u) !=
+              make_graph_variant(true, false, false, false, 0u),
           "NEW: graph_layout=64 is DISTINCT from small_spec");
-    check(make_graph_variant(false, false, false, 128u) !=
-              make_graph_variant(false, true, false, 0u),
+    check(make_graph_variant(false, false, false, false, 128u) !=
+              make_graph_variant(false, true, false, false, 0u),
           "NEW: graph_layout=128 is DISTINCT from rs_verify");
-    check(make_graph_variant(false, false, false, 7u) !=
-              make_graph_variant(false, false, true, 7u),
+    check(make_graph_variant(false, false, false, false, 7u) !=
+              make_graph_variant(false, false, true, false, 7u),
           "NEW: masked and mask-free captures have DISTINCT variants");
+    // A fused-argmax capture records a different LM head than a materialising
+    // one, so replaying either for the other is a silent miscompute.
+    check(make_graph_variant(false, false, false, false, 7u) !=
+              make_graph_variant(false, false, false, true, 7u),
+          "NEW: fused-argmax and materialising captures have DISTINCT variants");
 
     const std::uint8_t continuing[] = {0, 0};
     const std::uint8_t resetting[] = {0, 1};
@@ -57,19 +62,19 @@ int main() {
             graph_replay_has_no_host_resets(false, nullptr, 2),
         "Qwen graph replay is disabled whenever a host reset is requested");
     const auto root_tp_key =
-        make_graph_variant(false, false, true, 7);
+        make_graph_variant(false, false, true, false, 7);
     const auto follower_tp_key =
-        make_graph_variant(false, false, true, 7);
+        make_graph_variant(false, false, true, false, 7);
     check(
         root_tp_key == follower_tp_key,
         "TP root/follower keys use identical actual capture flags");
 
     // ── 2b. Increment-4 hook bit (kGvHasHooks, layout shift 3 -> 4) ──
-    check(make_graph_variant(false, false, false, 7u, true) !=
-              make_graph_variant(false, false, false, 7u, false),
+    check(make_graph_variant(false, false, false, false, 7u, true) !=
+              make_graph_variant(false, false, false, false, 7u, false),
           "NEW: hook and hookless captures have DISTINCT variants");
-    check(make_graph_variant(false, false, false, 1u) !=
-              make_graph_variant(false, false, false, 0u, true),
+    check(make_graph_variant(false, false, false, false, 1u) !=
+              make_graph_variant(false, false, false, false, 0u, true),
           "NEW: graph_layout=1 is DISTINCT from kGvHasHooks (post-shift)");
 
     // ── 3. NEW encoding: exhaustive uniqueness over (4 flags) × (layout 0..255) ──
@@ -79,8 +84,8 @@ int main() {
         for (std::uint32_t layout = 0; layout <= 255u; ++layout) {
             for (int f = 0; f < 16; ++f) {
                 const std::uint32_t v = make_graph_variant(
-                    (f & 1) != 0, (f & 2) != 0, (f & 4) != 0, layout,
-                    (f & 8) != 0);
+                    (f & 1) != 0, (f & 2) != 0, (f & 4) != 0, (f & 8) != 0,
+                    layout, (f & 16) != 0);
                 if (!seen.insert(v).second) unique = false;
             }
         }

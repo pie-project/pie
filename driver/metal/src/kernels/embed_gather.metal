@@ -7,13 +7,24 @@
 // Port notes (M=1 decode, group_size=64, bits=4, hidden=1024):
 //   * token_id IS the per-token IO scalar -> read from a *buffer* (id[0]) per
 //     decode_abi I1, never setBytes.
-//   * Same 4-bit affine packing as qmv: 8 nibbles/uint32, per-group scale+bias.
+//   * Same affine packing as qmv: 32/bits codes per uint32, per-group scale+bias.
 //   * One thread per output channel k -> out[k] = scale[g]*nibble_k + bias[g].
 //   * Output goes to the resident hidden slot (logits path is the separate qmv).
 // Launch: dispatchThreads grid=(hidden, 1, 1). bfloat native on Metal 4.
 
 #include <metal_stdlib>
 using namespace metal;
+
+// One row of a quantized table, at either width mlx_lm ships. The `bits`
+// template parameter used to be decorative -- the body divided by 8 and masked
+// a nibble -- so an 8-bit table would have been gathered as if it were 4-bit,
+// which is exactly the class of error that produces a fluent wrong answer.
+template <int bits>
+inline uint dequant_code(const device uint32_t* row, int k) {
+  constexpr int per_word = 32 / bits;
+  constexpr uint mask = (1u << bits) - 1u;
+  return (row[k / per_word] >> ((k % per_word) * bits)) & mask;
+}
 
 template <typename T, int group_size, int bits>
 [[kernel]] void embed_gather_4bit(
@@ -26,12 +37,11 @@ template <typename T, int group_size, int bits>
     uint k [[thread_position_in_grid]]) {
   if ((int)k >= hidden) return;
   const int row = id[0];
-  const int packs_per_row = hidden / 8;        // 8 nibbles per uint32
+  const int packs_per_row = hidden / (32 / bits);
   const int groups_per_row = hidden / group_size;
 
   const int g = (int)k / group_size;
-  const uint32_t pack = w[row * packs_per_row + (int)k / 8];
-  const uint nibble = (pack >> (((int)k % 8) * 4)) & 0xf;
+  const uint nibble = dequant_code<bits>(w + row * packs_per_row, (int)k);
 
   const float s = static_cast<float>(scales[row * groups_per_row + g]);
   const float b = static_cast<float>(biases[row * groups_per_row + g]);
@@ -44,9 +54,12 @@ template <typename T, int group_size, int bits>
       const device uint32_t*, const device itype*, const device itype*, \
       const device int*, device itype*, const constant int&, uint);
 
-instantiate_embed(float32, float, 64, 4)
-instantiate_embed(float16, half, 64, 4)
 instantiate_embed(bfloat16, bfloat, 64, 4)
+instantiate_embed(bfloat16, bfloat, 32, 4)
+instantiate_embed(bfloat16, bfloat, 128, 4)
+instantiate_embed(bfloat16, bfloat, 64, 8)
+instantiate_embed(bfloat16, bfloat, 32, 8)
+instantiate_embed(bfloat16, bfloat, 128, 8)
 
 // ── Scaled variant (gemma4): out[k] = embed_scale * dequant(row, k). ─────────────
 // gemma4 multiplies the gathered embedding by a constant (embed_tokens: sqrt(hidden);
@@ -66,11 +79,10 @@ template <typename T, int group_size, int bits>
     uint k [[thread_position_in_grid]]) {
   if ((int)k >= hidden) return;
   const int row = id[0];
-  const int packs_per_row = hidden / 8;
+  const int packs_per_row = hidden / (32 / bits);
   const int groups_per_row = hidden / group_size;
   const int g = (int)k / group_size;
-  const uint32_t pack = w[row * packs_per_row + (int)k / 8];
-  const uint nibble = (pack >> (((int)k % 8) * 4)) & 0xf;
+  const uint nibble = dequant_code<bits>(w + row * packs_per_row, (int)k);
   const float s = static_cast<float>(scales[row * groups_per_row + g]);
   const float b = static_cast<float>(biases[row * groups_per_row + g]);
   out[k] = static_cast<T>((s * static_cast<float>(nibble) + b) * embed_scale);
@@ -83,9 +95,12 @@ template <typename T, int group_size, int bits>
       const device int*, device itype*, const constant int&,                    \
       const constant float&, uint);
 
-instantiate_embed_scaled(float32, float, 64, 4)
-instantiate_embed_scaled(float16, half, 64, 4)
 instantiate_embed_scaled(bfloat16, bfloat, 64, 4)
+instantiate_embed_scaled(bfloat16, bfloat, 32, 4)
+instantiate_embed_scaled(bfloat16, bfloat, 128, 4)
+instantiate_embed_scaled(bfloat16, bfloat, 64, 8)
+instantiate_embed_scaled(bfloat16, bfloat, 32, 8)
+instantiate_embed_scaled(bfloat16, bfloat, 128, 8)
 
 // ── M>1 batched gather (multi-batch lane). ───────────────────────────────────
 // One thread per (channel k, token row m); token m gathers row id[m] (per-row IO
@@ -104,11 +119,10 @@ template <typename T, int group_size, int bits>
   const int m = int(gid.y);
   if (k >= hidden) return;
   const int row = id[m];
-  const int packs_per_row = hidden / 8;
+  const int packs_per_row = hidden / (32 / bits);
   const int groups_per_row = hidden / group_size;
   const int g = k / group_size;
-  const uint32_t pack = w[row * packs_per_row + k / 8];
-  const uint nibble = (pack >> ((k % 8) * 4)) & 0xf;
+  const uint nibble = dequant_code<bits>(w + row * packs_per_row, k);
   const float s = static_cast<float>(scales[row * groups_per_row + g]);
   const float b = static_cast<float>(biases[row * groups_per_row + g]);
   out[m * hidden + k] = static_cast<T>(s * static_cast<float>(nibble) + b);
@@ -120,9 +134,12 @@ template <typename T, int group_size, int bits>
       const device uint32_t*, const device itype*, const device itype*,     \
       const device int*, device itype*, const constant int&, uint2);
 
-instantiate_embed_mb(float32, float, 64, 4)
-instantiate_embed_mb(float16, half, 64, 4)
 instantiate_embed_mb(bfloat16, bfloat, 64, 4)
+instantiate_embed_mb(bfloat16, bfloat, 32, 4)
+instantiate_embed_mb(bfloat16, bfloat, 128, 4)
+instantiate_embed_mb(bfloat16, bfloat, 64, 8)
+instantiate_embed_mb(bfloat16, bfloat, 32, 8)
+instantiate_embed_mb(bfloat16, bfloat, 128, 8)
 
 // gemma4 scaled batched variant.
 template <typename T, int group_size, int bits>
@@ -139,11 +156,10 @@ template <typename T, int group_size, int bits>
   const int m = int(gid.y);
   if (k >= hidden) return;
   const int row = id[m];
-  const int packs_per_row = hidden / 8;
+  const int packs_per_row = hidden / (32 / bits);
   const int groups_per_row = hidden / group_size;
   const int g = k / group_size;
-  const uint32_t pack = w[row * packs_per_row + k / 8];
-  const uint nibble = (pack >> ((k % 8) * 4)) & 0xf;
+  const uint nibble = dequant_code<bits>(w + row * packs_per_row, k);
   const float s = static_cast<float>(scales[row * groups_per_row + g]);
   const float b = static_cast<float>(biases[row * groups_per_row + g]);
   out[m * hidden + k] = static_cast<T>((s * static_cast<float>(nibble) + b) * embed_scale);
@@ -156,6 +172,9 @@ template <typename T, int group_size, int bits>
       const device int*, device itype*, const constant int&,                      \
       const constant float&, uint2);
 
-instantiate_embed_scaled_mb(float32, float, 64, 4)
-instantiate_embed_scaled_mb(float16, half, 64, 4)
 instantiate_embed_scaled_mb(bfloat16, bfloat, 64, 4)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 32, 4)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 128, 4)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 64, 8)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 32, 8)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 128, 8)

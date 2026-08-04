@@ -12,7 +12,6 @@ namespace {
 constexpr int BLOCK = 256;
 constexpr int MAX_MASKED_TOP_K = 64;
 constexpr int MASKED_TILE_TOKENS = 8;
-constexpr int LM_HEAD_TILE_TOKENS = 8;
 
 bool argmax_vec2_enabled() {
     static const bool enabled = [] {
@@ -438,53 +437,6 @@ __global__ void masked_embedding_tile_argmax_pairs_bf16_kernel(
     (void)num_tiles;
 }
 
-__global__ void lm_head_argmax_pairs_bf16_kernel(
-    const __nv_bfloat16* __restrict__ hidden_states,
-    const __nv_bfloat16* __restrict__ lm_head_weight,
-    std::uint64_t* __restrict__ partial_pairs,
-    int hidden,
-    int vocab)
-{
-    const int row = blockIdx.x;
-    const int tile = blockIdx.y;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int tok = tile * LM_HEAD_TILE_TOKENS + warp;
-    const auto* hidden_row =
-        hidden_states + static_cast<long long>(row) * hidden;
-
-    __shared__ float vals[LM_HEAD_TILE_TOKENS];
-    __shared__ int toks[LM_HEAD_TILE_TOKENS];
-
-    float dot = -INFINITY;
-    if (warp < LM_HEAD_TILE_TOKENS && tok < vocab) {
-        const auto* wrow =
-            lm_head_weight + static_cast<long long>(tok) * hidden;
-        float sum = 0.f;
-        for (int h = lane; h < hidden; h += 32) {
-            sum += __bfloat162float(hidden_row[h]) *
-                   __bfloat162float(wrow[h]);
-        }
-        dot = warp_sum(sum);
-    }
-
-    if (lane == 0) {
-        vals[warp] = dot;
-        toks[warp] = tok;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        float best_val = vals[0];
-        int best_tok = toks[0];
-        for (int i = 1; i < LM_HEAD_TILE_TOKENS; ++i) {
-            update_argmax(vals[i], toks[i], best_val, best_tok);
-        }
-        partial_pairs[static_cast<std::size_t>(tile) * gridDim.x + row] =
-            pack_argmax_pair(best_val, best_tok);
-    }
-}
-
 __device__ __forceinline__ float unpack_argmax_value(std::uint64_t pair) {
     const std::uint32_t bits = static_cast<std::uint32_t>(pair >> 32);
     return __uint_as_float(bits);
@@ -521,6 +473,110 @@ __global__ void select_lm_head_argmax_pairs_kernel(
     out_tokens[row] = best_tok;
 }
 
+
+// ── Chunked (vocab-streaming) argmax ─────────────────────────────────
+// One block per row, `kAccumThreads` threads striding the slab. Each thread
+// keeps a running best, then the warps reduce so the state carried between
+// slabs is `kArgmaxAccumSlots` pairs per row rather than one per thread —
+// carrying per-thread state instead round-trips megabytes of scratch per
+// slab and measured SLOWER than not chunking at all (§20.36).
+//
+// The ordering is a total order on (value, -index), so the result does not
+// depend on scan order or on how the vocab is cut.
+constexpr int kAccumThreads = 1024;
+constexpr int kAccumWarps = kAccumThreads / 32;
+static_assert(kAccumWarps == kArgmaxAccumSlots,
+              "the accumulator carries one slot per warp; "
+              "kArgmaxAccumSlots must match kAccumThreads / 32");
+
+__device__ __forceinline__ void warp_reduce_argmax(float& v, int& i) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, v, off);
+        const int   oi = __shfl_down_sync(0xffffffffu, i, off);
+        update_argmax(ov, oi, v, i);
+    }
+}
+
+__global__ void argmax_accumulate_bf16_kernel(
+    const __nv_bfloat16* __restrict__ slab,
+    int width,
+    int row_stride,
+    int vocab_base,
+    float* __restrict__ acc_val,
+    std::int32_t* __restrict__ acc_idx,
+    bool init,
+    bool vectorised)
+{
+    const int row = blockIdx.x;
+    const __nv_bfloat16* row_ptr =
+        slab + static_cast<std::size_t>(row) * row_stride;
+
+    float best_val = -INFINITY;
+    int   best_idx = 0;
+
+    if (vectorised) {
+        // 8 bf16 per 16-byte load. `vectorised` is decided host-side from
+        // the row stride, so every row starts 16-byte aligned.
+        const int vec_count = width >> 3;
+        const uint4* vec_ptr = reinterpret_cast<const uint4*>(row_ptr);
+        for (int v = threadIdx.x; v < vec_count; v += kAccumThreads) {
+            const uint4 packed = vec_ptr[v];
+            const auto* lane =
+                reinterpret_cast<const __nv_bfloat16*>(&packed);
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                update_argmax(__bfloat162float(lane[t]),
+                              vocab_base + (v << 3) + t, best_val, best_idx);
+            }
+        }
+        for (int i = (vec_count << 3) + threadIdx.x; i < width;
+             i += kAccumThreads) {
+            update_argmax(__bfloat162float(row_ptr[i]), vocab_base + i,
+                          best_val, best_idx);
+        }
+    } else {
+        for (int i = threadIdx.x; i < width; i += kAccumThreads) {
+            update_argmax(__bfloat162float(row_ptr[i]), vocab_base + i,
+                          best_val, best_idx);
+        }
+    }
+
+    warp_reduce_argmax(best_val, best_idx);
+    if ((threadIdx.x & 31) != 0) return;
+
+    const std::size_t slot =
+        static_cast<std::size_t>(row) * kAccumWarps + (threadIdx.x >> 5);
+    if (!init) {
+        update_argmax(acc_val[slot], acc_idx[slot], best_val, best_idx);
+    }
+    acc_val[slot] = best_val;
+    acc_idx[slot] = best_idx;
+}
+
+__global__ void argmax_finalize_bf16_kernel(
+    const float* __restrict__ acc_val,
+    const std::int32_t* __restrict__ acc_idx,
+    std::int32_t* __restrict__ token_ids)
+{
+    const int row = blockIdx.x;
+    const std::size_t slot =
+        static_cast<std::size_t>(row) * kAccumWarps + threadIdx.x;
+    float best_val = acc_val[slot];
+    int   best_idx = acc_idx[slot];
+    warp_reduce_argmax(best_val, best_idx);
+    if (threadIdx.x == 0) token_ids[row] = best_idx;
+}
+
+// The vec2 kernels index rows as `base + row * vocab` and load through
+// `__nv_bfloat162`, so an odd vocab puts every second row on a 2-byte
+// boundary and the load faults. Production vocabs are even, which is why this
+// never fired, but the guard costs nothing.
+bool argmax_vec2_usable(const void* logits, int vocab) {
+    return argmax_vec2_enabled() && (vocab % 2) == 0 &&
+           (reinterpret_cast<std::uintptr_t>(logits) % 4) == 0;
+}
+
 }  // namespace
 
 void launch_argmax_bf16(
@@ -529,7 +585,7 @@ void launch_argmax_bf16(
 {
     dim3 grid(num_rows);
     dim3 block(BLOCK);
-    if (argmax_vec2_enabled()) {
+    if (argmax_vec2_usable(logits, vocab)) {
         argmax_bf16_vec2_kernel<<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits), token_ids, vocab);
     } else {
@@ -549,7 +605,7 @@ void launch_argmax_bf16_compact_scatter(
     if (num_rows <= 0 || vocab <= 0) return;
     dim3 grid(num_rows);
     dim3 block(BLOCK);
-    if (argmax_vec2_enabled()) {
+    if (argmax_vec2_usable(logits, vocab)) {
         argmax_bf16_compact_scatter_vec2_kernel<<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits), row_indices,
             token_ids, vocab);
@@ -560,30 +616,39 @@ void launch_argmax_bf16_compact_scatter(
     }
 }
 
-void launch_lm_head_argmax_bf16(
-    const void* hidden_states,
-    const void* lm_head_weight,
-    std::uint64_t* partial_pairs,
-    std::int32_t* token_ids,
-    int num_rows,
-    int hidden,
-    int vocab,
+void launch_argmax_accumulate_bf16(
+    const void* slab,
+    int rows,
+    int width,
+    int row_stride,
+    int vocab_base,
+    float* acc_val,
+    std::int32_t* acc_idx,
+    bool init,
     cudaStream_t stream)
 {
-    if (num_rows <= 0 || hidden <= 0 || vocab <= 0) return;
-    const int tiles = (vocab + LM_HEAD_TILE_TOKENS - 1) / LM_HEAD_TILE_TOKENS;
-    dim3 score_grid(num_rows, tiles);
-    dim3 score_block(BLOCK);
-    lm_head_argmax_pairs_bf16_kernel<<<score_grid, score_block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(hidden_states),
-        static_cast<const __nv_bfloat16*>(lm_head_weight),
-        partial_pairs,
-        hidden,
-        vocab);
-    dim3 select_block(128);
-    dim3 select_grid((num_rows + select_block.x - 1) / select_block.x);
-    select_lm_head_argmax_pairs_kernel<<<select_grid, select_block, 0, stream>>>(
-        partial_pairs, token_ids, num_rows, tiles);
+    if (rows <= 0 || width <= 0) return;
+    // The vectorised path needs every row to start 16-byte aligned, which is
+    // the slab base and the row stride together. A caller slicing a chunk out
+    // of a wider buffer can land on an odd column, so check rather than assume.
+    const bool vectorised =
+        (row_stride % 8) == 0 && width >= 8 &&
+        (reinterpret_cast<std::uintptr_t>(slab) % 16) == 0;
+    argmax_accumulate_bf16_kernel<<<rows, kAccumThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(slab), width, row_stride,
+        vocab_base, acc_val, acc_idx, init, vectorised);
+}
+
+void launch_argmax_finalize_bf16(
+    const float* acc_val,
+    const std::int32_t* acc_idx,
+    std::int32_t* token_ids,
+    int rows,
+    cudaStream_t stream)
+{
+    if (rows <= 0) return;
+    argmax_finalize_bf16_kernel<<<rows, kAccumWarps, 0, stream>>>(
+        acc_val, acc_idx, token_ids);
 }
 
 // ── Fused INT8 GEMV + argmax ──────────────────────────────────────

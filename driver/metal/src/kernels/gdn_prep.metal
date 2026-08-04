@@ -330,11 +330,7 @@ template <typename T>
       const device float*, const device float*, device float*,              \
       constant GdnCoreParams&, const device uint*, uint3, uint);
 
-instantiate_gdn_prep(float32, float)
-instantiate_gdn_prep(float16, half)
 instantiate_gdn_prep(bfloat16, bfloat)
-instantiate_gdn_prep_slotted(float32, float)
-instantiate_gdn_prep_slotted(float16, half)
 instantiate_gdn_prep_slotted(bfloat16, bfloat)
 
 // ---------------------------------------------------------------------------
@@ -519,6 +515,4 @@ template <typename T>
       constant GdnCoreParams&, const device uint*, constant int&, constant int&,\
       uint3, uint);
 
-instantiate_gdn_prefill(float32, float)
-instantiate_gdn_prefill(float16, half)
 instantiate_gdn_prefill(bfloat16, bfloat)

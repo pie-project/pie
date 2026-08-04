@@ -305,6 +305,12 @@ fn step_desc<'a>(
         rs_fold_lens: u32_slice(&plan.rs_fold_lens),
         rs_buffer_slot_ids: u32_slice(&plan.rs_buffer_slot_ids),
         rs_buffer_slot_indptr: u32_slice(&plan.rs_buffer_slot_indptr),
+        rs_buffer_read_slot_ids: u32_slice(&plan.rs_buffer_read_slot_ids),
+        rs_buffer_read_indptr: u32_slice(&plan.rs_buffer_read_indptr),
+        rs_buffer_read_lens: u32_slice(&plan.rs_buffer_read_lens),
+        rs_buffer_heads: u32_slice(&plan.rs_buffer_heads),
+        rs_translation: u32_slice(&plan.rs_translation),
+        rs_translation_indptr: u32_slice(&plan.rs_translation_indptr),
         masks: masks.as_desc(),
         sampling_indices: u32_slice(&plan.sampling_indices),
         sampling_indptr: u32_slice(&plan.sampling_indptr),
@@ -341,9 +347,12 @@ fn step_desc<'a>(
         channel_expected_head: u64_slice(&step.channel_expected_head),
         channel_expected_tail: u64_slice(&step.channel_expected_tail),
         channel_ticket_indptr: u32_slice(&step.channel_ticket_indptr),
-        region_row_indptr: u32_slice(&step.region_row_indptr),
-        region_sig: u32_slice(&step.region_sig),
-        region_k: u32_slice(&step.region_k),
+        // tart rung ③ (region table): DORMANT until the upstream
+        // scheduler regraft — the driver derives all plans as UNPLANNED
+        // from an empty table, the legacy discipline.
+        region_row_indptr: pie_driver_abi::PieU32Slice::default(),
+        region_sig: pie_driver_abi::PieU32Slice::default(),
+        region_k: pie_driver_abi::PieU32Slice::default(),
     }
 }
 

@@ -334,6 +334,10 @@ __device__ __forceinline__ float m1_intrinsic_row_load(
 // argmax over a 154k vocabulary read its logits at 37 GB/s. The row is loop
 // invariant and the dtype branch is block-uniform, so both belong outside the
 // column loop.
+//
+// `mode == 3` (pre-reduced, see `ptir_fast_argmax_intrinsic`) never reaches
+// here: there are no columns to address, so its only reader returns before
+// resolving a row.
 __device__ __forceinline__ const m1_u8* m1_intrinsic_row_base(
     const m1_u8* input, m1_u64 row, m1_u32 stride, m1_u32 mode) {
   if (mode == 2u) {

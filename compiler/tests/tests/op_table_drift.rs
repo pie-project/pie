@@ -43,7 +43,7 @@ struct CxxRow {
 
 fn op_table_hpp() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../driver/abi/include/pie_native/launch/op_table.hpp")
+        .join("../../driver/common/include/pie/driver/launch/op_table.hpp")
 }
 
 /// Parses the `case OpCode::X: return {c, arity, results, "name"};` rows out of

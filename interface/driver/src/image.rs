@@ -4,7 +4,7 @@
 //! [`PieLaunchPackage`]. They cannot run the compiler, and the compiler cannot
 //! emit C++ initializers because the fixtures are written *after* the C++ is
 //! built. So the package is written out as its own `#[repr(C)]` bytes plus a
-//! relocation table, and the C++ side (`pie_native/launch/image.hpp`) turns it
+//! relocation table, and the C++ side (`pie/driver/testing/image.hpp`) turns it
 //! back into a package with one pass of pointer fixups.
 //!
 //! This is not a wire format and nothing in production reads it: the engine

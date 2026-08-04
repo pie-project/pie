@@ -408,14 +408,32 @@ __device__ __forceinline__ void ptir_m1_execute(
     return;
   }
   if (p.tag == 0x40 || p.tag == 0x41) {
+    // Scanned in the operand's own dtype. A u32 offset scan is exactly what
+    // ragged row offsets are built from, and accumulating one through float
+    // is exact only below 2^24 -- past that it rounds, silently.
+    const bool is_sum = p.tag == 0x40;
     for (m1_u32 row = 0; row < d0.rows; ++row) {
-      float accumulated = p.tag == 0x40 ? 0.0f : 1.0f;
+      float accumulated_f = is_sum ? 0.0f : 1.0f;
+      m1_u32 accumulated_u = is_sum ? 0u : 1u;
+      int accumulated_i = is_sum ? 0 : 1;
       for (m1_u32 column = 0; column < d0.last; ++column) {
         const m1_u32 index = row * d0.last + column;
-        const float value = m1_load_f(a0, index, d0.dtype);
-        accumulated =
-            p.tag == 0x40 ? accumulated + value : accumulated * value;
-        m1_store_f(o0, index, accumulated);
+        if (d0.dtype == 1) {
+          const int value = m1_load_i(a0, index, d0.dtype);
+          accumulated_i = is_sum ? (int)((m1_u32)accumulated_i + (m1_u32)value)
+                                 : (int)((m1_u32)accumulated_i * (m1_u32)value);
+          m1_store_i(o0, index, accumulated_i);
+        } else if (d0.dtype == 2) {
+          const m1_u32 value = m1_load_u(a0, index, d0.dtype);
+          accumulated_u = is_sum ? accumulated_u + value
+                                 : accumulated_u * value;
+          m1_store_u(o0, index, accumulated_u);
+        } else {
+          const float value = m1_load_f(a0, index, d0.dtype);
+          accumulated_f = is_sum ? accumulated_f + value
+                                 : accumulated_f * value;
+          m1_store_f(o0, index, accumulated_f);
+        }
       }
     }
     return;

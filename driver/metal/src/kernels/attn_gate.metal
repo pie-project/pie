@@ -68,10 +68,6 @@ template <typename T>
   [[kernel]] void attn_gate<itype>(                               \
       device itype*, const device itype*, const constant int&, uint);
 
-instantiate_q_gate_split(float32, float)
-instantiate_q_gate_split(float16, half)
 instantiate_q_gate_split(bfloat16, bfloat)
 
-instantiate_attn_gate(float32, float)
-instantiate_attn_gate(float16, half)
 instantiate_attn_gate(bfloat16, bfloat)

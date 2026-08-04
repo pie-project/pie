@@ -11,12 +11,20 @@ interface tokenizer {
     // Converts token IDs back into a decoded string
     decode: func(tokens: list<u32>) -> result<string, error>;
 
-    // Returns the model's vocabulary as a list of byte sequences (tokens)
-    vocabs: func() -> tuple<list<u32>, list<list<u8>>>;
+    // One entry of a token table: the id the model uses and the raw bytes it
+    // stands for. A record rather than two parallel lists, so a caller cannot
+    // zip them wrong and no comment is needed to say which is which.
+    record token {
+        id: u32,
+        bytes: list<u8>,
+    }
+
+    // Returns the model's vocabulary
+    vocabs: func() -> list<token>;
 
     // Returns the split regular expression used by the tokenizer
     split-regex: func() -> string;
 
     // Returns the special tokens recognized by the model
-    special-tokens: func() -> tuple<list<u32>, list<list<u8>>>;
+    special-tokens: func() -> list<token>;
 }

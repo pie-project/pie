@@ -32,8 +32,8 @@
 #include <type_traits>
 #include <vector>
 
-#include "pie_native/launch/op_table.hpp"
-#include "pie_native/launch/plan.hpp"
+#include "pie/driver/launch/op_table.hpp"
+#include "pie/driver/launch/plan.hpp"
 #include <rng_contract.generated.h>
 
 namespace pie_cuda_driver::pipeline::generated {
@@ -138,8 +138,8 @@ inline constexpr bool supported_tag(std::uint8_t tag) {
 }
 
 inline bool same_type(
-    const pie_native::launch::plan::ValueType& left,
-    const pie_native::launch::plan::ValueType& right) {
+    const pie::driver::launch::plan::ValueType& left,
+    const pie::driver::launch::plan::ValueType& right) {
     return left.dtype == right.dtype &&
         left.dims.size() == right.dims.size() &&
         std::equal(
@@ -152,8 +152,8 @@ inline bool same_type(
 }
 
 inline bool nucleus_library_region_valid(
-    const pie_native::launch::plan::StagePlan& stage,
-    const pie_native::launch::plan::Region& region) {
+    const pie::driver::launch::plan::StagePlan& stage,
+    const pie::driver::launch::plan::Region& region) {
     if (!region.library ||
         region.library_op != PTIR_LIBRARY_NUCLEUS_SAMPLE ||
         region.schedule != PTIR_SCHEDULE_LIBRARY ||
@@ -204,7 +204,7 @@ inline bool nucleus_library_region_valid(
             logits_type.dims.back().value) {
         return false;
     }
-    const std::vector<pie_native::launch::plan::Dimension> row_dims(
+    const std::vector<pie::driver::launch::plan::Dimension> row_dims(
         logits_type.dims.begin(), logits_type.dims.end() - 1);
     return top_p_type.dtype == PTIR_DT_F32 &&
         (top_p_type.dims.empty() ||
@@ -222,8 +222,8 @@ inline bool nucleus_library_region_valid(
 }
 
 inline bool library_region_valid(
-    const pie_native::launch::plan::StagePlan& stage,
-    const pie_native::launch::plan::Region& region) {
+    const pie::driver::launch::plan::StagePlan& stage,
+    const pie::driver::launch::plan::Region& region) {
     if (!region.library) {
         return region.schedule != PTIR_SCHEDULE_LIBRARY;
     }

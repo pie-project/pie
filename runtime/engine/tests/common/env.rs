@@ -57,7 +57,6 @@ fn dummy_driver_backend(
         has_mtp_drafts: true,
         has_value_head: true,
         has_attn_score: true,
-        model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
         callback_delay_ms,
         reject_launches: false,
         reject_launches_remaining: 0,
@@ -82,7 +81,7 @@ pub struct MockEnv {
     temp_cache: TempDir,
     /// Recurrent-state pool the model reports (`rs_cache_slots` /
     /// `rs_cache_slot_bytes`). Zero — the default — makes the mock a
-    /// pure-attention model; non-zero makes `model.is-linear()` true and
+    /// pure-attention model; non-zero makes `model.pass-kind()` non-attention and
     /// gives the engine an `RsStore` to bind, which is what the GDN/linear
     /// inferlets need.
     rs_slots: usize,
@@ -145,9 +144,7 @@ impl MockEnv {
                 has_value_head: true,
                 has_kv_envelopes: false,
                 has_attn_page_mask: false,
-                has_lora: false,
                 has_attn_score: false,
-                model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
                 limits: SchedulerLimits {
                     max_forward_requests: 32,
@@ -180,9 +177,13 @@ impl MockEnv {
                 arch_name: String::new(),
                 kv_page_size: 16,
                 tokenizer_path,
+                // A fixture snapshot, not an artifact.
+                artifact: None,
                 drivers,
                 scheduler: SchedulerConfig {
                     request_timeout_secs: 30,
+                    submit_deadline_us: 50_000,
+                    silence_timeout_secs: 30,
                 },
             },
             runtime: RuntimeConfig {

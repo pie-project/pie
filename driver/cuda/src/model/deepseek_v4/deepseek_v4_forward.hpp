@@ -89,6 +89,15 @@ struct DsV4Workspace {
     int swa_plan_tokens = -1;
     int swa_plan_requests = -1;
 
+    // Staging for one FP8 -> BF16 dequantised `wo_a` group slice,
+    // `[o_lora_rank, (num_heads * head_dim) / o_groups]`. It has its own
+    // allocation because `wo_a` is REPLICATED across TP ranks while every
+    // routed-expert buffer shrinks as `moe_intermediate_size / tp_size`:
+    // borrowing `expert_gate_w` for it (as this used to) fit at tp<=4 and
+    // overran it at tp=8, which surfaced only as an illegal memory access
+    // several kernels later.
+    DeviceTensor wo_a_dequant;
+
     // Routed expert scratch
     DeviceTensor expert_in;      // [N, H] bf16 — gathered input rows
     DeviceTensor expert_gate_w;  // [moe_I, H] bf16 — dequanted gate weight

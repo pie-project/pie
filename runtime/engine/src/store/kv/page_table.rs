@@ -1690,7 +1690,7 @@ impl KvPageTable {
             external.extend(self.anchor_locations(terminal));
         }
 
-        // DIAGNOSIS (PIE_CONTENTION_TRACE_MS): when the suspend path finds
+        // DIAGNOSIS (PIE_CONTENTION_TRACE_EVENTS): when the suspend path finds
         // nothing to reclaim, report WHY — how many target pages were shared
         // with another working set, held by a cache root, or already swapped.
         let diagnose = crate::planner::trace_enabled();

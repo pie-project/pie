@@ -35,9 +35,25 @@ void launch_dequant_fp8_e4m3_to_bf16_per_channel(
     int                 cols,
     cudaStream_t        stream);
 
-/// Per-group (block-scaled) variant: dequant a `[rows, cols]` row-major
-/// FP8 weight with scales shaped `[rows/group_size, cols/group_size]`.
-/// Each group_size x group_size block of elements shares one scale.
+/// Block-scaled variant: dequant a `[rows, cols]` row-major FP8 weight with
+/// scales shaped `[rows/row_block, cols/col_block]`. Each block of elements
+/// shares one scale.
+///
+/// The two extents are separate because they need not be equal: a per-channel
+/// scale is `row_block = 1` with the whole row as one column block, and
+/// DeepSeek's square 128x128 is the case where they happen to agree.
+void launch_dequant_fp8_e4m3_to_bf16_blocked(
+    const std::uint8_t* fp8_in,     // [rows, cols] fp8 bytes
+    void*               bf16_out,   // [rows, cols] bf16
+    const float*        scale_dev,  // [rows/rb, cols/cb] fp32 device scales
+    int                 rows,
+    int                 cols,
+    int                 row_block,
+    int                 col_block,
+    cudaStream_t        stream);
+
+/// The square case, kept because a checkpoint that ships one number per block
+/// says it once: `group_size` on both axes.
 void launch_dequant_fp8_e4m3_to_bf16_per_group(
     const std::uint8_t* fp8_in,         // [rows, cols] fp8 bytes
     void*               bf16_out,       // [rows, cols] bf16

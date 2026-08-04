@@ -16,7 +16,7 @@
 //! Stage-2 (`mtp_logits` driver head); the intrinsic API is stable, so this
 //! pre-stages the §6.1 pass.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 /// MTP draft width (K); the verify window is `[K+1, V]`.
@@ -34,32 +34,33 @@ async fn main(_input: String) -> Result<String> {
     let gmask = Channel::new([kp1, v], dtype::bool).named("gmask");
     // toks: the K+1 verify-window input tokens (seeded per instance).
     let toks = Channel::from(vec![BOS; kp1 as usize]).named("toks");
-    let lanes = Channel::from((0u32..=kp1).collect::<Vec<_>>()).named("embed_indptr");
-    let positions = Channel::from((0..kp1).collect::<Vec<_>>()).named("positions");
+    let lanes = Channel::from_iter(0u32..=kp1).named("embed_indptr");
+    let positions = Channel::from_iter(0..kp1).named("positions");
     let pages = Channel::from(vec![0u32; kp1 as usize]).named("pages");
-    let page_indptr = Channel::from((0u32..=kp1).collect::<Vec<_>>()).named("page_indptr");
+    let page_indptr = Channel::from_iter(0u32..=kp1).named("page_indptr");
     let w_slot = Channel::from(vec![0u32; kp1 as usize]).named("w_slot");
-    let w_off = Channel::from((0..kp1).collect::<Vec<_>>()).named("w_off");
+    let w_off = Channel::from_iter(0..kp1).named("w_off");
     // out: the committed accept-prefix (host-reader).
     let out = Channel::new([kp1], dtype::i32).named("out");
     let ws = WorkingSet::new();
-    ws.reserve(kp1.div_ceil(PAGE_T))
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(kp1.div_ceil(PAGE_T)).context("reserve KV")?;
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &lanes)?;
-    let kv_len = Channel::from((1..=kp1).collect::<Vec<_>>()).named("kv_len");
+    let kv_len = Channel::from_iter(1..=kp1).named("kv_len");
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         // Grammar mask FIRST, then the target argmax → grammar-legal picks.
@@ -72,12 +73,12 @@ async fn main(_input: String) -> Result<String> {
         // mtp_verify_tail: head = picked[0..K]; accept-prefix = leading run of matches.
         let head = gather(&picked, iota(K)); // [K]
         let hit = eq(&head, &draft); // [K] bool
-        let ones = broadcast(Tensor::constant(1.0f32), [K]);
-        let zeros = broadcast(Tensor::constant(0.0f32), [K]);
+        let ones = broadcast(1.0f32, [K]);
+        let zeros = broadcast(0.0f32, [K]);
         let run = cumprod(select(&hit, &ones, &zeros)); // [K]
-        let nacc = cast(reduce_sum(&run), DType::U32); // accepted-prefix length
+        let nacc = cast(reduce_sum(&run), dtype::u32); // accepted-prefix length
         let keep = ge(broadcast(&nacc, [kp1]), iota(kp1)); // [K+1]
-        let neg1 = broadcast(Tensor::constant(-1i32), [kp1]);
+        let neg1 = broadcast(-1i32, [kp1]);
         let commit = select(&keep, &picked, &neg1); // accept-prefix + -1 sentinels
         out.put(&commit);
     });
@@ -89,12 +90,8 @@ async fn main(_input: String) -> Result<String> {
     // decode loop + a real grammar mask land with charlie's MTP Stage-2 driver.
     let pipeline = Pipeline::new();
     gmask.put(vec![true; (kp1 * v) as usize]); // all-allow
-    fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
-    let committed = out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("out.take: {e}"))?;
+    fwd.submit(&pipeline).context("submit")?;
+    let committed = out.take_host::<Vec<i32>>().await?;
 
     let result = format!(
         "MTP_GRAMMAR K={K} committed={} (SDK-authored §6.1 native-MTP+grammar, vocab={vocab})",

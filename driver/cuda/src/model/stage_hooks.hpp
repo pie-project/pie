@@ -161,4 +161,48 @@ inline void invoke_stage_hook(
         stream, query_is_f32, sideband);
 }
 
+
+// ── Upstream ambient-hook compatibility (merge 2026-08-04) ────────────
+// github/dev's model bodies (qwen3_5 family) invoke hooks through an
+// ambient pointer instead of tart's explicit threading + sideband. Both
+// styles coexist: tart bodies keep the explicit `const StageHooks*`
+// overload above (scores/page-mask sidebands need it); upstream bodies
+// compile against this point-first overload. Until a caller installs
+// ScopedStageHooks, the ambient is null and upstream-style invocations
+// are no-ops — qwen3_5 hooks are DORMANT this era (re-port pending).
+inline thread_local const StageHooks* active_stage_hooks = nullptr;
+
+class ScopedStageHooks {
+  public:
+    explicit ScopedStageHooks(const StageHooks* hooks)
+        : previous_(active_stage_hooks) {
+        active_stage_hooks = hooks;
+    }
+    ~ScopedStageHooks() { active_stage_hooks = previous_; }
+
+    ScopedStageHooks(const ScopedStageHooks&) = delete;
+    ScopedStageHooks& operator=(const ScopedStageHooks&) = delete;
+
+  private:
+    const StageHooks* previous_ = nullptr;
+};
+
+inline void invoke_stage_hook(
+    StageHookPoint point,
+    const void* query_data,
+    std::uint32_t query_rows,
+    std::uint32_t query_columns,
+    std::uint32_t layer,
+    cudaStream_t stream,
+    bool query_is_f32 = false) {
+    if (active_stage_hooks == nullptr ||
+        active_stage_hooks->execute == nullptr) {
+        return;
+    }
+    active_stage_hooks->execute(
+        active_stage_hooks->context, point, query_data, query_rows,
+        query_columns, layer, stream, query_is_f32,
+        StageHookSideband{active_stage_hooks->observation});
+}
+
 }  // namespace pie_cuda_driver::model

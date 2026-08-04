@@ -26,10 +26,9 @@ interface chat {
     /// Returns the stop token IDs for the model
     stop-tokens: func() -> list<u32>;
 
-    /// Create a decoder to classify generated tokens
-    create-decoder: func() -> decoder;
-
+    /// Classifies generated tokens.
     resource decoder {
+        constructor();
         feed: func(tokens: list<u32>) -> result<event, error>;
         reset: func();
     }

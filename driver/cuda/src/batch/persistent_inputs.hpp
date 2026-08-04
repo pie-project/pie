@@ -94,10 +94,22 @@ struct PersistentInputs {
     DeviceBuffer<std::uint32_t> rs_fold_lens;
     DeviceBuffer<std::uint32_t> rs_buffer_slot_ids;
     DeviceBuffer<std::uint32_t> rs_buffer_slot_indptr;
+    // Buffer READ side. Host-only for the model, but it still has to be
+    // STAGED to device: on a TP fire only rank 0 sees the launch descriptor,
+    // and followers recover every per-request array by reading it back off
+    // the device. An array that never lands here never reaches a follower.
+    DeviceBuffer<std::uint32_t> rs_buffer_read_slot_ids;
+    DeviceBuffer<std::uint32_t> rs_buffer_read_indptr;
+    DeviceBuffer<std::uint32_t> rs_buffer_read_lens;
+    DeviceBuffer<std::uint32_t> rs_buffer_heads;
     PinnedHostBuffer<std::uint8_t>  rs_slot_flags_host;
     PinnedHostBuffer<std::uint32_t> rs_fold_lens_host;
     PinnedHostBuffer<std::uint32_t> rs_buffer_slot_ids_host;
     PinnedHostBuffer<std::uint32_t> rs_buffer_slot_indptr_host;
+    PinnedHostBuffer<std::uint32_t> rs_buffer_read_slot_ids_host;
+    PinnedHostBuffer<std::uint32_t> rs_buffer_read_indptr_host;
+    PinnedHostBuffer<std::uint32_t> rs_buffer_read_lens_host;
+    PinnedHostBuffer<std::uint32_t> rs_buffer_heads_host;
     DeviceBuffer<std::int32_t>  mtp_request_ids;
     PinnedHostBuffer<std::int32_t> mtp_positions_host;
     PinnedHostBuffer<std::int32_t> mtp_hidden_rows_host;

@@ -1,5 +1,7 @@
 #include "model/deepseek_v4/deepseek_v4.hpp"
 
+#include "loader/group_stream_cache.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -207,7 +209,22 @@ DsV4Weights bind_deepseek_v4(const LoadedModel& engine) {
         // stacks -- never both, so there is no second copy to pay for.
         L.moe_gate_up_bf16 = maybe(engine, fp + "experts.gate_up.weight");
         L.moe_down_bf16 = maybe(engine, fp + "experts.down.weight");
-        if (L.moe_gate_up_bf16 == nullptr) {
+        if (GroupStreamCache* cache = engine.group_cache();
+            cache != nullptr && L.moe_gate_up_bf16 == nullptr) {
+            const std::string group_name = fp + "experts";
+            const std::size_t g = cache->find_group(group_name);
+            if (g != GroupStreamCache::kNoGroup) {
+                if (cache->arity(g) != static_cast<std::uint32_t>(E)) {
+                    throw std::runtime_error(
+                        "deepseek_v4: group '" + group_name + "' holds " +
+                        std::to_string(cache->arity(g)) + " experts but the "
+                        "config says " + std::to_string(E));
+                }
+                L.expert_cache = cache;
+                L.expert_group = g;
+            }
+        }
+        if (L.moe_gate_up_bf16 == nullptr && L.expert_cache == nullptr) {
             L.experts.resize(static_cast<std::size_t>(E));
             for (int e = 0; e < E; ++e) {
                 const std::string ep =

@@ -143,7 +143,7 @@ fn lint_double_endpoint_host_both_ends() {
     let dup: &'static Channel = leak(Channel::new([1], dtype::i32).named("dup"));
     tok.put([1i32]);
     dup.put([0i32]); // host writes
-    let _ = dup.take(); // host also consumes
+    dup.note_host_take(); // host also consumes
 
     let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, tok);
@@ -453,4 +453,131 @@ fn s6_1_mtp_grammar_binds() {
         GOLDEN_MTP_GRAMMAR,
         "byte-identical to the channel-only descriptor golden"
     );
+}
+
+// ---------------------------------------------------------------------------
+// put auto-drains a peeked descriptor port
+// ---------------------------------------------------------------------------
+
+/// A channel bound to a port whose discipline is *read* keeps its cell full
+/// across the descriptor phase, so a loop-carried re-put has to drain the stale
+/// value or the ring grows by one every fire. `put` does that itself: the
+/// author writes the same call whichever side of `Port::consumes` the port
+/// falls on, and cannot leak occupancy by forgetting which.
+#[test]
+fn put_drains_a_peeked_port_and_leaves_a_consuming_one_alone() {
+    let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
+    // Peeked (`consumes()` false): the descriptor reads it, so `put` drains.
+    let pidx: &'static Channel = leak(Channel::from([0u32, 1]).named("pidx"));
+    // Consuming (`consumes()` true): the descriptor drains it, so `put` fills.
+    let pos: &'static Channel = leak(Channel::from([0u32]).named("pos"));
+    // Peeked, but drained EXPLICITLY — the author's take is honoured, not doubled.
+    let len: &'static Channel = leak(Channel::from([1u32]).named("len"));
+    tok.put([1i32]);
+
+    let mut b = Builder::new(VOCAB, PAGE);
+    b.bind_port(Port::EmbedTokens, tok);
+    b.bind_port(Port::EmbedIndptr, indptr);
+    b.bind_port(Port::PageIndptr, pidx);
+    b.bind_port(Port::Positions, pos);
+    b.bind_port(Port::KvLen, len);
+    b.stage(Stage::Epilogue, move || {
+        let t = reduce_argmax(intrinsics::logits());
+        tok.put(t);
+        pidx.put(Tensor::constant([0u32, 1]));
+        pos.put(Tensor::constant([0u32]));
+        len.put(len.take() + 1u32);
+    });
+
+    let traced = b.build().expect("must build");
+    let c = traced.container();
+    let order = traced.channel_order();
+    let dense = |ch: &Channel| {
+        order
+            .iter()
+            .position(|gid| *gid == ch.gid())
+            .expect("channel interned") as u32
+    };
+    let takes: Vec<u32> = c.stages[0]
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::ChanTake(chan) => Some(*chan),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        takes.iter().filter(|c| **c == dense(pidx)).count(),
+        1,
+        "a peeked port's re-put must drain exactly once: {takes:?}"
+    );
+    assert_eq!(
+        takes.iter().filter(|c| **c == dense(pos)).count(),
+        0,
+        "a consuming port already drains; put must not add a take: {takes:?}"
+    );
+    assert_eq!(
+        takes.iter().filter(|c| **c == dense(len)).count(),
+        1,
+        "an explicit take must not be doubled by put: {takes:?}"
+    );
+
+    // The drain precedes the put it makes room for.
+    let pos_of =
+        |pred: &dyn Fn(&Op) -> bool| c.stages[0].ops.iter().position(|op| pred(op)).expect("op");
+    assert!(
+        pos_of(&|op| matches!(op, Op::ChanTake(c) if *c == dense(pidx)))
+            < pos_of(&|op| matches!(op, Op::ChanPut { chan, .. } if *chan == dense(pidx))),
+        "the drain must precede its put"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// div_ceil / indptr lower to exactly what they replaced
+// ---------------------------------------------------------------------------
+
+/// Both helpers are pure spelling: they must emit the SAME ops as the
+/// arithmetic the guests wrote by hand, or migrating 81 call sites would move
+/// the container bytes.
+#[test]
+fn div_ceil_and_indptr_match_the_arithmetic_they_replace() {
+    const PAGE: u32 = 16;
+
+    fn ops_of(body: impl Fn() + 'static) -> Vec<Op> {
+        let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
+        let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]));
+        tok.put([1i32]);
+        let mut b = Builder::new(VOCAB, PAGE);
+        b.bind_port(Port::EmbedTokens, tok);
+        b.bind_port(Port::EmbedIndptr, indptr_ch);
+        b.stage(Stage::Epilogue, move || {
+            body();
+            tok.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        });
+        b.build().expect("must build").container().stages[0]
+            .ops
+            .clone()
+    }
+
+    let by_hand = ops_of(|| {
+        let len = Tensor::constant([7u32]);
+        let _ = (&len + (PAGE - 1)) / PAGE;
+    });
+    let by_helper = ops_of(|| {
+        let len = Tensor::constant([7u32]);
+        let _ = len.div_ceil(PAGE);
+    });
+    assert_eq!(by_hand, by_helper, "div_ceil must not change the lowering");
+
+    let by_hand = ops_of(|| {
+        let count = Tensor::constant([3u32]);
+        let _ = iota(2) * broadcast(&count, [2]);
+    });
+    let by_helper = ops_of(|| {
+        let count = Tensor::constant([3u32]);
+        let _ = indptr(1, &count);
+    });
+    assert_eq!(by_hand, by_helper, "indptr must not change the lowering");
 }

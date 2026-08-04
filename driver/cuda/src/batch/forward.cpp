@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include "ops/attention_workspace.hpp"
+#include "kernels/argmax.hpp"
 #include "kernels/custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
@@ -59,6 +60,7 @@ void ForwardFn::attach_model(model::IModel* m) {
     supports_runtime_window       = caps.supports_runtime_window;
     supports_hook_graph_capture   = caps.supports_hook_graph_capture;
     supports_supergraph           = caps.supports_supergraph;
+    supports_fused_lm_head_argmax = caps.supports_fused_lm_head_argmax;
 }
 
 void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
@@ -273,6 +275,30 @@ bool step_profile_take() {
     return seq.fetch_add(1, std::memory_order_relaxed) < step_profile_limit();
 }
 
+int logits_argmax_chunk_tokens() {
+    static const int tokens = [] {
+        const char* v = std::getenv("PIE_LOGITS_CHUNK_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 0;
+        const long parsed = std::strtol(v, nullptr, 10);
+        if (parsed <= 0) return 0;
+        // Validated, not clamped. The width itself is a tuning question this
+        // layer refuses to answer, but a value the mechanism cannot express is
+        // a config error, and failing at startup beats capturing a graph with
+        // tens of thousands of slab nodes and appearing to hang.
+        if (parsed > std::numeric_limits<int>::max() ||
+            parsed < static_cast<long>(kernels::kArgmaxAccumSlots)) {
+            throw std::runtime_error(
+                "PIE_LOGITS_CHUNK_TOKENS must be at least " +
+                std::to_string(kernels::kArgmaxAccumSlots) +
+                " (the per-row accumulator width) and fit in an int; a slab "
+                "narrower than that carries more running state than it "
+                "summarises");
+        }
+        return static_cast<int>(parsed);
+    }();
+    return tokens;
+}
+
 cudaGraphExec_t capture_forward_graph_exec(
     BatchEngine& engine,
     const std::uint32_t* qo_indptr_h,
@@ -298,7 +324,8 @@ cudaGraphExec_t capture_forward_graph_exec(
     // NS-3: the spatial split (UINT32_MAX = not a spatial fire). The
     // captured body splits its attention and reads the identity qo from
     // pi.mask_suffix_qo_indptr.
-    std::uint32_t unmasked_prefix_rows)
+    std::uint32_t unmasked_prefix_rows,
+    int logits_argmax_chunk)
 {
     auto& pi = engine.inputs;
 
@@ -365,6 +392,7 @@ cudaGraphExec_t capture_forward_graph_exec(
         fwd_in.is_fresh_d          = pi.is_fresh.data();
         fwd_in.logit_row_indices_d = logit_row_indices_d;
         fwd_in.num_logit_rows      = num_logit_rows;
+        fwd_in.logits_argmax_chunk_tokens = logits_argmax_chunk;
         fwd_in.w_page_d = w_page_d;
         fwd_in.w_off_d = w_off_d;
         fwd_in.row_valid_d = pi.row_valid.data();
@@ -582,9 +610,19 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             });
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
+        // The lattice pre-captures the shape the hot path will ask for. Setting
+        // the width is an explicit opt-in, so betting on the fused shape is the
+        // right bet -- but it IS a bet: a deployment that sets the width and
+        // then runs guests whose epilogues are not bare argmaxes gets no useful
+        // lattice at all and pays lazy capture per bucket on the ramp.
+        const int lattice_chunk =
+            engine.tp_comm == nullptr && engine.forward_fn.supports_fused_lm_head_argmax
+                ? logits_argmax_chunk_tokens()
+                : 0;
         const std::uint32_t graph_variant =
             make_graph_variant(/*small_spec=*/false, /*rs_verify=*/false,
                                /*custom_mask=*/false,
+                               /*fused_argmax=*/lattice_chunk > 0,
                                graph_layout);
         const ForwardGraphKey key{R, N, graph_variant};
         if (engine.graph_cache->get(key) != nullptr) continue;
@@ -600,7 +638,12 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             /*num_logit_rows=*/0,
             pi.w_page.data(), pi.w_off.data(),
             /*has_write_desc=*/true,
-            /*runtime_window_left=*/-2);
+            /*runtime_window_left=*/-2,
+            /*stage_hooks=*/nullptr,
+            /*use_supergraph=*/false,
+            /*lora=*/nullptr,
+            /*unmasked_prefix_rows=*/0xffffffffu,
+            lattice_chunk);
         engine.graph_cache->put(key, exec);
         ++captured;
         tp_graph_capture_barrier(engine);
@@ -721,7 +764,16 @@ bool forward_graph_replay_eligible(
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
          engine.inputs.custom_mask_indptr.data() != nullptr);
-    return engine.graph_cache != nullptr &&
+    // A kill switch for the decode graphs alone. `PIE_CUDA_PREFILL_DECODE_
+    // NOGRAPHS` reshapes the whole plan, so it cannot answer "is this bug in
+    // the graph or in the kernels the graph records?" -- the question every
+    // hang inside a replay asks first.
+    static const bool graphs_disabled = [] {
+        const char* v = std::getenv("PIE_CUDA_DISABLE_DECODE_GRAPHS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return !graphs_disabled &&
+        engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
         is_pure_decode &&
         mask_pointers_stable &&
@@ -953,6 +1005,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 /*small_spec=*/false,
                 /*rs_verify=*/false,
                 use_supergraph ? false : in.have_custom_mask,
+                /*fused_argmax=*/in.logits_argmax_chunk_tokens > 0,
                 graph_layout,
                 /*has_hooks=*/has_hooks) |
             (use_supergraph ? kGvSupergraph : 0u) |
@@ -1116,7 +1169,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.lora,
                 (use_spatial_mask || use_spatial_mask_mixed)
                     ? in.unmasked_prefix_rows
-                    : 0xffffffffu);
+                    : 0xffffffffu,
+                in.logits_argmax_chunk_tokens);
             if (has_hooks) {
                 // The capture is the one moment the model's per-layer hook
                 // coverage is observable; a body that skipped hooks would
@@ -1313,6 +1367,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         : nullptr;
     fwd_in.rs_buffer_slot_ids_h    = in.rs_buffer_slot_ids_h;
     fwd_in.rs_buffer_slot_indptr_h = in.rs_buffer_slot_indptr_h;
+    fwd_in.rs_buffer_read_slot_ids_h = in.rs_buffer_read_slot_ids_h;
+    fwd_in.rs_buffer_read_indptr_h   = in.rs_buffer_read_indptr_h;
+    fwd_in.rs_buffer_read_lens_h     = in.rs_buffer_read_lens_h;
+    fwd_in.rs_buffer_heads_h         = in.rs_buffer_heads_h;
     fwd_in.rs_fold_lens_h           = in.rs_fold_lens_h;
     fwd_in.rs_fold_lens_d           = in.rs_fold_lens_d;
     fwd_in.rs_buffer_write         = in.rs_buffer_write;
@@ -1322,6 +1380,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.num_logit_rows =
         in.compact_logits ? in.num_sampling : 0;
     fwd_in.emit_logits         = in.num_sampling > 0;
+    fwd_in.logits_argmax_chunk_tokens = in.logits_argmax_chunk_tokens;
     // Multimodal: image data for the encode+scatter (no-op if none).
     fwd_in.image_pixels_h            = in.image_pixels_h;
     fwd_in.image_pixel_byte_indptr_h = in.image_pixel_byte_indptr_h;

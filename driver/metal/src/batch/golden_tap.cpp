@@ -33,8 +33,8 @@ bool tap_for(const Dispatch& d, const DecodeGeometry& g, Tap& out) {
 
         case Kernel::QmvIn:         out = {"gdn_in_qkv", 4, g.gdn_conv_dim}; return true;
         case Kernel::QmvInZ:        out = {"gdn_in_z",   4, g.gdn_v_total};  return true;
-        case Kernel::GdnInA:        out = {"gdn_in_a",   2, g.gdn_v_heads};  return true;
-        case Kernel::GdnInB:        out = {"gdn_in_b",   2, g.gdn_v_heads};  return true;
+        case Kernel::GdnInA:        out = {"gdn_in_a",   4, g.gdn_v_heads};  return true;
+        case Kernel::GdnInB:        out = {"gdn_in_b",   4, g.gdn_v_heads};  return true;
         // The reference's `gdn_core` tap is the output of gated_delta_net, which
         // already includes the gate RMSNorm — so it lines up with GatedRms here,
         // not with the bare recurrence.
@@ -168,6 +168,28 @@ void dump_golden_bf16(const std::string& name,
             out[std::size_t(r) * std::size_t(width) + std::size_t(i)] =
                 bf16_to_f32(src[std::size_t(r) * row_stride_elems + std::size_t(i)]);
     write_npy(dir + "/" + name + ".npy", out, rows, width);
+}
+
+void dump_golden_bf16_sorted(const std::string& name,
+                             const void* bf16,
+                             const std::int32_t* perm,
+                             int stored_rows,
+                             int rows,
+                             int slots,
+                             int width) {
+    const std::string& dir = golden_tap_dir();
+    if (dir.empty() || bf16 == nullptr || perm == nullptr) return;
+    if (rows <= 0 || slots <= 0 || width <= 0 || stored_rows <= 0) return;
+    const auto* src = static_cast<const std::uint16_t*>(bf16);
+    std::vector<float> out(std::size_t(rows) * std::size_t(slots) * std::size_t(width), 0.0f);
+    for (int p = 0; p < stored_rows; ++p) {
+        const std::int32_t sel = perm[p];
+        if (sel < 0 || sel >= rows * slots) continue;
+        const std::size_t dst = std::size_t(sel) * std::size_t(width);
+        const std::size_t s = std::size_t(p) * std::size_t(width);
+        for (int i = 0; i < width; ++i) out[dst + std::size_t(i)] = bf16_to_f32(src[s + std::size_t(i)]);
+    }
+    write_npy(dir + "/" + name + ".npy", out, rows, slots * width);
 }
 
 void dump_golden_tokens(const std::uint32_t* ids, int n) {

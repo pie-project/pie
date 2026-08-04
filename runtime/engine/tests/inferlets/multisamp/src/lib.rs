@@ -31,7 +31,7 @@
 //! the kept set without an explicit normalize. `r` is a `[2]` u32 rng state
 //! (`gumbel`'s `state` operand is validated as EXACTLY `[2]` u32).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const TEMPERATURE: f32 = 0.8;
@@ -55,7 +55,7 @@ fn keep_mask(kind: Kind, scaled: &Tensor) -> Tensor {
         }
         Kind::MinP { p } => {
             let probs = softmax(scaled);
-            let thr = mul(reduce_max(&probs), p); // scalar threshold (NOT broadcast to [vocab])
+            let thr = reduce_max(&probs) * p; // scalar threshold (NOT broadcast to [vocab])
             pivot_threshold(probs, prob_ge(thr))
         }
         Kind::TopKTopP { k, p } => {
@@ -69,19 +69,19 @@ fn keep_mask(kind: Kind, scaled: &Tensor) -> Tensor {
 
 /// Masked Gumbel-max sample: `argmax(select(keep, scaled, -inf) + gumbel(r))`.
 /// `r` is the taken `[2]` u32 rng state (`[key, ctr]`).
-fn sample(kind: Kind, scaled: Tensor, vocab: u32, r: impl AsTensor) -> Tensor {
+fn sample(kind: Kind, scaled: Tensor, vocab: u32, r: &Tensor) -> Tensor {
     let keep = keep_mask(kind, &scaled);
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     let g = gumbel(r, [vocab]);
-    reduce_argmax(add(masked, g))
+    reduce_argmax(masked + g)
 }
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     let samplers: [(&str, Kind); 4] = [
         ("topk", Kind::TopK { k: 40 }),
@@ -96,66 +96,52 @@ async fn main(_input: String) -> Result<String> {
     let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
     let n = prompt.len() as u32;
     let max_pages = (n + (samplers.len() * STEPS_PER_KIND) as u32 + 1).div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // ── PREFILL FIRE (N-wide) — the first kind's first token. ──
     let (_, kind0) = samplers[0];
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p = Channel::from(
-        (0..n)
-            .map(|position| position / page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot_p");
-    let w_off_p = Channel::from(
-        (0..n)
-            .map(|position| position % page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off_p");
-    let rng_p = Channel::from(vec![0x9e37_u32, 0]).named("rng_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p =
+        Channel::from_iter((0..n).map(|position| position / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|position| position % page_size)).named("w_off_p");
+    let rng_p = Channel::from([0x9e37_u32, 0]).named("rng_p");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
     fwd_p.epilogue(move || {
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
-        let scaled = div(intrinsics::logits(), TEMPERATURE);
+        let scaled = intrinsics::logits() / TEMPERATURE;
         let t = sample(kind0, scaled, vocab, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         g0_ch.put(&t);
         rng_p.put(&r_next);
     });
     // ONE pipeline for the whole stream (R4-4): the prefill and every kind's
     // decode fires continue the SAME growing context, so they all submit here.
     let pipeline = Pipeline::new();
-    fwd_p
-        .submit(&pipeline)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    fwd_p.submit(&pipeline).context("prefill submit")?;
+    let g0 = g0_ch.take_host::<i32>().await?;
 
     // `count` = total tokens generated so far (across every kind), INCLUDING
     // `last_tok`; the next fire embeds `last_tok` at absolute position
@@ -181,63 +167,63 @@ async fn main(_input: String) -> Result<String> {
             // `(last_tok, count)` — the handoff rides the host, exactly like
             // the prefill→decode seam. KvLen starts after this kind's first
             // write and advances by one per fire.
-            let tok_in = Channel::from(vec![last_tok; 1]).named("tok_in");
-            let rng = Channel::from(vec![0x51ed_u32 ^ (i as u32), 0]).named("rng");
+            let tok_in = Channel::from([last_tok]).named("tok_in");
+            let rng = Channel::from([0x51ed_u32 ^ (i as u32), 0]).named("rng");
             let out = Channel::new([1], dtype::i32).named("out");
-            let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+            let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
             let start = n + count - 1;
             let initial_length = n + count;
-            let positions = Channel::from(vec![start]).named("positions");
-            let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+            let positions = Channel::from([start]).named("positions");
+            let pages = Channel::from_iter(0..max_pages).named("pages");
             let page_indptr =
-                Channel::from(vec![0u32, initial_length.div_ceil(page_size)]).named("page_indptr");
-            let w_slot = Channel::from(vec![start / page_size]).named("w_slot");
-            let w_off = Channel::from(vec![start % page_size]).named("w_off");
+                Channel::from([0u32, initial_length.div_ceil(page_size)]).named("page_indptr");
+            let w_slot = Channel::from([start / page_size]).named("w_slot");
+            let w_off = Channel::from([start % page_size]).named("w_off");
 
             let fwd = ForwardPass::new();
             fwd.embed(&tok_in, &lane1)?;
-            let kv_len = Channel::from(vec![initial_length]).named("kv_len");
+            let kv_len = Channel::from([initial_length]).named("kv_len");
             fwd.attention(
                 &ws,
-                ..,
-                (start / page_size)..,
-                &kv_len,
-                &pages,
-                &page_indptr,
-                &w_slot,
-                &w_off,
-                &positions,
-                None,
+                KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: (start / page_size)..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
             )?;
             fwd.epilogue(move || {
-                let length = kv_len.take().tensor();
+                let length = kv_len.take();
                 let r = rng.take(); // [2] u32 rng state
-                let scaled = div(intrinsics::logits(), TEMPERATURE);
+                let scaled = intrinsics::logits() / TEMPERATURE;
                 let t = sample(kind, scaled, vocab, &r);
 
-                let r_next = add(&r, iota(2));
-                let next_length = add(&length, 1u32);
-                let page_count = div(add(&next_length, page_size - 1), page_size);
+                let r_next = &r + iota(2);
+                let next_length = &length + 1u32;
+                let page_count = next_length.div_ceil(page_size);
 
                 tok_in.put(&t);
                 kv_len.put(&next_length);
                 positions.put(&length);
-                w_slot.put(div(&length, page_size));
-                w_off.put(rem(&length, page_size));
-                page_indptr.take();
-                page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+                w_slot.put(&length / page_size);
+                w_off.put(&length % page_size);
+                page_indptr.put(indptr(1, &page_count));
                 out.put(&t);
                 rng.put(&r_next);
             });
 
             for step in 0..steps {
                 fwd.submit(&pipeline)
-                    .map_err(|e| format!("{name} submit @{step}: {e}"))?;
+                    .with_context(|| format!("{name} submit @{step}"))?;
                 let t = out
-                    .take()
-                    .get::<i32>()
+                    .take_host::<Vec<i32>>()
                     .await
-                    .map_err(|e| format!("{name} out.take @{step}: {e}"))?;
+                    .with_context(|| format!("{name} out.take @{step}"))?;
                 let Some(&t0) = t.first() else {
                     return Err(format!("{name} out.take @{step}: empty tensor"));
                 };

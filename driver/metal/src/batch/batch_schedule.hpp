@@ -48,6 +48,12 @@ struct BatchStepInputs {
 };
 
 // Per-request spans, precomputed once per fire so the dispatch + read-walk avoid re-deriving.
+// Mirror of PIE_RS_FLAG_RESET in `pie_driver_abi.h`. Duplicated rather than
+// included: `paged_batch_validation_test` compiles this header without the
+// generated-ABI include directory, and this header's whole point is to stay
+// buildable from `src/` alone.
+inline constexpr std::uint8_t kRsFlagReset = 1;
+
 struct RequestSpan {
     uint32_t qo_lo;          // token range [qo_lo, qo_hi) into token_ids/position_ids
     uint32_t qo_hi;
@@ -111,7 +117,14 @@ inline BatchSchedule build_batch_schedule(
                        : 0;
         sp.pre_kv_len  = sp.seqlen - sp.new_tokens;
         sp.rs_slot     = rs_slot_ids ? rs_slot_ids[r] : 0;
-        sp.rs_is_new   = rs_slot_flags ? (rs_slot_flags[r] != 0) : false;
+        // MASK, do not truthiness-test: RS_FLAG_FOLD (2) is also non-zero, so
+        // a plain `!= 0` reads a FOLD row as a fresh sequence. That row then
+        // gets `reset_state(sp.rs_slot)` in forward.cpp, zeroing a LIVE
+        // recurrent state instead of continuing it. CUDA masks in both places
+        // it reads the flag (frame.cpp, tp.cpp); this did not.
+        sp.rs_is_new   = rs_slot_flags
+                       ? (rs_slot_flags[r] & kRsFlagReset) != 0
+                       : false;
         if (sp.new_tokens != 1) pure = false;
     }
     s.is_pure_decode = pure;

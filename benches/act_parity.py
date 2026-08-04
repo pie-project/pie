@@ -85,6 +85,16 @@ def main() -> None:
     ap.add_argument("--all", action="store_true",
                     help="print every tag instead of stopping at the first divergence")
     ap.add_argument(
+        "--device",
+        type=int,
+        default=0,
+        help="Which CUDA device of the pie dump to read. At tp>1 every rank "
+             "writes into the same directory and distinguishes itself with a "
+             "`d<device>_` filename prefix; device 0 holds the full "
+             "post-all-reduce residual stream, which is what a TP=1 reference "
+             "engine like vLLM can be compared against.",
+    )
+    ap.add_argument(
         "--rows",
         type=int,
         default=0,
@@ -94,9 +104,21 @@ def main() -> None:
     args = ap.parse_args()
 
     pie_dir, vllm_dir = Path(args.pie_dir), Path(args.vllm_dir)
-    pie = {f.name[len(f"s{args.step}_"):-4]: f
-           for f in pie_dir.glob(f"s{args.step}_*.npy")}
-    vllm = {f.name[len("s0_"):-4]: f for f in vllm_dir.glob("s0_*.npy")}
+    # pie tags its files with the writing device so that the ranks of a tp>1
+    # run do not overwrite each other; a TP=1 dump from an older build has no
+    # such prefix, so fall back to the bare form rather than reporting an
+    # empty intersection.
+    for prefix in (f"d{args.device}_s{args.step}_", f"s{args.step}_"):
+        pie = {f.name[len(prefix):-4]: f
+               for f in pie_dir.glob(f"{prefix}*.npy")}
+        if pie:
+            break
+    # The reference is usually vLLM, whose dumps are plain `s0_<tag>.npy`, but a
+    # TP=1 pie run is just as valid a reference and carries the device prefix.
+    for prefix in ("s0_", "d0_s0_"):
+        vllm = {f.name[len(prefix):-4]: f for f in vllm_dir.glob(f"{prefix}*.npy")}
+        if vllm:
+            break
 
     common = sorted(set(pie) & set(vllm), key=_order_key)
     if not common:

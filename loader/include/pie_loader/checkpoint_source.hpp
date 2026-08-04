@@ -40,6 +40,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -119,6 +120,52 @@ class CheckpointSource {
         return checked_file(file_id, file_offset, span_bytes).data + file_offset;
     }
 
+    /// The whole mapping for one plan file: its base and its length.
+    ///
+    /// Every other accessor here hands out a span the plan named, because that
+    /// is what a reader wants. A consumer that means to hand the mapping ITSELF
+    /// to a device needs the base and the length instead -- Metal's no-copy
+    /// buffer takes a page-aligned pointer and a length, and one buffer per
+    /// file is the difference between one allocation and one per tensor.
+    ///
+    /// Returns `{nullptr, 0}` for an unknown or empty file rather than
+    /// throwing: "this file cannot be mapped in place" is an answer a caller
+    /// acts on, not an error.
+    std::pair<const std::uint8_t*, std::size_t> mapped_file(
+        std::uint32_t file_id) const noexcept {
+        if (file_id >= files_.size()) return {nullptr, 0};
+        const File& file = files_[file_id];
+        return {file.data, file.mapped_size};
+    }
+
+    /// Ask the kernel to start faulting a span in.
+    ///
+    /// Advisory in both directions: it may do nothing, and a reader that skips
+    /// it is still correct, only later. It exists because the one thing the
+    /// page cache cannot work out for itself is which span comes next --
+    /// streaming reads experts in an order a router picks at runtime, and no
+    /// readahead heuristic will guess it. A caller that knows says so.
+    void advise_will_need(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes) const noexcept {
+        if (span_bytes == 0 || file_id >= files_.size()) return;
+        const File& file = files_[file_id];
+        if (file.data == nullptr) return;
+        if (file_offset > file.mapped_size ||
+            span_bytes > file.mapped_size - file_offset) {
+            return;
+        }
+        // Page-align down; madvise wants a page boundary and rounds the length
+        // up itself.
+        const auto start =
+            reinterpret_cast<std::uintptr_t>(file.data + file_offset);
+        const std::uintptr_t from = start - start % page_size_;
+        (void)::madvise(reinterpret_cast<void*>(from),
+                        static_cast<std::size_t>(span_bytes + (start - from)),
+                        MADV_WILLNEED);
+    }
+
     /// Read a span into a caller-owned host buffer.
     ///
     /// `pread` rather than `memcpy` from the mapping: the caller is a pinned
@@ -150,6 +197,36 @@ class CheckpointSource {
                                    std::strerror(errno));
             }
             done += static_cast<std::uint64_t>(got);
+        }
+    }
+
+    /// Hand a span of the mapping to `read`, then release it from the page
+    /// cache once.
+    ///
+    /// `copy_storage_bytes` is the right shape for a whole tensor and the wrong
+    /// one for a selection: splitting gpt-oss's fused expert projections copies
+    /// millions of 1.4 KB runs, and a `madvise` per run costs a syscall each
+    /// while a `memcpy` that size costs nothing. This lets a caller take all of
+    /// them from the mapping and pay for the release exactly once — which is
+    /// also what makes the runs parallelizable, since nothing in `read` has to
+    /// serialize on the kernel.
+    template <typename Read>
+    void with_mapped_span(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        const Read& read) const {
+        const File& file = checked_file(file_id, file_offset, span_bytes);
+        const std::uint8_t* base = file.data + file_offset;
+        read(base);
+        const auto start = reinterpret_cast<std::uintptr_t>(base);
+        const auto end = start + span_bytes;
+        const std::uintptr_t from = start - start % page_size_;
+        const std::uintptr_t to = end + (page_size_ - end % page_size_) % page_size_;
+        if (to > from) {
+            (void)::madvise(
+                reinterpret_cast<void*>(from), static_cast<std::size_t>(to - from),
+                MADV_DONTNEED);
         }
     }
 

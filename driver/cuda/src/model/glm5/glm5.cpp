@@ -7,11 +7,6 @@
 #include <string>
 #include <vector>
 
-#include <cuda_runtime.h>
-
-#include "cuda_check.hpp"
-#include "kernels/dequant_fp8.hpp"
-
 namespace pie_cuda_driver::model {
 
 bool glm5_moe_gate_up_swapped() {
@@ -41,68 +36,6 @@ void require_rank2(const DeviceTensor& t, const std::string& name) {
     if (t.shape().size() != 2) {
         throw std::runtime_error("glm5: expected rank-2 tensor for '" + name + "'");
     }
-}
-
-// Materialise a BF16 copy of a possibly-FP8 weight tensor. The kimi_mla
-// kernels (`launch_kimi_q_nope_to_latent_bf16`, `launch_kimi_latent_to_v_bf16`)
-// require kv_b_proj in BF16. GLM-5.1 ships kv_b_proj as FP8_E4M3 with a
-// per-channel `weight_scale_inv`; we dequantise once at bind time.
-DeviceTensor materialise_bf16(
-    const DeviceTensor& w,
-    const std::optional<QuantMeta>& meta,
-    const std::string& name)
-{
-    if (w.dtype() == DType::BF16) {
-        // Already BF16: copy into a new owned tensor so the caller has a
-        // uniform DeviceTensor handle.
-        auto out = DeviceTensor::allocate(DType::BF16, w.shape());
-        CUDA_CHECK(cudaMemcpy(out.data(), w.data(), w.nbytes(),
-                              cudaMemcpyDeviceToDevice));
-        return out;
-    }
-    if (w.dtype() != DType::FP8_E4M3) {
-        throw std::runtime_error(
-            "glm5: kv_b_proj has unsupported dtype " +
-            std::string(dtype_name(w.dtype())) + " for '" + name + "'");
-    }
-    if (!meta.has_value()) {
-        throw std::runtime_error(
-            "glm5: FP8 weight '" + name + "' has no QuantMeta companion");
-    }
-    if (meta->scale == nullptr) {
-        throw std::runtime_error(
-            "glm5: FP8 weight '" + name + "' has null scale tensor");
-    }
-    if (w.shape().size() != 2) {
-        throw std::runtime_error(
-            "glm5: FP8 weight '" + name + "' must be rank-2");
-    }
-    const int rows = static_cast<int>(w.shape()[0]);
-    const int cols = static_cast<int>(w.shape()[1]);
-    auto out = DeviceTensor::allocate(DType::BF16, w.shape());
-    if (meta->kind == QuantMeta::Kind::PerGroup && meta->group_size > 0) {
-        kernels::launch_dequant_fp8_e4m3_to_bf16_per_group(
-            static_cast<const std::uint8_t*>(w.data()),
-            out.data(),
-            static_cast<const float*>(meta->scale->data()),
-            rows, cols, meta->group_size, /*stream=*/0);
-    } else if (meta->kind == QuantMeta::Kind::PerChannel) {
-        kernels::launch_dequant_fp8_e4m3_to_bf16_per_channel(
-            static_cast<const std::uint8_t*>(w.data()),
-            out.data(),
-            static_cast<const float*>(meta->scale->data()),
-            rows, cols, /*stream=*/0);
-    } else {
-        throw std::runtime_error(
-            "glm5: FP8 weight '" + name +
-            "' has unsupported quant kind");
-    }
-    // No per-layer barrier: every dequant/copy here is enqueued on stream 0 and
-    // serialized there, so the result is ready once the caller syncs stream 0.
-    // bind_glm5 issues a single cudaDeviceSynchronize after the layer loop
-    // instead of one full-device barrier per layer (the B1 "cheap interim" —
-    // ~one cudaDeviceSynchronize per hidden layer was tens of seconds on GLM).
-    return out;
 }
 
 }  // namespace
@@ -177,7 +110,6 @@ Glm5Weights bind_glm5(const LoadedModel& engine) {
         L.q_a_proj_quant            = engine.quant_meta(ap + "q_a_proj.weight");
         L.q_b_proj_quant            = engine.quant_meta(ap + "q_b_proj.weight");
         L.kv_a_proj_with_mqa_quant  = engine.quant_meta(ap + "kv_a_proj_with_mqa.weight");
-        L.kv_b_proj_quant           = engine.quant_meta(ap + "kv_b_proj.weight");
         L.o_proj_quant              = engine.quant_meta(ap + "o_proj.weight");
 
         require_rank2(*L.q_a_proj, ap + "q_a_proj.weight");
@@ -195,12 +127,14 @@ Glm5Weights bind_glm5(const LoadedModel& engine) {
                                      std::to_string(li));
         }
 
-        // The kimi_mla kernels read kv_b_proj as a BF16 tensor; materialise
-        // a BF16 copy when the on-disk weight is FP8. For BF16 checkpoints
-        // we still copy, so the kernel always sees an owned BF16 view.
-        L.kv_b_proj_bf16 = std::make_unique<DeviceTensor>(
-            materialise_bf16(*L.kv_b_proj, L.kv_b_proj_quant,
-                             ap + "kv_b_proj.weight"));
+        // No dequant here: `glm5_bf16_kv_b_proj` states it on the contract, so
+        // this pointer is BF16 whatever the checkpoint shipped.
+        if (L.kv_b_proj->dtype() != DType::BF16) {
+            throw std::runtime_error(
+                "glm5: kv_b_proj must reach the bind as BF16, got " +
+                std::string(dtype_name(L.kv_b_proj->dtype())) + " at layer " +
+                std::to_string(li));
+        }
 
         // DSA lightning-indexer weights (glm_moe_dsa). Present on every layer.
         if (engine.has(ap + "indexer.wq_b.weight")) {
@@ -332,9 +266,6 @@ Glm5Weights bind_glm5(const LoadedModel& engine) {
         }
     }
 
-    // Single barrier for every per-layer kv_b_proj BF16 dequant enqueued on
-    // stream 0 above — replaces the former per-layer cudaDeviceSynchronize.
-    CUDA_CHECK(cudaDeviceSynchronize());
     return w;
 }
 

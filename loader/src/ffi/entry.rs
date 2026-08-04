@@ -145,6 +145,23 @@ unsafe fn emit(out: *mut *mut PieLoaderDiagnostics, diags: *mut PieLoaderDiagnos
     unsafe { *out = diags };
 }
 
+/// Publish one message through `out`, or clear it when there is none.
+///
+/// The whole of [`DiagnosticSink`] for an entry point whose failures are a
+/// single sentence — which is every entry point that opens a file rather than
+/// compiling something.
+///
+/// # Safety
+///
+/// `out` is either null or a writable `*mut PieLoaderDiagnostics`.
+pub(super) unsafe fn emit_error(out: *mut *mut PieLoaderDiagnostics, message: Option<String>) {
+    let mut sink = DiagnosticSink::default();
+    if let Some(message) = message {
+        sink.error(message);
+    }
+    unsafe { emit(out, sink.publish()) };
+}
+
 /// # Safety
 ///
 /// `diags` is null or a pointer from [`DiagnosticSink::publish`].

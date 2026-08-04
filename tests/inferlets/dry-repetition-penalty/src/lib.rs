@@ -77,8 +77,7 @@
 //! saturates at `multiplier · base^(max_ngram − allowed_length)`. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::ptir::prelude::*;
-use inferlet::{Result, model as wit_model};
+use inferlet::ptir::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -178,31 +177,31 @@ struct Cfg {
 /// `alive`, which never resurrects once cleared.
 fn suffix_match(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
     let l = cfg.capacity;
-    let pos = cast(iota(l), DType::I32);
-    let zero_i = broadcast(Tensor::constant(0i32), [l]);
-    let last = sub(cast(hlen, DType::I32), Tensor::constant(1i32));
+    let pos = cast(iota(l), dtype::i32);
+    let zero_i = broadcast(0i32, [l]);
+    let last = cast(hlen, dtype::i32) - 1i32;
 
     // A position is a candidate only if the token after it was actually
     // written, which rules out the tail itself.
     let mut alive = lt(&pos, broadcast(&last, [l]));
-    let mut m = broadcast(Tensor::constant(0.0f32), [l]);
+    let mut m = broadcast(0.0f32, [l]);
 
     for d in 0..cfg.max_ngram {
-        let d_i = Tensor::constant(d as i32);
+        let d_i = d as i32;
         let d_row = broadcast(d_i, [l]);
         // Indices are clamped rather than guarded, so the gathers stay in
         // bounds; the corresponding `alive` terms discard the clamped lanes.
-        let src = max_elem(sub(&pos, &d_row), &zero_i);
-        let tail = sub(&last, Tensor::constant(d as i32));
+        let src = max_elem(&pos - &d_row, &zero_i);
+        let tail = &last - d as i32;
         let window = gather(hist, &src);
-        let target = gather(hist, max_elem(&tail, Tensor::constant(0i32)));
+        let target = gather(hist, max_elem(&tail, 0i32));
 
         let matches = eq(&window, broadcast(&target, [l]));
         let in_window = ge(&pos, &d_row);
-        let tail_ok = broadcast(ge(&tail, Tensor::constant(0i32)), [l]);
+        let tail_ok = broadcast(ge(&tail, 0i32), [l]);
 
         alive = and(and(alive, matches), and(in_window, tail_ok));
-        m = add(&m, cast(&alive, DType::F32));
+        m = &m + cast(&alive, dtype::f32);
     }
     m
 }
@@ -218,30 +217,27 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: Cfg) -> (Tensor, T
     // scatter in bounds over the buffer's unwritten tail, whose lanes carry a
     // zero vote anyway.
     let next_idx = min_elem(
-        add(cast(iota(l), DType::I32), Tensor::constant(1i32)),
-        broadcast(Tensor::constant(l as i32 - 1), [l]),
+        cast(iota(l), dtype::i32) + 1i32,
+        broadcast(l as i32 - 1, [l]),
     );
-    let next_tok = max_elem(
-        gather(hist, &next_idx),
-        broadcast(Tensor::constant(0i32), [l]),
-    );
+    let next_tok = max_elem(gather(hist, &next_idx), broadcast(0i32, [l]));
 
-    let vocab_zero = broadcast(Tensor::constant(0.0f32), [vocab]);
-    let mut penalty = broadcast(Tensor::constant(0.0f32), [vocab]);
+    let vocab_zero = broadcast(0.0f32, [vocab]);
+    let mut penalty = broadcast(0.0f32, [vocab]);
     // Ascending, so the longest match is written last and wins.
     for n in cfg.allowed_length..=cfg.max_ngram {
-        let hit = ge(&m, broadcast(Tensor::constant(n as f32), [l]));
-        let votes = scatter_add(&vocab_zero, &next_tok, cast(&hit, DType::F32));
+        let hit = ge(&m, broadcast(n as f32, [l]));
+        let votes = scatter_add(&vocab_zero, &next_tok, cast(&hit, dtype::f32));
         let charge = cfg.multiplier * cfg.base.powi((n - cfg.allowed_length) as i32);
         penalty = select(
             gt(&votes, &vocab_zero),
-            broadcast(Tensor::constant(charge), [vocab]),
+            broadcast(charge, [vocab]),
             &penalty,
         );
     }
 
     let count = reshape(
-        reduce_sum(cast(&gt(&penalty, &vocab_zero), DType::F32)),
+        reduce_sum(cast(&gt(&penalty, &vocab_zero), dtype::f32)),
         [1],
     );
     let peak = reshape(reduce_max(&penalty), [1]);
@@ -255,16 +251,16 @@ fn step(
     cfg: Cfg,
     hist: &Tensor,
     hlen: &Tensor,
-    rng_state: impl AsTensor + Copy,
+    rng_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor) {
     let (penalty, count, peak) = dry_penalty(hist, hlen, vocab, cfg);
     // DRY is defined as a subtraction on raw logits, so temperature comes after
     // it — scaling first would make the penalty's strength depend on it.
-    let penalized = sub(&logits, &penalty);
+    let penalized = &logits - &penalty;
     let scaled = if cfg.temperature == 1.0 {
         penalized
     } else {
-        div(&penalized, cfg.temperature)
+        &penalized / cfg.temperature
     };
     let token = gumbel_max(scaled, rng_state);
     // `gumbel_max` reduces the row away, so `token` is rank-0 — which is
@@ -308,9 +304,9 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -327,14 +323,13 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let cfg = Cfg {
         multiplier: input.multiplier,
@@ -355,19 +350,17 @@ async fn main(input: Input) -> Result<Output> {
     let mut peaks: Vec<f32> = Vec::with_capacity(max_tokens);
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let toks_p =
-        Channel::from(history.iter().take(n as usize).copied().collect::<Vec<_>>()).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied()).named("toks_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
+    let rng_p = Channel::from([input.seed, 0]).named("rng_p");
     let hist_p = Channel::from(history.clone()).named("hist_p");
-    let hlen_p = Channel::from(vec![n]).named("hlen_p");
+    let hlen_p = Channel::from([n]).named("hlen_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
     let cnt_out_p = Channel::new([1], dtype::f32).named("cnt_out_p");
     let peak_out_p = Channel::new([1], dtype::f32).named("peak_out_p");
@@ -376,51 +369,39 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let hist = hist_p.take().tensor();
-        let hlen = hlen_p.take().tensor();
+        let hist = hist_p.take();
+        let hlen = hlen_p.take();
         let logits = intrinsics::logits();
         let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         cnt_out_p.put(&count);
         peak_out_p.put(&peak);
         hist_p.put(&hist_next);
-        hlen_p.put(add(&hlen, 1u32));
+        hlen_p.put(&hlen + 1u32);
         rng_p.put(&r_next);
     });
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let c0 = cnt_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("cnt take: {e}"))?[0];
-    let k0 = peak_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("peak take: {e}"))?[0];
+    let g0 = tok_out_p.take_host::<i32>().await?;
+    let c0 = cnt_out_p.take_host::<f32>().await?;
+    let k0 = peak_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
     counts.push(c0);
     peaks.push(k0);
@@ -431,10 +412,10 @@ async fn main(input: Input) -> Result<Output> {
         // over explicitly, already carrying the prefill's token.
         history[n as usize] = g0;
 
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
+        let tok_in = Channel::from([g0]).named("tok_in");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let hist_c = Channel::from(history.clone()).named("hist");
-        let hlen_c = Channel::from(vec![n + 1]).named("hlen");
+        let hlen_c = Channel::from([n + 1]).named("hlen");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
@@ -444,74 +425,71 @@ async fn main(input: Input) -> Result<Output> {
         let peak_out = Channel::new([1], dtype::f32)
             .capacity(channel_capacity() as u32)
             .named("peak_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
-            let hist = hist_c.take().tensor();
-            let hlen = hlen_c.take().tensor();
+            let hist = hist_c.take();
+            let hlen = hlen_c.take();
             let logits = intrinsics::logits();
             let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
-            page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
+            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             cnt_out.put(&count);
             peak_out.put(&peak);
             hist_c.put(&hist_next);
-            hlen_c.put(add(&hlen, 1u32));
+            hlen_c.put(&hlen + 1u32);
             rng.put(&r_next);
         });
 
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             let c = cnt_out
-                .take()
-                .get::<f32>()
+                .take_host::<f32>()
                 .await
-                .map_err(|e| format!("cnt_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             let k = peak_out
-                .take()
-                .get::<f32>()
+                .take_host::<f32>()
                 .await
-                .map_err(|e| format!("peak_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);
             counts.push(c);
             peaks.push(k);
@@ -539,7 +517,7 @@ async fn main(input: Input) -> Result<Output> {
     full.extend_from_slice(&generated);
     Ok(Output {
         sampler: "dry",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         multiplier: cfg.multiplier,
         base: cfg.base,

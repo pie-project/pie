@@ -8,6 +8,7 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
+from ..imports import pipeline
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
@@ -15,138 +16,139 @@ from componentize_py_async_support.futures import FutureReader, FutureWriter
 @dataclass
 class PageRange:
     """
-    Shared by both working-set kinds. A contiguous, half-open span
-    [start, start + len) of relative page slots inside a working set's dense
-    ordered array. `start`/`len` are in page-slot units. The ONLY references
-    that ever cross this API are these relative indices into the array —
-    never physical page ids, never vpage ids.
+    A contiguous, half-open span [start, start + len) of WorkingSet-relative
+    page indexes. The ONLY references that ever cross this API are these
+    relative indexes — never physical page ids.
     """
     start: int
     len: int
 
+@dataclass
+class PageSpan:
+    """
+    A half-open declaration [start, end) of WorkingSet-relative page
+    indexes. Unlike page-range, an absent end follows later lease growth at
+    the storage contract. A pass using SDK-generated dense page geometry
+    must be recreated if growth exceeds its bind-time page envelope. When
+    end is present, start must not exceed it. This type is only for forward-
+    pass readable/writable declarations; reserve/discard/slice continue to
+    use finite page-range values.
+    """
+    start: int
+    end: Optional[int]
+
 class KvWorkingSet:
     """
-    KV working set: a dense, ordered array of KV page slots, owned by the
-    inferlet. Public `u32` page references are relative indices into this
-    array (see `page-range`). Token lengths, positions, replay history, and
-    all semantic metadata are inferlet-owned — this resource is token-
-    agnostic. Sharing (`slice`/`append`/`fork`) is lazy copy-on-write: page
-    objects are shared by reference and the first divergent write copies.
-    Full-page CAS sealing happens runtime-side after a forward pass writes a
-    page; it never mutates other working sets' mappings.
+    KV working set: a logical page address space over the runtime's KV
+    mapping trie (kv_refact.md). It is a migration and memory-accounting
+    domain and a handle to one terminal in a persistent prefix-sharing
+    trie — not a physical allocator. PTIR geometry addresses pages by these
+    relative indexes; the runtime translates them to physical pages at the
+    kernel through the working set's flattened table.
+    
+    reserve is purely logical: no memory is held until a forward actually
+    computes pages, so a fully cached prefix never holds pool space.
+    discard removes ranges with no tombstone: all indexes at or after a
+    removed range shift down and the inferlet must publish new PTIR
+    geometry afterwards. On a shared path (after fork/slice), a discard
+    range must fall within the terminal region, reach the tail, or reach
+    the front; an interior range that would reroute a shared suffix is
+    rejected with an error. fork is O(1) and shares everything
+    copy-on-write; slice rebases [start, start+len) to page zero in the
+    child. Writes to shared pages copy-on-write inside the runtime — no
+    working set ever observes another's mutation.
     """
     
     def __init__(self) -> None:
-        """
-        Fresh, empty working set bound to `model` (and thus its device /
-        unified arena). The model is captured at construction so the
-        structural mutators (`alloc`/`free`/`slice`/`append`/`fork`) can
-        resolve the arena without a forward pass; `slice`/`fork` inherit this
-        model. In a single-model runtime every set binds to the single
-        bound model.
-        """
         raise NotImplementedError
 
-    def size(self) -> int:
-        """
-        Current number of page slots in the array.
-        """
-        raise NotImplementedError
-    def generation(self) -> int:
-        """
-        Monotonic counter bumped ONLY on `reorder`/`compact` — the operations
-        that renumber slot ids (W8). Lets the SDK/inferlet detect that cached
-        relative indices were invalidated by a reorder/compaction before it
-        submits a forward pass. `alloc`/`alloc-slots`/`free`/`free-slots`/
-        `append` do NOT bump it: slot ids are stable handles that survive
-        `free` (survivors never renumber), so allocation/reclamation cannot
-        invalidate a cached id. (CoW page writes do NOT bump it either.)
-        NOTE: legacy dense-compaction builds (feature `ws-slot-ids` off) still
-        bump on every structural mutation; the counter's meaning is strictly
-        weaker only for cases it never actually protected (device-resident
-        indices were never covered).
-        """
-        raise NotImplementedError
     def page_size(self) -> int:
         """
         Tokens per KV page for this working set's model/driver.
         """
         raise NotImplementedError
-    def alloc(self, n: int) -> PageRange:
+    def page_len(self) -> int:
         """
-        Append `n` fresh page slots to the end of the array; returns the
-        contiguous relative range that was added. `alloc(0)` returns an
-        empty range at the current end.
+        Current logical extent in pages, including reserved space whose
+        pages have not been written yet.
+        """
+        raise NotImplementedError
+    def reserve(self, pages: int) -> PageRange:
+        """
+        Extend the logical address space by `pages`; returns the added
+        range. Purely logical: physical pages are allocated only when a
+        forward writes them.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def free(self, indices: List[int]) -> None:
+    def update_index(self, key: bytes) -> None:
         """
-        Remove the slots at `indices`. MIGRATION SHIM (append-only): under
-        slot-id semantics (`ws-slot-ids`) this is `free-slots` — non-compacting
-        tombstone; survivors keep their ids; a freed trailing run is truncated
-        so a freed suffix leaves no hole. Legacy builds densely compact and
-        renumber survivors. `indices` are interpreted against the array AT CALL
-        TIME; all removals apply together. Out-of-range, already-freed, or
-        duplicate indices return `error` (the call never traps).
+        Atomically insert or replace `key` with a structurally retained view
+        of this working set. Keys are opaque bytes scoped to the active
+        model/driver store. The working set must have no in-flight fire and
+        every logical page must be physically mapped.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def alloc_slots(self, n: int) -> List[int]:
+    @classmethod
+    def from_index(cls, key: bytes) -> Optional[Self]:
         """
-        Stable-id allocation (W1/W2): return `n` slot ids, recycling freed ids
-        (ascending) before growing. Unlike `alloc`, the returned ids need not
-        be contiguous. A slot id is a stable handle that never renumbers, so it
-        stays valid until passed to `free-slots`. `alloc-slots(0)` returns the
-        empty list.
+        Exact best-effort lookup. A missing or pressure-evicted key returns
+        none. The returned working set structurally shares the indexed
+        mapping and participates in the normal copy-on-write rules.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def free_slots(self, ids: List[int]) -> None:
+    @classmethod
+    def remove_index(cls, key: bytes) -> bool:
         """
-        Tombstone the slots at `ids` (non-compacting): survivors keep their
-        ids; freed ids are recycled by a later `alloc-slots`; a freed trailing
-        run is truncated so a freed suffix leaves no hole. Out-of-range or
-        already-freed ids return `error` (the call never traps). Precondition:
-        the freed ids are unreachable from every in-flight forward pass (the
-        arena recycles the page only after the grace period).
+        Remove only the named index root. Working sets already returned by
+        from-index remain valid. Returns false when the key is absent.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def reorder(self, perm: List[int]) -> None:
+    def discard(self, on: pipeline.Pipeline, ranges: List[PageRange]) -> None:
         """
-        Reorder the array by the full bijection `perm` over `0..size`: new
-        slot `i` takes old slot `perm[i]`. `perm` must list every current
-        index exactly once; otherwise returns `error`.
+        Remove `ranges` (pre-discard indexes, applied atomically) from the
+        mapping, ordered on `on`. Suffix indexes shift; no tombstone
+        remains. Rejected when an interior range on a shared path would
+        reroute a shared suffix (growth-boundary invariant).
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def slice(self, start: int, len: int) -> Self:
+    def fork(self, on: pipeline.Pipeline) -> Self:
         """
-        Create a new working set whose array is the slots in
-        [start, start + len), sharing those page objects by reference (lazy
-        CoW; first divergent write copies). Out-of-range spans return `error`.
+        O(1) copy-on-write child over the complete logical address space,
+        ordered on `on`. The normal primitive for beam/MCTS branching and
+        self-correction.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def append(self, other: Self) -> None:
+    def slice(self, on: pipeline.Pipeline, range: PageRange) -> Self:
         """
-        Append the slots of `other` onto the end of this array, sharing the
-        page objects by reference (lazy CoW).
+        Structurally shared child over `range`, rebased to page zero,
+        ordered on `on`. Pages in front of the range stay reachable (and
+        unreclaimable) while the child lives.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def fork(self) -> Self:
+    def copy_into(self, on: pipeline.Pipeline, dst_page_ids: List[int], dst_tok_idx: List[int], src_page_ids: List[int], src_tok_idx: List[int]) -> None:
         """
-        Fork into a new working set that shares all current page objects by
-        reference (lazy CoW; first divergent write copies).
+        Ordered KV cell move within this working set (Design-B lazy KV
+        GC): move token cells, for ALL layers, from
+        (src-page-ids[i], src-tok-idx[i]) -> (dst-page-ids[i],
+        dst-tok-idx[i]); the four lists are parallel. Page ids are
+        WorkingSet-relative indexes. Rides the same in-flight FIFO as
+        submissions on `on`: ordered after every prior fire's KV write and
+        before every later fire's descriptor read. The caller guarantees
+        DISJOINT src/dst spans and computes the post-move layout itself.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -164,21 +166,15 @@ class KvWorkingSet:
 
 class RsWorkingSet:
     """
-    RS (recurrent-state) working set: required for hybrid / linear-attention
-    models. Holds a folded recurrent-state object plus a mutable buffered
-    suffix of page slots. NOT forced into the KV `list<page>` model. A
-    forward pass may write buffered RS state WITHOUT folding it; folding is a
-    separate, explicit operation (`inference.fold`). Fork is lazy CoW: the
-    first fold/write on a shared folded or buffered slab copies the relevant
-    object before mutation. RS CAS sharing is out of scope for v1.
+    RS (recurrent-state) working set: required for hybrid / linear-
+    attention models. Holds a folded recurrent-state object plus a mutable
+    buffered suffix of page slots. A forward pass may write buffered RS
+    state WITHOUT folding it; folding is a separate, explicit operation.
+    Fork is lazy CoW: the first fold/write on a shared folded or buffered
+    slab copies the relevant object before mutation.
     """
     
     def __init__(self) -> None:
-        """
-        Fresh, empty RS working set bound to `model` (device / arena),
-        captured at construction so `alloc-buffer`/`fork`/`fold` resolve the
-        arena without a forward pass; `fork` inherits this binding.
-        """
         raise NotImplementedError
 
     def state_size(self) -> int:
@@ -199,6 +195,7 @@ class RsWorkingSet:
     def alloc_buffer(self, n: int) -> PageRange:
         """
         Append `n` fresh buffered page slots; returns the contiguous range.
+        Slots are materialized lazily on their first write.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -206,8 +203,34 @@ class RsWorkingSet:
     def free_buffer(self, indices: List[int]) -> None:
         """
         Remove buffered slots at `indices` and densely compact (call-time
-        interpretation, same rules as `kv-working-set.free`). Invalid or
-        duplicate indices return `error`.
+        interpretation). Invalid or duplicate indices return `error`.
+        
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    def discard_buffered(self, count: int) -> None:
+        """
+        Forget the last `count` buffered tokens: they never happened.
+        
+        The twin of `rs-geometry.fold-len` on the other end of the buffer.
+        A fold moves the folded boundary RIGHT and is irreversible; this
+        moves the live end LEFT and is free, because the slots it releases
+        are simply overwritten by the next append.
+        
+        Not part of `rs-geometry`, deliberately. `fold-len` is there because
+        it changes what the DEVICE does -- it is where the recurrent state
+        snapshot lands. This changes nothing on the device at all; it is a
+        statement about the working set, which is what a resource method is
+        for. It is also the token-granular sibling of `free-buffer`: that
+        one releases CAPACITY, this one releases CONTENT.
+        
+        A speculative decoder is why it exists. A verify fire buffers a
+        whole window and a prefix of it is accepted; without this, the only
+        way to drop the rejected tail is `free-buffer`, which empties the
+        buffer wholesale and so forces the accepted prefix to be folded
+        away first -- in a second fire, since its length is not known until
+        the verify has run. Discard the tail instead and the NEXT window's
+        fire folds the previous prefix while writing its own tokens.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -219,10 +242,10 @@ class RsWorkingSet:
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def fork(self) -> Self:
+    def fork(self, on: pipeline.Pipeline) -> Self:
         """
-        Fork into a new RS working set sharing the folded state and buffered
-        slabs by reference (lazy CoW; first fold/write copies).
+        Copy-on-write child sharing the folded state and buffered slabs,
+        ordered on `on`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """

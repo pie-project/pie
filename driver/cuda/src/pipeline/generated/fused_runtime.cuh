@@ -3036,4 +3036,15 @@ inline GroupedLaunchResult run_generated_stage_ring(
     return launch_generated_stage(*prepared);
 }
 
+
+// ── Merge stub (2026-08-04): upstream's fused LM-head argmax for the
+// generated path is NOT taken this era (tart's stage6 machinery owns
+// this file; the upstream feature returns with its re-port). The
+// eligibility probe upstream call sites compiled against always says
+// no, so the epilogue keeps materialising logits.
+template <class StageT, class ExecT>
+inline bool generated_stage_is_compact_argmax(const StageT&, const ExecT&) {
+    return false;
+}
+
 }  // namespace pie_cuda_driver::pipeline::generated

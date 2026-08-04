@@ -11,7 +11,7 @@
 #include <memory>
 #include <string>
 
-#include "pie_native/abi_validation.hpp"
+#include "pie/driver/validate.hpp"
 
 namespace {
 
@@ -36,7 +36,7 @@ extern "C" int32_t pie_cuda_load_model(
     PieDriver* driver,
     const PieModelLoadDesc* load,
     PieDriverCaps* caps) {
-    const int status = pie_native::abi::validate_model_load_desc(load, caps);
+    const int status = pie::driver::validate::model_load_desc(load, caps);
     if (status != PIE_STATUS_OK) return status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
@@ -55,7 +55,7 @@ extern "C" int32_t pie_cuda_load_model(
 
 extern "C" PieDriver* pie_cuda_create(const PieDriverCreateDesc* desc,
                                        PieDriverCaps* caps) {
-    if (pie_native::abi::validate_create_desc(desc, caps) != PIE_STATUS_OK) {
+    if (pie::driver::validate::create_desc(desc, caps) != PIE_STATUS_OK) {
         return nullptr;
     }
     try {
@@ -72,7 +72,7 @@ extern "C" PieDriver* pie_cuda_create(const PieDriverCreateDesc* desc,
 extern "C" int32_t pie_cuda_register_program(PieDriver* driver,
                                               const PieProgramDesc* program,
                                               std::uint64_t* program_id) {
-    const int status = pie_native::abi::validate_program_desc(program, program_id);
+    const int status = pie::driver::validate::program_desc(program, program_id);
     if (status != PIE_STATUS_OK) return status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
@@ -86,7 +86,7 @@ extern "C" int32_t pie_cuda_register_channel(
     PieDriver* driver,
     const PieChannelDesc* channel,
     PieChannelEndpointBinding* binding) {
-    const int status = pie_native::abi::validate_channel_desc(channel, binding);
+    const int status = pie::driver::validate::channel_desc(channel, binding);
     if (status != PIE_STATUS_OK) return status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
@@ -99,7 +99,7 @@ extern "C" int32_t pie_cuda_register_channel(
 extern "C" int32_t pie_cuda_bind_instance(PieDriver* driver,
                                            const PieInstanceDesc* instance,
                                            PieInstanceBinding* binding) {
-    const int status = pie_native::abi::validate_instance_desc(instance, binding);
+    const int status = pie::driver::validate::instance_desc(instance, binding);
     if (status != PIE_STATUS_OK) return status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
@@ -118,10 +118,10 @@ extern "C" int32_t pie_cuda_bind_instance(PieDriver* driver,
 extern "C" int32_t pie_cuda_launch(PieDriver* driver,
                                     const PieFrameDesc* frame,
                                     PieCompletion completion) {
-    const int status = pie_native::abi::validate_frame_desc(frame);
+    const int status = pie::driver::validate::frame_desc(frame);
     if (status != PIE_STATUS_OK) return status;
     const int completion_status =
-        pie_native::abi::validate_completion(completion, false);
+        pie::driver::validate::completion(completion, false);
     if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
@@ -134,10 +134,10 @@ extern "C" int32_t pie_cuda_launch(PieDriver* driver,
 extern "C" int32_t pie_cuda_encode(PieDriver* driver,
                                     const PieEncodeDesc* encode,
                                     PieCompletion completion) {
-    const int status = pie_native::abi::validate_encode_desc(encode);
+    const int status = pie::driver::validate::encode_desc(encode);
     if (status != PIE_STATUS_OK) return status;
     const int completion_status =
-        pie_native::abi::validate_completion(completion, true);
+        pie::driver::validate::completion(completion, true);
     if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
@@ -150,10 +150,10 @@ extern "C" int32_t pie_cuda_encode(PieDriver* driver,
 extern "C" int32_t pie_cuda_copy_kv(PieDriver* driver,
                                      const PieKvCopyDesc* copy,
                                      PieCompletion completion) {
-    const int status = pie_native::abi::validate_kv_copy_desc(copy);
+    const int status = pie::driver::validate::kv_copy_desc(copy);
     if (status != PIE_STATUS_OK) return status;
     const int completion_status =
-        pie_native::abi::validate_completion(completion, true);
+        pie::driver::validate::completion(completion, true);
     if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
@@ -166,10 +166,10 @@ extern "C" int32_t pie_cuda_copy_kv(PieDriver* driver,
 extern "C" int32_t pie_cuda_copy_state(PieDriver* driver,
                                         const PieStateCopyDesc* copy,
                                         PieCompletion completion) {
-    const int status = pie_native::abi::validate_state_copy_desc(copy);
+    const int status = pie::driver::validate::state_copy_desc(copy);
     if (status != PIE_STATUS_OK) return status;
     const int completion_status =
-        pie_native::abi::validate_completion(completion, true);
+        pie::driver::validate::completion(completion, true);
     if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
@@ -182,10 +182,10 @@ extern "C" int32_t pie_cuda_copy_state(PieDriver* driver,
 extern "C" int32_t pie_cuda_resize_pool(PieDriver* driver,
                                          const PiePoolResizeDesc* resize,
                                          PieCompletion completion) {
-    const int status = pie_native::abi::validate_pool_resize_desc(resize);
+    const int status = pie::driver::validate::pool_resize_desc(resize);
     if (status != PIE_STATUS_OK) return status;
     const int completion_status =
-        pie_native::abi::validate_completion(completion, true);
+        pie::driver::validate::completion(completion, true);
     if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {

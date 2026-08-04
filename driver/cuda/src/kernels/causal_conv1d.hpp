@@ -109,6 +109,9 @@ void launch_causal_conv1d_prefill_batched_bf16(
     // Boundary-write for the commit-advance: if non-null, request r folds only
     // commit_len[r] tokens (the confirmed [input|accepted] prefix) into the
     // conv state.
-    const int* commit_len = nullptr);
+    const int* commit_len = nullptr,
+    // Per-row refinement of `write_state`: row r persists only if the mask is
+    // null or `mask[r] != 0`. A MIXED fire folds some rows and buffers others.
+    const std::uint8_t* write_state_mask = nullptr);
 
 }  // namespace pie_cuda_driver::kernels

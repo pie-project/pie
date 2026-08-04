@@ -65,10 +65,50 @@ struct Scope<'a> {
     checkpoint: &'a dyn CheckpointTypes,
     resolved: Checked,
     partition: Partition,
+    /// Which instance of a [`GroupContract`](crate::contract::GroupContract) is
+    /// being resolved, or `None` outside a group.
+    ///
+    /// The group's [`Partition`]: carried on the scope for the same reason, so
+    /// that the type checker and the specializer cannot be handed different
+    /// answers about which instance this is. `None` is what makes an index node
+    /// outside a group a contract error rather than a silent instance 0.
+    instance: Option<u32>,
     /// What the caller is resolving, for the message an indivisible axis
     /// produces. This is the text a user sees when a `tp_size` does not fit the
     /// model, so it wants to be a tensor name rather than a shape.
     what: String,
+}
+
+impl Scope<'_> {
+    /// This instance's index, or the error an index node outside a group earns.
+    fn instance(&self, node: &str) -> Result<i64, Error> {
+        self.instance.map(i64::from).ok_or_else(|| {
+            Error::Contract(format!(
+                "{node} names a group instance, but '{}' is not declared inside \
+                 a group",
+                self.what
+            ))
+        })
+    }
+}
+
+/// Substitute `index` for the single `{}` in `template`.
+///
+/// The whole of the template language, and it is this short on purpose. A
+/// contract exists so that the loader never has to *parse* a checkpoint name —
+/// naming is the author's business — and a template with formatting options
+/// would be a small language whose evaluator is exactly that parser. One
+/// placeholder, decimal, and every other use of a brace is rejected here rather
+/// than passed through to become a tensor nobody can find.
+pub fn substitute_index(template: &str, index: u32) -> Result<String, Error> {
+    let braces = template.matches('{').count();
+    if braces != 1 || template.matches('}').count() != 1 || !template.contains("{}") {
+        return Err(Error::Contract(format!(
+            "indexed source template '{template}' must contain exactly one '{{}}' \
+             and no other brace"
+        )));
+    }
+    Ok(template.replace("{}", &index.to_string()))
 }
 
 /// Type-check a standalone expression against the unsplit tensor.
@@ -107,9 +147,20 @@ impl<'a> Resolver<'a> {
                 checkpoint,
                 resolved: Checked::default(),
                 partition,
+                instance: None,
                 what: String::new(),
             },
         }
+    }
+
+    /// The same resolver, bound to one instance of a
+    /// [`GroupContract`](crate::contract::GroupContract).
+    ///
+    /// [`Expr::SrcIndexed`] and [`Expr::Select`] resolve against `instance` the
+    /// way [`Expr::Shard`] resolves against the partition.
+    pub fn for_instance(mut self, instance: u32) -> Self {
+        self.scope.instance = Some(instance);
+        self
     }
 
     /// Infer `expr`'s type, resolving [`Expr::Out`] against what has been
@@ -163,6 +214,33 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
                 "no contract named '{name}' is declared before this one"
             ))
         }),
+        Expr::SrcIndexed(template) => {
+            let index = scope.instance("SrcIndexed")?;
+            let name = substitute_index(template, index as u32)?;
+            let ty = scope.checkpoint.tensor_type(&name).ok_or_else(|| {
+                Error::Checkpoint(format!(
+                    "checkpoint has no tensor named '{name}' (instance {index} of \
+                     template '{template}')"
+                ))
+            })?;
+            scope.resolved.sources.insert(name, ty.clone());
+            Ok(ty)
+        }
+        Expr::Select {
+            src,
+            axis,
+            stride,
+            len,
+        } => {
+            let ty = infer(src, scope)?;
+            // Typed at instance 0, because a `Select`'s type is the one thing
+            // about it that does not depend on the index -- which is the
+            // property that makes its instances interchangeable. The instance
+            // that *is* being resolved is checked against the extent by
+            // `specialize`, which knows the concrete start.
+            let _ = stride;
+            infer_slice(&ty, *axis, 0, *len)
+        }
         Expr::Fill { value, ty } => infer_fill(*value, ty),
         Expr::Slice {
             src,
@@ -211,7 +289,7 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             let ty = infer(src, scope)?;
             match factor {
                 ScaleFactor::Uniform(bits) => infer_scale(ty, *bits),
-                ScaleFactor::PerGroup { by, group, axis } => {
+                ScaleFactor::PerBlock { by } => {
                     // The kernel reads the factors out of memory, so they have
                     // to be a tensor that exists rather than an expression the
                     // multiply would have to evaluate on its way past. Declare
@@ -225,7 +303,7 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
                         ));
                     }
                     let by = infer(by, scope)?;
-                    infer_scale_per_group(ty, by, *group, *axis)
+                    infer_scale_per_block(ty, by)
                 }
             }
         }
@@ -277,6 +355,33 @@ fn specialize(expr: Expr, scope: &mut Scope<'_>) -> Result<Expr, Error> {
         let ty = infer(&src, scope)?;
         let to = infer_transmute(&ty, &to, &src)?;
         return Ok(src.transmute(to));
+    }
+    // The two group nodes resolve the same way `Shard` does, one step earlier:
+    // a name and an offset both stop being symbolic here.
+    if let Expr::SrcIndexed(template) = &expr {
+        let index = scope.instance("SrcIndexed")?;
+        return Ok(Expr::Src(substitute_index(template, index as u32)?));
+    }
+    if let Expr::Select {
+        src,
+        axis,
+        stride,
+        len,
+    } = expr
+    {
+        let index = scope.instance("Select")?;
+        let src = specialize(*src, scope)?;
+        let start = index
+            .checked_mul(stride)
+            .or_overflow("a Select's start offset")?;
+        let ty = infer(&src, scope)?;
+        // Routed through `infer_slice` for the reason a `Shard` is: the band
+        // this instance reads is checked by everything a `Slice` is checked by,
+        // quantization-group alignment and extent included. An instance that
+        // runs off the end of the grid is caught here, so declaring an `arity`
+        // wider than the bank is a compile error rather than a slot of garbage.
+        infer_slice(&ty, axis, start, len)?;
+        return Ok(src.slice(axis.0, start, len));
     }
     // Every other variant is structural: its operands specialize and it puts
     // itself back together, which is what `map_children` says once.
@@ -931,19 +1036,7 @@ fn infer_scale(ty: TensorType, factor_bits: u32) -> Result<TensorType, Error> {
 /// the scales — or applied to both on different axes — is a compile error that
 /// names both shapes. Recovering that pairing from a name convention instead,
 /// below the contract, is unfalsifiable by construction.
-fn infer_scale_per_group(
-    ty: TensorType,
-    by: TensorType,
-    group: u32,
-    axis: Axis,
-) -> Result<TensorType, Error> {
-    if group == 0 {
-        return Err(Error::Contract(
-            "Scale group size is zero, which is also what an unset group field \
-             reads as; state the elements per factor the contract meant"
-                .to_string(),
-        ));
-    }
+fn infer_scale_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, Error> {
     let out_dtype = match &ty.encoding {
         Encoding::Raw(dtype) => *dtype,
         Encoding::Quant(spec) => spec.logical_dtype,
@@ -964,39 +1057,50 @@ fn infer_scale_per_group(
             )));
         }
     }
-    let index = usize::from(axis.0);
-    if index >= ty.shape.len() {
+    // Rank first, because everything below indexes both shapes together. Equal
+    // rank is what makes the ratio per axis meaningful at all: a factor tensor
+    // of a different rank is not a coarser view of this one, it is a different
+    // tensor the author paired by mistake.
+    if by.shape.len() != ty.shape.len() {
         return Err(Error::Contract(format!(
-            "Scale group axis {index} is out of range for shape {:?}",
-            ty.shape
-        )));
-    }
-    // A group is a run of adjacent elements only on the last axis, and both
-    // executors read it as one. Requiring the axis to be named rather than
-    // assumed is what lets this be a rejection an author sees instead of a
-    // silent mis-scaling, and it is the only line that moves the day a kernel
-    // learns to stride.
-    if index + 1 != ty.shape.len() {
-        return Err(Error::Contract(format!(
-            "Scale groups run along the last axis; axis {index} of {:?} is not it",
-            ty.shape
-        )));
-    }
-    let mut want = ty.shape.clone();
-    let extent = want[index];
-    let group = i64::from(group);
-    if extent % group != 0 {
-        return Err(Error::Contract(format!(
-            "Scale group size {group} does not divide axis {index} of {:?}",
-            ty.shape
-        )));
-    }
-    want[index] = extent / group;
-    if by.shape != want {
-        return Err(Error::Contract(format!(
-            "Scale factors have shape {:?}, but scaling {:?} in groups of \
-             {group} along axis {index} needs {want:?}",
+            "Scale factors have shape {:?}, which is not a blocking of {:?} \
+             -- a factor tensor states its block size by having the same rank \
+             and dividing each axis",
             by.shape, ty.shape
+        )));
+    }
+    let mut blocked = false;
+    for (axis, (&extent, &factors)) in ty.shape.iter().zip(by.shape.iter()).enumerate() {
+        if factors <= 0 {
+            return Err(Error::Contract(format!(
+                "Scale factors have extent {factors} on axis {axis}, so no \
+                 block size divides it"
+            )));
+        }
+        if extent % factors != 0 {
+            return Err(Error::Contract(format!(
+                "Scale factors have shape {:?}, but axis {axis} of {:?} is not \
+                 a whole number of blocks of {}",
+                by.shape,
+                ty.shape,
+                extent / factors
+            )));
+        }
+        if factors != extent {
+            blocked = true;
+        }
+    }
+    // Symmetry rule A: a node may not denote exactly its operand. Factors
+    // shaped like the weight are one number per element, which is a plain
+    // elementwise product and not a blocking -- and, read the other way, a
+    // `Uniform` scale is the rank-0 case this would shadow. Rejecting it keeps
+    // the two spellings of "no blocks" from both being legal.
+    if !blocked && !ty.shape.is_empty() {
+        return Err(Error::Contract(format!(
+            "Scale factors have the operand's own shape {:?}, so they group \
+             nothing; a factor per element is an elementwise product, not a \
+             block scale",
+            ty.shape
         )));
     }
     Ok(TensorType {
@@ -2030,6 +2134,7 @@ mod tests {
         ModelContract {
             alignment: 256,
             tensors,
+            groups: Vec::new(),
         }
     }
 

@@ -38,8 +38,8 @@ pub struct Image {
     pub patch_grid: multimodal::Grid,
     /// Model-specific delimiter tokens the context places immediately before /
     /// after this span (e.g. Qwen `<|vision_start|>` / `<|vision_end|>`). Empty
-    /// when the model needs none. The SDK's `append-image` applies them, so the
-    /// inferlet never names them.
+    /// when the model needs none. A guest reads them off the span and splices
+    /// them in, so it never names them itself.
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,
 }
@@ -149,9 +149,13 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
         Ok(self.ctx().table.get(&this)?.span.position_span)
     }
 
-    async fn grid(&mut self, this: Resource<Image>) -> Result<(u32, u32, u32)> {
+    async fn grid(&mut self, this: Resource<Image>) -> Result<pie::inferlet::media::MergedGrid> {
         let g = self.ctx().table.get(&this)?.span.grid;
-        Ok((g.t, g.h, g.w))
+        Ok(pie::inferlet::media::MergedGrid {
+            t: g.t,
+            h: g.h,
+            w: g.w,
+        })
     }
 
     async fn prefix_tokens(&mut self, this: Resource<Image>) -> Result<Vec<u32>> {

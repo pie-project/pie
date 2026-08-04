@@ -23,17 +23,47 @@ void launch_argmax_bf16_compact_scatter(
     int vocab,
     cudaStream_t stream);
 
-// Direct greedy scorer for single-step draft paths. Computes
-// hidden_states @ lm_head_weight.T and returns the argmax without
-// materializing [num_rows, vocab] logits.
-void launch_lm_head_argmax_bf16(
-    const void* hidden_states,        // [num_rows, hidden] bf16
-    const void* lm_head_weight,       // [vocab, hidden] bf16
-    std::uint64_t* partial_pairs,     // [ceil(vocab / 8), num_rows]
-    std::int32_t* token_ids,          // [num_rows]
-    int num_rows,
-    int hidden,
-    int vocab,
+// NOTE: a `launch_lm_head_argmax_bf16` used to live here — a fused
+// hidden@lm_head.T + argmax with grid=(num_rows, vocab/8). It had no call
+// sites and could not serve the sampler: every row re-read the whole weight
+// matrix, so at rows=512 it moved 512x the LM head weights. The chunked
+// accumulator below is the shape that works at batch. Deleted rather than
+// left as a trap for the next reader (§20.36).
+
+// ── Chunked (vocab-streaming) argmax ─────────────────────────────────
+// The sampler's read of a materialised [rows, vocab] logits tensor is pure
+// HBM traffic that exists only because the reduction is a separate kernel
+// from the LM head GEMM. When the caller can produce the logits one vocab
+// slab at a time into a reused buffer, the slab stays L2-resident and both
+// the write and the read stop reaching HBM (§20.36: 185 us/step at
+// rows=512, vocab=151936).
+//
+// `launch_argmax_accumulate_bf16` folds one slab into a running per-warp
+// best; `launch_argmax_finalize_bf16` collapses that to token ids. Results
+// are bit-identical to `launch_argmax_bf16` over the concatenated slabs:
+// the ordering is a total order on (value, -index), so slab order and scan
+// order do not matter.
+//
+// `acc_val` / `acc_idx` are caller-owned scratch of
+// `rows * kArgmaxAccumSlots` elements each.
+constexpr int kArgmaxAccumSlots = 32;
+
+void launch_argmax_accumulate_bf16(
+    const void* slab,          // [rows, row_stride] bf16
+    int rows,
+    int width,                 // valid columns in this slab
+    int row_stride,            // elements between slab rows
+    int vocab_base,            // global vocab index of column 0
+    float* acc_val,            // [rows, kArgmaxAccumSlots]
+    std::int32_t* acc_idx,     // [rows, kArgmaxAccumSlots]
+    bool init,                 // true for the first slab
+    cudaStream_t stream);
+
+void launch_argmax_finalize_bf16(
+    const float* acc_val,
+    const std::int32_t* acc_idx,
+    std::int32_t* token_ids,   // [rows]
+    int rows,
     cudaStream_t stream);
 
 // Per-row argmax over [num_rows, vocab] fp32 logits → [num_rows] i32 token ids.

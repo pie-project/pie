@@ -66,6 +66,27 @@ void launch_swiglu_clamp_bf16(
     float limit,
     cudaStream_t stream);
 
+// Kimi-K3's SiTU ("Sigmoid Tanh Unit") gated activation:
+//
+//     situ(gate) = beta * tanh(gate / beta) * sigmoid(gate)
+//     y          = situ(gate) * linear_beta * tanh(up / linear_beta)
+//
+// `linear_beta <= 0` leaves the `up` branch untouched, which is the form the
+// reference takes when `activation_situ_linear_beta` is absent. Both branches
+// are evaluated in fp32 before narrowing, because the tanh saturates far
+// enough out (beta 4, linear_beta 25 on K3) that bf16 intermediates lose the
+// distinction the gate is there to make.
+//
+// Matches `SituAndMul` in Moonshot's `modeling_kimi_linear.py`.
+void launch_situ_bf16(
+    const void* gate,
+    const void* up,
+    void* y,
+    int num_elements,
+    float beta,
+    float linear_beta,
+    cudaStream_t stream);
+
 // Elementwise `x[i] *= sigmoid(gate[i])`. Used by Qwen3.5 full-
 // attention's per-token output gate (a' = a * σ(g)).
 void launch_sigmoid_gate_inplace_bf16(
@@ -91,8 +112,20 @@ void launch_chunked_swiglu_bf16(
     cudaStream_t stream,
     bool gate_second = false);
 
+// Kimi-K3's routed experts fuse SiTU with the gate/up split the same way, so
+// the grouped GEMM's `[N, 2*I]` output becomes `[N, I]` in one pass:
+//
+//     y[n, i] = situ(packed[n, i]) * linear_beta * tanh(packed[n, I+i] / linear_beta)
+void launch_chunked_situ_bf16(
+    const void* packed,  // [N, 2*I] bf16
+    void*       y,       // [N, I]   bf16
+    int N, int I,
+    float beta,
+    float linear_beta,
+    bool gate_second,
+    cudaStream_t stream);
+
 // Clamped variant of `chunked_swiglu_bf16`, matching `swiglu_clamp_bf16`:
-// the gate is capped above at `limit` and the up branch is clamped to
 // [-limit, limit] before the product. DeepSeek-V4 ships `swiglu_limit`.
 void launch_chunked_swiglu_clamp_bf16(
     const void* packed,  // [N, 2*I] bf16 (gate first, up second)

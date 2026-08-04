@@ -2,6 +2,7 @@
 
 #include "batch/tp.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
@@ -9,11 +10,109 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "cuda_check.hpp"
 #include "kernels/custom_all_reduce.hpp"
 
 namespace pie_cuda_driver {
+
+namespace {
+
+/// Copy a known pattern from `src` to `dst` over the peer path and check it
+/// arrives. Returns false on any CUDA error or on a mismatch.
+///
+/// `cudaDeviceCanAccessPeer` answers "is there a path the driver is willing to
+/// map", not "does traffic over that path arrive". On a PCIe box with ACS
+/// enabled upstream of the GPUs -- the common case inside a VM or a container
+/// on a virtualised host -- the answer is yes for every pair and peer copies
+/// then land as zeros, silently. So ask the question that matters by moving
+/// bytes.
+bool peer_copy_round_trips(int src, int dst) {
+    constexpr int kCount = 64;
+    constexpr std::size_t kBytes = kCount * sizeof(std::uint32_t);
+
+    std::vector<std::uint32_t> pattern(kCount);
+    for (int i = 0; i < kCount; ++i) {
+        pattern[static_cast<std::size_t>(i)] = 0xA5A50000u ^ static_cast<std::uint32_t>(i * 2654435761u);
+    }
+
+    void* src_buf = nullptr;
+    void* dst_buf = nullptr;
+    bool ok = false;
+
+    if (cudaSetDevice(src) != cudaSuccess) return false;
+    // Enable the direct mapping the real collectives use. Already-enabled is
+    // success for our purposes; anything else means there is no peer path.
+    const cudaError_t peer = cudaDeviceEnablePeerAccess(dst, 0);
+    if (peer != cudaSuccess && peer != cudaErrorPeerAccessAlreadyEnabled) {
+        cudaGetLastError();
+        return false;
+    }
+    if (cudaMalloc(&src_buf, kBytes) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (cudaMemcpy(src_buf, pattern.data(), kBytes, cudaMemcpyHostToDevice) ==
+        cudaSuccess) {
+        if (cudaSetDevice(dst) == cudaSuccess &&
+            cudaMalloc(&dst_buf, kBytes) == cudaSuccess) {
+            std::vector<std::uint32_t> got(kCount, 0u);
+            // Poison the destination so "nothing arrived" cannot be mistaken
+            // for "the pattern arrived".
+            if (cudaMemset(dst_buf, 0, kBytes) == cudaSuccess &&
+                cudaMemcpyPeer(dst_buf, dst, src_buf, src, kBytes) ==
+                    cudaSuccess &&
+                cudaDeviceSynchronize() == cudaSuccess &&
+                cudaMemcpy(got.data(), dst_buf, kBytes,
+                           cudaMemcpyDeviceToHost) == cudaSuccess) {
+                ok = got == pattern;
+            }
+        }
+    }
+
+    if (dst_buf != nullptr) {
+        cudaSetDevice(dst);
+        cudaFree(dst_buf);
+    }
+    if (src_buf != nullptr) {
+        cudaSetDevice(src);
+        cudaFree(src_buf);
+    }
+    cudaGetLastError();
+    return ok;
+}
+
+}  // namespace
+
+bool p2p_transport_usable() {
+    static const bool usable = [] {
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
+            return false;
+        }
+        int original = 0;
+        if (cudaGetDevice(&original) != cudaSuccess) return false;
+
+        bool ok = true;
+        for (int src = 0; ok && src < devices; ++src) {
+            for (int dst = 0; dst < devices; ++dst) {
+                if (src == dst) continue;
+                int can_access = 0;
+                if (cudaDeviceCanAccessPeer(&can_access, src, dst) !=
+                        cudaSuccess ||
+                    can_access == 0 || !peer_copy_round_trips(src, dst)) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        cudaSetDevice(original);
+        cudaGetLastError();
+        return ok;
+    }();
+    return usable;
+}
 
 std::string nccl_unique_id_to_hex(const ncclUniqueId& id) {
     static const char* k = "0123456789abcdef";
@@ -98,6 +197,43 @@ void nccl_check_async(ncclResult_t result,
     }
 }
 
+namespace {
+
+// Every communicator alive in this process. TP ranks are threads, so one
+// rank's failure handler needs a way to reach its peers' communicators; this
+// is that list. Touched only at communicator construction/destruction and on
+// the failure path, never per collective.
+std::mutex g_live_comms_mu;
+std::vector<NcclComm*> g_live_comms;
+
+void register_live_comm(NcclComm* comm) {
+    std::lock_guard<std::mutex> lk(g_live_comms_mu);
+    g_live_comms.push_back(comm);
+}
+
+void unregister_live_comm(NcclComm* comm) {
+    std::lock_guard<std::mutex> lk(g_live_comms_mu);
+    g_live_comms.erase(
+        std::remove(g_live_comms.begin(), g_live_comms.end(), comm),
+        g_live_comms.end());
+}
+
+void replace_live_comm(NcclComm* from, NcclComm* to) {
+    std::lock_guard<std::mutex> lk(g_live_comms_mu);
+    for (auto*& entry : g_live_comms) {
+        if (entry == from) entry = to;
+    }
+}
+
+}  // namespace
+
+void nccl_abort_all_comms() noexcept {
+    std::lock_guard<std::mutex> lk(g_live_comms_mu);
+    for (auto* comm : g_live_comms) {
+        if (comm != nullptr) comm->abort();
+    }
+}
+
 NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
     : world_size_(world_size), rank_(rank) {
     static std::once_flag env_once;
@@ -108,24 +244,20 @@ NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
         // But that also gives up NVLink on machines that have it. Probe the
         // topology instead: keep P2P when every visible device can reach every
         // other directly, disable it only where the original hazard exists.
+        //
+        // "Can reach" has to be measured, not asked. `cudaDeviceCanAccessPeer`
+        // returns 1 for all 64 pairs on a PCIe box whose peer copies land as
+        // zeros, so trusting it left P2P on exactly where it is broken -- and
+        // a broken peer path does not announce itself: NCCL hangs on the first
+        // collective, or worse, reduces zeros and the model emits fluent
+        // nonsense. `p2p_transport_usable` moves bytes and checks them.
         if (std::getenv("NCCL_P2P_DISABLE") != nullptr) return;
-        int devices = 0;
-        bool fully_connected = cudaGetDeviceCount(&devices) == cudaSuccess &&
-                               devices > 1;
-        for (int src = 0; fully_connected && src < devices; ++src) {
-            for (int dst = 0; dst < devices; ++dst) {
-                if (src == dst) continue;
-                int can_access = 0;
-                if (cudaDeviceCanAccessPeer(&can_access, src, dst) !=
-                        cudaSuccess ||
-                    can_access == 0) {
-                    fully_connected = false;
-                    break;
-                }
-            }
-        }
-        if (!fully_connected) {
+        if (!p2p_transport_usable()) {
             setenv("NCCL_P2P_DISABLE", "1", /*overwrite=*/0);
+            std::fprintf(stderr,
+                         "[pie-driver-cuda] peer-to-peer transport failed a "
+                         "round-trip check; disabling NCCL P2P and the custom "
+                         "all-reduce (collectives stage through the host)\n");
         }
     });
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
@@ -137,9 +269,14 @@ NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
     NCCL_CHECK_ASYNC(
         ncclCommInitRankConfig(&comm_, world_size, uid, rank, &config),
         comm_);
+    register_live_comm(this);
 }
 
 NcclComm::~NcclComm() {
+    // Unregister BEFORE aborting, and under the same lock `nccl_abort_all_comms`
+    // takes: that is what makes the two paths exclusive, so neither can abort a
+    // handle the other has already released.
+    unregister_live_comm(this);
     if (comm_ != nullptr) {
         // NOT `ncclCommDestroy`: that finalizes collectively, so every rank
         // has to be inside it at the same time. Both TP ranks live in this
@@ -155,10 +292,16 @@ NcclComm::~NcclComm() {
 
 NcclComm& NcclComm::operator=(NcclComm&& o) noexcept {
     if (this != &o) {
-        if (comm_) ncclCommAbort(comm_);
+        if (comm_) {
+            unregister_live_comm(this);
+            ncclCommAbort(comm_);
+        }
         comm_ = o.comm_;             o.comm_ = nullptr;
         world_size_ = o.world_size_; o.world_size_ = 1;
         rank_ = o.rank_;             o.rank_ = 0;
+        // The handle moved, so the registry entry has to follow it or the
+        // failure path would abort through a dangling object.
+        replace_live_comm(&o, this);
     }
     return *this;
 }

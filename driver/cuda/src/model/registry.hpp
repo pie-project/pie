@@ -63,6 +63,7 @@ struct NemotronHWorkspace;
 struct DsV4Workspace;
 struct KimiWorkspace;
 struct Glm5Workspace;
+struct KimiK3Workspace;
 
 // Every architecture family the registry can construct. Distinct from the
 // `model_type` string: several strings alias onto the same family (e.g.
@@ -81,6 +82,7 @@ enum class Family {
     Qwen3_5Moe,
     NemotronH,
     Kimi,
+    KimiK3,
     DeepSeekV4,
     Glm5,
     Qwen3VL,
@@ -201,6 +203,11 @@ struct ModelResources {
     DsV4CompressCache* dsv4_comp_cache = nullptr;
     KimiWorkspace* kimi_ws = nullptr;
     Glm5Workspace* glm5_ws = nullptr;
+    // Kimi-K3 is the only family that needs an MLA cache and a recurrent
+    // state cache at once, so it takes its own scratch plus the state cache
+    // Qwen3.5 also uses.
+    KimiK3Workspace* kimi_k3_ws = nullptr;
+    RecurrentStateCache* kimi_k3_state_cache = nullptr;
 };
 
 // One row in the arch table. Every supported `model_type` string is its

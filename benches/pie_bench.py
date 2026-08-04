@@ -18,8 +18,10 @@ from typing import Any
 
 from common import (
     ROOT,
+    ArrivalPacer,
     RequestResult,
     add_mode_subcommands,
+    arrival_schedule,
     hash_output_tokens,
     cuda_profiler_start,
     cuda_profiler_stop,
@@ -161,7 +163,6 @@ def is_cumulative_status_key(key: str) -> bool:
             "bypass_hits",
             "chain_drops",
             "chain_submits",
-            "cold_hold_fires",
             "cumulative_batch_latency_us",
             "escape_fires",
             "readiness_miss",
@@ -225,6 +226,8 @@ def build_config(args: argparse.Namespace):
             driver_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
             driver_options["mxfp4_moe"] = args.mxfp4_moe
+        if getattr(args, "stream_routed_experts", False):
+            driver_options["stream_routed_experts"] = True
         if args.mtp_assistant_snapshot_dir:
             driver_options["mtp_assistant_snapshot_dir"] = (
                 args.mtp_assistant_snapshot_dir
@@ -247,6 +250,10 @@ def build_config(args: argparse.Namespace):
         # `gpu_mem_utilization` has nowhere to go; the batching caps are the
         # only tunables it reads.
         driver_options = {}
+        # Same key, same name, both backends -- the switch is a residency trade
+        # an operator makes about a model, not a backend detail.
+        if getattr(args, "stream_routed_experts", False):
+            driver_options["stream_routed_experts"] = True
         if getattr(args, "max_forward_tokens", 0):
             driver_options["max_forward_tokens"] = args.max_forward_tokens
         if getattr(args, "max_forward_requests", 0):
@@ -332,6 +339,16 @@ def build_config(args: argparse.Namespace):
         max_concurrent_processes = None  # serializer drops field → engine default
     else:
         max_concurrent_processes = args.concurrency
+    # Decouple the engine's admission cap from the client's offered
+    # concurrency. Setting them equal (the default above) means every request
+    # the client holds open is also admitted, so under KV oversubscription the
+    # whole fleet stays resident and thrashes. Overriding lets an experiment
+    # ask what the pool can actually sustain while the OFFERED load is
+    # unchanged -- the client still holds `--concurrency` requests open, they
+    # just queue for a seat.
+    _cap_override = os.environ.get("PIE_BENCH_ADMISSION_CAP")
+    if _cap_override:
+        max_concurrent_processes = int(_cap_override)
     requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
@@ -357,7 +374,22 @@ def build_config(args: argparse.Namespace):
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
-            wasm_max_instances=max(4096, (args.num_requests + args.warmup) * 4),
+            # A pooling slot costs ~4 GiB of VIRTUAL address space (wasmtime
+            # reserves a full wasm32 range per memory so it can elide bounds
+            # checks), and Linux gives the process 128 TiB total. So this cap
+            # is bounded at ~32k slots no matter how much RAM the box has.
+            # Sizing it off num_requests blew through that: 12288 requests
+            # asked for 49156 slots = 212 TB and the engine panicked inside
+            # mmap before serving anything.
+            #
+            # The live instance count is bounded by ADMISSION, not by the
+            # total request count -- a process releases its slot when it
+            # exits. pie's spawn pipeline can hold prewarm + bind (2x the
+            # execution limit, double-buffered) + executing at once, so 4x
+            # the admission cap is the true ceiling. `None` means the engine
+            # falls back to max_forward_requests (R), which the 4096 floor
+            # already covers for any R <= 1024.
+            wasm_max_instances=max(4096, (max_concurrent_processes or 0) * 4),
             **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
         model=ModelConfig(
@@ -616,7 +648,7 @@ async def run(args: argparse.Namespace):
             }
 
         async def launch_one(i: int, *, max_tokens: int | None = None):
-            if max_tokens is None and getattr(args, "mixed_phase", False):
+            if max_tokens is None:
                 max_tokens = request_max_tokens(args, i)
             inp = {
                 **common_input(max_tokens),
@@ -830,6 +862,12 @@ async def run(args: argparse.Namespace):
                     for _ in indices
                 ]
 
+        pacer = ArrivalPacer(
+            arrival_schedule(
+                n, args.arrival_rate, args.arrival_process, args.arrival_seed
+            )
+        )
+
         async def one(i: int, *, max_tokens: int | None = None) -> RequestResult:
             return await wait_one(await launch_one(i, max_tokens=max_tokens))
 
@@ -888,6 +926,21 @@ async def run(args: argparse.Namespace):
                     *(wait_one(item) for item in deferred)
                 )
             return await asyncio.gather(*(wait_one(item) for item in launched))
+
+        async def many_paced(indices) -> list[RequestResult]:
+            # Open loop: each request is launched at its scheduled offset and
+            # awaited from there, so a request that arrives while the engine
+            # is full pays the queueing delay in its own latency instead of
+            # having its arrival silently deferred.
+            pacer.start()
+
+            async def offer(k: int, i: int) -> RequestResult:
+                await pacer.wait(k)
+                return await one(i)
+
+            return await asyncio.gather(
+                *(offer(k, i) for k, i in enumerate(indices))
+            )
 
         if args.warmup:
             warmup_max_tokens = args.warmup_max_tokens or args.max_tokens
@@ -949,6 +1002,8 @@ async def run(args: argparse.Namespace):
         try:
             if args.mode == "latency":
                 results = [await one(start_idx + i) for i in range(n)]
+            elif pacer.enabled:
+                results = await many_paced(range(start_idx, start_idx + n))
             else:
                 results = await many(range(start_idx, start_idx + n))
         finally:
@@ -1055,16 +1110,6 @@ async def run(args: argparse.Namespace):
                             inter_fire_samples,
                             average_key,
                         )
-                cold_hold_fires = model_status.get(
-                    "default.fire.quorum.cold_hold_fires", 0
-                )
-                if isinstance(cold_hold_fires, (int, float)):
-                    measured_average(
-                        model_status,
-                        "default.fire.quorum.cold_hold_us_sum",
-                        cold_hold_fires,
-                        "default.fire.quorum.cold_hold_us",
-                    )
                 wave_fires = model_status.get("default.fire.quorum.wave_fires", 0)
                 if isinstance(wave_fires, (int, float)):
                     measured_average(
@@ -1132,7 +1177,6 @@ async def run(args: argparse.Namespace):
                         or "active_pipelines" in key
                         or "missing_at_fire" in key
                         or "straggler" in key
-                        or "cold_hold" in key
                     ):
                         engine_config[key] = value
         except Exception:  # noqa: BLE001
@@ -1161,6 +1205,9 @@ async def run(args: argparse.Namespace):
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
             "cuda profiler capture": args.cuda_profiler_capture,
+            "arrival_rate": args.arrival_rate,
+            "arrival_process": args.arrival_process,
+            **pacer.stats(),
             **(
                 {
                     "client timing epoch unix s": measured_epoch_unix_s,
@@ -1232,6 +1279,15 @@ def build_parser() -> argparse.ArgumentParser:
                  "planner with pool-only reclaim.",
         )
         sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
+        sp.add_argument(
+            "--stream-routed-experts",
+            action="store_true",
+            help="Bind a MoE checkpoint's routed experts over the file instead "
+                 "of copying them into the device heap. Both backends take the "
+                 "same `[model].stream_routed_experts` key; what they do with "
+                 "it differs (cuda stages through a cache, Metal demand-faults "
+                 "a page-aligned pack).",
+        )
         sp.add_argument("--max-forward-tokens", type=int, default=10240)
         sp.add_argument("--max-forward-requests", type=int, default=512)
         sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)

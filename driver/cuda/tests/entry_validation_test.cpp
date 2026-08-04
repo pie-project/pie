@@ -7,8 +7,8 @@
 
 #include "entry_validation.hpp"
 #include "kernels/slot_ops.hpp"
-#include "pie_native/abi_validation.hpp"
-#include "pie_native/fire/fire_geometry.hpp"
+#include "pie/driver/validate.hpp"
+#include "pie/driver/fire/geometry.hpp"
 #include "store/recurrent_state_cache.hpp"
 
 namespace {
@@ -207,7 +207,7 @@ int main() {
         .len = 3,
     };
     if (!expect(
-            pie_native::abi::validate_step_desc(&device_geometry_rs, kTestRosterLen) ==
+            pie::driver::validate::step_desc(&device_geometry_rs, kTestRosterLen) ==
                     PIE_STATUS_OK &&
                 pie_cuda_driver::abi::validate_launch_resources(
                     device_geometry_rs, 4, 16, 8, 8,
@@ -222,7 +222,7 @@ int main() {
         .len = 3,
     };
     if (!expect(
-            pie_native::abi::validate_step_desc(&device_geometry_rs, kTestRosterLen) ==
+            pie::driver::validate::step_desc(&device_geometry_rs, kTestRosterLen) ==
                 PIE_STATUS_INVALID_ARGUMENT,
             "deferred buffered RS CSR still rejects non-monotonic input")) {
         return 1;
@@ -233,7 +233,7 @@ int main() {
     };
     device_geometry_rs.rs_slot_flags.len = 1;
     if (!expect(
-            pie_native::abi::validate_step_desc(&device_geometry_rs, kTestRosterLen) ==
+            pie::driver::validate::step_desc(&device_geometry_rs, kTestRosterLen) ==
                 PIE_STATUS_INVALID_ARGUMENT,
             "resolved folded RS rejects mismatched ids/flags")) {
         return 1;
@@ -241,7 +241,7 @@ int main() {
     device_geometry_rs.rs_slot_flags.len = 2;
     device_geometry_rs.rs_fold_lens.len = 1;
     if (!expect(
-            pie_native::abi::validate_step_desc(&device_geometry_rs, kTestRosterLen) ==
+            pie::driver::validate::step_desc(&device_geometry_rs, kTestRosterLen) ==
                 PIE_STATUS_INVALID_ARGUMENT,
             "resolved folded RS rejects mismatched fold lengths")) {
         return 1;
@@ -413,7 +413,7 @@ int main() {
                     host_class, 1) == PIE_STATUS_INVALID_ARGUMENT,
                 "host-class row without pages rejects")) return 1;
 
-    pie_native::launch::FireGeometry geometry;
+    pie::driver::fire::FireGeometry geometry;
     geometry.token_ids = {1};
     geometry.position_ids = {0};
     geometry.qo_indptr = {0, 1};
@@ -426,7 +426,7 @@ int main() {
     geometry.w_off = {0};
     geometry.has_kv_family = true;
     geometry.has_write_desc = true;
-    if (!expect(pie_native::launch::validate_fire_geometry(
+    if (!expect(pie::driver::fire::validate_fire_geometry(
                     geometry, 4, 16),
                 "resolved device geometry accepts valid descriptor")) return 1;
     // Device extent kv_len=20 with one live row: the lane's first live
@@ -436,22 +436,22 @@ int main() {
     geometry.kv_last_page_lens = {4};
     geometry.w_page = {1};
     geometry.w_off = {3};
-    if (!expect(pie_native::launch::validate_kv_write_containment(
+    if (!expect(pie::driver::fire::validate_kv_write_containment(
                     geometry, 16, 19, 20),
                 "resolved write accepts the containment floor")) return 1;
-    if (!expect(!pie_native::launch::validate_kv_write_containment(
+    if (!expect(!pie::driver::fire::validate_kv_write_containment(
                     geometry, 16, 25, 26),
                 "resolved write rejects a token below the exact declaration")) return 1;
     geometry.w_off = {2};
-    if (!expect(!pie_native::launch::validate_kv_write_containment(
+    if (!expect(!pie::driver::fire::validate_kv_write_containment(
                     geometry, 16, 25, 26),
                 "resolved write rejects a token below the device extent")) return 1;
     geometry.w_off = {3};
-    if (!expect(!pie_native::launch::validate_kv_write_containment(
+    if (!expect(!pie::driver::fire::validate_kv_write_containment(
                     geometry, 16, 18, 19),
                 "resolved write rejects the exclusive upper bound")) return 1;
     geometry.token_ids = {std::numeric_limits<std::uint32_t>::max()};
-    if (!expect(pie_native::launch::validate_kv_write_containment(
+    if (!expect(pie::driver::fire::validate_kv_write_containment(
                     geometry, 16, 25, 26),
                 "sentinel rows bypass the exact declaration bounds")) return 1;
     geometry.token_ids = {1};
@@ -461,39 +461,39 @@ int main() {
     geometry.w_page = {0};
     geometry.w_off = {0};
     geometry.structured_mask = {
-        pie_native::launch::StructuredMaskKind::Causal, 1, 0, 0};
-    if (!expect(pie_native::launch::validate_fire_geometry(
+        pie::driver::fire::StructuredMaskKind::Causal, 1, 0, 0};
+    if (!expect(pie::driver::fire::validate_fire_geometry(
                    geometry, 4, 16),
                 "structured extent validates without a dense mask")) return 1;
     geometry.structured_mask = {
-        pie_native::launch::StructuredMaskKind::SlidingWindow, 1, 0, 0};
-    if (!expect(pie_native::launch::validate_fire_geometry(
+        pie::driver::fire::StructuredMaskKind::SlidingWindow, 1, 0, 0};
+    if (!expect(pie::driver::fire::validate_fire_geometry(
                    geometry, 4, 16),
                 "zero-width sliding descriptor is valid")) return 1;
     geometry.structured_mask = {
-        pie_native::launch::StructuredMaskKind::SinkWindow, 1, 99, 0};
-    if (!expect(pie_native::launch::validate_fire_geometry(
+        pie::driver::fire::StructuredMaskKind::SinkWindow, 1, 99, 0};
+    if (!expect(pie::driver::fire::validate_fire_geometry(
                    geometry, 4, 16),
                 "sink extent may exceed key length")) return 1;
     geometry.structured_mask.key_len = 0;
-    if (!expect(!pie_native::launch::validate_fire_geometry(
+    if (!expect(!pie::driver::fire::validate_fire_geometry(
                    geometry, 4, 16),
                 "structured extent rejects independently of dense fallback")) {
         return 1;
     }
     geometry.structured_mask = {};
-    pie_native::launch::FireGeometry idle_geometry;
+    pie::driver::fire::FireGeometry idle_geometry;
     idle_geometry.qo_indptr = {0, 0};
     idle_geometry.sampling_indptr = {0, 0};
     idle_geometry.structured_mask = {
-        pie_native::launch::StructuredMaskKind::Causal, 16, 0, 0};
-    if (!expect(pie_native::launch::validate_fire_geometry(
+        pie::driver::fire::StructuredMaskKind::Causal, 16, 0, 0};
+    if (!expect(pie::driver::fire::validate_fire_geometry(
                     idle_geometry, 4, 16),
                 "idle structured geometry does not index absent KV arrays")) {
         return 1;
     }
     geometry.w_page[0] = 4;
-    if (!expect(!pie_native::launch::validate_fire_geometry(
+    if (!expect(!pie::driver::fire::validate_fire_geometry(
                     geometry, 4, 16),
                 "resolved device geometry rejects out-of-range write")) return 1;
     geometry.w_page[0] = 0;
@@ -502,7 +502,7 @@ int main() {
     geometry.qo_indptr[1] = 2;
     geometry.w_page.push_back(0);
     geometry.w_off.push_back(1);
-    if (!expect(!pie_native::launch::validate_fire_geometry(
+    if (!expect(!pie::driver::fire::validate_fire_geometry(
                     geometry, 4, 16),
                 "resolved device geometry rejects short KV extent")) return 1;
 

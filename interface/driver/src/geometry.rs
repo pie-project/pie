@@ -12,6 +12,31 @@ pub const PIE_DEVICE_PORT_W_OFF: u32 = 1 << 6;
 /// a masked device-resolved pass additionally requires this bit.
 pub const PIE_DEVICE_PORT_ATTN_MASK: u32 = 1 << 7;
 
+/// Recurrent-state buffered-slot family. The driver resolves the buffered
+/// slab CSR (`rs_buffer_pages` / `rs_buffer_indptr`), the per-row live
+/// buffered length, and the buffered write descriptor from device channel
+/// cells pre-forward — the RS mirror of the KV `pages` / `page-indptr` /
+/// `kv-len` / `w-slot` / `w-off` set.
+///
+/// Orthogonal to the geometry-class port sets below: those describe how a
+/// pass resolves its ATTENTION geometry, and a recurrent-only pass has none.
+/// A backend advertises these bits independently.
+pub const PIE_DEVICE_PORT_RS_BUFFER_PAGES: u32 = 1 << 8;
+pub const PIE_DEVICE_PORT_RS_BUFFER_INDPTR: u32 = 1 << 9;
+pub const PIE_DEVICE_PORT_RS_BUFFER_LEN: u32 = 1 << 10;
+pub const PIE_DEVICE_PORT_RS_W_SLOT: u32 = 1 << 11;
+pub const PIE_DEVICE_PORT_RS_W_OFF: u32 = 1 << 12;
+
+/// Full device-resolved port mask of the recurrent-state buffered-slot
+/// family. A guest may bind `rs-geometry`'s channel fields only on a backend
+/// advertising every one of these bits; otherwise the host rejects the
+/// binding rather than silently ignoring it.
+pub const PIE_DEVICE_RS_BUFFER_PORTS: u32 = PIE_DEVICE_PORT_RS_BUFFER_PAGES
+    | PIE_DEVICE_PORT_RS_BUFFER_INDPTR
+    | PIE_DEVICE_PORT_RS_BUFFER_LEN
+    | PIE_DEVICE_PORT_RS_W_SLOT
+    | PIE_DEVICE_PORT_RS_W_OFF;
+
 /// Full device-resolved port mask of the `DecodeEnvelope` geometry class.
 /// Driver-neutral: any backend that executes the class resolves exactly these
 /// ports on device.

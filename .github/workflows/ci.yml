@@ -188,11 +188,68 @@ jobs:
             exit 1
           fi
 
+      # The loader's header is generated the same way and was not guarded, so
+      # it drifted: `STREAM_PAGE_BYTES` outlived the constant it mirrored by
+      # several commits. Native drivers include this file, so a stale copy is
+      # a compile error in someone else's build, not ours.
+      - name: Regenerate committed loader header
+        run: cargo run -p pie-loader-cbindgen
+
+      - name: Fail if committed pie_loader.h is stale
+        run: |
+          if ! git diff --exit-code -- loader/include/pie_loader.h; then
+            echo "::error::loader/include/pie_loader.h is out of date."
+            echo "Regenerate with: cargo run -p pie-loader-cbindgen   (then commit)"
+            exit 1
+          fi
+
   # WIT drift — the canonical inferlet interface (interface/inferlet) is
   # vendored into two SDK copies (sdk/rust/inferlet/wit,
   # sdk/tools/bakery/src/bakery/wit). Manual three-way editing has regressed
   # twice (commit 94043eb1). scripts/sync-wit.sh regenerates the copies from
   # source; this job fails if a PR edited the interface without re-syncing.
+  # Guest bitrot — the two inferlet trees are their own cargo workspaces, so
+  # `cargo build --workspace` above never touches them and an SDK change that
+  # breaks every guest still goes green. That is not hypothetical: nine
+  # commits of SDK work silently broke 13 of the 37 crates under
+  # runtime/engine/tests/inferlets before anyone built them (c82e06bba).
+  # These are the SDK's only consumers; if they do not compile, the SDK's
+  # public surface is whatever the last refactor happened to leave behind.
+  guest-inferlets:
+    name: guest inferlets (both trees, wasm32-wasip2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tests/inferlets/target
+            runtime/engine/tests/inferlets/target
+          key: ${{ runner.os }}-guest-inferlets-${{ hashFiles('tests/inferlets/Cargo.lock', 'runtime/engine/tests/inferlets/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-guest-inferlets-
+
+      # Warnings are denied: an unused import or a stale `mut` in a guest is
+      # usually the visible end of an SDK surface that moved.
+      - name: cargo check (tests/inferlets)
+        run: cargo check --target wasm32-wasip2 --manifest-path tests/inferlets/Cargo.toml
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: cargo check (runtime/engine/tests/inferlets)
+        run: cargo check --target wasm32-wasip2 --manifest-path runtime/engine/tests/inferlets/Cargo.toml
+        env:
+          RUSTFLAGS: -D warnings
+
   wit-drift:
     name: wit drift (sync-wit.sh)
     runs-on: ubuntu-latest

@@ -21,15 +21,24 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(false)
     }
 
-    /// Whether the bound model is linear/recurrent (carries a fused recurrent
-    /// state that folds tokens irreversibly). TRUE iff the model has recurrent
-    /// state — the same predicate the CUDA executor keys fold-commit on
-    /// (`use_slots` / `rs_cache` present). Derived from the driver-handshake RS
-    /// caps: a non-zero folded-state size means the model has recurrent state.
-    /// The runtime uses this to select fold-commit (linear) vs KV-slot discard
-    /// (attention) for speculative decode, so the inferlet stays model-agnostic.
-    async fn is_linear(&mut self) -> Result<bool> {
-        Ok(model::model().rs_caps().state_size > 0)
+    /// Which forward-pass interface the bound model requires, over STATE
+    /// SEMANTICS rather than architecture name. Recurrent state is present iff
+    /// the driver handshake reports a non-zero folded-state size — the same
+    /// predicate the CUDA executor keys fold-commit on (`use_slots` /
+    /// `rs_cache` present); paged KV is present iff the model has a KV
+    /// page size. Today every registered linear model (Qwen3.5 GDN dense/MoE,
+    /// Nemotron-H Mamba2) interleaves attention layers and therefore reports
+    /// `hybrid`; `recurrent` is reachable only for a model with no KV at all.
+    async fn pass_kind(&mut self) -> Result<pie::inferlet::model::ForwardKind> {
+        use pie::inferlet::model::ForwardKind;
+        let model = model::model();
+        let has_rs = model.rs_caps().state_size > 0;
+        let has_kv = model.kv_page_size() > 0;
+        Ok(match (has_kv, has_rs) {
+            (_, false) => ForwardKind::Attention,
+            (true, true) => ForwardKind::Hybrid,
+            (false, true) => ForwardKind::Recurrent,
+        })
     }
 
     /// LM-head output dimension = `hf_config.vocab_size` (e.g. 151936 for
@@ -47,6 +56,12 @@ impl pie::inferlet::model::Host for ProcessCtx {
     /// sizes its slot list to. Fixed at engine start, like `kv-page-size`.
     async fn frame_size(&mut self) -> Result<u32> {
         Ok(crate::scheduler::configured_frame_size() as u32)
+    }
+
+    /// Bound on how long a pipeline may hold a frame's wait-set without
+    /// submitting. See `scheduler::configured_submit_deadline`.
+    async fn submit_deadline_us(&mut self) -> Result<u64> {
+        Ok(crate::scheduler::configured_submit_deadline().as_micros() as u64)
     }
 
     /// Host-reader channel capacity, in cells, that sustains the engine's

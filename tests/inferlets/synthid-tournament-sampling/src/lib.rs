@@ -53,8 +53,8 @@
 //! because round-ℓ winners are i.i.d. from `p_ℓ`. Derivation in
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::ptir::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
+use inferlet::chat;
+use inferlet::ptir::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Keeps `h * 31 + token` far below `u32::MAX` so the device arithmetic is
@@ -175,10 +175,7 @@ const DECOY_SALT: u32 = 0x0200_0000;
 /// candidate token, so `g` is a pure function of the same three inputs.
 fn g_layer(secret: u32, counter: &Tensor, layer: u32, vocab: u32) -> Tensor {
     let state = rng_state(secret ^ (G_SALT.wrapping_mul(layer + 1)), counter);
-    cast(
-        ge(rng(&state, [vocab]), Tensor::constant(0.5f32)),
-        DType::F32,
-    )
+    cast(ge(rng(&state, [vocab]), 0.5f32), dtype::f32)
 }
 
 /// Rolling hash of the `context_width` tokens ending at `hlen - 1`.
@@ -188,33 +185,23 @@ fn g_layer(secret: u32, counter: &Tensor, layer: u32, vocab: u32) -> Tensor {
 /// same offset sees the same clamped prefix, so the counter stays a pure
 /// function of the context.
 fn context_counter(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
-    let last = sub(cast(hlen, DType::I32), Tensor::constant(1i32));
-    let mut h = broadcast(Tensor::constant(0u32), [1]);
+    let last = cast(hlen, dtype::i32) - 1i32;
+    let mut h = broadcast(0u32, [1]);
     // Oldest token first, so the hash is the usual left-to-right polynomial.
     for d in (0..cfg.context_width).rev() {
-        let idx = max_elem(
-            sub(&last, Tensor::constant(d as i32)),
-            Tensor::constant(0i32),
-        );
+        let idx = max_elem(&last - d as i32, 0i32);
         // `+1` lifts the `-1` padding sentinel to 0 and keeps every real token
         // distinguishable from it.
-        let tok = cast(add(gather(hist, &idx), Tensor::constant(1i32)), DType::U32);
-        h = rem(
-            add(mul(&h, Tensor::constant(HASH_MULTIPLIER)), tok),
-            Tensor::constant(HASH_MODULUS),
-        );
+        let tok = cast(gather(hist, &idx) + 1i32, dtype::u32);
+        h = (&h * HASH_MULTIPLIER + tok) % HASH_MODULUS;
     }
     h
 }
 
 /// Assembles the `[2]` u32 `[key, ctr]` rng state from two `[1]` parts.
 fn rng_state(key: u32, counter: &Tensor) -> Tensor {
-    let is_counter = eq(iota(2), broadcast(Tensor::constant(1u32), [2]));
-    select(
-        &is_counter,
-        broadcast(counter, [2]),
-        broadcast(Tensor::constant(key), [2]),
-    )
+    let is_counter = eq(iota(2), broadcast(1u32, [2]));
+    select(&is_counter, broadcast(counter, [2]), broadcast(key, [2]))
 }
 
 /// The host mirror of `context_counter`, used to find which steps saw a context
@@ -238,9 +225,9 @@ fn host_counter(history: &[i32], hlen: usize, context_width: u32) -> u32 {
 fn mean_g(gs: &[Tensor], token: &Tensor) -> Tensor {
     let mut total = scalar_gather(&gs[0], token);
     for g in &gs[1..] {
-        total = add(total, scalar_gather(g, token));
+        total += scalar_gather(g, token);
     }
-    reshape(div(total, gs.len() as f32), [1])
+    reshape(total / gs.len() as f32, [1])
 }
 
 /// One sampling step.
@@ -253,12 +240,12 @@ fn step(
     hist: &Tensor,
     hlen: &Tensor,
     chist: &Tensor,
-    free_state: impl AsTensor + Copy,
+    free_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
     let scaled = if cfg.temperature == 1.0 {
         logits
     } else {
-        div(&logits, cfg.temperature)
+        &logits / cfg.temperature
     };
 
     let counter = context_counter(hist, hlen, cfg);
@@ -267,9 +254,9 @@ fn step(
     let repeated = gt(
         reduce_max(cast(
             eq(chist, broadcast(&counter, [cfg.history_size])),
-            DType::U32,
+            dtype::u32,
         )),
-        Tensor::constant(0u32),
+        0u32,
     );
 
     let base = softmax(&scaled);
@@ -282,15 +269,15 @@ fn step(
     // `g ∈ {0,1}` and `E_p[g] ∈ [0,1]`, and preserves normalisation exactly.
     let mut watermarked = base.clone();
     for g in &gs {
-        let mass = reduce_sum(mul(&watermarked, g));
-        let offset = broadcast(sub(Tensor::constant(1.0f32), &mass), [vocab]);
-        watermarked = mul(&watermarked, add(&offset, g));
+        let mass = reduce_sum(&watermarked * g);
+        let offset = broadcast(1.0f32 - &mass, [vocab]);
+        watermarked = &watermarked * (&offset + g);
     }
 
     let effective = select(broadcast(&repeated, [vocab]), &base, &watermarked);
     // `log` of a probability that underflowed would be -inf and would poison
     // the Gumbel-max comparison, so the floor is applied before the log.
-    let wm_logits = log(max_elem(&effective, Tensor::constant(1e-30f32)));
+    let wm_logits = log(max_elem(&effective, 1e-30f32));
 
     let token = if cfg.watermark {
         gumbel_max(&wm_logits, free_state)
@@ -307,7 +294,7 @@ fn step(
     let null_score = mean_g(&decoy_gs, &token);
 
     let hist_next = scatter_set(hist, hlen, &token);
-    let chist_next = scatter_set(chist, rem(hlen, cfg.history_size), &counter);
+    let chist_next = scatter_set(chist, hlen % cfg.history_size, &counter);
     (token, hist_next, chist_next, score, null_score)
 }
 
@@ -327,9 +314,9 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -358,8 +345,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let cfg = Cfg {
         secret: input.secret,
@@ -382,19 +368,17 @@ async fn main(input: Input) -> Result<Output> {
     let mut nulls: Vec<f32> = Vec::with_capacity(max_tokens);
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let toks_p =
-        Channel::from(history.iter().take(n as usize).copied().collect::<Vec<_>>()).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied()).named("toks_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
+    let rng_p = Channel::from([input.seed, 0]).named("rng_p");
     let hist_p = Channel::from(history.clone()).named("hist_p");
-    let hlen_p = Channel::from(vec![n]).named("hlen_p");
+    let hlen_p = Channel::from([n]).named("hlen_p");
     let chist_p =
         Channel::from(vec![u32::MAX; cfg.history_size as usize]).named("context_history_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
@@ -405,54 +389,42 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let hist = hist_p.take().tensor();
-        let hlen = hlen_p.take().tensor();
-        let chist = chist_p.take().tensor();
+        let hist = hist_p.take();
+        let hlen = hlen_p.take();
+        let chist = chist_p.take();
         let logits = intrinsics::logits();
         let (token, hist_next, chist_next, score, null) =
             step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         score_out_p.put(&score);
         null_out_p.put(&null);
         chist_p.put(&chist_next);
         hist_p.put(&hist_next);
-        hlen_p.put(add(&hlen, 1u32));
+        hlen_p.put(&hlen + 1u32);
         rng_p.put(&r_next);
     });
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let s0 = score_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("score take: {e}"))?[0];
-    let n0 = null_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("null take: {e}"))?[0];
+    let g0 = tok_out_p.take_host::<i32>().await?;
+    let s0 = score_out_p.take_host::<f32>().await?;
+    let n0 = null_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
     scores.push(s0);
     nulls.push(n0);
@@ -461,10 +433,10 @@ async fn main(input: Input) -> Result<Output> {
     if generated.len() < max_tokens {
         history[n as usize] = g0;
 
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
+        let tok_in = Channel::from([g0]).named("tok_in");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let hist_c = Channel::from(history.clone()).named("hist");
-        let hlen_c = Channel::from(vec![n + 1]).named("hlen");
+        let hlen_c = Channel::from([n + 1]).named("hlen");
         // The decode fire gets its own channel, so the ring is seeded with the
         // entry the prefill fire wrote — otherwise the device and the host
         // mirror would disagree about the first context.
@@ -481,77 +453,74 @@ async fn main(input: Input) -> Result<Output> {
         let null_out = Channel::new([1], dtype::f32)
             .capacity(channel_capacity() as u32)
             .named("null_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
-            let hist = hist_c.take().tensor();
-            let hlen = hlen_c.take().tensor();
-            let chist = chist_c.take().tensor();
+            let hist = hist_c.take();
+            let hlen = hlen_c.take();
+            let chist = chist_c.take();
             let logits = intrinsics::logits();
             let (token, hist_next, chist_next, score, null) =
                 step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
-            page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
+            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             score_out.put(&score);
             null_out.put(&null);
             chist_c.put(&chist_next);
             hist_c.put(&hist_next);
-            hlen_c.put(add(&hlen, 1u32));
+            hlen_c.put(&hlen + 1u32);
             rng.put(&r_next);
         });
 
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             let s = score_out
-                .take()
-                .get::<f32>()
+                .take_host::<f32>()
                 .await
-                .map_err(|e| format!("score_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             let z = null_out
-                .take()
-                .get::<f32>()
+                .take_host::<f32>()
                 .await
-                .map_err(|e| format!("null_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);
             scores.push(s);
             nulls.push(z);
@@ -600,7 +569,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "synthid-tournament-sampling",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         secret: cfg.secret,
         context_width: cfg.context_width,

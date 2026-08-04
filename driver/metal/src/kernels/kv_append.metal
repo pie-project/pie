@@ -43,6 +43,4 @@ template <typename T>
       device itype*, const device int*, const constant int&,      \
       const constant size_t&, const constant size_t&, uint2);
 
-instantiate_kv_append(float32, float)
-instantiate_kv_append(float16, half)
 instantiate_kv_append(bfloat16, bfloat)

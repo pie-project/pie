@@ -100,6 +100,14 @@ struct LlamaLikeForwardCfg {
     // all-reduce there are no more collectives, so they can skip rank-0 logits.
     bool emit_logits = true;
 
+    // Per-fire, from `ForwardInputs::logits_argmax_chunk_tokens`. When
+    // non-zero the lm_head is computed one vocabulary slab at a time and each
+    // slab is reduced to a running greedy argmax as it lands, so `ws.logits`
+    // is never filled and `ws.sampled_tokens` carries the result (§20.37).
+    // Only the driver sets it, and only once it has proven every epilogue is a
+    // bare argmax over the logits.
+    int logits_argmax_chunk_tokens = 0;
+
     // ── Qwen3-VL M-RoPE ──────────────────────────────────────────────
     // mrope_section partitions head_dim/2 across the (t,h,w) axes. Consumed
     // only when `rope_kind == MRopeInterleaved`. The 3-axis positions are

@@ -24,7 +24,6 @@
 
 pub(crate) mod batch;
 pub(crate) mod dispatch;
-pub(crate) mod fire_plan;
 pub(crate) mod frame;
 pub(crate) mod probe;
 pub(crate) mod stats;
@@ -36,6 +35,7 @@ pub use frame::FrameStamp;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
@@ -156,6 +156,55 @@ pub async fn debug_dump(driver_id: usize) -> Result<String> {
 // Frame size (`PIE_FRAME_SIZE`) — the Vesuvius deployment constant k
 // =============================================================================
 
+/// How long a lane that is hard-blocking a frame's seal may go without
+/// submitting before the engine stops waiting for it
+/// (`[model.scheduler] submit_deadline_us`, default 50ms). Guests read it as
+/// `model.submit-deadline-us()`.
+///
+/// Small enough to be a real bound on fleet exposure because it measures a
+/// much narrower interval than its size suggests: the clock runs only while
+/// the lane is an awaited member with nothing submitted, and is stopped by
+/// run-ahead, by an unretired dispatch (the engine owes it a result), by a
+/// bind in flight, and by `forward.park()`. Host turnaround has its own
+/// headroom in `HOST_TURNAROUND_WAVES`.
+///
+/// This number can no longer kill: at the deadline the lane is dropped from
+/// the wait-set (an involuntary `forward.park()`), its queued frames still
+/// dispatch, and its next fire rejoins. It is a density bound — how long the
+/// fleet waits for a straggler — so a value that is too small costs a little
+/// epoch density and never a request. Termination is a separate, far longer
+/// verdict; see [`configured_silence_timeout`].
+pub fn configured_submit_deadline() -> Duration {
+    *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(50_000))
+}
+
+/// Install the configured deadline at bootstrap. First writer wins; later
+/// calls are ignored so the value a guest has already read cannot change.
+pub fn set_submit_deadline(deadline: Duration) {
+    let _ = SUBMIT_DEADLINE.set(deadline);
+}
+
+static SUBMIT_DEADLINE: OnceLock<Duration> = OnceLock::new();
+
+/// How long a lane may stay silent in total before its process is
+/// terminated. Unlike the leash above this IS a verdict, so it is generous:
+/// the leash already keeps a straggler from holding the fleet, which means
+/// nothing but an abandoned pipeline ever reaches this. A guest that means to
+/// go quiet calls `forward.park()`, which ends the silence and is never
+/// killed — that is exactly the contract this enforces.
+///
+/// Configured by `[model.scheduler] silence_timeout_secs` (default 30s).
+pub fn configured_silence_timeout() -> Duration {
+    *SILENCE_TIMEOUT.get_or_init(|| Duration::from_secs(30))
+}
+
+/// Install the configured silence timeout at bootstrap. First writer wins.
+pub fn set_silence_timeout(timeout: Duration) {
+    let _ = SILENCE_TIMEOUT.set(timeout);
+}
+
+static SILENCE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+
 /// Waves per frame (k): a static deployment constant, fixed at engine start
 /// exactly like the KV page size — never renegotiated per frame and never
 /// adapted from runtime timing. Guests query it via `model.frame-size()` and
@@ -242,14 +291,14 @@ pub fn channel_capacity() -> usize {
 }
 
 // =============================================================================
-// Fire trace (`PIE_SCHED_TRACE` / `PIE_SCHED_TRACE_FILE`)
+// Frame dispatch trace (`PIE_SCHED_TRACE` / `PIE_SCHED_TRACE_FILE`)
 // =============================================================================
 
-/// Whether the scheduler fire trace is enabled. Read once (cached, like
+/// Whether the scheduler dispatch trace is enabled. Read once (cached, like
 /// `frame::configured_max_in_flight`'s env lever) — MUST be set before the first fire
 /// (before boot), since later env mutations are never re-observed. `worker`
-/// checks this before doing any per-fire trace bookkeeping (e.g. the
-/// distinct-program count), so tracing off costs nothing on the hot path.
+/// checks this before doing any per-dispatch trace bookkeeping, so tracing
+/// off costs nothing on the hot path.
 pub(crate) fn sched_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
@@ -258,9 +307,8 @@ pub(crate) fn sched_trace_enabled() -> bool {
 
 /// The optional trace sink (`PIE_SCHED_TRACE_FILE`), opened once in append
 /// mode. A real file — unlike `eprintln!`'s fd 2 — survives libtest's
-/// stdout/stderr capture-sink for a background scheduler thread (see
-/// `cuda_grammar10.rs`'s `StderrCapture` doc for why the file form exists
-/// alongside the fd-2 form `cuda_grammar_r2.rs` captures via `dup2`).
+/// stdout/stderr capture-sink for a background scheduler thread, which is
+/// why the file form exists alongside the fd-2 form.
 fn sched_trace_file() -> Option<&'static Mutex<std::fs::File>> {
     static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
     FILE.get_or_init(|| {
@@ -275,13 +323,12 @@ fn sched_trace_file() -> Option<&'static Mutex<std::fs::File>> {
     .as_ref()
 }
 
-/// Appends one `[pie-sched-trace] …` fire line: to stderr (fd 2 — the
-/// `cuda_grammar_r2` capture) always when [`sched_trace_enabled`], and ALSO
-/// to `PIE_SCHED_TRACE_FILE` when set (the `cuda_grammar10` capture),
+/// Appends one `[pie-sched-trace] …` line: to stderr (fd 2) always when
+/// [`sched_trace_enabled`], and ALSO to `PIE_SCHED_TRACE_FILE` when set,
 /// flushed immediately so a polling reader observes it append-only and
-/// promptly. Callers should guard any per-fire bookkeeping this line needs
-/// (e.g. a distinct-program count) behind [`sched_trace_enabled`] first, so
-/// tracing-off costs nothing beyond that one flag read.
+/// promptly. Callers should guard any per-dispatch bookkeeping this line
+/// needs behind [`sched_trace_enabled`] first, so tracing-off costs nothing
+/// beyond that one flag read.
 pub(crate) fn sched_trace_write(args: std::fmt::Arguments) {
     if !sched_trace_enabled() {
         return;
@@ -865,8 +912,7 @@ fn build_driver_scheduler(
     page_size: u32,
     request_timeout_secs: u64,
 ) -> Result<BatchScheduler> {
-    let spec = crate::driver::get_spec(driver_id)?;
-    let limits = spec.scheduler_limits();
+    let limits = crate::driver::get_spec(driver_id)?.scheduler_limits();
     Ok(BatchScheduler::new(
         driver_id,
         driver_id,
@@ -874,10 +920,6 @@ fn build_driver_scheduler(
         limits,
         request_timeout_secs,
         configured_frame_size(),
-        // The driver's validated-plan site summary from the capabilities
-        // handshake: the scheduler maps it into fire-plan sites and merges
-        // them into every sealed frame (`fire_plan::site_table`).
-        spec.model_site_summary,
     ))
 }
 

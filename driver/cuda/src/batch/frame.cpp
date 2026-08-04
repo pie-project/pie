@@ -10,6 +10,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <span>
@@ -49,6 +50,10 @@ int tensor_rows(const DeviceTensor& t) {
     if (t.shape().empty()) return 0;
     return static_cast<int>(t.shape()[0]);
 }
+
+// Vocabulary slab width for the fused LM head + greedy argmax (§20.37) lives in
+// batch/forward.cpp: the graph-capture path needs the same value, and a second
+// copy of the `static` here would be a second chance to disagree with it.
 
 struct MtpDraftWork {
     std::size_t program = 0;
@@ -643,7 +648,7 @@ struct StepTiming {
 // pointers alias; the Impl is heap-held so those addresses are stable
 // under PreparedStep moves.
 struct PreparedStep::Impl {
-    const pie_native::LaunchView* view = nullptr;
+    const pie::driver::fire::LaunchView* view = nullptr;
     std::unique_ptr<pipeline::StagedLaunch> staged;
 
     // Resolution + composition.
@@ -653,7 +658,7 @@ struct PreparedStep::Impl {
     bool composed_ready = false;
     std::vector<std::uint32_t> prog_sample_csr;
     std::vector<std::uint32_t> program_token_starts;
-    pie_native::LaunchView dispatch_view{};
+    pie::driver::fire::LaunchView dispatch_view{};
     // ④ Act 1: distinct-k truncation bands (deepest-first) from the
     // region table; empty = unbanded.
     std::vector<std::uint32_t> depth_band_k;
@@ -679,6 +684,10 @@ struct PreparedStep::Impl {
     pipeline::FixedDecodeDeviceBuffers fixed_buffers{};
     pipeline::DecodeEnvelopeDeviceBuffers envelope_buffers{};
     bool compact_logits = false;
+    // Vocabulary slab width for the fused LM head + greedy argmax, or 0 when
+    // this fire materializes logits the ordinary way. See
+    // `ForwardInputs::logits_argmax_chunk_tokens`.
+    int logits_argmax_chunk_tokens = 0;
 
     // Masks.
     bool have_custom_mask = false;
@@ -709,6 +718,12 @@ struct PreparedStep::Impl {
     std::span<const std::uint32_t> rs_fold_len_view;
     std::span<const std::uint32_t> rs_buf_id_view;
     std::span<const std::uint32_t> rs_buf_indptr_view;
+    // The buffered prefix replayed ahead of this fire's own tokens.
+    std::span<const std::uint32_t> rs_buf_read_id_view;
+    std::span<const std::uint32_t> rs_buf_read_indptr_view;
+    std::span<const std::uint32_t> rs_buf_read_len_view;
+    std::span<const std::uint32_t> rs_buf_head_view;
+    bool rs_has_buffer_read = false;
     std::vector<std::int32_t> slot_ids_h;
     std::vector<std::uint8_t> is_fresh_h;
 
@@ -781,6 +796,10 @@ struct PreparedStep::Impl {
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_fold_lens{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_buf_indptr{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_buf_ids{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_ids{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_indptr{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_lens{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_heads{};
     DeviceBuffer<std::int32_t>::StagedUpload up_sample_idx{};
 
     // Diagnostics. Declared last so its emission (at destruction) runs
@@ -830,7 +849,7 @@ bool plan_inputs_identical(
 
 void prepare_step(
     BatchEngine& engine,
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     PreparedStep& step,
     const PreparedStep* previous) {
     PreparedStep::Impl& s = *step.impl();
@@ -1035,7 +1054,7 @@ void prepare_step(
             : nullptr;
     bool use_structured_mask = false;
     bool pack_structured_mask = false;
-    std::vector<pie_native::launch::StructuredMaskDescriptor>
+    std::vector<pie::driver::fire::StructuredMaskDescriptor>
         effective_structured_masks = s.composed.structured_masks;
     const auto mask_coverage = pipeline::structured_mask_coverage(
         effective_structured_masks);
@@ -1060,7 +1079,7 @@ void prepare_step(
         for (auto& descriptor : effective_structured_masks) {
             if (!descriptor) {
                 descriptor.kind =
-                    pie_native::launch::StructuredMaskKind::Causal;
+                    pie::driver::fire::StructuredMaskKind::Causal;
             }
         }
         filled_causal_coverage = true;
@@ -1109,45 +1128,45 @@ void prepare_step(
     }
     s.dispatch_view = view;
     if (s.composed_ready) {
-        s.dispatch_view.rs_slot_ids = pie_native::slice_from_u32(
+        s.dispatch_view.rs_slot_ids = pie::driver::slice_from_u32(
             s.composed.rs_slot_ids.data(), s.composed.rs_slot_ids.size());
-        s.dispatch_view.rs_slot_flags = pie_native::slice_from_u8(
+        s.dispatch_view.rs_slot_flags = pie::driver::slice_from_u8(
             s.composed.rs_slot_flags.data(),
             s.composed.rs_slot_flags.size());
-        s.dispatch_view.rs_fold_lens = pie_native::slice_from_u32(
+        s.dispatch_view.rs_fold_lens = pie::driver::slice_from_u32(
             s.composed.rs_fold_lens.data(), s.composed.rs_fold_lens.size());
-        s.dispatch_view.rs_buffer_slot_ids = pie_native::slice_from_u32(
+        s.dispatch_view.rs_buffer_slot_ids = pie::driver::slice_from_u32(
             s.composed.rs_buffer_slot_ids.data(),
             s.composed.rs_buffer_slot_ids.size());
-        s.dispatch_view.rs_buffer_slot_indptr = pie_native::slice_from_u32(
+        s.dispatch_view.rs_buffer_slot_indptr = pie::driver::slice_from_u32(
             s.composed.rs_buffer_slot_indptr.data(),
             s.composed.rs_buffer_slot_indptr.size());
-        s.dispatch_view.sampling_indices = pie_native::slice_from_u32(
+        s.dispatch_view.sampling_indices = pie::driver::slice_from_u32(
             sidx_view.data(), sidx_view.size());
-        s.dispatch_view.sampling_indptr = pie_native::slice_from_u32(
+        s.dispatch_view.sampling_indptr = pie::driver::slice_from_u32(
             s.prog_sample_csr.data(), s.prog_sample_csr.size());
-        s.dispatch_view.ptir_sample_starts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_sample_starts = pie::driver::slice_from_u32(
             s.composed.prog_sample_starts.data(),
             s.composed.prog_sample_starts.size());
-        s.dispatch_view.ptir_sample_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_sample_counts = pie::driver::slice_from_u32(
             s.composed.prog_sample_counts.data(),
             s.composed.prog_sample_counts.size());
-        s.dispatch_view.ptir_row_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_row_counts = pie::driver::slice_from_u32(
             s.composed.prog_row_counts.data(),
             s.composed.prog_row_counts.size());
-        s.dispatch_view.ptir_token_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_token_counts = pie::driver::slice_from_u32(
             s.composed.prog_token_counts.data(),
             s.composed.prog_token_counts.size());
-        s.dispatch_view.ptir_kv_lens = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_kv_lens = pie::driver::slice_from_u32(
             s.composed.prog_kv_lens.data(),
             s.composed.prog_kv_lens.size());
-        s.dispatch_view.ptir_page_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_page_counts = pie::driver::slice_from_u32(
             s.composed.prog_page_counts.data(),
             s.composed.prog_page_counts.size());
-        s.dispatch_view.ptir_query_lens = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_query_lens = pie::driver::slice_from_u32(
             s.composed.prog_query_lens.data(),
             s.composed.prog_query_lens.size());
-        s.dispatch_view.ptir_key_lens = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_key_lens = pie::driver::slice_from_u32(
             s.composed.prog_key_lens.data(),
             s.composed.prog_key_lens.size());
     }
@@ -1236,6 +1255,22 @@ void prepare_step(
         ? std::span<const std::uint32_t>(s.composed.rs_fold_lens)
         : view.rs_fold_lens.as<std::uint32_t>();
     std::string rs_binding_error;
+    // A device-resident fold length is SUBSTITUTED during composition, where
+    // the resolved `rs_fold_len` port is clamped to the host's bound. If the
+    // fire never went through composition, that substitution never happened
+    // and the wire array still holds the placeholder -- which would fold the
+    // entire buffer instead of the accepted prefix. Refuse rather than fold
+    // too much: the tokens are unrecoverable once absorbed.
+    if (!s.composed_ready &&
+        std::any_of(
+            s.rs_flag_view.begin(), s.rs_flag_view.end(),
+            [](std::uint8_t f) {
+                return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+            })) {
+        throw std::runtime_error(
+            "a fire claims a device-resident RS fold length but was not "
+            "descriptor-composed, so the resolved value never reached it");
+    }
     if (!pipeline::validate_folded_rs_bindings(
             s.rs_slot_view,
             s.rs_flag_view,
@@ -1255,6 +1290,29 @@ void prepare_step(
     s.rs_buf_indptr_view = s.composed_ready
         ? std::span<const std::uint32_t>(s.composed.rs_buffer_slot_indptr)
         : view.rs_buffer_slot_indptr.as<std::uint32_t>();
+    // Read side: host-only, so no device staging -- a replay span is a
+    // property of the working set's occupancy, which a channel-resolved
+    // rs-geometry cannot name. It still travels through composition, because
+    // composition REORDERS requests (wire programs first, device-geometry
+    // ones after) and the read rows have to follow their own requests.
+    s.rs_buf_read_id_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_slot_ids)
+        : view.rs_buffer_read_slot_ids.as<std::uint32_t>();
+    s.rs_buf_read_indptr_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_indptr)
+        : view.rs_buffer_read_indptr.as<std::uint32_t>();
+    s.rs_buf_read_len_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_lens)
+        : view.rs_buffer_read_lens.as<std::uint32_t>();
+    s.rs_buf_head_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_heads)
+        : view.rs_buffer_heads.as<std::uint32_t>();
+    s.rs_has_buffer_read =
+        !s.rs_buf_read_len_view.empty() &&
+        std::any_of(
+            s.rs_buf_read_len_view.begin(),
+            s.rs_buf_read_len_view.end(),
+            [](std::uint32_t n) { return n != 0; });
     if (!pipeline::plan_rs_execution(
             s.rs_slot_view,
             s.rs_flag_view,
@@ -1965,6 +2023,25 @@ void prepare_step(
             s.up_rs_buf_ids =
                 pi.rs_buffer_slot_ids.stage_from_host(s.rs_buf_id_view);
         }
+        // The read side is host-only for the model, but a TP follower never
+        // sees the launch descriptor -- it recovers every per-request array by
+        // reading it back off the device. So it has to be staged like the rest.
+        if (!s.rs_buf_read_id_view.empty()) {
+            s.up_rs_read_ids = pi.rs_buffer_read_slot_ids.stage_from_host(
+                s.rs_buf_read_id_view);
+        }
+        if (!s.rs_buf_read_indptr_view.empty()) {
+            s.up_rs_read_indptr = pi.rs_buffer_read_indptr.stage_from_host(
+                s.rs_buf_read_indptr_view);
+        }
+        if (!s.rs_buf_read_len_view.empty()) {
+            s.up_rs_read_lens = pi.rs_buffer_read_lens.stage_from_host(
+                s.rs_buf_read_len_view);
+        }
+        if (!s.rs_buf_head_view.empty()) {
+            s.up_rs_heads =
+                pi.rs_buffer_heads.stage_from_host(s.rs_buf_head_view);
+        }
     }
 
     if (!s.rs_is_fold &&
@@ -2000,6 +2077,68 @@ void prepare_step(
         s.mtp_plan.work.empty() &&
         num_sampling > 0 &&
         num_sampling < s.fN_real;
+    // Fold the greedy argmax into the LM head GEMM when every epilogue in the
+    // launch is a bare argmax over `logits`, so the vocabulary is reduced as
+    // it is produced instead of making a round trip through HBM (§20.37).
+    // MTP drafts read the logits for their own reasons, so they opt out.
+    //
+    // The slab width is a device+model property with a real optimum, so it has
+    // no default here: the path stays off until something measures one. It
+    // belongs in the planner's calibration, and the environment variable is
+    // the bridge until it lands there.
+    s.logits_argmax_chunk_tokens = 0;
+    // A fire that samples nothing has no logits to fuse into, and is also the
+    // fire whose answer would say nothing about the steady state, so it is
+    // skipped rather than reported on.
+    if (logits_argmax_chunk_tokens() > 0 && num_sampling > 0) {
+        const auto vocab =
+            static_cast<std::uint32_t>(
+                engine.loaded_model.hf_config().vocab_size);
+        // Cheap, launch-shape reasons to decline, checked before the epilogue
+        // analysis so a declining fire never pays for it.
+        const bool shape_ok =
+            s.mtp_plan.work.empty() &&
+            // Under TP the LM head is sharded and the logits are gathered
+            // across ranks, so a rank cannot reduce its own slab to a token id.
+            engine.tp_comm == nullptr &&
+            // Most model families ignore the slab width and materialize logits
+            // regardless. Fusing on one of those would hand the epilogue a
+            // buffer nobody wrote, so the model has to opt in.
+            engine.forward_fn.supports_fused_lm_head_argmax;
+        if (shape_ok && engine.dispatch->launch_epilogue_is_greedy_argmax(
+                            s.dispatch_view, vocab)) {
+            s.logits_argmax_chunk_tokens = logits_argmax_chunk_tokens();
+        }
+        // The request was made explicitly, so say whether it was honoured: a
+        // silent no-op is indistinguishable from a fused run that did nothing.
+        //
+        // Both outcomes get their own latch. The verdict is per-fire -- it
+        // depends on this launch's guest programs -- so a single flag would
+        // report whichever fire happened to be first as if it were the steady
+        // state. Reports only values already in hand; re-deriving the epilogue
+        // verdict here would run the analysis on fires that `shape_ok`
+        // deliberately excluded.
+        const bool engaged = s.logits_argmax_chunk_tokens > 0;
+        static std::once_flag announced_engaged;
+        static std::once_flag announced_declined;
+        std::call_once(engaged ? announced_engaged : announced_declined, [&] {
+            std::cerr << "[pie-driver-cuda] logits argmax chunking "
+                      << (engaged ? "engaged" : "requested but not engaged")
+                      << " chunk=" << logits_argmax_chunk_tokens()
+                      << " sampling=" << num_sampling
+                      << " mtp=" << !s.mtp_plan.work.empty()
+                      << " tp=" << (engine.tp_comm != nullptr)
+                      << " model_supports="
+                      << engine.forward_fn.supports_fused_lm_head_argmax
+                      << " greedy_epilogue=";
+            if (shape_ok) {
+                std::cerr << engaged;
+            } else {
+                std::cerr << "n/a";
+            }
+            std::cerr << "\n";
+        });
+    }
     if (s.rs_is_fold && !s.mtp_plan.work.empty()) {
         throw std::runtime_error(
             "state-only buffered RS fold cannot produce MTP drafts");
@@ -2406,7 +2545,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             s.structured_window_left,
             s.rs_plan.mode,
             static_cast<int>(s.rs_fold_len_view.size()),
-            static_cast<int>(s.rs_buf_id_view.size()));
+            static_cast<int>(s.rs_buf_id_view.size()),
+            static_cast<int>(s.rs_buf_read_id_view.size()));
         tp_commit.key = &engine.tp_cpu_gate_key;
     }
     if (s.empty_step) {
@@ -2467,6 +2607,10 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         pi.rs_fold_lens.commit_staged(s.up_rs_fold_lens);
         pi.rs_buffer_slot_indptr.commit_staged(s.up_rs_buf_indptr);
         pi.rs_buffer_slot_ids.commit_staged(s.up_rs_buf_ids);
+        pi.rs_buffer_read_slot_ids.commit_staged(s.up_rs_read_ids);
+        pi.rs_buffer_read_indptr.commit_staged(s.up_rs_read_indptr);
+        pi.rs_buffer_read_lens.commit_staged(s.up_rs_read_lens);
+        pi.rs_buffer_heads.commit_staged(s.up_rs_heads);
     }
     pi.sample_idx.commit_staged(s.up_sample_idx);
     if (engine.rs_cache != nullptr) {
@@ -2548,6 +2692,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             s.rs_plan.mode,
                             static_cast<int>(s.rs_fold_len_view.size()),
                             static_cast<int>(s.rs_buf_id_view.size()),
+                            static_cast<int>(s.rs_buf_read_id_view.size()),
                             /*stream=*/nullptr);
         tp_commit.completed = true;
         pie_cuda_driver::tp_watchdog_mark_phase(2);
@@ -2861,6 +3006,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .depth_band_count =
                 static_cast<std::uint32_t>(s.depth_band_k.size()),
             .compact_logits = s.compact_logits,
+            .logits_argmax_chunk_tokens = s.logits_argmax_chunk_tokens,
             .structured_window_left = s.structured_window_left,
             .has_write_desc = s.has_write_desc,
             .use_slots = s.use_slots,
@@ -2879,6 +3025,18 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 (s.rs_is_write || s.rs_is_fold)
                     ? s.rs_buf_indptr_view.data()
                     : nullptr,
+            .rs_buffer_read_slot_ids_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_id_view.data()
+                : nullptr,
+            .rs_buffer_read_indptr_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_indptr_view.data()
+                : nullptr,
+            .rs_buffer_read_lens_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_len_view.data()
+                : nullptr,
+            .rs_buffer_heads_h = s.rs_buf_head_view.empty()
+                ? nullptr
+                : s.rs_buf_head_view.data(),
             .rs_fold_lens_h = !s.rs_fold_len_view.empty()
                 ? s.rs_fold_len_view.data()
                 : nullptr,
@@ -2967,6 +3125,10 @@ void settle_step(
             static_cast<std::uint32_t>(tensor_rows(engine.ws.logits)),
             engine.inputs.row_valid.data(),
             s.program_token_starts,
+            s.logits_argmax_chunk_tokens > 0
+                ? static_cast<const std::int32_t*>(
+                      engine.ws.sampled_tokens.data())
+                : nullptr,
             dbg_fire ? &s.timing.finish_breakdown : nullptr);
     }
     if (dbg_fire) {

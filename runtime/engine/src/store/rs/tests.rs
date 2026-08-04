@@ -1,13 +1,23 @@
 //! Unit tests for the RS store.
 
 use super::write::RsBufferTarget;
-use super::{RsError, RsGeometry, RsStore, RsWorkingSetId};
+use super::{RsBufferIntent, RsError, RsGeometry, RsStore, RsWorkingSetId};
 
 fn geom() -> RsGeometry {
     RsGeometry {
         state_size: 4096,
         buffer_page_tokens: 4,
         fold_granularity: 4,
+    }
+}
+
+/// Production declares `fold_granularity = 1` (token-causal) while a buffer
+/// page is the KV page size, so folds routinely land mid-page. The default
+/// `geom()` hides that by making the two equal.
+fn geom_with_granularity(granularity: u32) -> RsGeometry {
+    RsGeometry {
+        fold_granularity: granularity,
+        ..geom()
     }
 }
 
@@ -339,22 +349,52 @@ fn fold_validates_granularity_and_capacity() {
     let mut s = store();
     let ws = s.create_working_set(geom());
     s.alloc_buffer(ws, 2).unwrap(); // capacity 8 tokens
-    assert_eq!(s.validate_fold(ws, 0), Err(RsError::FoldZero));
+    let write = |t, b| s.validate_fold(ws, t, Some(b), RsBufferIntent::Write);
+    assert_eq!(write(0, (0, 8)), Err(RsError::FoldZero));
     assert_eq!(
-        s.validate_fold(ws, 6),
+        write(6, (0, 8)),
         Err(RsError::FoldGranularity {
             tokens: 6,
             granularity: 4
         })
     );
     assert_eq!(
-        s.validate_fold(ws, 12),
+        write(12, (0, 12)),
         Err(RsError::FoldExceedsBuffer {
             tokens: 12,
             capacity: 8
         })
     );
-    assert_eq!(s.validate_fold(ws, 8), Ok(()));
+    assert_eq!(write(8, (0, 8)), Ok(()));
+}
+
+#[test]
+fn a_fold_may_not_reach_past_the_tokens_that_exist() {
+    // Two pages of four hold capacity for eight, but only four tokens are
+    // live. Bounding on capacity would accept a fold of eight and gather
+    // four slab tokens that were never written.
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s
+        .prepare_general(ws, false, None, Some((0, 4)), RsBufferIntent::Write)
+        .unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws), Ok(4));
+    // A commit replays only what is buffered.
+    assert_eq!(
+        s.validate_fold(ws, 8, None, RsBufferIntent::Replay),
+        Err(RsError::FoldExceedsBuffer {
+            tokens: 8,
+            capacity: 4
+        })
+    );
+    assert_eq!(s.validate_fold(ws, 4, None, RsBufferIntent::Replay), Ok(()));
+    // A write extends the live space by its own new tokens.
+    assert_eq!(
+        s.validate_fold(ws, 8, Some((4, 4)), RsBufferIntent::Write),
+        Ok(())
+    );
 }
 
 #[test]
@@ -448,7 +488,10 @@ fn publish_batch_rejects_a_released_working_set_and_cancels_every_row() {
     let b = s.prepare_write(second, true, None).unwrap();
     s.release_working_set(second, s.current_epoch());
 
-    assert_eq!(s.publish_batch(vec![a, b]), Err(RsError::UnknownWorkingSet));
+    assert_eq!(
+        s.publish_batch(vec![a, b]).err(),
+        Some(RsError::UnknownWorkingSet)
+    );
     assert_eq!(
         s.folded_slot(first).unwrap(),
         None,
@@ -464,8 +507,8 @@ fn publish_batch_rejects_an_aliased_working_set() {
     let a = s.prepare_write(ws, true, None).unwrap();
     let b = s.prepare_write(ws, true, None).unwrap();
     assert_eq!(
-        s.publish_batch(vec![a, b]),
-        Err(RsError::DuplicateWorkingSet)
+        s.publish_batch(vec![a, b]).err(),
+        Some(RsError::DuplicateWorkingSet)
     );
     assert_eq!(s.folded_slot(ws).unwrap(), None);
     assert_eq!(s.available_slots(), 12);
@@ -479,7 +522,8 @@ fn publish_batch_adopts_every_row_of_one_fire() {
     let a = s.prepare_write(first, true, None).unwrap();
     let b = s.prepare_write(second, true, None).unwrap();
     let (a_slot, b_slot) = (a.state().unwrap().slot, b.state().unwrap().slot);
-    let published = s.publish_batch(vec![a, b]).unwrap();
+    let (published, folds) = s.publish_batch(vec![a, b]).unwrap();
+    s.commit_folds(folds);
     assert_eq!(published.rows(), 2);
     assert_eq!(s.folded_slot(first).unwrap(), Some(a_slot));
     assert_eq!(s.folded_slot(second).unwrap(), Some(b_slot));
@@ -513,4 +557,451 @@ fn unmaterialized_read_is_an_error_and_zero_length_read_is_empty() {
         s.resolve_buffer(ws, 0, 4),
         Err(RsError::UnmaterializedRead { index: 0 })
     );
+}
+
+/// Reserving a buffer page does not buffer a token.
+///
+/// The fire classifier asks "is the buffer empty?" to decide whether an append
+/// is the legal empty-buffer case or the unimplemented read path. It used to
+/// ask the PAGE count, but a guest must reserve a page before it can write into
+/// one — so a brand-new buffer claimed a full page of occupancy and every
+/// speculative window was refused before it ran.
+#[test]
+fn reserving_a_buffer_page_does_not_buffer_a_token() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "a new working set is empty"
+    );
+
+    s.alloc_buffer(ws, 2).unwrap();
+    assert_eq!(s.buffer_size(ws).unwrap(), 2, "two pages reserved");
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "reserved but unwritten: still zero buffered tokens"
+    );
+
+    let prepared = s.prepare_write(ws, false, Some((0, 3))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        3,
+        "exactly the tokens written, not the 4-token page they sit in"
+    );
+
+    // Rewriting the same span must not double-count.
+    let prepared = s.prepare_write(ws, false, Some((0, 3))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        3,
+        "a rewrite is not an append"
+    );
+
+    // A disjoint append advances the fill to its far edge.
+    let prepared = s.prepare_write(ws, false, Some((4, 4))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 8);
+}
+
+/// Folding absorbs buffered tokens into the folded prefix, so they stop being
+/// buffered — which is what lets the next window append onto an empty buffer.
+#[test]
+fn folding_drains_the_buffered_token_count() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 8);
+
+    let prepared = s.prepare_fold(ws, 4).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        4,
+        "half the buffer folded away"
+    );
+
+    let prepared = s.prepare_fold(ws, 4).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "folding everything empties the buffer"
+    );
+}
+
+/// Freeing every buffered page empties the buffer — the reset a speculative
+/// loop performs between windows.
+#[test]
+fn freeing_every_page_empties_the_buffered_token_count() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 8);
+
+    s.free_buffer(ws, &[0, 1], 0).unwrap();
+    assert_eq!(s.buffer_size(ws).unwrap(), 0);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "no pages left, so nothing is buffered"
+    );
+
+    // And a fresh reservation is once again genuinely empty.
+    s.alloc_buffer(ws, 1).unwrap();
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
+}
+
+/// A fork shares the buffer, so it must share the occupancy too — otherwise
+/// the child would classify its first fire as an empty-buffer append.
+#[test]
+fn fork_inherits_the_buffered_token_count() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 5))).unwrap();
+    settled(&mut s, prepared);
+
+    let child = s.fork(ws).unwrap();
+    assert_eq!(s.buffer_tokens(child).unwrap(), 5);
+}
+
+/// A fold that lands MID-PAGE cannot release the page it half-consumed, so the
+/// surviving tokens keep their physical offsets. `buffer_head` is what records
+/// that, and every later span has to be resolved through it — otherwise the
+/// next append overwrites live tokens and the next replay re-scans tokens that
+/// are already inside the folded state.
+#[test]
+fn a_partial_fold_moves_the_buffer_head_rather_than_compacting() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    s.alloc_buffer(ws, 2).unwrap();
+
+    // 4 tokens into page 0 (page = 4 tokens).
+    let prepared = s.prepare_write(ws, false, Some((0, 4))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 4);
+    assert_eq!(s.buffer_head(ws).unwrap(), 0);
+
+    // Fold 2 of them. Page 0 is only half covered, so it survives.
+    let prepared = s.prepare_fold(ws, 2).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 2, "two tokens still buffered");
+    assert_eq!(s.buffer_size(ws).unwrap(), 2, "no page could be released");
+    assert_eq!(
+        s.buffer_head(ws).unwrap(),
+        2,
+        "logical token 0 now sits at physical offset 2"
+    );
+
+    // Appending onto that buffer starts at LOGICAL 2 == PHYSICAL 4, which is
+    // page 1. Resolving it as physical 2 would overwrite a live token.
+    let prepared = s.prepare_write(ws, false, Some((2, 2))).unwrap();
+    let pages: Vec<u32> = prepared
+        .buffer_targets()
+        .iter()
+        .map(|target| match *target {
+            RsBufferTarget::Fresh { index, .. }
+            | RsBufferTarget::InPlace { index, .. }
+            | RsBufferTarget::Cow { index, .. } => index,
+        })
+        .collect();
+    assert_eq!(
+        pages,
+        vec![1],
+        "the append lands on page 1, not back inside page 0"
+    );
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 4);
+}
+
+/// Folding whole pages away rebases the head back down: dropping page 0 moves
+/// every survivor one page earlier.
+#[test]
+fn folding_a_whole_page_rebases_the_head() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+
+    let prepared = s.prepare_fold(ws, 6).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_size(ws).unwrap(),
+        1,
+        "page 0 fully covered, dropped"
+    );
+    assert_eq!(
+        s.buffer_head(ws).unwrap(),
+        2,
+        "6 folded - 4 dropped with the page = 2 into the surviving page"
+    );
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 2);
+}
+
+/// A fold's span names the pages it REPLAYS on the way into the folded state.
+/// Those tokens leave the buffer; counting the span as a write would re-add
+/// what the fold just removed.
+#[test]
+fn a_fold_does_not_count_its_replay_span_as_newly_buffered() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 4))).unwrap();
+    settled(&mut s, prepared);
+
+    // Fold 3 of 4 — more than half, which is what exposes the double count.
+    let prepared = s.prepare_write(ws, true, Some((0, 3))).unwrap();
+    let prepared = {
+        let _ = prepared;
+        s.prepare_fold(ws, 3).unwrap()
+    };
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        1,
+        "one token left, not the 3 the replay span named"
+    );
+}
+
+/// The mtp-native-verify shape: every window allocates fresh pages, buffers a
+/// window, folds a prefix and frees everything. Without a rebase the head
+/// ratchets up until a fresh single-page window no longer fits its own tokens.
+#[test]
+fn emptying_the_buffer_rebases_the_head_so_the_next_window_starts_at_zero() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    for _ in 0..4 {
+        s.alloc_buffer(ws, 1).unwrap();
+        let prepared = s.prepare_write(ws, false, Some((0, 3))).unwrap();
+        settled(&mut s, prepared);
+        let prepared = s.prepare_fold(ws, 2).unwrap();
+        settled(&mut s, prepared);
+        let size = s.buffer_size(ws).unwrap();
+        s.free_buffer(ws, &(0..size).collect::<Vec<_>>(), 0)
+            .unwrap();
+        assert_eq!(
+            s.buffer_head(ws).unwrap(),
+            0,
+            "an emptied buffer must not carry a head into the next window"
+        );
+    }
+}
+
+/// A fold whose length lived on the device makes the boundary INDETERMINATE.
+///
+/// The host planned against an upper bound, so after the fire it knows only
+/// that `F` moved somewhere into `[F, F+b]`. Guessing either way is
+/// unrecoverable: guessing MORE drops pages that are still live, guessing LESS
+/// replays tokens already absorbed into the state — a double fold. So the
+/// store advances nothing, retains every page, and REFUSES to report an exact
+/// occupancy until the guest empties the buffer itself.
+#[test]
+fn a_device_fold_length_suspends_the_boundary_rather_than_guessing() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 8);
+    assert!(s.buffer_tokens_exact(ws));
+
+    let mut prepared = s.prepare_fold(ws, 8).unwrap();
+    prepared.mark_fold_len_device();
+    assert!(prepared.fold_len_is_bound());
+    settled(&mut s, prepared);
+
+    // Every page is retained: the boundary may not have moved at all.
+    assert_eq!(s.buffer_size(ws).unwrap(), 2);
+    assert!(!s.buffer_tokens_exact(ws));
+    assert_eq!(
+        s.buffer_tokens_bound(ws).unwrap(),
+        8,
+        "the pre-fold occupancy is now only an upper bound"
+    );
+    assert!(
+        matches!(
+            s.buffer_tokens(ws),
+            Err(RsError::BufferOccupancyIndeterminate { bound: 8 })
+        ),
+        "an exact read must refuse rather than return the bound"
+    );
+}
+
+/// ...and freeing the buffer restores exactness, which is what makes the
+/// suspension recoverable instead of terminal. This is the shape a speculative
+/// loop already has: buffer a window, commit its accepted prefix, free the
+/// window, start the next one.
+#[test]
+fn freeing_the_buffer_restores_an_exact_occupancy_after_a_device_fold() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+
+    let mut prepared = s.prepare_fold(ws, 8).unwrap();
+    prepared.mark_fold_len_device();
+    settled(&mut s, prepared);
+    assert!(s.buffer_tokens(ws).is_err());
+
+    s.free_buffer(ws, &[0, 1], 0).unwrap();
+    assert!(s.buffer_tokens_exact(ws));
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "no pages left, so the occupancy is knowable again"
+    );
+
+    s.alloc_buffer(ws, 1).unwrap();
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
+}
+
+/// A bound of zero is not a bound: it pins the true occupancy at exactly zero,
+/// because the live buffer is somewhere in `0..=n` and `n` is zero.
+///
+/// `Occupancy::at_most` collapses that case at construction, so `AtMost(0)` is
+/// unrepresentable. This is the invariant the type exists to hold: the old
+/// pair of fields could spell it, and three separate call sites had to
+/// remember to normalize it away by hand. Discarding the whole bound from the
+/// TAIL is the path that reaches zero without the guest ever freeing a page,
+/// so it is the one that would regress silently.
+#[test]
+fn a_bound_driven_to_zero_is_exact_again() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+
+    let mut prepared = s.prepare_fold(ws, 8).unwrap();
+    prepared.mark_fold_len_device();
+    settled(&mut s, prepared);
+    assert!(!s.buffer_tokens_exact(ws), "the device fold suspended it");
+
+    // Discarding fewer than the bound leaves it a bound: the uncertainty is
+    // how much the fold took off the FRONT, and this takes from the TAIL.
+    s.discard_buffered(ws, 3).unwrap();
+    assert!(!s.buffer_tokens_exact(ws));
+    assert_eq!(s.buffer_tokens_bound(ws).unwrap(), 5);
+
+    // Discarding the rest drives the bound to zero, which leaves nothing for
+    // the fold to have absorbed that is not already accounted for.
+    s.discard_buffered(ws, 5).unwrap();
+    assert!(
+        s.buffer_tokens_exact(ws),
+        "a bound of zero pins the count, so exactness returns without free_buffer"
+    );
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
+    assert_eq!(
+        s.buffer_size(ws).unwrap(),
+        2,
+        "capacity is untouched: this released TOKENS, not pages"
+    );
+}
+
+/// A fork shares the buffer, so it inherits the indeterminacy too — otherwise/// the child would read a stale exact occupancy and plan a second fold over
+/// tokens the parent's device fold may already have absorbed.
+#[test]
+fn a_fork_inherits_an_indeterminate_buffer() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+    let mut prepared = s.prepare_fold(ws, 8).unwrap();
+    prepared.mark_fold_len_device();
+    settled(&mut s, prepared);
+
+    let child = s.fork(ws).unwrap();
+    assert!(!s.buffer_tokens_exact(child));
+    assert!(s.buffer_tokens(child).is_err());
+}
+
+/// `publish_batch` must NOT move the fold boundary.
+///
+/// Every wire array a fire carries describes the buffer as that fire's own
+/// rows are laid out: extended row `j` is physical `buffer_head + j`, the
+/// write CSR lists the pages that span holds, and the read CSR starts at the
+/// head. All of it is the PRE-fold frame. Advancing the boundary inside
+/// `publish_batch` therefore handed a fire whose rows straddle the boundary a
+/// head — and a page list — from the far side of it.
+///
+/// It stayed invisible for as long as it did because the only folds that
+/// existed either moved nothing (`n == 0`) or emptied the buffer (`n == b+t`,
+/// which rebases the head to 0 anyway). An INTERIOR fold is neither, and it
+/// read the tokens the fold had just absorbed instead of the ones that
+/// survived it.
+#[test]
+fn publishing_a_fold_leaves_the_boundary_for_commit_folds() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    s.alloc_buffer(ws, 2).unwrap();
+
+    // Four tokens in, boundary still at 0.
+    let prepared = s.prepare_write(ws, false, Some((0, 4))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_head(ws).unwrap(), 0);
+
+    // A fire that writes its own tokens AND folds a prefix of the result.
+    let prepared = s.prepare_fold(ws, 2).unwrap();
+    let (published, folds) = s.publish_batch(vec![prepared]).unwrap();
+
+    assert_eq!(
+        s.buffer_head(ws).unwrap(),
+        0,
+        "the wire arrays are still being built against the pre-fold buffer"
+    );
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 4, "and against its occupancy");
+
+    s.commit_folds(folds);
+    assert_eq!(
+        s.buffer_head(ws).unwrap(),
+        2,
+        "only now does logical token 0 move to physical offset 2"
+    );
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 2);
+    s.settle(published);
+}
+
+/// `discard` is the twin of a fold on the other end of the buffer: a fold
+/// moves the folded boundary right and cannot be undone, this moves the live
+/// end left and costs nothing. It releases CONTENT; `free_buffer` releases
+/// CAPACITY. Having only the second is why a speculative window needed two
+/// fires — dropping a rejected tail meant emptying the buffer, which forced
+/// the accepted prefix to be folded away first.
+#[test]
+fn discarding_buffered_tokens_releases_content_but_not_capacity() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 3).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 10))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 10);
+
+    s.discard_buffered(ws, 4).unwrap();
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 6);
+    assert_eq!(s.buffer_size(ws).unwrap(), 3); // pages untouched
+
+    // It may take the whole live buffer, and not one token more.
+    assert_eq!(
+        s.discard_buffered(ws, 7),
+        Err(RsError::DiscardExceedsBuffer {
+            count: 7,
+            buffered: 6
+        })
+    );
+    s.discard_buffered(ws, 6).unwrap();
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
+    assert_eq!(s.buffer_size(ws).unwrap(), 3);
 }

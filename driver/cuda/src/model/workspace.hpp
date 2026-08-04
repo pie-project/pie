@@ -89,6 +89,24 @@ struct Workspace {
     DeviceTensor up;         // [max_tokens, intermediate]
     DeviceTensor logits;     // [max_tokens, vocab]
     DeviceTensor probs;      // [max_tokens, vocab] FP32 — softmax scratch for sampling
+    // [max_tokens] i32. Written instead of `logits` when the forward folds a
+    // greedy argmax into the LM head GEMM (§20.37), so the vocabulary is
+    // reduced as it is produced and never materialised. The chunked path's slab
+    // scratch is carved out of `logits`, which by construction is the buffer
+    // that path is not filling.
+    DeviceTensor sampled_tokens;
+    // [max_tokens, kArgmaxAccumSlots] running (value, index) pair per row for
+    // that same path. These do NOT share `logits`: at `chunk >= vocab` with
+    // every row sampling, the slab alone consumes all of it, and a scratch
+    // block that only sometimes fits would turn into a silent fallback the
+    // epilogue cannot see. Sized off the same row count, so it always fits.
+    //
+    // All three are allocated unconditionally. They cost ~2 MiB against a
+    // multi-GiB arena, and making them conditional would reintroduce exactly
+    // the "is this buffer real for this fire?" question that the fused path is
+    // built to never have to ask.
+    DeviceTensor argmax_acc_val;
+    DeviceTensor argmax_acc_idx;
 
     // Padded variants for the attention kernel when `head_dim_kernel >
     // head_dim` (Phi-3 ships head_dim=96; flashinfer's TC kernel only

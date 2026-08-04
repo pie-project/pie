@@ -1,6 +1,6 @@
 // Reasoning / thinking-block decoder.
 //
-// Wraps the host's `pie:instruct/reasoning.decoder`. Emits `Event.Start`
+// Wraps the host's `pie:inferlet/reasoning.decoder`. Emits `Event.Start`
 // when the model enters a thinking block, `Event.Delta` for each chunk
 // of reasoning text, and `Event.End` when the block closes (with the
 // full accumulated reasoning text).
@@ -10,7 +10,7 @@
 // suppression). The chat decoder handles its own filtering so visible
 // text and reasoning text don't overlap.
 
-import * as _reasoning from 'pie:instruct/reasoning';
+import * as _reasoning from 'pie:inferlet/reasoning';
 
 // =============================================================================
 // Events

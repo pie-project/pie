@@ -75,6 +75,10 @@ fn production_lines(body: &str) -> impl Iterator<Item = (usize, &str)> {
 ///   weight bytes; that is its whole job.
 /// * `cache_key.rs` — the on-disk plan cache. It stats and writes files that are
 ///   outputs of compilation, never inputs to it.
+/// * `weight_store.rs` — the materialized-weight artifact, which is an output
+///   for the same reason: it is written *after* a plan has run, from device
+///   memory the driver already holds, and read back only to skip doing that
+///   again. Nothing the compiler decides depends on whether one exists.
 /// * `verify.rs` — staleness. `verify` is deliberately *not* `compile`: its
 ///   whole point is to compare a plan against the world it was compiled for, so
 ///   asking whether the files still have the recorded sizes is the check, not a
@@ -86,6 +90,7 @@ fn nothing_below_the_reader_opens_a_file() {
         "testkit/host_executor.rs",
         "cache_key.rs",
         "verify.rs",
+        "weight_store.rs",
         "main.rs",
     ];
     // `Path`/`PathBuf` are values and may be passed around freely; what must not
@@ -171,6 +176,7 @@ fn a_plan_compiles_from_a_value_with_no_checkpoint_anywhere() {
             vec![2, 2],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
 
     let plan = compile_load_plan(&metadata, &contract, StorageTarget::default())

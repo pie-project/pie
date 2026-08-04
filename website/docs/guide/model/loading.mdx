@@ -59,7 +59,7 @@ Add more models to `~/.pie/config.toml`:
 ```toml
 [[model]]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
 [model.driver]
 type = "cuda_native"
@@ -67,7 +67,7 @@ device = ["cuda:0"]
 
 [[model]]
 name = "large"
-hf_repo = "Qwen/Qwen2.5-7B-Instruct"
+model = "Qwen/Qwen2.5-7B-Instruct"
 
 [model.driver]
 type = "cuda_native"

@@ -1,0 +1,20 @@
+[package]
+name = "pie-model-config"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "HuggingFace config.json normalization into Pie's canonical model descriptor (pie.model/1). A leaf crate: serde only, no driver and no runtime."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_model_config"
+path = "src/lib.rs"
+
+[dependencies]
+# The descriptor is JSON on the way in (HuggingFace `config.json`) and on the
+# way out (`pie.model/1`). Nothing else is needed: this crate is a normalizer,
+# not a runtime.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"

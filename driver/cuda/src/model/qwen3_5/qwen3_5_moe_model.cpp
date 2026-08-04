@@ -1,9 +1,6 @@
 #include "model/qwen3_5/qwen3_5_moe_model.hpp"
 
-#include <cstdio>
 #include <utility>
-
-#include "model/qwen3_5/declared_forward.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -40,12 +37,28 @@ Qwen35MoeModel::Qwen35MoeModel(
     caps_.supports_compact_logits      = true;
     caps_.supports_small_prefill_graph = supports_small_prefill_graph;
 
-    // Declared executor: same cold-start trace + validation as the dense
-    // model (qwen3_5_model.cpp) — the two classes do not share a
-    // construction site, so each opts in here. body() never consumes the
-    // MoE plan this slice (no MoE emission arms yet; see body()).
-    if (qwen35_declared_forward_enabled()) {
-        declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
+    // The per-expert dispatch reads the routing table back off the device and
+    // syncs on it, and page-in adds a host-chosen slot and a plan run on top.
+    // None of that is capturable.
+    //
+    // Unlike DeepSeek-V4 this is not conditional on the cache being able to
+    // miss: streamed experts have no fused slab to stride, so every device-side
+    // path is off the table and the forward takes the syncing one even when the
+    // slab holds the whole group.
+    bool host_work_in_forward = qwen35_moe_force_general_path();
+    for (const auto& L : weights_.layers) {
+        if (L.expert_cache != nullptr) {
+            host_work_in_forward = true;
+            break;
+        }
+    }
+    if (host_work_in_forward) {
+        // Only the capture caps. `graph_padding_kv_write_safe` states that this
+        // family's KV writes are gated on `row_valid`, which is a property of
+        // its kernels and stays true either way -- startup validates it against
+        // the padding aliasing.
+        caps_.graph_safe = false;
+        caps_.supports_small_prefill_graph = false;
     }
 }
 
@@ -63,20 +76,6 @@ void Qwen35MoeModel::body(Workspace& ws,
                           AttentionWorkspace& attn_ws,
                           ops::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
-    // Arc-2 decode slice: the MoE model ALWAYS falls back this slice. Its
-    // validated plan carries the dyn MoE vocabulary (TopK, selector
-    // Matmuls, WeightedSum, SigmoidGateAdd) which the executor's op-kind
-    // switch has no emission rule for — the grouped-GEMM emission is a
-    // later, much larger lift (commit 9c54b9b6's list). The trace-gated
-    // line keeps the exclusion visible in A/B runs.
-    if (static_cast<bool>(declared_) &&
-        qwen35_declared_exec_trace_enabled()) {
-        std::fprintf(stderr,
-                     "[declared-qwen35-exec] fallback N=%d R=%d decode=%d "
-                     "reason=moe emission arms absent this slice\n",
-                     in.total_tokens, in.num_requests,
-                     in.is_pure_decode ? 1 : 0);
-    }
     qwen3_5_moe_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_state_,
         ws, la_ws_, moe_ws_, kv, state_cache_,
@@ -93,8 +92,10 @@ void Qwen35MoeModel::body(Workspace& ws,
         in.commit_advance_gather_d,
         in.rs_buffer_slot_ids_h, in.rs_buffer_slot_indptr_h,
         in.rs_fold_lens_d,
+        in.rs_fold_lens_h,
         in.rs_buffer_write, in.rs_buffer_fold,
-        in.stage_hooks);
+        in.rs_buffer_read_slot_ids_h, in.rs_buffer_read_indptr_h,
+        in.rs_buffer_read_lens_h, in.rs_buffer_heads_h);
 }
 
 std::uint32_t Qwen35MoeModel::graph_layout() {

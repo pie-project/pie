@@ -248,6 +248,4 @@ template <typename T>
       const device itype*, device float*,                                  \
       constant GdnCoreParams&, const device uint*, uint3, uint3, uint);
 
-instantiate_gdn_core(float32, float)
-instantiate_gdn_core(float16, half)
 instantiate_gdn_core(bfloat16, bfloat)

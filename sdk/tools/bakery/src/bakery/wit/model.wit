@@ -14,19 +14,33 @@ interface model {
     // Whether the bound model enables system speculation by default
     default-system-speculation: func() -> bool;
 
-    // Whether the bound model is linear/recurrent — i.e. it carries a fused
-    // recurrent state that folds tokens IRREVERSIBLY (linear-attention / SSM:
-    // Qwen3.5 GDN, Nemotron-H Mamba2), as opposed to pure attention whose KV is
-    // per-token and reversibly discardable. TRUE iff the model has recurrent
-    // state (equivalently `rs-state-size() > 0`). The runtime uses this to pick
-    // the speculative-commit strategy — FOLD-COMMIT (fold only the accepted
-    // prefix, holding the uncertain tail in the RS buffer; folding is
-    // runtime-managed in-forward) for linear models vs KV-SLOT DISCARD for
-    // attention — so the inferlet's spec-decode loop can stay model-agnostic.
-    // Prefer this over
-    // reading `rs-state-size()` as a class flag: this pins the commit CONTRACT
-    // (irreversible fold ⇒ fold-commit), not a byte-accounting accident.
-    is-linear: func() -> bool;
+    // Which forward-pass kind the bound model requires. A guest may only
+    // construct the `forward-pass` of the matching interface; the other
+    // interfaces' constructors error immediately.
+    //
+    // Do NOT derive this by parsing `architecture()` — that is an open set and
+    // every new model family would break guests. This enum is closed over
+    // STATE SEMANTICS, so it does not grow with the model zoo.
+    //
+    // This is also the ONE place the linear/recurrent class is asked about.
+    // `!= attention` means the model carries a fused recurrent state that
+    // folds tokens IRREVERSIBLY (linear-attention / SSM: Qwen3.5 GDN,
+    // Nemotron-H Mamba2), as opposed to pure attention whose KV is per-token
+    // and reversibly discardable. That in turn pins the speculative-commit
+    // CONTRACT — FOLD-COMMIT (fold only the accepted prefix, holding the
+    // uncertain tail in the RS buffer; folding is runtime-managed in-forward)
+    // vs KV-SLOT DISCARD — so a spec-decode loop can stay model-agnostic.
+    // Do not re-derive the class from `rs-state-size() > 0`: that is a
+    // byte-accounting accident that happens to agree.
+    enum forward-kind {
+        // Per-token, reversibly discardable KV only  -> `forward`
+        attention,
+        // Irreversibly folded recurrent state only   -> `forward-recurrent`
+        recurrent,
+        // Both attention and recurrent layers        -> `forward-hybrid`
+        hybrid,
+    }
+    pass-kind: func() -> forward-kind;
 
     // Logits/output dimension (= hf_config.vocab_size). May EXCEED the
     // tokenizer's vocabs() token count due to padding. Use THIS for
@@ -45,6 +59,52 @@ interface model {
     // resource sizing, never token-level behavior. Never renegotiated per
     // frame and never adapted from runtime timing.
     frame-size: func() -> u32;
+
+    // How long (microseconds) a pipeline may hold a frame's wait-set without
+    // submitting before the engine stops waiting for it.
+    //
+    // A frame does not dispatch until every participating pipeline has
+    // submitted its slot, so membership is a promise to keep submitting, and
+    // this is that promise's bound. The clock is per pipeline, measures
+    // CONSECUTIVE silence while actually blocking a seal, and is suspended
+    // whenever the engine is what the pipeline is waiting on — so it is not a
+    // latency budget and a pipeline that keeps submitting can never trip it
+    // however long it runs.
+    //
+    // A pipeline that intends to stop — blocked on a user turn, waiting on a
+    // peer, or simply done for now — calls `forward.park` instead, which
+    // leaves the wait-set and stops the clock. What this bound catches is
+    // therefore only the case the engine cannot otherwise distinguish: a
+    // member that will never submit again.
+    //
+    // Small (50ms by default) because it measures a much narrower interval
+    // than its size suggests: run-ahead, an unsettled dispatch, a bind in
+    // flight and `forward.park` all stop the clock, so what is left is a
+    // pipeline hard-blocking the seal with nothing owed to it. It is not
+    // smaller because the one-off cost of BUILDING the first pass of a loop
+    // — tracing and compiling it after the prefill result lands — is on the
+    // clock and was measured between 5ms and 20ms; a steady decode turnaround
+    // is far below that.
+    //
+    // The corollary is the one thing a pipeline has to be deliberate about:
+    // work done between receiving a result and submitting the next fire is
+    // ON the clock, because during it the fleet is stalled on this pipeline
+    // and nothing is owed back. Anything that can outlast this bound —
+    // tokenizing a large document, compiling a grammar, an RPC, a decision
+    // that waits on another pipeline — should be preceded by `forward.park`
+    // and is rejoined by simply submitting again. Parking is cheap and
+    // unparking is implicit, so when in doubt, park.
+    //
+    // Overrunning it is not fatal. The engine simply stops waiting: the slot
+    // leaves the frame, already-submitted work still runs, and the next
+    // submit rejoins. What it costs is a boundary — so treat this as the
+    // budget that keeps you IN each frame, not as a deadline you die to.
+    // (Termination is reserved for a pipeline that goes silent for orders of
+    // magnitude longer without ever parking, i.e. an abandoned one.)
+    //
+    // Static, like frame-size and unlike channel-capacity: guests read it
+    // once and size their work against it, so it must not move.
+    submit-deadline-us: func() -> u64;
 
     // Host-reader channel capacity, in cells, that lets one lane sustain the
     // engine's run-ahead without the ring becoming the bottleneck. Size every

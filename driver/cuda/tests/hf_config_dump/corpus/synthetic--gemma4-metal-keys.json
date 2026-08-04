@@ -1,0 +1,33 @@
+{
+  "architectures": [
+    "Gemma4ForCausalLM"
+  ],
+  "final_logit_softcapping": 30.0,
+  "global_head_dim": 256,
+  "hidden_size": 128,
+  "hidden_size_per_layer_input": 64,
+  "layer_types": [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention"
+  ],
+  "max_position_embeddings": 2048,
+  "model_type": "gemma4_text",
+  "num_attention_heads": 8,
+  "num_global_key_value_heads": 2,
+  "num_hidden_layers": 4,
+  "num_kv_shared_layers": 1,
+  "rope_parameters": {
+    "full_attention": {
+      "partial_rotary_factor": 0.25,
+      "rope_theta": 1000000.0
+    },
+    "sliding_attention": {
+      "rope_theta": 10000.0
+    }
+  },
+  "sliding_window": 512,
+  "use_double_wide_mlp": true,
+  "vocab_size": 1000
+}

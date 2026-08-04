@@ -18,7 +18,7 @@
 //! pre-submit `put` (D2). The GPU e2e RUN is gated on charlie's [B,P]
 //! fork/freeze/compact driver geometry (thrust-1+3).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 /// Beam width (lanes) — small, matching the validated reference.
@@ -61,30 +61,29 @@ async fn main(_input: String) -> Result<String> {
     let ws = WorkingSet::new();
 
     let fwd = ForwardPass::new();
-    let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
-    let page_rows =
-        Channel::from((0u32..=B).map(|i| i * P).collect::<Vec<_>>()).named("page_indptr");
+    let lanes_b = Channel::from_iter(0u32..=B).named("embed_indptr");
+    let page_rows = Channel::from_iter((0u32..=B).map(|i| i * P)).named("page_indptr");
     fwd.embed(&toks, &lanes_b)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &klen,
-        &pages,
-        &page_rows,
-        &w_slot,
-        &w_off,
-        &pos,
-        Some(&kvm),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_rows,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &pos,
+            mask: Some(&kvm),
+        },
     )?;
     fwd.epilogue(move || {
         // cand = running scores ⊕ log_softmax(logits); (s, i) = top_k over [B*V].
-        let cand = add(
-            broadcast(reshape(scores.take(), [B, 1]), [B, v]),
-            log_softmax(intrinsics::logits()),
-        );
+        let cand =
+            broadcast(reshape(scores.take(), [B, 1]), [B, v]) + log_softmax(intrinsics::logits());
         let (s, i) = top_k(reshape(cand, [B * v]), B);
-        let parent = div(&i, v); // which lane each survivor came from
+        let parent = &i / v; // which lane each survivor came from
         // Reorder = row gathers by parent.
         let pg = gather(pages.take(), &parent);
         let pl = gather(lens.take(), &parent);
@@ -98,29 +97,27 @@ async fn main(_input: String) -> Result<String> {
         // else open a fresh slot at offset 0 (the freeze: siblings don't advance).
         let slot = select(&cont, gather(tslot.take(), &parent), fresh.take());
         let off = select(&cont, &tf, 0u32);
-        let n2 = select(&cont, &n, add(&n, 1u32));
-        let tcol = add(mul(&lanes, P), sub(&n2, 1u32)); // flat index of each lane's tail entry
+        let n2 = select(&cont, &n, &n + 1u32);
+        let tcol = &lanes * P + (&n2 - 1u32); // flat index of each lane's tail entry
         pages.put(reshape(
             scatter_set(reshape(pg, [B * P]), &tcol, &slot),
             [B, P],
         ));
-        let off1 = add(&off, 1u32);
+        let off1 = &off + 1u32;
         let pl2 = reshape(scatter_set(reshape(pl, [B * P]), &tcol, &off1), [B, P]);
         lens.put(&pl2); // the source; klen/kvm are its two derivatives (put-only, tracer drains)
-        klen.take();
-        klen.put(add(mul(sub(&n2, 1u32), PAGE_T), &off1)); // physical span (frozen pages full)
+        klen.put((&n2 - 1u32) * PAGE_T + &off1); // physical span (frozen pages full)
         let io = reshape(iota(PAGE_T), [1, 1, PAGE_T]);
         let iob = broadcast(io, [B, P, PAGE_T]);
         let lb = broadcast(reshape(&pl2, [B, P, 1]), [B, P, PAGE_T]);
-        kvm.take();
         kvm.put(reshape(lt(iob, lb), [B, P * PAGE_T])); // valid iff in-page offset < lens entry
-        pos.put(add(pos.take(), 1u32)); // logical length (ping-pong)
+        pos.put(pos.take() + 1u32); // logical length (ping-pong)
         np.put(&n2);
         tslot.put(&slot);
         tfill.put(&off1);
         w_slot.put(&slot); // next step's write descriptor
         w_off.put(&off);
-        let tok_i = cast(rem(&i, v), DType::I32);
+        let tok_i = cast(&i % v, dtype::i32);
         toks.put(&tok_i);
         scores.put(&s);
         out.put(&tok_i); // host-facing token (back-pressure)
@@ -138,25 +135,22 @@ async fn main(_input: String) -> Result<String> {
         // Fresh headroom for this fire: B grant ids from the working set (D2).
         let grant = ws
             .reserve(B)
-            .map_err(|e| format!("ws.reserve @{step}: {e}"))?;
+            .with_context(|| format!("ws.reserve @{step}"))?;
         fresh.put(grant);
         fwd.submit(&pipeline)
-            .map_err(|e| format!("submit @{step}: {e}"))?;
+            .with_context(|| format!("submit @{step}"))?;
         let picked = out
-            .take()
-            .get::<i32>()
+            .take_host::<Vec<i32>>()
             .await
-            .map_err(|e| format!("out.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
         let _parents = out_par
-            .take()
-            .get::<u32>()
+            .take_host::<Vec<u32>>()
             .await
-            .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
         let _scr = out_scr
-            .take()
-            .get::<f32>()
+            .take_host::<Vec<f32>>()
             .await
-            .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);
         }

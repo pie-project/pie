@@ -144,7 +144,21 @@ pub(super) fn build(
         });
     }
 
-    let tensors = arena.metadata.tensors.clone();
+    // `weights()`, not `tensors`: what crosses this boundary is what a driver
+    // will plan, copy and upload. A pie artifact stores its compiled tokenizer
+    // and model descriptor as `dense` `u8` objects under `__meta__/`, which are
+    // indistinguishable from raw `u8` weights except by name, and no driver
+    // knows the prefix -- neither this repo's Metal nor its CUDA schema
+    // mentions it. Handing them over made every family contract fail on
+    // `__meta__/model/descriptor` the first time it opened a `.zt`, and the
+    // alternative -- teaching each family to skip a prefix that is not part of
+    // any model -- puts container bookkeeping in the one place that is supposed
+    // to be nothing but the family's tensor names.
+    //
+    // Nothing is lost: no FFI entry point exposes metadata objects, and the
+    // consumers that want them (`worker::weights`, `pie model convert`) read
+    // them from the Rust `Checkpoint` directly via `meta_object`.
+    let tensors: Vec<_> = arena.metadata.weights().cloned().collect();
     for tensor in &tensors {
         let name = arena.store_str(&tensor.name);
         let shape = arena.store_i64(&tensor.shape);

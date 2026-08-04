@@ -19,8 +19,6 @@
 
 namespace pie_cuda_driver::model {
 
-struct StageHooks;
-
 // Per-linear-attention-layer extra workspace. Allocated once and
 // reused across layers (linear layers are processed sequentially).
 struct Qwen3_5LinearAttnWorkspace {
@@ -54,6 +52,36 @@ struct Qwen3_5LinearAttnWorkspace {
     // linear-attn scratch so the same workspace covers both layer kinds.
     DeviceBuffer<std::uint16_t> fa_qg_packed;  // [N, 2*Hq] bf16
     DeviceBuffer<std::uint16_t> fa_gate;       // [N, Hq]   bf16
+
+    // Buffer-read path only: the per-request token layout the linear layers
+    // run over when a request must replay buffered tokens before its own
+    // (`[B_r | T_r]` per row). Capacity R+1 <= max_tokens+1.
+    DeviceBuffer<std::uint32_t> qo_ext;        // [R+1] u32
+
+    // MIXED passes only: one byte per request, non-zero where the row's
+    // recurrent state must persist. A fire may fold one request while another
+    // only appends to its buffer, and the two shapes differ ONLY here -- same
+    // initial state, same extended layout, same outputs. Left unset (and the
+    // pointer null) whenever every row agrees, so the uniform path is
+    // byte-identical to before.
+    DeviceBuffer<std::uint8_t>  rs_write_state_mask;  // [R] u8
+
+    // INTERIOR fold boundary only (`b < n < b + t`): the 2R-segment layout
+    // that tiles the extended array exactly, splitting each request at its own
+    // boundary into `[qo_ext[r], qo_ext[r]+n_r)` and `[qo_ext[r]+n_r,
+    // qo_ext[r+1])`. Two chained calls then run over it -- the head persisting
+    // its end-of-sequence state (which IS the boundary), the tail continuing
+    // from that state to produce the outputs the head does not cover.
+    //
+    // `slot_head`/`slot_tail` are the SAME slots with the other segment's
+    // entry negated: every recurrent kernel early-returns on a negative slot,
+    // so each call fills only its own half of `core_out` and neither has to
+    // know the other exists.
+    DeviceBuffer<std::uint32_t> qo_split;        // [2R+1] u32
+    DeviceBuffer<std::int32_t>  split_slot_head; // [2R] i32
+    DeviceBuffer<std::int32_t>  split_slot_tail; // [2R] i32
+    DeviceBuffer<std::uint8_t>  split_mask_head; // [2R] u8
+    int max_tokens = 0;
 
     static Qwen3_5LinearAttnWorkspace allocate(
         int max_tokens, int conv_dim, int v_h, int k_h, int k_d, int v_d,
@@ -103,21 +131,6 @@ struct Qwen3_5PlanState {
     ops::PrefillPlanCachePtr prefill_plan;
     bool use_prefill_plan = false;
 };
-
-// GDN prefill recurrence-family knobs (env-gated, read once). Shared with
-// the declared executor so both paths select the recurrence lowering from
-// the same predicate terms:
-//   * cached-prefill max tokens (PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS,
-//     default 0 = off);
-//   * warp-tiled max tokens (PIE_QWEN35_GDN_WARP_TILED_MAX_TOKENS,
-//     default 64);
-//   * warp-tiled state-persist re-enable
-//     (PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST — the STOPGAP for the
-//     warp-tiled kernel's multi-token state fold; see the note in
-//     linear_attn_layer_body).
-int qwen35_gdn_cached_prefill_max_tokens();
-int qwen35_gdn_warp_tiled_max_tokens();
-bool qwen35_gdn_warp_tiled_state_persist_enabled();
 
 // Refresh the decode plan for the current fire. Caller is expected to
 // invoke this BEFORE either a direct forward call OR a graph replay,
@@ -197,11 +210,23 @@ void qwen3_5_forward_paged(
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     const std::int32_t* rs_fold_lens_d = nullptr,
+    // Host mirror. A buffered pass emits one length per row even when
+    // it folds nothing, so only the HOST copy can answer "does this
+    // write also fold?".
+    const std::uint32_t* rs_fold_lens_h = nullptr,
     bool rs_buffer_write = false,
     bool rs_buffer_fold = false,
-    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
-    // program attached.
-    const StageHooks* hooks = nullptr);
+    // Buffer READ: per-request CSR of the slab pool ids holding the tokens
+    // already buffered past the fold boundary, plus how many of them each
+    // request must replay. Distinct from the write CSR above: reads cover the
+    // whole live buffer, writes only the span this fire appends.
+    const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_read_indptr_h = nullptr,
+    const std::uint32_t* rs_buffer_read_lens_h = nullptr,
+    // Physical offset of each row's logical buffer token 0. A fold that lands
+    // mid-page cannot release the page it half-consumed, so the survivors keep
+    // their offsets and every buffer span is `head + logical`.
+    const std::uint32_t* rs_buffer_heads_h = nullptr);
 
 void qwen3_5_mtp_process_cache(
     const Qwen3_5Weights& w,

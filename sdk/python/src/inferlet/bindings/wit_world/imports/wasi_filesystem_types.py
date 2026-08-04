@@ -5,9 +5,6 @@ WASI filesystem is a filesystem API primarily intended to let users run WASI
 programs that access their files on their existing filesystems, without
 significant overhead.
 
-It is intended to be roughly portable between Unix-family platforms and
-Windows, though it does not hide many of the major differences.
-
 Paths are passed as interface-type `string`s, meaning they must consist of
 a sequence of Unicode Scalar Values (USVs). Some filesystems may contain
 paths which are not accessible by this API.
@@ -24,6 +21,20 @@ underlying filesystem, the function fails with `error-code::not-permitted`.
 For more information about WASI path resolution and sandboxing, see
 [WASI filesystem path resolution].
 
+Though this package presents a portable interface modelled on POSIX, it
+prioritizes compatibility over portability: allowing users to access their
+files on their machine is more important than exposing a single semantics
+across all platforms.  Notably, depending on the underlying operating system
+and file system:
+  * Paths may be case-folded or not.
+  * Deleting (unlinking) a file may fail if there are other file descriptors
+    open.
+  * Durability and atomicity of changes to underlying files when there are
+    concurrent writers.
+
+Users that need well-defined, portable semantics should use a key-value
+store or a database instead.
+
 [WASI filesystem path resolution]: https://github.com/WebAssembly/wasi-filesystem/blob/main/path-resolution.md
 """
 from typing import TypeVar, Generic, Union, Optional, Protocol, Tuple, List, Any, Self, Callable
@@ -34,27 +45,59 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import error
-from ..imports import streams
-from ..imports import wall_clock
+from ..imports import system_clock
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
-class DescriptorType(Enum):
-    """
-    The type of a filesystem object referenced by a descriptor.
-    
-    Note: This was called `filetype` in earlier versions of WASI.
-    """
-    UNKNOWN = 0
-    BLOCK_DEVICE = 1
-    CHARACTER_DEVICE = 2
-    DIRECTORY = 3
-    FIFO = 4
-    SYMBOLIC_LINK = 5
-    REGULAR_FILE = 6
-    SOCKET = 7
+
+@dataclass
+class DescriptorType_BlockDevice:
+    pass
+
+
+@dataclass
+class DescriptorType_CharacterDevice:
+    pass
+
+
+@dataclass
+class DescriptorType_Directory:
+    pass
+
+
+@dataclass
+class DescriptorType_Fifo:
+    pass
+
+
+@dataclass
+class DescriptorType_SymbolicLink:
+    pass
+
+
+@dataclass
+class DescriptorType_RegularFile:
+    pass
+
+
+@dataclass
+class DescriptorType_Socket:
+    pass
+
+
+@dataclass
+class DescriptorType_Other:
+    value: Optional[str]
+
+
+DescriptorType = Union[DescriptorType_BlockDevice, DescriptorType_CharacterDevice, DescriptorType_Directory, DescriptorType_Fifo, DescriptorType_SymbolicLink, DescriptorType_RegularFile, DescriptorType_Socket, DescriptorType_Other]
+"""
+The type of a filesystem object referenced by a descriptor.
+
+Note: This was called `filetype` in earlier versions of WASI.
+"""
+
 
 class DescriptorFlags(Flag):
     """
@@ -94,9 +137,9 @@ class DescriptorStat:
     type: DescriptorType
     link_count: int
     size: int
-    data_access_timestamp: Optional[wall_clock.Datetime]
-    data_modification_timestamp: Optional[wall_clock.Datetime]
-    status_change_timestamp: Optional[wall_clock.Datetime]
+    data_access_timestamp: Optional[system_clock.Instant]
+    data_modification_timestamp: Optional[system_clock.Instant]
+    status_change_timestamp: Optional[system_clock.Instant]
 
 
 @dataclass
@@ -111,7 +154,7 @@ class NewTimestamp_Now:
 
 @dataclass
 class NewTimestamp_Timestamp:
-    value: wall_clock.Datetime
+    value: system_clock.Instant
 
 
 NewTimestamp = Union[NewTimestamp_NoChange, NewTimestamp_Now, NewTimestamp_Timestamp]
@@ -128,50 +171,200 @@ class DirectoryEntry:
     type: DescriptorType
     name: str
 
-class ErrorCode(Enum):
-    """
-    Error codes returned by functions, similar to `errno` in POSIX.
-    Not all of these error codes are returned by the functions provided by this
-    API; some are used in higher-level library layers, and others are provided
-    merely for alignment with POSIX.
-    """
-    ACCESS = 0
-    WOULD_BLOCK = 1
-    ALREADY = 2
-    BAD_DESCRIPTOR = 3
-    BUSY = 4
-    DEADLOCK = 5
-    QUOTA = 6
-    EXIST = 7
-    FILE_TOO_LARGE = 8
-    ILLEGAL_BYTE_SEQUENCE = 9
-    IN_PROGRESS = 10
-    INTERRUPTED = 11
-    INVALID = 12
-    IO = 13
-    IS_DIRECTORY = 14
-    LOOP = 15
-    TOO_MANY_LINKS = 16
-    MESSAGE_SIZE = 17
-    NAME_TOO_LONG = 18
-    NO_DEVICE = 19
-    NO_ENTRY = 20
-    NO_LOCK = 21
-    INSUFFICIENT_MEMORY = 22
-    INSUFFICIENT_SPACE = 23
-    NOT_DIRECTORY = 24
-    NOT_EMPTY = 25
-    NOT_RECOVERABLE = 26
-    UNSUPPORTED = 27
-    NO_TTY = 28
-    NO_SUCH_DEVICE = 29
-    OVERFLOW = 30
-    NOT_PERMITTED = 31
-    PIPE = 32
-    READ_ONLY = 33
-    INVALID_SEEK = 34
-    TEXT_FILE_BUSY = 35
-    CROSS_DEVICE = 36
+
+@dataclass
+class ErrorCode_Access:
+    pass
+
+
+@dataclass
+class ErrorCode_Already:
+    pass
+
+
+@dataclass
+class ErrorCode_BadDescriptor:
+    pass
+
+
+@dataclass
+class ErrorCode_Busy:
+    pass
+
+
+@dataclass
+class ErrorCode_Deadlock:
+    pass
+
+
+@dataclass
+class ErrorCode_Quota:
+    pass
+
+
+@dataclass
+class ErrorCode_Exist:
+    pass
+
+
+@dataclass
+class ErrorCode_FileTooLarge:
+    pass
+
+
+@dataclass
+class ErrorCode_IllegalByteSequence:
+    pass
+
+
+@dataclass
+class ErrorCode_InProgress:
+    pass
+
+
+@dataclass
+class ErrorCode_Interrupted:
+    pass
+
+
+@dataclass
+class ErrorCode_Invalid:
+    pass
+
+
+@dataclass
+class ErrorCode_Io:
+    pass
+
+
+@dataclass
+class ErrorCode_IsDirectory:
+    pass
+
+
+@dataclass
+class ErrorCode_Loop:
+    pass
+
+
+@dataclass
+class ErrorCode_TooManyLinks:
+    pass
+
+
+@dataclass
+class ErrorCode_MessageSize:
+    pass
+
+
+@dataclass
+class ErrorCode_NameTooLong:
+    pass
+
+
+@dataclass
+class ErrorCode_NoDevice:
+    pass
+
+
+@dataclass
+class ErrorCode_NoEntry:
+    pass
+
+
+@dataclass
+class ErrorCode_NoLock:
+    pass
+
+
+@dataclass
+class ErrorCode_InsufficientMemory:
+    pass
+
+
+@dataclass
+class ErrorCode_InsufficientSpace:
+    pass
+
+
+@dataclass
+class ErrorCode_NotDirectory:
+    pass
+
+
+@dataclass
+class ErrorCode_NotEmpty:
+    pass
+
+
+@dataclass
+class ErrorCode_NotRecoverable:
+    pass
+
+
+@dataclass
+class ErrorCode_Unsupported:
+    pass
+
+
+@dataclass
+class ErrorCode_NoTty:
+    pass
+
+
+@dataclass
+class ErrorCode_NoSuchDevice:
+    pass
+
+
+@dataclass
+class ErrorCode_Overflow:
+    pass
+
+
+@dataclass
+class ErrorCode_NotPermitted:
+    pass
+
+
+@dataclass
+class ErrorCode_Pipe:
+    pass
+
+
+@dataclass
+class ErrorCode_ReadOnly:
+    pass
+
+
+@dataclass
+class ErrorCode_InvalidSeek:
+    pass
+
+
+@dataclass
+class ErrorCode_TextFileBusy:
+    pass
+
+
+@dataclass
+class ErrorCode_CrossDevice:
+    pass
+
+
+@dataclass
+class ErrorCode_Other:
+    value: Optional[str]
+
+
+ErrorCode = Union[ErrorCode_Access, ErrorCode_Already, ErrorCode_BadDescriptor, ErrorCode_Busy, ErrorCode_Deadlock, ErrorCode_Quota, ErrorCode_Exist, ErrorCode_FileTooLarge, ErrorCode_IllegalByteSequence, ErrorCode_InProgress, ErrorCode_Interrupted, ErrorCode_Invalid, ErrorCode_Io, ErrorCode_IsDirectory, ErrorCode_Loop, ErrorCode_TooManyLinks, ErrorCode_MessageSize, ErrorCode_NameTooLong, ErrorCode_NoDevice, ErrorCode_NoEntry, ErrorCode_NoLock, ErrorCode_InsufficientMemory, ErrorCode_InsufficientSpace, ErrorCode_NotDirectory, ErrorCode_NotEmpty, ErrorCode_NotRecoverable, ErrorCode_Unsupported, ErrorCode_NoTty, ErrorCode_NoSuchDevice, ErrorCode_Overflow, ErrorCode_NotPermitted, ErrorCode_Pipe, ErrorCode_ReadOnly, ErrorCode_InvalidSeek, ErrorCode_TextFileBusy, ErrorCode_CrossDevice, ErrorCode_Other]
+"""
+Error codes returned by functions, similar to `errno` in POSIX.
+Not all of these error codes are returned by the functions provided by this
+API; some are used in higher-level library layers, and others are provided
+merely for alignment with POSIX.
+"""
+
 
 class Advice(Enum):
     """
@@ -193,29 +386,6 @@ class MetadataHashValue:
     lower: int
     upper: int
 
-class DirectoryEntryStream:
-    """
-    A stream of directory entries.
-    """
-    
-    def read_directory_entry(self) -> Optional[DirectoryEntry]:
-        """
-        Read a single directory entry from a `directory-entry-stream`.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
-        """
-        raise NotImplementedError
-    def __enter__(self) -> Self:
-        """Returns self"""
-        return self
-                                
-    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
-        """
-        Release this resource.
-        """
-        raise NotImplementedError
-
-
 class Descriptor:
     """
     A descriptor is a reference to a filesystem object, which may be a file,
@@ -223,45 +393,55 @@ class Descriptor:
     calls may be made.
     """
     
-    def read_via_stream(self, offset: int) -> streams.InputStream:
+    def read_via_stream(self, offset: int) -> Tuple[ByteStreamReader, FutureReader[Result[None, ErrorCode]]]:
         """
-        Return a stream for reading from a file, if available.
-        
-        May fail with an error-code describing why the file cannot be read.
+        Return a stream for reading from a file.
         
         Multiple read, write, and append streams may be active on the same open
         file and they do not interfere with each other.
         
-        Note: This allows using `read-stream`, which is similar to `read` in POSIX.
+        This function returns a `stream` which provides the data received from the
+        file, and a `future` providing additional error information in case an
+        error is encountered.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        If no error is encountered, `stream.read` on the `stream` will return
+        `read-status::closed` with no `error-context` and the future resolves to
+        the value `ok`. If an error is encountered, `stream.read` on the
+        `stream` returns `read-status::closed` with an `error-context` and the future
+        resolves to `err` with an `error-code`.
+        
+        Note: This is similar to `pread` in POSIX.
         """
         raise NotImplementedError
-    def write_via_stream(self, offset: int) -> streams.OutputStream:
+    def write_via_stream(self, data: ByteStreamReader, offset: int) -> FutureReader[Result[None, ErrorCode]]:
         """
         Return a stream for writing to a file, if available.
         
         May fail with an error-code describing why the file cannot be written.
         
-        Note: This allows using `write-stream`, which is similar to `write` in
-        POSIX.
+        It is valid to write past the end of a file; the file is extended to the
+        extent of the write, with bytes between the previous end and the start of
+        the write set to zero.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        This function returns once either full contents of the stream are
+        written or an error is encountered.
+        
+        Note: This is similar to `pwrite` in POSIX.
         """
         raise NotImplementedError
-    def append_via_stream(self) -> streams.OutputStream:
+    def append_via_stream(self, data: ByteStreamReader) -> FutureReader[Result[None, ErrorCode]]:
         """
         Return a stream for appending to a file, if available.
         
         May fail with an error-code describing why the file cannot be appended.
         
-        Note: This allows using `write-stream`, which is similar to `write` with
-        `O_APPEND` in POSIX.
+        This function returns once either full contents of the stream are
+        written or an error is encountered.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Note: This is similar to `write` with `O_APPEND` in POSIX.
         """
         raise NotImplementedError
-    def advise(self, offset: int, length: int, advice: Advice) -> None:
+    async def advise(self, offset: int, length: int, advice: Advice) -> None:
         """
         Provide file advisory information on a descriptor.
         
@@ -270,7 +450,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def sync_data(self) -> None:
+    async def sync_data(self) -> None:
         """
         Synchronize the data of a file to disk.
         
@@ -282,7 +462,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def get_flags(self) -> DescriptorFlags:
+    async def get_flags(self) -> DescriptorFlags:
         """
         Get flags associated with a descriptor.
         
@@ -294,7 +474,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def get_type(self) -> DescriptorType:
+    async def get_type(self) -> DescriptorType:
         """
         Get the dynamic type of a descriptor.
         
@@ -310,7 +490,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def set_size(self, size: int) -> None:
+    async def set_size(self, size: int) -> None:
         """
         Adjust the size of an open file. If this increases the file's size, the
         extra bytes are filled with zeros.
@@ -320,7 +500,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def set_times(self, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) -> None:
+    async def set_times(self, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) -> None:
         """
         Adjust the timestamps of an open file or directory.
         
@@ -331,39 +511,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def read(self, length: int, offset: int) -> Tuple[bytes, bool]:
-        """
-        Read from a descriptor, without using and updating the descriptor's offset.
-        
-        This function returns a list of bytes containing the data that was
-        read, along with a bool which, when true, indicates that the end of the
-        file was reached. The returned list will contain up to `length` bytes; it
-        may return fewer than requested, if the end of the file is reached or
-        if the I/O operation is interrupted.
-        
-        In the future, this may change to return a `stream<u8, error-code>`.
-        
-        Note: This is similar to `pread` in POSIX.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
-        """
-        raise NotImplementedError
-    def write(self, buffer: bytes, offset: int) -> int:
-        """
-        Write to a descriptor, without using and updating the descriptor's offset.
-        
-        It is valid to write past the end of a file; the file is extended to the
-        extent of the write, with bytes between the previous end and the start of
-        the write set to zero.
-        
-        In the future, this may change to take a `stream<u8, error-code>`.
-        
-        Note: This is similar to `pwrite` in POSIX.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
-        """
-        raise NotImplementedError
-    def read_directory(self) -> DirectoryEntryStream:
+    def read_directory(self) -> Tuple[StreamReader[DirectoryEntry], FutureReader[Result[None, ErrorCode]]]:
         """
         Read directory entries from a directory.
         
@@ -375,10 +523,11 @@ class Descriptor:
         directory. Multiple streams may be active on the same directory, and they
         do not interfere with each other.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        This function returns a future, which will resolve to an error code if
+        reading full contents of the directory fails.
         """
         raise NotImplementedError
-    def sync(self) -> None:
+    async def sync(self) -> None:
         """
         Synchronize the data and metadata of a file to disk.
         
@@ -390,7 +539,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def create_directory_at(self, path: str) -> None:
+    async def create_directory_at(self, path: str) -> None:
         """
         Create a directory.
         
@@ -399,7 +548,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def stat(self) -> DescriptorStat:
+    async def stat(self) -> DescriptorStat:
         """
         Return the attributes of an open file or directory.
         
@@ -414,7 +563,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def stat_at(self, path_flags: PathFlags, path: str) -> DescriptorStat:
+    async def stat_at(self, path_flags: PathFlags, path: str) -> DescriptorStat:
         """
         Return the attributes of a file or directory.
         
@@ -427,7 +576,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def set_times_at(self, path_flags: PathFlags, path: str, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) -> None:
+    async def set_times_at(self, path_flags: PathFlags, path: str, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) -> None:
         """
         Adjust the timestamps of a file or directory.
         
@@ -439,7 +588,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def link_at(self, old_path_flags: PathFlags, old_path: str, new_descriptor: Self, new_path: str) -> None:
+    async def link_at(self, old_path_flags: PathFlags, old_path: str, new_descriptor: Self, new_path: str) -> None:
         """
         Create a hard link.
         
@@ -452,7 +601,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def open_at(self, path_flags: PathFlags, path: str, open_flags: OpenFlags, flags: DescriptorFlags) -> Self:
+    async def open_at(self, path_flags: PathFlags, path: str, open_flags: OpenFlags, flags: DescriptorFlags) -> Self:
         """
         Open a file or directory.
         
@@ -470,7 +619,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def readlink_at(self, path: str) -> str:
+    async def readlink_at(self, path: str) -> str:
         """
         Read the contents of a symbolic link.
         
@@ -482,7 +631,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def remove_directory_at(self, path: str) -> None:
+    async def remove_directory_at(self, path: str) -> None:
         """
         Remove a directory.
         
@@ -493,7 +642,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def rename_at(self, old_path: str, new_descriptor: Self, new_path: str) -> None:
+    async def rename_at(self, old_path: str, new_descriptor: Self, new_path: str) -> None:
         """
         Rename a filesystem object.
         
@@ -502,7 +651,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def symlink_at(self, old_path: str, new_path: str) -> None:
+    async def symlink_at(self, old_path: str, new_path: str) -> None:
         """
         Create a symbolic link (also known as a "symlink").
         
@@ -514,17 +663,22 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def unlink_file_at(self, path: str) -> None:
+    async def unlink_file_at(self, path: str) -> None:
         """
         Unlink a filesystem object that is not a directory.
         
-        Return `error-code::is-directory` if the path refers to a directory.
-        Note: This is similar to `unlinkat(fd, path, 0)` in POSIX.
+        This is similar to `unlinkat(fd, path, 0)` in POSIX.
+        
+        Error returns are as specified by POSIX.
+        
+        If the filesystem object is a directory, `error-code::access` or
+        `error-code::is-directory` may be returned instead of the
+        POSIX-specified `error-code::not-permitted`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def is_same_object(self, other: Self) -> bool:
+    async def is_same_object(self, other: Self) -> bool:
         """
         Test whether two descriptors refer to the same filesystem object.
         
@@ -534,7 +688,7 @@ class Descriptor:
         may be used instead.
         """
         raise NotImplementedError
-    def metadata_hash(self) -> MetadataHashValue:
+    async def metadata_hash(self) -> MetadataHashValue:
         """
         Return a hash of the metadata associated with a filesystem object referred
         to by a descriptor.
@@ -559,7 +713,7 @@ class Descriptor:
         Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
-    def metadata_hash_at(self, path_flags: PathFlags, path: str) -> MetadataHashValue:
+    async def metadata_hash_at(self, path_flags: PathFlags, path: str) -> MetadataHashValue:
         """
         Return a hash of the metadata associated with a filesystem object referred
         to by a directory descriptor and a relative path.
@@ -581,17 +735,3 @@ class Descriptor:
 
 
 
-def filesystem_error_code(err: error.Error) -> Optional[ErrorCode]:
-    """
-    Attempts to extract a filesystem-related `error-code` from the stream
-    `error` provided.
-    
-    Stream operations which return `stream-error::last-operation-failed`
-    have a payload with more information about the operation that failed.
-    This payload can be passed through to this function to see if there's
-    filesystem-related information about the error to return.
-    
-    Note that this function is fallible because not all stream-related
-    errors are filesystem-related errors.
-    """
-    raise NotImplementedError

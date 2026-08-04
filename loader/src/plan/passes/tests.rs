@@ -125,6 +125,13 @@ fn target_transform_matrix_matches_host_and_metal_executors() {
         ..StorageTarget::default()
     });
     metal.instrs.push(tile(TileMapKind::Cast));
+    assert!(validate_target_support(&mut metal).is_ok());
+    // Advertising a kind is not advertising every transform inside it: the
+    // Metal executor encodes to MLX affine U4 and nothing else, and a plan that
+    // asked it for the default (`None`) scheme would find no encoder.
+    metal.instrs[0] = tile(TileMapKind::Encode);
+    assert!(validate_target_support(&mut metal).is_err());
+    metal.instrs[0] = tile(TileMapKind::Repack);
     assert!(validate_target_support(&mut metal).is_err());
 }
 

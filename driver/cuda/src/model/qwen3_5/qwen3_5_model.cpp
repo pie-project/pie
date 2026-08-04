@@ -45,9 +45,11 @@ Qwen35Model::Qwen35Model(
     // `declared_` empty with the reason logged once and body() keeps the
     // hand-written path; a validated plan is consumed by body()'s
     // eligibility gate below.
-    if (qwen35_declared_forward_enabled()) {
-        declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
-    }
+    // MERGE 2026-08-04: the tart qwen3_5 declared walker is DORMANT this
+    // era — its gate helpers live in the tart qwen3_5_forward.cpp this
+    // merge did not take (upstream's RS-read generation owns the file).
+    // `declared_` stays empty; body() keeps the hand-written path.
+    // Re-port together with the qwen3_5 hook re-graft.
 }
 
 void Qwen35Model::prepare(AttentionWorkspace& attn_ws,
@@ -74,6 +76,7 @@ void Qwen35Model::body(Workspace& ws,
     // `fallback_reason` keeps the exclusion honest in the trace log (a
     // silent fallback would be indistinguishable from a passing A/B run).
     const char* fallback_reason = nullptr;
+#if 0  // MERGE 2026-08-04: qwen3_5 declared walker dormant (see ctor note)
     if (static_cast<bool>(declared_)) {
         const int qgkv_dim =
             2 * hf_config_.num_attention_heads * hf_config_.head_dim +
@@ -149,6 +152,8 @@ void Qwen35Model::body(Workspace& ws,
                          in.is_pure_decode ? 1 : 0, fallback_reason);
         }
     }
+#endif
+
     qwen3_5_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_state_,
         ws, la_ws_, kv, state_cache_,
@@ -165,8 +170,10 @@ void Qwen35Model::body(Workspace& ws,
         in.commit_advance_gather_d,
         in.rs_buffer_slot_ids_h, in.rs_buffer_slot_indptr_h,
         in.rs_fold_lens_d,
+        in.rs_fold_lens_h,
         in.rs_buffer_write, in.rs_buffer_fold,
-        in.stage_hooks);
+        in.rs_buffer_read_slot_ids_h, in.rs_buffer_read_indptr_h,
+        in.rs_buffer_read_lens_h, in.rs_buffer_heads_h);
 }
 
 std::uint32_t Qwen35Model::graph_layout() {

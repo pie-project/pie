@@ -158,6 +158,20 @@ pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Close).await;
 }
 
+/// `forward.park()`: the lane is leaving the frame wait-set until it fires
+/// again. Broadcast to every driver's scheduler and fire-and-forget — a
+/// policy that has never seen the lane fire ignores it, and the exit is
+/// ordered by `seq` against that lane's own submits rather than against this
+/// call. Deliberately NOT routed through the control path: park exists to
+/// release a gather, and the control slot is depth 1, so a park queued behind
+/// the dispatch the gather is holding could never arrive.
+pub(crate) fn notify_lane_park(pid: ProcessId, seq: u64) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::LanePark { lane: pid, seq });
+    }
+}
+
 /// A retiring process released its capped execution permit (capped
 /// deployments only). Broadcast to every driver's scheduler (mirrors
 /// [`notify_pipeline_leave`]): a policy with no staged successor ignores it,
@@ -187,7 +201,8 @@ pub(crate) fn notify_process_quiesced(pid: ProcessId) {
 }
 
 /// A parked process acquired its execution permit: its first fire is
-/// imminent, and the frame seal waits for it by identity. Sent BEFORE the
+/// imminent, so it is a named join in flight and the cohort-boundary window
+/// stays open until it lands. Sent BEFORE the
 /// process's first fire enters the mailbox (same producer), so the policy
 /// sees consume-then-fire; a reordered arrival is harmless (the policy's
 /// staged guard skips a lane that already fired).
@@ -195,6 +210,23 @@ pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
         let _ = handle.send(SchedulerItem::ExecutionSlotConsumed(pid));
+    }
+}
+
+/// A process joined the execution-admission FIFO. Announced before the
+/// permit wait so the frame policy can earmark it by identity.
+pub(crate) fn notify_admission_queued(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::AdmissionQueued(pid));
+    }
+}
+
+/// A process left the FIFO -- it took its permit, or it was cancelled.
+pub(crate) fn notify_admission_dequeued(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::AdmissionDequeued(pid));
     }
 }
 
@@ -230,23 +262,6 @@ pub(crate) struct PendingRequest {
     /// lane (and at k = 1 the synthesized single-slot stamp's lane).
     pub(crate) pipeline_id: Option<ProcessId>,
     pub(crate) prebuilt: bool,
-    /// Whether this fire's program declares an attention-hook stage
-    /// (OnAttnProj/OnAttn). Stamped at launch admission from the tracked
-    /// instance; the wire layout sorts hook-carrying rows last within their
-    /// wire class so the driver's hook-free fast prefix
-    /// (`StageHooks::hook_free_prefix_rows`) covers every hook-free lane.
-    pub(crate) hook_program: bool,
-    /// Whether this fire's program carries the pass-wide `lora`
-    /// configuration sink. Stamped at launch admission from the tracked
-    /// instance, exactly like `hook_program`; fire planning reads it as the
-    /// WEIGHT-class divergence fact (`fire_plan::MemberFacts::lora`).
-    pub(crate) lora_program: bool,
-    /// Whether this fire's program writes the `attn_page_mask` sink.
-    /// Stamped at launch admission from the tracked instance, exactly like
-    /// `hook_program`; `LaunchGrouping` reads it to keep page-mask fires
-    /// out of batches with multi-token rows (and vice versa) — the driver
-    /// throws on a written mask off the pure-decode path.
-    pub(crate) page_mask_program: bool,
     pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
     pub(crate) prelaunch_state_copy: Option<StateCopyPlan>,
     /// Vesuvius frame identity: which lane/frame/slot this fire belongs to.
@@ -325,11 +340,6 @@ impl PendingRequest {
             process_id,
             pipeline_id,
             prebuilt,
-            // Not known at construction: stamped at launch admission, where
-            // the tracked instance's program flags are available.
-            hook_program: false,
-            lora_program: false,
-            page_mask_program: false,
             prelaunch_copy,
             prelaunch_state_copy,
             frame,
@@ -341,69 +351,65 @@ impl PendingRequest {
         self.request.qo_indptr.len().saturating_sub(1)
     }
 
-    /// Whether any qo row of this fire carries more than one token — i.e.
-    /// the fire is NOT pure decode. Derived from `qo_indptr` the same way
-    /// `wire_row_count` reads it: consecutive entries bound each row's
-    /// token span.
-    fn has_multi_token_row(&self) -> bool {
-        self.request
-            .qo_indptr
-            .windows(2)
-            .any(|w| w[1].saturating_sub(w[0]) > 1)
-    }
-
     fn requires_solo_submission(&self) -> bool {
-        self.solo_reason().is_some()
+        (self.prebuilt && self.pipeline_id.is_none())
+            || (self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0))
+            || self.rs_batch_kind() == RsBatchKind::Solo
     }
 
-    /// Why this fire must go out alone, if it must — the fire census's
-    /// vocabulary (C, the class-collapse follow-up measurement): every
-    /// remaining solo term is either a harness path or a driver-contract
-    /// exclusion, and the census is what shows which ones a real workload
-    /// actually pays for.
-    pub(crate) fn solo_reason(&self) -> Option<&'static str> {
-        if self.prebuilt && self.pipeline_id.is_none() {
-            return Some("prebuilt-untracked");
+    /// How this fire's recurrent-state rows constrain the wave it joins.
+    ///
+    /// The driver's RS execution mode is read off `rs_slot_flags` and the
+    /// buffered CSR for the WHOLE composed batch, so a fire that touches the
+    /// RS buffer used to go out alone unconditionally. It no longer has to:
+    /// a row that appends to its buffer and a row that folds in-forward run
+    /// the identical dispatch and differ only in whether the recurrence
+    /// persists, which the driver now expresses per row. What still cannot
+    /// share a batch is a pure COMMIT — it gathers its activations out of the
+    /// slabs instead of computing them, a wholly different dispatch — and an
+    /// RS row cannot share with a row that has no RS binding at all, because
+    /// the RS arrays are one-per-request and a partial batch does not resolve.
+    fn rs_batch_kind(&self) -> RsBatchKind {
+        if self.request.rs_slot_ids.is_empty() {
+            return RsBatchKind::None;
         }
-        // STRUCTURAL v0 (S-1): a layer-truncated request fires alone
-        // until the depth union is ARMED (S-2, PIE_DEPTH_UNION=1) —
-        // composed, the two-range body serves full members at depth L
-        // and the truncated tail at k with one head. The batch planner
-        // still declines any shape outside the v0 contract (masks,
-        // hooks, lora, multi-token, mixed k), which falls back to the
-        // fire-level uniform bound.
-        if self.request.max_layers.is_some()
-            && !crate::scheduler::batch::depth_union_enabled()
-        {
-            return Some("truncated-depth");
+        let indptr = &self.request.rs_buffer_slot_indptr;
+        let replays = self
+            .request
+            .rs_slot_flags
+            .iter()
+            .enumerate()
+            .any(|(row, flags)| {
+                let span = indptr
+                    .get(row + 1)
+                    .zip(indptr.get(row))
+                    .is_some_and(|(end, begin)| end > begin);
+                span && flags & pie_driver_abi::RS_FLAG_FOLD != 0
+                    && flags & pie_driver_abi::RS_FLAG_BUFFER_WRITE == 0
+            });
+        if replays {
+            RsBatchKind::Solo
+        } else {
+            RsBatchKind::Composable
         }
-        if self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0) {
-            return Some("multirow-zero-tokens");
-        }
-        if self.touches_rs_buffer() {
-            return Some("rs-buffer");
-        }
-        None
-    }
-
-    /// A fire that buffers recurrent activations, or folds them back, picks
-    /// the driver's RS execution mode for the WHOLE composed batch: the mode
-    /// is read off `rs_slot_flags` and the buffered CSR, and the driver
-    /// rejects a batch that mixes folded and forward rows or that gives a
-    /// plain row no slabs. Coalescing such a fire with an ordinary one would
-    /// therefore fail the whole wave, so it goes out alone.
-    fn touches_rs_buffer(&self) -> bool {
-        !self.request.rs_buffer_slot_ids.is_empty()
-            || self
-                .request
-                .rs_slot_flags
-                .iter()
-                .any(|flags| flags & pie_driver_abi::RS_FLAG_FOLD != 0)
     }
 
     pub(crate) fn preserves_inner_rows(&self) -> bool {
         self.wire_row_count() > 1
     }
+}
+
+/// See [`PendingRequest::rs_batch_kind`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RsBatchKind {
+    /// No recurrent-state rows.
+    None,
+    /// Recurrent rows that compute their own tokens: a plain in-forward fold,
+    /// a buffered append, or a write-and-fold. These compose with each other.
+    Composable,
+    /// A pure commit, which replays buffered activations instead of computing
+    /// them. Goes out alone.
+    Solo,
 }
 
 fn fire_membership_hash<'a>(logical_fire_ids: impl IntoIterator<Item = &'a u64>) -> u64 {
@@ -432,84 +438,32 @@ pub(crate) struct LaunchGrouping {
     forward_tokens: usize,
     page_refs: usize,
     has_solo_submission: bool,
+    has_rs_rows: bool,
     has_user_mask: bool,
     has_device_geometry: bool,
-    /// A member's program writes the `attn_page_mask` sink.
-    has_page_mask: bool,
-    /// A member is a MASKED device-geometry fire (dense device mask, or
-    /// a wire-BRLE mask riding a device-geometry fire — the
-    /// resolved_custom_wire solo shape): nothing may join behind it, in
-    /// either direction, because its mask cannot be re-assembled against
-    /// a composed layout.
-    has_masked_device_geometry: bool,
-    /// A member carries a STRUCTURED device mask (item A's exempt shape).
-    /// Wire-BRLE-masked lanes must not share a fire with it: the frame
-    /// stages exactly one custom-mask source (the structured pack or the
-    /// wire assembly), and mixing the two would collide loudly there.
-    has_structured_mask: bool,
-    /// A member carries a qo row spanning more than one token (chunk
-    /// prefill / multi-token step).
-    has_multi_token: bool,
-    /// NS-2: a member is a wire-BRLE-masked DEVICE-GEOMETRY decode lane
-    /// admitted under the spatial-mask compose relax. Such a group must
-    /// stay pure single-token decode with no hooks, no lora, and no
-    /// structured mask — the split body is the only correct consumer.
-    has_wire_masked_envelope: bool,
-    /// NS-2: a member carries hooks or a lora sink (the planner sends
-    /// UNPLANNED for such fires, so a wire-masked envelope must not join).
-    has_hook_or_lora: bool,
-    /// AC-2: hooks alone — masked envelopes now compose with lora
-    /// lanes (the correction is not a window axis), so the spatial
-    /// refusals key on hooks specifically.
-    has_hook: bool,
-    /// PQ-tree mixed half: a BOTH-WINDOW-AXES lane (masked+truncated)
-    /// tolerates only k-uniform groups (the uniform stamp is its one
-    /// correct lowering; a mixed group would silently drop its k).
-    has_both_axes: bool,
-    /// `Some(k_of_every_member)` while uniform; `None` after a mismatch.
-    uniform_k: Option<Option<u32>>,
 }
 
-/// NS-2 (the spatial mask fire): engine-side mirror of the driver's
-/// PIE_SPATIAL_MASK gate. When armed, wire-BRLE-masked DEVICE-GEOMETRY
-/// decode lanes may compose with plain envelope lanes — the split body
-/// needs no mask rows for the unmasked prefix, which is what forced the
-/// solo rule (the fire-level arm demanded a mask row per lane, and an
-/// envelope lane's causal row cannot be host-synthesized).
-fn spatial_mask_compose_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var("PIE_SPATIAL_MASK").is_ok_and(|v| v == "0")
-    })
-}
-
-/// The mixed fire (M-1): masked envelopes composing with multi-token
-/// rows — the prefill-class mask peel serves the shape on all three
-/// legs. DEFAULT ON (`PIE_SPATIAL_MIXED=0` disarms and restores the
-/// pre-mixed refusals).
-fn spatial_mixed_compose_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var("PIE_SPATIAL_MIXED").is_ok_and(|v| v == "0")
-    })
-}
-
+/// A fire the driver will resolve a DENSE per-cell attention mask for out of
+/// a descriptor channel. Such a fire composes only SOLO: the driver's
+/// multi-program batch has no way to merge one program's dense mask with
+/// another's geometry (v1 scope), and it throws
+/// `RetryableLaunchError("dense device mask in a multi-program batch")`
+/// rather than execute a wrong one.
+///
+/// `dense_device_mask` is the program's own binding — an `AttnMask` port
+/// sourced from a channel — and is the SAME predicate the driver resolves
+/// on. The second clause is the older inference (a user mask with no wire
+/// BRLE rows must be device-carried); it is kept because it covers fires
+/// whose mask is device-carried without the port binding being visible here.
+///
+/// The inference alone was not enough. `cuda_runahead_concurrent` runs 8
+/// pipelines of a sink/sliding-window decode program: every fire carried
+/// BOTH wire BRLE rows (`masks` non-empty, so the second clause is false)
+/// AND a channel-bound `AttnMask`, so the batcher merged them and the first
+/// concurrent step failed the driver's contract, poisoned descriptor
+/// channel 0, and lost all 8 streams.
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
-    request.has_user_mask && request.masks.is_empty() && !request.structured_device_mask
-}
-
-/// Whether this plan's mask keeps it out of composed batches. Wire (BRLE)
-/// masks index the wire request layout composition replaces, and a genuinely
-/// dense device mask has no per-lane compose path — both block. A device
-/// mask that statically recognizes as STRUCTURED
-/// (`structured_device_mask`, the Stage 2 item A relax) does not: the
-/// driver re-recognizes it from the trace at admission
-/// (`Dispatch::dense_mask_scope_violation` returns clean) and lowers it per
-/// lane at prepare, filling mask-free co-batched lanes with causal — one
-/// fire instead of two serialized waves, which the Stage 2 measurement put
-/// at 1.8-2.3x per token for the plain lanes under the old solo regime.
-fn mask_blocks_composition(request: &crate::driver::LaunchPlan) -> bool {
-    request.has_user_mask && !(request.masks.is_empty() && request.structured_device_mask)
+    request.dense_device_mask || (request.has_user_mask && request.masks.is_empty())
 }
 
 impl LaunchGrouping {
@@ -519,19 +473,8 @@ impl LaunchGrouping {
         limits: SchedulerLimits,
         page_size: u32,
     ) -> bool {
-        self.refusal(request, limits, page_size).is_none()
-    }
-
-    /// [`Self::accepts`] with the WHY: `None` = admitted, `Some(reason)` =
-    /// the clause that refused — the fire census's join-refusal vocabulary.
-    pub(crate) fn refusal(
-        &self,
-        request: &PendingRequest,
-        limits: SchedulerLimits,
-        page_size: u32,
-    ) -> Option<&'static str> {
         if self.instances.contains(&request.instance_id) {
-            return Some("same-instance");
+            return false;
         }
         // Wire-geometry (chunk) and device-resolved (chained decode) fires
         // CO-BATCH as ordered sub-batches of one step (true sub-batches,
@@ -544,10 +487,16 @@ impl LaunchGrouping {
             .pipeline_id
             .is_some_and(|pid| self.pipelines.contains(&pid))
         {
-            return Some("same-pipeline");
+            return false;
         }
         if self.count != 0 && (request.requires_solo_submission() || self.has_solo_submission) {
-            return Some("solo-contract");
+            return false;
+        }
+        // RS rows are one per request across the whole composed batch, so a
+        // fire that binds recurrent state and one that does not cannot share
+        // a wave: the driver would see fewer slot ids than requests.
+        if self.count != 0 && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows {
+            return false;
         }
         // Custom wire masks co-batch freely with other wire-geometry fires —
         // the wire layer emits a mask row per request (synthesized causal for
@@ -556,123 +505,27 @@ impl LaunchGrouping {
         // request layout, which composition replaces (driver fails loud).
         // A DENSE-masked device-resolved fire is stricter still: unlike a
         // host-derived channel mask, it has no wire BRLE rows and the composed
-        // path cannot merge it with another program. A STRUCTURED device
-        // mask (`mask_blocks_composition` false) is exempt from all of these
-        // clauses — Stage 2 item A: the driver packs per-lane structured
-        // masks for the whole composed batch, so such a fire co-batches like
-        // an unmasked one.
+        // path cannot merge it with another program.
         let masked_device_geometry = has_dense_device_mask(&request.request);
         let wire_mask_on_device_geometry = request.request.has_user_mask
             && !request.request.masks.is_empty()
             && request.request.device_resolved_geometry;
-        // Dense-mask compose: a wire-BRLE-masked WIRE lane co-batches
-        // with device-resolved decode envelopes now — the frame decodes
-        // the wire rows and fills causal for the envelope lanes
-        // host-side, feeding the same custom dispatch (frame.cpp's
-        // composed assembly). What still refuses: a genuinely dense
-        // DEVICE mask (its content is device-resident — nothing to
-        // assemble from), a wire mask ON a device-geometry fire (its
-        // BRLE indexes the placeholder layout composition replaces; the
-        // solo resolved_custom_wire path serves it), and a
-        // structured × wire mask MIX (one custom-mask source per fire).
-        let wire_masked = request.request.has_user_mask
-            && !request.request.masks.is_empty()
-            && !request.request.device_resolved_geometry;
-        // NS-2 relax: a wire-BRLE-masked envelope DECODE lane composes when
-        // the gate is armed and the group can take the split body — pure
-        // single-token decode, no hooks/lora (the planner sends UNPLANNED
-        // for those and the frame refuses an unplanned spatial compose),
-        // no structured mask (one custom-mask source per fire), no dense
-        // device mask. Both join directions are checked.
-        let spatial_composable_masked_envelope = spatial_mask_compose_enabled()
-            && wire_mask_on_device_geometry
-            && request.request.token_ids.len() <= 1
-            && !request.has_multi_token_row();
-        let wire_mask_on_device_geometry_blocks =
-            wire_mask_on_device_geometry && !spatial_composable_masked_envelope;
         if self.count != 0
             && (masked_device_geometry
-                || (wire_mask_on_device_geometry_blocks)
-                // The mixed fire (M-1, ARMED by PIE_SPATIAL_MIXED=1):
-                // multi-token rows stop blocking a spatial-composable
-                // masked envelope in either join direction — the
-                // prefill-class mask peel serves the shape. DEFAULT OFF:
-                // the newly-admitted shapes still crash in the driver
-                // (illegal access on the fire-level arm too — under
-                // investigation), so the refusals hold until that lands.
-                || (spatial_composable_masked_envelope
-                    && ((!spatial_mixed_compose_enabled()
-                         && self.has_multi_token)
-                        || self.has_structured_mask
-                        || self.has_masked_device_geometry))
-                || self.has_masked_device_geometry
-                || (self.has_wire_masked_envelope
-                    && ((!spatial_mixed_compose_enabled()
-                         && request.has_multi_token_row())
-                        || request.request.structured_device_mask
-                        || (request.hook_program
-                            && request.request.has_user_mask)))
-                // PQ-tree mixed half: joining would break k-uniformity
-                // for a both-axes lane (either side) — refuse, the lane
-                // solos with its uniform stamp intact.
-                || ((request.request.has_user_mask
-                    && request.request.max_layers.is_some()
-                    || self.has_both_axes)
-                    && self.count != 0
-                    && self.uniform_k != Some(request.request.max_layers))
-                || (wire_masked && self.has_structured_mask)
-                || (request.request.structured_device_mask && self.has_user_mask))
+                || wire_mask_on_device_geometry
+                || (self.has_user_mask && self.has_device_geometry)
+                || (request.request.has_user_mask && self.has_device_geometry)
+                || (request.request.device_resolved_geometry && self.has_user_mask))
         {
-            if spatial_mask_compose_enabled() {
-                eprintln!(
-                    "[spatial-compose] REFUSE: req(mask={} dg={} stm={} \
-                     ntok={} hook={} lora={} structured={}) group(mde={} \
-                     wme={} hl={} mt={} sm={} um={})",
-                    request.request.has_user_mask,
-                    request.request.device_resolved_geometry,
-                    request.request.single_token_mode,
-                    request.request.token_ids.len(),
-                    request.hook_program,
-                    request.lora_program,
-                    request.request.structured_device_mask,
-                    self.has_masked_device_geometry,
-                    self.has_wire_masked_envelope,
-                    self.has_hook_or_lora,
-                    self.has_multi_token,
-                    self.has_structured_mask,
-                    self.has_user_mask,
-                );
-            }
-            return Some("mask-compose");
-        }
-        // Invariant: a batch containing an `attn_page_mask`-writing program
-        // is pure decode. The driver honours a written mask only on the
-        // paged decode path and THROWS mid-body otherwise
-        // (llama_like.cpp ~:1040, "attn_page_mask was written but this
-        // layer does not take the paged decode path"), killing every lane
-        // in the fire — so a chunk-prefill lane co-batched with a
-        // quest-class decode lane is a whole-wave failure. This clause
-        // converts that throw into a scheduling decision: page-mask
-        // programs and multi-token rows never share a group, in either
-        // admission order. Deliberately narrow — hook programs WITHOUT the
-        // page-mask sink (e.g. snapkv score capture, which is legal on
-        // prefill) keep co-batching with multi-token fires freely.
-        if self.count != 0
-            && ((request.page_mask_program && self.has_multi_token)
-                || (request.has_multi_token_row() && self.has_page_mask))
-        {
-            return Some("page-mask-multitoken");
+            return false;
         }
         if self.count == 0 {
-            return None;
+            return true;
         }
         let usage = batch::request_capacity_usage(request, page_size);
-        let fits = self.count.saturating_add(usage.forward_requests)
-            <= limits.max_forward_requests
-            && self.forward_tokens.saturating_add(usage.forward_tokens)
-                <= limits.max_forward_tokens
-            && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs;
-        if fits { None } else { Some("capacity") }
+        self.count.saturating_add(usage.forward_requests) <= limits.max_forward_requests
+            && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
+            && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
     }
 
     pub(crate) fn push(
@@ -690,36 +543,9 @@ impl LaunchGrouping {
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
         self.has_solo_submission |= request.requires_solo_submission();
-        // A structured device mask never blocks composition (item A), so it
-        // must not poison the group's mask bit either — otherwise a masked
-        // lane admitted first would still exclude every later
-        // device-geometry lane through the group-state clauses.
-        self.has_user_mask |= mask_blocks_composition(&request.request);
+        self.has_rs_rows |= request.rs_batch_kind() != RsBatchKind::None;
+        self.has_user_mask |= request.request.has_user_mask;
         self.has_device_geometry |= request.request.device_resolved_geometry;
-        self.has_page_mask |= request.page_mask_program;
-        self.has_structured_mask |= request.request.structured_device_mask;
-        let wire_masked_envelope = request.request.has_user_mask
-            && !request.request.masks.is_empty()
-            && request.request.device_resolved_geometry;
-        let spatial_relaxed = spatial_mask_compose_enabled()
-            && wire_masked_envelope
-            && request.request.token_ids.len() <= 1
-            && !request.has_multi_token_row()
-            && !request.hook_program
-            && !request.lora_program;
-        self.has_masked_device_geometry |= has_dense_device_mask(&request.request)
-            || (wire_masked_envelope && !spatial_relaxed);
-        self.has_wire_masked_envelope |= spatial_relaxed;
-        self.has_hook_or_lora |= request.hook_program || request.lora_program;
-        self.has_hook |= request.hook_program;
-        self.has_both_axes |=
-            request.request.has_user_mask && request.request.max_layers.is_some();
-        self.uniform_k = match self.uniform_k {
-            None if self.count == 0 => Some(request.request.max_layers),
-            Some(k) if k == request.request.max_layers => Some(k),
-            _ => None,
-        };
-        self.has_multi_token |= request.has_multi_token_row();
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
             || self.count >= limits.max_forward_requests
@@ -875,6 +701,11 @@ enum SchedulerItem {
     /// waits for this exact process's first fire (identity-paired with the
     /// release above — the two race through the mailbox in either order).
     ExecutionSlotConsumed(ProcessId),
+    /// A process is queued for an execution permit; it is the identified
+    /// taker of the next slot to free (the semaphore is FIFO-fair).
+    AdmissionQueued(ProcessId),
+    /// It took the permit, or went away before it could.
+    AdmissionDequeued(ProcessId),
     /// The planner concluded a suspended process is runnable again (restore
     /// committed, or the eviction rolled back): its lanes may rejoin the
     /// wait-set and batch full frames again. Process-keyed.
@@ -887,6 +718,15 @@ enum SchedulerItem {
         lane: ProcessId,
         seq: u64,
         submitted: u32,
+    },
+    /// `forward.park()`: the guest is leaving the seal's wait-set until it
+    /// fires again. Ordered against that lane's submits by `seq` — the exit
+    /// lands once every frame submitted before it has sealed, so a guest may
+    /// park with fires still outstanding (frame mode only; a no-op
+    /// otherwise).
+    LanePark {
+        lane: ProcessId,
+        seq: u64,
     },
     /// Snapshot the run loop's state as a human-readable dump (queue
     /// composition, in-flight work, barrier membership). Answered inline on
@@ -1027,49 +867,18 @@ enum LaneReply {
     },
 }
 
-/// Program-lifetime divergence facts, derived once at registration from the
-/// launch package. These are the per-program halves of fire planning's
-/// [`MemberFacts`](super::fire_plan::MemberFacts): stamped onto the tracked
-/// instance at bind commit, and from there onto each fire at launch
-/// admission. A missing registration degrades every flag to `false` — the
-/// row just doesn't join the corresponding fast path.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ProgramFacts {
-    /// Declares an attention-hook stage (OnAttnProj/OnAttn).
-    attention_hooks: bool,
-    /// Carries the pass-wide `lora` configuration sink.
-    lora_sink: bool,
-    /// Writes the `attn_page_mask` sink (Quest-class page eviction; the
-    /// sink call sits in an OnAttnProj stage, but placement is not part of
-    /// the fact — any stage counts, mirroring `lora_sink`). The driver only
-    /// honours a written mask on the paged decode path, so this is the
-    /// grouping fact that keeps such programs out of multi-token batches.
-    page_mask_sink: bool,
-}
-
 /// The worker-side half of a control that the lane finished executing.
 enum LaneCommit {
     /// Nothing to commit — the lane already sent the response (pure driver
     /// ops that touch no worker state: program/channel registers, channel
     /// closes, failed binds after lane-side rollback).
     None,
-    /// A standalone program registration succeeded on the lane: record the
-    /// program's divergence facts in the worker's `program_facts` map
-    /// (the response already went out lane-side).
-    ProgramRegistered {
-        program_id: crate::driver::instance::ProgramId,
-        facts: ProgramFacts,
-    },
     /// A successful bind: insert the instance, THEN respond (launch admission
     /// reads `instances` on the worker thread, so respond-after-insert is the
     /// ordering that makes the guest's first fire admissible).
     BindInstance {
         pipeline_id: Option<ProcessId>,
         bound: BoundInstance,
-        /// A program this combined control registered on the lane, with its
-        /// divergence facts — committed to `program_facts` before the
-        /// instance insert so `TrackedInstance` sees them.
-        registered_program: Option<(crate::driver::instance::ProgramId, ProgramFacts)>,
         respond: BindRespond,
     },
     /// A bind control completed without creating an instance.
@@ -1316,61 +1125,6 @@ impl DriverLane {
         drop(driver.take());
     }
 
-    /// Whether the program declares an attention-hook stage. Stage kinds:
-    /// Prologue 0, OnAttnProj 1, OnAttn 2, Epilogue 3 (see `LaunchStage` in
-    /// `interface/driver/src/plan.rs`).
-    fn declares_attention_hooks(plan: &ProgramRegistration) -> bool {
-        plan.launch
-            .stages
-            .iter()
-            .any(|stage| stage.kind == 1 || stage.kind == 2)
-    }
-
-    /// Whether the program carries the pass-wide `lora` configuration sink:
-    /// a `SinkCall` op in any stage whose name-table entry is `"lora"`
-    /// (`pie_ir::registry::KNOWN_SINKS`). Read off the launch package's
-    /// stage ops directly (`LaunchOp.code` is the PTIR wire tag,
-    /// `name_index` points into the program-wide name table) rather than
-    /// the grouped-plan `PIE_STAGE_REQUIRES_LORA` flag, whose derivation
-    /// walk can abort early on a stage the grouped path rejects.
-    fn declares_lora_sink(plan: &ProgramRegistration) -> bool {
-        Self::declares_sink(plan, "lora")
-    }
-
-    /// Whether the program writes the `attn_page_mask` sink. Same
-    /// derivation as `declares_lora_sink`; the sink's T11-legal home is an
-    /// OnAttnProj stage, but the scan deliberately covers every stage — the
-    /// fact is "this program writes the mask", not "where".
-    fn declares_page_mask_sink(plan: &ProgramRegistration) -> bool {
-        Self::declares_sink(plan, "attn_page_mask")
-    }
-
-    /// A `SinkCall` op in any stage whose name-table entry is `sink`
-    /// (`pie_ir::registry::KNOWN_SINKS`). Read off the launch package's
-    /// stage ops directly (`LaunchOp.code` is the PTIR wire tag,
-    /// `name_index` points into the program-wide name table).
-    fn declares_sink(plan: &ProgramRegistration, sink: &str) -> bool {
-        plan.launch.stages.iter().any(|stage| {
-            stage.ops.iter().any(|op| {
-                op.code == u16::from(pie_ir::op::tags::SINK_CALL)
-                    && plan
-                        .launch
-                        .names
-                        .get(op.name_index as usize)
-                        .is_some_and(|name| name == sink)
-            })
-        })
-    }
-
-    /// The divergence facts a registration commits program-lifetime.
-    fn program_facts(plan: &ProgramRegistration) -> ProgramFacts {
-        ProgramFacts {
-            attention_hooks: Self::declares_attention_hooks(plan),
-            lora_sink: Self::declares_lora_sink(plan),
-            page_mask_sink: Self::declares_page_mask_sink(plan),
-        }
-    }
-
     /// The driver half of the old `dispatch_ordered_item`: everything a
     /// control does against the driver and the lane-owned `channels` set,
     /// with worker-map effects returned as a [`LaneCommit`]. Failures respond
@@ -1455,19 +1209,12 @@ impl DriverLane {
                                 "scheduler RPC cancelled after program registration; retaining driver-lifetime program"
                             );
                         }
-                        // Even on a cancelled RPC the program stays registered
-                        // driver-lifetime, so its divergence facts are still
-                        // worth recording.
-                        LaneCommit::ProgramRegistered {
-                            program_id,
-                            facts: Self::program_facts(&plan),
-                        }
                     }
                     Err(error) => {
                         let _ = response.send(Err(error));
-                        LaneCommit::None
                     }
                 }
+                LaneCommit::None
             }
             QueuedItem::RegisterChannel { plan, response } => {
                 if response.is_closed() {
@@ -1570,7 +1317,6 @@ impl DriverLane {
                         Ok(bound) => LaneCommit::BindInstance {
                             pipeline_id,
                             bound,
-                            registered_program: None,
                             respond: BindRespond::Bind(response),
                         },
                         Err(error) => {
@@ -1648,8 +1394,6 @@ impl DriverLane {
                 }
                 let probe_t1 = bind_probe.then(Instant::now);
                 let program_registered = program.is_some();
-                let registered_program_facts =
-                    program.as_ref().map(|plan| Self::program_facts(plan));
                 if let Some(plan) = &program {
                     match driver.register_program(plan) {
                         Ok(program_id) => bind.program_id = program_id,
@@ -1705,8 +1449,6 @@ impl DriverLane {
                         LaneCommit::BindInstance {
                             pipeline_id,
                             bound,
-                            registered_program: registered_program_facts
-                                .map(|facts| (bind.program_id, facts)),
                             respond: BindRespond::ChannelsBind {
                                 registered,
                                 program_id: bind.program_id,
@@ -1956,7 +1698,7 @@ enum QueuedItem {
     /// 1280 bytes — a cohort boundary moved ~800 MB through `VecDeque`
     /// rotations alone. The indirection makes every queue move a pointer
     /// move; the payload itself never moves.
-    Launch(Box<PendingRequest>),
+    Launch(QueuedLaunch),
     PreLaunchCopy {
         plan: PreLaunchCopy,
         logical_completion: WorkItemCompletion,
@@ -2025,6 +1767,51 @@ enum QueuedItem {
     },
 }
 
+/// A queued launch, plus the only two fields the dispatcher's queue scan
+/// reads, mirrored inline next to the box.
+///
+/// [`BatchScheduler::scan_queue`] walks the whole queue and previously read
+/// both fields *through* the box, which costs one cache miss per queued item.
+/// The scan runs a fixed ~250 times per 1000 tokens no matter how many
+/// processes are admitted, so that per-item miss made the scan's cost linear
+/// in queue depth and therefore the host's scheduling cost linear in
+/// concurrency while the work stayed constant: measured 13.9 us/scan at 256
+/// admitted processes against 24.1 us at 512 (mixed-phase shape, same token
+/// count both sides), 3.9 s vs 6.5 s of loop time for identical work.
+///
+/// The mirror cannot go stale, structurally: `QueuedLaunch` hands out only
+/// `&PendingRequest` (there is deliberately no `DerefMut`), so neither field
+/// can be reassigned while the item is queued. Both are already final by the
+/// time they are mirrored — `logical_fire_id` is assigned at construction and
+/// the frame stamp is synthesized at ACCEPT, before `queue_attempt` hands the
+/// item to the queue.
+struct QueuedLaunch {
+    fire_id: u64,
+    framed: bool,
+    request: Box<PendingRequest>,
+}
+
+impl QueuedLaunch {
+    fn new(request: Box<PendingRequest>) -> Self {
+        Self {
+            fire_id: request.logical_fire_id,
+            framed: request.frame.is_some(),
+            request,
+        }
+    }
+
+    fn into_request(self) -> Box<PendingRequest> {
+        self.request
+    }
+}
+
+impl std::ops::Deref for QueuedLaunch {
+    type Target = PendingRequest;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
 /// A posted launch's lane lifecycle: the batch enters `in_flight_launches`
 /// (and the run-ahead depth) at POST; the driver's verdict arrives as a
 /// `LaneReply::LaunchDone` and upgrades the state. Retirement only ever
@@ -2065,7 +1852,93 @@ struct PendingControl {
     /// false for standalone copies — their pages are grant-pinned and no
     /// queued fire references them, so frames keep posting while
     /// suspend/restore traffic settles.
+    ///
+    /// It is also the exclusivity test: a control that holds launches needs
+    /// the whole in-flight set empty and blocks every other control while it
+    /// settles, exactly as the original single slot did.
     holds_launches: bool,
+}
+
+/// The async-completing controls the worker is waiting on — copies and pool
+/// resizes; lifecycle controls execute on the lane without ever entering
+/// here.
+///
+/// Two classes share this set. An **exclusive** control (a `PreLaunchCopy`,
+/// whose consumer fire is queued directly behind it, and a pool resize, whose
+/// pipe drain IS its ordering mechanism) keeps the original rule: it needs
+/// the set empty and, once posted, nothing else may join it.
+///
+/// **Standalone copies** — the residency planner's suspend/restore traffic —
+/// instead settle concurrently with one another. Nothing queued orders
+/// against them: their pages are grant-pinned and no queued fire can name
+/// one, which `pipe_concurrent_control` already relies on. So a single slot
+/// bought no safety, only a queue, and the queue was on the planner's
+/// critical path. Measured at 512-way KV contention: up to 7 restores wanted
+/// the slot at once (`restoring` p90 = 4, max = 7) and each H2D copy took
+/// 22.8 ms end to end against ~3.3 ms of transfer — 1.528 ms/page, versus
+/// 0.227 ms/page on the D2H side, which the planner itself issues strictly
+/// one at a time and which therefore never queued. The 6.7x asymmetry was
+/// the wait for this slot, not the device.
+///
+/// Nothing here needs a concurrency ceiling: the pending queue is the bound.
+/// Only copies the planner has already enqueued can be in flight, and the
+/// planner enqueues at most one per suspending or restoring process.
+#[derive(Default)]
+struct InFlightControls {
+    settling: Vec<PendingControl>,
+}
+
+impl InFlightControls {
+    fn is_empty(&self) -> bool {
+        self.settling.is_empty()
+    }
+
+    /// Whether anything is still settling.
+    fn is_settling(&self) -> bool {
+        !self.settling.is_empty()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, PendingControl> {
+        self.settling.iter()
+    }
+
+    /// Whether a standalone copy may be posted now: only an exclusive
+    /// control can refuse one.
+    fn admits_copy(&self) -> bool {
+        self.settling.iter().all(|control| !control.holds_launches)
+    }
+
+    /// Whether `item` may be posted into this set now. A standalone copy and
+    /// a lifecycle control are each refused only by an EXCLUSIVE control: the
+    /// copy addresses grant-pinned pages nothing queued can name, and a
+    /// lifecycle control never enters this set at all — it executes on the
+    /// lane, its driver order guaranteed by the lane FIFO. Blocking lifecycle
+    /// controls on a settling copy wedged the fleet: the planner's copies are
+    /// in flight almost continuously under churn, so every bind waited out the
+    /// whole strict-watchdog window (measured on `churn`: 270 binds at 1.0-2.4 s
+    /// end to end against a 59 us driver bind).
+    fn admits(&self, item: &QueuedItem) -> bool {
+        if BatchScheduler::standalone_copy(item) || BatchScheduler::lifecycle_control(item) {
+            !self.holds_launches()
+        } else {
+            self.is_empty()
+        }
+    }
+
+    /// Whether any settling control makes queued launches wait.
+    fn holds_launches(&self) -> bool {
+        self.settling.iter().any(|control| control.holds_launches)
+    }
+
+    fn push(&mut self, control: PendingControl) {
+        self.settling.push(control);
+    }
+
+    fn position_posted(&self, token: u64) -> Option<usize> {
+        self.settling.iter().position(
+            |control| matches!(control.state, ControlSlotState::Posted { token: t } if t == token),
+        )
+    }
 }
 
 /// What one pass over the pending queue tells the frame dispatcher — see
@@ -2413,7 +2286,6 @@ impl SchedulerHandle {
     pub(crate) fn nudge(&self) -> Result<()> {
         self.send(SchedulerItem::Nudge)
     }
-
     pub async fn register_program(&self, plan: ProgramRegistration) -> Result<u64> {
         let program_hash = plan.program_hash;
         {
@@ -2588,20 +2460,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         request_timeout_secs: u64,
         frame_size: usize,
-        model_site_summary: pie_driver_abi::ModelSiteSummary,
     ) -> Self {
-        // The driver's validated-plan site summary (capabilities handshake),
-        // mapped into the fire planner's vocabulary once at spawn; every
-        // sealed frame merges these sites via `plan_fire_with_model`.
-        // Informational this increment (nothing consumes the site vec yet).
-        let model_sites = super::fire_plan::site_table::summary_sites(&model_site_summary);
-        if !model_sites.is_empty() {
-            tracing::info!(
-                driver_id,
-                sites = model_sites.len(),
-                "scheduler holds model-structural site(s) from the driver's declared plan"
-            );
-        }
         let (tx, rx) = crossbeam::channel::unbounded::<SchedulerItem>();
         let stats = Arc::new(SchedulerStats::default());
         let handle = SchedulerHandle {
@@ -2630,7 +2489,6 @@ impl BatchScheduler {
                     limits,
                     stats_for_loop,
                     frame_size,
-                    model_sites,
                 );
             })
             .expect("spawn pie-sched thread");
@@ -2660,7 +2518,6 @@ impl BatchScheduler {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run(
         driver_id: DriverId,
         rx: crossbeam::channel::Receiver<SchedulerItem>,
@@ -2669,7 +2526,6 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: Arc<SchedulerStats>,
         frame_size: usize,
-        model_sites: Vec<super::fire_plan::Site>,
     ) {
         let lane_reply_tx = nudge_tx.clone();
         let nudge_waker = std::task::Waker::from(Arc::new(NudgeWaker {
@@ -2683,20 +2539,12 @@ impl BatchScheduler {
         let mut lane_inflight: u64 = 0;
         let mut lane_token: u64 = 0;
         let mut instances = HashMap::new();
-        // Program-lifetime divergence facts, mirroring `instances`:
-        // populated when a registration commits back from the lane, read at
-        // bind commit to stamp the tracked instance (and from there each
-        // fire at admission) so fire planning sees each member's axes —
-        // hook-carrying rows sort last within their wire class, lora rows
-        // mark the WEIGHT-class site.
-        let mut program_facts: HashMap<crate::driver::instance::ProgramId, ProgramFacts> =
-            HashMap::new();
         let mut pending = PendingQueue::default();
         let mut scan_cache = ScanCache::default();
         let mut slot_buffer = SlotBuffer::new();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
-        let mut in_flight_control = None;
+        let mut in_flight_control = InFlightControls::default();
         let mut stopping = false;
         // THE fire rule: the wait-for-all-active-lanes frame policy, one
         // instance per driver thread, mirroring `instances`/`channels` above.
@@ -2767,7 +2615,6 @@ impl BatchScheduler {
                             &mut in_flight_launches,
                             &mut in_flight_control,
                             &mut instances,
-                            &mut program_facts,
                             &mut frame_policy,
                             &nudge_tx,
                         );
@@ -2797,6 +2644,7 @@ impl BatchScheduler {
                 &mut instances,
                 &mut pending,
                 &stats,
+                &mut frame_policy,
             );
             progress |= Self::retire_ready_control(&mut in_flight_control);
             let retire_done = Instant::now();
@@ -2815,7 +2663,6 @@ impl BatchScheduler {
                 &mut scan_cache,
                 &mut slot_buffer,
                 stopping,
-                &model_sites,
             );
             progress |= dispatched;
             if probe {
@@ -2867,14 +2714,14 @@ impl BatchScheduler {
             if stopping
                 && pending.is_empty()
                 && in_flight_launches.is_empty()
-                && in_flight_control.is_none()
+                && in_flight_control.is_empty()
                 && lane_inflight == 0
             {
                 break;
             }
 
-            // Cohort-boundary bind deferral: while the seal waits on a
-            // successor's arrival, hold back the bind permits that retiring
+            // Cohort-boundary bind deferral: while a successor's arrival is
+            // imminent, hold back the bind permits that retiring
             // processes return, so the staged cohort's working-set
             // declaration and prefill construction do not compete with the
             // boundary's own bring-up. Cleared the moment this pass has
@@ -2883,7 +2730,9 @@ impl BatchScheduler {
             crate::inferlet::process::set_bind_release_hold(
                 !stopping
                     && frame_policy.is_joining()
-                    && (progress || !in_flight_launches.is_empty() || in_flight_control.is_some()),
+                    && (progress
+                        || !in_flight_launches.is_empty()
+                        || in_flight_control.is_settling()),
             );
 
             if progress {
@@ -2894,7 +2743,7 @@ impl BatchScheduler {
 
             let item = if pending.is_empty()
                 && in_flight_launches.is_empty()
-                && in_flight_control.is_none()
+                && in_flight_control.is_empty()
                 && !stopping
             {
                 match rx.recv() {
@@ -2922,7 +2771,7 @@ impl BatchScheduler {
                         LaunchState::Failed(_) => armed = false,
                     }
                 }
-                if let Some(control) = in_flight_control.as_ref() {
+                for control in in_flight_control.iter() {
                     match &control.state {
                         ControlSlotState::Posted { .. } => {}
                         ControlSlotState::Ready(completion) => {
@@ -2959,7 +2808,7 @@ impl BatchScheduler {
                         // the wait's own cadence), so it never counts here.
                         let missed = in_flight_launches.front().is_some_and(|front| {
                             matches!(&front.state, LaunchState::Accepted(c) if c.is_settled())
-                        }) || in_flight_control.as_ref().is_some_and(|control| {
+                        }) || in_flight_control.iter().any(|control| {
                             matches!(&control.state, ControlSlotState::Ready(c) if c.is_settled())
                         });
                         if missed && !stopping && wait_hint.is_none() {
@@ -3017,7 +2866,6 @@ impl BatchScheduler {
                         &mut in_flight_launches,
                         &mut in_flight_control,
                         &mut instances,
-                        &mut program_facts,
                         &mut frame_policy,
                         &nudge_tx,
                     );
@@ -3050,7 +2898,7 @@ impl BatchScheduler {
     fn render_debug_dump(
         pending: &VecDeque<QueuedItem>,
         in_flight_launches: &VecDeque<PendingLaunchBatch>,
-        in_flight_control: &Option<PendingControl>,
+        in_flight_control: &InFlightControls,
         instances: &HashMap<u64, TrackedInstance>,
         frame_policy: &FramePolicy,
     ) -> String {
@@ -3104,21 +2952,19 @@ impl BatchScheduler {
                 batch.started.elapsed(),
             );
         }
-        match in_flight_control {
-            Some(control) => {
-                let state = match &control.state {
-                    ControlSlotState::Posted { token } => format!("posted(token={token})"),
-                    ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
-                };
-                let _ = writeln!(
-                    out,
-                    "in_flight_control: {} pipeline {:?} {state}",
-                    control.operation, control.pipeline_id,
-                );
-            }
-            None => {
-                let _ = writeln!(out, "in_flight_control: none");
-            }
+        if in_flight_control.is_empty() {
+            let _ = writeln!(out, "in_flight_control: none");
+        }
+        for control in in_flight_control.iter() {
+            let state = match &control.state {
+                ControlSlotState::Posted { token } => format!("posted(token={token})"),
+                ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
+            };
+            let _ = writeln!(
+                out,
+                "in_flight_control: {} pipeline {:?} {state}",
+                control.operation, control.pipeline_id,
+            );
         }
         let _ = write!(out, "{}", frame_policy.debug_summary());
         out
@@ -3128,7 +2974,7 @@ impl BatchScheduler {
     fn enqueue_item(
         pending: &mut PendingQueue,
         terminated_processes: &mut HashSet<ProcessId>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         instances: &HashMap<u64, TrackedInstance>,
         limits: SchedulerLimits,
         page_size: u32,
@@ -3160,6 +3006,12 @@ impl BatchScheduler {
             SchedulerItem::ExecutionSlotConsumed(pid) => {
                 frame_policy.on_execution_slot_consumed(pid);
             }
+            SchedulerItem::AdmissionQueued(pid) => {
+                frame_policy.on_admission_queued(pid);
+            }
+            SchedulerItem::AdmissionDequeued(pid) => {
+                frame_policy.on_admission_dequeued(pid);
+            }
             SchedulerItem::PipelineLeave(pid, owner, kind, response) => {
                 if kind == LeaveKind::Terminate {
                     if !terminated_processes.insert(pid) {
@@ -3178,8 +3030,8 @@ impl BatchScheduler {
                     // ragged-boundary guard — see on_slotted_terminate).
                     frame_policy.on_slotted_terminate(pid);
                     let protected = in_flight_control
-                        .as_ref()
-                        .filter(|control| control.process_id == Some(pid))
+                        .iter()
+                        .find(|control| control.process_id == Some(pid))
                         .and_then(|control| control.logical_completion.clone());
                     if let Some(completion) = &protected {
                         completion.request_cancel();
@@ -3257,17 +3109,6 @@ impl BatchScheduler {
                     }
                     launch.completion.reject_unsubmitted(message);
                 } else {
-                    // Stamp the program's divergence facts off the tracked
-                    // instance (admission just validated the id): fire
-                    // planning sorts hook-carrying rows last within their
-                    // wire class so the driver's hook-free fast prefix is
-                    // maximal, and reads the lora flag as the WEIGHT-class
-                    // site fact.
-                    if let Some(instance) = instances.get(&launch.instance_id) {
-                        launch.hook_program = instance.facts.attention_hooks;
-                        launch.lora_program = instance.facts.lora_sink;
-                        launch.page_mask_program = instance.facts.page_mask_sink;
-                    }
                     // The default single-slot deployment: every tracked fire
                     // IS a one-fire frame. Synthesizing the stamp at accept
                     // (lane = the pipeline scope, seq = the globally
@@ -3317,6 +3158,9 @@ impl BatchScheduler {
                 submitted,
             } => {
                 frame_policy.on_frame_truncated(lane, seq, submitted);
+            }
+            SchedulerItem::LanePark { lane, seq } => {
+                frame_policy.on_lane_park(lane, seq);
             }
             SchedulerItem::RegisterProgram { plan, response } => {
                 pending.push_back(QueuedItem::RegisterProgram { plan, response });
@@ -3493,7 +3337,7 @@ impl BatchScheduler {
         for copy in copies {
             pending.push_back(copy);
         }
-        pending.push_back(QueuedItem::Launch(Box::new(request)));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(request))));
     }
 
     /// Whether any queued fire still targets `instance_id` (a queued
@@ -3645,7 +3489,15 @@ impl BatchScheduler {
     }
 
     /// launch that reached the queue front has no queued copy left).
-    fn rotate_launch_for_wave_work(pending: &mut PendingQueue, allow_controls: bool) -> bool {
+    ///
+    /// `allow_lifecycle` is the wider of the two flags: a lifecycle control
+    /// needs no control slot, so a standalone copy in flight does not stop
+    /// it from being worth exposing at the front.
+    fn rotate_launch_for_wave_work(
+        pending: &mut PendingQueue,
+        allow_slot: bool,
+        allow_lifecycle: bool,
+    ) -> bool {
         if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
             return false;
         }
@@ -3654,9 +3506,8 @@ impl BatchScheduler {
         };
         let work = &pending[run_len];
         if !(Self::standalone_copy(work)
-            || (allow_controls
-                && (Self::lifecycle_control(work)
-                    || matches!(work, QueuedItem::PreLaunchCopy { .. }))))
+            || (allow_lifecycle && Self::lifecycle_control(work))
+            || (allow_slot && matches!(work, QueuedItem::PreLaunchCopy { .. })))
         {
             return false;
         }
@@ -3672,7 +3523,7 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
@@ -3680,7 +3531,6 @@ impl BatchScheduler {
         scan_cache: &mut ScanCache,
         slot_buffer: &mut SlotBuffer,
         stopping: bool,
-        model_sites: &[super::fire_plan::Site],
     ) -> (bool, Option<Duration>) {
         let probe_disp = super::fire_timing_enabled();
         let disp_started = probe_disp.then(Instant::now);
@@ -3699,7 +3549,6 @@ impl BatchScheduler {
             limits,
             stats,
             stopping,
-            model_sites,
         );
         if let Some(started) = disp_started {
             super::LOOP_PHASES
@@ -3721,6 +3570,22 @@ impl BatchScheduler {
         // closes rotate and drain during the next generation's execution.
         // Shutdown never holds (the drain must retire everything).
         let hold_closes = !stopping && frame_policy.has_pending_binds();
+        // The control SLOT (depth 1) exists for controls that settle
+        // asynchronously; lifecycle controls execute on the lane FIFO and
+        // never take it (see `post_control`). So a standalone copy holding
+        // the slot must not block them: it addresses grant-pinned pages no
+        // bind, register or close can reference, and the lane FIFO already
+        // fixes their driver order. Blocking them on it wedged the fleet —
+        // the planner's suspend/restore copies are in flight almost
+        // continuously under churn, so every bind waited out the whole
+        // strict-watchdog window, its process sat in `staged` for the
+        // duration, and the cohort-boundary window it therefore held open
+        // (which then still held the seal) stalled the very traffic the copy
+        // was waiting behind. Measured on
+        // `churn`: every one of 270 binds took 1.0-2.4 s end to end against
+        // a 59 us driver bind, and the probe found the slot held by a
+        // tracked KV copy in 100% of the samples.
+        let slot_blocks_lifecycle = in_flight_control.holds_launches();
         loop {
             let Some(item) = pending.front() else {
                 break;
@@ -3731,7 +3596,11 @@ impl BatchScheduler {
                     // id, not queue position). A launch at the queue front
                     // only needs to yield to any dispatchable control behind
                     // it.
-                    if Self::rotate_launch_for_wave_work(pending, in_flight_control.is_none()) {
+                    if Self::rotate_launch_for_wave_work(
+                        pending,
+                        in_flight_control.is_empty(),
+                        !slot_blocks_lifecycle,
+                    ) {
                         progress = true;
                         continue;
                     }
@@ -3745,7 +3614,11 @@ impl BatchScheduler {
                     // whole-pipe drain stalled every launch queued behind a
                     // front close during cohort swaps and made freshly-bound
                     // pipelines' credits ragged (V6 iteration 3).
-                    if in_flight_control.is_some() {
+                    // A close needs no control slot either (see
+                    // `slot_blocks_lifecycle`), only its own instance
+                    // quiesced — a settling standalone copy addresses
+                    // grant-pinned pages no close can name.
+                    if slot_blocks_lifecycle {
                         break;
                     }
                     let id = *id;
@@ -3842,12 +3715,14 @@ impl BatchScheduler {
                     let item = pending.pop_front().expect("close front");
                     pending.push_back(item);
                 }
-                // Single control slot: a settling copy/resize blocks the
-                // next control (the slot only ever holds async-completing
-                // controls now — lifecycle controls execute on the lane
-                // without occupying it, their driver order guaranteed by the
-                // lane FIFO).
-                _ if in_flight_control.is_some() => break,
+                // A settling exclusive control (a `PreLaunchCopy` or a
+                // pool resize) blocks the next control. Standalone copies and
+                // lifecycle controls are refused by nothing else — see
+                // `InFlightControls::admits`. The front-rotation this arm used
+                // to need is gone with the single slot: a copy that cannot post
+                // is blocked by an exclusive control, and so is everything
+                // behind it, so giving up its position buys nothing.
+                _ if !in_flight_control.admits(item) => break,
                 _ if !in_flight_launches.is_empty() && !Self::pipe_concurrent_control(item) => {
                     break;
                 }
@@ -3875,11 +3750,21 @@ impl BatchScheduler {
         // copies ARE the residency planner's forward progress — leaving
         // them positional starved the very traffic that unsticks a held
         // frame (CONTENTION_FOLLOWUP.md §12).
+        //
+        // They also pipeline: the sweep keeps posting while no exclusive
+        // control holds the set, so a restore never waits out an unrelated
+        // copy's device time. Serialized, the wait WAS the cost — 22.8 ms
+        // per H2D restore against ~3.3 ms of transfer at 512-way
+        // contention. The queue bounds the depth: only what the planner
+        // enqueued can be posted.
         let copy_t = probe_disp.then(Instant::now);
-        if in_flight_control.is_none()
-            && let Some(index) = pending.iter().position(|item| Self::standalone_copy(item))
-            && let Some(item) = pending.remove(index)
-        {
+        while in_flight_control.admits_copy() {
+            let Some(index) = pending.iter().position(|item| Self::standalone_copy(item)) else {
+                break;
+            };
+            let Some(item) = pending.remove(index) else {
+                break;
+            };
             Self::post_control(
                 driver_lane,
                 lane_inflight,
@@ -3932,7 +3817,7 @@ impl BatchScheduler {
         lane_inflight: &mut u64,
         lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         frame_policy: &mut FramePolicy,
         item: QueuedItem,
     ) {
@@ -4021,11 +3906,12 @@ impl BatchScheduler {
         }
         *lane_token += 1;
         let token = *lane_token;
-        // Async-completing controls hold the single control slot from POST:
-        // the copy's coupled consumer launch (and any later control) must
-        // not pass it, exactly as before the lane existed. Exactly the
-        // standalone copies do NOT hold launches — one classification,
-        // shared with the out-of-band dispatch that relies on it.
+        // Async-completing controls enter the in-flight set from POST: an
+        // exclusive one (the copy's coupled consumer launch, a resize) must
+        // not be passed by any later control, exactly as before the lane
+        // existed. Exactly the standalone copies do NOT hold launches — one
+        // classification, shared with the out-of-band dispatch and the
+        // concurrency rule in `InFlightControls` that both rely on it.
         let holds_launches = !Self::standalone_copy(&item);
         match &item {
             QueuedItem::PreLaunchCopy {
@@ -4034,7 +3920,7 @@ impl BatchScheduler {
                 process_id,
                 pipeline_id,
             } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: Some(logical_completion.clone()),
                     process_id: *process_id,
@@ -4045,7 +3931,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::CopyKv { .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -4056,7 +3942,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::CopyKvTracked { completion, .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -4067,7 +3953,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::CopyState { .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -4078,7 +3964,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::ResizePool { .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -4127,14 +4013,14 @@ impl BatchScheduler {
         scan.clear();
         for item in pending.iter() {
             match item {
-                QueuedItem::Launch(request) => {
+                QueuedItem::Launch(launch) => {
                     if stopping {
-                        scan.drain_eligible.push(request.logical_fire_id);
+                        scan.drain_eligible.push(launch.fire_id);
                     }
-                    if request.frame.is_some() {
-                        scan.queued_ids.push(request.logical_fire_id);
+                    if launch.framed {
+                        scan.queued_ids.push(launch.fire_id);
                     } else if scan.untracked.is_none() {
-                        scan.untracked = Some(request.logical_fire_id);
+                        scan.untracked = Some(launch.fire_id);
                     }
                 }
                 QueuedItem::PreLaunchCopy { pipeline_id, .. } => {
@@ -4166,12 +4052,11 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &Option<PendingControl>,
+        in_flight_control: &InFlightControls,
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         stopping: bool,
-        model_sites: &[super::fire_plan::Site],
     ) -> (bool, Option<Duration>) {
         let mut progress = false;
         let mut wait_hint: Option<Duration> = None;
@@ -4185,10 +4070,7 @@ impl BatchScheduler {
             // frames under it. A settling standalone copy holds nothing
             // (`PendingControl::holds_launches`) — frames keep posting
             // while suspend/restore traffic settles.
-            if in_flight_control
-                .as_ref()
-                .is_some_and(|control| control.holds_launches)
-            {
+            if in_flight_control.holds_launches() {
                 break;
             }
             // Run-ahead depth in FRAMES: the enqueue horizon. Retirement
@@ -4235,6 +4117,34 @@ impl BatchScheduler {
                         break;
                     }
                     FramePlan::Park => break,
+                    FramePlan::Terminate(pids) => {
+                        // Abandoned pipeline. This is NOT the submit
+                        // deadline: that one only leashes (drops the lane
+                        // from the wait-set and lets it rejoin), so a guest
+                        // that is merely slow never lands here. Reaching this
+                        // means the lane was silent for the whole silence
+                        // timeout without ever calling `forward.park()`, so
+                        // nothing but a wedged process is being reclaimed.
+                        // The policy has already dropped these lanes, so the
+                        // `continue` re-plans a gather that no longer waits
+                        // on them; the terminate is asynchronous and arrives
+                        // back as the usual leave.
+                        for pid in pids {
+                            tracing::error!(
+                                pid = %pid,
+                                "scheduler: terminating abandoned pipeline (silent for the \
+                                 whole silence timeout without submitting and without \
+                                 calling forward.park())"
+                            );
+                            crate::inferlet::process::terminate(
+                                pid,
+                                Err("pipeline abandoned: silent past the silence timeout \
+                                     without submitting and without parking"
+                                    .to_string()),
+                            );
+                        }
+                        continue;
+                    }
                 }
             };
             if let Some(plan_started) = plan_started {
@@ -4256,7 +4166,6 @@ impl BatchScheduler {
                 limits,
                 stats,
                 &waves,
-                model_sites,
             );
             if let Some(post_started) = post_started {
                 super::LOOP_PHASES
@@ -4311,7 +4220,6 @@ impl BatchScheduler {
         true
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn post_frame(
         slot_buffer: &mut SlotBuffer,
         driver_lane: &DriverLane,
@@ -4324,7 +4232,6 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         waves: &[Vec<u64>],
-        model_sites: &[super::fire_plan::Site],
     ) -> (bool, bool) {
         let mut progress = false;
         let sub = super::fire_timing_enabled().then(Instant::now);
@@ -4368,16 +4275,16 @@ impl BatchScheduler {
         let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
-                QueuedItem::Launch(request) => match slot_of.get(&request.logical_fire_id) {
+                QueuedItem::Launch(launch) => match slot_of.get(&launch.fire_id) {
                     Some(&(wave, position)) => {
                         let slot = &mut slot_buffer[wave][position];
                         if slot.is_none() {
-                            *slot = Some(request);
+                            *slot = Some(launch.into_request());
                         } else {
-                            collisions.push((wave, request));
+                            collisions.push((wave, launch.into_request()));
                         }
                     }
-                    None => kept.push_back(QueuedItem::Launch(request)),
+                    None => kept.push_back(QueuedItem::Launch(launch)),
                 },
                 item => kept.push_back(item),
             }
@@ -4433,7 +4340,7 @@ impl BatchScheduler {
         }
         let nonempty_waves = survivors.iter().filter(|w| !w.is_empty()).count();
         let (submission, requests) =
-            batch::build_frame_submission(survivors, limits, page_size, stats, model_sites);
+            batch::build_frame_submission(survivors, limits, page_size, stats);
         // How many waves a sealed frame actually carries. ABI v14 has a frame
         // carry k steps the driver runs as one closed system, and the guest does
         // submit `live_slots` fires per frame -- but this reports
@@ -4522,6 +4429,7 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         stats: &Arc<SchedulerStats>,
+        frame_policy: &mut FramePolicy,
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
@@ -4544,6 +4452,10 @@ impl BatchScheduler {
                 _ => None,
             };
             let mut retired = in_flight_launches.pop_front().expect("front batch exists");
+            // The engine has answered these lanes: re-arm their submit
+            // deadline from here so the wave they waited on is not charged
+            // to them (see `FramePolicy::on_frame_retired`).
+            frame_policy.on_frame_retired(retired.requests.iter().filter_map(|r| r.pipeline_id));
             let native_complete_us = retired.timing.as_ref().map(|_| super::fire_timing_now_us());
             let timing_snapshots = retired
                 .timing
@@ -5008,43 +4920,41 @@ impl BatchScheduler {
         }
     }
 
-    fn retire_ready_control(in_flight_control: &mut Option<PendingControl>) -> bool {
-        let operation = in_flight_control
-            .as_ref()
-            .map(|pending| pending.operation)
-            .unwrap_or("control operation");
-        let Some(result) = in_flight_control
-            .as_ref()
-            .and_then(|pending| match &pending.state {
+    /// Retire every settled control this pass. Concurrent standalone copies
+    /// settle in device order, not post order, so the sweep cannot stop at
+    /// the first control that is still outstanding.
+    fn retire_ready_control(in_flight_control: &mut InFlightControls) -> bool {
+        let mut retired = false;
+        let mut index = 0;
+        while index < in_flight_control.settling.len() {
+            let ready = match &in_flight_control.settling[index].state {
                 // Still waiting for the lane's reply to install the driver
-                // completion (or clear the slot on rejection).
+                // completion (or drop the entry on rejection).
                 ControlSlotState::Posted { .. } => None,
                 ControlSlotState::Ready(completion) => completion.check(),
-            })
-        else {
-            return false;
-        };
-        if let Some(tracked) = in_flight_control
-            .as_ref()
-            .and_then(|pending| pending.tracked_completion.as_ref())
-        {
-            tracked.resolve(&result);
-        }
-        if let Err(ref err) = result {
-            tracing::warn!(
-                ?err,
-                operation,
-                "direct control completion closed before callback"
-            );
-            if let Some(logical) = in_flight_control
-                .as_ref()
-                .and_then(|pending| pending.logical_completion.as_ref())
-            {
-                logical.reject_unsubmitted(format!("pre-launch {operation} failed: {err:#}"));
+            };
+            let Some(result) = ready else {
+                index += 1;
+                continue;
+            };
+            let pending = in_flight_control.settling.remove(index);
+            let operation = pending.operation;
+            if let Some(tracked) = pending.tracked_completion.as_ref() {
+                tracked.resolve(&result);
             }
+            if let Err(ref err) = result {
+                tracing::warn!(
+                    ?err,
+                    operation,
+                    "direct control completion closed before callback"
+                );
+                if let Some(logical) = pending.logical_completion.as_ref() {
+                    logical.reject_unsubmitted(format!("pre-launch {operation} failed: {err:#}"));
+                }
+            }
+            retired = true;
         }
-        *in_flight_control = None;
-        true
+        retired
     }
 
     /// Apply a driver-lane reply on the worker thread: fill in a posted
@@ -5054,9 +4964,8 @@ impl BatchScheduler {
         reply: LaneReply,
         lane_inflight: &mut u64,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         instances: &mut HashMap<u64, TrackedInstance>,
-        program_facts: &mut HashMap<crate::driver::instance::ProgramId, ProgramFacts>,
         frame_policy: &mut FramePolicy,
         rollback_tx: &crossbeam::channel::Sender<SchedulerItem>,
     ) {
@@ -5117,26 +5026,15 @@ impl BatchScheduler {
             }
             LaneReply::ControlDone { token, commit } => match commit {
                 LaneCommit::None => {}
-                LaneCommit::ProgramRegistered { program_id, facts } => {
-                    program_facts.insert(program_id, facts);
-                }
                 LaneCommit::BindFinished { pipeline_id } => {
                     frame_policy.on_bind_completed(pipeline_id);
                 }
                 LaneCommit::BindInstance {
                     pipeline_id,
                     bound,
-                    registered_program,
                     respond,
                 } => {
                     frame_policy.on_bind_completed(pipeline_id);
-                    // Record the combined control's program registration
-                    // FIRST (even if the bind commit below refuses): the
-                    // program is driver-lifetime either way, and the tracked
-                    // instance's flags read this map.
-                    if let Some((program_id, facts)) = registered_program {
-                        program_facts.insert(program_id, facts);
-                    }
                     if instances.contains_key(&bound.instance_id) {
                         // Practically unreachable: driver-assigned ids are
                         // unique and requested ids are pre-checked at post
@@ -5159,15 +5057,7 @@ impl BatchScheduler {
                         return;
                     }
                     let instance_id = bound.instance_id;
-                    // Missing map entry (program registered before this code
-                    // shipped, or an unregistered id) degrades to all-false:
-                    // the row just doesn't join the hook-free fast prefix or
-                    // the lora site.
-                    let facts = program_facts
-                        .get(&bound.program_id)
-                        .copied()
-                        .unwrap_or_default();
-                    instances.insert(instance_id, TrackedInstance::from_bound(&bound, facts));
+                    instances.insert(instance_id, TrackedInstance::from_bound(&bound));
                     // Respond AFTER the insert: launch admission reads
                     // `instances` on this thread, so the guest's first fire
                     // (sent only after this response) is always admissible.
@@ -5254,25 +5144,26 @@ impl BatchScheduler {
                     }
                 }
                 LaneCommit::AsyncControl { result } => {
-                    let holds_token = in_flight_control.as_ref().is_some_and(
-                        |control| matches!(control.state, ControlSlotState::Posted { token: t } if t == token),
-                    );
-                    if !holds_token {
+                    // Replies arrive in lane FIFO order, but several
+                    // standalone copies can be posted at once, so the reply
+                    // is matched to its own entry by token.
+                    let Some(index) = in_flight_control.position_posted(token) else {
                         tracing::error!(
                             token,
                             "lane async-control reply without a matching control slot"
                         );
                         return;
-                    }
+                    };
                     match result {
                         Ok(completion) => {
-                            if let Some(control) = in_flight_control.as_mut() {
-                                control.state = ControlSlotState::Ready(completion);
-                            }
+                            in_flight_control.settling[index].state =
+                                ControlSlotState::Ready(completion);
                         }
                         // The lane already rejected/resolved the control's
-                        // completions; the slot just frees.
-                        Err(_) => *in_flight_control = None,
+                        // completions; the entry just leaves.
+                        Err(_) => {
+                            in_flight_control.settling.remove(index);
+                        }
                     }
                 }
             },
@@ -5321,19 +5212,15 @@ struct TrackedInstance {
     wait_slots: Arc<crate::driver::instance::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
-    /// The bound program's divergence facts (attention-hook stage,
-    /// lora sink); copied onto each fire at launch admission.
-    facts: ProgramFacts,
 }
 
 impl TrackedInstance {
-    fn from_bound(bound: &BoundInstance, facts: ProgramFacts) -> Self {
+    fn from_bound(bound: &BoundInstance) -> Self {
         Self {
             pacing_wait_id: bound.pacing_wait_id,
             wait_slots: bound.wait_slots(),
             in_flight: 0,
             next_target_epoch: pie_waker::FIRST_COMPLETION_EPOCH,
-            facts,
         }
     }
 
@@ -5541,21 +5428,15 @@ mod tests {
         crate::driver::BoundInstance,
         Vec<Arc<crate::driver::ChannelEndpoint>>,
     )> {
-        // The dummy fixture's site summary stands in for the summary a real
-        // driver's capabilities would report; spawn the scheduler with the
-        // same one, exactly as `scheduler::build_driver_scheduler` reads it
-        // off the registered `DriverSpec`.
-        let summary = options.model_site_summary.clone();
         let driver_id = driver::register_driver_backend(
             DriverSpec {
                 num_kv_pages: 16,
                 limits,
                 device_geometry_port_mask: 0,
-                model_site_summary: summary.clone(),
             },
             DriverBackend::Dummy(crate::driver::DummyDriver::new(options)),
         );
-        let scheduler = BatchScheduler::new(driver_id, driver_id, 16, limits, 1, 1, summary);
+        let scheduler = BatchScheduler::new(driver_id, driver_id, 16, limits, 1, 1);
         let program_id = crate::scheduler::register_program(driver_id, dummy_program()).await?;
         let endpoints = register_test_channels(driver_id, [7, 8]).await?;
         let bound = crate::scheduler::bind_instance(
@@ -5730,9 +5611,8 @@ mod tests {
         let (rollback_tx, rollback_rx) = crossbeam::channel::unbounded();
         let mut lane_inflight = 1;
         let mut launches = VecDeque::new();
-        let mut control = None;
+        let mut control = InFlightControls::default();
         let mut instances = HashMap::new();
-        let mut program_facts = HashMap::new();
         let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
 
         BatchScheduler::apply_lane_reply(
@@ -5741,7 +5621,6 @@ mod tests {
                 commit: LaneCommit::BindInstance {
                     pipeline_id: None,
                     bound,
-                    registered_program: None,
                     respond: BindRespond::Bind(response),
                 },
             },
@@ -5749,7 +5628,6 @@ mod tests {
             &mut launches,
             &mut control,
             &mut instances,
-            &mut program_facts,
             &mut frame_policy,
             &rollback_tx,
         );
@@ -5770,57 +5648,6 @@ mod tests {
                 .published(pacing_wait_id)
                 .is_none()
         );
-    }
-
-    #[test]
-    fn program_facts_derive_hooks_and_lora_from_the_launch_package() {
-        use pie_driver_abi::plan::{LaunchOp, LaunchPackage, LaunchStage};
-
-        let plan = ProgramRegistration {
-            launch: LaunchPackage {
-                names: vec!["attn_page_mask".to_string(), "lora".to_string()],
-                stages: vec![
-                    // Prologue carrying the pass-wide lora sink (its one
-                    // T11-legal home).
-                    LaunchStage {
-                        kind: 0,
-                        ops: vec![LaunchOp {
-                            code: u16::from(pie_ir::op::tags::SINK_CALL),
-                            name_index: 1,
-                            ..LaunchOp::default()
-                        }],
-                        ..LaunchStage::default()
-                    },
-                    // An OnAttn hook stage.
-                    LaunchStage {
-                        kind: 2,
-                        ..LaunchStage::default()
-                    },
-                ],
-                ..LaunchPackage::default()
-            },
-            ..ProgramRegistration::default()
-        };
-        let facts = DriverLane::program_facts(&plan);
-        assert!(facts.attention_hooks);
-        assert!(facts.lora_sink);
-        assert!(!facts.page_mask_sink);
-
-        // A sink call naming "attn_page_mask" flips the page-mask axis and
-        // ONLY that axis; a hook-free program stays hook-free.
-        let mut masked = plan.clone();
-        masked.launch.stages.truncate(1);
-        masked.launch.stages[0].ops[0].name_index = 0;
-        let facts = DriverLane::program_facts(&masked);
-        assert!(!facts.attention_hooks);
-        assert!(!facts.lora_sink);
-        assert!(facts.page_mask_sink);
-
-        // An empty registration (no launch package) degrades to all-false.
-        let facts = DriverLane::program_facts(&ProgramRegistration::default());
-        assert!(!facts.attention_hooks);
-        assert!(!facts.lora_sink);
-        assert!(!facts.page_mask_sink);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5987,53 +5814,6 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|entry| entry.starts_with("launch-shape tokens=2 programs=1"))
-        );
-        Ok(())
-    }
-
-    /// Dummy-path end-to-end for the capabilities site handshake: a
-    /// scheduler spawned from a driver whose fixture reports a populated
-    /// `model_site_summary` (the MoE shape a real CUDA driver would derive
-    /// from its validated plan) seals and launches a real frame. The
-    /// summary maps into fire-plan sites at spawn
-    /// (`site_table::summary_sites`) and `build_frame_submission`'s merge
-    /// assert — active in this debug-build test — verifies the sealed
-    /// frame's plan carried them; the launch completing normally pins that
-    /// a populated summary is informational and changes no scheduling
-    /// behavior.
-    #[tokio::test(flavor = "current_thread")]
-    async fn populated_model_site_summary_flows_through_a_real_launch() -> anyhow::Result<()> {
-        let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound, _endpoints) =
-            setup_scheduler_with_options(DummyDriverOptions {
-                model_site_summary: pie_driver_abi::ModelSiteSummary {
-                    expert_sites: vec![pie_driver_abi::ExpertSiteSummary {
-                        experts: 256,
-                        top_k: 8,
-                    }],
-                },
-                operation_log: Some(operation_log.clone()),
-                ..DummyDriverOptions::default()
-            })
-            .await?;
-
-        let completion = bound.reserve_completion();
-        crate::scheduler::submit_async(
-            dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            0,
-            None,
-            completion.clone(),
-        )?;
-        timeout(Duration::from_secs(5), completion).await??;
-        assert!(
-            operation_log
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|entry| entry.starts_with("launch-shape tokens=1 programs=1")),
-            "the fire launches exactly as without a summary"
         );
         Ok(())
     }
@@ -6223,7 +6003,7 @@ mod tests {
             false,
         );
         let mut pending: PendingQueue =
-            VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
+            VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
         completion.request_cancel();
         BatchScheduler::reject_pipeline_queued(&mut pending, pid, Some(&completion));
         assert_eq!(pending.len(), 1);
@@ -6720,7 +6500,7 @@ mod tests {
         let mut lane_token = 0u64;
         let mut instances = HashMap::new();
         let mut in_flight_launches = VecDeque::new();
-        let mut in_flight_control = None;
+        let mut in_flight_control = InFlightControls::default();
         let limits = SchedulerLimits {
             max_forward_requests: 64,
             max_forward_tokens: 64,
@@ -6749,7 +6529,6 @@ mod tests {
             &mut ScanCache::default(),
             &mut SlotBuffer::new(),
             false,
-            &[],
         );
         assert!(progress);
         assert!(
@@ -6766,7 +6545,9 @@ mod tests {
     #[test]
     fn instance_queued_work_gate_sees_launches() {
         let pid = ProcessId::new_v4();
-        let pending = VecDeque::from([QueuedItem::Launch(dummy_launch_request(pid, 7))]);
+        let pending = VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(
+            dummy_launch_request(pid, 7),
+        ))]);
         assert!(BatchScheduler::instance_has_queued_work(&pending, 7));
         assert!(!BatchScheduler::instance_has_queued_work(&pending, 8));
     }
@@ -6983,7 +6764,6 @@ mod tests {
                     max_page_refs: 64,
                 },
                 device_geometry_port_mask: 0,
-                model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
             },
             DriverBackend::Dummy(crate::driver::DummyDriver::new(
                 DummyDriverOptions::default(),
@@ -7000,7 +6780,6 @@ mod tests {
             },
             1,
             1,
-            pie_driver_abi::ModelSiteSummary::default(),
         );
         let exporter_bytes = TraceContainer {
             names: vec!["shared".to_string()],
@@ -7218,7 +6997,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn two_pipelines_coalesce_into_one_wave_after_cold_hold() -> anyhow::Result<()> {
+    async fn two_pipelines_coalesce_into_one_wave() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound_a, _endpoints) = setup_scheduler_with_limits(
             DummyDriverOptions {
@@ -7236,8 +7015,7 @@ mod tests {
 
         // Submitted back-to-back, no await in between: both land in the
         // scheduler's queue before it next drains, so both `on_pipeline_
-        // request` calls land in the SAME wave-gather — no timing race
-        // with the 500us cold-hold window.
+        // request` calls land in the SAME wave-gather.
         let first = bound_a.reserve_completion();
         crate::scheduler::submit_async(
             dummy_launch(),
@@ -7257,10 +7035,10 @@ mod tests {
             second.clone(),
         )?;
 
-        // The wait-all quorum's bootstrap cold-hold gathers both pipelines'
-        // first requests into ONE dense wave (`requests=2`) instead of two
-        // solo fires — the dummy driver's launch-shape trace names the
-        // program count directly.
+        // The wait-all gate holds the seal until every member is ready, so
+        // both pipelines' first requests land in ONE dense wave
+        // (`requests=2`) instead of two solo fires — the dummy driver's
+        // launch-shape trace names the program count directly.
         let coalesced = timeout(Duration::from_secs(5), async {
             loop {
                 let hit = operation_log
@@ -7680,394 +7458,36 @@ mod tests {
             !grouping.push(&host_on_device, limits, 16),
             "wire rows distinguish a host-derived mask from dense device lowering"
         );
-        // NS-2 (spatial mask, default ON): a wire-BRLE-masked
-        // device-geometry decode lane COMPOSES — the split body serves the
-        // masked suffix and the unmasked prefix needs no mask rows, which
-        // is what dissolved the old solo rule.
         let mut ordinary_group = LaunchGrouping::default();
         ordinary_group.push(&dummy_launch_request(ProcessId::new_v4(), 5), limits, 16);
         assert!(
-            ordinary_group.accepts(&host_on_device, limits, 16),
-            "the spatial split composes resolved-geometry host masks"
+            !ordinary_group.accepts(&host_on_device, limits, 16),
+            "resolved-geometry host masks remain incompatible with reordered wire rows"
         );
-    }
 
-    /// The Stage 2 liveness seam (verdict note, finding 2): a POOLED
-    /// device-geometry masked decode fire (naive-masked's shape — prebuilt,
-    /// zero-row `qo_indptr = [0, 0]`, `AttnMask` channel bound, geometry
-    /// resolved on device) must never share a step with wire fires, in
-    /// EITHER admission order. `fire_device_geometry` builds this plan and
-    /// stamps `device_resolved_geometry`; before that stamp landed, the
-    /// host-lowered (BRLE) shape of the mask classified as an ordinary
-    /// "co-batches freely" wire mask, the scheduler composed it with wire
-    /// fires, and the driver's v1 mask scope threw
-    /// `RetryableLaunchError("ptir: dense device mask in a multi-program
-    /// batch requires solo retry")` — poisoning the wave and leaking the
-    /// dead lanes' pages. Observed twice live under mixed masked+plain
-    /// load.
-    #[test]
-    fn launch_grouping_refuses_pooled_masked_device_geometry_mixes() {
-        let limits = SchedulerLimits {
-            max_forward_requests: 8,
-            max_forward_tokens: 4096,
-            max_page_refs: 4096,
-        };
-        // naive-masked's decode plan, as `fire_device_geometry` builds it:
-        // `host_lowered` selects the two per-fire mask lowerings — the
-        // seed/host-derivable fire ships wire BRLE rows
-        // (`FireAttnMask::Host`), a device-derived fire ships none
-        // (`FireAttnMask::Device`, the dense device mask).
-        let pooled_masked = |instance: u64, host_lowered: bool| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.prebuilt = true;
-            request.request = LaunchPlan {
-                qo_indptr: vec![0, 0],
-                has_user_mask: true,
-                device_resolved_geometry: true,
-                ..LaunchPlan::default()
-            };
-            if host_lowered {
-                request.request.masks =
-                    vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
-                request.request.mask_indptr = vec![0, 1];
-            }
-            assert!(
-                !request.requires_solo_submission(),
-                "the b=1 pooled fire is not structurally solo; only the \
-                 mask clauses keep it out of shared batches"
-            );
-            request
-        };
-        let envelope_decode = |instance: u64| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.request.device_resolved_geometry = true;
-            request
-        };
-
-        // NS-2 (spatial mask, default ON): the HOST-lowered pooled masked
-        // fire (wire BRLE rows) now COMPOSES with wire decode fires and
-        // envelope lanes — the split body's contract — while chunk
-        // prefills stay refused (multi-token) and the DEVICE-lowered
-        // (dense channel, no wire rows) shape stays fully solo.
-        {
-            let masked = pooled_masked(1, true);
-            let mut grouping = LaunchGrouping::default();
-            assert!(grouping.accepts(&masked, limits, 16));
-            grouping.push(&masked, limits, 16);
-            assert!(
-                grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 2), limits, 16),
-                "a wire decode fire composes with a host-lowered masked \
-                 device-geometry fire (the spatial split)"
-            );
-            let mut prefill = dummy_launch_request(ProcessId::new_v4(), 3);
-            prefill.request = dummy_prefill(64);
-            assert!(
-                grouping.accepts(&prefill, limits, 16),
-                "the mixed fire (default ON): a chunk-prefill fire \
-                 composes with a host-lowered masked device-geometry \
-                 fire — the prefill-class mask peel serves the shape \
-                 (prefix causal dispatch, masked 1-token suffix; \
-                 PIE_SPATIAL_MIXED=0 restores the refusal)"
-            );
-            assert!(
-                grouping.accepts(&envelope_decode(4), limits, 16),
-                "an envelope decode lane composes with a host-lowered \
-                 masked device-geometry fire (the spatial split)"
-            );
-            let mut grouping = LaunchGrouping::default();
-            grouping.push(
-                &dummy_launch_request(ProcessId::new_v4(), 5),
-                limits,
-                16,
-            );
-            assert!(
-                grouping.accepts(&pooled_masked(6, true), limits, 16),
-                "a host-lowered masked device-geometry fire joins wire \
-                 fires (the spatial split)"
-            );
-        }
-        {
-            // The DEVICE-lowered dense mask: no wire rows, nothing to
-            // pack at composed positions — solo in both directions,
-            // exactly as before.
-            let masked = pooled_masked(11, false);
-            let mut grouping = LaunchGrouping::default();
-            assert!(grouping.accepts(&masked, limits, 16));
-            grouping.push(&masked, limits, 16);
-            assert!(
-                !grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 12), limits, 16),
-                "a wire decode fire must not join a dense-device-masked fire"
-            );
-            let mut grouping = LaunchGrouping::default();
-            grouping.push(
-                &dummy_launch_request(ProcessId::new_v4(), 13),
-                limits,
-                16,
-            );
-            assert!(
-                !grouping.accepts(&pooled_masked(14, false), limits, 16),
-                "a dense-device-masked fire must not join wire fires"
-            );
-            let fresh = LaunchGrouping::default();
-            assert!(
-                fresh.accepts(&pooled_masked(15, false), limits, 16),
-                "the refused masked fire stays schedulable solo"
-            );
-        }
-    }
-
-    /// Dense-mask compose: a wire-BRLE-masked WIRE lane co-batches with
-    /// device-resolved decode envelopes (the frame decodes the wire rows
-    /// and fills causal for the envelopes host-side); the structured ×
-    /// wire mix stays refused (one custom-mask source per fire), and
-    /// masked DEVICE-GEOMETRY fires stay out in both directions.
-    #[test]
-    fn launch_grouping_composes_wire_masked_with_envelopes() {
-        let limits = SchedulerLimits {
-            max_forward_requests: 8,
-            max_forward_tokens: 4096,
-            max_page_refs: 4096,
-        };
-        let wire_masked = |instance: u64| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.request.has_user_mask = true;
-            request.request.masks =
-                vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
-            request.request.mask_indptr = vec![0, 1];
-            request
-        };
-        let envelope = |instance: u64| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.request.device_resolved_geometry = true;
-            request
-        };
-        let structured = |instance: u64| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.request.has_user_mask = true;
-            request.request.structured_device_mask = true;
-            request.request.device_resolved_geometry = true;
-            request
-        };
-
-        // Wire-masked first: envelopes join now (the relax), in both
-        // admission orders.
+        // The wire rows above are an INFERENCE, not the binding. A program
+        // that binds `AttnMask` to a channel gets its dense mask resolved on
+        // device whether or not this fire also lowered BRLE rows, so the
+        // binding itself has to keep the fire solo. `cuda_runahead_concurrent`
+        // is the case: 8 pipelines of a sink/sliding-window decode program,
+        // every fire carrying BOTH wire rows and the channel binding, batched
+        // into one step that the driver rejects — the failed prepare poisons
+        // descriptor channel 0 and every stream is lost.
+        let mut bound_dense = dummy_launch_request(ProcessId::new_v4(), 6);
+        bound_dense.request.dense_device_mask = true;
+        bound_dense.request.has_user_mask = true;
+        bound_dense.request.masks = vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+        bound_dense.request.mask_indptr = vec![0, 1];
         let mut grouping = LaunchGrouping::default();
-        assert!(grouping.accepts(&wire_masked(1), limits, 16));
-        grouping.push(&wire_masked(1), limits, 16);
         assert!(
-            grouping.accepts(&envelope(2), limits, 16),
-            "an envelope decode joins a wire-masked wire lane (the frame \
-             assembles wire rows + causal fill)"
+            grouping.push(&bound_dense, limits, 16),
+            "a channel-bound dense mask seals its step even with wire rows"
         );
-        let mut grouping = LaunchGrouping::default();
-        grouping.push(&envelope(3), limits, 16);
+        let mut ordinary_group = LaunchGrouping::default();
+        ordinary_group.push(&dummy_launch_request(ProcessId::new_v4(), 7), limits, 16);
         assert!(
-            grouping.accepts(&wire_masked(4), limits, 16),
-            "a wire-masked wire lane joins envelope decodes"
-        );
-
-        // The structured x wire mix stays refused, both orders.
-        let mut grouping = LaunchGrouping::default();
-        grouping.push(&structured(5), limits, 16);
-        assert_eq!(
-            grouping.refusal(&wire_masked(6), limits, 16),
-            Some("mask-compose"),
-            "wire mask must not join a structured-mask group"
-        );
-        let mut grouping = LaunchGrouping::default();
-        grouping.push(&wire_masked(7), limits, 16);
-        assert_eq!(
-            grouping.refusal(&structured(8), limits, 16),
-            Some("mask-compose"),
-            "a structured-mask fire must not join a wire-masked group"
-        );
-    }
-
-    /// Stage 2 item A: a pooled device-geometry fire whose device mask
-    /// statically recognizes as STRUCTURED (`structured_device_mask`,
-    /// naive-masked's `mask_mode=structured` shape, attention-sink /
-    /// sliding-window-attention's real producers) CO-BATCHES — with
-    /// envelope decode lanes, wire decode fires, and other structured
-    /// fires, in either admission order. The driver fills the mask-free
-    /// lanes' descriptors with causal and packs per lane. A genuinely
-    /// dense (unrecognized) device mask keeps the solo contract, and wire
-    /// (BRLE) masks stay out of composed batches — both pinned by
-    /// `launch_grouping_refuses_pooled_masked_device_geometry_mixes`; the
-    /// wire-mask exclusion is re-pinned here against a structured group.
-    #[test]
-    fn launch_grouping_co_batches_structured_device_masks() {
-        let limits = SchedulerLimits {
-            max_forward_requests: 8,
-            max_forward_tokens: 4096,
-            max_page_refs: 4096,
-        };
-        let structured_masked = |instance: u64| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.prebuilt = true;
-            request.request = LaunchPlan {
-                qo_indptr: vec![0, 0],
-                has_user_mask: true,
-                structured_device_mask: true,
-                device_resolved_geometry: true,
-                ..LaunchPlan::default()
-            };
-            request
-        };
-        let envelope_decode = |instance: u64| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.request.device_resolved_geometry = true;
-            request
-        };
-
-        // Structured fire first: envelope decode, wire decode, and a second
-        // structured fire all join (the mixed repro's composition, one wave).
-        let mut grouping = LaunchGrouping::default();
-        assert!(grouping.accepts(&structured_masked(1), limits, 16));
-        assert!(
-            !grouping.push(&structured_masked(1), limits, 16),
-            "a structured device mask must not close the group"
-        );
-        assert!(
-            grouping.accepts(&envelope_decode(2), limits, 16),
-            "an envelope decode lane co-batches behind a structured-masked fire"
-        );
-        grouping.push(&envelope_decode(2), limits, 16);
-        assert!(
-            grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 3), limits, 16),
-            "a wire decode fire co-batches behind a structured-masked fire"
-        );
-        assert!(
-            grouping.accepts(&structured_masked(4), limits, 16),
-            "two structured-masked fires co-batch (per-lane descriptors)"
-        );
-
-        // Envelope decode first: the structured fire joins (the reverse
-        // admission order).
-        let mut grouping = LaunchGrouping::default();
-        grouping.push(&envelope_decode(5), limits, 16);
-        assert!(
-            grouping.accepts(&structured_masked(6), limits, 16),
-            "a structured-masked fire joins envelope decode lanes"
-        );
-        grouping.push(&structured_masked(6), limits, 16);
-        assert!(
-            grouping.accepts(&envelope_decode(7), limits, 16),
-            "later envelope lanes still join after the structured admit"
-        );
-
-        // The structured bit relaxes ONLY the structured shape: a dense
-        // device mask in the same group state still refuses, in both orders.
-        let dense_masked = |instance: u64| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.request = LaunchPlan {
-                qo_indptr: vec![0, 0],
-                has_user_mask: true,
-                device_resolved_geometry: true,
-                ..LaunchPlan::default()
-            };
-            request
-        };
-        assert!(
-            !grouping.accepts(&dense_masked(8), limits, 16),
-            "a dense device mask must not ride a structured co-batch"
-        );
-        let mut grouping = LaunchGrouping::default();
-        grouping.push(&dense_masked(9), limits, 16);
-        assert!(
-            !grouping.accepts(&structured_masked(10), limits, 16),
-            "a structured fire must not join a dense-masked solo group"
-        );
-
-        // Wire (BRLE) masks still index the wire layout: they never join a
-        // structured device-geometry group, in either order.
-        let wire_masked = |instance: u64| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.request.has_user_mask = true;
-            request.request.masks =
-                vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
-            request.request.mask_indptr = vec![0, 1];
-            request
-        };
-        let mut grouping = LaunchGrouping::default();
-        grouping.push(&structured_masked(11), limits, 16);
-        assert!(
-            !grouping.accepts(&wire_masked(12), limits, 16),
-            "a wire-masked fire must not join a structured device-geometry group"
-        );
-        let mut grouping = LaunchGrouping::default();
-        grouping.push(&wire_masked(13), limits, 16);
-        assert!(
-            !grouping.accepts(&structured_masked(14), limits, 16),
-            "a structured fire must not join a wire-masked group"
-        );
-    }
-
-    /// The page-mask/pure-decode grouping invariant: an
-    /// `attn_page_mask`-writing program shares a batch only with
-    /// single-token (decode) rows — the driver throws on a written mask off
-    /// the paged decode path, so mixing would kill the whole fire.
-    #[test]
-    fn launch_grouping_keeps_page_mask_programs_pure_decode() {
-        let limits = SchedulerLimits {
-            max_forward_requests: 8,
-            max_forward_tokens: 4096,
-            max_page_refs: 4096,
-        };
-        let make_page_mask_decode = |instance| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.page_mask_program = true;
-            request
-        };
-        let make_chunk_prefill = |instance| {
-            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
-            request.request = dummy_prefill(64);
-            request
-        };
-
-        // Page-mask decode + plain single-token decode co-batch.
-        let quest = make_page_mask_decode(1);
-        let decode = dummy_launch_request(ProcessId::new_v4(), 2);
-        let mut grouping = LaunchGrouping::default();
-        assert!(grouping.accepts(&quest, limits, 16));
-        grouping.push(&quest, limits, 16);
-        assert!(
-            grouping.accepts(&decode, limits, 16),
-            "a page-mask program must keep co-batching with pure-decode lanes"
-        );
-
-        // Page-mask first, chunk prefill second: the prefill is refused
-        // from THIS group (deferred to the next wave), not dropped — a
-        // fresh group takes it.
-        let prefill = make_chunk_prefill(3);
-        assert!(
-            !grouping.accepts(&prefill, limits, 16),
-            "a multi-token fire must not join a page-mask batch: the driver \
-             throws on a written mask off the pure-decode path"
-        );
-        let fresh = LaunchGrouping::default();
-        assert!(
-            fresh.accepts(&prefill, limits, 16),
-            "the refused prefill stays schedulable on its own wave"
-        );
-
-        // Order independence: multi-token first, page-mask second also
-        // splits.
-        let mut grouping = LaunchGrouping::default();
-        assert!(grouping.accepts(&prefill, limits, 16));
-        grouping.push(&prefill, limits, 16);
-        assert!(
-            !grouping.accepts(&make_page_mask_decode(4), limits, 16),
-            "a page-mask program must not join a batch holding multi-token rows"
-        );
-
-        // Narrowness: a hook program WITHOUT the page-mask sink (snapkv
-        // score capture — legal on prefill) still co-batches with
-        // multi-token fires.
-        let mut hook_only = dummy_launch_request(ProcessId::new_v4(), 5);
-        hook_only.hook_program = true;
-        assert!(
-            grouping.accepts(&hook_only, limits, 16),
-            "plain hook programs stay freely mixable with prefill"
+            !ordinary_group.accepts(&bound_dense, limits, 16),
+            "and never joins a step that already has a member"
         );
     }
 
@@ -8082,9 +7502,15 @@ mod tests {
         let pipeline_a = ProcessId::new_v4();
         let pipeline_b = ProcessId::new_v4();
         let mut pending = PendingQueue::default();
-        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
-        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
-        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_b, 2)));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
+            pipeline_a, 1,
+        ))));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
+            pipeline_a, 1,
+        ))));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
+            pipeline_b, 2,
+        ))));
         pending.push_back(QueuedItem::CloseInstance {
             id: 9,
             pacing_wait_id: 0,
@@ -8092,6 +7518,7 @@ mod tests {
 
         assert!(BatchScheduler::rotate_launch_for_wave_work(
             &mut pending,
+            true,
             true
         ));
 
@@ -8129,10 +7556,10 @@ mod tests {
     fn launch_rotation_reaches_a_pre_launch_copy() {
         let make_pending = || {
             let mut pending = PendingQueue::default();
-            pending.push_back(QueuedItem::Launch(dummy_launch_request(
+            pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
                 ProcessId::new_v4(),
                 1,
-            )));
+            ))));
             pending.push_back(QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
                 logical_completion: WorkItemCompletion::deferred_with_guard(None),
@@ -8144,13 +7571,14 @@ mod tests {
 
         let mut pending = make_pending();
         assert!(
-            !BatchScheduler::rotate_launch_for_wave_work(&mut pending, false),
+            !BatchScheduler::rotate_launch_for_wave_work(&mut pending, false, false),
             "a settling control slot (controls disallowed) must keep launch order"
         );
 
         let mut pending = make_pending();
         assert!(BatchScheduler::rotate_launch_for_wave_work(
             &mut pending,
+            true,
             true
         ));
         assert!(
@@ -8193,7 +7621,7 @@ mod tests {
         frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
 
         let mut pending: PendingQueue =
-            VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
+            VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
         let (lane, _lane_rx) = test_lane(None);
         let mut lane_inflight = 0u64;
         let mut lane_token = 0u64;
@@ -8227,7 +7655,6 @@ mod tests {
             limits,
             &stats,
             &waves,
-            &[],
         );
         assert!(progress, "the drop is progress");
         assert!(!posted, "nothing launches for a cancelled fire");
@@ -8281,7 +7708,7 @@ mod tests {
 
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let mut pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(Box::new(request)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(request))),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
                 response: resize_tx,
@@ -8297,7 +7724,7 @@ mod tests {
         let mut lane_token = 0u64;
         let mut instances = HashMap::new();
         let mut in_flight_launches = VecDeque::new();
-        let mut in_flight_control = None;
+        let mut in_flight_control = InFlightControls::default();
         let limits = SchedulerLimits {
             max_forward_requests: 64,
             max_forward_tokens: 64,
@@ -8320,7 +7747,6 @@ mod tests {
             &mut ScanCache::default(),
             &mut SlotBuffer::new(),
             false,
-            &[],
         );
         assert!(progress, "the copy dispatch is progress");
         assert!(
@@ -8328,11 +7754,243 @@ mod tests {
             "the gathering frame must not post"
         );
         assert_eq!(
-            in_flight_control.as_ref().map(|control| control.operation),
+            in_flight_control
+                .iter()
+                .next()
+                .map(|control| control.operation),
             Some("tracked KV copy"),
             "the copy dispatches out-of-band past the launch and the resize"
         );
         assert_eq!(pending.len(), 2, "launch and resize keep their positions");
+    }
+
+    /// Standalone copies pipeline instead of queueing for one slot. Nothing
+    /// queued orders against them, so the single control slot only ever made
+    /// each restore wait out the ones ahead of it: measured at 512-way KV
+    /// contention, up to 7 restores wanted the slot at once and each H2D
+    /// copy billed 22.8 ms against ~3.3 ms of transfer, while the D2H side —
+    /// which the planner already issues one at a time, so it never queued —
+    /// ran 6.7x cheaper per page. An exclusive control still takes the whole
+    /// set (the next test).
+    #[test]
+    fn concurrent_standalone_copies_all_dispatch_in_one_pass() {
+        let (copy_tx, _copy_rx) = tokio::sync::oneshot::channel();
+        let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
+        let mut pending: PendingQueue = VecDeque::from([
+            QueuedItem::CopyKvTracked {
+                plan: crate::driver::KvCopyPlan::default(),
+                completion: ControlCompletion::new(),
+            },
+            QueuedItem::CopyKv {
+                plan: crate::driver::KvCopyPlan::default(),
+                response: copy_tx,
+            },
+            QueuedItem::CopyKvTracked {
+                plan: crate::driver::KvCopyPlan::default(),
+                completion: ControlCompletion::new(),
+            },
+            QueuedItem::ResizePool {
+                plan: PoolResizePlan::default(),
+                response: resize_tx,
+            },
+        ])
+        .into();
+        let (lane, _lane_rx) = test_lane(None);
+        let mut lane_inflight = 0u64;
+        let mut lane_token = 0u64;
+        let mut instances = HashMap::new();
+        let mut in_flight_launches = VecDeque::new();
+        let mut in_flight_control = InFlightControls::default();
+        let limits = SchedulerLimits {
+            max_forward_requests: 64,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let stats = Arc::new(SchedulerStats::default());
+        let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+
+        let (progress, _) = BatchScheduler::dispatch_ready_items(
+            &lane,
+            &mut lane_inflight,
+            &mut lane_token,
+            &mut instances,
+            &mut pending,
+            &mut in_flight_launches,
+            &mut in_flight_control,
+            16,
+            limits,
+            &stats,
+            &mut frame_policy,
+            &mut ScanCache::default(),
+            &mut SlotBuffer::new(),
+            false,
+        );
+
+        assert!(progress);
+        assert_eq!(
+            in_flight_control.settling.len(),
+            3,
+            "every queued standalone copy is in flight after one pass"
+        );
+        assert_eq!(lane_inflight, 3, "each copy was posted to the lane");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the resize stays queued behind the settling copies"
+        );
+    }
+
+    /// The exclusivity half: an exclusive control (a `PreLaunchCopy`, whose
+    /// consumer fire is queued behind it, or a pool resize, whose pipe drain
+    /// IS its ordering mechanism) keeps the original single-slot rule in
+    /// both directions.
+    #[test]
+    fn an_exclusive_control_never_shares_the_in_flight_set() {
+        let settling = |holds_launches: bool| {
+            let mut controls = InFlightControls::default();
+            controls.push(PendingControl {
+                state: ControlSlotState::Posted { token: 1 },
+                logical_completion: None,
+                process_id: None,
+                pipeline_id: None,
+                tracked_completion: None,
+                operation: "settling",
+                holds_launches,
+            });
+            controls
+        };
+        let run = |mut in_flight_control: InFlightControls, item: QueuedItem| {
+            let mut pending: PendingQueue = VecDeque::from([item]).into();
+            let (lane, _lane_rx) = test_lane(None);
+            let mut lane_inflight = 1u64;
+            let mut lane_token = 1u64;
+            let mut instances = HashMap::new();
+            let mut in_flight_launches = VecDeque::new();
+            let limits = SchedulerLimits {
+                max_forward_requests: 64,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            };
+            let stats = Arc::new(SchedulerStats::default());
+            let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+            BatchScheduler::dispatch_ready_items(
+                &lane,
+                &mut lane_inflight,
+                &mut lane_token,
+                &mut instances,
+                &mut pending,
+                &mut in_flight_launches,
+                &mut in_flight_control,
+                16,
+                limits,
+                &stats,
+                &mut frame_policy,
+                &mut ScanCache::default(),
+                &mut SlotBuffer::new(),
+                false,
+            );
+            (pending.len(), in_flight_control.settling.len())
+        };
+
+        assert_eq!(
+            run(
+                settling(true),
+                QueuedItem::CopyKvTracked {
+                    plan: crate::driver::KvCopyPlan::default(),
+                    completion: ControlCompletion::new(),
+                }
+            ),
+            (1, 1),
+            "a settling exclusive control admits no standalone copy"
+        );
+
+        let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            run(
+                settling(false),
+                QueuedItem::ResizePool {
+                    plan: PoolResizePlan::default(),
+                    response: resize_tx,
+                }
+            ),
+            (1, 1),
+            "a resize waits for the settling copies to drain"
+        );
+    }
+
+    /// A lifecycle control never enters the in-flight set, so a settling
+    /// standalone copy must not delay one. Under churn the planner's
+    /// suspend/restore copies are in flight nearly continuously, and gating
+    /// binds on them made every bind wait out the strict-watchdog window: the
+    /// process stayed in `staged`, which pinned the cohort-boundary window
+    /// open (back when that still held the seal) and stalled the very traffic
+    /// the copy was settling behind.
+    #[test]
+    fn a_bind_dispatches_past_a_settling_standalone_copy() {
+        let mut pending: PendingQueue = VecDeque::from([QueuedItem::BindInstance {
+            pipeline_id: Some(ProcessId::new_v4()),
+            plan: InstanceBindingPlan {
+                driver_id: 0,
+                program_id: 0,
+                requested_instance_id: 0,
+                pacing_wait_id: 0,
+                channel_ids: Vec::new(),
+                seed_values: Vec::new(),
+                geometry_class: pie_driver_abi::GeometryClass::Host,
+            },
+            response: tokio::sync::oneshot::channel().0,
+        }])
+        .into();
+        let (lane, _lane_rx) = test_lane(None);
+        let mut lane_inflight = 0u64;
+        let mut lane_token = 0u64;
+        let mut instances = HashMap::new();
+        let mut in_flight_launches = VecDeque::new();
+        let mut in_flight_control = InFlightControls::default();
+        in_flight_control.push(PendingControl {
+            state: ControlSlotState::Posted { token: 1 },
+            logical_completion: None,
+            process_id: None,
+            pipeline_id: None,
+            tracked_completion: Some(ControlCompletion::new()),
+            operation: "tracked KV copy",
+            holds_launches: false,
+        });
+        let limits = SchedulerLimits {
+            max_forward_requests: 64,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let stats = Arc::new(SchedulerStats::default());
+        let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+
+        let (progress, _) = BatchScheduler::dispatch_ready_items(
+            &lane,
+            &mut lane_inflight,
+            &mut lane_token,
+            &mut instances,
+            &mut pending,
+            &mut in_flight_launches,
+            &mut in_flight_control,
+            16,
+            limits,
+            &stats,
+            &mut frame_policy,
+            &mut ScanCache::default(),
+            &mut SlotBuffer::new(),
+            false,
+        );
+
+        assert!(progress, "the bind dispatched");
+        assert!(
+            pending.is_empty(),
+            "the bind must not wait out a copy it shares nothing with"
+        );
+        assert_eq!(
+            in_flight_control.settling.len(),
+            1,
+            "the bind enters no in-flight set, so the copy is still alone"
+        );
     }
 
     /// §12 regression, barrier half: queued standalone copies and resizes
@@ -8371,7 +8029,7 @@ mod tests {
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let (copy_tx, _copy_rx) = tokio::sync::oneshot::channel();
         let pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(Box::new(request_a)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(request_a))),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
                 response: resize_tx,
@@ -8384,7 +8042,7 @@ mod tests {
                 plan: crate::driver::KvCopyPlan::default(),
                 response: copy_tx,
             },
-            QueuedItem::Launch(Box::new(request_b)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(request_b))),
             QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
                 logical_completion: WorkItemCompletion::deferred_with_guard(None),
@@ -8451,8 +8109,8 @@ mod tests {
         let rider = make(None);
         let (stamped_id, rider_id) = (stamped.logical_fire_id, rider.logical_fire_id);
         let mut pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(Box::new(stamped)),
-            QueuedItem::Launch(Box::new(rider)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(stamped))),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(rider))),
         ])
         .into();
 
@@ -8522,13 +8180,14 @@ mod tests {
             let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
             frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
             let mut pending: PendingQueue =
-                VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
+                VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
             let (lane, _lane_rx) = test_lane(None);
             let mut lane_inflight = 0u64;
             let mut lane_token = 1u64;
             let mut instances = HashMap::new();
             let mut in_flight_launches = VecDeque::new();
-            let mut in_flight_control = Some(PendingControl {
+            let mut in_flight_control = InFlightControls::default();
+            in_flight_control.push(PendingControl {
                 state: ControlSlotState::Posted { token: 1 },
                 logical_completion: None,
                 process_id: None,
@@ -8558,7 +8217,6 @@ mod tests {
                 &mut ScanCache::default(),
                 &mut SlotBuffer::new(),
                 false,
-                &[],
             );
             pending.len()
         };

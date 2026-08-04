@@ -378,44 +378,314 @@ fn bound_rs_working_set_ids<C: FireContext>(
     Ok(Ok(ids))
 }
 
-/// Resolve the pass's declared RS mode into the per-row plan the lowering
-/// needs: a buffered write covers each row's own token span, and a fold
-/// replays the lengths the guest supplied.
+/// Resolve the fire's `rs-geometry.fold-len` into the per-row plan the
+/// lowering needs.
+///
+/// `fold-len` says where each request's folded boundary lands, counted from
+/// the current boundary over `[buffer | this fire's tokens]`. That single
+/// scalar subsumes the three fold-mode methods this replaced:
+///
+/// | `fold_len`   | buffer    | plan                       |
+/// |--------------|-----------|----------------------------|
+/// | `> 0`        | empty     | `Fold` — the fast path     |
+/// | `0`          | empty     | `Buffer` — open a chunk    |
+/// | `0 < n <= B` | non-empty | `FoldBuffered` — commit    |
+///
+/// `fold-len` is CLAMPED to `B + T`, so "fold everything" is the fire-invariant
+/// constant `u32::MAX` — the SDK's default — rather than a value the guest
+/// would have to recompute from each fire's token count.
+///
+/// Every remaining position needs the SAME missing primitive: a recurrence
+/// that starts from `folded ⊕ replay(buffer)` rather than from `folded`. The
+/// driver has no such read path (see
+/// `.wiki/designs/linear-state-programming-model.md` §2), so all of them are
+/// refused:
+///
+/// - `n == B + T` with `B > 0` — the fast path, "fold everything I have".
+/// - `B < n < B + T` — a boundary inside this fire's own new tokens. The
+///   extended layout describes it fine; the KERNELS do not, because
+///   `commit_len` truncates the sequence rather than merely moving the state
+///   snapshot, so the tokens past the boundary would get no outputs.
+/// - `n == 0` with `B > 0` — appending a second chunk. This one is quiet: the
+///   fire happily emits logits computed as though the buffer were empty.
+///   (Both of the above now RUN; only the interior boundary is still refused.)
+///
+/// They are errors rather than silent approximations because approximating a
+/// fold in either direction is unrecoverable: folding early destroys tokens
+/// the guest still wanted, and folding late silently drops them from the
+/// context.
 fn rs_plan_for(
-    mode: &crate::pipeline::instance::RsMode,
-    rows: usize,
+    fold_len: &Option<Vec<u32>>,
+    stores: &crate::store::registry::Stores,
+    ids: &[crate::store::rs::RsWorkingSetId],
     qo_indptr: &[u32],
 ) -> Result<rs::RsPlan, String> {
-    use crate::pipeline::instance::RsMode;
-    Ok(match mode {
-        RsMode::Fold => rs::RsPlan::Fold,
-        RsMode::Buffer { start_token } => rs::RsPlan::Buffer {
-            start_token: *start_token,
-            row_tokens: (0..rows)
-                .map(|row| {
-                    qo_indptr
-                        .get(row + 1)
-                        .zip(qo_indptr.get(row))
-                        .map(|(end, start)| end.saturating_sub(*start))
-                        .unwrap_or(0)
-                })
-                .collect(),
-        },
-        RsMode::FoldBuffered { tokens } => {
-            if tokens.len() != rows {
-                return Err(format!(
-                    "fold-buffered supplied {} length(s) for {rows} request row(s)",
-                    tokens.len()
-                ));
-            }
-            rs::RsPlan::FoldBuffered {
-                tokens: tokens.clone(),
+    let rows = ids.len();
+    if rows == 0 {
+        return Ok(rs::RsPlan::Fold);
+    }
+    if let Some(lens) = fold_len {
+        if lens.len() != rows {
+            return Err(format!(
+                "rs-geometry.fold-len supplied {} length(s) for {rows} request row(s)",
+                lens.len()
+            ));
+        }
+    }
+    let mut row_tokens: Vec<u32> = (0..rows)
+        .map(|row| {
+            qo_indptr
+                .get(row + 1)
+                .zip(qo_indptr.get(row))
+                .map(|(end, start)| end.saturating_sub(*start))
+                .unwrap_or(0)
+        })
+        .collect();
+    // Buffer occupancy in TOKENS, exactly. This used to be a page-granular
+    // upper bound (`buffer_size() * page_tokens`), which is wrong in the one
+    // way that matters: you must reserve a page BEFORE you can buffer into it,
+    // so a freshly allocated, genuinely empty buffer reported a full page of
+    // occupancy and the legal "append onto an empty buffer" fire was refused
+    // as an append onto a non-empty one. The store now publishes the written
+    // span, so `buffer_tokens` is exact.
+    let mut buffered: Vec<u32> = {
+        let store = stores.rs.lock().unwrap();
+        let mut out = Vec::with_capacity(rows);
+        for (row, id) in ids.iter().enumerate() {
+            match store.buffer_tokens(*id) {
+                Ok(tokens) => out.push(tokens),
+                // A working set whose last fold had a device-resident length
+                // has no exact occupancy any more, and classifying a fire
+                // against a bound would either replay absorbed tokens (a
+                // double fold) or drop live ones. The store says so; say it
+                // back with the row that tripped it.
+                Err(crate::store::rs::RsError::BufferOccupancyIndeterminate { bound }) => {
+                    return Err(format!(
+                        "request row {row} needs its exact buffer occupancy, but the working \
+                         set's last fold had a device-resident length: at most {bound} token(s) \
+                         remain and the true count reached only the driver. Free the buffer to \
+                         settle the boundary before a fire that must replay it"
+                    ));
+                }
+                Err(_) => out.push(0),
             }
         }
+        out
+    };
+
+    // The fold length lives on device: only the driver will ever resolve it.
+    // The host can still PLAN, because the driver CLAMPS the resolved count to
+    // the bound the host publishes — the row's whole live buffer `b`. That
+    // clamp is what makes the dispatch knowable in advance: every value the
+    // device can name lies in `[1, b]`, and every value in `[1, b]` is the
+    // same `FoldBuffered` replay. The fire's own new tokens are irrelevant to
+    // the choice for the same reason they are irrelevant to any commit — the
+    // linear layers do not compute them, they replay the slabs.
+    //
+    // The price is that the boundary can never land INSIDE this fire's own new
+    // tokens under a device-resident length, because the clamp forbids it.
+    // That is the interior-boundary case, which is refused for host-known
+    // lengths too, so nothing is lost here that is available elsewhere.
+    if fold_len.is_none() {
+        if let Some(row) = (0..rows).find(|row| buffered[*row] == 0) {
+            return Err(format!(
+                "rs-geometry.fold-len is device-resident, but request row {row} has an empty \
+                 buffer: there is nothing for the device's count to name"
+            ));
+        }
+        return Ok(rs::RsPlan::FoldBuffered {
+            tokens: buffered,
+            fold_len_is_device: true,
+        });
+    }
+    let fold_len = fold_len.as_deref().expect("checked above");
+
+    // Classify each row independently, then decide what the PASS can be.
+    // `Fold` and `Buffer` mix freely: both run this fire's own tokens through
+    // the full stack over the extended layout, and they differ only in whether
+    // the row's recurrence persists — which the driver now expresses as a
+    // per-row mask rather than a per-pass flag. `Commit` does not mix with
+    // anything: it replays activations out of the slabs instead of computing
+    // them, which is a different dispatch, not a different flag.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Position {
+        Fold,
+        Buffer,
+        Commit,
+    }
+    let mut kinds: Vec<Position> = Vec::with_capacity(rows);
+    let mut fold_tokens: Vec<u32> = vec![0; rows];
+    for row in 0..rows {
+        let (b, t) = (buffered[row], row_tokens[row]);
+        let n = fold_len[row].min(b + t);
+        fold_tokens[row] = n;
+        let here = if t == 0 {
+            // The guest said, in the only way that cannot be confused with
+            // anything else, "I have nothing to compute; only move the
+            // boundary". A row spanning no tokens is a PURE REPLAY: the
+            // linear layers gather the buffered prefix [0, n) out of the
+            // slabs and return before the output projection.
+            //
+            // This used to be inferred from `n <= b`, which is an incidental
+            // property of a commit rather than a statement of intent -- and
+            // it is exactly the condition a fire folding BEHIND its own new
+            // tokens satisfies while meaning the opposite. Reading the
+            // emptiness of the row directly frees `n <= b` to mean what it
+            // says.
+            if n == 0 {
+                return Err(format!(
+                    "request row {row} carries no tokens and folds nothing: it neither \
+                     computes nor moves the boundary, so the fire has no effect. \
+                     A row spanning no tokens means \"replay the buffered prefix \
+                     and stop\", which needs a fold length"
+                ));
+            }
+            Position::Commit
+        } else if n == 0 {
+            // A pure append. Still the extended layout when b > 0, but the
+            // folded boundary does not move.
+            Position::Buffer
+        } else if n == b + t {
+            // The fold takes the WHOLE row. With nothing buffered that is the
+            // plain in-forward advance and no buffer is involved at all; with
+            // a non-empty buffer it is the same thing over the extended
+            // `[b | t]` layout, and since the boundary is the last extended
+            // token the ordinary end-of-sequence state writeback lands exactly
+            // on it -- no `commit_len`, no kernel work.
+            if b == 0 {
+                Position::Fold
+            } else {
+                Position::Buffer
+            }
+        } else {
+            // Everything else runs over the extended `[b | t]` layout, which
+            // IS the row's buffer token space. The driver replays the b
+            // buffered tokens ahead of the t new ones (every recurrence
+            // initializes from `recurrent_state[slot]`, the state at F),
+            // scatters all t new ones into the buffer, and snapshots the
+            // recurrent state at extended token n. So one shape covers the
+            // append (n == 0), the fold through a non-empty buffer
+            // (n == b + t), the boundary landing strictly INSIDE this fire's
+            // own new tokens (b < n < b + t), and the boundary landing BEHIND
+            // them (n < b) -- folding a previous window's accepted prefix in
+            // the very fire that writes the next one.
+            //
+            // The interior case is not `commit_len`: that TRUNCATES the
+            // sequence, and a fire folding at an interior boundary still owes
+            // logits for the tokens past it. The driver cuts the row in two
+            // instead and runs the recurrence twice on one stream -- the head
+            // persisting its end-of-sequence state onto the boundary, the tail
+            // continuing from that state to produce the remaining outputs
+            // without moving it again.
+            Position::Buffer
+        };
+        kinds.push(here);
+    }
+
+    // A pure commit cannot share a fire. Its rows are not computed at all --
+    // the linear layers gather already-buffered activations and return before
+    // the output projection -- so there is no per-row switch that would let a
+    // computing row ride along.
+    if kinds.iter().any(|k| *k == Position::Commit) && !kinds.iter().all(|k| *k == Position::Commit)
+    {
+        let row = kinds
+            .iter()
+            .position(|k| *k == Position::Commit)
+            .expect("checked above");
+        return Err(format!(
+            "request row {row} only replays buffered tokens while another row of the same \
+             fire computes new ones; a buffered commit gathers its activations instead of \
+             producing them, so it cannot share a pass. Split the fire"
+        ));
+    }
+
+    let pass = if kinds.iter().all(|k| *k == Position::Commit) {
+        Position::Commit
+    } else if kinds.iter().all(|k| *k == Position::Fold) {
+        Position::Fold
+    } else {
+        // Mixed, or uniformly buffered. Either way the pass runs the buffered
+        // shape; an `in_forward` row simply owns no buffer inside it.
+        Position::Buffer
+    };
+    let in_forward: Vec<bool> = kinds.iter().map(|k| *k == Position::Fold).collect();
+    for (row, forward) in in_forward.iter().enumerate() {
+        if *forward {
+            // Its boundary moves through its OWN tokens, not through a buffer,
+            // so it carries no fold length: `validate_fold` measures against
+            // buffered capacity, which this row does not have.
+            fold_tokens[row] = 0;
+            buffered[row] = 0;
+            row_tokens[row] = 0;
+        }
+    }
+
+    Ok(match pass {
+        Position::Fold => rs::RsPlan::Fold,
+        // Each row opens at its own exact occupancy. The planner still refuses
+        // a non-zero one above until the recurrence can read the buffer, but
+        // the plan carries the truth either way, so relaxing that refusal is a
+        // one-line change rather than a re-derivation.
+        Position::Buffer => rs::RsPlan::Buffer {
+            start_tokens: buffered,
+            row_tokens,
+            fold_tokens,
+            in_forward,
+        },
+        Position::Commit => rs::RsPlan::FoldBuffered {
+            fold_len_is_device: false,
+            // `fold_tokens`, not the raw `fold_len`: the WIT promises the
+            // length is CLAMPED to the tail, which is what makes "fold
+            // everything" a fire-invariant `u32::MAX`. Under the old rule a
+            // commit was selected by `fold_len <= buffered`, so the raw value
+            // was already clamped by construction and the distinction never
+            // showed. A row that carries no tokens is a commit whatever its
+            // fold length says, so an unclamped `u32::MAX` would now reach
+            // `validate_fold` and be REFUSED as exceeding capacity.
+            tokens: fold_tokens,
+        },
     })
 }
 
 /// Phase-A RS demand for the acquisition grant.
+
+/// Drop the SYNTHESIZED read-out rows from a fire that replays the BUFFER.
+///
+/// A `FoldBuffered` fire scans activations that were computed by an earlier
+/// fire and are already sitting in buffer slabs. It exists only to move the
+/// folded boundary, so it returns from the linear layers before the output
+/// projection and produces no logits; the driver refuses one that declares
+/// sample rows. But an absent `readout` binding does not mean "sample nothing"
+/// — it means "sample each lane's last row" — and an empty readout channel has
+/// no expressible shape. So a guest that simply committed got a sample row it
+/// never asked for and a fire that could not run.
+///
+/// **Only `FoldBuffered`.** A plain `RsPlan::Fold` also advances the folded
+/// state, but it does so over the fire's OWN new tokens, running them through
+/// the full stack exactly as a prefill does — because that is what a prefill
+/// on a linear model IS. Its logits are ordinary and required. Suppressing
+/// them left `sampled_rows` at zero and the fused epilogue failed to launch
+/// with a zero extent, which is to say: every prefill on a linear model. The
+/// driver draws this line correctly already — its `rs_is_fold` is
+/// `mode == BufferFold`, nothing wider — so this must match it and not the
+/// looser "does this fire fold at all".
+///
+/// Only the default is dropped. An EXPLICIT readout on a buffered fold still
+/// reaches the driver and is still refused, loudly: asking for logits that
+/// cannot exist is a guest bug worth reporting, not one worth papering over.
+fn suppress_defaulted_readout_for_fold(
+    req: &mut crate::driver::LaunchPlan,
+    readout_defaulted: bool,
+    plan: &rs::RsPlan,
+) {
+    let replays_buffer = matches!(plan, rs::RsPlan::FoldBuffered { .. });
+    if !replays_buffer || !readout_defaulted {
+        return;
+    }
+    req.sampling_indices.clear();
+    req.sampling_indptr = vec![0; req.sampling_indptr.len()];
+}
+
 fn rs_slot_demand(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
@@ -881,8 +1151,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             cells,
             ws_rep,
             rs_reps,
-            rs_mode,
-            pass_max_layers,
+            rs_fold_len,
             kv_declaration,
             kv_declaration_realized,
             fwd_rep,
@@ -891,6 +1160,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             attn_mask,
             accesses,
             decode_envelope,
+            dense_mask,
         ) = {
             let p = ctx.resources().get_mut(&fwd)?;
             if let Some(e) = &p.failed {
@@ -908,21 +1178,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let bound = &p.instance.program.bound;
                 let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
                 let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-                // Device-geometry lowering: a statically structured mask
-                // classifies `Device { structured: true }` regardless of
-                // host derivability (item A — the driver re-derives it per
-                // lane from the trace, and wire BRLE rows would force the
-                // fire solo).
-                let attn_mask = match geometry::evaluate_attn_mask_device_geometry(
-                    bound,
-                    &mut known,
-                    &geometry.qo_indptr,
-                ) {
-                    Ok(mask) => mask,
-                    Err(error) => {
-                        return Ok(Err(format!("pipeline: fire attention mask: {error}")));
-                    }
-                };
+                let attn_mask =
+                    match geometry::evaluate_attn_mask(bound, &mut known, &geometry.qo_indptr) {
+                        Ok(mask) => mask,
+                        Err(error) => {
+                            return Ok(Err(format!("pipeline: fire attention mask: {error}")));
+                        }
+                    };
                 (geometry, attn_mask)
             } else {
                 let bound = &p.instance.program.bound;
@@ -970,8 +1232,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.cells.clone(),
                 p.kv_ws,
                 p.rs_ws.clone(),
-                p.rs_mode.clone(),
-                p.max_layers,
+                p.rs_fold_len.clone(),
                 p.kv_declaration,
                 p.kv_declaration_realized,
                 fwd.rep(),
@@ -980,33 +1241,23 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 attn_mask,
                 accesses,
                 p.decode_envelope.clone(),
+                p.dense_mask,
             )
         };
         crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::BindGeometry, phase_cpu);
         phase_cpu = crate::scheduler::phase_start();
         let mut req = crate::driver::LaunchPlan::default();
+        let readout_defaulted = geometry.readout_defaulted;
         geometry.apply_to(&mut req);
         req.device_resolved_geometry = decode_envelope.is_some();
+        // Carried to the batcher, which keeps such a fire out of shared
+        // waves — see `scheduler::worker::has_dense_device_mask`. The
+        // binding is the program's, so it holds for every fire of the pass
+        // whether or not this one's geometry resolved on the host wire.
+        req.dense_device_mask = dense_mask;
         req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
             && req.qo_indptr.windows(2).all(|lane| lane[1] - lane[0] == 1);
         attn_mask.apply_to(&mut req);
-        // STRUCTURAL v0 (S-1): the pass's declared layer truncation
-        // (forward-pass.set-max-layers). The env override remains as the
-        // battery scaffold — it wins when set, so a whole boot can be
-        // driven at depth k without inferlet changes.
-        req.max_layers = pass_max_layers;
-        {
-            static DEBUG_MAX_LAYERS: std::sync::OnceLock<Option<u32>> =
-                std::sync::OnceLock::new();
-            let k = DEBUG_MAX_LAYERS.get_or_init(|| {
-                std::env::var("PIE_DEBUG_MAX_LAYERS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            });
-            if let Some(k) = k {
-                req.max_layers = Some(*k);
-            }
-        }
         crate::pipeline::offload::try_encode(&mut req).await;
         // Resource preparation is independent of token position: realize the
         // declaration once, back only its missing frontier, then snapshot the
@@ -1079,12 +1330,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             Ok(ids) => ids,
             Err(error) => return Ok(Err(error)),
         };
-        let rs_plan = match rs_plan_for(&rs_mode, rs_reps.len(), &req.qo_indptr) {
+        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &req.qo_indptr) {
             Ok(plan) => plan,
             Err(error) => {
                 return Ok(Err(format!("pipeline: recurrent-state mode: {error}")));
             }
         };
+        suppress_defaulted_readout_for_fold(&mut req, readout_defaulted, &rs_plan);
         crate::planner::trace_mark!("build", pid, "hp-acquire");
         let mut attempts = 0;
         crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Declare, phase_cpu);
@@ -1298,62 +1550,6 @@ pub async fn submit_frame<C: FireContext>(
         let (_, rep) = fired[0];
         return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None).await;
     }
-    // Same-frame producer hazard (Stage 2 verdict, liveness seam 1): a
-    // DeviceGeometry-class pass resolves its descriptor ports from channel
-    // cells ON THE HOST at the driver's FramePrepare, and FramePrepare for
-    // EVERY step of a v14 frame runs before ANY step reaches the stream
-    // (driver context.cpp `launch`: an admitted frame is atomic, so all
-    // prepares precede all enqueues). A device-geometry fire behind another
-    // fire of the same frame therefore host-reads cells whose producing
-    // fire — in a run-ahead decode loop, its own previous fire, one slot
-    // earlier — is not even enqueued yet: the read fails
-    // (`descriptor_resolve.hpp` "not ready") and the whole frame poisons.
-    // The class is decided at bind (`inferlet::host::forward`, e.g. every
-    // dense-device-mask decode loop routes to pool-owned device geometry),
-    // so the hazard is structural per frame composition. Submit each fire
-    // as its own single-slot frame instead: one frame per lane seals per
-    // boundary, so the producer's frame is enqueued on-stream before the
-    // consumer's FramePrepare descriptor readback (which syncs that
-    // stream) — exactly the `PIE_FRAME_SIZE=1` shape that runs these
-    // passes correctly today, paid only by this lane.
-    let mut device_geometry_tail = false;
-    for &(_, rep) in fired.iter().skip(1) {
-        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        if ctx.resources().get(&fwd)?.devgeo.is_some() {
-            device_geometry_tail = true;
-            break;
-        }
-    }
-    if device_geometry_tail {
-        for &(slot, rep) in &fired {
-            let (lane, seq) = {
-                let pipeline = ctx.resources().get(&this)?;
-                if pipeline.scope.is_closed() {
-                    return Ok(Err("pipeline: pipeline is closed".to_string()));
-                }
-                (pipeline.scope.scheduler_id(), pipeline.next_frame_seq())
-            };
-            let stamp = crate::scheduler::FrameStamp {
-                lane,
-                seq,
-                slot: 0,
-                fires: 1,
-            };
-            let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
-            let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-            match submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await {
-                // A single-slot frame is arrival-complete on its own, so a
-                // mid-sequence failure strands nothing: the frames already
-                // submitted seal and drain without truncation bookkeeping.
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    return Ok(Err(format!("pipeline: frame slot {slot}: {error}")));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        return Ok(Ok(()));
-    }
     if let Err(error) = validate_frame(ctx, k, &fired)? {
         return Ok(Err(error));
     }
@@ -1401,6 +1597,29 @@ pub async fn submit_frame<C: FireContext>(
     Ok(Ok(()))
 }
 
+/// `forward.park()`: leave the frame wait-set on `this` until it submits
+/// again. Consumes a frame seq so the exit orders against this pipeline's own
+/// submits — every frame submitted before it must seal first, which is what
+/// makes it legal to park with fires still outstanding.
+///
+/// Silent no-op when there is no wait-set to leave: `k == 1` never batches
+/// across pipelines (`submit_frame` bypasses stamping entirely there), and a
+/// closed pipeline has already left. The WIT signature returns nothing for
+/// the same reason — parking is a statement about the future, and there is no
+/// state in which it can fail to be true.
+pub fn park_frame<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
+    if crate::scheduler::configured_frame_size() == 1 {
+        return Ok(());
+    }
+    let pipeline = ctx.resources().get(&this)?;
+    if pipeline.scope.is_closed() {
+        return Ok(());
+    }
+    let (lane, seq) = (pipeline.scope.scheduler_id(), pipeline.next_frame_seq());
+    crate::scheduler::worker::notify_lane_park(lane, seq);
+    Ok(())
+}
+
 /// Section 5 structural frame validation (k > 1 only): fusability is a
 /// deterministic program property — decided from program structure and
 /// staged occupancy at submit, never timing.
@@ -1430,7 +1649,67 @@ fn validate_frame<C: FireContext>(
     // its frame) existed only because `fire` serialized such a pass behind
     // every predecessor's settlement, which a frame can never reach: the
     // frame seals one fire short forever. Both halves are gone.
-    for &(_, rep) in fired {
+    // Slot index of the first fire that binds recurrent state, and the set of
+    // channels each slot publishes, so the RS chaining rule below can name the
+    // exact slot pair that is unsupported.
+    let mut first_rs_slot: Option<usize> = None;
+    let mut published_before: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Per slot: does this fire bind recurrent state the driver must resolve on
+    // the HOST? Only those slots are subject to the chaining rule below. See
+    // the comment there for why the answer is not simply "it binds RS".
+    let mut rs_host_resolved: Vec<bool> = Vec::with_capacity(fired.len());
+    for &(_, rep) in fired.iter() {
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        let (rs_reps, fold_len_is_device) = {
+            let pass = ctx.resources().get(&fwd)?;
+            let bound = match pass.bound() {
+                Ok(bound) => bound,
+                Err(error) => return Ok(Err(format!("pipeline: {error}"))),
+            };
+            (bound.rs_ws.clone(), bound.rs_fold_len.is_none())
+        };
+        if rs_reps.is_empty() {
+            rs_host_resolved.push(false);
+            continue;
+        }
+        if fold_len_is_device {
+            rs_host_resolved.push(true);
+            continue;
+        }
+        let mut buffered = false;
+        // One lock for the whole pass: `bound_rs_working_set_ids` has already
+        // refused a pass whose rows disagree on (model, driver), so the first
+        // row names the store all of them live in.
+        let first: Resource<RsWorkingSet> = Resource::new_borrow(rs_reps[0]);
+        let (model, driver) = {
+            let rs = ctx.resources().get(&first)?;
+            (rs.model, rs.driver)
+        };
+        let mut ids = Vec::with_capacity(rs_reps.len());
+        for &rs_rep in &rs_reps {
+            let resource: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
+            ids.push(ctx.resources().get(&resource)?.id);
+        }
+        {
+            let stores = crate::store::registry::get(model, driver);
+            let store = stores.rs.lock().unwrap();
+            for id in ids {
+                // A bound, not the exact count: an indeterminate occupancy
+                // must read as "may be buffered", and `bound()` never refuses.
+                //
+                // An id the store does not know reads as buffered too. This is
+                // a safety guard, so the unknown case fails CLOSED — the worst
+                // it costs is a refusal the guest can retry in a later frame,
+                // where failing open costs a device cascade.
+                if store.buffer_tokens_bound(id).unwrap_or(u32::MAX) > 0 {
+                    buffered = true;
+                    break;
+                }
+            }
+        }
+        rs_host_resolved.push(buffered);
+    }
+    for (slot, &(_, rep)) in fired.iter().enumerate() {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
         let pass = ctx.resources().get(&fwd)?;
         let bound = match pass.bound() {
@@ -1438,6 +1717,63 @@ fn validate_frame<C: FireContext>(
             Err(error) => return Ok(Err(format!("pipeline: {error}"))),
         };
         let accesses = &bound.instance.program.channel_accesses;
+
+        // ── The frame shapes the CUDA driver cannot execute.
+        //
+        // FramePrepare runs EVERY step's host work at frame entry, before any
+        // of the frame reaches the stream. A step whose descriptor ports are
+        // device-carried normally escapes that by taking the device-composed
+        // template, which resolves ports at kernel time. So a fire that the
+        // template REFUSES falls back to the host readback path and demands,
+        // at frame entry, a cell that an EARLIER SLOT of the same frame has
+        // not produced yet.
+        //
+        // This rule once covered any fire carrying RS rows, because the
+        // template refused all of them. It no longer does: `299b76320` let an
+        // unbuffered fold-all recurrent decode take the template, which is the
+        // ordinary hybrid decode shape. `try_device_composed_template` in
+        // `driver/cuda/src/pipeline/dispatch.cu` now refuses exactly two RS
+        // shapes, and `rs_host_resolved` above mirrors them:
+        //
+        //   * buffered rows — ragged and sized to the real request count, so a
+        //     padded template lane indexes past the end;
+        //   * a device-resident fold length — substituted during descriptor
+        //     resolution against a host bound, and the template resolves
+        //     nothing.
+        //
+        // Left unchecked this surfaced as a cascade — `descriptor channel 0
+        // not ready` from the driver, then a poisoned channel in the guest —
+        // that named neither the slot nor the cause. Refuse it here, where
+        // both are known. See `live_slots()` in the SDK, which keeps a linear
+        // lane from building this frame in the first place.
+        if rs_host_resolved[slot] && first_rs_slot.is_none() {
+            first_rs_slot = Some(slot);
+        }
+        if first_rs_slot.is_some() {
+            for (channel, &(consume, _)) in accesses.iter().enumerate() {
+                if !consume {
+                    continue;
+                }
+                let key = Arc::as_ptr(&bound.cells[channel]) as usize;
+                if published_before.contains(&key) {
+                    return Ok(Err(format!(
+                        "pipeline: frame slot {slot} consumes channel {channel}, which an \
+earlier slot of the same frame publishes, and slot {} binds recurrent state the \
+driver must resolve on the host (a buffered row, or a device-resident fold \
+length) — those descriptors are resolved at frame entry, before any slot has \
+run, so they cannot see that value. Submit the chained fire in a LATER frame \
+(a linear lane should size its run-ahead with `live_slots()`).",
+                        first_rs_slot.expect("set just above")
+                    )));
+                }
+            }
+        }
+        for (channel, &(_, publish)) in accesses.iter().enumerate() {
+            if publish {
+                published_before.insert(Arc::as_ptr(&bound.cells[channel]) as usize);
+            }
+        }
+
         for (cell, &(consume, publish)) in bound.cells.iter().zip(accesses) {
             let key = Arc::as_ptr(cell) as usize;
             let entry = uses.entry(key).or_insert_with(|| ChannelUse {
@@ -2080,14 +2416,9 @@ async fn fire_device_geometry<C: FireContext>(
     // order), so a recurrent-state device-geometry pass runs ahead too.
     let timing_enabled = ctx.fire_timing_requested();
 
-    let (ws_rep, rs_reps, rs_mode, pass_max_layers) = {
+    let (ws_rep, rs_reps, rs_fold_len) = {
         let pass = ctx.resources().get(&fwd)?;
-        (
-            pass.kv_ws,
-            pass.rs_ws.clone(),
-            pass.rs_mode.clone(),
-            pass.max_layers,
-        )
+        (pass.kv_ws, pass.rs_ws.clone(), pass.rs_fold_len.clone())
     };
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
@@ -2129,22 +2460,32 @@ async fn fire_device_geometry<C: FireContext>(
         .as_ref()
         .expect("fire_device_geometry on a non-device-geometry pass")
         .pooled;
-    let pooled_write_indexes: Vec<u64> = if pooled {
+    let writable_span: Option<std::ops::Range<u64>> = {
         let writable = ctx.resources().get(&fwd)?.kv_declaration.writable;
         let reserved = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
             kv_store.page_len(ws.id)
         });
-        let span = reserved
+        match reserved
             .map_err(|error| error.to_string())
-            .and_then(|page_len| writable.resolve(page_len));
-        match span {
-            Ok(span) => span.collect(),
-            Err(error) => {
+            .and_then(|page_len| writable.resolve(page_len))
+        {
+            Ok(span) => Some(span),
+            Err(error) if pooled => {
                 return Ok(Err(format!(
                     "pipeline: pool-owned device geometry: {error}"
                 )));
             }
+            // Not pooled: the declaration is not needed to place writes, so a
+            // span that will not resolve is not fatal here — it only costs the
+            // containment bound below.
+            Err(_) => None,
         }
+    };
+    let pooled_write_indexes: Vec<u64> = if pooled {
+        writable_span
+            .clone()
+            .expect("a pooled pass returns above when its span will not resolve")
+            .collect()
     } else {
         Vec::new()
     };
@@ -2218,7 +2559,7 @@ async fn fire_device_geometry<C: FireContext>(
                 "pipeline: KV demand exceeds the planner ABI".to_string()
             ));
         };
-        let rs_plan = match rs_plan_for(&rs_mode, rs_reps.len(), &resolved_qo_indptr) {
+        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &resolved_qo_indptr) {
             Ok(plan) => plan,
             Err(error) => {
                 reclaim_pending_device_grant(ctx, &fwd);
@@ -2368,11 +2709,7 @@ async fn fire_device_geometry<C: FireContext>(
         let bound = &p.instance.program.bound;
         let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
         let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-        // Recognition precedes evaluation on this device-geometry path
-        // (item A): a structured mask classifies `Device { structured:
-        // true }` and co-batches; host-derivable unrecognized masks keep
-        // wire BRLE + the solo clauses below.
-        geometry::evaluate_attn_mask_device_geometry(bound, &mut known, &mask_qo_indptr)
+        geometry::evaluate_attn_mask(bound, &mut known, &mask_qo_indptr)
     };
     let attn_mask = match attn_mask {
         Ok(mask) => mask,
@@ -2388,34 +2725,27 @@ async fn fire_device_geometry<C: FireContext>(
     req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
-    // This pass's geometry resolves ON DEVICE (the driver reads its port
-    // channels at frame prepare); stamp the plan so the scheduler's
-    // `LaunchGrouping` classifies it as device-resolved. Leaving the flag
-    // unset made a pooled masked decode fire look like an ordinary
-    // wire-masked fire — "custom wire masks co-batch freely" — and the
-    // scheduler co-batched it with wire fires into a multi-program batch
-    // the driver's v1 mask scope must refuse (frame.cpp "dense device mask
-    // in a multi-program batch requires solo retry"): the wave poisoned and
-    // the dead lanes leaked pages (Stage 2 verdict, liveness seam 2).
-    req.device_resolved_geometry = true;
-    // STRUCTURAL v0 (S-1): the pass's declared truncation rides the
-    // device-geometry (chained decode) path too — same env override
-    // discipline as the wire path.
-    req.max_layers = pass_max_layers;
-    {
-        static DEBUG_MAX_LAYERS: std::sync::OnceLock<Option<u32>> =
-            std::sync::OnceLock::new();
-        let k = DEBUG_MAX_LAYERS.get_or_init(|| {
-            std::env::var("PIE_DEBUG_MAX_LAYERS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        });
-        if let Some(k) = k {
-            req.max_layers = Some(*k);
-        }
+    // The declared writable span is this pass's containment promise, and the
+    // host has to state it even though the device picks the exact cells: the
+    // driver's device-composed template — the ONLY resolver that can read a
+    // value the producing fire has not committed yet — refuses a batch whose
+    // bounds are absent, and falls back to a host readback that cannot see a
+    // loop-carried descriptor at all. Omitting them here is what made every
+    // device-carried decode fail with `descriptor channel N not ready`.
+    if let Some(span) = &writable_span {
+        let page_size = u64::from(page_size);
+        req.kv_write_lower_bounds = vec![span.start * page_size];
+        req.kv_write_upper_bounds = vec![span.end * page_size];
     }
     rs_prepared.apply_to(&mut req);
     attn_mask.apply_to(&mut req);
+    // Same carry as the wire path: the AttnMask channel binding is the
+    // program's, so a device-geometry fire of a mask-binding pass must be
+    // scheduled SOLO too. Omitting it here is what let the run-ahead
+    // carrier batch 8 concurrent pipelines into one step, which the driver
+    // rejects (`dense device mask in a multi-program batch`) — the failing
+    // prepare then poisoned descriptor channel 0 and lost every stream.
+    req.dense_device_mask = ctx.resources().get(&fwd)?.dense_mask;
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let last_page_len = if pages.is_empty() { 0 } else { page_size };

@@ -1,0 +1,18 @@
+{
+  "architectures": [
+    "LlamaForCausalLM"
+  ],
+  "hidden_size": 128,
+  "max_position_embeddings": 2048,
+  "model_type": "llama",
+  "num_attention_heads": 8,
+  "num_hidden_layers": 4,
+  "quantization_config": {
+    "bits": 8,
+    "desc_act": false,
+    "group_size": 128,
+    "quant_method": "fp8",
+    "sym": true
+  },
+  "vocab_size": 1000
+}

@@ -83,9 +83,6 @@ inline const char* dtype_name(DType d) {
     return "?";
 }
 
-// Parse the safetensors dtype string ("BF16", "F16", "F32", "I8", "U8", …).
-DType dtype_from_safetensors(const std::string& s);
-
 using DeviceTensorMemoryCallback = void (*)(void* context);
 using DeviceMemoryAllocateCallback = void* (*)(
     void* context,

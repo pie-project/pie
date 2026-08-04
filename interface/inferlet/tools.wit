@@ -2,11 +2,17 @@ interface tools {
     use grammar.{grammar, matcher};
     use types.{error};
 
+    /// A complete tool call parsed out of the model's output.
+    record tool-call {
+        name: string,
+        arguments-json: string,
+    }
+
     variant event {
         /// Tool call detected
         start,
-        /// Complete tool call: (name, arguments-json)
-        call(tuple<string, string>),
+        /// Complete tool call
+        call(tool-call),
     }
 
     /// Register available tools (list of JSON schema strings)
@@ -15,9 +21,6 @@ interface tools {
     /// Provide a tool result (after a tool-call reply)
     answer: func(name: string, value: string) -> list<u32>;
 
-    /// Create a decoder to detect tool calls in generated tokens
-    create-decoder: func() -> decoder;
-
     /// Returns the grammar that constrains well-formed tool-call output for
     /// this model and toolset, or none if the model has no enforceable format.
     format: func(tools: list<string>) -> option<grammar>;
@@ -25,7 +28,9 @@ interface tools {
     /// Create a grammar matcher to force-generate tool calls
     create-matcher: func(tools: list<string>) -> matcher;
 
+    /// Detects tool calls in generated tokens.
     resource decoder {
+        constructor();
         feed: func(tokens: list<u32>) -> result<event, error>;
         reset: func();
     }

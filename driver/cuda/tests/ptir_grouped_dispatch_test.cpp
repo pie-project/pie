@@ -15,7 +15,7 @@
 
 #include <cuda_runtime.h>
 
-#include "pie_native/launch/plan.hpp"
+#include "pie/driver/launch/plan.hpp"
 #include "pipeline/dispatch.hpp"
 
 #include <map>
@@ -347,36 +347,36 @@ std::uint64_t run_case(
             cudaMemcpyHostToDevice);
     }
 
-    pie_native::LaunchView view{};
-    view.terminal_cells = pie_native::slice_from(
+    pie::driver::fire::LaunchView view{};
+    view.terminal_cells = pie::driver::slice_from(
         terminal_ptrs.data(), terminal_ptrs.size());
-    view.ptir_program_hashes = pie_native::slice_from_u64(
+    view.ptir_program_hashes = pie::driver::slice_from_u64(
         hashes.data(), hashes.size());
-    view.ptir_program_instances = pie_native::slice_from_u64(
+    view.ptir_program_instances = pie::driver::slice_from_u64(
         instances.data(), instances.size());
-    view.sampling_indptr = pie_native::slice_from_u32(
+    view.sampling_indptr = pie::driver::slice_from_u32(
         sampling_indptr.data(), sampling_indptr.size());
-    view.channel_expected_head = pie_native::slice_from_u64(
+    view.channel_expected_head = pie::driver::slice_from_u64(
         expected_heads.data(), expected_heads.size());
-    view.channel_expected_tail = pie_native::slice_from_u64(
+    view.channel_expected_tail = pie::driver::slice_from_u64(
         expected_tails.data(), expected_tails.size());
-    view.channel_ticket_indptr = pie_native::slice_from_u32(
+    view.channel_ticket_indptr = pie::driver::slice_from_u32(
         ticket_indptr.data(), ticket_indptr.size());
     view.ptir_row_counts =
-        pie_native::slice_from_u32(row_counts.data(), row_counts.size());
+        pie::driver::slice_from_u32(row_counts.data(), row_counts.size());
     view.ptir_token_counts =
-        pie_native::slice_from_u32(token_counts.data(), token_counts.size());
+        pie::driver::slice_from_u32(token_counts.data(), token_counts.size());
     view.ptir_kv_lens =
-        pie_native::slice_from_u32(kv_lens.data(), kv_lens.size());
+        pie::driver::slice_from_u32(kv_lens.data(), kv_lens.size());
     view.ptir_page_counts =
-        pie_native::slice_from_u32(page_counts.data(), page_counts.size());
+        pie::driver::slice_from_u32(page_counts.data(), page_counts.size());
     view.ptir_query_lens =
-        pie_native::slice_from_u32(query_lens.data(), query_lens.size());
+        pie::driver::slice_from_u32(query_lens.data(), query_lens.size());
     view.ptir_key_lens =
-        pie_native::slice_from_u32(key_lens.data(), key_lens.size());
+        pie::driver::slice_from_u32(key_lens.data(), key_lens.size());
     const std::uint32_t rs_slot = 0;
     if (recurrent_state) {
-        view.rs_slot_ids = pie_native::slice_from_u32(&rs_slot, 1);
+        view.rs_slot_ids = pie::driver::slice_from_u32(&rs_slot, 1);
     }
 
     expect(
@@ -643,32 +643,32 @@ std::vector<std::int32_t> run_nucleus_case(
             cudaMemcpyHostToDevice);
     }
 
-    pie_native::LaunchView view{};
+    pie::driver::fire::LaunchView view{};
     view.terminal_cells =
-        pie_native::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
+        pie::driver::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
     view.ptir_program_hashes =
-        pie_native::slice_from_u64(hashes.data(), hashes.size());
+        pie::driver::slice_from_u64(hashes.data(), hashes.size());
     view.ptir_program_instances =
-        pie_native::slice_from_u64(instances.data(), instances.size());
+        pie::driver::slice_from_u64(instances.data(), instances.size());
     view.sampling_indptr =
-        pie_native::slice_from_u32(sampling_indptr.data(), sampling_indptr.size());
-    view.channel_expected_head = pie_native::slice_from_u64(
+        pie::driver::slice_from_u32(sampling_indptr.data(), sampling_indptr.size());
+    view.channel_expected_head = pie::driver::slice_from_u64(
         expected_heads.data(), expected_heads.size());
-    view.channel_expected_tail = pie_native::slice_from_u64(
+    view.channel_expected_tail = pie::driver::slice_from_u64(
         expected_tails.data(), expected_tails.size());
     view.channel_ticket_indptr =
-        pie_native::slice_from_u32(ticket_indptr.data(), ticket_indptr.size());
-    view.ptir_row_counts = pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(ticket_indptr.data(), ticket_indptr.size());
+    view.ptir_row_counts = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_token_counts = pie_native::slice_from_u32(
+    view.ptir_token_counts = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_kv_lens = pie_native::slice_from_u32(
+    view.ptir_kv_lens = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_page_counts = pie_native::slice_from_u32(
+    view.ptir_page_counts = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_query_lens = pie_native::slice_from_u32(
+    view.ptir_query_lens = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_key_lens = pie_native::slice_from_u32(
+    view.ptir_key_lens = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
     expect(
         dispatch.validate_launch(view, &error) == PIE_STATUS_OK,
@@ -817,24 +817,24 @@ void run_structured_mask_golden(const std::string& golden_directory) {
             static_cast<std::uint32_t>(expected_heads.size()));
         sampling_indptr.push_back(0);
     }
-    pie_native::LaunchView view{};
+    pie::driver::fire::LaunchView view{};
     view.terminal_cells =
-        pie_native::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
+        pie::driver::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
     view.ptir_program_hashes =
-        pie_native::slice_from_u64(hashes.data(), hashes.size());
+        pie::driver::slice_from_u64(hashes.data(), hashes.size());
     view.ptir_program_instances =
-        pie_native::slice_from_u64(instances.data(), instances.size());
+        pie::driver::slice_from_u64(instances.data(), instances.size());
     view.sampling_indptr =
-        pie_native::slice_from_u32(sampling_indptr.data(), sampling_indptr.size());
-    view.channel_expected_head = pie_native::slice_from_u64(
+        pie::driver::slice_from_u32(sampling_indptr.data(), sampling_indptr.size());
+    view.channel_expected_head = pie::driver::slice_from_u64(
         expected_heads.data(), expected_heads.size());
-    view.channel_expected_tail = pie_native::slice_from_u64(
+    view.channel_expected_tail = pie::driver::slice_from_u64(
         expected_tails.data(), expected_tails.size());
     view.channel_ticket_indptr =
-        pie_native::slice_from_u32(ticket_indptr.data(), ticket_indptr.size());
-    view.ptir_row_counts = pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(ticket_indptr.data(), ticket_indptr.size());
+    view.ptir_row_counts = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_token_counts = pie_native::slice_from_u32(
+    view.ptir_token_counts = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
     expect(
         dispatch.validate_launch(view, &error) == PIE_STATUS_OK,
@@ -1009,41 +1009,41 @@ void run_declared_phase_case(
         no_ticket, no_ticket, 1, 1, 1, no_ticket,
         0, 0, 0, 0,
     };
-    pie_native::LaunchView view{};
+    pie::driver::fire::LaunchView view{};
     view.ptir_program_hashes =
-        pie_native::slice_from_u64(hashes, 1);
+        pie::driver::slice_from_u64(hashes, 1);
     view.ptir_program_instances =
-        pie_native::slice_from_u64(instances, 1);
+        pie::driver::slice_from_u64(instances, 1);
     view.terminal_cells =
-        pie_native::slice_from(terminals, 1);
+        pie::driver::slice_from(terminals, 1);
     view.ptir_program_row_indptr =
-        pie_native::slice_from_u32(row_attribution, 2);
+        pie::driver::slice_from_u32(row_attribution, 2);
     view.channel_ticket_indptr =
-        pie_native::slice_from_u32(ticket_indptr, 2);
+        pie::driver::slice_from_u32(ticket_indptr, 2);
     view.channel_expected_head =
-        pie_native::slice_from_u64(
+        pie::driver::slice_from_u64(
             expected_heads, std::size(expected_heads));
     view.channel_expected_tail =
-        pie_native::slice_from_u64(
+        pie::driver::slice_from_u64(
             expected_tails, std::size(expected_tails));
     const std::uint32_t translation[] = {0, 1, 2, 3};
     const std::uint32_t translation_indptr[] = {0, 4};
     view.kv_translation =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             translation, std::size(translation));
     view.kv_translation_indptr =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             translation_indptr, std::size(translation_indptr));
     const std::uint32_t fixed_position[] = {0};
-    view.position_ids = pie_native::slice_from_u32(
+    view.position_ids = pie::driver::slice_from_u32(
         fixed_position, std::size(fixed_position));
     const std::uint64_t write_lower_bounds[] = {1};
     const std::uint64_t write_upper_bounds[] = {
         std::numeric_limits<std::uint64_t>::max()};
     if (write_bound_case != WriteBoundCase::None) {
-        view.ptir_kv_write_lower_bounds = pie_native::slice_from_u64(
+        view.ptir_kv_write_lower_bounds = pie::driver::slice_from_u64(
             write_lower_bounds, std::size(write_lower_bounds));
-        view.ptir_kv_write_upper_bounds = pie_native::slice_from_u64(
+        view.ptir_kv_write_upper_bounds = pie::driver::slice_from_u64(
             write_upper_bounds, std::size(write_upper_bounds));
     }
 
@@ -1220,7 +1220,7 @@ void run_declared_phase_case(
     cudaFree(fixed_w_page);
     cudaFree(fixed_w_off);
     cudaFree(fixed_valid);
-    pie_native::launch::ResolvedPrograms resolved;
+    pie::driver::fire::ResolvedPrograms resolved;
     expect(
         dispatch.resolve_descriptors(
             view, 16, 4, resolved, &error, false, launch.get()) &&
@@ -1240,17 +1240,17 @@ void run_declared_phase_case(
     const std::uint32_t sample_start[] = {0};
     const std::uint32_t unit[] = {1};
     view.sampling_indptr =
-        pie_native::slice_from_u32(sample_ptr, 2);
+        pie::driver::slice_from_u32(sample_ptr, 2);
     view.ptir_sample_starts =
-        pie_native::slice_from_u32(sample_start, 1);
+        pie::driver::slice_from_u32(sample_start, 1);
     view.ptir_sample_counts =
-        pie_native::slice_from_u32(unit, 1);
-    view.ptir_row_counts = pie_native::slice_from_u32(unit, 1);
-    view.ptir_token_counts = pie_native::slice_from_u32(unit, 1);
-    view.ptir_kv_lens = pie_native::slice_from_u32(unit, 1);
-    view.ptir_page_counts = pie_native::slice_from_u32(unit, 1);
-    view.ptir_query_lens = pie_native::slice_from_u32(unit, 1);
-    view.ptir_key_lens = pie_native::slice_from_u32(unit, 1);
+        pie::driver::slice_from_u32(unit, 1);
+    view.ptir_row_counts = pie::driver::slice_from_u32(unit, 1);
+    view.ptir_token_counts = pie::driver::slice_from_u32(unit, 1);
+    view.ptir_kv_lens = pie::driver::slice_from_u32(unit, 1);
+    view.ptir_page_counts = pie::driver::slice_from_u32(unit, 1);
+    view.ptir_query_lens = pie::driver::slice_from_u32(unit, 1);
+    view.ptir_key_lens = pie::driver::slice_from_u32(unit, 1);
     dispatch.update_launch_geometry(
         *launch, view, std::span<const std::uint32_t>(sample_start, 1));
 
@@ -1545,32 +1545,32 @@ std::vector<std::uint8_t> run_beam_case(
             device_logits, logits.data(), logits.size() * sizeof(float),
             cudaMemcpyHostToDevice);
     }
-    pie_native::LaunchView view{};
+    pie::driver::fire::LaunchView view{};
     view.terminal_cells =
-        pie_native::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
+        pie::driver::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
     view.ptir_program_hashes =
-        pie_native::slice_from_u64(hashes.data(), hashes.size());
+        pie::driver::slice_from_u64(hashes.data(), hashes.size());
     view.ptir_program_instances =
-        pie_native::slice_from_u64(instances.data(), instances.size());
+        pie::driver::slice_from_u64(instances.data(), instances.size());
     view.sampling_indptr =
-        pie_native::slice_from_u32(sampling_indptr.data(), sampling_indptr.size());
-    view.channel_expected_head = pie_native::slice_from_u64(
+        pie::driver::slice_from_u32(sampling_indptr.data(), sampling_indptr.size());
+    view.channel_expected_head = pie::driver::slice_from_u64(
         expected_heads.data(), expected_heads.size());
-    view.channel_expected_tail = pie_native::slice_from_u64(
+    view.channel_expected_tail = pie::driver::slice_from_u64(
         expected_tails.data(), expected_tails.size());
     view.channel_ticket_indptr =
-        pie_native::slice_from_u32(ticket_indptr.data(), ticket_indptr.size());
-    view.ptir_row_counts = pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(ticket_indptr.data(), ticket_indptr.size());
+    view.ptir_row_counts = pie::driver::slice_from_u32(
         row_extents.data(), row_extents.size());
-    view.ptir_token_counts = pie_native::slice_from_u32(
+    view.ptir_token_counts = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_kv_lens = pie_native::slice_from_u32(
+    view.ptir_kv_lens = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_page_counts = pie_native::slice_from_u32(
+    view.ptir_page_counts = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_query_lens = pie_native::slice_from_u32(
+    view.ptir_query_lens = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
-    view.ptir_key_lens = pie_native::slice_from_u32(
+    view.ptir_key_lens = pie::driver::slice_from_u32(
         unit_extents.data(), unit_extents.size());
     expect(
         dispatch.validate_launch(view, &error) == PIE_STATUS_OK,
@@ -1771,25 +1771,25 @@ void run_mtp_direct_case(const std::string& golden_directory) {
     };
     std::vector<std::uint32_t> draft_counts(
         lane_count, draft_rows);
-    pie_native::LaunchView view{};
+    pie::driver::fire::LaunchView view{};
     view.terminal_cells =
-        pie_native::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
+        pie::driver::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
     view.ptir_program_hashes =
-        pie_native::slice_from_u64(hashes.data(), hashes.size());
+        pie::driver::slice_from_u64(hashes.data(), hashes.size());
     view.ptir_program_instances =
-        pie_native::slice_from_u64(instances.data(), instances.size());
+        pie::driver::slice_from_u64(instances.data(), instances.size());
     view.sampling_indptr =
-        pie_native::slice_from_u32(sample_ptr.data(), sample_ptr.size());
-    view.channel_expected_head = pie_native::slice_from_u64(
+        pie::driver::slice_from_u32(sample_ptr.data(), sample_ptr.size());
+    view.channel_expected_head = pie::driver::slice_from_u64(
         expected_heads.data(), expected_heads.size());
-    view.channel_expected_tail = pie_native::slice_from_u64(
+    view.channel_expected_tail = pie::driver::slice_from_u64(
         expected_tails.data(), expected_tails.size());
     view.channel_ticket_indptr =
-        pie_native::slice_from_u32(ticket_indptr.data(), ticket_indptr.size());
+        pie::driver::slice_from_u32(ticket_indptr.data(), ticket_indptr.size());
     view.ptir_row_counts =
-        pie_native::slice_from_u32(extents.data(), extents.size());
+        pie::driver::slice_from_u32(extents.data(), extents.size());
     view.ptir_token_counts =
-        pie_native::slice_from_u32(extents.data(), extents.size());
+        pie::driver::slice_from_u32(extents.data(), extents.size());
     cudaStream_t stream = nullptr;
     cudaStreamCreate(&stream);
     expect(
@@ -1964,37 +1964,37 @@ void run_parallel_signature_case(const std::string& golden_directory) {
     };
     std::vector<std::uint32_t> ticket_indptr{0, 2, 7};
     std::vector<std::uint32_t> extents{1, 1};
-    pie_native::LaunchView view{};
+    pie::driver::fire::LaunchView view{};
     view.terminal_cells =
-        pie_native::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
+        pie::driver::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
     view.ptir_program_hashes =
-        pie_native::slice_from_u64(hashes.data(), hashes.size());
+        pie::driver::slice_from_u64(hashes.data(), hashes.size());
     view.ptir_program_instances =
-        pie_native::slice_from_u64(instances.data(), instances.size());
+        pie::driver::slice_from_u64(instances.data(), instances.size());
     view.sampling_indptr =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             sampling_indptr.data(), sampling_indptr.size());
     view.channel_expected_head =
-        pie_native::slice_from_u64(
+        pie::driver::slice_from_u64(
             expected_heads.data(), expected_heads.size());
     view.channel_expected_tail =
-        pie_native::slice_from_u64(
+        pie::driver::slice_from_u64(
             expected_tails.data(), expected_tails.size());
     view.channel_ticket_indptr =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             ticket_indptr.data(), ticket_indptr.size());
     view.ptir_row_counts =
-        pie_native::slice_from_u32(extents.data(), extents.size());
+        pie::driver::slice_from_u32(extents.data(), extents.size());
     view.ptir_token_counts =
-        pie_native::slice_from_u32(extents.data(), extents.size());
+        pie::driver::slice_from_u32(extents.data(), extents.size());
     view.ptir_kv_lens =
-        pie_native::slice_from_u32(extents.data(), extents.size());
+        pie::driver::slice_from_u32(extents.data(), extents.size());
     view.ptir_page_counts =
-        pie_native::slice_from_u32(extents.data(), extents.size());
+        pie::driver::slice_from_u32(extents.data(), extents.size());
     view.ptir_query_lens =
-        pie_native::slice_from_u32(extents.data(), extents.size());
+        pie::driver::slice_from_u32(extents.data(), extents.size());
     view.ptir_key_lens =
-        pie_native::slice_from_u32(extents.data(), extents.size());
+        pie::driver::slice_from_u32(extents.data(), extents.size());
 
     std::vector<float> logits(2 * 32, -100.0f);
     logits[2] = 100.0f;

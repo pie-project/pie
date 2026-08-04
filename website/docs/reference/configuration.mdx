@@ -42,7 +42,7 @@ max_upload_mb = 256
 # entry is the implicit default for inferlets that don't specify a model.
 [[model]]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
 [model.scheduler]
 batch_policy = "adaptive"
@@ -116,7 +116,7 @@ Each `[[model]]` entry has only identity-level fields at the top:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `name` | required | The inferlet-side lookup key for `Model.load("<name>")`. Must be unique across `[[model]]` entries. The first `[[model]]` is the implicit default. |
-| `hf_repo` | required | HuggingFace repo id or local HuggingFace snapshot directory to load. Repo ids use the standard HuggingFace cache and download on cache miss. |
+| `model` | required | HuggingFace repo id or local HuggingFace snapshot directory to load. Repo ids use the standard HuggingFace cache and download on cache miss. |
 
 Per-process admission and market policy live in `[model.scheduler]`, not at the top level.
 
@@ -156,13 +156,13 @@ Use `pie config` rather than hand-editing when possible:
 pie config show              # pretty-print ~/.pie/config.toml
 pie config set server.port 9090
 pie config set auth.enabled true
-pie config set model.0.hf_repo meta-llama/Llama-3.2-1B
+pie config set model.0.model meta-llama/Llama-3.2-1B
 pie config set model.0.driver.device "cuda:0,cuda:1"
 ```
 
 `pie config init` regenerates the default file (and downloads the embedded Python runtime that hosts Python inferlets).
 
-`pie config set` takes a dot-path under the section the key lives in (e.g. `server.port`, not `port`). Numeric segments index into TOML arrays — `model.0.hf_repo` targets the first `[[model]]` block. Comma-separated values become lists (`"cuda:0,cuda:1"` → `["cuda:0", "cuda:1"]`).
+`pie config set` takes a dot-path under the section the key lives in (e.g. `server.port`, not `port`). Numeric segments index into TOML arrays — `model.0.model` targets the first `[[model]]` block. Comma-separated values become lists (`"cuda:0,cuda:1"` → `["cuda:0", "cuda:1"]`).
 
 ## Migration from the older schema
 

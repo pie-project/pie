@@ -50,8 +50,7 @@
 //!    generation leaves genuinely-absent slots at every earlier step. Those
 //!    slots read `-inf`, and `pages_absent` counts them.
 
-use inferlet::ptir::prelude::*;
-use inferlet::{Result, model as wit_model};
+use inferlet::ptir::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -157,11 +156,11 @@ struct Output {
 }
 
 /// One sampling step: temperature, then a Gumbel-max draw over the full vocab.
-fn step(logits: Tensor, temperature: f32, rng_state: impl AsTensor + Copy) -> Tensor {
+fn step(logits: Tensor, temperature: f32, rng_state: &Tensor) -> Tensor {
     let scaled = if temperature == 1.0 {
         logits
     } else {
-        div(&logits, temperature)
+        &logits / temperature
     };
     gumbel_max(scaled, rng_state)
 }
@@ -178,13 +177,13 @@ async fn main(input: Input) -> Result<Output> {
     let temperature = input.temperature;
     let report = input.report;
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Err("max_tokens must be at least 1".into());
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -193,8 +192,7 @@ async fn main(input: Input) -> Result<Output> {
     let max_pages = (n + reserve as u32 + 1).div_ceil(page_size).max(1);
     let p_max = max_pages;
     let budget = input.page_budget.min(p_max);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
@@ -227,55 +225,52 @@ async fn main(input: Input) -> Result<Output> {
     for &(base, end) in &spans {
         let len = end - base;
 
-        let toks_p =
-            Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_p");
-        let embed_indptr_p = Channel::from(vec![0u32, len]).named("embed_indptr_p");
-        let positions_p = Channel::from((base..end).collect::<Vec<_>>()).named("positions_p");
-        let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-        let page_indptr_p =
-            Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-        let w_slot_p =
-            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-        let w_off_p =
-            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-        let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
-        let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+        let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
+        let embed_indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
+        let positions_p = Channel::from_iter(base..end).named("positions_p");
+        let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+        let page_indptr_p = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_p");
+        let w_slot_p = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
+        let w_off_p = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
+        let kv_len_p = Channel::from([end]).named("kv_len_p");
+        let rng_p = Channel::from([input.seed, 0]).named("rng_p");
         let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
-            ..,
-            ..,
-            &kv_len_p,
-            &pages_p,
-            &page_indptr_p,
-            &w_slot_p,
-            &w_off_p,
-            &positions_p,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: None,
+            },
         )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
             tok_out_p.put(&token);
-            rng_p.put(&add(&r, iota(2)));
+            rng_p.put(&(&r + iota(2)));
         });
 
         fwd_p
             .submit(&pipe)
-            .map_err(|e| format!("prefill submit @{base}: {e}"))?;
+            .with_context(|| format!("prefill submit @{base}"))?;
 
         // Every chunk samples; only the last chunk's token is the prompt's
         // continuation. The intermediate takes are not waste that can be
         // skipped -- the epilogue put has to be drained or the channel fills.
         g0 = tok_out_p
-            .take()
-            .get::<i32>()
+            .take_host::<i32>()
             .await
-            .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
+            .with_context(|| format!("@{base}"))?;
     }
     generated.push(g0 as u32);
 
@@ -285,19 +280,18 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE LOOP (1-wide, run-ahead), with the Quest tap. ──
     if generated.len() < max_tokens {
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
+        let tok_in = Channel::from([g0]).named("tok_in");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         // The per-layer accumulator. `OnAttnProj` fires once per layer and the
         // inferlet has no way to ask the model how many layers there are, so
@@ -309,7 +303,7 @@ async fn main(input: Input) -> Result<Output> {
         // caller did not ask for a report.
         let acc = report
             .then(|| Channel::from(vec![f32::NEG_INFINITY; p_max as usize]).named("quest_acc"));
-        let layer_ct = report.then(|| Channel::from(vec![0u32]).named("quest_layers"));
+        let layer_ct = report.then(|| Channel::from([0u32]).named("quest_layers"));
 
         // Host drains. Present only when the caller asked to be told what
         // happened; see `Input::report`.
@@ -333,15 +327,17 @@ async fn main(input: Input) -> Result<Output> {
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
 
         // ── THE TAP. Fires once per layer, inside the fire, after the layer's
@@ -366,15 +362,15 @@ async fn main(input: Input) -> Result<Output> {
             // Everything below is the report, not the policy: the mask above
             // has already been applied to this layer.
             if let (Some(acc), Some(layer_ct)) = (acc.as_ref(), layer_ct.as_ref()) {
-                let prev = acc.take().tensor();
-                let ct = layer_ct.take().tensor();
+                let prev = acc.take();
+                let ct = layer_ct.take();
                 acc.put(&max_elem(&prev, &scores));
-                layer_ct.put(&add(&ct, 1u32));
+                layer_ct.put(&(&ct + 1u32));
             }
         });
 
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             if let Some(kvlen_out) = kvlen_out.as_ref() {
                 kvlen_out.put(&length);
             }
@@ -382,18 +378,17 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
 
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let next_length = &length + 1u32;
+            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
-            page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
+            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
-            rng.put(&add(&r, iota(2)));
+            rng.put(&(&r + iota(2)));
 
             // Publish the layer fold, then re-seed it for the next fire.
             if let (Some(acc), Some(layer_ct), Some(scores_out), Some(layers_out)) = (
@@ -402,43 +397,39 @@ async fn main(input: Input) -> Result<Output> {
                 scores_out.as_ref(),
                 layers_out.as_ref(),
             ) {
-                let folded = acc.take().tensor();
-                let layers = layer_ct.take().tensor();
+                let folded = acc.take();
+                let layers = layer_ct.take();
                 scores_out.put(&folded);
                 layers_out.put(&layers);
                 acc.put(&broadcast(f32::NEG_INFINITY, [p_max]));
-                layer_ct.put(&reshape(&mul(&layers, 0u32), [1]));
+                layer_ct.put(&reshape(&(&layers * 0u32), [1]));
             }
         });
 
         let budget_n = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             if let Some(ch) = scores_out.as_ref() {
                 last_scores = ch
-                    .take()
-                    .get::<f32>()
+                    .take_host::<Vec<f32>>()
                     .await
-                    .map_err(|e| format!("quest_scores.take @{}: {e}", generated.len()))?;
+                    .with_context(|| format!("@{}", generated.len()))?;
             }
             layers_observed = match layers_out.as_ref() {
                 Some(ch) => ch
-                    .take()
-                    .get::<u32>()
+                    .take_host::<u32>()
                     .await
-                    .map_err(|e| format!("quest_layer_count.take @{}: {e}", generated.len()))?[0],
+                    .with_context(|| format!("@{}", generated.len()))?,
                 None => layers_observed,
             };
             kv_len_last = match kvlen_out.as_ref() {
                 Some(ch) => ch
-                    .take()
-                    .get::<u32>()
+                    .take_host::<u32>()
                     .await
-                    .map_err(|e| format!("quest_kv_len.take @{}: {e}", generated.len()))?[0],
+                    .with_context(|| format!("@{}", generated.len()))?,
                 None => kv_len_last,
             };
             generated.push(t as u32);
@@ -466,7 +457,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "quest-attention",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         max_pages,
         page_size,

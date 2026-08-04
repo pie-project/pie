@@ -97,6 +97,13 @@ struct MixtralLayerWeights {
     const DeviceTensor* router_bias = nullptr;   // [num_experts] (gpt-oss)
     std::vector<MixtralExpertWeights> experts;   // size = num_experts
 
+    // Set when the contract published this layer's experts as a group rather
+    // than as a bank. The `experts` entries then carry only the biases, which
+    // stay resident, and the forward re-points the weight and scale fields at
+    // whichever slot the expert was paged into.
+    GroupStreamCache* expert_cache = nullptr;
+    std::size_t expert_group = 0;
+
     // Device-resident per-expert pointer arrays for the fused MXFP4 decode
     // GEMV. Populated only when every expert on the layer is
     // `Mxfp4RoutedDequant`; empty otherwise, which is also the runtime's
@@ -110,6 +117,12 @@ struct MixtralLayerWeights {
     DeviceBuffer<const std::uint8_t*> expert_down_packed_ptrs;
     DeviceBuffer<const std::uint8_t*> expert_down_scale_ptrs;
     DeviceBuffer<const void*>         expert_down_bias_ptrs;
+
+    /// Set once the layer's experts can no longer move: the pointer arrays
+    /// above then describe every expert permanently, so the forward stops
+    /// reading back the routed set to rebuild them. Mutable because it is a
+    /// memo of the cache's state, not part of the weights.
+    mutable bool expert_ptrs_static = false;
 };
 
 struct MixtralWeights {

@@ -4,7 +4,6 @@ use std::collections::HashMap;
 
 use pie_driver_abi::PieTerminalCell;
 
-use super::fire_plan;
 use super::stats::SchedulerStats;
 use super::wire;
 use super::worker::PendingRequest;
@@ -24,77 +23,6 @@ pub(crate) struct StepBuild {
     pub(crate) channel_expected_head: Vec<u64>,
     pub(crate) channel_expected_tail: Vec<u64>,
     pub(crate) channel_ticket_indptr: Vec<u32>,
-}
-
-/// `PIE_FIRE_CENSUS=1` prints one line per sealed step group (size, solo
-/// contract, join refusals by clause) — the C measurement's surface.
-fn fire_census_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PIE_FIRE_CENSUS").is_ok_and(|v| !v.is_empty() && v != "0")
-    })
-}
-
-/// V2 rung ③a (north-star-dsl.md "RUNG ③ SPEC"): the region table —
-/// the seriation's output stated ONCE, from which the planned scalar
-/// words become derivations. Regions are maximal runs of members
-/// sharing an axis signature (`PIE_REGION_SIG_*`: multi_token, hook,
-/// mask, truncated — exactly the seriation's vocabulary) and a depth
-/// operand k; boundaries are WIRE rows through the attribution CSR.
-/// Declined (empty) when the step carries no attribution to convert
-/// through, or when any member owns zero wire rows (a device-geometry
-/// placeholder — its facts occupy no rows, so a table would state
-/// regions the row scan can't confirm): the words' UNPLANNED
-/// discipline, table-shaped.
-fn planned_region_table(
-    ordered: &[Box<PendingRequest>],
-    row_indptr: &[u32],
-) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    if row_indptr.len() != ordered.len() + 1
-        || row_indptr.windows(2).any(|w| w[1] <= w[0])
-    {
-        return (Vec::new(), Vec::new(), Vec::new());
-    }
-    let mut indptr: Vec<u32> = vec![row_indptr[0]];
-    let mut sigs: Vec<u32> = Vec::new();
-    let mut ks: Vec<u32> = Vec::new();
-    for (member, req) in ordered.iter().enumerate() {
-        let sig = u32::from(
-            req.request
-                .qo_indptr
-                .windows(2)
-                .any(|w| w[1] - w[0] > 1),
-        ) * pie_driver_abi::PIE_REGION_SIG_MULTI_TOKEN
-            | u32::from(req.hook_program) * pie_driver_abi::PIE_REGION_SIG_HOOK
-            | u32::from(req.request.has_user_mask) * pie_driver_abi::PIE_REGION_SIG_MASK
-            | u32::from(req.request.max_layers.is_some())
-                * pie_driver_abi::PIE_REGION_SIG_TRUNCATED
-            | u32::from(req.lora_program) * pie_driver_abi::PIE_REGION_SIG_LORA;
-        let k = req
-            .request
-            .max_layers
-            .unwrap_or(pie_driver_abi::PIE_MAX_LAYERS_FULL);
-        let end = row_indptr[member + 1];
-        if sigs.last() == Some(&sig) && ks.last() == Some(&k) {
-            *indptr.last_mut().expect("indptr starts nonempty") = end;
-        } else {
-            sigs.push(sig);
-            ks.push(k);
-            indptr.push(end);
-        }
-    }
-    (indptr, sigs, ks)
-}
-
-/// The depth union's arm switch — DEFAULT ON (`PIE_DEPTH_UNION=0`
-/// disarms and restores the S-1 solo rule). The union oracle and the
-/// wide battery (R=4, mixed-k decline, all-truncated control) passed
-/// on the armed boots before the flip.
-pub(crate) fn depth_union_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var("PIE_DEPTH_UNION").is_ok_and(|v| v == "0")
-    })
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -312,7 +240,6 @@ pub(crate) fn build_frame_submission(
     limits: SchedulerLimits,
     page_size: u32,
     stats: &SchedulerStats,
-    model_sites: &[fire_plan::Site],
 ) -> (FrameSubmission, Vec<Box<PendingRequest>>) {
     let mut step_groups: Vec<Vec<Box<PendingRequest>>> = Vec::new();
     for wave in waves {
@@ -327,53 +254,13 @@ pub(crate) fn build_frame_submission(
             let mut group: Vec<Box<PendingRequest>> = Vec::new();
             let mut rest: Vec<Box<PendingRequest>> = Vec::new();
             let mut closed = false;
-            let mut refusals: Vec<&'static str> = Vec::new();
             for req in deferred {
-                if closed {
-                    refusals.push("group-closed");
-                    rest.push(req);
-                    continue;
-                }
-                if let Some(reason) = grouping.refusal(&req, limits, page_size) {
-                    refusals.push(reason);
+                if closed || !grouping.accepts(&req, limits, page_size) {
                     rest.push(req);
                     continue;
                 }
                 closed = grouping.push(&req, limits, page_size);
                 group.push(req);
-            }
-            // The fire census (C): one line per sealed step group — size,
-            // the head's solo contract if any, and every join refusal by
-            // clause. This is the measurement surface for "what does the
-            // remaining partition cost": a workload whose census shows only
-            // contract-bound reasons has nothing left for the scheduler to
-            // relax.
-            if fire_census_enabled() {
-                let solo = group
-                    .first()
-                    .and_then(|req| req.solo_reason())
-                    .unwrap_or("-");
-                // Per-member fingerprint (fire id × row count): whether two
-                // runs composed the SAME logical fires is what separates a
-                // composition-timing difference from a numeric one when
-                // their outputs disagree.
-                let members: Vec<String> = group
-                    .iter()
-                    .map(|req| {
-                        format!(
-                            "{}x{}",
-                            req.logical_fire_id,
-                            req.request.token_ids.len()
-                        )
-                    })
-                    .collect();
-                eprintln!(
-                    "[fire-census] step members={} [{}] solo={} deferred={:?}",
-                    group.len(),
-                    members.join(","),
-                    solo,
-                    refusals,
-                );
             }
             debug_assert!(!group.is_empty(), "grouping always admits the head");
             if group.is_empty() {
@@ -396,83 +283,10 @@ pub(crate) fn build_frame_submission(
         // Ordered sub-batches: wire (Host-class) members first, the
         // device-resolved envelope suffix last — the driver's offset
         // fixed-decode compose requires the envelope lanes to be a
-        // contiguous program suffix. That contract stays PRIMARY. Within
-        // each class, attention-hook-carrying programs sort last: the
-        // driver's hook-free prefix (`StageHooks::hook_free_prefix_rows`)
-        // is the fused fast path, and a leading hook-free run that spans
-        // ALL hook-free lanes makes that prefix maximal instead of ending
-        // at whichever hook lane happened to arrive first. Stable order
-        // keeps arrival otherwise. The permutation comes from the fire
-        // planner — the same key the inline sort here used to apply,
-        // generalized so the next divergence axis lands as planner data
-        // (`fire_plan::MemberFacts`) instead of a wider sort key; the
-        // plan's per-site lowerings are not consumed yet (v0).
-        let facts: Vec<fire_plan::MemberFacts> = group
-            .iter()
-            .enumerate()
-            .map(|(arrival, req)| fire_plan::MemberFacts {
-                hook_program: req.hook_program,
-                lora: req.lora_program,
-                custom_mask: req.request.has_user_mask,
-                truncated: req.request.max_layers.is_some(),
-                max_layers: req.request.max_layers,
-                multi_token: req.request.qo_indptr.windows(2).any(|w| w[1] - w[0] > 1),
-                device_resolved_geometry: req.request.device_resolved_geometry,
-                arrival,
-            })
-            .collect();
-        // `model_sites` is the driver's own statement, from its validated
-        // declared plan through the capabilities handshake (the site_table
-        // module doc's wiring; `fire_plan::site_table::summary_sites` maps
-        // the reported summary into the vocabulary). Empty — every dense
-        // model, every driver without a declared plan — reduces this to
-        // the old `plan_fire` exactly. The qkv_postprocess site is
-        // CONSUMED since B (`planned_prefix_wire_rows` below): its
-        // Prefix{fast_rows} crosses the wire as
-        // `planned_hook_free_prefix_rows` and the driver's Peel split
-        // uses it after a cross-check. The other sites remain
-        // informational.
-        let plan = fire_plan::plan_fire_with_model(&facts, model_sites);
-        debug_assert_eq!(
-            plan.sites.len(),
-            3 + model_sites.len(),
-            "the merged plan carries both member-fact sites and every model site"
-        );
-        debug_assert_eq!(
-            plan.member_order,
-            {
-                let mut order: Vec<usize> = (0..group.len()).collect();
-                order.sort_by_key(|&i| {
-                    (
-                        group[i].request.device_resolved_geometry,
-                        group[i].request.has_user_mask,
-                        group[i].hook_program,
-                        // STRUCTURAL S-2 (found by AC-0: the lora x
-                        // depth pair PANICKED this parity assert — the
-                        // reference comparator must carry every
-                        // seriation term the plan's key carries).
-                        group[i].request.max_layers.is_some(),
-                        // ④: the deepest-first band order, mirrored.
-                        std::cmp::Reverse(
-                            group[i].request.max_layers.unwrap_or(u32::MAX),
-                        ),
-                        !group[i]
-                            .request
-                            .qo_indptr
-                            .windows(2)
-                            .any(|w| w[1] - w[0] > 1),
-                    )
-                });
-                order
-            },
-            "fire plan order must equal the stable sort it replaced"
-        );
-        let mut slots: Vec<Option<Box<PendingRequest>>> = group.into_iter().map(Some).collect();
-        let group: Vec<Box<PendingRequest>> = plan
-            .member_order
-            .iter()
-            .map(|&index| slots[index].take().expect("member_order is a permutation"))
-            .collect();
+        // contiguous program suffix. Stable sort keeps arrival order
+        // within each class.
+        let mut group = group;
+        group.sort_by_key(|req| req.request.device_resolved_geometry);
         let wire_count = group
             .iter()
             .take_while(|req| !req.request.device_resolved_geometry)
@@ -516,29 +330,13 @@ pub(crate) fn build_frame_submission(
             );
         }
         required_kv_pages = required_kv_pages.max(build.plan.required_kv_pages);
-        // The planner's first CONSUMED lowering (fire_plan module doc):
-        // the qkv_postprocess site's Prefix{fast_rows} — member counts —
-        // converted to WIRE request rows through the attribution CSR and
-        // handed across; the driver cross-checks it against its own
-        // compiled-plan derivation and refuses the launch on drift.
-        // V2 rung ③c-ii: the four planned words are DEAD — the region
-        // table below is the plans' single source; the driver derives
-        // them at the view-assembly boundary (region_plans.hpp). The
-        // uniform-k stamp went with them: plan.max_layers now feeds
-        // nothing (the table's per-region k is the depth operand).
-        let merged_plan = build.plan;
-        let (region_row_indptr, region_sig, region_k) =
-            planned_region_table(&group, &build.program_row_indptr);
         steps.push(StepSubmission {
-            plan: merged_plan,
+            plan: build.plan,
             roster_rows,
             sub_batch_indptr,
             sub_batch_class,
             terminal_cells: build.terminal_cells,
             program_row_indptr: build.program_row_indptr,
-            region_row_indptr,
-            region_sig,
-            region_k,
             logical_fire_ids: build.logical_fire_ids,
             channel_expected_head: build.channel_expected_head,
             channel_expected_tail: build.channel_expected_tail,
@@ -581,9 +379,6 @@ mod tests {
             process_id: None,
             pipeline_id: None,
             prebuilt,
-            hook_program: false,
-            lora_program: false,
-            page_mask_program: false,
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
@@ -605,44 +400,6 @@ mod tests {
             single_token_mode: true,
             ..LaunchPlan::default()
         }
-    }
-
-    /// The driver-reported model sites are INFORMATIONAL this increment
-    /// (nothing consumes a fire plan's site vec downstream — v0): sealing a
-    /// frame with an MoE summary's expert site merged produces a submission
-    /// identical to sealing without it, while the debug assert inside
-    /// `build_frame_submission` pins that the merged plan really carried
-    /// the site through `plan_fire_with_model`.
-    #[test]
-    fn model_sites_are_informational_for_the_submission() {
-        let limits = SchedulerLimits {
-            max_forward_requests: 8,
-            max_forward_tokens: 64,
-            max_page_refs: 64,
-        };
-        let waves = || {
-            vec![vec![
-                pending(wire_decode(11, 3), 1, false),
-                pending(wire_decode(22, 4), 2, false),
-            ]]
-        };
-        let stats = SchedulerStats::default();
-        let (without_sites, retired) = build_frame_submission(waves(), limits, 16, &stats, &[]);
-        assert_eq!(retired.len(), 2);
-
-        let model_sites = [fire_plan::expert_weights_site(256, 8)];
-        let (with_sites, retired) =
-            build_frame_submission(waves(), limits, 16, &stats, &model_sites);
-        assert_eq!(retired.len(), 2);
-        // Terminal cells are per-completion heap pointers, distinct between
-        // the two constructions by nature; everything else must agree.
-        let scrub = |mut submission: FrameSubmission| {
-            for step in &mut submission.steps {
-                step.terminal_cells.clear();
-            }
-            submission
-        };
-        assert_eq!(scrub(without_sites), scrub(with_sites));
     }
 
     #[test]

@@ -577,7 +577,8 @@ mod grouped_coverage {
         ));
         assert!(
             handled.len() > 40,
-            "only {} tag arms parsed out of ptir_m1_execute; the scan broke and              every comparison below would be vacuous",
+            "only {} tag arms parsed out of ptir_m1_execute; the scan broke and \
+             every comparison below would be vacuous",
             handled.len()
         );
         let mut checked = 0usize;

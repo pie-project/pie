@@ -45,6 +45,13 @@ public:
     int num_layers() const noexcept { return num_layers_; }
     std::size_t bytes_per_page() const noexcept { return page_bytes_; }
     cudaStream_t stream() const noexcept { return stream_; }
+    /// The stream a restore (H2D) is issued on. Restores are on the
+    /// critical path — an evicted process cannot run until its pages are
+    /// back — while evictions are background work, so sharing one stream
+    /// made every restore queue behind every pending eviction. PCIe is
+    /// full duplex; separating them lets the two directions proceed at
+    /// once instead of FIFO.
+    cudaStream_t restore_stream() const noexcept { return restore_stream_; }
     void synchronize() const;
 
     // Bulk page copies, src/dst expressed as page indices. Pairs are
@@ -91,9 +98,12 @@ private:
         std::size_t page_bytes = 0;
     };
     std::vector<std::vector<HostBuffer>> host_pools_;
-    // Dedicated stream — swap copies don't share the default stream that
+    // Dedicated streams — swap copies don't share the default stream that
     // the forward pass runs on. Synced per-call before responding.
+    // `stream_` carries eviction (D2H) and graft (D2D) traffic;
+    // `restore_stream_` carries restores (H2D). See `restore_stream()`.
     cudaStream_t stream_ = nullptr;
+    cudaStream_t restore_stream_ = nullptr;
 };
 
 }  // namespace pie_cuda_driver

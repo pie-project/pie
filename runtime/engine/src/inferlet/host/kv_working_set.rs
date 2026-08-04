@@ -53,18 +53,17 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         crate::inferlet::process::gate::residency_gate(self).await?;
         // Single-model runtime: bind the one model (index 0), driver 0.
         let stores = store_registry::get(0, 0);
-        let id = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-            kv.create_working_set()
+        // Allocate before locking: a stalled malloc under the global KV lock
+        // freezes every lane, not just this one.
+        let prepared = crate::store::kv::PreparedWorkingSet::new();
+        let id = store_registry::with_kv_lock(&stores.kv, "host-working-set", move |kv| {
+            kv.install_working_set(prepared)
         });
         let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
         self.register_kv_working_set(&ws);
         Ok(self.ctx().table.push(ws)?)
     }
 
-    async fn page_size(&mut self, this: Resource<KvWorkingSet>) -> Result<u32> {
-        crate::inferlet::process::gate::residency_gate(self).await?;
-        Ok(self.ctx().table.get(&this)?.page_size)
-    }
 
     async fn page_len(&mut self, this: Resource<KvWorkingSet>) -> Result<u32> {
         crate::inferlet::process::gate::residency_gate(self).await?;
@@ -132,8 +131,10 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
     ) -> Result<Result<Option<Resource<KvWorkingSet>>, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let stores = store_registry::get(0, 0);
-        let indexed =
-            store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| kv.from_index(&key));
+        let prepared = crate::store::kv::PreparedWorkingSet::new();
+        let indexed = store_registry::with_kv_lock(&stores.kv, "host-working-set", move |kv| {
+            kv.from_index(&key, prepared)
+        });
         match indexed {
             Ok(Some(id)) => {
                 let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
@@ -205,8 +206,10 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
             Err(error) => return Ok(Err(error)),
         };
         let stores = store_registry::get(ws.model, ws.driver as usize);
-        let forked =
-            store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| kv.fork(ws.id));
+        let prepared = crate::store::kv::PreparedWorkingSet::new();
+        let forked = store_registry::with_kv_lock(&stores.kv, "host-working-set", move |kv| {
+            kv.fork(ws.id, prepared)
+        });
         match forked {
             Ok(id) => {
                 // A distinct working-set id gets its OWN fresh lifecycle —
@@ -233,10 +236,12 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
             Err(error) => return Ok(Err(error)),
         };
         let stores = store_registry::get(ws.model, ws.driver as usize);
-        let sliced = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+        let prepared = crate::store::kv::PreparedWorkingSet::new();
+        let sliced = store_registry::with_kv_lock(&stores.kv, "host-working-set", move |kv| {
             kv.slice(
                 ws.id,
                 range.start as u64..(range.start as u64 + range.len as u64),
+                prepared,
             )
         });
         match sliced {

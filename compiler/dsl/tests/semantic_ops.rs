@@ -60,9 +60,9 @@ fn nucleus_trace(explicit: bool, escape_intermediate: bool) -> Traced {
     let escaped = escape_intermediate.then(|| Channel::new([2, 4], dtype::f32));
     let mut builder = Builder::new(32_000, 16);
     builder.stage(Stage::Epilogue, || {
-        let logits = logits.take().tensor();
-        let top_p = top_p.take().tensor();
-        let rng = rng.take().tensor();
+        let logits = logits.take();
+        let top_p = top_p.take();
+        let rng = rng.take();
         let token = if explicit {
             let probabilities = softmax(&logits);
             if let Some(escaped) = &escaped {
@@ -247,7 +247,7 @@ fn newly_exposed_unary_ops_evaluate() {
     let r = Channel::new([4], dtype::f32);
     let mut builder = Builder::new(32_000, 16);
     builder.stage(Stage::Epilogue, || {
-        let x = input.take().tensor();
+        let x = input.take();
         a.put(abs(&x));
         s.put(sign(&x));
         r.put(recip(&x));

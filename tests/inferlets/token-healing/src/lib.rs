@@ -35,8 +35,7 @@
 //! Faithfulness: **Exact**. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::ptir::prelude::*;
-use inferlet::{Result, model as wit_model};
+use inferlet::ptir::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -95,11 +94,11 @@ async fn main(input: Input) -> Result<Output> {
         return Err("backoff must satisfy 1 <= backoff <= 4".into());
     }
 
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
-    let full = wit_model::encode(&input.prompt);
+    let full = model::encode(&input.prompt);
     if full.len() <= input.backoff {
         return Err("prompt is too short to roll back that many tokens".into());
     }
@@ -107,11 +106,11 @@ async fn main(input: Input) -> Result<Output> {
     // The fragment is the *bytes* the rolled-back tokens covered, not their
     // text: a prefix test on decoded strings would break on tokens whose bytes
     // are not valid UTF-8 on their own, which is most multi-byte tokens.
-    let (ids, byte_sequences) = wit_model::vocabs();
+    let vocabs = model::vocabs();
     let mut token_bytes: Vec<&[u8]> = vec![&[]; vocab as usize];
-    for (&id, bytes) in ids.iter().zip(byte_sequences.iter()) {
-        if (id as usize) < token_bytes.len() {
-            token_bytes[id as usize] = bytes.as_slice();
+    for token in &vocabs {
+        if (token.id as usize) < token_bytes.len() {
+            token_bytes[token.id as usize] = token.bytes.as_slice();
         }
     }
 
@@ -154,20 +153,17 @@ async fn main(input: Input) -> Result<Output> {
 
     let n = prompt.len() as u32;
     let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
-    let prompt_tokens = Channel::from(prompt.iter().map(|&t| t as i32).collect::<Vec<_>>());
-    let prefill_indptr = Channel::from(vec![0u32, n]).named("prefill_indptr");
-    let prefill_positions = Channel::from((0..n).collect::<Vec<_>>()).named("prefill_positions");
-    let prefill_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("prefill_pages");
+    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
+    let prefill_indptr = Channel::from([0u32, n]).named("prefill_indptr");
+    let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
+    let prefill_pages = Channel::from_iter(0..max_pages).named("prefill_pages");
     let prefill_page_indptr =
-        Channel::from(vec![0u32, n.div_ceil(page_size)]).named("prefill_page_indptr");
-    let prefill_w_slot =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("prefill_w_slot");
-    let prefill_w_off =
-        Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("prefill_w_off");
-    let prefill_kv_len = Channel::from(vec![n]).named("prefill_kv_len");
+        Channel::from([0u32, n.div_ceil(page_size)]).named("prefill_page_indptr");
+    let prefill_w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("prefill_w_slot");
+    let prefill_w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("prefill_w_off");
+    let prefill_kv_len = Channel::from([n]).named("prefill_kv_len");
     let heal_mask = Channel::new([vocab], dtype::bool).named("heal_mask");
     let first_out = Channel::new([1], dtype::i32).named("first_token");
 
@@ -175,15 +171,17 @@ async fn main(input: Input) -> Result<Output> {
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
     prefill.attention(
         &ws,
-        ..,
-        ..,
-        &prefill_kv_len,
-        &prefill_pages,
-        &prefill_page_indptr,
-        &prefill_w_slot,
-        &prefill_w_off,
-        &prefill_positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &prefill_kv_len,
+            pages: &prefill_pages,
+            page_indptr: &prefill_page_indptr,
+            w_slot: &prefill_w_slot,
+            w_off: &prefill_w_off,
+            positions: &prefill_positions,
+            mask: None,
+        },
     )?;
     prefill.epilogue(move || {
         let allowed = heal_mask.take();
@@ -192,27 +190,20 @@ async fn main(input: Input) -> Result<Output> {
 
     heal_mask.put(first_mask);
     let pipeline = Pipeline::new();
-    prefill
-        .submit(&pipeline)
-        .map_err(|e| format!("token-healing prefill: {e}"))?;
-    let first = first_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read healed token: {e}"))?[0] as u32;
+    prefill.submit(&pipeline).context("token-healing prefill")?;
+    let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = vec![first];
 
     if generated.len() < input.max_tokens {
-        let token_in = Channel::from(vec![first as i32]).named("token_in");
-        let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let token_in = Channel::from([first as i32]).named("token_in");
+        let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
         let token_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("token_out");
@@ -221,39 +212,36 @@ async fn main(input: Input) -> Result<Output> {
         decode.embed(&token_in, &embed_indptr)?;
         decode.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         decode.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let next_length = &length + 1u32;
+            let page_count = next_length.div_ceil(page_size);
 
             token_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
-            page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
+            page_indptr.put(indptr(1, &page_count));
             token_out.put(&token);
         });
 
         let budget = input.max_tokens - 1;
         run_ahead(&pipeline, &decode, budget as usize, async || {
-            let token = token_out
-                .take()
-                .get::<i32>()
-                .await
-                .map_err(|e| format!("read token: {e}"))?[0] as u32;
+            let token = token_out.take_host::<i32>().await? as u32;
             generated.push(token);
             Ok(ControlFlow::Continue(()))
         })
@@ -279,7 +267,7 @@ async fn main(input: Input) -> Result<Output> {
         healed_token: first,
         healed_token_bytes: healed_bytes.len(),
         prompt_preserved,
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
     })
 }
