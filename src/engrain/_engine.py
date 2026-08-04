@@ -38,6 +38,12 @@ import triton
 import triton.language as tl
 
 _GROUP_BLOCK = 64
+
+# Slots in the per-row filter that stops a group being unioned twice. A power
+# of two, and small: what a row admits is a handful, and a collision costs a
+# repeated union rather than a wrong answer. Sixty-four is 16 MiB at batch 512
+# against 5.16 GiB for the bit-per-group shape it replaces.
+_GROUP_FILTER = 64
 # Threads per block for the CUDA kernels that give a warp to a configuration.
 # Four warps, which is what the Triton locate uses, so the two are comparable.
 _LOCATE_THREADS = 128
@@ -3520,7 +3526,13 @@ class DeviceBatch:
         # is work. Measured on the corpus schema that forks hardest, sixty-four
         # configurations produce four distinct rows and write sixty times the
         # bits that end up set.
-        self.group_words = (grammar.num_groups + 31) // 32
+        # Slots in each row's filter, a power of two so the probe can mask.
+        # Not a bit per group: `num_groups` is the largest schema the pool
+        # holds, so that shape was 5.16 GiB at batch 512 over sixty-four corpus
+        # schemas and could not be built at all at 1,024. A row admits a
+        # handful of groups, so a fixed set holds them, and a collision costs
+        # one repeated union rather than a wrong answer.
+        self.group_words = _GROUP_FILTER
         self.group_given = torch.zeros(
             rows * self.group_words, dtype=torch.int32, device="cuda"
         )

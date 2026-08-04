@@ -2,28 +2,20 @@
   "schemas": 64,
   "rows": [
     {
-      "batch": 512,
-      "distinct": 1,
-      "engrain_us": 1445.9348749369383,
-      "xgrammar_serial_us": 25091.625517234206,
-      "xgrammar_threaded_us": 7757.613901048899,
-      "forward_us": 30241.122748702765
-    },
-    {
-      "batch": 512,
-      "distinct": 8,
-      "engrain_us": 1884.3384459614754,
-      "xgrammar_serial_us": 257749.05015714467,
-      "xgrammar_threaded_us": 36088.463151827455,
-      "forward_us": 30241.122748702765
-    },
-    {
-      "batch": 512,
+      "batch": 1024,
       "distinct": 64,
-      "engrain_us": 3918.7988732010126,
-      "xgrammar_serial_us": 62882.07368925214,
-      "xgrammar_threaded_us": 12270.263629034162,
-      "forward_us": 30241.122748702765
+      "engrain_us": 5485.567729920149,
+      "xgrammar_serial_us": 127799.75892044604,
+      "xgrammar_threaded_us": 20993.191050365567,
+      "forward_us": 29636.43546681851
+    },
+    {
+      "batch": 2048,
+      "distinct": 64,
+      "engrain_us": 9611.03243753314,
+      "xgrammar_serial_us": 252449.33902285993,
+      "xgrammar_threaded_us": 37822.89405353367,
+      "forward_us": 49388.70414625853
     }
   ]
 }

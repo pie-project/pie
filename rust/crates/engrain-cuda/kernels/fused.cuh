@@ -447,6 +447,14 @@ extern "C" __global__ void en_fill_probe(
     // on the corpus schema that forks hardest: sixty-four configurations
     // produce four distinct rows, and the bits written are sixty times the
     // bits that end up set.
+    //
+    // A small open-addressed set per row, not a bit per group. A bit per group
+    // is `rows x num_groups / 8` and `num_groups` is the largest schema in the
+    // pool, so a batch of 512 over sixty-four corpus schemas wanted 5.16 GiB
+    // of it and a batch of 1,024 could not be built at all. What a row
+    // actually admits is a handful, so a fixed set holds it - and when it does
+    // not, the group is written twice, which is a union either way. This is a
+    // filter, not a fact.
     for (int32_t at = lane; at < group_words; at += blockDim.x) {
         admitted[(int64_t)sequence * group_words + at] = 0;
     }
@@ -593,10 +601,24 @@ extern "C" __global__ void en_fill_sweep(
             // group is `mask_words` atomics, and paying that sixty times for
             // one answer is what made a schema that forks cost 3.6 ms against
             // 42 us for the same schema seeded where it does not.
-            int32_t bit = 1 << (group & 31);
-            int32_t before = atomicOr(
-                &admitted[(int64_t)sequence * group_words + (group >> 5)], bit);
-            if (before & bit) {
+            // Claim the group, or find it already claimed. Four probes and
+            // then give up and write it again: a full filter costs work and
+            // never an answer.
+            bool given = false;
+            uint32_t home = ((uint32_t)group * 2654435761u) & (uint32_t)(group_words - 1);
+            for (int32_t probe = 0; probe < 4; ++probe) {
+                int32_t* cell = &admitted[(int64_t)sequence * group_words
+                                          + ((home + probe) & (group_words - 1))];
+                int32_t was = atomicCAS(cell, 0, group + 1);
+                if (was == 0) {
+                    break;
+                }
+                if (was == group + 1) {
+                    given = true;
+                    break;
+                }
+            }
+            if (given) {
                 continue;
             }
             int32_t kind = arena->group_set_kind[groups + group];
