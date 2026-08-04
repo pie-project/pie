@@ -7,7 +7,6 @@
 //! subcommand runs on it. `local`/`serve` use the full daemon `startup::init`
 //! + `run_until_signal`; one-shot ops use the light `startup::init_cli`.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -66,33 +65,7 @@ enum Command {
         cmd: ops::inferlet::InferletCmd,
     },
 
-    /// Manage per-driver venvs + diagnostics (`pie driver <type> ...`).
-    Driver {
-        #[command(subcommand)]
-        cmd: ops::driver::DriverCmd,
-    },
-
-    /// Validate a config TOML without booting the engine. Defaults to the
-    /// one pie would boot from.
-    Check {
-        /// Path to the config TOML. Omit to check the resolved one.
-        config: Option<PathBuf>,
-        /// Print the fully parsed config after validation.
-        #[arg(long)]
-        debug: bool,
-    },
-
-    /// FFI smoke test — invoke a driver's `--help` and report its exit code.
-    Smoke {
-        /// Accepted for backwards compatibility; no-op.
-        #[arg(long)]
-        rpc: bool,
-        /// Which compiled driver flavor to invoke (`cuda`/`metal`/`dummy`).
-        #[arg(long)]
-        flavor: Option<String>,
-    },
-
-    /// Environment readiness check (platform, GPUs, compiled drivers).
+    /// Will pie run here, and with this config? Exits non-zero if not.
     Doctor,
 }
 
@@ -142,8 +115,12 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Doctor => {
             startup::init_cli(&cli.global)?;
-            ops::doctor::doctor()?;
-            Ok(ExitCode::SUCCESS)
+            // The exit code IS the answer -- `pie doctor && pie serve` should
+            // be a thing an operator can write.
+            Ok(match ops::doctor::doctor(&cli.global)? {
+                true => ExitCode::SUCCESS,
+                false => ExitCode::FAILURE,
+            })
         }
         Command::Cache { cmd } => {
             startup::init_cli(&cli.global)?;
@@ -158,22 +135,6 @@ async fn main() -> anyhow::Result<ExitCode> {
         Command::Inferlet { cmd } => {
             startup::init_cli(&cli.global)?;
             ops::inferlet::run(cmd, &cli.global).await?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Driver { cmd } => {
-            startup::init_cli(&cli.global)?;
-            ops::driver::run(cmd, &cli.global)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Check { config, debug } => {
-            startup::init_cli(&cli.global)?;
-            let path = config.unwrap_or_else(|| startup::cli_config_path(&cli.global).0);
-            ops::diag::check(&path, debug)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Smoke { rpc, flavor } => {
-            startup::init_cli(&cli.global)?;
-            ops::diag::smoke(rpc, flavor.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
     }

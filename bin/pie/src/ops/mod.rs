@@ -5,9 +5,7 @@
 
 pub mod cache;
 pub mod config;
-pub mod diag;
 pub mod doctor;
-pub mod driver;
 pub mod hf;
 pub mod inferlet;
 pub mod model;
