@@ -2649,3 +2649,19 @@ full+truncated fires need the row-narrowing to become compute-bound
 (large R / prefill-shaped members) before it prices. Correctness: at
 both scales the full lane byte-matches its solo run and truncated
 lanes emit layer-k class — the demotion is dead wherever bands arm.
+
+## ACT 1 HARDENED AT 14B (2026-08-04): two real bugs, one honest limit
+
+Taking bands to 14B surfaced what 0.6B/7B could not: (1) the declared
+leg was swallowing banded fires and silently demoting them — the
+per-fire fallback now refuses stamped bands; (2) the frame's band
+computation sat inside the plan-once-per-frame skip, so steady-state
+steps read empty bands and replayed demoted graphs. Both are the same
+lesson the campaign kept teaching: A DEFAULT-ON AXIS MUST BE VISIBLE
+TO EVERY GATE THAT ROUTES AROUND THE WALKER THAT SERVES IT (graphs,
+legs, plan reuse). And one honest limit: the 14B chained-decode
+ENVELOPE rarely runs prepare at all (placeholder host inputs skip the
+plan hook), so banding it requires planning from composed geometry —
+scoped out as a future increment; the envelope degrades to the
+pre-Act-1 demotion, no regression. Diagnosis instruments are
+permanent (PIE_REGION_TRACE: [region] / [band-gate] / [band-prep]).
