@@ -106,12 +106,10 @@ async fn main(_input: String) -> Result<String> {
         let off1 = &off + 1u32;
         let pl2 = reshape(scatter_set(reshape(pl, [B * P]), &tcol, &off1), [B, P]);
         lens.put(&pl2); // the source; klen/kvm are its two derivatives (put-only, tracer drains)
-        klen.take();
         klen.put((&n2 - 1u32) * PAGE_T + &off1); // physical span (frozen pages full)
         let io = reshape(iota(PAGE_T), [1, 1, PAGE_T]);
         let iob = broadcast(io, [B, P, PAGE_T]);
         let lb = broadcast(reshape(&pl2, [B, P, 1]), [B, P, PAGE_T]);
-        kvm.take();
         kvm.put(reshape(lt(iob, lb), [B, P * PAGE_T])); // valid iff in-page offset < lens entry
         pos.put(pos.take() + 1u32); // logical length (ping-pong)
         np.put(&n2);

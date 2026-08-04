@@ -110,11 +110,8 @@ async fn main(input: Input) -> Result<String> {
     let amateur_prefill_embed_indptr =
         Channel::from([0u32, n]).named("amateur_prefill_embed_indptr");
     let amateur_prefill_positions = Channel::from_iter(0..n).named("amateur_prefill_positions");
-    let amateur_prefill_slots = Channel::from(
-        (0..n)
-            .map(|position| amateur_ids[(position / PAGE_T) as usize])
-            .collect::<Vec<_>>(),
-    );
+    let amateur_prefill_slots =
+        Channel::from_iter((0..n).map(|position| amateur_ids[(position / PAGE_T) as usize]));
     let amateur_prefill_offsets = Channel::from_iter((0..n).map(|position| position % PAGE_T));
     let amateur_prefill_klen = Channel::from([n]);
     let amateur_prefill_pages = Channel::from(amateur_ids.clone());
@@ -122,7 +119,7 @@ async fn main(input: Input) -> Result<String> {
     // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
     // count claims a kv length the pass does not have and silently corrupts
     // attention, so the count must track `kv_len` exactly (as the expert pass does).
-    let amateur_prefill_indptr = Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]);
+    let amateur_prefill_indptr = Channel::from([0u32, n.div_ceil(PAGE_T)]);
     let amateur_prefill_mask = Channel::from_shaped(
         [n, pool_len],
         (0..n)
@@ -229,7 +226,7 @@ async fn main(input: Input) -> Result<String> {
             .collect::<Vec<_>>(),
     );
     let amateur_pages = Channel::from(amateur_ids.clone());
-    let amateur_page_indptr = Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]);
+    let amateur_page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]);
     let amateur_ids_input = Channel::from(amateur_ids.clone()).named("amateur_pool_ids");
     let amateur_logits_out = Channel::new([vocab], dtype::f32)
         .capacity(channel_capacity() as u32)
@@ -269,17 +266,13 @@ async fn main(input: Input) -> Result<String> {
         amateur_logits_out.put(intrinsics::logits());
         amateur_position.put(&base);
         amateur_fill.put(&next);
-        amateur_klen.take();
         amateur_klen.put(&next);
         amateur_write_slot.put(gather(&ids, &base / PAGE_T));
         amateur_write_offset.put(&base % PAGE_T);
-        amateur_mask.take();
         amateur_mask.put(next_mask);
-        amateur_pages.take();
         amateur_pages.put(reshape(&ids, [pool_pages]));
-        amateur_page_indptr.take();
-        let amateur_page_count = (&next + (PAGE_T - 1)) / PAGE_T;
-        amateur_page_indptr.put(iota(2) * broadcast(&amateur_page_count, [2]));
+        let amateur_page_count = next.div_ceil(PAGE_T);
+        amateur_page_indptr.put(indptr(1, &amateur_page_count));
         amateur_ids_input.put(&ids);
     });
 
@@ -317,15 +310,14 @@ async fn main(input: Input) -> Result<String> {
         let length = expert_kv_len.take();
         let token = contrastive_pick(&expert_amateur.take(), lambda, alpha, vocab);
         let next_length = &length + 1u32;
-        let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
+        let page_count = next_length.div_ceil(PAGE_T);
 
         expert_token.put(&token);
         expert_kv_len.put(&next_length);
         expert_position.put(&length);
         expert_write_slot.put(&length / PAGE_T);
         expert_write_offset.put(&length % PAGE_T);
-        expert_page_indptr.take();
-        expert_page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+        expert_page_indptr.put(indptr(1, &page_count));
         expert_token_out.put(&token);
     });
 

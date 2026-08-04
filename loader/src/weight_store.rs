@@ -386,7 +386,7 @@ impl Artifact {
     pub fn bytes(&self, index: usize) -> Result<&[u8], Error> {
         self.source
             .tensor(&self.tensor(index)?.name)
-            .and_then(|t| t.map())
+            .and_then(|t| t.data()?.map())
             .map_err(Error::from)
     }
 
@@ -397,7 +397,7 @@ impl Artifact {
         let name = &self.tensor(index)?.name;
         self.source
             .tensor(name)
-            .and_then(|t| t.locate())
+            .and_then(|t| t.data()?.locate())
             .map(|at| at.offset)
             .map_err(Error::from)
     }
@@ -411,7 +411,7 @@ impl Artifact {
     pub fn verify(&self, index: usize) -> Result<bool, Error> {
         let name = &self.tensor(index)?.name;
         match self.source.tensor(name).and_then(|t| t.verify()) {
-            Ok(verified) => Ok(verified.checked()),
+            Ok(verified) => Ok(verified.is_checked()),
             // A mismatch is a rejected file to zTensor and a cache miss here;
             // both mean the same thing to the caller, which is recompute.
             Err(err) if err.rule() == Some(ztensor::Rule::Digest) => Ok(false),

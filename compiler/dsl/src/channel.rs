@@ -263,6 +263,12 @@ impl Channel {
 
     /// `put(v)` — empty ⇒ fill + full; full ⇒ block (back-pressure). In-program
     /// `v` is a `Tensor` (reshaped to fit the cell); on the host `v` is data.
+    ///
+    /// On a channel bound to a *peeked* descriptor port (geometry, masks — the
+    /// ports whose discipline is read, not take) the put drains the stale value
+    /// first, so a loop-carried update is one call whichever side of
+    /// [`pie_ir::registry::Port::consumes`] the port falls on. An explicit
+    /// `take` in the same trace is honoured and not repeated.
     #[track_caller]
     pub fn put(&self, v: impl IntoPut) -> Put {
         let span = Span::here();

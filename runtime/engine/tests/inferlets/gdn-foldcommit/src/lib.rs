@@ -1308,18 +1308,10 @@ async fn main(input: String) -> Result<String> {
     let spec_pages = Channel::from_iter(0..max_pages).named("spec_pages");
     let spec_page_indptr =
         Channel::from([0u32, (n + SPEC_TOKENS).div_ceil(page_size)]).named("spec_page_indptr");
-    let spec_w_slot = Channel::from(
-        (n..n + SPEC_TOKENS)
-            .map(|p| p / page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("spec_w_slot");
-    let spec_w_off = Channel::from(
-        (n..n + SPEC_TOKENS)
-            .map(|p| p % page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("spec_w_off");
+    let spec_w_slot =
+        Channel::from_iter((n..n + SPEC_TOKENS).map(|p| p / page_size)).named("spec_w_slot");
+    let spec_w_off =
+        Channel::from_iter((n..n + SPEC_TOKENS).map(|p| p % page_size)).named("spec_w_off");
     let spec_out = Channel::new([1], dtype::i32).named("spec_out");
 
     let fwd_s = ForwardPass::new();
@@ -1445,18 +1437,10 @@ async fn main(input: String) -> Result<String> {
         let c2_pages = Channel::from_iter(0..max_pages).named("c2_pages");
         let c2_page_indptr =
             Channel::from([0u32, (base + SPEC_TOKENS).div_ceil(page_size)]).named("c2_page_indptr");
-        let c2_w_slot = Channel::from(
-            (base..base + SPEC_TOKENS)
-                .map(|p| p / page_size)
-                .collect::<Vec<_>>(),
-        )
-        .named("c2_w_slot");
-        let c2_w_off = Channel::from(
-            (base..base + SPEC_TOKENS)
-                .map(|p| p % page_size)
-                .collect::<Vec<_>>(),
-        )
-        .named("c2_w_off");
+        let c2_w_slot = Channel::from_iter((base..base + SPEC_TOKENS).map(|p| p / page_size))
+            .named("c2_w_slot");
+        let c2_w_off =
+            Channel::from_iter((base..base + SPEC_TOKENS).map(|p| p % page_size)).named("c2_w_off");
         let c2_out = Channel::new([1], dtype::i32).named("c2_out");
 
         let fwd2 = ForwardPass::new();
