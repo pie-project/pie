@@ -2347,3 +2347,15 @@ root cause an open observation), the 14B four-axis product A/B lands:
 The composition claim is now measured at three model scales and holds
 its ~6x at both 7B and 14B (both firmly weight-bound at R=32) — the
 review's decisive gap is closed at every scale this hardware serves.
+
+## OBSERVATION LEDGER CLOSES (2026-08-04)
+
+The kvpp fault hunt: three boot-immediate demoted-arm runs at the
+current tip, zero faults, all rounds green — the original failure
+reproduced only on the pre-3-way binary and has not recurred since
+the prefix re-plan landed. Downgraded from "probabilistic fault" to
+"not reproducible at tip; instruments standing" (PIE_KVPP_TRACE +
+[kvpp-sfx] remain permanent). The boot-window register-death keeps
+its ops note (settle 15s on big models). The remaining niceties —
+the middle's third stream, true group splitting — are recorded
+optimizations with no correctness weight.
