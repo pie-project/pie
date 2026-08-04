@@ -1167,6 +1167,24 @@ PieLoaderStatus pie_loader_compile_model(const PieLoaderModelRequest *req,
                                          uint32_t *out_mxfp4_moe,
                                          PieLoaderDiagnostics **out_diags);
 
+/// Check a plan against the contract this request authors.
+///
+/// The model-request counterpart of
+/// [`pie_loader_verify_contract`](super::entry::pie_loader_verify_contract):
+/// the caller has no contract to hand over, so the verifier re-authors one
+/// from the same request and holds the plan to it. Re-authoring is the
+/// point, not a cost — the check covers the author's determinism along with
+/// everything the contract verifier checks.
+///
+/// # Safety
+///
+/// `plan` must point at an unreleased plan; `req` and everything its
+/// pointers reach must be live for the call. `out_diags` is null or a
+/// writable slot.
+PieLoaderStatus pie_loader_verify_model(const PieLoaderPlan *plan,
+                                        const PieLoaderModelRequest *req,
+                                        PieLoaderDiagnostics **out_diags);
+
 /// Open an artifact for `key` at `path`.
 ///
 /// Nothing appears at `path` until [`pie_loader_weight_store_publish`]

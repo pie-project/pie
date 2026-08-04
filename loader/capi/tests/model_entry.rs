@@ -14,6 +14,7 @@ use pie_loader_capi::entry::{
 };
 use pie_loader_capi::model::{
     PieLoaderFamilyKnobs, PieLoaderModelFactsView, PieLoaderModelRequest, pie_loader_compile_model,
+    pie_loader_verify_model,
 };
 use pie_loader_capi::{PieLoaderBackendKind, PieLoaderBytes, PieLoaderDiagnostics, PieLoaderPlan};
 
@@ -194,6 +195,17 @@ fn a_llama_request_compiles_to_a_plan_through_the_abi() {
             .any(|name| name == "model.layers.0.self_attn.qkv_proj.fused.weight"),
         "the dense join's bank is missing from the plan: {names:?}"
     );
+
+    // The verify entry re-authors from the same request and holds the plan
+    // to it — the round trip a migrated driver boot will run.
+    let mut verify_diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
+    let status = unsafe { pie_loader_verify_model(plan, &request, &mut verify_diags) };
+    assert_eq!(
+        status,
+        PieLoaderStatus::Ok,
+        "verify_model rejected its own plan"
+    );
+    unsafe { pie_loader_release_diagnostics(verify_diags) };
 
     // An unknown model_type answers with the fallback's name, not a guess.
     let mut unknown = request;

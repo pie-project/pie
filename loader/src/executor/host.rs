@@ -607,9 +607,15 @@ impl HostExecutor<'_, '_> {
             // A per-group `Scale` and a `Decode` are the transforms whose
             // output is a different width from their input by design:
             // unpacking four-bit codes into `BF16` quadruples the bytes, and a
-            // GGUF block trades 18 bytes for 64. Every other kind moves the
-            // same bytes it read, and the mismatch is a bug worth catching.
-            if transform.scale_blocks.is_empty() && kind != TileMapKind::Decode {
+            // GGUF block trades 18 bytes for 64. A `Cast` preserves the
+            // *element count* while the width follows the representation —
+            // F16→BF16 happened to keep the bytes equal, which is how the
+            // byte check survived until an F32→BF16 plan first ran here.
+            // Every other kind moves the same bytes it read, and the
+            // mismatch is a bug worth catching.
+            if kind == TileMapKind::Cast {
+                require_same_element_count(source_stride, &dest.stride)?;
+            } else if transform.scale_blocks.is_empty() && kind != TileMapKind::Decode {
                 require_same_byte_count(source_stride, &dest.stride)?;
             }
             if !dest.stride.has_dense_destination() {
@@ -1502,6 +1508,25 @@ fn require_same_byte_count(source: &Extent, dest: &Extent) -> Result<(), Error> 
         return Err(invalid(format!(
             "source extent spans {source_bytes:?} bytes but the destination spans \
              {dest_bytes:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// A cast is well-formed when the two sides hold the same number of
+/// *elements*; the widths differ by exactly the representations' ratio.
+fn require_same_element_count(source: &Extent, dest: &Extent) -> Result<(), Error> {
+    let count = |extent: &Extent| -> Option<i64> {
+        extent
+            .dims
+            .iter()
+            .try_fold(1i64, |acc, dim| acc.checked_mul(dim.count))
+    };
+    let (source_count, dest_count) = (count(source), count(dest));
+    if source_count.is_none() || source_count != dest_count {
+        return Err(invalid(format!(
+            "cast source holds {source_count:?} elements but the destination holds \
+             {dest_count:?}"
         )));
     }
     Ok(())

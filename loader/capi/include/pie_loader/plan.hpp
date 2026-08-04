@@ -171,6 +171,22 @@ class LoadPlan {
         return LoadPlan(raw);
     }
 
+    /// Re-check the plan against the contract its model request authors.
+    ///
+    /// The verifier re-authors from the request on the far side and holds
+    /// the plan to it, so the author's determinism is in scope along with
+    /// everything `verify` checks.
+    void verify_model(const PieLoaderModelRequest& request) const {
+        LoadPlanDiagnostics diags;
+        const PieLoaderStatus status =
+            pie_loader_verify_model(plan_, &request, diags.slot());
+        if (status != PieLoaderStatus::Ok) {
+            throw std::runtime_error(
+                "load plan: model verification failed (" + status_name(status) +
+                "): " + diags.text());
+        }
+    }
+
     /// Re-check the plan against the contract it was compiled from.
     ///
     /// Not a tautology across a process or a cache: the plan may have come from

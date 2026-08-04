@@ -28,37 +28,37 @@
     {
       "pass": "hoist-bulk-arena-writes",
       "instrs_before": 63,
-      "instrs_after": 61,
-      "rewrites": 2
+      "instrs_after": 63,
+      "rewrites": 0
     },
     {
       "pass": "recompute-memory-plan",
-      "instrs_before": 61,
-      "instrs_after": 61,
+      "instrs_before": 63,
+      "instrs_after": 63,
       "rewrites": 0
     },
     {
       "pass": "validate-fill-order",
-      "instrs_before": 61,
-      "instrs_after": 61,
+      "instrs_before": 63,
+      "instrs_after": 63,
       "rewrites": 0
     },
     {
       "pass": "validate-target-support",
-      "instrs_before": 61,
-      "instrs_after": 61,
+      "instrs_before": 63,
+      "instrs_after": 63,
       "rewrites": 0
     },
     {
       "pass": "validate-scale-factors",
-      "instrs_before": 61,
-      "instrs_after": 61,
+      "instrs_before": 63,
+      "instrs_after": 63,
       "rewrites": 0
     },
     {
       "pass": "validate-persistent-layout",
-      "instrs_before": 61,
-      "instrs_after": 61,
+      "instrs_before": 63,
+      "instrs_after": 63,
       "rewrites": 0
     }
   ],
@@ -908,19 +908,19 @@
       }
     },
     {
-      "BulkExtentWrite": {
+      "ExtentWrite": {
         "id": 21,
         "source": {
           "file_id": 0,
           "tensor_id": 0,
           "file_offset": 0,
-          "span_bytes": 262656,
+          "span_bytes": 262144,
           "stride": {
             "base_offset": 0,
             "element_bytes": 1,
             "dims": [
               {
-                "count": 262656,
+                "count": 262144,
                 "src_stride": 1,
                 "dst_stride": 1
               }
@@ -928,12 +928,83 @@
           },
           "dtype": "BF16"
         },
-        "dest_offset": 0
+        "dest": {
+          "buffer": 0,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 512,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
       }
     },
     {
-      "BulkExtentWrite": {
+      "Finalize": {
         "id": 22,
+        "tensor": 0,
+        "name": "model.embed_tokens.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 23,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 1,
+          "file_offset": 262144,
+          "span_bytes": 512,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 512,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 1,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "Finalize": {
+        "id": 24,
+        "tensor": 1,
+        "name": "model.layers.0.input_layernorm.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 25,
         "source": {
           "file_id": 0,
           "tensor_id": 2,
@@ -952,12 +1023,38 @@
           },
           "dtype": "BF16"
         },
-        "dest_offset": 262656
+        "dest": {
+          "buffer": 2,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
       }
     },
     {
-      "BulkExtentWrite": {
-        "id": 23,
+      "Finalize": {
+        "id": 26,
+        "tensor": 2,
+        "name": "model.layers.0.self_attn.q_proj.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 27,
         "source": {
           "file_id": 0,
           "tensor_id": 3,
@@ -976,12 +1073,38 @@
           },
           "dtype": "BF16"
         },
-        "dest_offset": 328192
+        "dest": {
+          "buffer": 3,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 32,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
       }
     },
     {
-      "BulkExtentWrite": {
-        "id": 24,
+      "Finalize": {
+        "id": 28,
+        "tensor": 3,
+        "name": "model.layers.0.self_attn.k_proj.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 29,
         "source": {
           "file_id": 0,
           "tensor_id": 4,
@@ -1000,311 +1123,38 @@
           },
           "dtype": "BF16"
         },
-        "dest_offset": 344576
-      }
-    },
-    {
-      "BulkExtentWrite": {
-        "id": 25,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 6,
-          "file_offset": 590336,
-          "span_bytes": 512,
+        "dest": {
+          "buffer": 4,
+          "offset": 0,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 512,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 32,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 360960
+          }
+        }
       }
     },
     {
-      "BulkExtentWrite": {
-        "id": 26,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 7,
-          "file_offset": 771072,
-          "span_bytes": 180224,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 180224,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 361472
-      }
-    },
-    {
-      "BulkExtentWrite": {
-        "id": 27,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 8,
-          "file_offset": 1131520,
-          "span_bytes": 180224,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 180224,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 541696
-      }
-    },
-    {
-      "BulkExtentWrite": {
-        "id": 28,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 10,
-          "file_offset": 1672192,
-          "span_bytes": 512,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 512,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 721920
-      }
-    },
-    {
-      "BulkExtentWrite": {
-        "id": 29,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 11,
-          "file_offset": 1738240,
-          "span_bytes": 65536,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 65536,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 722432
-      }
-    },
-    {
-      "BulkExtentWrite": {
+      "Finalize": {
         "id": 30,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 12,
-          "file_offset": 1820160,
-          "span_bytes": 16384,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 16384,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 787968
-      }
-    },
-    {
-      "BulkExtentWrite": {
-        "id": 31,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 13,
-          "file_offset": 1852928,
-          "span_bytes": 16384,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 16384,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 804352
-      }
-    },
-    {
-      "BulkExtentWrite": {
-        "id": 32,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 15,
-          "file_offset": 2000384,
-          "span_bytes": 512,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 512,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 820736
-      }
-    },
-    {
-      "BulkExtentWrite": {
-        "id": 33,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 16,
-          "file_offset": 2181120,
-          "span_bytes": 180224,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 180224,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 821248
-      }
-    },
-    {
-      "BulkExtentWrite": {
-        "id": 34,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 17,
-          "file_offset": 2541568,
-          "span_bytes": 180224,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 180224,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 1001472
-      }
-    },
-    {
-      "BulkExtentWrite": {
-        "id": 35,
-        "source": {
-          "file_id": 0,
-          "tensor_id": 19,
-          "file_offset": 3082240,
-          "span_bytes": 262656,
-          "stride": {
-            "base_offset": 0,
-            "element_bytes": 1,
-            "dims": [
-              {
-                "count": 262656,
-                "src_stride": 1,
-                "dst_stride": 1
-              }
-            ]
-          },
-          "dtype": "BF16"
-        },
-        "dest_offset": 1181696
-      }
-    },
-    {
-      "Finalize": {
-        "id": 36,
-        "tensor": 0,
-        "name": "model.embed_tokens.weight"
-      }
-    },
-    {
-      "Finalize": {
-        "id": 37,
-        "tensor": 1,
-        "name": "model.layers.0.input_layernorm.weight"
-      }
-    },
-    {
-      "Finalize": {
-        "id": 38,
-        "tensor": 2,
-        "name": "model.layers.0.self_attn.q_proj.weight"
-      }
-    },
-    {
-      "Finalize": {
-        "id": 39,
-        "tensor": 3,
-        "name": "model.layers.0.self_attn.k_proj.weight"
-      }
-    },
-    {
-      "Finalize": {
-        "id": 40,
         "tensor": 4,
         "name": "model.layers.0.self_attn.v_proj.weight"
       }
     },
     {
       "ExtentWrite": {
-        "id": 41,
+        "id": 31,
         "source": {
           "file_id": 0,
           "tensor_id": 5,
@@ -1347,35 +1197,159 @@
     },
     {
       "Finalize": {
-        "id": 42,
+        "id": 32,
         "tensor": 5,
         "name": "model.layers.0.self_attn.o_proj.weight"
       }
     },
     {
+      "ExtentWrite": {
+        "id": 33,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 6,
+          "file_offset": 590336,
+          "span_bytes": 512,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 512,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 6,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "Finalize": {
-        "id": 43,
+        "id": 34,
         "tensor": 6,
         "name": "model.layers.0.post_attention_layernorm.weight"
       }
     },
     {
+      "ExtentWrite": {
+        "id": 35,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 7,
+          "file_offset": 771072,
+          "span_bytes": 180224,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 180224,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 7,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 352,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "Finalize": {
-        "id": 44,
+        "id": 36,
         "tensor": 7,
         "name": "model.layers.0.mlp.gate_proj.weight"
       }
     },
     {
+      "ExtentWrite": {
+        "id": 37,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 8,
+          "file_offset": 1131520,
+          "span_bytes": 180224,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 180224,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 8,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 352,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "Finalize": {
-        "id": 45,
+        "id": 38,
         "tensor": 8,
         "name": "model.layers.0.mlp.up_proj.weight"
       }
     },
     {
       "ExtentWrite": {
-        "id": 46,
+        "id": 39,
         "source": {
           "file_id": 0,
           "tensor_id": 9,
@@ -1418,42 +1392,209 @@
     },
     {
       "Finalize": {
-        "id": 47,
+        "id": 40,
         "tensor": 9,
         "name": "model.layers.0.mlp.down_proj.weight"
       }
     },
     {
+      "ExtentWrite": {
+        "id": 41,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 10,
+          "file_offset": 1672192,
+          "span_bytes": 512,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 512,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 10,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "Finalize": {
-        "id": 48,
+        "id": 42,
         "tensor": 10,
         "name": "model.layers.1.input_layernorm.weight"
       }
     },
     {
+      "ExtentWrite": {
+        "id": 43,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 11,
+          "file_offset": 1738240,
+          "span_bytes": 65536,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 65536,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 11,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "Finalize": {
-        "id": 49,
+        "id": 44,
         "tensor": 11,
         "name": "model.layers.1.self_attn.q_proj.weight"
       }
     },
     {
+      "ExtentWrite": {
+        "id": 45,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 12,
+          "file_offset": 1820160,
+          "span_bytes": 16384,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 16384,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 12,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 32,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "Finalize": {
-        "id": 50,
+        "id": 46,
         "tensor": 12,
         "name": "model.layers.1.self_attn.k_proj.weight"
       }
     },
     {
+      "ExtentWrite": {
+        "id": 47,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 13,
+          "file_offset": 1852928,
+          "span_bytes": 16384,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 16384,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 13,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 32,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "Finalize": {
-        "id": 51,
+        "id": 48,
         "tensor": 13,
         "name": "model.layers.1.self_attn.v_proj.weight"
       }
     },
     {
       "ExtentWrite": {
-        "id": 52,
+        "id": 49,
         "source": {
           "file_id": 0,
           "tensor_id": 14,
@@ -1496,23 +1637,147 @@
     },
     {
       "Finalize": {
-        "id": 53,
+        "id": 50,
         "tensor": 14,
         "name": "model.layers.1.self_attn.o_proj.weight"
       }
     },
     {
+      "ExtentWrite": {
+        "id": 51,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 15,
+          "file_offset": 2000384,
+          "span_bytes": 512,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 512,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 15,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "Finalize": {
-        "id": 54,
+        "id": 52,
         "tensor": 15,
         "name": "model.layers.1.post_attention_layernorm.weight"
       }
     },
     {
+      "ExtentWrite": {
+        "id": 53,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 16,
+          "file_offset": 2181120,
+          "span_bytes": 180224,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 180224,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 16,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 352,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "Finalize": {
-        "id": 55,
+        "id": 54,
         "tensor": 16,
         "name": "model.layers.1.mlp.gate_proj.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 55,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 17,
+          "file_offset": 2541568,
+          "span_bytes": 180224,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 180224,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 17,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 352,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
       }
     },
     {
@@ -1573,15 +1838,96 @@
       }
     },
     {
-      "Finalize": {
+      "ExtentWrite": {
         "id": 59,
-        "tensor": 19,
-        "name": "model.norm.weight"
+        "source": {
+          "file_id": 0,
+          "tensor_id": 19,
+          "file_offset": 3082240,
+          "span_bytes": 512,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 512,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 19,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
       }
     },
     {
       "Finalize": {
         "id": 60,
+        "tensor": 19,
+        "name": "model.norm.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 61,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 20,
+          "file_offset": 3082752,
+          "span_bytes": 262144,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 262144,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          },
+          "dtype": "BF16"
+        },
+        "dest": {
+          "buffer": 20,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 512,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "Finalize": {
+        "id": 62,
         "tensor": 20,
         "name": "lm_head.weight"
       }
@@ -1648,7 +1994,9 @@
     57,
     58,
     59,
-    60
+    60,
+    61,
+    62
   ],
   "memory": {
     "persistent_bytes": 1935872,

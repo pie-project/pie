@@ -190,12 +190,23 @@ unsafe fn read_model_request(
     Ok((facts, policy))
 }
 
+/// The authoring front half both entries share: resolve the target once,
+/// read the request, author. Compile and verify calling this is what keeps
+/// them about the same contract.
+///
 /// # Safety
 ///
 /// `req` and everything its pointers reach must be live for the call.
-unsafe fn compile_model_request(
+unsafe fn author_from_request(
     req: &PieLoaderModelRequest,
-) -> Result<(pie_loader::plan::LoadPlan, String, Mxfp4MoePolicy), (PieLoaderStatus, String)> {
+) -> Result<
+    (
+        pie_loader::contract::ModelContract,
+        pie_loader::plan::StorageTarget,
+        Mxfp4MoePolicy,
+    ),
+    (PieLoaderStatus, String),
+> {
     let bad = |err: String| (PieLoaderStatus::InvalidRequest, err);
     if req.checkpoint.is_null() {
         return Err(bad(
@@ -228,6 +239,17 @@ unsafe fn compile_model_request(
                     facts.model_type
                 ))
             })?;
+    Ok((contract, target, resolved_moe))
+}
+
+/// # Safety
+///
+/// `req` and everything its pointers reach must be live for the call.
+unsafe fn compile_model_request(
+    req: &PieLoaderModelRequest,
+) -> Result<(pie_loader::plan::LoadPlan, String, Mxfp4MoePolicy), (PieLoaderStatus, String)> {
+    let (contract, target, resolved_moe) = unsafe { author_from_request(req) }?;
+    let source = unsafe { super::checkpoint::arena_of(req.checkpoint) };
 
     compile_load_plan(&source.metadata, &contract, target)
         .map_err(|err| (compile_error_status(&err), err.to_string()))
@@ -294,6 +316,59 @@ pub unsafe extern "C" fn pie_loader_compile_model(
             sink.error(message);
             status
         }
+    };
+    unsafe { emit(out_diags, sink.publish()) };
+    status
+}
+
+/// Check a plan against the contract this request authors.
+///
+/// The model-request counterpart of
+/// [`pie_loader_verify_contract`](super::entry::pie_loader_verify_contract):
+/// the caller has no contract to hand over, so the verifier re-authors one
+/// from the same request and holds the plan to it. Re-authoring is the
+/// point, not a cost — the check covers the author's determinism along with
+/// everything the contract verifier checks.
+///
+/// # Safety
+///
+/// `plan` must point at an unreleased plan; `req` and everything its
+/// pointers reach must be live for the call. `out_diags` is null or a
+/// writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_loader_verify_model(
+    plan: *const PieLoaderPlan,
+    req: *const PieLoaderModelRequest,
+    out_diags: *mut *mut PieLoaderDiagnostics,
+) -> PieLoaderStatus {
+    if !out_diags.is_null() {
+        unsafe { *out_diags = std::ptr::null_mut() };
+    }
+    let mut sink = DiagnosticSink::default();
+    if plan.is_null() || req.is_null() {
+        sink.error("pie_loader_verify_model: plan or request is null");
+        unsafe { emit(out_diags, sink.publish()) };
+        return PieLoaderStatus::InvalidRequest;
+    }
+
+    let plan = unsafe { &*plan };
+    let req = unsafe { &*req };
+    match unsafe { author_from_request(req) } {
+        Ok((contract, _, _)) => {
+            super::entry::verify_plan_contract(
+                plan,
+                &pie_loader::verify::ContractView::of(&contract),
+                &mut sink,
+            );
+        }
+        Err((_, message)) => sink.error(message),
+    }
+    super::entry::verify_target_compat(plan, &req.target, &mut sink);
+
+    let status = if sink.is_empty() {
+        PieLoaderStatus::Ok
+    } else {
+        PieLoaderStatus::ContractViolation
     };
     unsafe { emit(out_diags, sink.publish()) };
     status

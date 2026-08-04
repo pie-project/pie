@@ -10,9 +10,8 @@
 // hardware, and deleting the oracle is the harvest that follows it, not a
 // step of it.
 //
-// UNVERIFIED ON HARDWARE. Written ahead of a CUDA build machine by
-// agreement (implementation first, verification after); the first compile
-// and the first differential run happen there.
+// Compiles on any machine with the CUDA toolchain (the workspace build
+// does); what waits for real hardware is only the differential itself.
 //
 // What the request does NOT carry mirrors what the C++ authors never read:
 // tied-embeddings and the MLX quantization facts are Metal vocabulary and
@@ -34,6 +33,10 @@
 #include "model/contract.hpp"
 
 namespace pie_cuda_driver {
+
+using pie_loader::PieLoaderFamilyKnobs;
+using pie_loader::PieLoaderModelFactsView;
+using pie_loader::PieLoaderModelRequest;
 
 /// Whether the boot authors through the Rust side.
 ///
@@ -127,10 +130,10 @@ inline LoadPlanResult prepare_load_plan_rust_author(
         *out_policy = static_cast<model::Mxfp4MoePolicy>(resolved_moe);
     }
 
-    // No `plan.verify(request)` here yet: the verifier takes the contract
-    // request, and this path has no contract on this side to hand it. The
-    // `verify_model` entry that re-authors and verifies is the follow-up
-    // recorded in `plan/model-in-rust.md` §6.
+    // The same second opinion the default path gets from `plan.verify`: the
+    // verifier re-authors from this request on the far side and holds the
+    // plan to it, marshalling and author determinism both in scope.
+    plan.verify_model(request);
 
     const auto view = plan.view();
     return {

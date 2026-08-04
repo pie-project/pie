@@ -102,7 +102,7 @@ impl DiagnosticSink {
             .push((PieLoaderSeverity::Error, message.into()));
     }
 
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -562,7 +562,7 @@ pub unsafe extern "C" fn pie_loader_release_diagnostics(diags: *mut PieLoaderDia
 /// request: was this plan compiled *for the caller*? Rank divergence is the
 /// motivating case (`architecture.md` §6.2), and no amount of internal
 /// consistency detects it.
-fn verify_plan_contract(
+pub(super) fn verify_plan_contract(
     plan: &PieLoaderPlan,
     contract: &pie_loader::verify::ContractView<'_>,
     sink: &mut DiagnosticSink,
@@ -586,7 +586,7 @@ fn verify_plan_contract(
 /// Shared by both entry points because the question does not depend on who
 /// authored the contract: a plan built for another rank, another alignment or
 /// another fusion set is wrong for this driver either way.
-fn verify_target_compat(
+pub(super) fn verify_target_compat(
     plan: &PieLoaderPlan,
     target: &PieLoaderTargetSpec,
     sink: &mut DiagnosticSink,
@@ -659,11 +659,12 @@ unsafe impl Sync for EntryAddr {}
 /// final link rather than anywhere near this file (`architecture.md` §3.4).
 /// `#[used]` keeps the table, and the table keeps the functions.
 #[used]
-static KEEP_ALIVE: [EntryAddr; 7] = [
+static KEEP_ALIVE: [EntryAddr; 8] = [
     EntryAddr(pie_loader_open_checkpoint as *const ()),
     EntryAddr(pie_loader_close_checkpoint as *const ()),
     EntryAddr(pie_loader_compile_contract as *const ()),
     EntryAddr(crate::model::pie_loader_compile_model as *const ()),
+    EntryAddr(crate::model::pie_loader_verify_model as *const ()),
     EntryAddr(pie_loader_verify_contract as *const ()),
     EntryAddr(pie_loader_release as *const ()),
     EntryAddr(pie_loader_release_diagnostics as *const ()),

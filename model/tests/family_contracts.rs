@@ -20,12 +20,14 @@
 use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use pie_loader::plan::{CUDA_TILE_MAP_MASK, StorageTarget, compile as compile_load_plan};
+use pie_loader::plan::{
+    CUDA_TILE_MAP_MASK, METAL_TILE_MAP_MASK, StorageTarget, compile as compile_load_plan,
+};
 use pie_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 use pie_loader::verify::ContractView;
 
 use pie_model::common::facts::ModelFacts;
-use pie_model::common::policy::{Mxfp4MoeRequest, Policy};
+use pie_model::common::policy::{Mxfp4MoeRequest, Naming, Policy, Projections};
 use pie_model::contract::author;
 
 // ── fixture machinery ───────────────────────────────────────────────
@@ -808,5 +810,205 @@ fn deepseek_v4_streamed_cuda() {
         &facts("deepseek_v4", 1),
         &target(0, 1),
         &policy,
+    );
+}
+
+// ═══ The Metal point in policy space: Naming::Mlx, bind in place ═══
+
+fn metal_target() -> StorageTarget {
+    StorageTarget {
+        backend: BackendKind::Metal,
+        tp_rank: 0,
+        tp_size: 1,
+        preferred_alignment: 256,
+        max_tile_bytes: 64 << 20,
+        tile_map_mask: METAL_TILE_MAP_MASK,
+        ..StorageTarget::default()
+    }
+}
+
+fn mlx_policy() -> Policy {
+    Policy {
+        naming: Naming::Mlx,
+        projections: Projections::InPlace,
+        ..Policy::default()
+    }
+}
+
+fn f16enc() -> Encoding {
+    Encoding::Raw(DType::F16)
+}
+
+/// One MLX affine-U4 g64 triplet: `[rows, cols/8]` U32 beside `[rows,
+/// cols/64]` F16 scales and biases.
+fn mlx_triplet(ck: &mut Checkpoint, base: &str, rows: i64, cols: i64) {
+    ck.push(
+        &format!("{base}.weight"),
+        &[rows, cols / 8],
+        Encoding::Raw(DType::U32),
+    );
+    ck.push(&format!("{base}.scales"), &[rows, cols / 64], f16enc());
+    ck.push(&format!("{base}.biases"), &[rows, cols / 64], f16enc());
+}
+
+fn llama_mlx_checkpoint() -> CheckpointMetadata {
+    let (hidden, intermediate, vocab) = (64, 128, 128);
+    let mut ck = Checkpoint::new();
+    // Tied: an embed_tokens and no lm_head, quantized like everything else.
+    mlx_triplet(&mut ck, "model.embed_tokens", vocab, hidden);
+    let p = "model.layers.0.";
+    ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
+    for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+        mlx_triplet(&mut ck, &format!("{p}self_attn.{proj}"), hidden, hidden);
+    }
+    ck.push(
+        &format!("{p}post_attention_layernorm.weight"),
+        &[hidden],
+        bf16(),
+    );
+    mlx_triplet(&mut ck, &format!("{p}mlp.gate_proj"), intermediate, hidden);
+    mlx_triplet(&mut ck, &format!("{p}mlp.up_proj"), intermediate, hidden);
+    mlx_triplet(&mut ck, &format!("{p}mlp.down_proj"), hidden, intermediate);
+    ck.push("model.norm.weight", &[hidden], bf16());
+    ck.finish("llama_mlx")
+}
+
+#[test]
+fn llama_mlx_metal() {
+    let mut facts = facts("llama3", 1);
+    facts.mlx_quant_bits = 4;
+    facts.mlx_quant_group_size = 64;
+    check(
+        "llama_mlx_metal",
+        &llama_mlx_checkpoint(),
+        &facts,
+        &metal_target(),
+        &mlx_policy(),
+    );
+}
+
+fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {
+    let hidden = 64;
+    let mut ck = Checkpoint::new();
+    // The mlx_lm spelling: `language_model.model.*`, words swapped.
+    mlx_triplet(&mut ck, "language_model.model.embed_tokens", 128, hidden);
+    let p = "language_model.model.layers.0.";
+    ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
+    for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+        mlx_triplet(&mut ck, &format!("{p}self_attn.{proj}"), hidden, hidden);
+    }
+    ck.push(&format!("{p}linear_attn.A_log"), &[8], f32enc());
+    ck.push("language_model.model.norm.weight", &[hidden], bf16());
+    ck.finish("qwen3_5_mlx")
+}
+
+#[test]
+fn qwen3_5_mlx_metal() {
+    let mut facts = facts("qwen3_5", 1);
+    facts.mlx_quant_bits = 4;
+    facts.mlx_quant_group_size = 64;
+    check(
+        "qwen3_5_mlx_metal",
+        &qwen3_5_mlx_checkpoint(),
+        &facts,
+        &metal_target(),
+        &mlx_policy(),
+    );
+}
+
+fn gemma4_mlx_checkpoint() -> CheckpointMetadata {
+    let hidden = 64;
+    let mut ck = Checkpoint::new();
+    mlx_triplet(&mut ck, "model.language_model.embed_tokens", 128, hidden);
+    for layer in 0..2 {
+        let p = format!("model.language_model.layers.{layer}.");
+        ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            mlx_triplet(&mut ck, &format!("{p}self_attn.{proj}"), hidden, hidden);
+        }
+        ck.push(&format!("{p}self_attn.k_norm.weight"), &[16], bf16());
+    }
+    ck.push("model.language_model.norm.weight", &[hidden], bf16());
+    ck.finish("gemma4_mlx")
+}
+
+/// Layer 1 is KV-shared: its k/v projections and k-norm ship in the file
+/// and must not be declared — the golden is what pins that they are not.
+#[test]
+fn gemma4_mlx_metal() {
+    let mut facts = facts("gemma4_text", 2);
+    facts.mlx_quant_bits = 4;
+    facts.mlx_quant_group_size = 64;
+    facts.num_kv_shared_layers = 1;
+    check(
+        "gemma4_mlx_metal",
+        &gemma4_mlx_checkpoint(),
+        &facts,
+        &metal_target(),
+        &mlx_policy(),
+    );
+}
+
+fn gptoss_mlx_checkpoint() -> CheckpointMetadata {
+    // The PUBLISHED layout: BF16 attention the loader quantizes on the way
+    // in, plus MXFP4 `_blocks`/`_scales`/`_bias` expert triplets whose
+    // gate/up halves are interleaved row by row.
+    let (hidden, experts, intermediate) = (64, 2, 64);
+    let mut ck = Checkpoint::new();
+    ck.push("model.embed_tokens.weight", &[128, hidden], bf16());
+    let p = "model.layers.0.";
+    ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
+    for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+        ck.push(
+            &format!("{p}self_attn.{proj}.weight"),
+            &[hidden, hidden],
+            bf16(),
+        );
+    }
+    ck.push(&format!("{p}self_attn.sinks"), &[4], bf16());
+    ck.push(&format!("{p}mlp.router.weight"), &[experts, hidden], bf16());
+    ck.push(&format!("{p}mlp.router.bias"), &[experts], bf16());
+    let e = format!("{p}mlp.experts.");
+    ck.push(
+        &format!("{e}gate_up_proj_blocks"),
+        &[experts, 2 * intermediate, hidden / 32, 16],
+        u8enc(),
+    );
+    ck.push(
+        &format!("{e}gate_up_proj_scales"),
+        &[experts, 2 * intermediate, hidden / 32],
+        u8enc(),
+    );
+    ck.push(
+        &format!("{e}gate_up_proj_bias"),
+        &[experts, 2 * intermediate],
+        bf16(),
+    );
+    ck.push(
+        &format!("{e}down_proj_blocks"),
+        &[experts, hidden, intermediate / 32, 16],
+        u8enc(),
+    );
+    ck.push(
+        &format!("{e}down_proj_scales"),
+        &[experts, hidden, intermediate / 32],
+        u8enc(),
+    );
+    ck.push(&format!("{e}down_proj_bias"), &[experts, hidden], bf16());
+    ck.push("model.norm.weight", &[hidden], bf16());
+    ck.push("lm_head.weight", &[128, hidden], bf16());
+    ck.finish("gptoss_mlx")
+}
+
+#[test]
+fn gptoss_mlx_metal() {
+    let mut facts = facts("gpt_oss", 1);
+    facts.num_experts = 2;
+    check(
+        "gptoss_mlx_metal",
+        &gptoss_mlx_checkpoint(),
+        &facts,
+        &metal_target(),
+        &mlx_policy(),
     );
 }
