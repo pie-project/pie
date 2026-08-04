@@ -2050,3 +2050,16 @@ anchor, verdict from the fire trace):
 Zero incidents across the sweep. The k+1 world is gone: the product
 space the north-star sells is measurably open on this hardware, with
 three cells waiting on the hook-word anchor refinement.
+
+## THE CAMPAIGN SEALS AT RELEASE (2026-08-04)
+
+The 15/15 tip at release, no-env boot: the solo oracle BYTE-EQUAL to
+the pre-campaign reference; the census 14/15 PRODUCT + 1 PARTIAL
+(a launch-phasing artifact of the faster binary's narrower overlap
+windows — the same subset was PRODUCT on the debug sweep and the
+4-axis cell itself fired 11 products this sweep), SOLO 0, incidents 0.
+The axis-composition property is default, total, and numerics-neutral
+at release. What remains beyond this campaign is recorded on the
+scoreboard: R=32-scale WEIGHT, the PQ-tree class, the spec-verify
+STRUCTURAL producer, a real mask-policy inferlet, the step-logit
+oracle.
