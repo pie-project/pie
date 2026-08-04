@@ -2710,3 +2710,22 @@ trace). The battery is formalized as .wiki/tart/bands_comp.py. The
 composition table's depth column now reads: uniform-k unions (S-2),
 mixed-k bands (Act 1), each composing with lora, degrading safely
 against mask/hooks until Act 2's (start,len)/gather admits them.
+
+## THE V2 SEAL (2026-08-04): release at the redesign's tip
+
+One release boot (15s settle) over the ENTIRE V2 arc — seams (①),
+depth-in-the-body (②a), the class collapse (②b), the region table
+and the words' death (③a-c), banded depth total across three legs
+with its composition cells (④ Act 1) — plus every prior campaign
+property: canonical 3/3, solo oracle BYTE-EQUAL to the pre-campaign
+reference, S-B identity + k8 determinism, census 15/15 PRODUCT (one
+first-pass PARTIAL = the documented release phasing artifact,
+resolved on the immediate retry), bands×lora PRODUCT (16 banded
+fires with the correction aboard), bands×mask/hook SAFE decline,
+banded trio full-lane prefix match, 68 banded fires, ZERO incidents.
+
+The redesign holds at release. What the review called four mechanisms
+is now: one attach vocabulary on the surface, one dispatch statement
+in the text, one region table on the wire, one seriation invariant in
+the scheduler, and one walk per leg that serves it — with every
+degradation loud and every axis's plans derived, not declared twice.
