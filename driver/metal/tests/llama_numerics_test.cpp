@@ -1197,9 +1197,9 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         std::vector<int> cut(std::size_t(n_rows), kAll);
         permuted.assign(std::size_t(n_rows), false);
         ambiguous = 0;
-        if (!g.is_moe() || plan.expert_ids_value < 0) return cut;
+        if (!g.is_moe() || plan.expert_ids_by_layer.empty()) return cut;
         const auto& ids_slot =
-            b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_ids_value)])];
+            b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_ids_by_layer.back())])];
         const auto* ids = static_cast<const std::int32_t*>(ids_slot.contents());
         if (ids == nullptr) return cut;
         // The device's own router logits, for the last layer -- the same layer
@@ -1471,11 +1471,11 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         });
 
         const Trace want = ref.step(dag, tokens[std::size_t(step)], step);
-        if (g.is_moe() && std::getenv("PIE_NUM_DEBUG") != nullptr && plan.expert_ids_value >= 0) {
+        if (g.is_moe() && std::getenv("PIE_NUM_DEBUG") != nullptr && !plan.expert_ids_by_layer.empty()) {
             const auto& ids_slot =
-                b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_ids_value)])];
+                b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_ids_by_layer.back())])];
             const auto& w_slot =
-                b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_weights_value)])];
+                b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_weights_by_layer.back())])];
             const auto* ids = static_cast<const std::int32_t*>(ids_slot.contents());
             const auto* wt = static_cast<const std::uint16_t*>(w_slot.contents());
             std::printf("    [dbg] router ids(dev)");

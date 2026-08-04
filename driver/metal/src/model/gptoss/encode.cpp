@@ -356,11 +356,14 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
 void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const GptOssGeometry& g, int rows, const DecodeStepPsos& base,
                            const MultiBatchPsos& mb, const GptOssPsos& go, int ordinal_base,
-                           int head_rows) {
+                           int head_rows, std::size_t begin, std::size_t end) {
     // Deliberately the same walk as `encode_gptoss_step`: the DAG, its order
     // and its concurrency runs belong to the MODEL, not to the batch size.
+    // Off the WHOLE dag, not the slice: a run's extent is the model's, and
+    // recomputing it per segment would let a boundary invent a barrier.
     const std::vector<int> run_ends = concurrent_run_ends(dag);
-    for (std::size_t i = 0; i < dag.size(); ++i) {
+    if (end == 0 || end > dag.size()) end = dag.size();
+    for (std::size_t i = begin; i < end; ++i) {
         const Dispatch& d = dag[i];
         Grid grid;
         Threadgroup tg;
@@ -368,7 +371,7 @@ void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
         se.set_pso(pso_for_mb_rows(d, g, rows, base, mb, go, head_rows));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
-        if (i + 1 >= dag.size() || run_ends[i] == static_cast<int>(i)) se.barrier();
+        if (i + 1 >= end || run_ends[i] == static_cast<int>(i)) se.barrier();
     }
 }
 

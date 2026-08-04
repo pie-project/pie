@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -300,8 +301,15 @@ void check_scratch(const char* who, const LlamaGeometry& g) {
     // The routing decision must be live ACROSS the expert matvecs, not recycled
     // between them. This is the specific thing a naive colouring gets wrong.
     if (g.is_moe()) {
-        expect(plan.expert_ids_value >= 0 && plan.expert_weights_value >= 0,
-               std::string(who) + ": routing values are identified");
+        // One routing decision per MIXTURE LAYER, in DAG order, and all
+        // distinct: the host rewrites the one the next segment will read when
+        // the experts are paged, so a stack that reported a single value would
+        // let it rewrite a buffer nothing reads.
+        expect_eq(int(plan.expert_ids_by_layer.size()), g.n_layers,
+                  std::string(who) + ": one routing decision per mixture layer");
+        std::set<int> distinct(plan.expert_ids_by_layer.begin(), plan.expert_ids_by_layer.end());
+        expect_eq(int(distinct.size()), g.n_layers,
+                  std::string(who) + ": no two layers share a routing value");
         // Per layer: written once by RouterTopK, read three times by the
         // expert matvecs (ids) and once by the combine (weights).
         int id_reads = 0, weight_reads = 0;
@@ -318,7 +326,7 @@ void check_scratch(const char* who, const LlamaGeometry& g) {
         expect_eq(weight_reads, g.n_layers,
                   std::string(who) + ": the combine reads the router's weights");
     } else {
-        expect(plan.expert_ids_value < 0,
+        expect(plan.expert_ids_by_layer.empty(),
                std::string(who) + ": a dense model has no routing values");
     }
 
