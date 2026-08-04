@@ -1722,3 +1722,20 @@ owed); mixed numerics sit in the generic co-batch rounding class
 (control-proven, 2/8 both ways); masked x hooks/lora and padded/XQA
 shapes keep the fire-level word; graph capture does not cover
 prefill-shaped fires (eager by class).
+
+## THE OVERLAP, MEASURED (2026-08-04) — the deferred edge closes
+
+Release build, heavy shapes (a 2.4k-token masked KV decoding 256 steps
+while 1.9k-token prefills join at 0.1s stagger; L0 fork->join span,
+PIE_SPATIAL_STREAM_TIMING=1):
+
+  two streams . med 0.096 ms  p90 0.103 ms  (n=24)
+  serialized  . med 0.115 ms  p90 0.115 ms  (n=23)
+
+The masked suffix's custom dispatch (~19us at this KV size) hides
+COMPLETELY behind the prefix causal dispatch — a ~17% shorter
+attention section per layer, the whole distribution shifted, on the
+default path. The win scales with the suffix's work (longer masked
+KV, more masked lanes); at 1B/16-layers it is ~0.3ms per mixed fire.
+The directive's two-stream requirement is not just structural — it
+pays, measurably. Battery: .wiki/tart/heavy_overlap.py.
