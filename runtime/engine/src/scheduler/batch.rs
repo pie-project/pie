@@ -35,150 +35,6 @@ fn fire_census_enabled() -> bool {
     })
 }
 
-/// The fire plan's qkv_postprocess lowering, converted from MEMBER counts
-/// to WIRE request rows through the step's attribution CSR — the value
-/// [`StepSubmission::planned_hook_free_prefix_rows`] carries. The
-/// semantics mirror `Dispatch::launch_hook_free_prefix_rows` EXACTLY (it
-/// walks compiled PTIR stage plans where this walks the admission-time
-/// `hook_program` stamps over the SAME spans) so the driver's cross-check
-/// can refuse on drift instead of guessing which side is right:
-///   * malformed/absent attribution → UNPLANNED (driver derives alone);
-///   * a hook member with an empty wire span cannot be located among the
-///     rows → 0, no fast prefix;
-///   * otherwise the first hook member's row start IS the prefix (spans
-///     are contiguous in planned order — hooks-last is what makes it
-///     maximal), and with no hook members every row is in it.
-fn planned_prefix_wire_rows(
-    plan: &fire_plan::FirePlan,
-    ordered: &[Box<PendingRequest>],
-    row_indptr: &[u32],
-) -> u32 {
-    // A plan is sent only when it DECIDES something: at least one hook
-    // member (the site's Prefix arm). Hook stamps come from tracked
-    // registration, so on every planned step the driver's compiled-plan
-    // walk sees the same programs and the cross-check compares like with
-    // like; a hook-free step (including prebuilt/untracked fires, whose
-    // programs the driver may not know) keeps the driver's own
-    // derivation, whose answer is consumed by nothing anyway.
-    if !ordered.iter().any(|req| req.hook_program) {
-        return pie_driver_abi::PIE_HOOK_FREE_PREFIX_UNPLANNED;
-    }
-    if row_indptr.len() != ordered.len() + 1 {
-        return pie_driver_abi::PIE_HOOK_FREE_PREFIX_UNPLANNED;
-    }
-    let total = *row_indptr.last().expect("indptr has a total");
-    if total == 0 {
-        return 0;
-    }
-    let mut first_hook_row = total;
-    for (member, req) in ordered.iter().enumerate() {
-        if !req.hook_program {
-            continue;
-        }
-        let (lo, hi) = (row_indptr[member], row_indptr[member + 1]);
-        if hi <= lo {
-            return 0;
-        }
-        first_hook_row = first_hook_row.min(lo);
-    }
-    // The site IS the source; the row scan above is its span binding. The
-    // two must agree by construction (fast_rows counts the leading
-    // non-hook members of the same planned order).
-    if let Some(site) = plan
-        .sites
-        .iter()
-        .find(|site| site.name == fire_plan::SITE_QKV_POSTPROCESS)
-    {
-        // ≥1 hook member, so the site is always the Prefix arm here.
-        let fast_members = match site.lowering {
-            fire_plan::Lowering::Prefix { fast_rows } => fast_rows as usize,
-            _ => unreachable!("a hooked step always plans the Prefix arm"),
-        };
-        debug_assert_eq!(
-            first_hook_row,
-            row_indptr[fast_members.min(ordered.len())],
-            "the plan's member prefix and the row-span scan must agree"
-        );
-    }
-    first_hook_row
-}
-
-/// NS-2: the attention_mask site's unmasked prefix, converted to WIRE
-/// rows through the attribution CSR — the value
-/// [`StepSubmission::planned_unmasked_prefix_rows`] carries. Meaningful
-/// only on hook-free steps with at least one masked member (the
-/// seriation nests mask under hooks, so a hooked step's masked members
-/// are not contiguous); everything else is UNPLANNED and the driver
-/// keeps the fire-level mask arm.
-/// STRUCTURAL S-2: the depth union's REQUEST split — the count of
-/// leading full-depth members. Planned only for the v0 shape: at least
-/// one truncated member AND at least one full member, every member a
-/// plain 1-token decode lane (no hooks/lora/masks/multi-token), all
-/// truncated members sharing ONE k and seriated as the contiguous tail
-/// (the sort key guarantees it; the scan verifies loudly-silently by
-/// declining).
-fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
-    if !depth_union_enabled() {
-        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-    }
-    let truncated = ordered
-        .iter()
-        .filter(|r| r.request.max_layers.is_some())
-        .count();
-    if truncated == 0 || truncated == ordered.len() {
-        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-    }
-    let mut k: Option<u32> = None;
-    for req in ordered.iter() {
-        // AC-3 (lora x depth): an UNTRUNCATED lora member rides the
-        // full-depth prefix freely — the correction is span-grouped and
-        // window-free, and the seriation keeps it out of the truncated
-        // tail. A single lane carrying BOTH axes still declines (its
-        // correction span would cross the depth window — the PQ-tree
-        // class, refused as safe degradation for now).
-        if (req.hook_program && req.request.max_layers.is_some())
-            || (req.lora_program && req.request.max_layers.is_some())
-            // AC-1: a lane on BOTH window axes is the PQ-tree class.
-            || (req.request.has_user_mask && req.request.max_layers.is_some())
-            || req.request.token_ids.len() > ordered.len()
-            || req
-                .request
-                .qo_indptr
-                .windows(2)
-                .any(|w| w[1] - w[0] > 1)
-        {
-            return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-        }
-        if let Some(this_k) = req.request.max_layers {
-            if *k.get_or_insert(this_k) != this_k {
-                return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-            }
-        }
-    }
-    // AC-1 order [plain | truncated | masked]: the truncated block is a
-    // MIDDLE window ending where the masked suffix starts; every member
-    // after it must be masked (full-depth), every truncated member
-    // contiguous. dsplit = the block's start; its end derives from the
-    // mask word driver-side.
-    // AC-4/AC-5: the full-depth suffix behind the truncated middle may
-    // hold hooked lanes then masked lanes (the seriation's order) —
-    // both are full-depth. The driver's stash window anchors on the
-    // mask word when present, the hook word otherwise.
-    let masked_tail = ordered
-        .iter()
-        .rev()
-        .take_while(|r| r.request.has_user_mask || r.hook_program)
-        .count();
-    let split = ordered.len() - masked_tail - truncated;
-    if ordered[split..ordered.len() - masked_tail]
-        .iter()
-        .any(|r| r.request.max_layers.is_none())
-    {
-        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-    }
-    split as u32
-}
-
 /// V2 rung ③a (north-star-dsl.md "RUNG ③ SPEC"): the region table —
 /// the seriation's output stated ONCE, from which the planned scalar
 /// words become derivations. Regions are maximal runs of members
@@ -239,58 +95,6 @@ pub(crate) fn depth_union_enabled() -> bool {
     *ON.get_or_init(|| {
         !std::env::var("PIE_DEPTH_UNION").is_ok_and(|v| v == "0")
     })
-}
-
-fn planned_unmasked_prefix_wire_rows(
-    plan: &fire_plan::FirePlan,
-    ordered: &[Box<PendingRequest>],
-    row_indptr: &[u32],
-) -> u32 {
-    // AC-4: hooks no longer suppress the plan either — the order is
-    // [plain | truncated | hooked | masked], so the mask window is
-    // still the suffix and hooked lanes sit in the unmasked prefix. A
-    // lane on BOTH axes (a masked hook program) remains the refusal.
-    if ordered
-        .iter()
-        .any(|req| req.hook_program && req.request.has_user_mask)
-        || !ordered.iter().any(|req| req.request.has_user_mask)
-    {
-        return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
-    }
-    if row_indptr.len() != ordered.len() + 1 {
-        return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
-    }
-    let total = *row_indptr.last().expect("indptr has a total");
-    if total == 0 {
-        return 0;
-    }
-    let mut first_masked_row = total;
-    for (member, req) in ordered.iter().enumerate() {
-        if !req.request.has_user_mask {
-            continue;
-        }
-        let (lo, hi) = (row_indptr[member], row_indptr[member + 1]);
-        if hi <= lo {
-            return 0;
-        }
-        first_masked_row = first_masked_row.min(lo);
-    }
-    if let Some(site) = plan
-        .sites
-        .iter()
-        .find(|site| site.name == fire_plan::SITE_ATTENTION_MASK)
-    {
-        let unmasked_members = match site.lowering {
-            fire_plan::Lowering::Prefix { fast_rows } => fast_rows as usize,
-            _ => unreachable!("a masked step always plans the Prefix arm"),
-        };
-        debug_assert_eq!(
-            first_masked_row,
-            row_indptr[unmasked_members.min(ordered.len())],
-            "the plan's member prefix and the row-span scan must agree"
-        );
-    }
-    first_masked_row
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -712,32 +516,12 @@ pub(crate) fn build_frame_submission(
         // converted to WIRE request rows through the attribution CSR and
         // handed across; the driver cross-checks it against its own
         // compiled-plan derivation and refuses the launch on drift.
-        let planned_hook_free_prefix_rows =
-            planned_prefix_wire_rows(&plan, &group, &build.program_row_indptr);
-        let planned_unmasked_prefix_rows =
-            planned_unmasked_prefix_wire_rows(&plan, &group, &build.program_row_indptr);
-        // STRUCTURAL S-2: a planned depth union stamps the SUFFIX's
-        // uniform k onto the merged plan (the wire merge does not carry
-        // per-member max_layers); a DECLINED composed shape leaves it
-        // None — every member runs full depth, the safe degradation of
-        // an advisory truncation.
-        let planned_full_depth_rows = planned_full_depth_request_split(&group);
-        let mut merged_plan = build.plan;
-        if planned_full_depth_rows != pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED {
-            merged_plan.max_layers = group
-                .iter()
-                .find_map(|r| r.request.max_layers);
-        } else if let Some(k) = group[0].request.max_layers {
-            // The uniform half of the PQ-tree cell: when EVERY member
-            // shares one truncation, the fire-level layer bound cuts
-            // every row — mask-compatible (the attention arms operate
-            // inside [0, k) unchanged) — so a declined SPLIT must not
-            // silently drop the members' k (found by the arc-78 probe:
-            // the wire merge discards per-member max_layers).
-            if group.iter().all(|r| r.request.max_layers == Some(k)) {
-                merged_plan.max_layers = Some(k);
-            }
-        }
+        // V2 rung ③c-ii: the four planned words are DEAD — the region
+        // table below is the plans' single source; the driver derives
+        // them at the view-assembly boundary (region_plans.hpp). The
+        // uniform-k stamp went with them: plan.max_layers now feeds
+        // nothing (the table's per-region k is the depth operand).
+        let merged_plan = build.plan;
         let (region_row_indptr, region_sig, region_k) =
             planned_region_table(&group, &build.program_row_indptr);
         steps.push(StepSubmission {
@@ -747,9 +531,6 @@ pub(crate) fn build_frame_submission(
             sub_batch_class,
             terminal_cells: build.terminal_cells,
             program_row_indptr: build.program_row_indptr,
-            planned_hook_free_prefix_rows,
-            planned_unmasked_prefix_rows,
-            planned_full_depth_rows,
             region_row_indptr,
             region_sig,
             region_k,

@@ -1181,33 +1181,6 @@ pub struct PieStepDesc {
     pub channel_expected_head: PieU64Slice,
     pub channel_expected_tail: PieU64Slice,
     pub channel_ticket_indptr: PieU32Slice,
-    /// The fire planner's hook-free prefix for this step, in WIRE request
-    /// rows: rows `[0, n)` belong to no attention-stage program by the
-    /// SCHEDULER's plan (`fire_plan`'s qkv_postprocess site — the
-    /// planner's first consumed lowering). [`PIE_HOOK_FREE_PREFIX_UNPLANNED`]
-    /// means the scheduler sent no plan and the driver derives the prefix
-    /// itself (the pre-plan behavior); any other value the driver
-    /// cross-checks against its own compiled-plan derivation and refuses
-    /// the launch on drift — the declaration-side hook stamp and the
-    /// compiled stage plans must agree.
-    pub planned_hook_free_prefix_rows: u32,
-    /// NS-2: the scheduler-planned count of leading wire rows whose
-    /// members carry NO user mask (meaningful only on hook-free steps;
-    /// the seriation nests mask under hooks).
-    /// [`PIE_UNMASKED_PREFIX_UNPLANNED`] = no plan; the driver must not
-    /// split the attention.
-    pub planned_unmasked_prefix_rows: u32,
-    /// STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
-    /// take the head at layer `k` (the layerskip-draft class).
-    /// [`PIE_MAX_LAYERS_FULL`] = the full model (every pre-S1 step). v0
-    /// steps carrying a truncation are SOLO (the scheduler's blocking
-    /// rule), so one per-step word suffices until the depth union.
-    pub planned_max_layers: u32,
-    /// STRUCTURAL S-2: leading members at FULL depth (the depth
-    /// seriation's request split; the truncated suffix's uniform k is
-    /// `planned_max_layers`). [`PIE_FULL_DEPTH_UNPLANNED`] = a uniform
-    /// fire; the driver must not depth-split.
-    pub planned_full_depth_rows: u32,
     /// V2 rung ③a (north-star-dsl.md "RUNG ③ SPEC"): the region table —
     /// the seriation's output stated ONCE. Region `r` spans wire rows
     /// `[region_row_indptr[r], region_row_indptr[r+1])`;
@@ -1318,10 +1291,6 @@ impl Default for PieStepDesc {
             channel_expected_head: PieU64Slice::default(),
             channel_expected_tail: PieU64Slice::default(),
             channel_ticket_indptr: PieU32Slice::default(),
-            planned_hook_free_prefix_rows: PIE_HOOK_FREE_PREFIX_UNPLANNED,
-            planned_unmasked_prefix_rows: PIE_UNMASKED_PREFIX_UNPLANNED,
-            planned_max_layers: PIE_MAX_LAYERS_FULL,
-            planned_full_depth_rows: PIE_FULL_DEPTH_UNPLANNED,
             region_row_indptr: PieU32Slice::default(),
             region_sig: PieU32Slice::default(),
             region_k: PieU32Slice::default(),

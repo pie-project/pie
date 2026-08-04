@@ -29,20 +29,6 @@ pub struct StepSubmission {
     /// each (a device-geometry fire's row is an empty placeholder the driver
     /// replaces with channel-resolved geometry).
     pub program_row_indptr: Vec<u32>,
-    /// The fire planner's hook-free prefix in WIRE request rows
-    /// (`fire_plan`'s qkv_postprocess site, converted through
-    /// `program_row_indptr` — the planner's first consumed lowering).
-    /// `PIE_HOOK_FREE_PREFIX_UNPLANNED` when the step carries no
-    /// attribution to convert through; the driver then derives it alone.
-    pub planned_hook_free_prefix_rows: u32,
-    /// NS-2: leading wire rows with no user mask (hook-free steps only;
-    /// `PIE_UNMASKED_PREFIX_UNPLANNED` otherwise).
-    pub planned_unmasked_prefix_rows: u32,
-    /// STRUCTURAL S-2: leading members at FULL depth (the depth
-    /// seriation's request split; the truncated suffix's uniform k rides
-    /// `planned_max_layers`). `PIE_FULL_DEPTH_UNPLANNED` = a uniform
-    /// fire (solo truncated or all-full — today's shapes).
-    pub planned_full_depth_rows: u32,
     /// V2 rung ③a: the region table (north-star-dsl.md "RUNG ③ SPEC") —
     /// maximal runs of members sharing an axis signature and depth
     /// operand, boundaries in WIRE rows through the attribution CSR.

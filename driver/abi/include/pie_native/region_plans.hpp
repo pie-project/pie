@@ -4,10 +4,10 @@
 // SOURCE OF TRUTH for the four planned words. `apply_region_plans` runs
 // at the StepLaunch -> LaunchView assembly — before any consumer — so
 // every reader downstream (frame prepare, the walkers, dispatch) sees
-// values DERIVED from the table whenever a table is present. The wire
-// words survive one more era as a TRIPWIRE: derivation must equal them
-// strictly (the 3b proof, kept armed), and drift refuses the launch.
-// When the words die (3c-ii) the tripwire arguments go with them.
+// values DERIVED from the table. Since 3c-ii the wire words are gone:
+// this derivation IS the plans' single source (the 3b live equivalence
+// proof — strict word equality on every fire shape, declines included
+// — is what licensed retiring them).
 //
 // The derivation mirrors the engine's plan/decline rules LITERALLY
 // (batch.rs planned_prefix_wire_rows / planned_unmasked_prefix_wire_
@@ -129,37 +129,16 @@ inline bool derive_region_plans(const LaunchView& view, RegionPlans& out) {
     return true;
 }
 
-// Derive-verify-apply at the assembly boundary. `view.region_*` must
-// already be populated; `wire_*` are the step's words. A present table
-// must strictly reproduce the wire words (the 3b proof kept armed as a
-// tripwire; PIE_DEBUG_MAX_LAYERS writes the max_layers word outside
-// the plan rules, so that word keeps the wire value and skips the
-// check). No table -> the wire words stand.
-inline void apply_region_plans(LaunchView& view,
-                               std::uint32_t wire_hook,
-                               std::uint32_t wire_mask,
-                               std::uint32_t wire_k,
-                               std::uint32_t wire_depth) {
-    view.planned_hook_free_prefix_rows = wire_hook;
-    view.planned_unmasked_prefix_rows = wire_mask;
-    view.planned_max_layers = wire_k;
-    view.planned_full_depth_rows = wire_depth;
+// Derivation at the assembly boundary (3c-ii: the wire words are
+// gone, so this IS the plans' birth). `view.region_*` must already be
+// populated; no table -> everything UNPLANNED, the legacy discipline.
+inline void apply_region_plans(LaunchView& view) {
     RegionPlans d;
-    if (!derive_region_plans(view, d)) return;
-    const auto drift = [](const char* what) {
-        throw std::runtime_error(std::string("region table drift: ") +
-                                 what);
-    };
-    if (d.hook_free_prefix_rows != wire_hook) drift("hook-free prefix");
-    if (d.unmasked_prefix_rows != wire_mask) drift("unmasked prefix");
-    if (d.full_depth_rows != wire_depth) drift("full-depth split");
-    const bool k_overridden =
-        std::getenv("PIE_DEBUG_MAX_LAYERS") != nullptr;
-    if (!k_overridden && d.max_layers != wire_k) drift("max_layers");
+    derive_region_plans(view, d);
     view.planned_hook_free_prefix_rows = d.hook_free_prefix_rows;
     view.planned_unmasked_prefix_rows = d.unmasked_prefix_rows;
+    view.planned_max_layers = d.max_layers;
     view.planned_full_depth_rows = d.full_depth_rows;
-    if (!k_overridden) view.planned_max_layers = d.max_layers;
 }
 
 }  // namespace pie_native

@@ -1471,41 +1471,6 @@ typedef struct PieStepDesc {
   struct PieU64Slice channel_expected_tail;
   struct PieU32Slice channel_ticket_indptr;
   /**
-   * The fire planner's hook-free prefix for this step, in WIRE request
-   * rows: rows `[0, n)` belong to no attention-stage program by the
-   * SCHEDULER's plan (`fire_plan`'s qkv_postprocess site — the
-   * planner's first consumed lowering). [`PIE_HOOK_FREE_PREFIX_UNPLANNED`]
-   * means the scheduler sent no plan and the driver derives the prefix
-   * itself (the pre-plan behavior); any other value the driver
-   * cross-checks against its own compiled-plan derivation and refuses
-   * the launch on drift — the declaration-side hook stamp and the
-   * compiled stage plans must agree.
-   */
-  uint32_t planned_hook_free_prefix_rows;
-  /**
-   * NS-2: the scheduler-planned count of leading wire rows whose
-   * members carry NO user mask (meaningful only on hook-free steps;
-   * the seriation nests mask under hooks).
-   * [`PIE_UNMASKED_PREFIX_UNPLANNED`] = no plan; the driver must not
-   * split the attention.
-   */
-  uint32_t planned_unmasked_prefix_rows;
-  /**
-   * STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
-   * take the head at layer `k` (the layerskip-draft class).
-   * [`PIE_MAX_LAYERS_FULL`] = the full model (every pre-S1 step). v0
-   * steps carrying a truncation are SOLO (the scheduler's blocking
-   * rule), so one per-step word suffices until the depth union.
-   */
-  uint32_t planned_max_layers;
-  /**
-   * STRUCTURAL S-2: leading members at FULL depth (the depth
-   * seriation's request split; the truncated suffix's uniform k is
-   * `planned_max_layers`). [`PIE_FULL_DEPTH_UNPLANNED`] = a uniform
-   * fire; the driver must not depth-split.
-   */
-  uint32_t planned_full_depth_rows;
-  /**
    * V2 rung ③a (north-star-dsl.md "RUNG ③ SPEC"): the region table —
    * the seriation's output stated ONCE. Region `r` spans wire rows
    * `[region_row_indptr[r], region_row_indptr[r+1])`;

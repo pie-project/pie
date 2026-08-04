@@ -269,15 +269,10 @@ struct LaunchScratch {
         view.region_row_indptr = pie_native::slice_from_u32(launch.region_row_indptr.ptr, launch.region_row_indptr.len);
         view.region_sig = pie_native::slice_from_u32(launch.region_sig.ptr, launch.region_sig.len);
         view.region_k = pie_native::slice_from_u32(launch.region_k.ptr, launch.region_k.len);
-        // V2 rung 3c: the region table is the source of truth for the
-        // four planned words — derived here, before ANY consumer; the
-        // wire words are the strict tripwire for one more era.
-        pie_native::apply_region_plans(
-            view,
-            launch.planned_hook_free_prefix_rows,
-            launch.planned_unmasked_prefix_rows,
-            launch.planned_max_layers,
-            launch.planned_full_depth_rows);
+        // V2 rung 3c-ii: the planned words are DERIVED STATE — the
+        // region table is their only source, computed here before any
+        // consumer (the wire words died with the era bump).
+        pie_native::apply_region_plans(view);
         view.ptir_kv_write_lower_bounds = pie_native::slice_from_u64(
             launch.ptir_kv_write_lower_bounds.ptr,
             launch.ptir_kv_write_lower_bounds.len);
@@ -392,10 +387,6 @@ void expand_step(
     launch.kv_translation_indptr = {
         out->kv_translation_indptr.data(), out->kv_translation_indptr.size()};
     launch.ptir_program_row_indptr = step.ptir_program_row_indptr;
-    launch.planned_hook_free_prefix_rows = step.planned_hook_free_prefix_rows;
-    launch.planned_unmasked_prefix_rows = step.planned_unmasked_prefix_rows;
-    launch.planned_max_layers = step.planned_max_layers;
-    launch.planned_full_depth_rows = step.planned_full_depth_rows;
     launch.region_row_indptr = step.region_row_indptr;
     launch.region_sig = step.region_sig;
     launch.region_k = step.region_k;

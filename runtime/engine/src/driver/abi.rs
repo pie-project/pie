@@ -341,13 +341,6 @@ fn step_desc<'a>(
         channel_expected_head: u64_slice(&step.channel_expected_head),
         channel_expected_tail: u64_slice(&step.channel_expected_tail),
         channel_ticket_indptr: u32_slice(&step.channel_ticket_indptr),
-        planned_hook_free_prefix_rows: step.planned_hook_free_prefix_rows,
-        planned_unmasked_prefix_rows: step.planned_unmasked_prefix_rows,
-        planned_max_layers: step
-            .plan
-            .max_layers
-            .unwrap_or(pie_driver_abi::PIE_MAX_LAYERS_FULL),
-        planned_full_depth_rows: step.planned_full_depth_rows,
         region_row_indptr: u32_slice(&step.region_row_indptr),
         region_sig: u32_slice(&step.region_sig),
         region_k: u32_slice(&step.region_k),
