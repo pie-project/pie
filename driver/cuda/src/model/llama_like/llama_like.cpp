@@ -167,19 +167,6 @@ bool decode_full_attention_variant_enabled() {
 // = reduction noise, immediate+total = bug; the tp_equivalence reasoning).
 // Once the grouped path has soaked, the gate should be deleted, not kept.
 bool lora_grouped_enabled() {
-// Bug#2 A/B: the fused QKV+qk-norm+rope+KV-write kernel
-// (`launch_qkv_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
-// suspect (the standalone BatchDecode attention is proven per-request-correct,
-// so the corruption is upstream in KV/Q production). PIE_CUDA_DECODE_FUSED_POST=0
-// falls back to the non-fused split-qkv + separate rope + `write_kv_to_pages`
-// (the verified `resolve_dst` path). If the fleet goes 8/8 with it off, the
-// fused kernel is the bug. Default on.
-//
-// The env var kept its `DECODE` name after the kernel was generalised to
-// prefill, so the switch is now the A/B for BOTH shapes: turning it off costs
-// ~10% of prefill wall. Existing runbooks keep working, which is why the name
-// was not churned.
-bool decode_fused_post_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_LORA_GROUPED");
         if (v == nullptr || v[0] == '\0') return true;
@@ -1819,7 +1806,6 @@ void llama_like_forward_paged(
             is_pure_decode &&
             !has_custom_mask &&
             (!has_write_desc || (w_page_d != nullptr && w_off_d != nullptr)) &&
-            (is_pure_decode || has_write_desc || qo_indptr != nullptr) &&
             native_bf16_kv_cache &&
             !head_dim_padded &&
             !fwd_cfg.use_qkv_bias &&
@@ -1839,7 +1825,7 @@ void llama_like_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 qkv_in, ops::WeightView(*layer.qkv_proj_fused),
                 ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-            if (fused_qkv_post) {
+            if (fused_decode_qkv_post) {
                 if (!rope_table_ready && !ws.rope_table.empty()) {
                     kernels::launch_rope_standard_table(
                         positions,
@@ -2064,7 +2050,7 @@ void llama_like_forward_paged(
         const void* attn_k   = ws.k.data();
         const void* attn_v   = ws.v.data();
         void* attn_out_buf   = ws.attn_out.data();
-        if (!fused_qkv_post && head_dim_padded) {
+        if (!fused_decode_qkv_post && head_dim_padded) {
             kernels::launch_pad_head_dim_bf16(
                 ws.q.data(), ws.q_padded.data(),
                 N, num_q_heads_local, d, dk, stream);
@@ -2938,54 +2924,9 @@ void llama_like_forward_paged(
                 N, H, eps, stream);
             lm_head_input = ws.norm_y.data();
         }
-        // Fused LM head + greedy argmax: the vocabulary is reduced slab by
-        // slab as it is produced, so the [rows, vocab] logits never exist
-        // (§20.37). The slab scratch is carved out of `ws.logits` -- by
-        // construction the buffer this path is not filling -- so the fused
-        // route allocates nothing.
-        //
-        // There is deliberately no quiet fallback. By the time the forward
-        // runs, `prepare_step` has already put `kGvFusedArgmax` in the graph
-        // key and `settle_step` will hand the epilogue `ws.sampled_tokens`
-        // whatever happens here; materializing logits instead would leave the
-        // epilogue publishing uninitialised memory as token ids. Every
-        // condition below is established before the fire is admitted
-        // (`ModelCapabilities::supports_fused_lm_head_argmax` for the weight,
-        // and `lm_head_rows <= workspace_logits_rows` for the shapes), so this
-        // is an assertion, not a branch.
-        const int chunk = fwd_cfg.logits_argmax_chunk_tokens;
-        if (chunk > 0) {
-            const auto rows = static_cast<std::size_t>(lm_head_rows);
-            const std::size_t accum = rows * kernels::kArgmaxAccumSlots;
-            if (ws.sampled_tokens.numel() < rows ||
-                ws.argmax_acc_val.numel() < accum ||
-                ws.argmax_acc_idx.numel() < accum) {
-                throw std::runtime_error(
-                    "fused lm_head argmax: workspace holds fewer rows than "
-                    "this fire samples");
-            }
-            if (ops::lm_head_argmax_slab_bytes(lm_head_rows, V, chunk) >
-                ws.logits.nbytes()) {
-                throw std::runtime_error(
-                    "fused lm_head argmax: vocabulary slab does not fit the "
-                    "logits arena");
-            }
-            if (!ops::lm_head_argmax_chunked(
-                    cublas.handle(), lm_head_input, *w.lm_head,
-                    static_cast<std::int32_t*>(ws.sampled_tokens.data()),
-                    ws.logits.data(),
-                    static_cast<float*>(ws.argmax_acc_val.data()),
-                    static_cast<std::int32_t*>(ws.argmax_acc_idx.data()),
-                    lm_head_rows, V, H, chunk)) {
-                throw std::runtime_error(
-                    "fused lm_head argmax: lm_head weight is not dense BF16, "
-                    "yet the model advertised the capability");
-            }
-        } else {
-            ops::gemm_act_x_w(cublas.handle(),
-                lm_head_input, *w.lm_head, ws.logits.data(),
-                lm_head_rows, V, H);
-        }
+        ops::gemm_act_x_w(cublas.handle(),
+            lm_head_input, *w.lm_head, ws.logits.data(),
+            lm_head_rows, V, H);
     }
 }
 

@@ -54,8 +54,7 @@ inline constexpr int           kGvLayoutShift = 4;
 inline constexpr std::uint32_t kGvFusedArgmax = 1u << 28;
 
 inline constexpr std::uint32_t kGvFlagMask =
-    kGvSmallSpec | kGvRsVerify | kGvCustomMask | kGvHasHooks |
-    kGvFusedArgmax;
+    kGvSmallSpec | kGvRsVerify | kGvCustomMask | kGvHasHooks;
 
 // By construction: every flag is below the layout field, so no `graph_layout`
 // value can ever alias a flag bit.

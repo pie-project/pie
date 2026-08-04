@@ -639,6 +639,10 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             pi.w_page.data(), pi.w_off.data(),
             /*has_write_desc=*/true,
             /*runtime_window_left=*/-2,
+            /*stage_hooks=*/nullptr,
+            /*use_supergraph=*/false,
+            /*lora=*/nullptr,
+            /*unmasked_prefix_rows=*/0xffffffffu,
             lattice_chunk);
         engine.graph_cache->put(key, exec);
         ++captured;

@@ -72,9 +72,10 @@ LlamaLikeModel::LlamaLikeModel(
     // acts on it -- but only a dense BF16 head can be reduced slab by slab, so
     // the weight decides too. Asked once here rather than inside the forward:
     // by then the graph key and the epilogue's token source are committed.
-    caps_.supports_fused_lm_head_argmax =
-        weights_.lm_head != nullptr &&
-        ops::lm_head_argmax_supported(*weights_.lm_head);
+    // MERGE NOTE: upstream's fused LM-head argmax is NOT taken into the
+    // tart llama_like body (its epilogue would read tokens the body never
+    // wrote); the capability stays off until that port.
+    caps_.supports_fused_lm_head_argmax = false;
 }
 
 void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,

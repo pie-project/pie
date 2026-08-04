@@ -22,7 +22,7 @@
 
 #include "fire/view.hpp"
 
-namespace pie_native {
+namespace pie::driver::fire {
 
 struct RegionPlans {
     std::uint32_t hook_free_prefix_rows = 0xffffffffu;
@@ -150,4 +150,4 @@ inline void apply_region_plans(LaunchView& view) {
     view.planned_full_depth_rows = d.full_depth_rows;
 }
 
-}  // namespace pie_native
+}  // namespace pie::driver::fire

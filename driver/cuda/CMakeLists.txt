@@ -446,6 +446,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/kimi/kimi_forward.cpp
   src/model/kimi/kimi_model.cpp
   src/model/llama_like/llama_like.cpp
+  src/model/llama_like/declared_forward.cpp
   src/model/llama_like/llama_like_model.cpp
   src/model/llama_like/mistral3.cpp
   src/model/llama_like/qwen3.cpp
@@ -459,6 +460,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/qwen3_5/qwen3_5.cpp
   src/model/qwen3_5/qwen3_5_config.cpp
   src/model/qwen3_5/qwen3_5_forward.cpp
+  src/model/qwen3_5/declared_forward.cpp
   src/model/qwen3_5/qwen3_5_model.cpp
   src/model/qwen3_5/qwen3_5_moe.cpp
   src/model/qwen3_5/qwen3_5_moe_forward.cpp
@@ -604,6 +606,8 @@ target_include_directories(pie_driver_cuda_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # tart: the declared-forward FFI headers (pie_forward/*.hpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../forward/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
     # Ahead of NCCL: its header is located with ${CUDAToolkit_INCLUDE_DIRS} as
     # the first HINT, so on hosts that ship nccl.h inside the CUDA tree

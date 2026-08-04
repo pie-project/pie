@@ -1079,7 +1079,7 @@ void prepare_step(
         for (auto& descriptor : effective_structured_masks) {
             if (!descriptor) {
                 descriptor.kind =
-                    pie::driver::launch::StructuredMaskKind::Causal;
+                    pie::driver::fire::StructuredMaskKind::Causal;
             }
         }
         filled_causal_coverage = true;
