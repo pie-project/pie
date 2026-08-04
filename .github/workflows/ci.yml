@@ -37,18 +37,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Cheap structural check: every workspace member compiles. Skips
-      # the cmake-driven C++ build by checking pie-worker with
-      # `--no-default-features` (the default features pull in ggml).
+      # Cheap structural check: the composition root compiles, and with it the
+      # runtime and every role lib it pulls in. `pie-bin` depends on `pie-worker`
+      # with `default-features = false`, so this reaches a no-driver worker and
+      # skips the cmake-driven C++ build. `pie-client` is checked separately
+      # because the binary does not depend on it.
       - name: cargo check (runtime, client, no-driver pie-worker)
         run: |
-          cargo check -p pie
-          cargo check -p pie --no-default-features
+          cargo check -p pie-bin
+          cargo check -p pie-bin --no-default-features
           cargo check -p pie-client
 
+      # `pie-engine` is the runtime library; the `pie` package it was split out
+      # of no longer exists.
       - name: cargo test (runtime, client)
         run: |
-          cargo test -p pie --lib
+          cargo test -p pie-engine --lib
           cargo test -p pie-client --lib
 
       # `pie-ir` and `pie-plan` declare `#![no_std]` behind `not(feature =
@@ -300,9 +304,13 @@ jobs:
           cargo build -p pie-worker \
             --no-default-features --features driver-dummy
 
+      # `pie-worker` is a library and has no bin target; the `pie` command lives
+      # in `bin/pie`. The old `--bin pie` here named a target this package has
+      # never had, so the step could only ever fail. Test what the step above
+      # just built.
       - name: cargo test (pie-worker, dummy)
         run: |
-          cargo test -p pie-worker --bin pie \
+          cargo test -p pie-worker \
             --no-default-features --features driver-dummy
 
   # macOS Metal driver build. Verifies driver/metal's cmake + link
