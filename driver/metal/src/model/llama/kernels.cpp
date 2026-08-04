@@ -20,10 +20,7 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // A width with no instantiation fails here, by name, instead of running a
     // pipeline built for a different one.
     const std::string d = "_d_" + std::to_string(g.head_dim);
-    // Likewise the quantization width: the config states it, and a pipeline
-    // built for the wrong one reads the bytes at the wrong stride.
-    const std::string q = "_bfloat16_gs_" + std::to_string(g.quant_group_size) + "_b_" +
-                          std::to_string(g.quant_bits);
+    const std::string q = g.quant.kernel_suffix();
     const std::string sdpa_name = "sdpa_vector_decode_bfloat16" + d;
     const std::string paged_name = "sdpa_paged_decode_bfloat16" + d;
     const std::string tiled_name = "sdpa_paged_tiled_bfloat16" + d;

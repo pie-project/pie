@@ -170,8 +170,6 @@ template <typename T, int N_READS>
       const device itype*, const device itype*, device itype*,          \
       constant RmsParams&, constant int&, uint, uint, uint, uint);
 
-instantiate_rms_strided_row(float32, float, 4)
-instantiate_rms_strided_row(float16, half, 4)
 instantiate_rms_strided_row(bfloat16, bfloat, 4)
 
 #define instantiate_rms_single_row(name, itype, n_reads)               \
@@ -180,8 +178,6 @@ instantiate_rms_strided_row(bfloat16, bfloat, 4)
       const device itype*, const device itype*, device itype*,          \
       constant RmsParams&, uint, uint, uint, uint);
 
-instantiate_rms_single_row(float32, float, 4)
-instantiate_rms_single_row(float16, half, 4)
 instantiate_rms_single_row(bfloat16, bfloat, 4)
 
 // ── Fused norm + residual (+ optional layer scalar) — gemma4 ─────────────────
@@ -317,6 +313,4 @@ template <typename T, int N_READS>
       constant RmsParams&, const device itype*, const device itype*,     \
       uint, uint, uint, uint);
 
-instantiate_rms_residual(float32, float, 4)
-instantiate_rms_residual(float16, half, 4)
 instantiate_rms_residual(bfloat16, bfloat, 4)

@@ -96,7 +96,7 @@ max_upload_mb = 256
 
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
 [model.scheduler]
 request_timeout_secs = 120

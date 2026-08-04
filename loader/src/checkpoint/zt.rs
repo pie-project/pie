@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ztensor::cbor::Value;
+use ztensor::format::cbor::Value;
 use ztensor::{DType as ZDType, Source};
 
 use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
@@ -55,6 +55,103 @@ pub fn parse_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
 /// files is refused rather than resolved by precedence.
 pub fn parse_checkpoint_files(paths: &[PathBuf]) -> Result<CheckpointMetadata, Error> {
     describe(&ztensor_compat::index_all(paths).map_err(Error::from)?)
+}
+
+/// Verifies every tensor digest of a `.zt` artifact; returns the tensor count.
+///
+/// The gate a destructive caller (`pie model convert --delete-source`) runs
+/// before destroying what the artifact was computed from. A part *without* a
+/// digest fails rather than passes: "nothing was checked" cannot justify a
+/// delete.
+pub fn verify_checkpoint(path: &Path) -> Result<usize, Error> {
+    let source = Source::open(path).map_err(Error::from)?;
+    let mut count = 0usize;
+    for tensor in source.tensors() {
+        if tensor.verify().map_err(Error::from)? == ztensor::Verified::NoDigest {
+            return Err(Error::Checkpoint(format!(
+                "tensor '{}' carries no digest to verify",
+                tensor.name()
+            )));
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// A `.zt` artifact's identity: the digest of every tensor it names, folded
+/// into one value. `None` for anything that is not a `.zt` with a manifest.
+///
+/// The manifest holds each object's own digest, and for a sharded artifact it
+/// holds the shard table — whose entries are whole-file digests. So hashing
+/// the manifest is a claim about the whole artifact, single-file or not, for
+/// the cost of reading a header. It also survives the file being moved, which
+/// an identity derived from a path does not.
+///
+/// This lives here rather than in the worker because "what identifies a
+/// checkpoint" is a question about the format, and because the worker has no
+/// business depending on zTensor directly.
+pub fn artifact_identity(path: &Path) -> Result<Option<Vec<u8>>, Error> {
+    if !path.is_file()
+        || !path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zt"))
+    {
+        return Ok(None);
+    }
+    let Some(manifest) = ztensor::read::manifest_of(path).map_err(Error::from)? else {
+        // A data shard carries no manifest, so it identifies nothing on its
+        // own — the root that names it does.
+        return Ok(None);
+    };
+    let mut identity = Vec::new();
+    for (name, object) in &manifest.objects {
+        identity.extend_from_slice(name.as_bytes());
+        for (part_name, part) in &object.parts {
+            identity.extend_from_slice(part_name.as_bytes());
+            if let Some(digest) = &part.digest {
+                identity.extend_from_slice(digest.as_bytes());
+            } else {
+                // Canonical form gives every part a digest; a part without one
+                // still has to contribute something, or two artifacts that
+                // differ only there would collide.
+                identity.extend_from_slice(&part.blob.length.to_le_bytes());
+            }
+        }
+    }
+    for (name, shard) in &manifest.shards {
+        identity.extend_from_slice(name.as_bytes());
+        identity.extend_from_slice(shard.digest.as_bytes());
+        identity.extend_from_slice(&shard.size.to_le_bytes());
+    }
+    Ok(Some(identity))
+}
+
+/// Reads a checkpoint's file-level attributes as a flat text map.
+///
+/// The read side of what [`CheckpointWriter`](super::write::CheckpointWriter)
+/// writes as provenance. It is a function rather than a field on
+/// [`CheckpointMetadata`] because the two answer different questions and have
+/// different readers: metadata says which tensors exist and where, which every
+/// planner needs, while attributes say where the artifact *came from*, which
+/// only `pie model list` and the re-convert skip check ask about. Charging
+/// every reader — including the FFI marshaller and sixty-odd tests that build
+/// metadata by hand — for a map they never read would be the wrong trade.
+///
+/// Attributes whose value is not text are skipped: the format allows arbitrary
+/// CBOR there and the GGUF projection uses it for whole tokenizer tables, none
+/// of which is provenance.
+pub fn read_attributes(path: &Path) -> Result<std::collections::BTreeMap<String, String>, Error> {
+    let source = Source::open(path).map_err(Error::from)?;
+    let Some(Value::Map(entries)) = source.attributes() else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    Ok(entries
+        .iter()
+        .filter_map(|(key, value)| match (key, value) {
+            (Value::Text(key), Value::Text(value)) => Some((key.clone(), value.clone())),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Turns an opened source into the loader's metadata.
@@ -334,33 +431,23 @@ fn affine_group_scheme(attrs: Option<&Value>) -> Result<QuantScheme, Error> {
     })
 }
 
-fn attr_map<'a>(attrs: Option<&'a Value>, key: &str) -> Option<&'a [(Value, Value)]> {
-    attrs?
-        .as_map()?
-        .iter()
-        .find(|(k, _)| k.as_text() == Some(key))
-        .and_then(|(_, v)| v.as_map())
+fn attr_map<'a>(attrs: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    attrs?.get(key).filter(|v| v.as_map().is_some())
 }
 
-fn map_text<'a>(entries: &'a [(Value, Value)], key: &str) -> Option<&'a str> {
-    entries
-        .iter()
-        .find(|(k, _)| k.as_text() == Some(key))
-        .and_then(|(_, v)| v.as_text())
+fn map_text<'a>(entries: &'a Value, key: &str) -> Option<&'a str> {
+    entries.get(key)?.as_text()
 }
 
 fn attr_u64(attrs: Option<&Value>, key: &str) -> Option<u64> {
-    attrs?
-        .as_map()?
-        .iter()
-        .find(|(k, _)| k.as_text() == Some(key))
-        .and_then(|(_, v)| v.as_u64())
+    attrs?.get(key)?.as_u64()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ztensor::{DType as ZDType, Writer, cbor};
+    use ztensor::format::cbor;
+    use ztensor::{DType as ZDType, Writer};
 
     /// Writes a file and describes it, which is the whole path this module is:
     /// zTensor's object model in, the loader's flat tensor space out.
@@ -429,20 +516,18 @@ mod tests {
     fn a_quant_attribute_that_does_not_fit_is_refused() {
         for (attr, value) in [("bits", 999u64), ("group_size", 1u64 << 33), ("axis", 300)] {
             let result = lower(attr, |w| {
-                w.object("w")
-                    .shape([32u64, 32])
-                    .layout("zt.mx/1")
-                    .attr(attr, value)
-                    .part("data")
-                    .dtype(ZDType::U8)
-                    .logical("f4_e2m1")
-                    .bytes(&[0u8; 512])
-                    .part("scales")
-                    .dtype(ZDType::U8)
-                    .logical("f8_e8m0")
-                    .bytes(&[0u8; 32])
-                    .add()
-                    .unwrap();
+                w.object("w", |o| {
+                    o.shape([32u64, 32])
+                        .layout("zt.mx/1")
+                        .attr(attr, value)
+                        .part("data", |p| {
+                            p.dtype(ZDType::U8).logical("f4_e2m1").bytes(&[0u8; 512])
+                        })
+                        .part("scales", |p| {
+                            p.dtype(ZDType::U8).logical("f8_e8m0").bytes(&[0u8; 32])
+                        })
+                })
+                .unwrap();
             });
             let err = result.expect_err(&format!("{attr}={value} was accepted"));
             let text = err.to_string();
@@ -460,20 +545,18 @@ mod tests {
     #[test]
     fn secondary_parts_take_a_suffixed_name() {
         let tensors = lower("mx", |w| {
-            w.object("w")
-                .shape([32u64, 32])
-                .layout("zt.mx/1")
-                .attr("block_size", 32u64)
-                .part("data")
-                .dtype(ZDType::U8)
-                .logical("f4_e2m1")
-                .bytes(&[0u8; 512])
-                .part("scales")
-                .dtype(ZDType::U8)
-                .logical("f8_e8m0")
-                .bytes(&[0u8; 32])
-                .add()
-                .unwrap();
+            w.object("w", |o| {
+                o.shape([32u64, 32])
+                    .layout("zt.mx/1")
+                    .attr("block_size", 32u64)
+                    .part("data", |p| {
+                        p.dtype(ZDType::U8).logical("f4_e2m1").bytes(&[0u8; 512])
+                    })
+                    .part("scales", |p| {
+                        p.dtype(ZDType::U8).logical("f8_e8m0").bytes(&[0u8; 32])
+                    })
+            })
+            .unwrap();
         })
         .unwrap();
         let names: Vec<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
@@ -495,14 +578,12 @@ mod tests {
     #[test]
     fn an_unknown_layout_is_refused() {
         let err = lower("mystery", |w| {
-            w.object("w")
-                .shape([32u64])
-                .layout("vendor.mystery/1")
-                .part("data")
-                .dtype(ZDType::U8)
-                .bytes(&[0u8; 32])
-                .add()
-                .unwrap();
+            w.object("w", |o| {
+                o.shape([32u64])
+                    .layout("vendor.mystery/1")
+                    .part("data", |p| p.dtype(ZDType::U8).bytes(&[0u8; 32]))
+            })
+            .unwrap();
         })
         .unwrap_err();
         assert!(format!("{err}").contains("no loader quantization scheme"));
@@ -513,14 +594,14 @@ mod tests {
         // A compressed part is stored bytes, not tensor bytes: there is no
         // range of the file the planner could point a device at.
         let err = lower("zstd", |w| {
-            w.object("w")
-                .shape([32u64])
-                .part("data")
-                .dtype(ZDType::U8)
-                .encoding("zt.zstd-seekable/1")
-                .bytes(&[0u8; 32])
-                .add()
-                .unwrap();
+            w.object("w", |o| {
+                o.shape([32u64]).part("data", |p| {
+                    p.dtype(ZDType::U8)
+                        .encoding("zt.zstd-seekable/1")
+                        .bytes(&[0u8; 32])
+                })
+            })
+            .unwrap();
         })
         .unwrap_err();
         assert!(format!("{err}").contains("no address"), "{err}");
@@ -531,21 +612,19 @@ mod tests {
         // `zt.quant_group/1` is parametric: the same layout id names different
         // schemes depending on the packing and zero-point attributes.
         let tensors = lower("awq", |w| {
-            w.object("w")
-                .shape([32u64, 32])
-                .layout("zt.quant_group/1")
-                .attr("bits", 4u64)
-                .attr("packing", cbor::map([("order", "lsb_first")]))
-                .attr(
-                    "zero_point",
-                    cbor::map([("form", "tensor"), ("packing", "same_as_data")]),
-                )
-                .attr("group_size", 128u64)
-                .part("data")
-                .dtype(ZDType::U8)
-                .bytes(&[0u8; 512])
-                .add()
-                .unwrap();
+            w.object("w", |o| {
+                o.shape([32u64, 32])
+                    .layout("zt.quant_group/1")
+                    .attr("bits", 4u64)
+                    .attr("packing", cbor::map([("order", "lsb_first")]))
+                    .attr(
+                        "zero_point",
+                        cbor::map([("form", "tensor"), ("packing", "same_as_data")]),
+                    )
+                    .attr("group_size", 128u64)
+                    .part("data", |p| p.dtype(ZDType::U8).bytes(&[0u8; 512]))
+            })
+            .unwrap();
         })
         .unwrap();
         match &tensors[0].encoding {

@@ -88,10 +88,16 @@ pub fn ensure_installed_best_effort() {
     }
 }
 
-/// Synchronous tarball download. Uses `reqwest::blocking` — we're
-/// either in a non-async context (`pie config init`) or this is a
-/// best-effort startup install where briefly blocking the main
-/// thread is fine (matches Python's `asyncio.to_thread` behavior).
+/// Synchronous tarball download, via `reqwest::blocking`.
+///
+/// **Every caller must already be on a blocking thread.** `main` is
+/// `#[tokio::main]`, so there is no non-async context in this binary — the
+/// client here builds a tokio runtime of its own and dropping that inside an
+/// async one is an error tokio reports at runtime rather than a compile error.
+/// `pie config init` used to reach this directly and printed "Cannot drop a
+/// runtime in a context where blocking is not allowed" every time; it goes
+/// through `spawn_blocking` now, as `runtime install` and the startup
+/// best-effort install already did.
 fn fetch() -> Result<Vec<u8>> {
     let resp = reqwest::blocking::Client::new()
         .get(RUNTIME_URL)

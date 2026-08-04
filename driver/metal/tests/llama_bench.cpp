@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +51,24 @@ bool exists(const std::string& dir) {
     if (f == nullptr) return false;
     std::fclose(f);
     return true;
+}
+
+/// How many bytes of weights this checkpoint is, off the filesystem.
+///
+/// The plan's own figure would be better, but it is behind `MetalExecutor` and
+/// the point of the probe is to run BEFORE one exists. The weight files are the
+/// same number to within their headers, and the probe only needs a capacity
+/// that is plainly under the model.
+std::uint64_t checkpoint_weight_bytes(const std::string& dir) {
+    std::uint64_t total = 0;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec || !entry.is_regular_file(ec)) continue;
+        const std::string ext = entry.path().extension().string();
+        if (ext != ".safetensors" && ext != ".zt" && ext != ".gguf" && ext != ".bin") continue;
+        total += entry.file_size(ec);
+    }
+    return total;
 }
 
 double now_s() {
@@ -276,6 +295,14 @@ int main(int argc, char** argv) {
     // the interesting question -- whether a sparsely read bank costs anything
     // to stream -- is only answerable by running the SAME stopwatch both ways.
     cfg.stream_routed_experts = std::getenv("PIE_METAL_TEST_STREAM_EXPERTS") != nullptr;
+    // A megabyte budget for the routed experts, which turns mapping OFF and
+    // pages them through a slab instead. This is the only setting under which a
+    // model can exceed the machine, and the only way to exercise it here: no
+    // checkpoint on this box is bigger than its working set, so the bounded
+    // budget stands in for the case that cannot be run directly.
+    if (const char* mb = std::getenv("PIE_METAL_EXPERT_SLAB_MB")) {
+        cfg.expert_slab_bytes = std::uint64_t(std::strtoull(mb, nullptr, 10)) * 1024ull * 1024ull;
+    }
     // One sequence, so one sequence's worth of ring. The default is sized for a
     // 64-request fleet and does not scale with the model: at 48 layers it is
     // 13 GiB of KV, which beside a 17 GiB checkpoint does not fit a 32 GiB
@@ -306,14 +333,50 @@ int main(int argc, char** argv) {
     // one caller makes is not a check the driver makes.
     //
     // This costs nothing: the refusal happens before a byte is allocated.
-    {
-        RawMetalContext::set_device_working_set_bytes_for_test(256u << 20);
+    //
+    // Twice, at two capacities, because one of them proves nothing on its own.
+    // 256 MiB is under any checkpoint's SCRATCH, so it refuses even a driver
+    // that has forgotten the weights entirely -- which is exactly what happened
+    // when weights bound where they lie stopped being counted: a 17.17 GB model
+    // reported that it needed 0.326 GiB, and this probe still passed. Half the
+    // weights is a capacity only the right arithmetic refuses.
+    //
+    // With a slab budget the SECOND probe inverts, and that inversion is the
+    // gate for expert paging as a whole. A budget means the routed bank is read
+    // from an mmap the GPU never sees, so it is neither allocated nor resident,
+    // and a device holding half the weights must ADMIT the model -- which is
+    // the entire capability, stated as the one thing that distinguishes it from
+    // every earlier arrangement. Nothing on this machine is bigger than its
+    // working set, so this stands in for the case that cannot be run directly.
+    const std::uint64_t weight_bytes = checkpoint_weight_bytes(cfg.snapshot_dir);
+    const bool paging = cfg.expert_slab_bytes > 0;
+    for (const std::uint64_t hold :
+         {std::uint64_t(256u << 20), weight_bytes / 2}) {
+        if (hold == 0) continue;
+        if (paging && hold == weight_bytes / 2) {
+            RawMetalContext::set_device_working_set_bytes_for_test(std::size_t(hold));
+            MetalExecutor admitted;
+            std::string why;
+            const bool ok = admitted.setup(cfg, &why);
+            RawMetalContext::set_device_working_set_bytes_for_test(0);
+            if (!ok) {
+                std::printf("  FAIL  paging refused a model it should hold: %s\n", why.c_str());
+                return 1;
+            }
+            std::printf("  PASS  paged the experts onto a device holding %.2f GiB,"
+                        " against %.2f GiB of weights\n",
+                        double(hold) / (1 << 30), double(weight_bytes) / (1 << 30));
+            continue;
+        }
+        RawMetalContext::set_device_working_set_bytes_for_test(std::size_t(hold));
         MetalExecutor probe;
         std::string too_big;
         const bool set_up = probe.setup(cfg, &too_big);
         RawMetalContext::set_device_working_set_bytes_for_test(0);
         if (set_up) {
-            std::printf("  FAIL  setup succeeded on a device that said it would hold 256 MiB\n");
+            std::printf("  FAIL  setup succeeded on a device that said it would hold %.2f GiB,"
+                        " against %.2f GiB of weights\n",
+                        double(hold) / (1 << 30), double(weight_bytes) / (1 << 30));
             return 1;
         }
         if (too_big.find("does not fit this GPU") == std::string::npos) {

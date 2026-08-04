@@ -261,12 +261,18 @@ int main(int argc, char** argv) {
     expect(true, "the contract compiles a load plan for the real checkpoint");
 
     BoundGptOss b;
+    std::shared_ptr<void> weight_mapping;
     try {
         const auto storage = plan.view();
-        pie_loader::CheckpointSource view(storage);
+        auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
         StagedWeights staged =
-            stage_plan_weights(*ctx, view, plan, storage.memory.persistent_bytes);
+            stage_plan_weights(*ctx, std::move(view), plan, storage.memory.persistent_bytes);
         b.weights = std::move(staged.weights);
+        // The mapping has to outlive `b.weights`: when the checkpoint places
+        // its tensors where a device pointer may point, those slots are slices
+        // of the checkpoint's own mmap rather than copies in the heap, and
+        // dropping `staged` here would unmap them under the GPU.
+        weight_mapping = std::move(staged.weight_mapping);
     } catch (const std::exception& e) {
         std::printf("  FAIL  stage_plan_weights: %s\n", e.what());
         return 1;
@@ -305,7 +311,10 @@ int main(int argc, char** argv) {
     GptOssPsos psos;
     DecodeStepPsos base;
     if (!build_gptoss_psos(*ctx, kernels_dir, g, psos, &err) ||
-        !load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/false, &err)) {
+        // gpt-oss's shared table is affine b4/g64; its mxfp4 entrypoints are
+        // named directly in `gptoss/kernels.cpp`.
+        !load_decode_psos(*ctx, kernels_dir, base, pie::metal::AffineFormat{4, 64},
+                          /*with_argmax=*/false, &err)) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }

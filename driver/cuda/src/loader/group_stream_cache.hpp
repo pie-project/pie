@@ -46,14 +46,15 @@
 // Unconditionally CUDA, unlike the executor it wraps: a slab is device memory
 // and there is no host-side reading of this component to preserve. The part
 // that is worth testing without a device is `GroupSlotIndex`, which is why it
-// is a separate header.
+// is a separate header, and why that header is the loader's rather than this
+// driver's -- Metal pages the same groups by the same rule.
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
 #include "pie_loader/plan.hpp"
 #include "pie_loader/checkpoint_source.hpp"
 
-#include "loader/group_slot_index.hpp"
+#include <pie_loader/group_slot_index.hpp>
 #include "loader/load_plan_executor.hpp"
 #include "loader/loader_config.hpp"
 #include "loader/weight_copy_engine.hpp"
@@ -61,6 +62,11 @@
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
+
+// Which instance is in which slot is not a CUDA question, and Metal asks it
+// too. The rule lives in the loader so both backends evict the same way; only
+// the half that moves bytes is below.
+using pie_loader::GroupSlotIndex;
 
 class GroupStreamCache {
 public:

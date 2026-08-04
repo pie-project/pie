@@ -8,9 +8,16 @@
 // between those is policy, which lives here.
 //
 // This is the bookkeeping half of that policy and nothing else. It holds no
-// device memory, opens no files, and never touches CUDA, so the eviction rule
-// -- the part that decides whether streaming thrashes -- is testable on a
-// machine with no GPU. The half that moves bytes is `GroupStreamCache`.
+// device memory, opens no files, and names no API, so the eviction rule -- the
+// part that decides whether streaming thrashes -- is testable on a machine
+// with no GPU. The half that moves bytes is each backend's own: CUDA pages
+// into a device slab, Metal into a heap slot, and neither disagrees with the
+// other about which instance was supposed to be there.
+//
+// It lives beside the plan rather than in a driver for that last reason. Two
+// backends deciding residency by two eviction rules is two ways for the same
+// checkpoint to thrash, and one of them would be found much later than the
+// other.
 //
 // The rule: a free slot always beats a used one (free slots have age 0, and
 // nothing else ever does), ties go to the lowest slot id, and among used slots
@@ -25,7 +32,7 @@
 #include <string>
 #include <vector>
 
-namespace pie_cuda_driver {
+namespace pie_loader {
 
 class GroupSlotIndex {
 public:
@@ -153,4 +160,4 @@ private:
     std::uint64_t evictions_ = 0;
 };
 
-}  // namespace pie_cuda_driver
+}  // namespace pie_loader

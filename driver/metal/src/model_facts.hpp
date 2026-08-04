@@ -12,6 +12,7 @@
 /// someone edits one of them.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 // `SetupConfig` is forward-declared rather than included. This header used to
@@ -177,6 +178,12 @@ struct ModelFacts {
 /// defaults, which every caller then refuses on: there is no configuration
 /// worth guessing at.
 ModelFacts read_model_facts(const std::string& hf_path);
+
+/// The same facts, read out of a `pie.model/1` descriptor instead of derived
+/// from `config.json`. `nullopt` when there is no descriptor to read, and the
+/// caller falls back to [`read_model_facts`].
+std::optional<ModelFacts> read_model_facts_from_descriptor(
+    const std::string& descriptor_path);
 
 /// Fill the family-specific half of a `SetupConfig` from those facts.
 void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts& facts);

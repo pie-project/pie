@@ -58,8 +58,8 @@ bool gemma4_geometry(const SetupConfig& cfg, gemma4::Gemma4Geometry& g, int max_
                      std::string* err) {
     if (!gemma4::geometry_from_facts(cfg.gemma4, g, err)) return false;
     if (cfg.vocab_size != 0) g.vocab = static_cast<int>(cfg.vocab_size);
-    if (cfg.quant_bits != 0) g.quant_bits = cfg.quant_bits;
-    if (cfg.quant_group_size != 0) g.quant_group_size = cfg.quant_group_size;
+    if (cfg.quant_bits != 0) g.quant.bits = cfg.quant_bits;
+    if (cfg.quant_group_size != 0) g.quant.group = cfg.quant_group_size;
     g.kv_max_ctx = max_ctx;
     return true;
 }
@@ -81,8 +81,8 @@ bool llama_geometry(const SetupConfig& cfg, llama::LlamaGeometry& g, int max_ctx
                     std::string* err) {
     if (!llama::geometry_from_facts(cfg.llama, g, err)) return false;
     if (cfg.vocab_size != 0) g.vocab = static_cast<int>(cfg.vocab_size);
-    if (cfg.quant_bits != 0) g.quant_bits = cfg.quant_bits;
-    if (cfg.quant_group_size != 0) g.quant_group_size = cfg.quant_group_size;
+    if (cfg.quant_bits != 0) g.quant.bits = cfg.quant_bits;
+    if (cfg.quant_group_size != 0) g.quant.group = cfg.quant_group_size;
     g.kv_max_ctx = max_ctx;
     return true;
 }
@@ -281,20 +281,15 @@ class Gemma4Engine final : public SimpleFamilyEngine {
 
         try {
             const auto storage = load_plan.view();
-            pie_loader::CheckpointSource view(storage);
+            auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
             StagedWeights staged = stage_plan_weights(
-                ctx, view, load_plan, storage.memory.persistent_bytes,
+                ctx, std::move(view), load_plan, storage.memory.persistent_bytes,
                 stream_predicate(cfg.stream_routed_experts));
             b_.weights = std::move(staged.weights);
-            // The pack must outlive the weights that point into it; see the
+            // Whatever the weights point into -- the pack, or the checkpoint's
+            // own mapping -- must outlive them; see the
             // gpt-oss engine below.
-            stream_pack_ = std::move(staged.stream_pack);
-            if (staged.streamed_bytes > 0) {
-                std::fprintf(stderr,
-                             "[pie-metal] gemma4: %.2f GB of FFN weights streamed from a "
-                             "pack, and out of the heap\n",
-                             double(staged.streamed_bytes) / 1e9);
-            }
+            weight_mapping_ = std::move(staged.weight_mapping);
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging gemma4's weights: ") + e.what();
             return false;
@@ -356,13 +351,13 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
 
         if (!gemma4::build_gemma4_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err,
+        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/false, err,
                               /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false, g_.quant_bits, g_.quant_group_size)) {
+                              /*untied=*/false)) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/true, err,
-                                  /*routed=*/false, g_.quant_bits, g_.quant_group_size)) {
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/true, err,
+                                  /*routed=*/false)) {
             return false;
         }
 
@@ -491,7 +486,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
 
     gemma4::Gemma4Geometry g_{};
     /// Keeps the streamed weights' mapping alive; see `init`.
-    std::shared_ptr<void> stream_pack_{};
+    std::shared_ptr<void> weight_mapping_{};
     int max_ctx_ = 0;
     int max_rows_ = 1;
     int max_sampled_ = 1;
@@ -627,21 +622,15 @@ class GptOssEngine final : public SimpleFamilyEngine {
 
         try {
             const auto storage = load_plan.view();
-            pie_loader::CheckpointSource view(storage);
+            auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
             StagedWeights staged = stage_plan_weights(
-                ctx, view, load_plan, storage.memory.persistent_bytes,
+                ctx, std::move(view), load_plan, storage.memory.persistent_bytes,
                 stream_predicate(cfg.stream_routed_experts));
             b_.weights = std::move(staged.weights);
             // The pack must outlive the weights that point into it. Taking only
             // `staged.weights` and letting `staged` die unmaps it under them,
             // which reads as weights of exactly zero.
-            stream_pack_ = std::move(staged.stream_pack);
-            if (staged.streamed_bytes > 0) {
-                std::fprintf(stderr,
-                             "[pie-metal] gpt-oss: %.2f GB of experts streamed from a pack, "
-                             "and out of the heap\n",
-                             double(staged.streamed_bytes) / 1e9);
-            }
+            weight_mapping_ = std::move(staged.weight_mapping);
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging gpt-oss's weights: ") + e.what();
             return false;
@@ -732,8 +721,17 @@ class GptOssEngine final : public SimpleFamilyEngine {
         }
 
         if (!gptoss::build_gptoss_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err)) return false;
+        // b4/g64, NOT the (mxfp4, 32) pair gpt-oss's config declares globally.
+        // That global is overridden back to affine g64 by nearly every tensor,
+        // and this shared table only ever compiles the affine entrypoints --
+        // gpt-oss's own mxfp4 kernels are named explicitly in `gptoss/kernels.cpp`.
+        // This used to be the parameter's default, which meant the driver was
+        // making the same choice without saying so.
+        const AffineFormat kGptOssBase{/*bits=*/4, /*group=*/64};
+        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, /*with_argmax=*/false, err))
+            return false;
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, kGptOssBase, /*with_d512=*/false, err))
+            return false;
 
         gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
         bound_rows_ = 1;
@@ -853,7 +851,7 @@ class GptOssEngine final : public SimpleFamilyEngine {
     std::vector<SlotHandle> kpages_{};
     std::vector<SlotHandle> vpages_{};
     /// Keeps the streamed weights' mapping alive; see `init`.
-    std::shared_ptr<void> stream_pack_{};
+    std::shared_ptr<void> weight_mapping_{};
     int max_sampled_ = 1;
     int max_rows_ = 1;
     int bound_rows_ = 0;
@@ -993,20 +991,20 @@ class LlamaEngine final : public SimpleFamilyEngine {
 
         try {
             const auto storage = load_plan.view();
-            pie_loader::CheckpointSource view(storage);
+            auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
+            ExpertSlabRequest slab_req;
+            if (cfg.expert_slab_bytes > 0 && g_.n_experts > 1) {
+                slab_req.n_experts = g_.n_experts;
+                slab_req.budget_bytes = cfg.expert_slab_bytes;
+            }
             StagedWeights staged = stage_plan_weights(
-                ctx, view, load_plan, storage.memory.persistent_bytes,
-                stream_predicate(cfg.stream_routed_experts));
+                ctx, std::move(view), load_plan, storage.memory.persistent_bytes,
+                stream_predicate(cfg.stream_routed_experts || slab_req.valid()), slab_req);
             b_.weights = std::move(staged.weights);
             // The pack must outlive the weights that point into it; see the
             // gpt-oss engine above.
-            stream_pack_ = std::move(staged.stream_pack);
-            if (staged.streamed_bytes > 0) {
-                std::fprintf(stderr,
-                             "[pie-metal] llama: %.2f GB of FFN weights streamed from a pack, "
-                             "and out of the heap\n",
-                             double(staged.streamed_bytes) / 1e9);
-            }
+            weight_mapping_ = std::move(staged.weight_mapping);
+            slab_ = std::move(staged.slab);
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging llama's weights: ") + e.what();
             return false;
@@ -1082,13 +1080,13 @@ class LlamaEngine final : public SimpleFamilyEngine {
         }
 
         if (!llama::build_llama_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err,
+        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/false, err,
                               /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false, g_.quant_bits, g_.quant_group_size)) {
+                              /*untied=*/false)) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err,
-                                  /*routed=*/false, g_.quant_bits, g_.quant_group_size)) {
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/false, err,
+                                  /*routed=*/false)) {
             return false;
         }
 
@@ -1104,6 +1102,7 @@ class LlamaEngine final : public SimpleFamilyEngine {
         // The logits leave the pool: the sampler reads a slot of its own, so
         // the tail writes there and nothing copies afterwards.
         ctx.arg_bind_ordinal(dag_.back().ordinal, (std::uint8_t)bind::Qmv::Out, logits_);
+        if (slab_ && !plan_segments(err)) return false;
         write_u32s(b_.io[int(IoSlot::AttnMaskStride)], {0u});
         if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
             std::memset(b_.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, 1);
@@ -1190,6 +1189,7 @@ class LlamaEngine final : public SimpleFamilyEngine {
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
+        if (!seg_end_.empty()) return fire_segmented(ctx, rows, head_rows, pre, post);
         return ctx.run_step([&](StepEncoder& se) {
             if (pre) pre(se);
             llama::encode_llama_step(se, dag_, g_, base_, psos_, /*ordinal_base=*/0, &mb_, rows,
@@ -1205,6 +1205,134 @@ class LlamaEngine final : public SimpleFamilyEngine {
     }
 
   private:
+    /// Where the step has to be cut, and what the host reads at each cut.
+    ///
+    /// A mixture layer's router runs INSIDE that layer, so the host cannot know
+    /// which experts the layer wants until part of the layer has already run.
+    /// That is why one cut per mixture layer is the minimum and why the cut is
+    /// where it is: immediately after `RouterTopK`, the first point at which
+    /// the answer exists and the last before anything reads the bank.
+    ///
+    /// Cuts are pushed out to the end of their concurrency run. A run is a set
+    /// of dispatches the encoder deliberately does NOT barrier between, and
+    /// splitting one across two command buffers would serialize exactly the
+    /// dispatches that were grouped to overlap.
+    bool plan_segments(std::string* err) {
+        seg_end_.clear();
+        moe_of_segment_.clear();
+        const std::vector<int> run_ends = llama::llama_run_ends(dag_);
+        // The mixture layers in the order they run, which is the order the slab
+        // indexes them in -- both walk the layer number upwards.
+        std::vector<int> moe_layers;
+        for (std::size_t i = 0; i < dag_.size(); ++i) {
+            if (dag_[i].kind != llama::Kind::RouterTopK) continue;
+            const auto cut = std::size_t(run_ends[i]) + 1;
+            if (!seg_end_.empty() && cut <= seg_end_.back()) {
+                if (err) *err = "llama expert slab: two routers in one concurrency run";
+                return false;
+            }
+            seg_end_.push_back(cut);
+            moe_layers.push_back(dag_[std::size_t(i)].layer);
+        }
+        if (moe_layers.size() != std::size_t(slab_->layers())) {
+            if (err) {
+                *err = "llama expert slab: " + std::to_string(moe_layers.size()) +
+                       " routed layers in the DAG against " + std::to_string(slab_->layers()) +
+                       " staged";
+            }
+            return false;
+        }
+        moe_of_segment_ = std::move(moe_layers);
+        seg_end_.push_back(dag_.size());  // the tail after the last mixture
+        // The routing decision, which the host has to read and rewrite. One
+        // value for the whole stack -- it is dead by the end of its layer -- so
+        // one pool slot serves every cut.
+        expert_ids_ = {};
+        for (const llama::Use& u : plan_.uses) {
+            if (!u.is_write || u.value != plan_.expert_ids_value) continue;
+            if (u.index < 0 || std::size_t(u.index) >= coloring_.per_dispatch.size()) continue;
+            for (const auto& sb : coloring_.per_dispatch[std::size_t(u.index)]) {
+                if (sb.bind_index != u.bind_index) continue;
+                if (sb.color < 0 || std::size_t(sb.color) >= b_.pool.size()) continue;
+                expert_ids_ = b_.pool[std::size_t(sb.color)];
+            }
+        }
+        if (!expert_ids_.valid() || expert_ids_.contents() == nullptr) {
+            if (err) *err = "llama expert slab: the routing decision is not host-readable";
+            return false;
+        }
+        // Every expert a single fire can route to must be resident AT ONCE:
+        // one dispatch reads them all, so there is no order in which a smaller
+        // cache could serve it. Refused here, with the number that would work,
+        // because the alternative is discovering it 40 layers into a decode --
+        // where the cache is right to refuse but nothing can be done about it.
+        //
+        // The bound is the mixture's arity or what the batch can reach,
+        // whichever is smaller. It is also why the slab never needs to be
+        // bigger than ONE layer's bank however many layers the model has,
+        // which is the whole reduction: 16.31 GB to 0.34 GB on Qwen3-30B.
+        const auto worst = std::uint32_t(std::min<std::int64_t>(
+            g_.n_experts, std::int64_t(max_rows_) * g_.experts_per_token));
+        if (slab_->num_slots() < worst) {
+            if (err) {
+                *err = "expert_slab_bytes is too small: a fire of " +
+                       std::to_string(max_rows_) + " rows can route to " +
+                       std::to_string(worst) + " distinct experts at once, which needs " +
+                       std::to_string(std::uint64_t(worst) * slab_->slot_bytes()) +
+                       " bytes, but the budget holds " + std::to_string(slab_->num_slots()) +
+                       " experts";
+            }
+            return false;
+        }
+        std::fprintf(stderr,
+                     "[pie-metal] experts paged through %u slots of %d, %.2f GB on the device\n",
+                     slab_->num_slots(), g_.n_experts * int(slab_->layers()),
+                     double(slab_->slab_bytes()) / 1e9);
+        return true;
+    }
+
+    /// One command buffer per stretch between routers, with the host paging in
+    /// what the router just asked for.
+    ///
+    /// The ids are rewritten IN PLACE from expert numbers to slot numbers. The
+    /// routed matvec reads `expert_ids[sel]` and multiplies by the row stride,
+    /// so a slot number in a shorter stack is the same instruction sequence
+    /// against different bytes -- which is why no kernel changed for any of
+    /// this.
+    StepTiming fire_segmented(RawMetalContext& ctx, int rows, int head_rows,
+                              const EncodeHook& pre, const EncodeHook& post) {
+        const std::size_t n = seg_end_.size();
+        std::vector<std::function<void(StepEncoder&)>> segs;
+        segs.reserve(n);
+        std::size_t begin = 0;
+        for (std::size_t k = 0; k < n; ++k) {
+            const std::size_t end = seg_end_[k];
+            segs.push_back([this, rows, head_rows, begin, end, k, n, &pre, &post](StepEncoder& se) {
+                if (k == 0 && pre) pre(se);
+                llama::encode_llama_step(se, dag_, g_, base_, psos_, /*ordinal_base=*/0, &mb_,
+                                         rows, head_rows, begin, end);
+                if (k + 1 == n && post) post(se);
+            });
+            begin = end;
+        }
+        const std::size_t ids = std::size_t(rows) * std::size_t(g_.experts_per_token);
+        return ctx.run_segments(segs, [this, ids](std::size_t k) {
+            // Give the previous layer's pins back first: its command buffer has
+            // completed, which is exactly the condition that makes its slots
+            // reusable. Doing it after the page-in would hold two layers at
+            // once and need twice the budget.
+            slab_->end_batch();
+            if (k >= moe_of_segment_.size()) return;  // the tail owns no experts
+            auto* p = static_cast<std::int32_t*>(expert_ids_.contents());
+            const auto layer = std::uint32_t(k);
+            for (std::size_t i = 0; i < ids; ++i) {
+                const std::int32_t e = p[i];
+                if (e < 0 || e >= g_.n_experts) continue;  // a padded slot
+                p[i] = std::int32_t(slab_->ensure_resident(layer, std::uint32_t(e)));
+            }
+        });
+    }
+
     llama::LlamaGeometry g_{};
     int max_ctx_ = 0;
     std::vector<llama::Dispatch> dag_{};
@@ -1216,12 +1344,23 @@ class LlamaEngine final : public SimpleFamilyEngine {
     MultiBatchPsos mb_{};
     std::vector<llama::KvPages> kv_{};
     /// Keeps the streamed weights' mapping alive; see the gpt-oss engine.
-    std::shared_ptr<void> stream_pack_{};
+    std::shared_ptr<void> weight_mapping_{};
     int max_rows_ = 1;
     int max_sampled_ = 1;
     int bound_rows_ = 0;
     int bound_head_rows_ = 0;
     SlotHandle logits_{};
+    /// The routed experts' paging cache, when a budget asked for one.
+    std::shared_ptr<ExpertSlab> slab_{};
+    /// Where the routing decision lands, so the host can rewrite it.
+    SlotHandle expert_ids_{};
+    /// One past the last dispatch of each segment. Empty means the step is not
+    /// cut at all, which covers both the ordinary resident model and a slab
+    /// large enough to hold everything.
+    std::vector<std::size_t> seg_end_{};
+    /// Which mixture layer each segment's cut belongs to. Shorter than
+    /// `seg_end_` by one: the tail after the last mixture pages nothing.
+    std::vector<int> moe_of_segment_{};
 };
 
 }  // namespace
@@ -1266,14 +1405,29 @@ std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
 
     // A ROUTED expert bank, and nothing else. One pattern, no family.
     //
-    // What makes streaming a bank worth doing is that the bank is read
-    // SPARSELY. A token reads 8 experts of 128 per layer, so an eighth of it
-    // faults in and the kernel evicts the rest: measured at 16.31 GB out of
+    // What this buys is a LOAD that maps instead of copying: 16.31 GB out of
     // the heap on Qwen3-30B-A3B, load 33.2 s -> 0.67 s, prefill unchanged and
-    // decode down 3%. A DENSE FFN is read whole every token, so paging it
-    // saves no traffic at all -- the only thing it buys is that a model larger
-    // than RAM runs slowly instead of failing to load, which is a different
-    // decision under a switch that does not name it.
+    // decode down 3%. A dense FFN would map just as well, but it is read whole
+    // every token, so mapping it trades a copy for nothing else, and this
+    // switch is about the banks where the trade is one-sided.
+    //
+    // What it does NOT buy is running a model larger than the machine, and it
+    // is worth being exact about why, because this comment used to claim the
+    // opposite -- that a token touching 8 experts of 128 faults an eighth of
+    // the bank in and the kernel evicts the rest. Nothing is evicted. The
+    // mapping goes into the residency set and `requestResidency` wires every
+    // page of it, whether or not a kernel ever reads it. Measured with
+    // `vm_stat` across a streamed Qwen3-30B-A3B run: wired memory goes from
+    // 1.5 GB at rest to 18.4 GB while the model is live -- the 16.31 GB pack
+    // plus the 0.87 GB heap, all of it, for the whole run -- and returns to
+    // 1.4 GB when it exits.
+    //
+    // That is the hardware, not this driver: an Apple Silicon GPU has no
+    // demand paging, and a kernel that touched a page the residency set had
+    // let go would abort its command buffer rather than fault it back. So a
+    // bank larger than the working set cannot be mapped at all; it has to be
+    // paged through a bounded slab that stays wired while its CONTENTS change,
+    // which is a different mechanism from this one and not yet built here.
     //
     // This predicate used to stream the dense FFN too, for the families that
     // have one. That was wrong twice over. It made one switch mean two trades,

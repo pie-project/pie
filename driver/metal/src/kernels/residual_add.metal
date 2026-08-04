@@ -25,6 +25,4 @@ template <typename T>
   [[kernel]] void residual_add<itype>(                            \
       const device itype*, const device itype*, device itype*, const constant int&, uint);
 
-instantiate_residual_add(float32, float)
-instantiate_residual_add(float16, half)
 instantiate_residual_add(bfloat16, bfloat)

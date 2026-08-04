@@ -170,6 +170,16 @@ class StepEncoder {
 
   private:
     friend class RawMetalContext;
+    // The encode body is shared by the ordered and unordered runners, and a
+    // shared body has to be a free function -- neither runner can host it
+    // without the other calling across a class boundary. This is that function,
+    // named here only so it can be trusted with the constructor.
+    // Both take and return their Metal objects as `void*`, like every other
+    // Obj-C handle this header carries, because the header is included by
+    // plain C++ translation units that cannot name an `id<>`.
+    friend void* encode_one_command_buffer(
+        void* ctx_impl, int ab,
+        const std::function<void(StepEncoder&)>& encode_fn);
     explicit StepEncoder(void* impl) : impl_(impl) {}
     void* impl_;  // borrowed encoder state
 };
@@ -396,6 +406,28 @@ class RawMetalContext {
     // pass splits into parallel chunks that would otherwise pay N submits.
     StepTiming run_steps(const std::vector<std::function<void(StepEncoder&)>>& encode_fns,
                          int ab = 0);
+    // Encode and run N segments IN ORDER, with the host running between them.
+    //
+    // `between(i)` runs after segment `i` has completed on the GPU and before
+    // segment `i + 1` is encoded, so it may read what the segment computed and
+    // may change what the next one reads. It runs after EVERY segment, the last
+    // one included, because a caller that pinned something per segment needs
+    // somewhere to give the last pin back. That is the whole reason this exists
+    // and the one thing neither `run_step` nor `run_steps` can do: both commit
+    // everything before waiting for anything, which is right when the host has
+    // nothing to add and impossible when it does.
+    //
+    // The caller pays one submit and one completion wait per segment. Splitting
+    // a step that does not need the host is therefore a straight loss; this is
+    // for the case where the host holds something the GPU cannot compute for
+    // itself -- which, for expert paging, is which weights exist at all.
+    //
+    // Distinct from `run_steps` in ordering as well as in the callback: those
+    // command buffers race each other on purpose, these are serialized by the
+    // wait between them.
+    StepTiming run_segments(const std::vector<std::function<void(StepEncoder&)>>& encode_fns,
+                            const std::function<void(std::size_t)>& between,
+                            int ab = 0);
     // Most recent Metal 4 commit feedback (GPU-measured timing, GPU-side error).
     // Delivered asynchronously, so it may lag the last committed step.
     GpuCommitFeedback last_commit_feedback() const;

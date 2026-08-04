@@ -13,8 +13,7 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         "sdpa_vector_decode_swa_bfloat16_d_" + std::to_string(g.global_head_dim);
     const std::string dir =
         kernels_dir.empty() || kernels_dir.back() == '/' ? kernels_dir : kernels_dir + "/";
-    const std::string q = "_bfloat16_gs_" + std::to_string(g.quant_group_size) + "_b_" +
-                          std::to_string(g.quant_bits);
+    const std::string q = g.quant.kernel_suffix();
     struct Spec {
         const char* file;
         std::string fn;

@@ -40,8 +40,6 @@ template <typename T>
       const device itype*, const device itype*, device itype*,         \
       constant GegluParams&, uint);
 
-instantiate_geglu_tanh(float32, float)
-instantiate_geglu_tanh(float16, half)
 instantiate_geglu_tanh(bfloat16, bfloat)
 
 // ── Strided variant: the operands are rows of DIFFERENT pitches ──────────────
@@ -87,5 +85,4 @@ template <typename T>
       const device itype*, const device itype*, device itype*,     \
       constant GegluStridedParams&, uint2);
 
-instantiate_geglu_strided(float32, float)
 instantiate_geglu_strided(bfloat16, bfloat)

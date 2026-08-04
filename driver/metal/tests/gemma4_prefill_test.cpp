@@ -499,8 +499,11 @@ int main(int argc, char** argv) {
     DecodeStepPsos base;
     MultiBatchPsos mb;
     std::string berr;
-    if (load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/true, &berr) &&
-        load_multibatch_psos(*ctx, kernels_dir, mb, /*with_d512=*/false, &berr)) {
+    // The gemma4 checkpoints these tests read are affine b4/g64; this test is
+    // about pipeline resolution, not the quantization axis.
+    const AffineFormat q{/*bits=*/4, /*group=*/64};
+    if (load_decode_psos(*ctx, kernels_dir, base, q, /*with_argmax=*/true, &berr) &&
+        load_multibatch_psos(*ctx, kernels_dir, mb, q, /*with_d512=*/false, &berr)) {
         the_paged_kernel_agrees_with_the_contiguous_one(*ctx, psos, base, mb, 512, "512");
         the_paged_kernel_agrees_with_the_contiguous_one(*ctx, psos, base, mb, 0, "0 (full)");
     } else {

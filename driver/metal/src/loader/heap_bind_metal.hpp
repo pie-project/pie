@@ -12,6 +12,7 @@
 
 #include "decode_abi.hpp"
 #include "heap_layout.hpp"      // HeapPlan
+#include "loader/expert_slab.hpp"
 #include "mtl4_context.hpp"     // RawMetalContext, SlotHandle
 #include "pie_loader/plan.hpp"
 
@@ -27,10 +28,12 @@ struct Dispatch;  // beta: decode_step.hpp
 struct BoundDecode {
     HeapPlan plan;
     SlotHandle weights_region;
-    /// Keeps any streamed weights' mapping alive. It MUST outlive every slot in
-    /// `weights`: they point into it, and unmapping it under them reads as
-    /// weights of exactly zero.
-    std::shared_ptr<void> stream_pack;
+    /// Keeps alive whatever the weight slots point into when they point
+    /// outside the heap -- the stream pack, or the checkpoint's own mapping.
+    /// It MUST outlive every slot in `weights`: unmapping it under them reads
+    /// as weights of exactly zero, which is a model that runs and answers
+    /// nothing rather than a model that fails.
+    std::shared_ptr<void> weight_mapping;
 
     // load-once weights, keyed by HF tensor name (tied lm_head appears once).
     std::unordered_map<std::string, SlotHandle> weights;
@@ -65,16 +68,22 @@ struct BoundDecode {
 struct StagedWeights {
     /// How many bytes were bound over a pack instead of copied into the heap.
     std::uint64_t streamed_bytes = 0;
-    /// Keeps that pack's mapping alive. It MUST outlive every slot in
-    /// `weights`: they point into it, and unmapping it under them reads as
-    /// weights of exactly zero -- a model that runs and answers nothing.
-    std::shared_ptr<void> stream_pack;
+    /// Keeps alive whatever the weight slots point into when they point
+    /// outside the heap. Two things can be on the other end and they are the
+    /// same obligation: the stream pack, or -- when the checkpoint already
+    /// places its tensors where a device pointer may point -- the
+    /// `CheckpointSource` whose mmap the slots slice directly.
+    std::shared_ptr<void> weight_mapping;
     SlotHandle weights_region{};
     std::unordered_map<std::string, SlotHandle> weights;
+    /// The routed experts' paging cache, when one was asked for. Null
+    /// otherwise, and null is the ordinary case: a model that fits is bound
+    /// whole and never calls back.
+    std::shared_ptr<ExpertSlab> slab;
 };
 StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
-    const pie_loader::CheckpointSource& view,
+    std::shared_ptr<pie_loader::CheckpointSource> view,
     const pie_loader::LoadPlan& load,
     std::size_t weights_bytes);
 
@@ -84,8 +93,14 @@ StagedWeights stage_plan_weights(
 /// BEFORE the context exists: the heap has to be created without them, and a
 /// heap sized for weights that then also get mapped is the footprint doubled
 /// rather than halved.
+/// `slab_paging` says the routed experts will be PAGED rather than mapped.
+/// Mapping subsumes streaming -- when every weight can be bound where it lies
+/// there is no pack to carve out -- but paging does not: it turns mapping off,
+/// so only the routed banks leave the heap and the dense weights are copied
+/// into it as they would be from a checkpoint nothing could map.
 std::uint64_t streamable_plan_bytes(const pie_loader::LoadPlan& load,
-                                    const std::function<bool(const std::string&)>& streams);
+                                    const std::function<bool(const std::string&)>& streams,
+                                    bool slab_paging = false);
 
 /// Stage with weight STREAMING for the tensors `streams` names.
 ///
@@ -137,14 +152,44 @@ WeightBytes weight_bytes(const std::unordered_map<std::string, SlotHandle>& weig
 
 StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
-    const pie_loader::CheckpointSource& view,
+    std::shared_ptr<pie_loader::CheckpointSource> view,
     const pie_loader::LoadPlan& load,
     std::size_t weights_bytes,
     const std::function<bool(const std::string&)>& streams);
 
+/// Page the routed experts through a bounded slab instead of binding the bank.
+///
+/// This is the only arrangement under which a model can exceed the machine.
+/// Mapping does not achieve it -- `requestResidency` wires every page of a
+/// mapping, and an Apple Silicon GPU has no demand paging to make it lazy --
+/// so the routed bytes the GPU can reach must be a fixed region whose contents
+/// the host swaps. Asking for this therefore turns mapping OFF: the dense
+/// weights are copied into the heap as they would be from a checkpoint that
+/// could not be mapped, and only the mmap's host pointers are kept, as the
+/// source the slab copies from.
+///
+/// `budget_bytes` is what the slab may occupy in total. Slots are
+/// `budget_bytes / slot_bytes`, floored, and at least one -- a budget below a
+/// single expert is refused rather than rounded up, because a caller in that
+/// position has not asked for a small cache.
+struct ExpertSlabRequest {
+    /// The mixture's arity. Each streamed bank is this many equal bands.
+    int n_experts = 0;
+    std::uint64_t budget_bytes = 0;
+    bool valid() const { return n_experts > 1 && budget_bytes > 0; }
+};
+
+StagedWeights stage_plan_weights(
+    RawMetalContext& ctx,
+    std::shared_ptr<pie_loader::CheckpointSource> view,
+    const pie_loader::LoadPlan& load,
+    std::size_t weights_bytes,
+    const std::function<bool(const std::string&)>& streams,
+    const ExpertSlabRequest& slab);
+
 BoundDecode stage_decode_storage(
     RawMetalContext& ctx,
-    const pie_loader::CheckpointSource& view,
+    std::shared_ptr<pie_loader::CheckpointSource> view,
     const pie_loader::LoadPlan& load_plan,
     const DecodeGeometry& g,
     const HeapPlan& heap_plan,

@@ -98,9 +98,17 @@ int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows);
 std::vector<int> llama_run_ends(const std::vector<Dispatch>& dag);
 
 /// Walk the DAG with a real encoder.
+///
+/// `[begin, end)` bounds which dispatches are encoded, so a caller that must
+/// run the host between two parts of the step can put each part in its own
+/// command buffer. `end` past the DAG means the rest of it. A cut must fall on
+/// a concurrency-run boundary -- `llama_run_ends` says where those are -- since
+/// a run split across two command buffers would lose the very concurrency it
+/// was grouped for.
 void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                        const LlamaGeometry& g, const DecodeStepPsos& base, const LlamaPsos& ll,
                        int ordinal_base = 0, const MultiBatchPsos* mb = nullptr, int rows = 1,
-                       int head_rows = 1);
+                       int head_rows = 1, std::size_t begin = 0,
+                       std::size_t end = ~std::size_t(0));
 
 }  // namespace pie::metal::llama

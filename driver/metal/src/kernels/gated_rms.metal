@@ -130,8 +130,6 @@ template <typename T>
       const device itype*, const device itype*, const device itype*, \
       device itype*, constant GatedRmsParams&, constant int&, uint3, uint3, uint3, uint, uint);
 
-instantiate_gated_rms_strided(float32, float)
-instantiate_gated_rms_strided(float16, half)
 instantiate_gated_rms_strided(bfloat16, bfloat)
 
 #define instantiate_gated_rms(name, itype)                        \
@@ -140,6 +138,4 @@ instantiate_gated_rms_strided(bfloat16, bfloat)
       const device itype*, const device itype*, const device itype*, \
       device itype*, constant GatedRmsParams&, uint3, uint3, uint3, uint, uint);
 
-instantiate_gated_rms(float32, float)
-instantiate_gated_rms(float16, half)
 instantiate_gated_rms(bfloat16, bfloat)

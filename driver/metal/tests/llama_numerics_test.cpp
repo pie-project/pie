@@ -848,11 +848,12 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     MultiBatchPsos mb;
     std::string err;
     if (!build_llama_psos(ctx, kernels_dir, g, ll, &err) ||
-        !load_decode_psos(ctx, kernels_dir, base, /*with_argmax=*/false, &err)) {
+        !load_decode_psos(ctx, kernels_dir, base, g.quant, /*with_argmax=*/false, &err)) {
         expect(false, std::string(who) + ": pipelines compiled (" + err + ")");
         return;
     }
-    if (paged && !load_multibatch_psos(ctx, kernels_dir, mb, /*with_d512=*/false, &err)) {
+    if (paged && !load_multibatch_psos(ctx, kernels_dir, mb, g.quant, /*with_d512=*/false,
+                                       &err)) {
         expect(false, std::string(who) + ": multi-batch pipelines compiled (" + err + ")");
         return;
     }

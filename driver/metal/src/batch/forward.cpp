@@ -777,13 +777,103 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // a heap sized for weights that are then ALSO mapped is the footprint
     // doubled rather than halved, and on a machine where the model only just
     // fits that is the difference between running and reading zeros.
-    const auto streams = SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts);
+    // A budget for the routed experts changes BOTH numbers below, in opposite
+    // directions, and that is the whole shape of the feature. The bank leaves
+    // the heap as it does when streamed -- but a slab of the budget's size
+    // joins it, and unlike a mapping the bank never becomes resident at all.
+    // So the ask falls from the model to the dense weights plus the budget,
+    // which is what lets a model bigger than the GPU be admitted.
+    const bool slab = cfg.expert_slab_bytes > 0;
+    // Asked BEFORE the sizing, because the sizing below already believes the
+    // budget: it takes the paging rule for what must be resident on the
+    // strength of this field alone. A family that cannot page then reached the
+    // fit check having had its bank subtracted from the ask and the budget
+    // added to the heap, and refused with "this model does not fit" -- true,
+    // but about the wrong thing, and it never reached the engine that knew the
+    // real reason. One site, before either number is computed, so the message
+    // is the reason.
+    if (slab) {
+        const char* why = nullptr;
+        switch (family) {
+        case model::ModelFamily::Llama:
+            break;
+        case model::ModelFamily::GptOss:
+            // It has a routed bank, but every expert also carries a BIAS that
+            // stays resident and is indexed by the very buffer paging
+            // renumbers into slot space -- so it would read one expert's bias
+            // beside another's weights. Fluent wrong tokens, not a failure.
+            why = "gpt-oss: expert_slab_bytes is not supported -- its per-expert bias is "
+                  "indexed by the routing decision that paging renumbers";
+            break;
+        case model::ModelFamily::Gemma4:
+            // Nothing to page: dense, no routed bank at all.
+            why = "gemma4: expert_slab_bytes has nothing to page -- this family is dense "
+                  "and has no routed expert bank";
+            break;
+        default:
+            why = "expert_slab_bytes is only supported for the llama family";
+            break;
+        }
+        if (why) {
+            if (err) *err = why;
+            return false;
+        }
+    }
+    const auto streams =
+        SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts || slab);
+    // Not gated on `streams`: a checkpoint that places its tensors where a
+    // device pointer may point has EVERY weight bound over its own mapping,
+    // whether or not anything asked for expert streaming.
+    //
+    // With a slab the mapping is off, so only the routed banks leave the heap.
     const std::size_t streamed =
-        streams ? std::size_t(streamable_plan_bytes(load_plan, streams)) : 0;
-    const std::size_t heap_bytes = (weights > streamed ? weights - streamed : weights) +
+        std::size_t(streamable_plan_bytes(load_plan, streams, slab));
+    // Saturating, not `>` -- when EVERY weight is bound where it lies the two
+    // are equal, and a guard that fell back to the full `weights` on equality
+    // is the one case that matters most: it re-reserved the entire model
+    // alongside its own mapping and the first command buffer came back out of
+    // memory.
+    const std::size_t heap_bytes = (weights >= streamed ? weights - streamed : 0) +
+                                   (slab ? std::size_t(cfg.expert_slab_bytes) : 0) +
                                    SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
-    // `create` here takes no elastic budget, so the whole ask is the heap.
-    if (!fits_on_this_gpu(heap_bytes, 0, weights, err)) return false;
+    // What to ALLOCATE and what must be RESIDENT are two numbers, and this
+    // refusal is about the second. Weights bound where they lie leave the heap
+    // but not the working set -- `wrap_host_memory` puts them in the residency
+    // set and asks for them, and paging in Qwen3-30B's mapping costs 9.3 s of
+    // real I/O, which is not what an evictable byte costs. Subtracting them
+    // from the ask made a 17.17 GB model report that it needed 0.326 GiB, so
+    // the one guard meant to say "this will not fit" said nothing at all.
+    //
+    // `create` here takes no elastic budget, so the whole ask is the heap plus
+    // whatever was bound outside it.
+    //
+    // A slab makes `streamed` mean something else: those bytes are read from an
+    // mmap the GPU never sees, so they are neither allocated nor resident, and
+    // adding them here would refuse exactly the models this exists to run.
+    if (!fits_on_this_gpu(slab ? heap_bytes : heap_bytes + streamed, 0,
+                          slab ? heap_bytes : weights, err)) {
+        return false;
+    }
+    // Two marks, because between them lies the answer to "why is loading slow"
+    // and the two halves have completely different causes. Everything up to
+    // `staged` is the driver's own work -- copying, dequantizing, allocating --
+    // and `PIE_METAL_LOAD_TRACE`'s `load:` line breaks it down further. What
+    // follows is `make_resident`, which is the kernel paging the weights in,
+    // and no amount of driver work makes it cheaper.
+    //
+    // Binding a checkpoint where it lies moves the whole cost across that line:
+    // Qwen3-30B off safetensors is 31.3 s of copying and 2.2 s of residency,
+    // and off the same weights in a `.zt` it is 1 ms and 9.3 s. The second
+    // number rose because the pages are now faulted from the file instead of
+    // from a heap that the copy had already warmed -- and the total still fell
+    // from 33.8 s to 9.6 s, because the file is read once instead of twice.
+    const auto _t0 = std::chrono::steady_clock::now();
+    const auto _mark = [&](const char* what) {
+        if (std::getenv("PIE_METAL_LOAD_TRACE") == nullptr) return;
+        std::fprintf(stderr, "[pie-metal] setup: %s %.0f ms\n", what,
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - _t0).count());
+    };
     ctx_ = RawMetalContext::create(heap_bytes);
     if (!ctx_) {
         if (err) *err = "RawMetalContext::create failed";
@@ -791,6 +881,7 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     }
     simple_ = SimpleFamilyEngine::create(family, *ctx_, kernels_dir, cfg, load_plan, max_ctx_,
                                          err);
+    _mark("staged");
     if (!simple_) return false;
 
     // The sampler reads through the same staging path qwen3.5 uses, so the
@@ -837,6 +928,7 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     kv_pool_.layers.clear();
 
     ctx_->make_resident();
+    _mark("resident");
     return true;
 }
 
@@ -851,7 +943,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // The mmap is transient: the LoadPlan copies each finalized tensor
     // once into the resident weights region.
     const auto storage = load_plan.view();
-    pie_loader::CheckpointSource view(storage);
+    auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
     plan_ = plan_heap(
         g_,
         storage.memory.persistent_bytes,
@@ -892,10 +984,11 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // footprint doubled rather than halved, which on a machine where the model
     // only just fits is the difference between running and reading zeros.
     const auto streams = SimpleFamilyEngine::stream_predicate(stream_routed_experts);
-    const size_t streamed =
-        streams ? size_t(streamable_plan_bytes(load_plan, streams)) : 0;
+    // Not gated on `streams`; see `setup_simple`.
+    const size_t streamed = size_t(streamable_plan_bytes(load_plan, streams));
+    // Saturating; see `setup_simple` on why equality is the case that matters.
     const size_t resident_weights =
-        plan_.weights_bytes > streamed ? plan_.weights_bytes - streamed : plan_.weights_bytes;
+        plan_.weights_bytes >= streamed ? plan_.weights_bytes - streamed : 0;
     const size_t heap_bytes =
         resident_weights + plan_.io_bytes + plan_.mb_io_bytes +
         consts_budget + (32u << 20);
@@ -903,7 +996,10 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
         plan_.kv_pool_bytes + (taps ? 0u : scratch_pool_bytes);
 
-    if (!fits_on_this_gpu(heap_bytes, elastic_budget, resident_weights, err)) return false;
+    // Heap plus mapping: see `setup_simple`. What leaves the heap does not
+    // leave the working set.
+    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err))
+        return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
     if (!ctx_) {
@@ -912,7 +1008,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     }
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal. ──
-    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_, streams);
+    b_ = stage_decode_storage(*ctx_, std::move(view), load_plan, g_, plan_, streams);
     bind_decode_dag(*ctx_, b_, dag_, g_, gdn_prep_);
 
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──
@@ -945,17 +1041,16 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
 
     // ── Compile the kernel PSOs. ──
     std::string load_err;
-    if (!load_decode_psos(*ctx_, kernels_dir, psos_, /*with_argmax=*/false, &load_err,
+    if (!load_decode_psos(*ctx_, kernels_dir, psos_, g_.quant, /*with_argmax=*/false, &load_err,
                           fuse_residual_, gdn_prep_, g_.is_moe(),
-                          /*untied=*/!g_.tied_embeddings, g_.quant_bits,
-                          g_.quant_group_size)) {
+                          /*untied=*/!g_.tied_embeddings)) {
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
     }
     if (g_.paged_kv_enabled &&
-        !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, /*with_d512=*/false, &load_err,
-                              g_.is_moe(), g_.quant_bits, g_.quant_group_size)) {
+        !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, g_.quant, /*with_d512=*/false,
+                              &load_err, g_.is_moe())) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -2402,8 +2497,8 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // geometry from its own facts.
     if (family == model::ModelFamily::Qwen35) {
         std::string gerr;
-        if (cfg.quant_bits != 0) geom.quant_bits = cfg.quant_bits;
-        if (cfg.quant_group_size != 0) geom.quant_group_size = cfg.quant_group_size;
+        if (cfg.quant_bits != 0) geom.quant.bits = cfg.quant_bits;
+        if (cfg.quant_group_size != 0) geom.quant.group = cfg.quant_group_size;
         if (!geometry_from_facts(cfg.qwen35, geom, &gerr)) {
             if (err != nullptr) *err = gerr;
             return false;

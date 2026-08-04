@@ -53,8 +53,6 @@ template <typename T>
       device itype*, const device int*, const constant float&,   \
       const constant float&, const constant int&, uint2, uint2);
 
-instantiate_rope_neox(float32, float)
-instantiate_rope_neox(float16, half)
 instantiate_rope_neox(bfloat16, bfloat)
 
 // ── M>1 batched NEOX RoPE (multi-batch lane). ────────────────────────────────
@@ -100,8 +98,6 @@ template <typename T>
       device itype*, const device int*, const constant float&,   \
       const constant float&, const constant int&, uint3, uint3);
 
-instantiate_rope_neox_mb(float32, float)
-instantiate_rope_neox_mb(float16, half)
 instantiate_rope_neox_mb(bfloat16, bfloat)
 
 // ── Proportional (gemma4) partial NEOX RoPE ──────────────────────────────────
@@ -151,8 +147,6 @@ template <typename T>
       device itype*, const device int*, const constant float&,   \
       const constant float&, const constant int&, uint2);
 
-instantiate_rope_prop(float32, float)
-instantiate_rope_prop(float16, half)
 instantiate_rope_prop(bfloat16, bfloat)
 
 // M>1 counterpart: token m rotates by its own position[m]. x is token-major
@@ -192,8 +186,6 @@ template <typename T>
       device itype*, const device int*, const constant float&,   \
       const constant float&, const constant int&, uint3, uint3);
 
-instantiate_rope_prop_mb(float32, float)
-instantiate_rope_prop_mb(float16, half)
 instantiate_rope_prop_mb(bfloat16, bfloat)
 
 // ── RoPE from a supplied frequency table (gpt-oss / YaRN) ───────────────────
@@ -283,6 +275,4 @@ template <typename T>
       const device float*, const constant int&, const constant float&, \
       const constant int&, uint3, uint3);
 
-instantiate_rope_freqs(float32, float)
-instantiate_rope_freqs(float16, half)
 instantiate_rope_freqs(bfloat16, bfloat)

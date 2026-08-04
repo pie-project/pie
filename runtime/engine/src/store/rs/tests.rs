@@ -377,13 +377,7 @@ fn a_fold_may_not_reach_past_the_tokens_that_exist() {
     let ws = s.create_working_set(geom());
     s.alloc_buffer(ws, 2).unwrap();
     let prepared = s
-        .prepare_general(
-            ws,
-            false,
-            None,
-            Some((0, 4)),
-            RsBufferIntent::Write,
-        )
+        .prepare_general(ws, false, None, Some((0, 4)), RsBufferIntent::Write)
         .unwrap();
     settled(&mut s, prepared);
     assert_eq!(s.buffer_tokens(ws), Ok(4));
@@ -577,7 +571,11 @@ fn reserving_a_buffer_page_does_not_buffer_a_token() {
     let mut s = store();
     let ws = s.create_working_set(geom());
 
-    assert_eq!(s.buffer_tokens(ws).unwrap(), 0, "a new working set is empty");
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "a new working set is empty"
+    );
 
     s.alloc_buffer(ws, 2).unwrap();
     assert_eq!(s.buffer_size(ws).unwrap(), 2, "two pages reserved");
@@ -598,7 +596,11 @@ fn reserving_a_buffer_page_does_not_buffer_a_token() {
     // Rewriting the same span must not double-count.
     let prepared = s.prepare_write(ws, false, Some((0, 3))).unwrap();
     settled(&mut s, prepared);
-    assert_eq!(s.buffer_tokens(ws).unwrap(), 3, "a rewrite is not an append");
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        3,
+        "a rewrite is not an append"
+    );
 
     // A disjoint append advances the fill to its far edge.
     let prepared = s.prepare_write(ws, false, Some((4, 4))).unwrap();
@@ -734,7 +736,11 @@ fn folding_a_whole_page_rebases_the_head() {
 
     let prepared = s.prepare_fold(ws, 6).unwrap();
     settled(&mut s, prepared);
-    assert_eq!(s.buffer_size(ws).unwrap(), 1, "page 0 fully covered, dropped");
+    assert_eq!(
+        s.buffer_size(ws).unwrap(),
+        1,
+        "page 0 fully covered, dropped"
+    );
     assert_eq!(
         s.buffer_head(ws).unwrap(),
         2,
@@ -782,7 +788,8 @@ fn emptying_the_buffer_rebases_the_head_so_the_next_window_starts_at_zero() {
         let prepared = s.prepare_fold(ws, 2).unwrap();
         settled(&mut s, prepared);
         let size = s.buffer_size(ws).unwrap();
-        s.free_buffer(ws, &(0..size).collect::<Vec<_>>(), 0).unwrap();
+        s.free_buffer(ws, &(0..size).collect::<Vec<_>>(), 0)
+            .unwrap();
         assert_eq!(
             s.buffer_head(ws).unwrap(),
             0,

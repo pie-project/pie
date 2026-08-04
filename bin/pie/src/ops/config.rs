@@ -1,7 +1,7 @@
 //! `pie config { init | show | set }` — manage the user's config TOML.
 //!
 //! Mirrors `pie/src/pie_cli/config.py`. The dot-path setter
-//! (`pie config set model.hf_repo Qwen/Qwen3-1.7B`) walks nested
+//! (`pie config set model.model Qwen/Qwen3-1.7B`) walks nested
 //! TOML tables, matching Python's behavior.
 
 use std::io::IsTerminal;
@@ -33,9 +33,9 @@ pub enum ConfigCmd {
         path: Option<PathBuf>,
     },
 
-    /// Set a config value by dot-path (e.g. `model.hf_repo`).
+    /// Set a config value by dot-path (e.g. `model.model`).
     Set {
-        /// Dot-path key (e.g. `server.port`, `model.hf_repo`).
+        /// Dot-path key (e.g. `server.port`, `model.model`).
         key: String,
         /// Value to set. Parsed as bool / int / float / comma-list / str
         /// in that order.
@@ -220,7 +220,16 @@ fn set(key: String, value: String, path: Option<PathBuf>) -> Result<()> {
     crate::derive::derive_standalone(&serialized).context("validating updated config")?;
     std::fs::write(&cfg_path, serialized).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
 
-    println!("✓ Set {key} = {}", display_value(&parsed));
+    // Report the key that was actually written, which a renamed one is not.
+    let written = normalize_key(&key);
+    if written == key {
+        println!("✓ Set {key} = {}", display_value(&parsed));
+    } else {
+        println!(
+            "✓ Set {written} = {} ({key} was renamed)",
+            display_value(&parsed)
+        );
+    }
     Ok(())
 }
 
@@ -259,9 +268,23 @@ fn display_value(v: &toml::Value) -> String {
     }
 }
 
+/// Keys that were renamed, and what they are now.
+///
+/// The setter writes whatever key string it is handed, so without this a
+/// `pie config set model.hf_repo …` on a config that already uses the new
+/// spelling would leave *both* in the file — and `ModelConfig` accepts
+/// `hf_repo` only as an alias for `model`, so serde rejects a document
+/// carrying the two as a duplicate field. Normalizing here makes a config
+/// converge on one spelling however it is edited.
+/// Matched against the *end* of a dot-path, because the same table is reached
+/// as `model.hf_repo` in a worker config and `worker.model.hf_repo` in a
+/// standalone one.
+const RENAMED_KEYS: [(&str, &str); 1] = [("model.hf_repo", "model.model")];
+
 /// Walk a dot-path into the TOML tree, creating intermediate tables
 /// as needed. Mirrors `pie_cli/config.py::_set_nested`.
 fn set_nested(root: &mut toml::Value, key: &str, value: toml::Value) -> Result<()> {
+    let key = normalize_key(key);
     let parts: Vec<&str> = key.split('.').collect();
     if parts.is_empty() {
         bail!("empty key");
@@ -279,7 +302,41 @@ fn set_nested(root: &mut toml::Value, key: &str, value: toml::Value) -> Result<(
         .as_table_mut()
         .ok_or_else(|| anyhow!("{} is not a table", parts.join(".")))?;
     table.insert(last.to_string(), value);
+
+    // Having written the current spelling, drop the superseded one from the
+    // same table. `ModelConfig` takes the old name only as an alias, so a
+    // document carrying both is a duplicate field rather than a preference —
+    // and this is the one place that can notice.
+    if parts.len() >= 2 {
+        for (old, new) in RENAMED_KEYS {
+            let (old_table, stale) = old.rsplit_once('.').expect("renamed keys are dotted");
+            let (_, current) = new.rsplit_once('.').expect("renamed keys are dotted");
+            if last == current && parts[parts.len() - 2] == old_table {
+                table.remove(stale);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Rewrites a renamed dot-path to its current spelling, matching on the tail
+/// so both the worker and standalone shapes are covered.
+///
+/// Public spellings outlive the code that reads them: someone has
+/// `pie config set model.hf_repo …` in a script, and the rename is pie's
+/// problem rather than theirs.
+pub(crate) fn normalize_key(key: &str) -> String {
+    for (old, new) in RENAMED_KEYS {
+        if key == old {
+            return new.to_string();
+        }
+        if let Some(prefix) = key.strip_suffix(old) {
+            if prefix.ends_with('.') {
+                return format!("{prefix}{new}");
+            }
+        }
+    }
+    key.to_string()
 }
 
 fn step<'a>(
@@ -352,14 +409,50 @@ hf_repo = "Qwen/Qwen3-0.6B"
         .unwrap();
         set_nested(
             &mut t,
-            "model.hf_repo",
+            "model.model",
             toml::Value::String("meta-llama/Llama-3.2-1B".to_string()),
         )
         .unwrap();
         assert_eq!(
-            t["model"]["hf_repo"].as_str().unwrap(),
+            t["model"]["model"].as_str().unwrap(),
             "meta-llama/Llama-3.2-1B"
         );
+        // The old spelling is removed rather than left beside the new one:
+        // `ModelConfig` takes `hf_repo` as an alias for `model`, and a document
+        // carrying both is a duplicate field, not a preference.
+        assert!(t["model"].get("hf_repo").is_none());
+    }
+
+    /// The renamed key still works from the command line, and lands on the new
+    /// spelling — in both config shapes. Someone with
+    /// `pie config set model.hf_repo …` in a script should not have to learn
+    /// about the rename to keep working.
+    #[test]
+    fn the_old_model_key_sets_the_new_one() {
+        for (prefix, table) in [("", "model"), ("worker.", "worker")] {
+            let doc = if prefix.is_empty() {
+                "[model]\nname = \"default\"\nhf_repo = \"old\"\n".to_string()
+            } else {
+                "[worker.model]\nname = \"default\"\nhf_repo = \"old\"\n".to_string()
+            };
+            let mut t: toml::Value = toml::from_str(&doc).unwrap();
+            set_nested(
+                &mut t,
+                &format!("{prefix}model.hf_repo"),
+                toml::Value::String("Qwen/Qwen3-1.7B".to_string()),
+            )
+            .unwrap();
+            let model = if table == "model" {
+                &t["model"]
+            } else {
+                &t["worker"]["model"]
+            };
+            assert_eq!(model["model"].as_str().unwrap(), "Qwen/Qwen3-1.7B");
+            assert!(
+                model.get("hf_repo").is_none(),
+                "the old spelling survived beside the new one ({prefix}model)"
+            );
+        }
     }
 
     #[test]

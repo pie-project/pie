@@ -1,0 +1,19 @@
+{
+  "architectures": [
+    "NemotronHForCausalLM"
+  ],
+  "chunk_size": 64,
+  "conv_kernel": 4,
+  "hidden_size": 128,
+  "hybrid_override_pattern": "M*E-",
+  "mamba_head_dim": 16,
+  "mamba_num_heads": 8,
+  "max_position_embeddings": 2048,
+  "model_type": "nemotron_h",
+  "n_groups": 2,
+  "num_attention_heads": 8,
+  "num_hidden_layers": 4,
+  "ssm_state_size": 32,
+  "time_step_min": 0.001,
+  "vocab_size": 1000
+}

@@ -54,8 +54,6 @@ template <typename T, int group_size, int bits>
       const device uint32_t*, const device itype*, const device itype*, \
       const device int*, device itype*, const constant int&, uint);
 
-instantiate_embed(float32, float, 64, 4)
-instantiate_embed(float16, half, 64, 4)
 instantiate_embed(bfloat16, bfloat, 64, 4)
 instantiate_embed(bfloat16, bfloat, 32, 4)
 instantiate_embed(bfloat16, bfloat, 128, 4)
@@ -97,8 +95,6 @@ template <typename T, int group_size, int bits>
       const device int*, device itype*, const constant int&,                    \
       const constant float&, uint);
 
-instantiate_embed_scaled(float32, float, 64, 4)
-instantiate_embed_scaled(float16, half, 64, 4)
 instantiate_embed_scaled(bfloat16, bfloat, 64, 4)
 instantiate_embed_scaled(bfloat16, bfloat, 32, 4)
 instantiate_embed_scaled(bfloat16, bfloat, 128, 4)
@@ -138,8 +134,6 @@ template <typename T, int group_size, int bits>
       const device uint32_t*, const device itype*, const device itype*,     \
       const device int*, device itype*, const constant int&, uint2);
 
-instantiate_embed_mb(float32, float, 64, 4)
-instantiate_embed_mb(float16, half, 64, 4)
 instantiate_embed_mb(bfloat16, bfloat, 64, 4)
 instantiate_embed_mb(bfloat16, bfloat, 32, 4)
 instantiate_embed_mb(bfloat16, bfloat, 128, 4)
@@ -178,8 +172,6 @@ template <typename T, int group_size, int bits>
       const device int*, device itype*, const constant int&,                      \
       const constant float&, uint2);
 
-instantiate_embed_scaled_mb(float32, float, 64, 4)
-instantiate_embed_scaled_mb(float16, half, 64, 4)
 instantiate_embed_scaled_mb(bfloat16, bfloat, 64, 4)
 instantiate_embed_scaled_mb(bfloat16, bfloat, 32, 4)
 instantiate_embed_scaled_mb(bfloat16, bfloat, 128, 4)
