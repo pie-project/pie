@@ -59,6 +59,20 @@ struct SpatialSideStream {
     }
 };
 
+// The mixed fire's SECOND prefill-family plan needs its own workspace:
+// the prefix causal plan and the suffix custom plan are both
+// PrefillPlan-family and write per-request scheduling metadata at the
+// same int-workspace offsets — planning both into one AttentionWorkspace
+// clobbers the first (measured: illegal access at the causal launch).
+// The pure-decode split never collides (decode planner + prefill
+// planner) and qwen2_5's split has a plan-free prefix. Lazy singleton:
+// one worker thread launches fires sequentially, and plan+dispatch of
+// one fire pair against the same instance.
+inline AttentionWorkspace& spatial_suffix_ws() {
+    static AttentionWorkspace ws = AttentionWorkspace::allocate();
+    return ws;
+}
+
 inline bool spatial_stream_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_SPATIAL_STREAM");
@@ -923,7 +937,7 @@ void prepare_llama_like_decode_plan(
                 num_kv_heads_local,
                 cfg.head_dim_kernel,
                 cache.page_size(),
-                attn_ws,
+                spatial_suffix_ws(),
                 /*stream=*/nullptr,
                 fwd_cfg.decode_plan_cuda_graph,
                 /*window_left=*/-1,
@@ -1999,7 +2013,7 @@ void llama_like_forward_paged(
                     kv_page_indptr + split_req,
                     kv_last_page_lens + split_req,
                     custom_mask_d, custom_mask_indptr_d + split_req,
-                    attn_ws, custom_stream);
+                    spatial_suffix_ws(), custom_stream);
                 // The prefix causal dispatch on the main stream — the
                 // bf16 view needs the prefix pages staged (no-op on
                 // native-bf16 caches; the custom dispatch takes the
