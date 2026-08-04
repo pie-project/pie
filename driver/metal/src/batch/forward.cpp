@@ -538,6 +538,8 @@ struct MetalExecutor::Impl {
     // The prefill's uniform scratch row pitch, in elements, for the batched
     // projection (`affine_qmm_t_strided` reads it at buffer 8).
     SlotHandle prefill_row_stride_{};
+    SlotHandle prefill_rows_{};
+    SlotHandle prefill_fp16_input_{};
     // One scan-length buffer per prompt row.  A grouped prefill carries several
     // requests, each with its own scan length, and the row's argument table is
     // what selects the segment -- so the length has to be per row too.
@@ -1049,7 +1051,9 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     }
     if (g_.paged_kv_enabled &&
         !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, g_.quant, /*with_d512=*/false,
-                              &load_err, g_.is_moe())) {
+                              &load_err, g_.is_moe(), /*fp16_precast=*/false,
+                              /*fp16_strided=*/!g_.is_moe() &&
+                                  g_.quant.bits == 4 && g_.quant.group == 64)) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -1062,9 +1066,20 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         ctx_->create_standalone_buffer(
             sizeof(PtirLogitsCopyParams) * kPtirLogitsCopyMaxRows);
     prefill_row_stride_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+    prefill_rows_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
     if (prefill_row_stride_.valid()) {
         *static_cast<std::int32_t*>(prefill_row_stride_.contents()) =
             static_cast<std::int32_t>(scratch_widest_elems(g_));
+    }
+    if (!g_.is_moe() && g_.quant.bits == 4 && g_.quant.group == 64) {
+        prefill_fp16_input_ = ctx_->heap_alloc(
+            std::size_t(std::max(1, g_.max_tokens)) *
+            std::size_t(scratch_widest_elems(g_)) * sizeof(std::uint16_t));
+        if (!prefill_fp16_input_.valid()) {
+            if (err) *err = "allocating Qwen prefill FP16 input staging";
+            ctx_.reset();
+            return false;
+        }
     }
     prefill_scan_rows_.clear();
     if (!ptir_logits_copy_pso_.valid() ||
@@ -1500,6 +1515,10 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                 for (const Dispatch& d : prefill_dags_[0]) {
                     if (qmv_out_size(d.kind, g_) != 0) {
                         ctx_->arg_bind_ordinal(d.ordinal, 8, prefill_row_stride_);
+                        if (prefill_rows_.valid())
+                            ctx_->arg_bind_ordinal(d.ordinal, 9, prefill_rows_);
+                        if (prefill_fp16_input_.valid())
+                            ctx_->arg_bind_ordinal(d.ordinal, 12, prefill_fp16_input_);
                         continue;
                     }
                     // The row-blocked elementwise/norm kernels take the same pitch,
@@ -2200,6 +2219,8 @@ bool MetalExecutor::Impl::run_prefill_step(
     // Alternate the arms fire by fire so both see the same machine, exactly as
     // the decode step does -- prefill fires are few, so without interleaving a
     // single contended window decides the answer.
+    if (prefill_rows_.valid())
+        *static_cast<std::int32_t*>(prefill_rows_.contents()) = schedule.N;
     static bool prefill_ab_flip = false;
     if (ab_enabled()) ab_set_arm(prefill_ab_flip = !prefill_ab_flip);
     // The staging copy rides this command buffer, exactly as it rides the
@@ -2236,7 +2257,7 @@ bool MetalExecutor::Impl::run_prefill_step(
         static double enc[2] = {};
         static int n[2] = {};
         const int arm = ab_enabled() && ab_arm() ? 1 : 0;
-        ms[arm] += timing.gpu_exec_ms;
+        ms[arm] += timing.gpu_ms > 0.0 ? timing.gpu_ms : timing.gpu_exec_ms;
         enc[arm] += timing.encode_ms;
         rows[arm] += double(schedule.N);
         ++n[arm];

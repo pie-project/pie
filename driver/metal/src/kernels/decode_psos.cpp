@@ -169,7 +169,8 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           bool with_d512,
                           std::string* err,
                           bool routed,
-                          bool fp16_precast) {
+                          bool fp16_precast,
+                          bool fp16_strided) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
     const std::string q = quant.kernel_suffix();
@@ -271,6 +272,22 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     want(qmm, "affine_qmm_t_strided" + q + "_bm_32_bn_32", &out.qmm_t_strided_wide);
     want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_32_bn_32",
          &out.qmm_t_strided_wide_residual);
+    if (fp16_strided && quant.group == 64 && quant.bits == 4) {
+        want(qmm, "affine_qmm_t_strided_fp16_precast" + q + "_bm_16_bn_32",
+             &out.qmm_t_strided_fp16_precast);
+        want(qmm, "affine_qmm_t_strided_fp16_precast" + q + "_bm_32_bn_32",
+             &out.qmm_t_strided_fp16_precast_wide);
+        want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q +
+                     "_bm_16_bn_32",
+             &out.qmm_t_strided_fp16_precast_residual);
+        want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q +
+                     "_bm_32_bn_32",
+             &out.qmm_t_strided_fp16_precast_wide_residual);
+        want(qmm, "cast_qmm_input_strided_bfloat16_to_float16",
+             &out.qmm_t_strided_cast);
+        want(qmm, "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",
+             &out.qmv_wide_strided);
+    }
     for (const MbSpec& s : specs) {
         if (!s.required && !with_d512) continue;
         want(s.file, s.fn, s.dst);
