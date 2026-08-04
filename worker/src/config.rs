@@ -22,18 +22,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Client-facing listener, plus what pie fetches inferlets from.
     #[serde(default)]
     pub server: ServerConfig,
+    /// OpenTelemetry export. Off by default.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// Tokio + wasmtime tuning and the sandbox an inferlet runs in.
     #[serde(default)]
     pub runtime: RuntimeConfig,
     /// Distributed-cluster topology (controller + role + gateways). Absent, or
     /// `controller` unset ⇒ single-node (gateway-free local inference).
     #[serde(default)]
     pub cluster: ClusterConfig,
+    /// Limits on remote clients leasing this worker's KV space.
     #[serde(default)]
     pub executor: ExecutorConfig,
+    /// Disaggregated serving: moving prefill and KV to partner workers.
     #[serde(default)]
     pub offload: OffloadConfig,
     /// The single `[model]` table. Pie serves exactly one model.
@@ -75,6 +80,12 @@ impl Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
+    /// Remote clients that may hold a scratch lease at once.
+    ///
+    /// Not just a connection count: the KV pool is divided evenly between the
+    /// slots, so each client gets `total_pages / max_clients` pages and raising
+    /// this shrinks every client's share. Refused at validation if it exceeds
+    /// the pool's page count, since a slot with no pages cannot serve anyone.
     #[serde(default = "default_executor_max_clients")]
     pub max_clients: usize,
 }
@@ -104,12 +115,23 @@ fn default_executor_max_clients() -> usize {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OffloadConfig {
+    /// Serve prefill and KV from partner workers rather than only locally.
+    ///
+    /// Off by default. Turning it on also makes the worker publish an artifact
+    /// digest, because partners must agree on the weight layout they trade
+    /// pages in.
     #[serde(default)]
     pub enabled: bool,
+    /// Shortest suffix worth offloading a prefill for. `0` derives one from
+    /// the transport -- 512 tokens over NIXL, 2048 inline -- since the
+    /// worthwhile length is a property of how fast the pages move.
     #[serde(default)]
     pub prefill_min_suffix_tokens: usize,
+    /// Transfers in flight to any one partner before the next waits.
     #[serde(default = "default_offload_max_outstanding")]
     pub max_outstanding_per_partner: u32,
+    /// How KV pages cross between workers: `inline` in the message,
+    /// `nixl` via RDMA, or `auto` to use NIXL where it is available.
     #[serde(default)]
     pub transfer: OffloadTransfer,
 }
@@ -363,16 +385,33 @@ impl ClusterConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Address the client edge binds. Loopback by default -- a reachable port
+    /// should be something an operator asks for.
     #[serde(default = "default_host")]
     pub host: String,
+    /// Port the client edge binds.
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Verbose engine logging, and passed down to the embedded driver.
+    /// Independent of `--log-level`, which sets the tracing filter.
     #[serde(default)]
     pub verbose: bool,
+    /// Where `pie inferlet` downloads from, and where the engine fetches a
+    /// program it is asked to run but does not have.
     #[serde(default = "default_registry")]
     pub registry: String,
+    /// Hard cap on inferlets admitted at once. **Omit to derive it** from the
+    /// driver's `max_forward_requests`, which is what fills a batch.
+    ///
+    /// A physical safety limit, not a scheduling knob: past the point where
+    /// every batch is full, more concurrent processes add queueing and not
+    /// throughput.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
+    /// Apply the host-side snapshot optimization to Python components.
+    ///
+    /// On by default. It only affects startup cost, so turning it off is a
+    /// debugging step -- it changes which wasmtime linker variant is built.
     #[serde(default = "default_true")]
     pub python_snapshot: bool,
 }
@@ -419,10 +458,13 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
+    /// Export traces over OTLP.
     #[serde(default)]
     pub enabled: bool,
+    /// OTLP collector to export to.
     #[serde(default = "default_otlp_endpoint")]
     pub endpoint: String,
+    /// `service.name` on exported spans.
     #[serde(default = "default_service_name")]
     pub service_name: String,
 }
@@ -451,24 +493,49 @@ fn default_service_name() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
+    /// Tokio worker threads. Derived from the visible CPUs, capped at 64.
+    ///
+    /// The cap is measured, not arbitrary: past ~64 the runtime's own
+    /// scheduling overhead adds variance without adding parallelism (on a
+    /// 256-thread EPYC 7773X, +0.5% mean tok/s and about triple the stdev
+    /// without it). Raise it only for heavy non-inference work in-process.
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
+    /// Instances the wasmtime pooling allocator may hold. A ceiling on
+    /// concurrent inferlets, reserved up front.
     #[serde(default = "default_wasm_max_instances")]
     pub wasm_max_instances: u32,
+    /// Linear memory one instance may address.
     #[serde(default = "default_wasm_max_memory")]
     pub wasm_max_memory: ByteSize,
+    /// Linear memory kept resident when an instance is returned to the pool,
+    /// rather than decommitted. Trades RSS for a cheaper next start; `0B`
+    /// keeps none.
     #[serde(default)]
     pub wasm_warm_memory: ByteSize,
+    /// Unused pool slots kept warm rather than torn down.
     #[serde(default = "default_wasm_warm_slots")]
     pub wasm_warm_slots: u32,
+    /// Give each inferlet a private `/scratch` with read-write access.
+    /// Off by default: nothing else in the sandbox reaches a filesystem.
     #[serde(default)]
     pub allow_fs: bool,
+    /// Where the per-process `/scratch` directories are made. Ignored unless
+    /// `allow_fs` is set.
     #[serde(default = "default_fs_scratch_dir")]
     pub fs_scratch_dir: PathBuf,
+    /// Allow outbound network from inferlets at all. `false` is the tight
+    /// setting -- it is the only one that also stops `wasi:http`.
     #[serde(default = "default_true")]
     pub allow_network: bool,
+    /// Hosts an inferlet may reach, `["*"]` for any.
+    ///
+    /// Filters `wasi:sockets` only. `wasi:http` bypasses the per-socket hook
+    /// because its host stack resolves names itself, so this list does not
+    /// constrain it -- use `allow_network = false` when that matters.
     #[serde(default = "default_network_allowed_hosts")]
     pub network_allowed_hosts: Vec<String>,
+    /// Largest blob a client may upload in one request.
     #[serde(default = "default_max_upload")]
     pub max_upload: ByteSize,
 }
@@ -550,9 +617,16 @@ fn default_max_upload() -> ByteSize {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
+    /// What clients ask for this model by. Required, and free-form: it names
+    /// the deployment, not the checkpoint.
     pub name: String,
+    /// Hugging Face repo the weights come from. Read out of the local HF
+    /// cache; `pie model download` is what puts it there.
     pub hf_repo: String,
+    /// Which backend runs the model, on what devices.
     pub driver: DriverConfig,
+    /// Batching and timeout policy. Every field has a measured default; the
+    /// frame knobs are part of the guest contract.
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     /// Where this model's materialized-weight artifacts are kept between runs.
@@ -599,6 +673,12 @@ impl ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
+    /// How long a client request may run before the engine gives up on it.
+    ///
+    /// The outermost of the three clocks here and the only one about the
+    /// client rather than the pipeline: `submit_deadline` leashes a straggler
+    /// and `silence_timeout` terminates an abandoned process, but this one
+    /// bounds the answer a caller is waiting for.
     #[serde(default = "default_request_timeout")]
     pub request_timeout: Duration,
     /// How long a pipeline that is HARD-BLOCKING a frame's seal may go
@@ -817,10 +897,16 @@ pub struct DriverConfig {
     /// Single string or list of strings — both accepted on input.
     #[serde(deserialize_with = "deserialize_string_or_list")]
     pub device: Vec<String>,
+    /// Ranks the model is sharded across. Must divide the device list.
     #[serde(default = "default_tp_size")]
     pub tensor_parallel_size: u32,
+    /// Compute dtype for activations, e.g. `"bfloat16"`. Separate from
+    /// `weight_dtype` and `kv_cache_dtype`: a deployment can store weights
+    /// narrower than it computes.
     #[serde(default = "default_activation_dtype")]
     pub activation_dtype: String,
+    /// Seed for sampling. Also mixed into the artifact digest, so two workers
+    /// with different seeds do not trade cached weight layouts.
     #[serde(default = "default_random_seed")]
     pub random_seed: u64,
     /// Driver-specific knobs. Embedded drivers parse this into typed
@@ -971,11 +1057,24 @@ where
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetalDriverOptions {
+    /// KV page size in tokens. Used as given -- unlike the CUDA driver, the
+    /// Metal driver has no planner to derive one.
     pub kv_page_size: u32,
+    /// KV pages to allocate. Used directly, and 1024 is a real default.
+    ///
+    /// Not the CUDA driver's `total_pages`, which it resembles: there the
+    /// field is an optional hard cap over a value derived from
+    /// `gpu_mem_utilization`.
     pub total_pages: u32,
+    /// Tokens one forward pass may carry, across all requests in the batch.
     pub max_forward_tokens: u32,
+    /// Requests one forward pass may carry. Also what `max_concurrent_processes`
+    /// derives from when the operator leaves it unset.
     pub max_forward_requests: u32,
+    /// Host-memory KV pages to swap into. `0` disables swapping.
     pub cpu_pages: u32,
+    /// Dtype KV pages are stored in. `"auto"` follows the activation dtype;
+    /// a narrower one buys pages at some accuracy.
     pub kv_cache_dtype: String,
     /// Page routed MoE experts in from a mapping of the checkpoint instead of
     /// keeping every expert resident in the heap.
@@ -989,15 +1088,19 @@ pub struct MetalDriverOptions {
     /// Off by default: it trades resident memory for page faults, which only
     /// pays when the weights do not comfortably fit.
     pub stream_routed_experts: bool,
+    /// Metal device string, e.g. `"metal:0"`. Populated from
+    /// `model.driver.device` rather than written here.
     #[serde(skip)]
     pub device: String,
+    /// Driver-side verbose logging. Populated from `server.verbose` rather
+    /// than written here.
     #[serde(skip)]
     pub verbose: bool,
+    /// How long to wait for the driver's caps handshake before giving up.
+    /// Generous because it covers loading the weights.
     pub ready_timeout: Duration,
+    /// How long to wait for the driver to drain before abandoning it.
     pub shutdown_timeout: Duration,
-    /// Accepted for config compatibility; ignored (the metal driver is a
-    /// statically-linked lib, no separate executable to discover).
-    pub binary_path: String,
 }
 
 impl Default for MetalDriverOptions {
@@ -1014,7 +1117,6 @@ impl Default for MetalDriverOptions {
             verbose: false,
             ready_timeout: Duration::from_secs(120),
             shutdown_timeout: Duration::from_secs(5),
-            binary_path: String::new(),
         }
     }
 }
@@ -1040,6 +1142,8 @@ pub struct DummyDriverOptions {
     #[serde(default)]
     pub arch_name: Option<String>,
 
+    /// How long to wait for the caps handshake. Short, because the dummy
+    /// driver fabricates its answer rather than loading anything.
     #[serde(default = "default_dummy_ready_timeout")]
     pub ready_timeout: Duration,
 }
@@ -1050,16 +1154,17 @@ fn default_dummy_ready_timeout() -> Duration {
 
 /// `[model.driver.options]` for `type = "cuda_native"`.
 /// Mirrors `pie/src/pie_driver_cuda_native/config.py::CudaNativeDriverConfig`.
-///
-/// `binary_path` is accepted for config compatibility with the Python
-/// wrapper path but ignored — the standalone embeds the cuda driver as
-/// a static library, so there is no separate executable to discover.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CudaNativeDriverOptions {
-    pub binary_path: String,
-
+    /// Fraction of each GPU's memory pie may use, weights included.
+    ///
+    /// What is left after the weights becomes the KV pool, so this is the
+    /// knob that sizes it -- `total_pages` only caps the result.
     pub gpu_mem_utilization: f64,
+    /// Which serving shape the memory planner optimizes its layout for:
+    /// `auto` to infer it, `latency` for few concurrent requests, or
+    /// `throughput` for many.
     pub memory_profile: CudaMemoryProfile,
     /// KV page size in tokens. **Omit to let the driver's memory planner
     /// derive one** by scoring candidates against the serving profile, which
@@ -1068,7 +1173,11 @@ pub struct CudaNativeDriverOptions {
     /// `PIE_CUDA_KV_PAGE_SIZE` could pin it. Setting it pins it, and the
     /// planner searches a single-candidate lattice.
     pub kv_page_size: Option<u32>,
+    /// Dtype KV pages are stored in. `"auto"` follows the activation dtype;
+    /// a narrower one buys pages at some accuracy.
     pub kv_cache_dtype: String,
+    /// Host-memory KV pages to swap into, reaching the driver as its
+    /// `cpu_pages`. `0` disables swapping.
     pub swap_pool_size: u32,
     /// HARD cap on the runtime KV page count. **Omit to derive it from
     /// `gpu_mem_utilization`.** Setting it forces a tiny deterministic pool
@@ -1078,12 +1187,16 @@ pub struct CudaNativeDriverOptions {
     /// Note this is NOT the metal driver's `total_pages`, which it resembles:
     /// there the value is used directly and 1024 is a real default.
     pub total_pages: Option<u32>,
+    /// Dtype weights are materialized in. Separate from `activation_dtype`:
+    /// narrower weights and wider compute is a normal combination.
     pub weight_dtype: String,
     /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
     /// from `model.driver.device`; set on the C++ side via
     /// `cudaSetDevice` (see `driver/cuda/src/engine.cpp`).
     #[serde(skip)]
     pub device: String,
+    /// Driver-side verbose logging. Populated from `server.verbose` rather
+    /// than written here.
     #[serde(skip)]
     pub verbose: bool,
     /// Runtime quantization mode applied during CUDA layout-plan
@@ -1128,7 +1241,10 @@ pub struct CudaNativeDriverOptions {
     /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
     pub enable_system_speculation: bool,
 
+    /// How long to wait for the driver's caps handshake before giving up.
+    /// Generous because it covers loading and laying out the weights.
     pub ready_timeout: Duration,
+    /// How long to wait for the driver to drain before abandoning it.
     pub shutdown_timeout: Duration,
 }
 
@@ -1164,7 +1280,6 @@ pub enum CudaMemoryProfile {
 impl Default for CudaNativeDriverOptions {
     fn default() -> Self {
         Self {
-            binary_path: String::new(),
             gpu_mem_utilization: 0.90,
             memory_profile: CudaMemoryProfile::Auto,
             kv_page_size: None,
@@ -1568,6 +1683,71 @@ device = "cuda:0"
 "#;
         let cfg: Config = toml::from_str(one).unwrap();
         assert_eq!(cfg.model.driver.device, vec!["cuda:0".to_string()]);
+    }
+
+    #[test]
+    fn every_config_field_carries_a_doc_comment() {
+        // `pie config list` prints each key's first doc line, so a field with
+        // no doc comment is a key the CLI cannot explain -- and the reason
+        // `configuration.mdx` drifted is that its descriptions lived away from
+        // the fields they described. Reading the source is crude but it reads
+        // the definition itself, which is the only copy that cannot be stale.
+        let source = include_str!("config.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut current = "";
+        let mut undocumented = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(rest) = line.strip_prefix("pub struct ") {
+                current = rest
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("");
+            }
+            let Some(rest) = line.strip_prefix("    pub ") else {
+                continue;
+            };
+            // A field is an identifier followed immediately by `:`. Without
+            // the second half this also matches `pub const fn from_secs(s:`
+            // in the newtypes' impl blocks.
+            let field: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if field.is_empty() || !rest[field.len()..].starts_with(':') {
+                continue;
+            }
+            // Walk back over any attributes to reach what precedes the field.
+            let mut j = i;
+            while j > 0 && lines[j - 1].trim_start().starts_with("#[") {
+                j -= 1;
+            }
+            if j == 0 || !lines[j - 1].trim_start().starts_with("///") {
+                undocumented.push(format!("{current}.{field}"));
+            }
+        }
+        assert!(
+            undocumented.is_empty(),
+            "config fields with no doc comment: {undocumented:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_binary_path() {
+        // Both driver option structs carried it "for compatibility with the
+        // Python wrapper", and nothing anywhere read it -- the drivers are
+        // linked in, so there has never been an executable to point at.
+        let legacy = r#"
+[model]
+name = "a"
+hf_repo = "x"
+[model.driver]
+type = "metal"
+device = ["metal:0"]
+[model.driver.options]
+binary_path = "/opt/pie/driver"
+"#;
+        let err = Config::parse(legacy).unwrap_err().to_string();
+        assert!(err.contains("binary_path"), "got: {err}");
     }
 
     #[test]
