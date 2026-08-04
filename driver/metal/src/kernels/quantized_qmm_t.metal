@@ -1547,35 +1547,127 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       w, scales, biases, x, y, residual, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
-#define instantiate_qmm_t(bm, bk, bn)                                          \
-  template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
-  [[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, bm, bk, bn>(             \
+/// The same matmul, against the expert slice this TILE was routed to.
+///
+/// The whole of the batched mixture is here: `moe_route_sort` has already put
+/// the rows that share an expert next to each other and padded each run to a
+/// tile, so a tile's rows agree on their expert and the only thing that changes
+/// per tile is where the weights start. `x` and `y` are read and written
+/// contiguously in that sorted order -- the permutation is the gather's job and
+/// the scatter's, not this kernel's.
+///
+/// That is why this is an entry point and not an implementation. Nothing about
+/// the inner loop differs from the dense case, and a routed copy of
+/// `qmm_t_aligned_impl` would be a second place for the tile shape, the loader
+/// and the epilogue to drift.
+///
+/// `tile_expert[tid.y] < 0` is a tile past the end of the routing. The grid is
+/// the WORST CASE -- every expert claiming a partial tile -- because the real
+/// tile count is a number the GPU computed and the host cannot see without a
+/// stall, so the spare tiles have to be dispatched and then decline. The return
+/// is uniform across the threadgroup, which is what makes it safe to take
+/// before the barriers inside the impl.
+template <typename T, int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_routed(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& K      [[buffer(5)]],
+    const constant int& N      [[buffer(6)]],
+    // Buffer 12, clear of every slot `bind::GoQmv` uses: one argument table
+    // ordinal serves this pipeline and the routed matvec both, and the host
+    // binds all of an ordinal's slots whichever one the row count selects.
+    const device int* tile_expert [[buffer(12)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  const int e = tile_expert[tid.y];
+  if (e < 0) return;
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  // The stack is [n_experts * N, K] as the contract declared it: one flat
+  // matrix, expert-major, so an expert's slice is a row offset and not a
+  // separate allocation.
+  const size_t w_bytes = size_t(e) * size_t(N) * size_t(K) *
+                         size_t(bytes_per_pack) / size_t(pack_factor);
+  const size_t g_off = size_t(e) * size_t(N) * size_t(K / group_size);
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false>(
+      (const device uint32_t*)((const device uint8_t*)w + w_bytes),
+      scales + g_off, biases + g_off, x, y, nullptr, Xs, Ws, K, N, tid,
+      simd_gid, simd_lid);
+}
+
+#define instantiate_qmm_t(gs, bm, bk, bn, b)                                          \
+  template [[host_name("affine_qmm_t_routed_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void affine_qmm_t_routed<bfloat, gs, b, bm, bk, bn>(              \
+      const device uint32_t*, const device bfloat*, const device bfloat*,      \
+      const device bfloat*, device bfloat*, const constant int&,               \
+      const constant int&, const device int*, uint3, uint, uint);              \
+  template [[host_name("affine_qmm_t_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void affine_qmm_t_aligned<bfloat, gs, b, bm, bk, bn>(             \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
       const constant int&, uint3, uint, uint);                                 \
-  template [[host_name("affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
-  [[kernel]] void affine_qmm_t_aligned_residual<bfloat, 64, 4, bm, bk, bn>(    \
+  template [[host_name("affine_qmm_t_residual_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void affine_qmm_t_aligned_residual<bfloat, gs, b, bm, bk, bn>(    \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
       const constant int&, const device bfloat*, uint3, uint, uint);           \
-  template [[host_name("affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
-  [[kernel]] void affine_qmm_t_aligned_bias<bfloat, 64, 4, bm, bk, bn>(        \
+  template [[host_name("affine_qmm_t_bias_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void affine_qmm_t_aligned_bias<bfloat, gs, b, bm, bk, bn>(        \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
       const constant int&, const device bfloat*, uint3, uint, uint);
 
-instantiate_qmm_t(16, 32, 32)
-instantiate_qmm_t(16, 32, 64)
-instantiate_qmm_t(16, 32, 16)
-instantiate_qmm_t(32, 32, 16)
-instantiate_qmm_t(32, 32, 32)
+instantiate_qmm_t(64, 16, 32, 32, 4)
+instantiate_qmm_t(32, 16, 32, 32, 4)
+instantiate_qmm_t(128, 16, 32, 32, 4)
+instantiate_qmm_t(64, 16, 32, 32, 8)
+instantiate_qmm_t(32, 16, 32, 32, 8)
+instantiate_qmm_t(128, 16, 32, 32, 8)
+instantiate_qmm_t(64, 16, 32, 64, 4)
+instantiate_qmm_t(32, 16, 32, 64, 4)
+instantiate_qmm_t(128, 16, 32, 64, 4)
+instantiate_qmm_t(64, 16, 32, 64, 8)
+instantiate_qmm_t(32, 16, 32, 64, 8)
+instantiate_qmm_t(128, 16, 32, 64, 8)
+instantiate_qmm_t(64, 16, 32, 16, 4)
+instantiate_qmm_t(32, 16, 32, 16, 4)
+instantiate_qmm_t(128, 16, 32, 16, 4)
+instantiate_qmm_t(64, 16, 32, 16, 8)
+instantiate_qmm_t(32, 16, 32, 16, 8)
+instantiate_qmm_t(128, 16, 32, 16, 8)
+instantiate_qmm_t(64, 32, 32, 16, 4)
+instantiate_qmm_t(32, 32, 32, 16, 4)
+instantiate_qmm_t(128, 32, 32, 16, 4)
+instantiate_qmm_t(64, 32, 32, 16, 8)
+instantiate_qmm_t(32, 32, 32, 16, 8)
+instantiate_qmm_t(128, 32, 32, 16, 8)
+instantiate_qmm_t(64, 32, 32, 32, 4)
+instantiate_qmm_t(32, 32, 32, 32, 4)
+instantiate_qmm_t(128, 32, 32, 32, 4)
+instantiate_qmm_t(64, 32, 32, 32, 8)
+instantiate_qmm_t(32, 32, 32, 32, 8)
+instantiate_qmm_t(128, 32, 32, 32, 8)
 // The wide row block at the widest column tile. `qmm_bn` takes the widest tile
 // that DIVIDES the output, and every projection in these checkpoints is a
 // multiple of 64 -- so a 32-row batch asks for exactly this pair. It used to be
 // left out and aliased onto the BM=16 pipeline, which is not a crash: the grid
 // is built for 32 rows per block and the pipeline computes 16, so HALF the
 // batch is never written. At 32 rows gemma4's logits came back all zero.
-instantiate_qmm_t(32, 32, 64)
+instantiate_qmm_t(64, 32, 32, 64, 4)
+instantiate_qmm_t(32, 32, 32, 64, 4)
+instantiate_qmm_t(128, 32, 32, 64, 4)
+instantiate_qmm_t(64, 32, 32, 64, 8)
+instantiate_qmm_t(32, 32, 32, 64, 8)
+instantiate_qmm_t(128, 32, 32, 64, 8)
 
 // ── Strided form, for the prefill ────────────────────────────────────────────
 // Identical to the aligned kernel above except that the row pitch of `x`, `y`
@@ -1703,21 +1795,31 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       tid, simd_gid, simd_lid);
 }
 
-#define instantiate_qmm_t_strided(bm, bk, bn)                                     \
-  template [[host_name("affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
-  [[kernel]] void affine_qmm_t_strided<bfloat, 64, 4, bm, bk, bn>(                \
+#define instantiate_qmm_t_strided(gs, bm, bk, bn, b)                                     \
+  template [[host_name("affine_qmm_t_strided_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void affine_qmm_t_strided<bfloat, gs, b, bm, bk, bn>(                \
       const device uint32_t*, const device bfloat*, const device bfloat*,         \
       const device bfloat*, device bfloat*, const constant int&,                  \
       const constant int&, const constant int&, uint3, uint, uint);               \
-  template [[host_name("affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
-  [[kernel]] void affine_qmm_t_strided_residual<bfloat, 64, 4, bm, bk, bn>(       \
+  template [[host_name("affine_qmm_t_strided_residual_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void affine_qmm_t_strided_residual<bfloat, gs, b, bm, bk, bn>(       \
       const device uint32_t*, const device bfloat*, const device bfloat*,         \
       const device bfloat*, device bfloat*, const constant int&,                  \
       const constant int&, const device bfloat*, const constant int&,             \
       uint3, uint, uint);
 
-instantiate_qmm_t_strided(16, 32, 32)
-instantiate_qmm_t_strided(32, 32, 32)
+instantiate_qmm_t_strided(64, 16, 32, 32, 4)
+instantiate_qmm_t_strided(32, 16, 32, 32, 4)
+instantiate_qmm_t_strided(128, 16, 32, 32, 4)
+instantiate_qmm_t_strided(64, 16, 32, 32, 8)
+instantiate_qmm_t_strided(32, 16, 32, 32, 8)
+instantiate_qmm_t_strided(128, 16, 32, 32, 8)
+instantiate_qmm_t_strided(64, 32, 32, 32, 4)
+instantiate_qmm_t_strided(32, 32, 32, 32, 4)
+instantiate_qmm_t_strided(128, 32, 32, 32, 4)
+instantiate_qmm_t_strided(64, 32, 32, 32, 8)
+instantiate_qmm_t_strided(32, 32, 32, 32, 8)
+instantiate_qmm_t_strided(128, 32, 32, 32, 8)
 
 
 // Same as `qmm_t_aligned_impl`, except the K loop runs `k_len` columns from the
@@ -1860,17 +1962,27 @@ template <typename T, bool WITH_RESIDUAL>
   y[o] = static_cast<T>(acc);
 }
 
-#define instantiate_qmm_t_splitk(bm, bk, bn)                                    \
-  template [[host_name("affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_" #bm         \
+#define instantiate_qmm_t_splitk(gs, bm, bk, bn, b)                                    \
+  template [[host_name("affine_qmm_t_splitk_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm         \
                        "_bn_" #bn)]]                                            \
-  [[kernel]] void affine_qmm_t_splitk<bfloat, 64, 4, bm, bk, bn>(               \
+  [[kernel]] void affine_qmm_t_splitk<bfloat, gs, b, bm, bk, bn>(               \
       const device uint32_t*, const device bfloat*, const device bfloat*,       \
       const device bfloat*, device bfloat*, const constant int&,                \
       const constant int&, const constant int&, const constant int&,            \
       uint3, uint, uint);
 
-instantiate_qmm_t_splitk(16, 32, 32)
-instantiate_qmm_t_splitk(32, 32, 32)
+instantiate_qmm_t_splitk(64, 16, 32, 32, 4)
+instantiate_qmm_t_splitk(32, 16, 32, 32, 4)
+instantiate_qmm_t_splitk(128, 16, 32, 32, 4)
+instantiate_qmm_t_splitk(64, 16, 32, 32, 8)
+instantiate_qmm_t_splitk(32, 16, 32, 32, 8)
+instantiate_qmm_t_splitk(128, 16, 32, 32, 8)
+instantiate_qmm_t_splitk(64, 32, 32, 32, 4)
+instantiate_qmm_t_splitk(32, 32, 32, 32, 4)
+instantiate_qmm_t_splitk(128, 32, 32, 32, 4)
+instantiate_qmm_t_splitk(64, 32, 32, 32, 8)
+instantiate_qmm_t_splitk(32, 32, 32, 32, 8)
+instantiate_qmm_t_splitk(128, 32, 32, 32, 8)
 
 template [[host_name("qmm_splitk_reduce_bfloat16")]] [[kernel]] void
 qmm_splitk_reduce<bfloat, false>(device bfloat*, const constant int&,

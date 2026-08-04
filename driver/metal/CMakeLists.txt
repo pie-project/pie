@@ -16,6 +16,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# This driver is Metal 4 only: MTL4* command queues, argument tables, explicit
+# barriers, residency sets and placement-sparse heaps have no pre-macOS-26
+# equivalent here, and the kernels are compiled as MSL 4.0. Pinning the
+# deployment target makes that a build-time contract rather than a runtime
+# surprise, and lets the @available-free source compile without warnings.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING
+      "Minimum macOS version (Metal 4 floor)" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD 20)
@@ -72,6 +82,7 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 set(PIE_METAL_EXPLICIT_SOURCES
   src/abi.cpp
   src/context.cpp
+  src/model_facts.cpp
   src/pipeline/registry.cpp
   src/batch/compose.cpp
   src/batch/forward.cpp)
@@ -102,6 +113,11 @@ if(APPLE)
     src/model/gptoss/scratch.cpp
     src/model/gptoss/encode.cpp
     src/model/gptoss/bind.cpp
+    src/model/llama/kernels.cpp
+    src/model/llama/decode_consts.cpp
+    src/model/llama/encode.cpp
+    src/model/llama/bind.cpp
+    src/model/llama/scratch.cpp
     src/batch/simple_family.cpp
     src/model/qwen3_5/decode_step.cpp
     src/model/qwen3_5/decode_step_mb.cpp
@@ -215,7 +231,6 @@ set(PIE_METAL_SHADER_NAMES
   argmax
   attn_gate
   bf16_gemv
-  dense_gemv
   embed_gather
   gated_rms
   gdn_core
@@ -245,7 +260,7 @@ if(PIE_METAL_BUILD_METALLIB)
     set(air_file ${CMAKE_BINARY_DIR}/metal/${shader_name}.air)
     add_custom_command(
       OUTPUT ${air_file}
-      COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal -c ${shader} -o ${air_file}
+      COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal -std=metal4.0 -c ${shader} -o ${air_file}
       DEPENDS ${shader}
       COMMENT "Compiling Metal shader ${shader_name}.metal")
     list(APPEND PIE_METAL_AIR_FILES ${air_file})
@@ -398,18 +413,42 @@ add_test(NAME pipeline_launch_conformance_test
   COMMAND pipeline_launch_conformance_test
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
 
+# ...and generating it is this suite's job, not the reader's. `driver/fixtures/`
+# is gitignored, so on a fresh checkout the images simply do not exist and the
+# conformance test fails for a reason that has nothing to do with the driver.
+# A CTest setup fixture emits them first. Skipped when cargo is absent, in
+# which case the test fails with its own message naming this command.
+find_program(PIE_CARGO_EXECUTABLE cargo)
+if(PIE_CARGO_EXECUTABLE)
+  add_test(NAME pipeline_launch_conformance_fixtures
+    COMMAND ${PIE_CARGO_EXECUTABLE} test -p pie-compiler-tests
+      --test cuda_golden emit_driver_test_kernel
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+  set_tests_properties(pipeline_launch_conformance_fixtures PROPERTIES
+    FIXTURES_SETUP pie_launch_images)
+  set_tests_properties(pipeline_launch_conformance_test PROPERTIES
+    FIXTURES_REQUIRED pie_launch_images)
+endif()
+
 # What this driver declares, and what `push_mlx_affine_u4` owes the qmv kernels
 # after the loader v2 `QuantSpec` field removal. Deliberately does NOT link
 # `pie_driver_metal_lib`: the schema is a header and the loader archive is
 # CUDA-free and Metal-free, so this runs on Linux too — which is what stops the
 # Metal *contract* layer from depending on someone owning a Mac.
 if(PIE_LOADER_STATICLIB)
-  add_executable(model_contract_test tests/model_contract_test.cpp)
+  # `model_facts.cpp` is compiled in rather than linked from the driver lib:
+  # this target deliberately does not depend on Metal, and reading config.json
+  # does not either.
+  add_executable(model_contract_test tests/model_contract_test.cpp src/model_facts.cpp)
   target_compile_features(model_contract_test PRIVATE cxx_std_20)
   target_include_directories(model_contract_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/batch
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
     ${PIE_LOADER_INCLUDE_DIR})
   target_link_libraries(model_contract_test PRIVATE
+    nlohmann_json::nlohmann_json
     ${PIE_LOADER_STATICLIB} Threads::Threads ${CMAKE_DL_LIBS})
   add_test(NAME model_contract_test COMMAND model_contract_test)
 else()
@@ -435,6 +474,36 @@ target_include_directories(gptoss_decode_step_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
 target_link_libraries(gptoss_decode_step_test PRIVATE pie_driver_metal_lib)
 add_test(NAME gptoss_decode_step_test COMMAND gptoss_decode_step_test)
+
+# Llama: one DAG serving llama/mistral/qwen2/qwen3 and the Qwen MoEs. The claim
+# that these are one family and not four is a claim about this function, so it
+# is checked here rather than discovered in an encoder.
+# The Qwen3.5 family's shape, as a config-to-geometry function. Its geometry
+# used to be a struct of compiled-in defaults, so this pins that it is derived
+# and that what cannot be derived is refused by name.
+add_executable(qwen3_5_geometry_test tests/qwen3_5_geometry_test.cpp)
+target_compile_features(qwen3_5_geometry_test PRIVATE cxx_std_20)
+target_include_directories(qwen3_5_geometry_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(qwen3_5_geometry_test PRIVATE pie_driver_metal_lib)
+add_test(NAME qwen3_5_geometry_test COMMAND qwen3_5_geometry_test)
+
+add_executable(llama_decode_step_test tests/llama_decode_step_test.cpp)
+target_compile_features(llama_decode_step_test PRIVATE cxx_std_20)
+target_include_directories(llama_decode_step_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(llama_decode_step_test PRIVATE pie_driver_metal_lib)
+add_test(NAME llama_decode_step_test COMMAND llama_decode_step_test)
+
+add_executable(llama_mb_test tests/llama_mb_test.cpp)
+target_compile_features(llama_mb_test PRIVATE cxx_std_20)
+target_include_directories(llama_mb_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(llama_mb_test PRIVATE pie_driver_metal_lib)
+add_test(NAME llama_mb_test COMMAND llama_mb_test)
 
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
@@ -473,6 +542,13 @@ add_test(NAME executor_worker_test COMMAND executor_worker_test)
 if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
+  add_metal_linked_test(commit_batch_feedback_test tests/commit_batch_feedback_test.cpp)
+  add_metal_linked_test(argtable_capacity_test tests/argtable_capacity_test.cpp)
+  # Reads a .metal source to exercise archive invalidation, so it needs the
+  # source tree rather than the build directory.
+  add_metal_linked_test(pso_archive_test tests/pso_archive_test.mm)
+  set_tests_properties(pso_archive_test PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
   # The six gemma4 kernels that shipped with no PSO entry and no binder.
   add_metal_linked_test(host_buffer_bind_test tests/host_buffer_bind_test.cpp)
   target_compile_definitions(host_buffer_bind_test PRIVATE
@@ -488,6 +564,16 @@ if(APPLE)
   add_metal_linked_test(gptoss_forward_test tests/gptoss_forward_test.cpp NEEDS_LOADER)
   if(TARGET gptoss_forward_test)
     target_compile_definitions(gptoss_forward_test PRIVATE
+      PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  endif()
+  # A stopwatch that checks its own work. Under ctest it SKIPs (no checkpoint
+  # path), so the suite stays green on a machine without an 1.1 GB download;
+  # given one it asserts the greedy continuation against mlx-lm's and prints
+  # throughput. The timings are printed, never asserted -- a number that depends
+  # on what else the machine is doing must not be able to fail a build.
+  add_metal_linked_test(llama_bench tests/llama_bench.cpp NEEDS_LOADER)
+  if(TARGET llama_bench)
+    target_compile_definitions(llama_bench PRIVATE
       PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   endif()
   add_metal_linked_test(simple_family_executor_test tests/simple_family_executor_test.cpp NEEDS_LOADER)
@@ -515,6 +601,29 @@ if(APPLE)
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)
   add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)
+  # `router_topk` past one simdgroup. gpt-oss's 32 experts never exercised the
+  # cross-simdgroup path; Qwen3-MoE's 128 do, and the kernel was wrong there.
+  # The MXFP4 codec on the GPU, against the format written out by hand. Only
+  # gpt-oss's experts use it, and its checkpoint is 11 GB, so this is where the
+  # decode is proved -- not in a test that needs the weights.
+  add_metal_linked_test(mxfp4_matvec_test tests/mxfp4_matvec_test.cpp)
+  target_compile_definitions(mxfp4_matvec_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(router_topk_test tests/router_topk_test.cpp)
+  target_compile_definitions(router_topk_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  # The llama family's kernels beyond the shared decode set, compiled on device.
+  add_metal_linked_test(llama_pso_test tests/llama_pso_test.cpp)
+  target_compile_definitions(llama_pso_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  # Every slot the llama family's kernels declare, against a real argument
+  # table. Catches the unbound-slot class, which is never a crash.
+  add_metal_linked_test(llama_bind_test tests/llama_bind_test.cpp)
+  # The family's arithmetic, against an fp32 reference written from the .metal
+  # files. Synthesises its own MLX affine-U4 weights, so it needs no checkpoint.
+  add_metal_linked_test(llama_numerics_test tests/llama_numerics_test.cpp)
+  target_compile_definitions(llama_numerics_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   # `heap_bind.cpp`'s `case K::Fill` on a real heap.
   add_metal_linked_test(loader_fill_test tests/loader_fill_test.cpp NEEDS_LOADER)
   # The host MSL emitter's whole corpus, through Apple's shader compiler. The

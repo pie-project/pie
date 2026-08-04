@@ -100,6 +100,41 @@ std::uint64_t streamable_plan_bytes(const pie_loader::LoadPlan& load,
 /// The pack exists because a stock safetensors checkpoint does not put tensors
 /// where a device pointer may point: of gpt-oss's 400 expert tensors, 196 start
 /// on a 4-byte boundary, 36 on 16, and none on 32.
+/// How many weight bytes are resident, and how many one decoded token reads.
+///
+/// Measured from the tensors that were actually staged, not computed from a
+/// geometry. The formula this replaces read `cfg.llama` for every family, so
+/// it printed `0.00 GiB` for gemma4 and gpt-oss -- and it could not have been
+/// merely repaired family by family: qwen3.5's stack is mostly linear
+/// attention rather than the four projections a formula assumes, and gpt-oss's
+/// expert bank is 4 bits under a one-byte exponent per 32 rather than a pair
+/// of bf16 per 64. All of it is already a byte count in the heap.
+///
+/// Only two things are read in part rather than in whole, and both are named
+/// for what they ARE rather than for which family holds them:
+///
+///  * the routed expert bank, of which a token pulls `experts_per_token` of
+///    `n_experts`. That is the whole difference between a mixture's size and
+///    its cost: counting the bank in full would say Qwen3-30B-A3B moves 30B of
+///    weights per token when it moves about 3B.
+///  * an embedding table that is only GATHERED -- one row a token, which rounds
+///    to nothing next to a decoder layer. A TIED table is not one of these: the
+///    head reads every row of it, so it counts whole.
+struct WeightBytes {
+    std::uint64_t resident = 0;
+    /// Fractional because a mixture's active share need not land on a whole
+    /// byte, and rounding it would be rounding the answer.
+    double per_token = 0.0;
+    /// How much of `resident` is the routed bank. Reported rather than kept
+    /// private so a caller can CHECK the discount above against the top-k the
+    /// checkpoint's own config declares -- two independent sources, which is
+    /// the only way this can be checked at all. Everything else here is the
+    /// heap describing itself, and a heap agrees with itself by construction.
+    std::uint64_t routed_resident = 0;
+};
+WeightBytes weight_bytes(const std::unordered_map<std::string, SlotHandle>& weights,
+                         int n_experts, int experts_per_token);
+
 StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
     const pie_loader::CheckpointSource& view,

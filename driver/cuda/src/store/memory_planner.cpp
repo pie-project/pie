@@ -542,12 +542,10 @@ CudaMemoryPlan plan_cuda_memory(
             const int output_rows = R0;
             int mtp_drafts_per_program = 0;
             if (qwen3_5_selected || qwen3_5_moe_selected) {
-                mtp_drafts_per_program = cfg.model.mtp_num_drafts;
-                if (const char* value =
-                        std::getenv("PIE_MTP_DRAFT_TOKENS")) {
-                    mtp_drafts_per_program =
-                        std::clamp(std::atoi(value), 0, 32);
-                }
+                // Same clamp as `configured_mtp_num_drafts` in context.cpp;
+                // the arena must be sized for exactly the K that will run.
+                mtp_drafts_per_program =
+                    std::clamp(cfg.model.mtp_num_drafts, 0, 32);
             }
             std::size_t arena = 0;
             arena += pie_cuda_driver::model::workspace_bytes(

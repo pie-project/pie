@@ -75,22 +75,19 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
 
     let ws = WorkingSet::new();
     let max_pages = n.div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // Seeded inputs (single fire: the host geometry prefill reads seeds) +
     // terminal [k]-Token reader outputs.
     let toks = Channel::from(input_toks).named("toks");
-    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
-    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
-    let w_slot =
-        Channel::from((0..n).map(|position| position / PAGE_T).collect::<Vec<_>>()).named("w_slot");
-    let w_off =
-        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>()).named("w_off");
-    let kv_len = Channel::from(vec![n]).named("kv_len");
-    let draft_ch = Channel::from(draft.to_vec()).named("draft");
+    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
+    let positions = Channel::from_iter(0..n).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
+    let w_slot = Channel::from_iter((0..n).map(|position| position / PAGE_T)).named("w_slot");
+    let w_off = Channel::from_iter((0..n).map(|position| position % PAGE_T)).named("w_off");
+    let kv_len = Channel::from([n]).named("kv_len");
+    let draft_ch = Channel::from(draft).named("draft");
     let target_out = Channel::new([k], dtype::i32).named("target_out");
     let verify_out = Channel::new([k], dtype::i32).named("verify_out");
 
@@ -103,19 +100,21 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
     fwd.readout(&readout)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         // Takes + compute first, PUTS last (value-id discipline).
-        let d = draft_ch.take().tensor(); // [k] i32 submit draft
+        let d = draft_ch.take(); // [k] i32 submit draft
         let logits = intrinsics::logits(); // [k, vocab] f32 matrix intrinsic
         let tgt = reduce_argmax(logits); // [k] i32 per-row argmax
         let hit = eq(&tgt, &d); // [k] bool
@@ -130,17 +129,9 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
     });
 
     let pipeline = Pipeline::new();
-    fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
-    let tgt = target_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("target take: {e}"))?;
-    let ver = verify_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("verify take: {e}"))?;
+    fwd.submit(&pipeline).context("submit")?;
+    let tgt = target_out.take_host::<Vec<i32>>().await?;
+    let ver = verify_out.take_host::<Vec<i32>>().await?;
     pipeline.close();
     Ok((tgt, ver))
 }

@@ -4,8 +4,8 @@
 //! each query attends to the first `sink_size` positions and the most recent
 //! `window_size` positions. Masked KV pages remain allocated in this example.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
@@ -66,20 +66,19 @@ async fn main(input: Input) -> Result<String> {
     let ws = WorkingSet::new();
     let slots = ws
         .reserve(pool_pages)
-        .map_err(|e| format!("reserve attention-sink KV: {e}"))?;
+        .context("reserve attention-sink KV")?;
     let pool_ids = slots.ids().to_vec();
 
-    let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let prefill_embed_indptr = Channel::from(vec![0u32, n]).named("prefill_embed_indptr");
-    let prefill_positions = Channel::from((0..n).collect::<Vec<_>>()).named("prefill_positions");
+    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
+    let prefill_embed_indptr = Channel::from([0u32, n]).named("prefill_embed_indptr");
+    let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
     let prefill_slots = Channel::from(
         (0..n)
             .map(|position| pool_ids[(position / PAGE_T) as usize])
             .collect::<Vec<_>>(),
     );
-    let prefill_offsets =
-        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>());
-    let prefill_klen = Channel::from(vec![n]);
+    let prefill_offsets = Channel::from_iter((0..n).map(|position| position % PAGE_T));
+    let prefill_klen = Channel::from([n]);
     let prefill_pages = Channel::from(pool_ids.clone());
     // The page CSR is the wire's source of truth for kv_len: the driver derives
     // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
@@ -98,15 +97,17 @@ async fn main(input: Input) -> Result<String> {
     prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
     prefill.attention(
         &ws,
-        ..,
-        ..,
-        &prefill_klen,
-        &prefill_pages,
-        &prefill_indptr,
-        &prefill_slots,
-        &prefill_offsets,
-        &prefill_positions,
-        Some(&causal),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &prefill_klen,
+            pages: &prefill_pages,
+            page_indptr: &prefill_indptr,
+            w_slot: &prefill_slots,
+            w_off: &prefill_offsets,
+            positions: &prefill_positions,
+            mask: Some(&causal),
+        },
     )?;
     prefill.epilogue(move || {
         first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
@@ -118,14 +119,10 @@ async fn main(input: Input) -> Result<String> {
     let pipeline = Pipeline::new();
     prefill
         .submit(&pipeline)
-        .map_err(|e| format!("attention-sink prefill: {e}"))?;
+        .context("attention-sink prefill")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
-    let first = first_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read first token: {e}"))?[0] as u32;
+    let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -133,15 +130,15 @@ async fn main(input: Input) -> Result<String> {
     }
     if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
         pipeline.close();
-        return wit_model::decode(&generated);
+        return model::decode(&generated);
     }
 
-    let token_in = Channel::from(vec![first as i32]).named("token_in");
-    let position = Channel::from(vec![n]).named("position");
-    let fill = Channel::from(vec![n + 1]).named("fill");
-    let klen = Channel::from(vec![n + 1]).named("klen");
-    let write_slot = Channel::from(vec![pool_ids[(n / PAGE_T) as usize]]);
-    let write_offset = Channel::from(vec![n % PAGE_T]);
+    let token_in = Channel::from([first as i32]).named("token_in");
+    let position = Channel::from([n]).named("position");
+    let fill = Channel::from([n + 1]).named("fill");
+    let klen = Channel::from([n + 1]).named("klen");
+    let write_slot = Channel::from([pool_ids[(n / PAGE_T) as usize]]);
+    let write_offset = Channel::from([n % PAGE_T]);
     let mask = Channel::from_shaped(
         [1, pool_len],
         host_sink_window_mask(pool_len, n, sink, window),
@@ -154,23 +151,25 @@ async fn main(input: Input) -> Result<String> {
         .named("token_out");
 
     let decode = ForwardPass::new();
-    let decode_indptr = Channel::from(vec![0u32, 1]).named("decode_indptr");
+    let decode_indptr = Channel::from([0u32, 1]).named("decode_indptr");
     decode.embed(&token_in, &decode_indptr)?;
     decode.attention(
         &ws,
-        ..,
-        ..,
-        &klen,
-        &pages,
-        &page_indptr,
-        &write_slot,
-        &write_offset,
-        &position,
-        Some(&mask),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &write_slot,
+            w_off: &write_offset,
+            positions: &position,
+            mask: Some(&mask),
+        },
     )?;
     decode.epilogue(move || {
-        let base = fill.take().tensor();
-        let ids = pool_ids_input.take().tensor();
+        let base = fill.take();
+        let ids = pool_ids_input.take();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
         let next_mask = reshape(
             sink_window_mask(&base, pool_len, sink, window),
@@ -206,11 +205,7 @@ async fn main(input: Input) -> Result<String> {
 
     let budget = input.max_tokens.saturating_sub(generated.len());
     run_ahead(&pipeline, &decode, budget, async || {
-        let token = token_out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("read generated token: {e}"))?[0] as u32;
+        let token = token_out.take_host::<i32>().await? as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }
@@ -221,5 +216,5 @@ async fn main(input: Input) -> Result<String> {
     // Any fire still in flight after an early stop is left untaken; close
     // releases the scheduler wait-set and reclaims them.
     pipeline.close();
-    wit_model::decode(&generated)
+    model::decode(&generated)
 }

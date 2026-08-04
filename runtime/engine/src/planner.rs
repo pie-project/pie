@@ -462,6 +462,14 @@ pub struct PlannerQueueEntry {
 /// reports. A wedge needs the first few; a healthy fleet needs none.
 const RUNNER_DUMP_CAP: usize = 24;
 
+/// The reciprocal of the host-pool slice the eviction rung may not spend on
+/// a fleet that is still running — see the HOST RESERVE note in
+/// [`ResidencyPlanner::plan_eviction`]. It only has to be large enough that
+/// a live fleet's evictees cannot squeeze the pool to the `host_free == 0`
+/// kill arm, and small enough that it never binds where host room is
+/// plentiful relative to the device pool.
+const HOST_RESERVE_DIVISOR: u32 = 8;
+
 #[derive(Debug, Clone)]
 pub struct PlannerDiagnostics {
     pub device_pages_free: u32,
@@ -761,11 +769,128 @@ impl Inner {
     /// invariant, looked up here and nowhere else. A served-but-uncollected
     /// grant no longer competes for pages (its collector removes it
     /// promptly), so the next ask behind it drains meanwhile.
+    ///
+    /// A restore YIELDS to every unmet allocation. Spawn order alone is the
+    /// wrong key across that boundary: an allocation comes from a resident
+    /// process that already holds pages and needs one more step, and only a
+    /// resident can complete — a completion is the single event that
+    /// returns a whole working set to the pool. A restore instead adds a
+    /// claimant to a pool the resident set cannot already cover, and it
+    /// arrives holding an OLD spawn seq, so pure FCFS hands it the head
+    /// ahead of the residents whose eviction paid for the pages.
+    ///
+    /// The module header argued thrash was unrepresentable because "a
+    /// victim is younger than the head it funded, and its restore entry
+    /// queues behind every older ask". That holds for one step and not for
+    /// the loop: the older asks each want ONE page, they drain in
+    /// microseconds, and then the evictee is the oldest entry left and
+    /// takes its whole working set back. Measured on D/512 with the rung
+    /// open: 993 evictions against 929 restores for a net of 64 processes
+    /// out, `free` pinned at 0, and 314 residents holding 26 pages each
+    /// against the 35 they each need to finish — 234 residents would have
+    /// fit. The pool oscillated instead of draining.
+    ///
+    /// Yielding cannot deadlock on its own: an unmet allocation is funded
+    /// by evicting residents, and evicting every resident leaves nothing
+    /// but restores in the queue, which then board in spawn order. It is
+    /// the fleet stalling for some OTHER reason — a resident parked on
+    /// something an evictee owns — that the yield must not outlive, so
+    /// [`Inner::fleet_stalled`] hands the head straight back to the oldest
+    /// entry of any kind.
+    ///
+    /// That argument has a second precondition it did not name: eviction
+    /// must be able to KEEP evicting. It is funded by the host pool, which
+    /// is finite, and the only event that returns a host slot is a restore
+    /// — the very thing being yielded. Once the pool is out, "evict every
+    /// resident" is not reachable, the unmet allocations stay unmet, and
+    /// the evictees holding the host pool can never come back to release
+    /// it. `fleet_stalled` does not catch it, because residents ARE
+    /// completing; the fleet is live and starving a resource at the same
+    /// time. Measured on `soak` (160 device pages, 1024 host pages, 4096
+    /// requests at 256-way): the rung drained host_free 1024 -> 0 in the
+    /// first seconds and it never recovered — restores pinned at 1-8 and
+    /// `evicted` at ~210 for the remaining 60 s while every further
+    /// attempt rolled back on `HostSwapFull`, 21895 of them, and the
+    /// starvation rung killed 138 of the stranded processes. Before the
+    /// yield the same fleet ran 123 evictions, 0 rollbacks and 0 kills.
+    /// So [`Inner::eviction_unfundable`] is the second valve.
     fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
+        let mut oldest_restore: Option<EntryKey> = None;
+        let mut allocation: Option<EntryKey> = None;
+        for (&key, waiter) in &self.queue {
+            if !waiter.is_unmet() {
+                continue;
+            }
+            match &waiter.kind {
+                // Keys ascend, so the first unmet allocation is the oldest,
+                // and every restore that could outrank it has been seen.
+                WaitKind::Allocation { .. } => {
+                    allocation = Some(key);
+                    break;
+                }
+                WaitKind::Restore { .. } => {
+                    oldest_restore.get_or_insert(key);
+                }
+            }
+        }
+        let head = match (allocation, oldest_restore) {
+            (Some(allocation), Some(restore)) => {
+                if restore < allocation && (self.fleet_stalled() || self.eviction_unfundable()) {
+                    restore
+                } else {
+                    allocation
+                }
+            }
+            (Some(allocation), None) => allocation,
+            (None, restore) => restore?,
+        };
         self.queue
-            .iter()
-            .find(|(_, waiter)| waiter.is_unmet())
+            .get_key_value(&head)
             .map(|(&key, waiter)| (key, waiter))
+    }
+
+    /// Eviction has run out of the resource that funds it. A victim parked
+    /// in `host_swap_blocked` is proof: its bytes were refused by the host
+    /// pool, and victim selection is deterministic, so nothing about that
+    /// answer changes until host slots are actually returned. Only a
+    /// restore returns them, which is why this gates the restore yield in
+    /// [`Inner::unmet_head`] — preferring an allocation here cannot serve
+    /// it, since the rung that would fund it is blocked on the same pool.
+    ///
+    /// Deliberately a live signal rather than a latch: `clear_host_swap_blocks`
+    /// empties the set the moment host room returns, so the yield resumes as
+    /// soon as eviction can pay for itself again.
+    fn eviction_unfundable(&self) -> bool {
+        !self.host_swap_blocked.is_empty()
+    }
+
+    /// No completion can ever arrive on its own: no eviction in flight, no
+    /// grant served and awaiting collection, and every admitted resident
+    /// parked in the queue.
+    ///
+    /// The eviction rung's last-resort path and the starvation rung share
+    /// this predicate through [`ResidencyPlanner::is_wedged`], so the two
+    /// can never disagree about when waiting is still an option.
+    fn fleet_stalled(&self) -> bool {
+        if !self.evicting.is_empty() {
+            return false;
+        }
+        let mut parked = HashSet::new();
+        for waiter in self.queue.values() {
+            match &waiter.kind {
+                WaitKind::Allocation {
+                    outcome: Some(_), ..
+                } => return false,
+                _ => {
+                    parked.insert(waiter.pid);
+                }
+            }
+        }
+        self.procs.iter().all(|(pid, proc)| match proc.state {
+            Residency::Resident => !proc.admitted || parked.contains(pid),
+            Residency::Evicting | Residency::Restoring => false,
+            Residency::Evicted => true,
+        })
     }
 }
 
@@ -1533,35 +1658,84 @@ impl ResidencyPlanner {
         // Eviction funds the head only when KV bytes can physically move
         // out: a swap-incapable driver or an exhausted host pool leaves the
         // starvation predicate as the last rung.
-        let (host_free, _) = self.port.host_stats();
+        let (host_free, host_total) = self.port.host_stats();
         if !self.port.suspend_capable() || host_free == 0 {
             self.check_starvation(StarveCause::NoSwapRoom);
             return;
         }
-        // LOAD CONTROL. Eviction is a LIVENESS rung, not a demand rung.
+        // HOST RESERVE. The rung may not spend the last of the host pool on
+        // a fleet that is still running.
         //
-        // A shortage is not by itself a reason to move KV bytes. While any
-        // admitted process is still running, its pages are already on their
-        // way back to the pool: it will retire, free, and poke the drain.
-        // Evicting to serve the head sooner only trades that free for a
-        // fence → lane-leave → lease-quiesce → D2H → H2D round trip, and
-        // then owes an H2D to put the victim back — for a pool that was
-        // going to turn over anyway.
+        // The gate below asks whether waiting can produce the next page. It
+        // does not ask what the eviction is being paid for with. Eviction is
+        // funded by the host pool, the pool is finite, and the only event
+        // that returns a host slot is a restore — so a saturated fleet,
+        // whose `free` is 0 by definition and whose head is therefore
+        // permanently unmet, drains the host pool to nothing and then meets
+        // the `host_free == 0` arm above, which is a KILL. The fleet was
+        // never in trouble; it was recycling its pages as fast as it could.
         //
-        // Measured, X-shape at 3.1x oversubscription (1024 req, conc 512,
-        // 8192 pages): demand-triggered eviction ran 982 times in 36 s to
-        // avoid the 9 starvation restarts the same shape takes with no swap
-        // at all, at p50 246 ms per victim (135 ms of it just waiting out
-        // the victim's in-flight lease) and 77 MB moved each way. Batch
-        // width was never the limit — p90 was 352 of a 366 request cap — so
-        // the extra residency bought nothing.
+        // Measured on `soak` (160 device pages, 1024 host pages, 4096
+        // requests at 256-way): the rung took host_free 1024 -> 0 in the
+        // first seconds and held it there for the remaining 60 s, running
+        // 631 evictions against 123 before the rung was opened and handing
+        // 99 processes to the starvation rung — every one of them destroyed
+        // and restarted, i.e. work thrown away by a fleet that was
+        // completing normally.
         //
-        // The wedge predicate is exactly "no completion can ever arrive on
-        // its own", and it is the same one the starvation rung uses, so the
-        // two can never disagree about when waiting is still an option.
-        // Under it, host swap does what it is for: a wedged fleet PARKS to
-        // host DRAM instead of having a request destroyed.
-        if !self.is_wedged() {
+        // So the last slice of the host pool is reserved for the case the
+        // rung actually exists for. [`Self::is_wedged`] — nothing admitted
+        // can progress on its own — spends it; anything less defers and
+        // waits for the completion that a live fleet will deliver. This
+        // does not close the rung at high oversubscription, which is the
+        // defect the wedge predicate had: the reserve is a fraction of the
+        // HOST pool, so it binds only where host room is scarce relative to
+        // demand. On the D/512 shape the rung exists for (8192 device pages
+        // against 16384 host pages) the reserve is 2048 host pages and the
+        // device pool cannot put enough out to reach it.
+        if host_free.saturating_mul(HOST_RESERVE_DIVISOR) <= host_total && !self.is_wedged() {
+            self.stats
+                .eviction_deferrals
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // LOAD CONTROL. Eviction is a SUPPLY rung, not a demand rung.
+        //
+        // A shortage is not by itself a reason to move KV bytes: a process
+        // that is still running will retire, free, and poke the drain, and
+        // evicting to serve the head sooner only trades that free for a
+        // fence → lane-leave → lease-quiesce → D2H round trip and an H2D
+        // owed to put the victim back.
+        //
+        // What that argument needs, and what the wedge predicate assumed,
+        // is that a running process's pages are ALREADY on their way back.
+        // At high oversubscription they are not. Measured on D/512 (768
+        // requests, 512-way, 8192 pages, 35 pages needed per request): 512
+        // admitted processes each held ~16 pages of the 35 their last token
+        // needs, `free` was 0 for 98.75% of samples, and the FCFS head's
+        // ask was 1 page. Nobody could finish, so nobody freed, so the
+        // wedge predicate — which is false while ANY admitted process is
+        // unparked — deferred 22826 of 22859 attempts (99.86%) and moved
+        // 595 of 8192 pages. Host swap was dead code in the one regime it
+        // exists for, and the shape ran at 0.71x of vLLM.
+        //
+        // So the gate is the arithmetic of supply instead: the pool is
+        // empty, nothing is already on its way (no eviction in flight, no
+        // kill ordered), and the head's ask exceeds what the accumulation
+        // has managed to pull. Those four together are "waiting cannot
+        // produce the next page", which is the honest form of what the
+        // wedge predicate was reaching for.
+        //
+        // This IS more eviction than before, and the X-shape number above
+        // is the standing warning about paying for it. Three things bound
+        // it. Host swap is opt-in — with no host room the rung returns
+        // `NoSwapRoom` above and never reaches this gate at all, so every
+        // no-swap deployment is unaffected. The HOST RESERVE above caps
+        // how much of the host pool a live fleet may spend. And
+        // `evicting.is_empty()` keeps one victim in flight at a time, so
+        // the rung's rate is set by how fast a victim can land, not by how
+        // often demand asks.
+        if !self.supply_stalled() {
             self.stats
                 .eviction_deferrals
                 .fetch_add(1, Ordering::Relaxed);
@@ -1743,28 +1917,38 @@ impl ResidencyPlanner {
     /// forever: the whole admitted cohort parked on an empty pool, the
     /// unadmitted remainder queued behind the very permits those parked
     /// processes hold, and the starvation rung disarmed by their presence.
-    fn is_wedged(&self) -> bool {
+    /// Waiting cannot produce the next page: the pool is empty, nothing is
+    /// already on its way back through the planner (no eviction in flight,
+    /// no kill ordered), and the head still asks for more than the
+    /// accumulation holds.
+    ///
+    /// This is the eviction rung's load control. It is strictly weaker than
+    /// [`Self::is_wedged`], which additionally requires that no admitted
+    /// process is running — see the measurement in `plan_eviction` for why
+    /// that extra clause made the rung unreachable at high
+    /// oversubscription.
+    fn supply_stalled(&self) -> bool {
+        let (free, _) = self.port.device_stats();
+        if free > 0 {
+            return false;
+        }
         self.with_inner(|inner| {
-            if !inner.evicting.is_empty() {
+            if !inner.evicting.is_empty() || inner.kill_in_flight() {
                 return false;
             }
-            let mut parked = std::collections::HashSet::new();
-            for waiter in inner.queue.values() {
-                match &waiter.kind {
-                    WaitKind::Allocation {
-                        outcome: Some(_), ..
-                    } => return false,
-                    _ => {
-                        parked.insert(waiter.pid);
-                    }
-                }
+            match inner.unmet_head() {
+                Some((_, head)) => head.kv_need() > inner.accum.len() as u32,
+                None => false,
             }
-            inner.procs.iter().all(|(pid, proc)| match proc.state {
-                Residency::Resident => !proc.admitted || parked.contains(pid),
-                Residency::Evicting | Residency::Restoring => false,
-                Residency::Evicted => true,
-            })
         })
+    }
+
+    /// No completion can ever arrive on its own — see
+    /// [`Inner::fleet_stalled`]. The starvation rung's precondition, and
+    /// the eviction rung's last resort, so the two can never disagree
+    /// about when waiting is still an option.
+    fn is_wedged(&self) -> bool {
+        self.with_inner(|inner| inner.fleet_stalled())
     }
 
     /// Last-resort victim search, immediately before the starvation rung
@@ -2860,6 +3044,213 @@ pub fn planner() -> Option<&'static Arc<ResidencyPlanner>> {
     PRIMARY.get()
 }
 
+/// Service order across the allocation/restore boundary — [`Inner::unmet_head`]
+/// is the single place that decides it, so these drive it directly.
+#[cfg(test)]
+mod service_order_tests {
+    use super::*;
+    use crate::planner::grant::Demand;
+
+    /// Build an `Inner` holding one process per `(seq, residency, admitted)`
+    /// triple, returning the pids in the order given.
+    fn fleet(spec: &[(u64, Residency, bool)]) -> (Inner, Vec<ProcessId>) {
+        let mut inner = Inner::default();
+        let mut pids = Vec::new();
+        for &(seq, state, admitted) in spec {
+            let pid = ProcessId::new_v4();
+            let mut proc = Proc::new(seq);
+            proc.state = state;
+            proc.admitted = admitted;
+            inner.procs.insert(pid, proc);
+            pids.push(pid);
+        }
+        (inner, pids)
+    }
+
+    fn park_allocation(inner: &mut Inner, pid: ProcessId, seq: u64, kv_pages: u32) {
+        inner.queue.insert(
+            (seq, seq),
+            Waiter {
+                pid,
+                kind: WaitKind::Allocation {
+                    demand: Demand {
+                        kv_pages,
+                        rs_slots: 0,
+                    },
+                    notify: Arc::new(Notify::new()),
+                    outcome: None,
+                    yielded: false,
+                },
+            },
+        );
+    }
+
+    fn park_restore(inner: &mut Inner, pid: ProcessId, seq: u64, demand: u32) {
+        inner.queue.insert(
+            (seq, seq),
+            Waiter {
+                pid,
+                kind: WaitKind::Restore { demand },
+            },
+        );
+    }
+
+    /// The ping-pong regression. An evictee carries an OLD spawn seq back
+    /// into the queue, so pure FCFS hands it the head ahead of the residents
+    /// whose eviction paid for those pages — measured on D/512 as 993
+    /// evictions against 929 restores, net 64 processes out, `free` pinned
+    /// at 0. Only a resident can complete, so the resident's ask goes first.
+    #[test]
+    fn a_restore_yields_the_head_to_a_younger_allocation() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            // Still running, so the fleet has not stalled.
+            (2, Residency::Resident, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[2], 3, 1);
+
+        let (key, waiter) = inner.unmet_head().expect("a head");
+        assert_eq!(key.0, 3, "the younger allocation must take the head");
+        assert!(matches!(waiter.kind, WaitKind::Allocation { .. }));
+    }
+
+    /// The safety valve. Yielding forever would deadlock a fleet whose
+    /// residents are all parked on something an evictee owns, so once no
+    /// completion can arrive on its own the head goes back to spawn order.
+    #[test]
+    fn a_restore_takes_the_head_once_the_fleet_has_stalled() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[1], 3, 1);
+
+        assert!(inner.fleet_stalled(), "every admitted resident is parked");
+        let (key, waiter) = inner.unmet_head().expect("a head");
+        assert_eq!(key.0, 1, "the older restore must take the head");
+        assert!(matches!(waiter.kind, WaitKind::Restore { .. }));
+    }
+
+    /// An eviction in flight is a completion on its way, so the fleet has
+    /// not stalled and the valve stays shut.
+    #[test]
+    fn an_eviction_in_flight_keeps_the_restore_yielding() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[1], 3, 1);
+        inner
+            .evicting
+            .insert(ProcessId::new_v4(), EvictionMark { pages: 26 });
+
+        assert!(!inner.fleet_stalled(), "a transfer is already in flight");
+        assert_eq!(inner.unmet_head().expect("a head").0.0, 3);
+    }
+
+    /// Nothing to yield TO: a served-but-uncollected grant has stopped
+    /// competing for pages, so the restore boards on its own order without
+    /// needing the stall valve at all.
+    #[test]
+    fn a_restore_holds_the_head_when_no_allocation_is_unmet() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[1], 3, 1);
+        let Some(Waiter {
+            kind: WaitKind::Allocation { outcome, .. },
+            ..
+        }) = inner.queue.get_mut(&(3, 3))
+        else {
+            unreachable!("just parked an allocation");
+        };
+        *outcome = Some(Err(PlannerError::Cancelled));
+
+        assert!(!inner.fleet_stalled(), "a served grant is uncollected");
+        let (key, waiter) = inner.unmet_head().expect("a head");
+        assert_eq!(key.0, 1, "the restore is the only unmet entry");
+        assert!(matches!(waiter.kind, WaitKind::Restore { .. }));
+    }
+
+    /// The yield is one-directional: a restore that is genuinely younger
+    /// than the head keeps queueing behind it, exactly as FCFS says.
+    #[test]
+    fn a_younger_restore_still_queues_behind_an_older_allocation() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Resident, true),
+            (2, Residency::Resident, true),
+            (3, Residency::Evicted, true),
+        ]);
+        park_allocation(&mut inner, pids[0], 1, 4);
+        park_restore(&mut inner, pids[2], 3, 18);
+
+        let (key, waiter) = inner.unmet_head().expect("a head");
+        assert_eq!(key.0, 1);
+        assert!(matches!(waiter.kind, WaitKind::Allocation { .. }));
+    }
+
+    /// The second valve. The fleet is live — a resident is running, so
+    /// `fleet_stalled` is false and the first valve stays shut — but the
+    /// host pool that funds eviction is out, and only a restore returns a
+    /// host slot. Yielding here serves nobody: the allocation it yields to
+    /// can only be funded by an eviction that cannot be paid for. On `soak`
+    /// this ran for 60 s and cost 21895 rollbacks and 138 starvation kills.
+    #[test]
+    fn a_restore_takes_the_head_once_eviction_cannot_be_funded() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            (2, Residency::Resident, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[2], 3, 1);
+        assert!(!inner.fleet_stalled(), "a resident is still running");
+        assert_eq!(
+            inner.unmet_head().expect("a head").0.0,
+            3,
+            "with host room the yield stands"
+        );
+
+        inner.host_swap_blocked.insert(pids[1]);
+
+        assert!(inner.eviction_unfundable());
+        let (key, waiter) = inner.unmet_head().expect("a head");
+        assert_eq!(key.0, 1, "the older restore must take the head");
+        assert!(matches!(waiter.kind, WaitKind::Restore { .. }));
+    }
+
+    /// And it is a live signal, not a latch: once host room returns the
+    /// blocked set is cleared and the yield resumes, so the fix cannot
+    /// re-introduce the evict/restore ping-pong it is bounding.
+    #[test]
+    fn returning_host_room_resumes_the_yield() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            (2, Residency::Resident, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[2], 3, 1);
+        inner.host_swap_blocked.insert(pids[1]);
+        assert_eq!(inner.unmet_head().expect("a head").0.0, 1);
+
+        inner.host_swap_blocked.clear();
+
+        assert!(!inner.eviction_unfundable());
+        assert_eq!(
+            inner.unmet_head().expect("a head").0.0,
+            3,
+            "the allocation takes the head again"
+        );
+    }
+}
+
 #[cfg(test)]
 mod starvation_race_tests {
     use super::*;
@@ -2878,10 +3269,14 @@ mod starvation_race_tests {
         free: parking_lot::Mutex<Vec<PhysicalKvPageId>>,
         total: u32,
         stall: AtomicU32,
-        /// Host swap room. Zero (the default) keeps `plan_eviction` on its
-        /// `NoSwapRoom` short-circuit, which is what every starvation-rung
-        /// test wants; non-zero lets a test reach the load-control gate.
+        /// Host swap room still free. Zero (the default) keeps
+        /// `plan_eviction` on its `NoSwapRoom` short-circuit, which is what
+        /// every starvation-rung test wants; non-zero lets a test reach the
+        /// load-control gate.
         host: u32,
+        /// Host swap capacity. Kept apart from `host` so a test can put the
+        /// pool under the reserve without emptying it.
+        host_total: u32,
     }
 
     impl RacePool {
@@ -2891,6 +3286,7 @@ mod starvation_race_tests {
                 total,
                 stall: AtomicU32::new(0),
                 host: 0,
+                host_total: 0,
             }
         }
 
@@ -2899,6 +3295,18 @@ mod starvation_race_tests {
         fn with_swap(total: u32, host: u32) -> Self {
             Self {
                 host,
+                host_total: host,
+                ..Self::new(total)
+            }
+        }
+
+        /// A swap-capable pool whose host room is already down to `host` of
+        /// `host_total`, so the HOST RESERVE gate can be exercised without
+        /// emptying the pool (which is the separate `NoSwapRoom` arm).
+        fn with_host_pressure(total: u32, host: u32, host_total: u32) -> Self {
+            Self {
+                host,
+                host_total,
                 ..Self::new(total)
             }
         }
@@ -2919,7 +3327,7 @@ mod starvation_race_tests {
             (self.free.lock().len() as u32, self.total)
         }
         fn host_stats(&self) -> (u32, u32) {
-            (self.host, self.host)
+            (self.host, self.host_total)
         }
         fn rs_stats(&self) -> (u32, u32) {
             (0, 0)
@@ -2932,7 +3340,7 @@ mod starvation_race_tests {
             // straight to `check_starvation(NoSwapRoom)` — the shortest path
             // to the starvation rung, and it skips `last_resort_evict`
             // (which needs the real residency tables).
-            self.host > 0
+            self.host_total > 0
         }
         fn locus(&self) -> (usize, usize) {
             (0, 0)
@@ -3185,16 +3593,17 @@ mod starvation_race_tests {
         );
     }
 
-    /// Load control: a shortage alone must NOT move KV bytes.
+    /// Load control: an EXHAUSTED pool with no transfer in flight evicts,
+    /// even though admitted processes are still running.
     ///
-    /// While any admitted process is still running, its pages are already on
-    /// their way back to the pool — evicting only trades that free for a
-    /// fence → lease-quiesce → D2H → H2D round trip and an owed restore.
-    /// Eviction is therefore gated on the same wedge predicate the
-    /// starvation rung uses, so the two can never disagree about whether
-    /// waiting is still an option.
+    /// This inverts what the rung used to do. Gating on the wedge predicate
+    /// — false while ANY admitted process is unparked — made the rung
+    /// unreachable exactly when it is needed: at 512-way contention every
+    /// resident holds a partial working set, so nobody can finish, nobody
+    /// frees, and "its pages are already on their way back" is false for
+    /// every one of them. See `plan_eviction`'s LOAD CONTROL note.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_shortage_alone_defers_eviction_while_the_fleet_still_runs() {
+    async fn an_exhausted_pool_evicts_even_while_the_fleet_still_runs() {
         // Non-zero capacity with an empty free list: an ask bigger than the
         // pool is failed loud instead of parking.
         let pool = Arc::new(RacePool::with_swap(4, 64));
@@ -3252,20 +3661,122 @@ mod starvation_race_tests {
             "younger residents are legal victims"
         );
 
-        // ...yet the drain must not have spawned one, because `holder` is
-        // still running and will free on its own.
+        // `holder` is unparked, so the fleet is NOT wedged — and the rung
+        // must run anyway, because an exhausted pool with nothing in flight
+        // cannot produce the head's page by waiting. (It gets no further
+        // than the victim quotes here: `kv_reclaim_quotes` reads the real
+        // residency registry, which a planner-only fixture never fills.)
         assert!(!planner.is_wedged(), "a running holder is not a wedge");
-        let d = planner.diagnostics();
+        assert!(planner.supply_stalled(), "an empty pool with an unmet head");
         assert_eq!(
-            d.evictions_total, 0,
-            "a shortage alone must not move KV bytes"
-        );
-        assert!(
-            d.eviction_deferrals_total > 0,
-            "the load-control rung must record the deferral it made"
+            planner.diagnostics().eviction_deferrals_total,
+            0,
+            "the rung must not have deferred"
         );
 
+        // The two ways relief IS already on its way, each shutting the gate
+        // on its own: a victim in flight, and a kill ordered.
+        let mark = ProcessId::new_v4();
+        planner.with_inner(|inner| {
+            inner.evicting.insert(mark, EvictionMark { pages: 1 });
+        });
+        assert!(
+            !planner.supply_stalled(),
+            "a victim already in flight must hold the rung shut"
+        );
+        planner.with_inner(|inner| {
+            inner.evicting.remove(&mark);
+        });
+        assert!(planner.supply_stalled(), "and open again once it lands");
+
         parked.abort();
+    }
+
+    /// HOST RESERVE: the rung may not spend the last of the host pool on a
+    /// fleet that is still running.
+    ///
+    /// Load control asks whether waiting can produce the next page. It does
+    /// not ask what the eviction is PAID for. A saturated fleet has `free`
+    /// at 0 by definition, so its head is permanently unmet and the gate is
+    /// permanently open — which drained the host pool to nothing and then
+    /// handed the stranded processes to the starvation rung, one rung below
+    /// the `host_free == 0` arm. See `plan_eviction`'s HOST RESERVE note
+    /// for the `soak` measurement.
+    ///
+    /// Two fixtures identical but for host room, so the reserve is the only
+    /// thing that can differ in the outcome. That the reserve is still
+    /// SPENT by a wedge is the `!is_wedged()` clause in the gate, and the
+    /// suite's wedge scenarios (`tinyswap`, `tinyswap_thrash`, `onefits`)
+    /// are what hold it: all of them still reach eviction.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_running_fleet_may_not_spend_the_last_of_the_host_pool() {
+        for host_free in [8u32, 64] {
+            let under_reserve = host_free * HOST_RESERVE_DIVISOR <= 128;
+            assert_eq!(under_reserve, host_free == 8, "the fixtures straddle it");
+
+            // Host room down to `host_free` of 128, and never zero: the
+            // `NoSwapRoom` arm is a different gate and must not be what
+            // fires here.
+            let pool = Arc::new(RacePool::with_host_pressure(4, host_free, 128));
+            let planner = Arc::new(ResidencyPlanner::new(
+                pool.clone(),
+                PlannerConfig::default(),
+            ));
+
+            // An unparked admitted runner: the fleet is live, so the head's
+            // ask parks instead of being destroyed on arrival.
+            let holder = ProcessId::new_v4();
+            planner.register(holder);
+            planner.note_admitted(holder);
+
+            let head = ProcessId::new_v4();
+            planner.register(head);
+            planner.note_admitted(head);
+            // Younger, resident, admitted: legal victims, so a set exists
+            // and only the gate can hold the round back.
+            for _ in 0..3 {
+                let pid = ProcessId::new_v4();
+                planner.register(pid);
+                planner.note_admitted(pid);
+            }
+
+            let demand = Demand {
+                kv_pages: 1,
+                rs_slots: 0,
+            };
+            let p = planner.clone();
+            let parked = tokio::spawn(async move { p.acquire(head, head, demand).await });
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if planner.diagnostics().queue.len() == 1 {
+                    break;
+                }
+            }
+            assert_eq!(planner.diagnostics().queue.len(), 1, "the ask must park");
+
+            // Everything load control looks at says "evict": empty pool,
+            // unmet head, nothing in flight, fleet not wedged. Only the
+            // reserve is left to tell the two rounds apart.
+            assert!(planner.supply_stalled(), "an empty pool with an unmet head");
+            assert!(!planner.is_wedged(), "a running holder is not a wedge");
+
+            let before = planner.diagnostics().eviction_deferrals_total;
+            planner.plan_eviction();
+            let deferred = planner.diagnostics().eviction_deferrals_total - before;
+            assert_eq!(
+                deferred,
+                u64::from(under_reserve),
+                "a live fleet under the reserve waits for the completion it \
+                 will deliver, and evicts as usual above it (host_free={host_free})"
+            );
+            assert_eq!(
+                planner.diagnostics().starvations_total,
+                0,
+                "and deferring is never starving"
+            );
+
+            parked.abort();
+        }
     }
 
     /// The destruction guard clears on BOTH of its exits, so it can never

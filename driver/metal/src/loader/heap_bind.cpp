@@ -359,9 +359,16 @@ class TranscodeGpu {
             encoder.set_argtable_ordinal(ordinal);
             encoder.dispatch(Grid{threads, 1, 1}, Threadgroup{width, 1, 1});
         });
-        if (timing.timed_out) {
+        if (!timing.succeeded()) {
+            // This used to read `timing.timed_out`, back when that meant "took
+            // longer than five seconds" -- so a transform over a large expert
+            // bank on a busy machine was killed for being slow, and one that
+            // genuinely never finished was waited on forever instead. It now
+            // means the driver gave up, which is the thing worth throwing on.
             throw std::runtime_error(
-                "metal storage executor: a load-time transform did not complete");
+                "metal storage executor: a load-time transform did not complete" +
+                (timing.gpu_error_text.empty() ? std::string()
+                                               : ": " + timing.gpu_error_text));
         }
         return true;
     }
@@ -426,6 +433,70 @@ void run_tile_map(
     };
 
     switch (op.tile_kind) {
+    case pie_loader::PieLoaderTileMapKind::Cast: {
+        // Raw to raw, and only ever narrowing to BF16 -- the one float format
+        // every kernel in this driver reads. `push_direct` emits this whenever
+        // a checkpoint ships F16 or F32, which `mlx-community`'s Llama
+        // conversions do for every unpacked tensor they have.
+        if (op.output_buffers.len != 1) {
+            throw std::runtime_error(
+                "metal storage executor: a Cast writes exactly one buffer");
+        }
+        const auto& out_decl = index.buffer(op.output_buffers.ptr[0]);
+        if (!out_decl.has_tensor) {
+            throw std::runtime_error("metal storage executor: Cast output has no tensor type");
+        }
+        const auto& out_tensor = index.tensor(out_decl.tensor_id);
+        if (out_tensor.encoding_kind != pie_loader::PieLoaderEncodingKind::Raw ||
+            out_tensor.dtype != pie_loader::PieLoaderDType::BF16) {
+            throw std::runtime_error(
+                "metal storage executor: Cast is implemented for raw BF16 outputs only");
+        }
+        // The input's width comes from whichever side supplied it, so a fused
+        // read off disk and a transform of a resident buffer answer the same
+        // question in the same units.
+        pie_loader::PieLoaderDType from{};
+        if (op.has_source) {
+            from = index.source(op.source.tensor_id).dtype;
+        } else {
+            if (op.input_buffers.len == 0) {
+                throw std::runtime_error(
+                    "metal storage executor: Cast has neither a source nor an operand");
+            }
+            const auto& in_decl = index.buffer(op.input_buffers.ptr[0]);
+            if (!in_decl.has_tensor) {
+                throw std::runtime_error(
+                    "metal storage executor: Cast operand has no tensor type");
+            }
+            from = index.tensor(in_decl.tensor_id).dtype;
+        }
+        std::uint32_t src_bytes = 0;
+        switch (from) {
+        case pie_loader::PieLoaderDType::F16:
+        case pie_loader::PieLoaderDType::BF16: src_bytes = 2; break;
+        case pie_loader::PieLoaderDType::F32: src_bytes = 4; break;
+        default:
+            throw std::runtime_error(
+                "metal storage executor: Cast reads F16, BF16 or F32 only");
+        }
+        const auto [bytes, size] = payload(0);
+        if (src_bytes == 0 || size % src_bytes != 0) {
+            throw std::runtime_error(
+                "metal storage executor: Cast operand is not a whole number of elements");
+        }
+        const SlotHandle& out = slot(op.output_buffers.ptr[0]);
+        const std::uint64_t at = op.has_dest ? op.dest.offset + op.dest.stride.base_offset : 0;
+        if (at > out.size) {
+            throw std::runtime_error(
+                "metal storage executor: Cast destination is out of bounds");
+        }
+        trace.scale_out_bytes += size;
+        const auto _span = trace.span(&trace.scale_ms);
+        tc::cast_float_to_bf16(
+            bytes, src_bytes, static_cast<std::int64_t>(size / src_bytes),
+            tc::Region{static_cast<std::uint8_t*>(out.contents()) + at, out.size - at});
+        return;
+    }
     case pie_loader::PieLoaderTileMapKind::Scale: {
         if (op.output_buffers.len != 1 || op.transform_scale_blocks.len == 0) {
             throw std::runtime_error(
@@ -626,6 +697,42 @@ namespace {
 // second implementation would quietly diverge, and a checkpoint staged two
 // slightly different ways is a model that works for one family and produces
 // plausible wrong tokens for the other.
+WeightBytes weight_bytes(const std::unordered_map<std::string, SlotHandle>& weights,
+                         int n_experts, int experts_per_token) {
+    // A mixture with a top-k wider than its bank would be a config defect, and
+    // a share above one would silently inflate the bandwidth it claims.
+    const double share = (n_experts > 0 && experts_per_token > 0 && experts_per_token < n_experts)
+                             ? double(experts_per_token) / double(n_experts)
+                             : 1.0;
+    WeightBytes out;
+    for (const auto& [name, slot] : weights) {
+        out.resident += slot.size;
+        // `mlp.experts.` is the runtime name every family's routed bank is
+        // staged under -- llama's, qwen3.5's and gpt-oss's alike -- and the
+        // shared expert beside it is `mlp.shared_expert.`, which every token
+        // reads whole and which this therefore leaves alone.
+        if (name.find("mlp.experts.") != std::string::npos) {
+            out.routed_resident += slot.size;
+            out.per_token += double(slot.size) * share;
+        } else if (name.rfind("embed_tokens", 0) == 0) {
+            // Gathered, one row a token. Counted at zero rather than at a row
+            // because a row is under a millionth of what a layer moves and
+            // pretending to that precision would suggest the rest has it.
+            //
+            // `embed_tokens` is the UNTIED spelling -- `EmbedUntied` binds it
+            // and `LmHeadUntied` binds a separate `lm_head`, which is read in
+            // full and counted in full. A tied checkpoint stages one tensor
+            // called `shared_embedding` that serves both, and it falls to the
+            // branch below because the head does read every row of it.
+            // `embed_tokens_per_layer` is gemma4's second gathered table and
+            // shares the prefix on purpose.
+        } else {
+            out.per_token += double(slot.size);
+        }
+    }
+    return out;
+}
+
 StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
     const pie_loader::CheckpointSource& view,
@@ -646,14 +753,41 @@ StagedWeights stage_plan_weights(
     const auto load_plan = load.view();
     for (std::size_t i = 0; i < load_plan.tensors.len; ++i) {
         const auto& tensor = load_plan.tensors.ptr[i];
-        if (tensor.quant_scheme ==
-                pie_loader::PieLoaderQuantScheme::MlxAffineU4 &&
-            (tensor.quant_bits_per_element != 4 ||
-             tensor.quant_group_size != 64)) {
+        // Every quantized encoding SOME kernel here reads, listed rather than
+        // pattern-matched. This is a necessary condition and not a sufficient
+        // one: 8-bit g64 is on the list because gpt-oss's router is 8-bit and
+        // has its own matvec, which does not mean an 8-bit llama has one. That
+        // second question is about which kernel a family names for a width, so
+        // it is asked where the width chooses a kernel and not here.
+        const auto scheme = tensor.quant_scheme;
+        const int bits = int(tensor.quant_bits_per_element);
+        const int group = int(tensor.quant_group_size);
+        // The affine group is an axis now, not a constant: `quantized_qmv`,
+        // `embed_gather` and `quantized_qmm_t` all instantiate at 32, 64 and
+        // 128, so the width and the group are two independent choices rather
+        // than the one pair g64/b4 every kernel name used to be spelled with.
+        //
+        // Still necessary and not sufficient, in the same way the width is.
+        // The ROUTED matvec takes its group from its codec, which is fixed at
+        // 64 because only g64 mixtures are published, so a routed checkpoint
+        // at another group passes here and fails where its pipeline is built,
+        // by name. That is the same place a width with no instantiation fails.
+        const bool affine_group = group == 32 || group == 64 || group == 128;
+        const bool readable =
+            scheme == pie_loader::PieLoaderQuantScheme::None ||
+            (scheme == pie_loader::PieLoaderQuantScheme::MlxAffineU4 && bits == 4 &&
+             affine_group) ||
+            (scheme == pie_loader::PieLoaderQuantScheme::Int8Asymmetric && bits == 8 &&
+             affine_group) ||
+            (scheme == pie_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0 && bits == 4 &&
+             group == 32);
+        if (!readable) {
             throw std::runtime_error(
-                "metal qmv kernels require MLX affine-U4 g64/b4; plan requested g" +
-                std::to_string(tensor.quant_group_size) + "/b" +
-                std::to_string(tensor.quant_bits_per_element));
+                "no metal kernel here reads '" + std::string(reinterpret_cast<const char*>(tensor.name.ptr), tensor.name.len) +
+                "': scheme " + std::to_string(int(scheme)) + " at g" + std::to_string(group) +
+                "/b" + std::to_string(bits) +
+                ". The kernels read MLX affine at b4 or b8 over g32, g64 or g128, "
+                "and MXFP4 g32/b4.");
         }
     }
     std::unordered_map<std::uint32_t, SlotHandle> buffers;
@@ -1097,6 +1231,14 @@ void push_quant(std::vector<WeightBind>& out, const std::string& base) {
     out.push_back({2, base + ".biases"});
 }
 
+/// The MXFP4 flavour: a `.scales` of block exponents and no zero point. The
+/// third slot is left unbound because the format has nothing to put in it, and
+/// the kernel that reads these never loads from it.
+void push_mxfp4(std::vector<WeightBind>& out, const std::string& base) {
+    out.push_back({0, base + ".weight"});
+    out.push_back({1, base + ".scales"});
+}
+
 }  // namespace
 
 std::vector<WeightBind> weight_binds(
@@ -1104,8 +1246,14 @@ std::vector<WeightBind> weight_binds(
     int layer,
     const DecodeGeometry& g,
     bool gdn_prep) {
-    (void)g;
     std::vector<WeightBind> weights;
+    const auto push_expert = [&](std::vector<WeightBind>& o, const std::string& base) {
+        if (g.mxfp4_experts) {
+            push_mxfp4(o, base);
+        } else {
+            push_quant(o, base);
+        }
+    };
     const std::string prefix = layer >= 0 ? layer_prefix(layer) : std::string();
     switch (kind) {
     case Kernel::EmbedGather:
@@ -1149,18 +1297,8 @@ std::vector<WeightBind> weight_binds(
     case Kernel::QmvIn: push_quant(weights, prefix + "linear_attn.in_proj_qkv"); break;
     case Kernel::QmvInZ: push_quant(weights, prefix + "linear_attn.in_proj_z"); break;
     case Kernel::QmvOut: push_quant(weights, prefix + "linear_attn.out_proj"); break;
-    case Kernel::GdnInA:
-        weights.push_back({
-            static_cast<std::uint8_t>(bind::Dense::W),
-            prefix + "linear_attn.in_proj_a.weight",
-        });
-        break;
-    case Kernel::GdnInB:
-        weights.push_back({
-            static_cast<std::uint8_t>(bind::Dense::W),
-            prefix + "linear_attn.in_proj_b.weight",
-        });
-        break;
+    case Kernel::GdnInA: push_quant(weights, prefix + "linear_attn.in_proj_a"); break;
+    case Kernel::GdnInB: push_quant(weights, prefix + "linear_attn.in_proj_b"); break;
     // ── Gemma 4 ──
     // The norm sandwich: four per layer, so three of them need their own kind.
     case Kernel::G4AttnPostNorm:
@@ -1195,10 +1333,12 @@ std::vector<WeightBind> weight_binds(
     // projection carries an additive bias at slot 7 alongside its quantized
     // triplet. `.bias` and `.biases` differ by one character and mean nothing
     // alike; the triplet's zero point is the latter.
-    case Kernel::GoEmbed:
+    // Untied: the embedding table and the head are different tensors. Shared
+    // by gpt-oss and by any llama-family checkpoint that does not tie them.
+    case Kernel::EmbedUntied:
         push_quant(weights, "embed_tokens");
         break;
-    case Kernel::GoLmHead:
+    case Kernel::LmHeadUntied:
         push_quant(weights, "lm_head");
         break;
     case Kernel::GoQmvQ:
@@ -1225,16 +1365,16 @@ std::vector<WeightBind> weight_binds(
         weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.router.bias"});
         break;
     case Kernel::GoExpertGate:
-        push_quant(weights, prefix + "mlp.experts.gate_proj");
+        push_expert(weights, prefix + "mlp.experts.gate_proj");
         weights.push_back(
             {(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.gate_proj.bias"});
         break;
     case Kernel::GoExpertUp:
-        push_quant(weights, prefix + "mlp.experts.up_proj");
+        push_expert(weights, prefix + "mlp.experts.up_proj");
         weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.up_proj.bias"});
         break;
     case Kernel::GoExpertDown:
-        push_quant(weights, prefix + "mlp.experts.down_proj");
+        push_expert(weights, prefix + "mlp.experts.down_proj");
         weights.push_back(
             {(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.down_proj.bias"});
         break;
@@ -1243,6 +1383,47 @@ std::vector<WeightBind> weight_binds(
     case Kernel::GoRouterTopK:
     case Kernel::GoSwiGlu:
     case Kernel::GoExpertCombine:
+        break;
+
+    // ── The llama family's routed FFN ──
+    // The same tensors gpt-oss's experts use, minus the biases: Qwen's experts
+    // carry none, and asking for `mlp.experts.gate_proj.bias` on a checkpoint
+    // that has no such tensor is a load failure, not a zero.
+    case Kernel::LlRouter:
+        push_quant(weights, prefix + "mlp.gate");
+        break;
+    case Kernel::LlExpertGate:
+        push_expert(weights, prefix + "mlp.experts.gate_proj");
+        break;
+    case Kernel::LlExpertUp:
+        push_expert(weights, prefix + "mlp.experts.up_proj");
+        break;
+    case Kernel::LlExpertDown:
+        push_expert(weights, prefix + "mlp.experts.down_proj");
+        break;
+
+    // ── The Qwen3.5 mixture's shared expert ──
+    // A dense FFN under its own names. These are separate kinds from
+    // `QmvGate`/`QmvUp`/`QmvDown` for exactly this switch's sake: a kind is a
+    // weight name, and reusing the dense kinds would have made the contract
+    // rename `mlp.shared_expert.gate_proj` to `mlp.gate_proj` -- true of the
+    // shape, false of the model, and unreadable in any dump.
+    case Kernel::LlSharedGate:
+        push_quant(weights, prefix + "mlp.shared_expert.gate_proj");
+        break;
+    case Kernel::LlSharedUp:
+        push_quant(weights, prefix + "mlp.shared_expert.up_proj");
+        break;
+    case Kernel::LlSharedDown:
+        push_quant(weights, prefix + "mlp.shared_expert.down_proj");
+        break;
+    case Kernel::LlSharedGateProj:
+        push_quant(weights, prefix + "mlp.shared_expert_gate");
+        break;
+    // Weightless, like the mixture's own combine: it reads two activations and
+    // a gate, all produced this layer.
+    case Kernel::LlSharedCombine:
+    case Kernel::LlExpertSiluMul:
         break;
 
     case Kernel::G4PleResidualScaled:

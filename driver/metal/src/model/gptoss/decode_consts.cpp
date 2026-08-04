@@ -22,26 +22,16 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "kernels.hpp"
+#include "../shared_kernels.hpp"
 
 namespace pie::metal::gptoss {
 namespace {
 
-struct RmsParams {  // rms_norm.metal:22 (buffer 3)
-    float eps;
-    std::uint32_t axis_size;
-    std::uint32_t w_stride;
-    std::uint32_t plus_one;
-};
+using shared_kernels::RmsParams;
 
 template <class V>
 inline void bind_const(RawMetalContext& ctx, int ord, std::uint8_t idx, const V& val, int* count) {
-    SlotHandle s = ctx.const_slot(ord, idx, sizeof(V));
-    if (!s.valid()) {
-        throw std::runtime_error("gpt-oss consts: heap_alloc failed (budget too small)");
-    }
-    std::memcpy(s.contents(), &val, sizeof(V));
-    ctx.arg_bind_ordinal(ord, idx, s);
-    if (count != nullptr) ++*count;
+    shared_kernels::bind_const(ctx, ord, idx, val, count, "gpt-oss");
 }
 
 /// The KV cache is [n_kv_heads, kv_max_ctx, head_dim] per layer.

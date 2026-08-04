@@ -81,7 +81,7 @@ fn mirostat_step(
     let masked = select(&mask, &logits, &neg_inf);
     let g = gumbel(r, [vocab]);
     let token = reduce_argmax(add(masked, g)); // [1] i32
-    let p_token = gather(&probs, cast(&token, DType::U32)); // [1] f32
+    let p_token = gather(&probs, cast(&token, dtype::u32)); // [1] f32
     let surprise = neg(log(p_token)); // [1] f32
     (token, surprise)
 }
@@ -105,7 +105,7 @@ async fn main(input: String) -> Result<String> {
 
     let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     let mu0_default = (vocab as f32).ln() + 1.0;
     let mut mu: f32 = json_f32(&params, "mu0", mu0_default);
@@ -116,8 +116,7 @@ async fn main(input: String) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     let mut surprises: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -125,10 +124,10 @@ async fn main(input: String) -> Result<String> {
     // ── PREFILL FIRE (N-wide) — first mirostat step over the prompt. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
     let w_slot_p = Channel::from(
         (0..n)
             .map(|position| position / page_size)
@@ -142,27 +141,29 @@ async fn main(input: String) -> Result<String> {
     )
     .named("w_off_p");
     let mu_p = Channel::new([1], dtype::f32).named("mu_p");
-    let rng_p = Channel::from(vec![0x9e37_u32, 0]).named("rng_p");
+    let rng_p = Channel::from([0x9e37_u32, 0]).named("rng_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
     let s_out_p = Channel::new([1], dtype::f32).named("s_out_p");
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
     fwd_p.epilogue(move || {
-        let mu_v = mu_p.take().tensor();
+        let mu_v = mu_p.take();
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
         let (token, surprise) = mirostat_step(floor, logits, vocab, mu_v, &r);
@@ -178,19 +179,9 @@ async fn main(input: String) -> Result<String> {
     // (F7) right after the prefill submit only in the degenerate case where
     // zero decode fires follow.
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let s0 = s_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("s0 take: {e}"))?[0];
+    fwd_p.submit(&pipe).context("prefill submit")?;
+    let g0 = tok_out_p.take_host::<i32>().await?;
+    let s0 = s_out_p.take_host::<f32>().await?;
 
     generated.push(g0 as u32);
     surprises.push(s0);
@@ -200,36 +191,37 @@ async fn main(input: String) -> Result<String> {
     if generated.len() < max_tokens {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let mu_ch = Channel::new([1], dtype::f32).named("mu_ch");
-        let rng = Channel::from(vec![0x51ed_u32, 0]).named("rng");
+        let rng = Channel::from([0x51ed_u32, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32).named("tok_out");
         let s_out = Channel::new([1], dtype::f32).named("s_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         fwd.epilogue(move || {
             // Takes + compute first, PUTS last (value-id discipline).
-            let length = kv_len.take().tensor();
-            let mu_v = mu_ch.take().tensor(); // [1] f32, host-updated each step
+            let length = kv_len.take();
+            let mu_v = mu_ch.take(); // [1] f32, host-updated each step
             let r = rng.take(); // [2] u32 rng state
             let logits = intrinsics::logits(); // [vocab] f32
             let (token, surprise) = mirostat_step(floor, logits, vocab, mu_v, &r);
@@ -253,17 +245,15 @@ async fn main(input: String) -> Result<String> {
         for step in 1..max_tokens {
             mu_ch.put(vec![mu]);
             fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{step}: {e}"))?;
+                .with_context(|| format!("decode submit @{step}"))?;
             let t = tok_out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0];
+                .with_context(|| format!("@{step}"))?;
             let s = s_out
-                .take()
-                .get::<f32>()
+                .take_host::<f32>()
                 .await
-                .map_err(|e| format!("s_out.take @{step}: {e}"))?[0];
+                .with_context(|| format!("@{step}"))?;
             generated.push(t as u32);
             surprises.push(s);
             mu -= lr * (s - tau);

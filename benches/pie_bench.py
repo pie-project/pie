@@ -163,7 +163,6 @@ def is_cumulative_status_key(key: str) -> bool:
             "bypass_hits",
             "chain_drops",
             "chain_submits",
-            "cold_hold_fires",
             "cumulative_batch_latency_us",
             "escape_fires",
             "readiness_miss",
@@ -1111,16 +1110,6 @@ async def run(args: argparse.Namespace):
                             inter_fire_samples,
                             average_key,
                         )
-                cold_hold_fires = model_status.get(
-                    "default.fire.quorum.cold_hold_fires", 0
-                )
-                if isinstance(cold_hold_fires, (int, float)):
-                    measured_average(
-                        model_status,
-                        "default.fire.quorum.cold_hold_us_sum",
-                        cold_hold_fires,
-                        "default.fire.quorum.cold_hold_us",
-                    )
                 wave_fires = model_status.get("default.fire.quorum.wave_fires", 0)
                 if isinstance(wave_fires, (int, float)):
                     measured_average(
@@ -1188,7 +1177,6 @@ async def run(args: argparse.Namespace):
                         or "active_pipelines" in key
                         or "missing_at_fire" in key
                         or "straggler" in key
-                        or "cold_hold" in key
                     ):
                         engine_config[key] = value
         except Exception:  # noqa: BLE001

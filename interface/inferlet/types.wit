@@ -15,7 +15,9 @@ interface types {
     /// buffers are not represented.
     type shape = list<u32>;
 
-    variant dtype { %f32, %i32, %u32, %bool }
+    /// Element type of a tensor payload. Closed set, no payloads — an `enum`,
+    /// like `model.forward-kind`.
+    enum dtype { %f32, %i32, %u32, %bool }
 
     /// Packed little-endian tensor payload. The runtime validates byte length
     /// against the tensor shape/dtype.

@@ -295,8 +295,8 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
 // Constant construction (author-facing)
 // ---------------------------------------------------------------------------
 
-/// Anything convertible to a trace-known [`ConstData`]: scalars and arrays of
-/// `f32` / `i32` / `u32` / `bool`.
+/// Anything convertible to a trace-known [`ConstData`]: scalars, slices,
+/// arrays and vectors of `f32` / `i32` / `u32` / `bool`.
 pub trait IntoConst {
     /// Encodes `self` into a typed [`ConstData`].
     fn into_const(self) -> ConstData;
@@ -322,31 +322,27 @@ macro_rules! num_const {
                 }
             }
         }
-        impl<const N: usize> IntoConst for [$t; N] {
+        impl IntoConst for &[$t] {
             fn into_const(self) -> ConstData {
                 let mut bytes = Vec::new();
-                for x in self {
+                for &x in self {
                     bytes.extend_from_slice(&scalar_bytes_of(x as f64, $dt));
                 }
                 ConstData {
-                    shape: Shape::vector(N as u32),
+                    shape: Shape::vector(self.len() as u32),
                     dtype: $dt,
                     bytes,
                 }
             }
         }
+        impl<const N: usize> IntoConst for [$t; N] {
+            fn into_const(self) -> ConstData {
+                self.as_slice().into_const()
+            }
+        }
         impl IntoConst for Vec<$t> {
             fn into_const(self) -> ConstData {
-                let n = self.len() as u32;
-                let mut bytes = Vec::new();
-                for x in self {
-                    bytes.extend_from_slice(&scalar_bytes_of(x as f64, $dt));
-                }
-                ConstData {
-                    shape: Shape::vector(n),
-                    dtype: $dt,
-                    bytes,
-                }
+                self.as_slice().into_const()
             }
         }
     };
@@ -364,23 +360,23 @@ impl IntoConst for bool {
         }
     }
 }
-impl<const N: usize> IntoConst for [bool; N] {
+impl IntoConst for &[bool] {
     fn into_const(self) -> ConstData {
         ConstData {
-            shape: Shape::vector(N as u32),
+            shape: Shape::vector(self.len() as u32),
             dtype: DType::Bool,
             bytes: self.iter().map(|&b| b as u8).collect(),
         }
     }
 }
+impl<const N: usize> IntoConst for [bool; N] {
+    fn into_const(self) -> ConstData {
+        self.as_slice().into_const()
+    }
+}
 impl IntoConst for Vec<bool> {
     fn into_const(self) -> ConstData {
-        let n = self.len() as u32;
-        ConstData {
-            shape: Shape::vector(n),
-            dtype: DType::Bool,
-            bytes: self.iter().map(|&b| b as u8).collect(),
-        }
+        self.as_slice().into_const()
     }
 }
 

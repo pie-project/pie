@@ -52,7 +52,7 @@ async fn run_foldcommit(input: &str) -> Result<std::result::Result<String, Strin
     common::init_trace();
     let ws = build_inferlet()?;
 
-    let pie = common::boot_4090_mtp().await?;
+    let pie = common::boot_4090_mtp(common::mtp_draft_tokens(3)).await?;
     eprintln!(
         "[gdn-foldcommit] booted Qwen3.5-0.8B, listen_addr={}",
         pie.listen_addr

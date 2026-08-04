@@ -31,6 +31,7 @@
 
 using pie::metal::RawMetalContext;
 using pie::metal::gemma4::build_gemma4_psos;
+using pie::metal::gemma4::Gemma4Geometry;
 using pie::metal::gemma4::Gemma4Psos;
 
 namespace {
@@ -91,7 +92,7 @@ int main(int argc, char** argv) {
     expect(true, "RawMetalContext::create succeeds");
 
     Gemma4Psos psos;
-    const bool built = build_gemma4_psos(*ctx, kernels_dir, psos, &error);
+    const bool built = build_gemma4_psos(*ctx, kernels_dir, Gemma4Geometry{}, psos, &error);
     expect(built, "every gemma4 PSO compiles: " + (built ? std::string("ok") : error));
     if (built) {
         // Named individually so a regression says which kernel broke.
@@ -103,6 +104,39 @@ int main(int argc, char** argv) {
         expect(psos.ple_combine.valid(), "ple_combine (per-layer embeddings)");
         expect(psos.vnorm.valid(), "vnorm_single_row (weightless V-norm)");
         expect(psos.valid(), "the table reports itself complete");
+    }
+
+    // The two attention widths used to be literals (256 and 512) while the
+    // geometry read both from the config. A pipeline built for one width and
+    // handed the other's heads does not fail -- it strides past the end of
+    // every head and writes zeros. So the widths have to be the geometry's,
+    // and these three assertions are what says so.
+    {
+        std::printf("[the attention widths come from the geometry]\n");
+
+        // There is no pipeline cache, so identity says nothing. What says the
+        // width was read is the NAME the load fails on: move one field, and the
+        // refusal has to name that field's value. Do it for each field
+        // separately -- a literal left in either slot survives the other probe.
+        auto refusal_for = [&](int head_dim, int global_head_dim) {
+            Gemma4Geometry g;
+            g.head_dim = head_dim;
+            g.global_head_dim = global_head_dim;
+            Gemma4Psos p;
+            std::string e;
+            const bool ok = build_gemma4_psos(*ctx, kernels_dir, g, p, &e);
+            return ok ? std::string("<compiled>") : e;
+        };
+
+        const std::string sliding = refusal_for(96, 512);
+        expect(sliding.find("_d_96") != std::string::npos,
+               "moving head_dim alone is refused, naming d=96 (the sliding layers): " +
+                   sliding);
+
+        const std::string global = refusal_for(256, 96);
+        expect(global.find("_d_96") != std::string::npos,
+               "moving global_head_dim alone is refused, naming d=96 (the full layers): " +
+                   global);
     }
 
     // Every dispatch in the step has to resolve to a pipeline that exists and a

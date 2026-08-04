@@ -15,15 +15,31 @@ struct RouterParams {
 
 // top-k over the router's logits, then a softmax over ONLY the k that survive.
 //
-// One threadgroup, one lane per expert. `n_experts` is 32 on this family, so a
-// single simdgroup holds the whole distribution and the selection is k rounds of
-// simd_max -- no sort, no scratch, and no dependence on the expert count beyond
-// "fits in a threadgroup".
+// One threadgroup per token row, one lane per expert. The selection is k rounds
+// of "take the max, record it, mask it out" -- cheaper than any sort at these
+// k, and it reproduces argpartition+take exactly, ties breaking toward the
+// lower index.
+//
+// The reduction is THREADGROUP-wide, not simdgroup-wide. It used to be the
+// latter, which is the same thing only while `n_experts <= 32`: gpt-oss has 32,
+// so one simdgroup held the whole distribution and nothing was wrong. Qwen3-MoE
+// has 128. At that width `simd_max` reduces four disjoint quarters, and every
+// one of the four `simd_lid == 0` lanes then writes `expert_ids[r]` -- a race
+// whose winner is a quarter's local maximum rather than the row's. So each
+// simdgroup now posts its (max, lowest-winning-lane) pair and one thread picks
+// across them.
 //
 // Emits both halves of the routing decision: the ids the routed matvecs index
 // their weight stack with, and the normalized weights `ExpertCombine` sums by.
 // mlx-lm softmaxes the top-k VALUES, not the full logit vector, so the weights
 // sum to 1 over the chosen experts.
+//
+// `experts_per_token` is bounded by `kRouterMaxTopK` because the chosen values
+// have to live somewhere between the selection and the softmax. The host
+// refuses a larger k rather than letting this overflow.
+constant constexpr uint kRouterMaxTopK = 16;
+constant constexpr uint kRouterMaxSimdgroups = 32;  // 1024 threads / 32
+
 template <typename T>
 [[kernel]] void router_topk(
     const device T* logits     [[buffer(0)]],
@@ -34,10 +50,13 @@ template <typename T>
     // same dimensionality, and the threadgroup position below is 3D.
     uint3 lid3 [[thread_position_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint3 tgsize [[threads_per_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]]) {
   const uint lid = lid3.x;
   const uint n = p.n_experts;
-  const uint k = p.experts_per_token;
+  const uint k = min(p.experts_per_token, kRouterMaxTopK);
+  const uint n_simd = min((tgsize.x + 31u) / 32u, kRouterMaxSimdgroups);
   constexpr float NEG_INF = -3.0e38f;
 
   // One threadgroup per token row. Every row routes independently -- which is
@@ -49,26 +68,48 @@ template <typename T>
 
   float v = (lid < n) ? float(logits[lid]) : NEG_INF;
 
-  threadgroup float chosen[16];
-  // k rounds: take the max, record it, mask it out. k is 4 here, so this is
-  // cheaper than any sort and exactly reproduces argpartition+take for the
-  // values -- ties break toward the lower index, as `simd_max` then the
-  // lowest-lane test does.
+  threadgroup float part_v[kRouterMaxSimdgroups];
+  threadgroup uint  part_i[kRouterMaxSimdgroups];
+  threadgroup float chosen[kRouterMaxTopK];
+  threadgroup uint  winner_of_round;
+
   for (uint r = 0; r < k; ++r) {
+    // Per simdgroup: its max, and the lowest lane still holding it. Resolving
+    // the tie by lane here and by index below keeps the choice deterministic
+    // rather than dependent on which lane the hardware reduces last.
     const float m = simd_max(v);
-    // The lowest lane still holding the max wins, so a tie is resolved the same
-    // way every time rather than by whichever lane the hardware reduces last.
-    const uint winner = simd_min((v == m) ? lid : 0xFFFFFFFFu);
+    const uint w = simd_min((v == m) ? lid : 0xFFFFFFFFu);
     if (simd_lid == 0) {
-      expert_ids[r] = int(winner);
-      chosen[r] = m;
+      part_v[simd_gid] = m;
+      part_i[simd_gid] = w;
     }
-    if (lid == winner) v = NEG_INF;
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+      float best = NEG_INF;
+      uint best_i = 0xFFFFFFFFu;
+      for (uint sg = 0; sg < n_simd; ++sg) {
+        // `>` keeps the FIRST simdgroup that attains the max, so the lowest
+        // expert index wins a tie across simdgroups as well as within one.
+        if (part_v[sg] > best) {
+          best = part_v[sg];
+          best_i = part_i[sg];
+        }
+      }
+      expert_ids[r] = int(best_i);
+      chosen[r] = best;
+      winner_of_round = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == winner_of_round) v = NEG_INF;
+    // Before the next round overwrites `part_*`, and after every thread has
+    // read `winner_of_round`.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
   // Softmax over the k selected logits only.
-  if (simd_lid == 0) {
+  if (lid == 0) {
     float mx = NEG_INF;
     for (uint r = 0; r < k; ++r) mx = max(mx, chosen[r]);
     float sum = 0;
@@ -86,7 +127,7 @@ template <typename T>
   template [[host_name("router_topk_" #name)]]                     \
   [[kernel]] void router_topk<itype>(                              \
       const device itype*, device int*, device itype*,             \
-      constant RouterParams&, uint3, uint, uint3);
+      constant RouterParams&, uint3, uint, uint, uint3, uint3);
 
 instantiate_router_topk(float32, float)
 instantiate_router_topk(bfloat16, bfloat)
