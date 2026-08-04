@@ -332,8 +332,22 @@ async def run(args: argparse.Namespace) -> int:
         admitted = [
             (g["width"], g["max_tokens"]) for g in gates if g["verdict"] != "matched"
         ]
-        if not admitted:
-            print("\nno configuration passed the gate; nothing to time")
+        # Success needs at least one point that can actually carry mask
+        # evidence. Width 1 is unconditionally `vacuous` — a single beam's
+        # ancestry is already the whole filled span — so it is worth timing as
+        # the greedy reference but proves nothing about the mask. Admitting on
+        # `!= "matched"` alone would let a driver that ignores custom_mask_d
+        # strike widths 2/4/8, time width 1 by itself, and still exit 0 behind a
+        # populated results table that nothing downstream could distinguish from
+        # a healthy run. A `diverged` point is always admitted, so requiring one
+        # subsumes the empty-admitted case too.
+        if not any(g["verdict"] == "diverged" for g in gates):
+            print(
+                "\nno configuration produced mask evidence: every non-vacuous "
+                "point was struck, so nothing here shows attention reading the "
+                "mask. Not timing, and no results table."
+            )
+            report(gates, [], args)
             return 1
 
         # ── Timing, admitted configurations only ───────────────────────────
