@@ -412,13 +412,12 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
 
         if (!gemma4::build_gemma4_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/false, err,
-                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false)) {
+        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, err)) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/true, err,
-                                  /*routed=*/false)) {
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, g_.quant, err,
+                MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
             return false;
         }
         // A checkpoint may quantize the dense FFN and the router at a DIFFERENT
@@ -428,13 +427,12 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         // `gemma4_uses_alt_quant` picks between them per dispatch. One table for
         // both would run a 4-bit kernel over 8-bit bytes: fast, and wrong.
         if (g_.has_alt_quant()) {
-            if (!load_decode_psos(ctx, kernels_dir, base_alt_, g_.ffn_quant,
-                                  /*with_argmax=*/false, err, /*fuse_residual=*/false,
-                                  /*gdn_prep=*/false, /*routed=*/false, /*untied=*/false)) {
+            if (!load_decode_psos(ctx, kernels_dir, base_alt_, g_.ffn_quant, err)) {
                 return false;
             }
-            if (!load_multibatch_psos(ctx, kernels_dir, mb_alt_, g_.ffn_quant,
-                                      /*with_d512=*/true, err, /*routed=*/false)) {
+            if (!load_multibatch_psos(
+                    ctx, kernels_dir, mb_alt_, g_.ffn_quant, err,
+                    MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
                 return false;
             }
         }
@@ -922,9 +920,11 @@ class GptOssEngine final : public SimpleFamilyEngine {
         // This used to be the parameter's default, which meant the driver was
         // making the same choice without saying so.
         const AffineFormat kGptOssBase{/*bits=*/4, /*group=*/64};
-        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, /*with_argmax=*/false, err))
+        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, err))
             return false;
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, kGptOssBase, /*with_d512=*/false, err))
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, kGptOssBase, err,
+                MultiBatchPsoFeatures{.bias = true}))
             return false;
 
         gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
@@ -1331,15 +1331,17 @@ class LlamaEngine final : public SimpleFamilyEngine {
         ap->vocab = std::uint32_t(g_.vocab);
 
         if (!llama::build_llama_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/true, err,
-                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false)) {
+        if (!load_decode_psos(
+                ctx, kernels_dir, base_, g_.quant, err,
+                DecodePsoFeatures{.argmax = true})) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/false, err,
-                                  /*routed=*/false,
-                                  /*fp16_precast=*/!g_.is_moe() &&
-                                      g_.quant.bits == 4 && g_.quant.group == 64)) {
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, g_.quant, err,
+                MultiBatchPsoFeatures{
+                    .splitk = true,
+                    .fp16_precast = !g_.is_moe() &&
+                        g_.quant.bits == 4 && g_.quant.group == 64})) {
             return false;
         }
 

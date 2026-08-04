@@ -1042,18 +1042,30 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
 
     // ── Compile the kernel PSOs. ──
     std::string load_err;
-    if (!load_decode_psos(*ctx_, kernels_dir, psos_, g_.quant, /*with_argmax=*/false, &load_err,
-                          fuse_residual_, gdn_prep_, g_.is_moe(),
-                          /*untied=*/!g_.tied_embeddings)) {
+    if (!load_decode_psos(
+            *ctx_, kernels_dir, psos_, g_.quant, &load_err,
+            DecodePsoFeatures{
+                .residual_qmv = fuse_residual_,
+                .gdn = gdn_prep_,
+                .gated_attention = true,
+                .sdpa_d256 = true,
+                .routed = g_.is_moe(),
+                .untied = !g_.tied_embeddings})) {
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
     }
     if (g_.paged_kv_enabled &&
-        !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, g_.quant, /*with_d512=*/false,
-                              &load_err, g_.is_moe(), /*fp16_precast=*/false,
-                              /*fp16_strided=*/!g_.is_moe() &&
-                                  g_.quant.bits == 4 && g_.quant.group == 64)) {
+        !load_multibatch_psos(
+            *ctx_, kernels_dir, mb_psos_, g_.quant, &load_err,
+            MultiBatchPsoFeatures{
+                .sdpa_d256 = true,
+                .gdn = true,
+                .residual = fuse_residual_,
+                .routed = g_.is_moe(),
+                .strided = true,
+                .fp16_strided = !g_.is_moe() &&
+                    g_.quant.bits == 4 && g_.quant.group == 64})) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
