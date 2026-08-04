@@ -64,6 +64,4 @@ template <typename T>
       const device itype*, const device itype*, device itype*,          \
       const constant int&, const constant int&, uint3, uint, uint);
 
-instantiate_bf16_gemv(float32, float)
-instantiate_bf16_gemv(float16, half)
 instantiate_bf16_gemv(bfloat16, bfloat)

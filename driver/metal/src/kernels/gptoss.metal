@@ -129,7 +129,6 @@ template <typename T>
       const device itype*, device int*, device itype*,             \
       constant RouterParams&, uint3, uint, uint, uint3, uint3);
 
-instantiate_router_topk(float32, float)
 instantiate_router_topk(bfloat16, bfloat)
 
 struct GptOssSwiGluParams {
@@ -168,7 +167,6 @@ template <typename T>
       const device itype*, const device itype*, device itype*,     \
       constant GptOssSwiGluParams&, uint);
 
-instantiate_gptoss_swiglu(float32, float)
 instantiate_gptoss_swiglu(bfloat16, bfloat)
 
 struct ExpertCombineParams {
@@ -208,5 +206,4 @@ template <typename T>
       const device itype*, const device itype*, device itype*,     \
       constant ExpertCombineParams&, uint2);
 
-instantiate_expert_combine(float32, float)
 instantiate_expert_combine(bfloat16, bfloat)

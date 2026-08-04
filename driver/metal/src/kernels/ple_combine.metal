@@ -36,6 +36,4 @@ template <typename T>
       const device itype*, const device itype*, device itype*,         \
       constant PleCombineParams&, uint);
 
-instantiate_ple_combine(float32, float)
-instantiate_ple_combine(float16, half)
 instantiate_ple_combine(bfloat16, bfloat)
