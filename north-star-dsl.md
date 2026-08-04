@@ -2678,3 +2678,19 @@ incidents. Record corrected: the declared leg (opt-in, never running)
 was NOT the 14B demoter — the envelope's prepare-skip was the whole
 story. Board: hand ✓ declared ✓ generated (stands down, port later);
 envelope banding and Act 2/3 remain.
+
+## THREE LEGS, ONE WALK (2026-08-04): banded depth completes its leg set
+
+The emitter spells the banded walk into the static forms (per-layer
+band resolution against the plan-state arrays, band plan/ws at the
+swap dispatch); the interpreter's stand-down is gone; five .inc forms
+regenerated. Parity: truncated rows CHARACTER-IDENTICAL across
+interpreter and generated legs; full rows within the sealed
+execution-history equality class (the earlier per-boot byte-matches
+were a deterministic sub-case, not a guarantee — the floor is the
+bar, as sealed in the observation ledger). Default-path bar re-run at
+the tip: census 15/15 PRODUCT, solo oracle byte-equal, zero
+incidents. Banded depth now exists in every walker the driver owns —
+the axis is total across legs, exactly what the v2 thesis demands of
+an axis: one vocabulary, one scheduler output, every consumer serves
+it or loudly declines.
