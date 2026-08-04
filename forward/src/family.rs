@@ -17,7 +17,7 @@ use crate::dsl::{
     Trace, Val,
 };
 use crate::trace::{
-    DType, Dim, FireClass, ForwardPlan, GuardPred, HookStage, NormVariant, RopeKind, Shape,
+    DType, Dim, FireClass, ForwardPlan, GuardPred, NormVariant, RopeKind, Shape,
 };
 
 /// The lowering a qwen3_5 body traces under, threaded by value: the CUDA
@@ -160,20 +160,15 @@ fn llama_like_text(
                     )
                 };
                 if m.lowering().is_some() {
-                    // The §5.1 lora correction: the adapter delta lands
-                    // on the just-materialized RAW q/v projections,
-                    // BEFORE anything consumes them — bias, norms, rope,
-                    // the KV append (the hand-written apply's position;
+                    // The adapter value seam (§5.1): attachments land on
+                    // the just-materialized RAW q/v projections, BEFORE
+                    // anything consumes them — bias, norms, rope, the KV
+                    // append (the hand-written apply's position;
                     // correcting after rope is different arithmetic, the
-                    // bug the first live A/B caught). A guard with an
-                    // EMPTY else: a fire with no usable lanes launches
-                    // nothing.
-                    dsl::guard(
-                        m,
-                        GuardPred::HasLora,
-                        || cuda::lora_qkv_correction(&q, &v, l),
-                        || {},
-                    );
+                    // bug the first live A/B caught). Rung-① lowering is
+                    // the HasLora guard with an EMPTY else: a fire with
+                    // no usable lanes launches nothing.
+                    dsl::seam_adapter_qv(m, &q, &v, l);
                 }
                 // Qwen-2 family qkv biases: on the raw projections, after
                 // the lora correction and before norms/rope — the
@@ -321,7 +316,7 @@ fn llama_like_text(
                         }
                     };
                     let attn_with_sites = |q: &Val| {
-                        dsl::hook_site(HookStage::OnAttnProj, q, l);
+                        dsl::seam_observe(&dsl::seam::ATTN_Q, q, l);
                         if c.xqa_decode {
                             cuda::attention_xqa_decode_region(q, &w.kv);
                         } else if c.force_prefill_path {
@@ -336,7 +331,7 @@ fn llama_like_text(
                                     cuda::attention_flashinfer_decode_region(q, &w.kv)
                                 });
                         }
-                        dsl::hook_site(HookStage::OnAttn, q, l);
+                        dsl::seam_observe(&dsl::seam::ATTN_OUT, q, l);
                     };
                     if fused_post {
                         g.arm(GuardPred::HasCustomMask, || {
@@ -349,9 +344,9 @@ fn llama_like_text(
                             // the programs a null scores pointer (the
                             // publish-gated contract).
                             let q = general_qkv();
-                            dsl::hook_site(HookStage::OnAttnProj, &q, l);
+                            dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
                             masked_attention(&q);
-                            dsl::hook_site(HookStage::OnAttn, &q, l);
+                            dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
                         })
                         // The lora arm: the fused epilogue writes V
                         // straight to the paged cache — nothing exists to
@@ -405,9 +400,9 @@ fn llama_like_text(
                         let q = hoisted_q.as_ref().expect("hoisted for the non-fused arm");
                         g.arm(GuardPred::HasCustomMask, || {
                             // Masked+hooked (the fused arm's comment).
-                            dsl::hook_site(HookStage::OnAttnProj, q, l);
+                            dsl::seam_observe(&dsl::seam::ATTN_Q, q, l);
                             masked_attention(q);
-                            dsl::hook_site(HookStage::OnAttn, q, l);
+                            dsl::seam_observe(&dsl::seam::ATTN_OUT, q, l);
                         })
                         .otherwise(|| attn_with_sites(q));
                     }
@@ -423,7 +418,7 @@ fn llama_like_text(
                         // branch's contract). Masked+hooked composes: the
                         // sites bracket the dispatch (null scores at
                         // OnAttn — no capture variant publishes).
-                        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+                        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
                         // The MIXED FIRE: the prefill-class mask arm
                         // states the same UnmaskedPrefix peel as the
                         // decode class — prefix region = the causal
@@ -457,13 +452,13 @@ fn llama_like_text(
                                 },
                             );
                         }
-                        dsl::hook_site(HookStage::OnAttn, &q, l);
+                        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
                     })
                     .otherwise(|| {
                         // Prefill has no fused post, so no Peel: the body
                         // is row-uniform — sites (argument no-ops when
                         // unhooked), dequant, the score-guarded dispatch.
-                        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+                        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
                         cuda::dequant_only(&w.kv);
                         dsl::guarded(m)
                             .arm(GuardPred::WantsAttnScore, || {
@@ -472,7 +467,7 @@ fn llama_like_text(
                             .otherwise(|| {
                                 cuda::attention_flashinfer_prefill_region(&q, &w.kv)
                             });
-                        dsl::hook_site(HookStage::OnAttn, &q, l);
+                        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
                     });
                     a
                 }
@@ -840,7 +835,7 @@ fn gdn_attn_body(
     // repeats; the repeats read q_pre and never write it, so observing
     // before the recurrence guard sees the same bytes.)
     if lower.is_some() {
-        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
     }
     // GQA (value heads sharing fewer key heads) picks the `_gqa` decode
     // step; the prefill kernels state their own layout handling.
@@ -898,7 +893,7 @@ fn gdn_attn_body(
     // The OnAttn site: after the recurrence core, before the gated norm
     // — the hand-written invoke's position (observing q_pre again).
     if lower.is_some() {
-        dsl::hook_site(HookStage::OnAttn, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
     }
 
     // Gated norm (z-gated, per-head, plain fold) → o_proj landed on
@@ -1067,7 +1062,7 @@ fn full_attn_body(
     // hand-written full-attn invoke's position, observing the roped q
     // (bf16). Observation-only, like the GDN sites.
     if lower.is_some() {
-        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
     }
 
     // KV write. Lowered: the mechanism is a per-fire runtime input
@@ -1107,7 +1102,7 @@ fn full_attn_body(
     // The OnAttn site: after the output gate, before the o_proj — the
     // hand-written invoke's position (observing q).
     if lower.is_some() {
-        dsl::hook_site(HookStage::OnAttn, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
     }
     y += matmul(&gated, &w.o_proj);
     y
@@ -1338,9 +1333,9 @@ fn commit_advance_body(t: &Trace, facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFa
         // invokes (they precede its early return), so the commit trace
         // mirrors them (A4) — argument no-ops on every commit fire
         // today, stated because the contract is the body's.
-        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
         cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, cuda.state_bf16);
-        dsl::hook_site(HookStage::OnAttn, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
     }
     // Nothing after the loop: no final norm, no lm_head — the pass ends
     // with the last linear layer's recurrence.

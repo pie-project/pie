@@ -801,6 +801,118 @@ pub fn hook_site(stage: crate::trace::HookStage, q: &Val, layer: u32) {
     });
 }
 
+// ── The seam surface (V2 rung ①) ───────────────────────────────────────
+
+/// V2 (north-star-dsl.md "V2 — THE REDESIGN"): the seam vocabulary.
+///
+/// A seam is a named, typed, identity-by-default extension point in the
+/// model text — the ONE surface behind what were three mechanisms (the
+/// two [`crate::trace::HookStage`]s, the `HasLora` guard arm, and the
+/// dispatch-side prologue/epilogue stages). At THIS rung only the
+/// surface unifies: each seam lowers to exactly the op(s) the pre-seam
+/// text recorded, and the goldens pin that byte-identity. The IR's own
+/// Seam op and the signature-table ABI are later rungs; what changes
+/// now is that the model text states extension points in one vocabulary
+/// instead of naming mechanisms.
+pub mod seam {
+    /// What an attachment at a seam MAY do. Caps are the seam's
+    /// interface; whether a given deployment can service a cap is a
+    /// dispatch-table fact refused at load (the XQA-has-no-capture
+    /// contract's future home — enforcement lands with the signature
+    /// ABI). The vocabulary documents the gradient: pure expressions
+    /// innermost, observation mid-body, full PTIR at the boundary.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Cap {
+        /// Pure value rewrite `|x, y| y'` (the adapter family).
+        Transform,
+        /// Read the seam's value from an attached program.
+        Observe,
+        /// Read the attention scores the capturing dispatch published.
+        Scores,
+        /// Narrow the page list the stated attention kernel consumes.
+        PageMaskSink,
+        /// Device puts (embeds, channels) — boundary-only.
+        Put,
+        /// Draw samples from the logits — boundary-only.
+        Sample,
+        /// Emit host-visible outputs — boundary-only.
+        Emit,
+    }
+
+    /// A seam's definition: the stable NAME the request surface keys on
+    /// (`fwd.adapter("attn.qv", ..)`, `fwd.attach(..)`) and its caps.
+    pub struct Def {
+        pub name: &'static str,
+        pub caps: &'static [Cap],
+    }
+
+    /// Pre-attention observation seam: sees the just-projected q; a
+    /// page-mask-sink attachment narrows the page list the SAME stated
+    /// attention kernel consumes as substituted arguments (today's
+    /// `OnAttnProj`).
+    pub const ATTN_Q: Def = Def {
+        name: "attn.q",
+        caps: &[Cap::Observe, Cap::PageMaskSink],
+    };
+
+    /// Post-attention observation seam: sees the scores the (possibly
+    /// capturing) dispatch published through the sideband (today's
+    /// `OnAttn`).
+    pub const ATTN_OUT: Def = Def {
+        name: "attn.out",
+        caps: &[Cap::Observe, Cap::Scores],
+    };
+
+    /// The adapter value seam over the raw q/v projections — pure
+    /// expressions of `(x, y)`, `fwd.adapter`'s site family (today's
+    /// `HasLora` guard arm).
+    pub const ATTN_QV: Def = Def {
+        name: "attn.qv",
+        caps: &[Cap::Transform],
+    };
+
+    /// Entry boundary seam (prologue's home). Boundary attachments
+    /// never enter row signatures — they cause no divergence — which is
+    /// why their dispatch-side lowering needs no trace op at any rung.
+    pub const IN: Def = Def {
+        name: "in",
+        caps: &[Cap::Put, Cap::Emit],
+    };
+
+    /// Exit boundary seam (epilogue's home).
+    pub const OUT: Def = Def {
+        name: "out",
+        caps: &[Cap::Observe, Cap::Sample, Cap::Put, Cap::Emit],
+    };
+}
+
+/// An observation seam at `def`, watching `v` at `layer` — rung-①
+/// lowering: exactly the [`OpKind::HookSite`] op the pre-seam text
+/// recorded, so the traced form is byte-identical.
+///
+/// [`OpKind::HookSite`]: crate::trace::OpKind::HookSite
+pub fn seam_observe(def: &seam::Def, v: &Val, layer: u32) {
+    let stage = match def.name {
+        "attn.q" => crate::trace::HookStage::OnAttnProj,
+        "attn.out" => crate::trace::HookStage::OnAttn,
+        other => unreachable!("no observation seam named {other}"),
+    };
+    hook_site(stage, v, layer);
+}
+
+/// The adapter value seam ([`seam::ATTN_QV`]) over the raw q/v
+/// projections — rung-① lowering: exactly the `HasLora` guard with the
+/// span-grouped correction arm and the EMPTY else (a fire with no
+/// usable lanes launches nothing), byte-identical to the pre-seam text.
+pub fn seam_adapter_qv(m: &M, q: &Val, v: &Val, layer: u32) {
+    guard(
+        m,
+        crate::trace::GuardPred::HasLora,
+        || cuda::lora_qkv_correction(q, v, layer),
+        || {},
+    );
+}
+
 // ── Raw kernel signatures ──────────────────────────────────────────────
 
 /// The CUDA launchers a lowered declaration may state, one function per

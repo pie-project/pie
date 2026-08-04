@@ -2369,3 +2369,106 @@ to the pre-campaign reference, S-B identity, and — for the first time
 at release — the census at 15/15 PRODUCT (the 15s settle removed the
 earlier phasing artifact). Zero incidents. Everything this session
 built is default, total, numerics-neutral, and instrumented.
+
+## V2 — THE REDESIGN (2026-08-04): axes dissolve into operands, seams, signatures
+
+The user's review named the smell exactly: four axes, four mechanisms
+(class = separate trace calls; mask/lora/score = GuardPred, temporal;
+hook/mask split = PeelWindow, spatial, 2-way fixed; depth = depth_role,
+painted OUTSIDE the trace in family.rs:64-91). The failure mode this
+project exists to kill — a separate device per axis — reproduced inside
+our own IR. mask×depth needed the stash detour precisely because the two
+were different kinds of thing.
+
+The redesign converged over four rounds (axis-enum v1 was rejected as a
+closed algebra — "Mask, MultiToken 같은 건 불가피한가?" — no). V2 rests
+on one axiom:
+
+> A fire is a set of rows; each row is a point in a product space of
+> PER-ROW OPERANDS. The trace is ONE function over that space. All
+> divergence is derived, never declared.
+
+Three open concepts replace the four mechanisms:
+
+1. PER-ROW OPERANDS (open set). Everything a request attaches or
+   geometry implies: the mask operand (Causal | Custom(expr)), the token
+   window (One | Many — the whole remaining content of FireClass), the
+   layer range (0..k — the whole depth axis), adapter expressions, hook
+   programs. "Axis" stops being a name; Mask and MultiToken dissolve
+   into operand CLASSES.
+
+2. OPERATOR DISPATCH (selector divergence). `attention(q, kv, mask)` is
+   one op; which kernel serves a row is a dispatch-table row over
+   (operand classes × fire-uniform predicates × deployment facts):
+   (Causal, One) → flashinfer_decode; (Causal, Many) → dequant+prefill;
+   (Custom, _) → prefill_custom; `if xqa` overrides. Fusions are
+   rewrite rules over op sequences gated on signatures (the fused
+   decode epilogue applies where window==One && seam("attn.qv").empty —
+   the true identity of fused_post + PeelWindow::HookFreePrefix). The
+   layer loop is a first-class `scan` whose range operand IS depth —
+   stated in the body, killing the family.rs paint-over and DepthRole.
+   New kernel = table row; DSL text unchanged.
+
+3. SEAMS + ATTACHMENTS (decorator divergence). A seam is a NAMED,
+   TYPED, IDENTITY-BY-DEFAULT op in the value flow:
+   `let (q,v) = m.seam("attn.qv", (q,v))` — downstream consumes the
+   seam's output, so an attachment rewrites out=in to out=expr(in)
+   without touching the graph; no attachment folds to an alias, zero
+   launches. Typed twice: EXPOSED VALUES (what |x,y| may see) and CAPS
+   (what effects an attachment may perform — Observe, Scores,
+   PageMaskSink, Put, Sample, Emit). Load-time cap checking replaces
+   the hand-written contracts (XQA-has-no-capture becomes: no capture
+   row in the table ⇒ Scores-requiring attachment refused).
+   fwd.adapter was the prototype: attachment = (seam, PTIR fragment),
+   generalized to the whole pass. hook_site and the HasLora guard were
+   the two special cases, living in two mechanisms.
+
+   Prologue/Epilogue are the BOUNDARY seams ("in"/"out"), free with
+   every model; caps form a GRADIENT — pure expressions innermost
+   (adapter), observation mid (hooks), full PTIR at the boundary
+   (prologue/epilogue) — because interior seams sit inside the batched,
+   seriated region where host effects would break the fire. Boundary
+   attachments never enter signatures (they cause no divergence), which
+   is WHY today's design kept them outside the trace without ever
+   producing a composition bug — v2 formalizes that as "attachments in
+   the signature vs not."
+
+THE SCHEDULER SEES ONLY SIGNATURES. Row signature = (operand classes at
+each operator) × (attached-seam set). Seriation makes co-signature rows
+contiguous (Gray order over the signature bits + descending k for
+ordered operands — EXACTLY the staged Gray machinery); gather is the
+total fallback (EXACTLY the staged gather primitive). The staged
+trio — Gray, (start,len) consumers, gather — turns out to be the
+runtime half of v2; the redesign is its trigger. Wire ABI: the accreted
+scalar words (fast_rows, unmasked_prefix_rows, mask_suffix_*,
+full_depth_rows, planned_max_layers, the mixed split word) become ONE
+signature table (row→signature id, signature→operand/attachment
+records); new attachment kinds change the ABI's shape never again.
+Streams are derived: distinct dispatch classes are disjoint row regions
+⇒ the 3-way mixed fire's three streams fall out of the table.
+
+WHAT DIES: family.rs's depth post-processing loop and DepthRole; the
+class parameter (plans per model: 5 → 1; CommitAdvance/StateOnly/
+FrozenVerify remain genuinely different passes); PeelWindow (regions
+are n-way, arbitrarily nested); half of GuardPred (HasCustomMask/
+HasStageHooks/HasLora → operand classes; HasWriteDesc/WantsAttnScore/
+TokensLE → fire-uniform predicate columns); the stash/restore depth
+union (mask×depth become two coordinates of one vocabulary); the
+pairwise gates (use_spatial_mask, spatial_mixed_compose, depth_union) —
+the O(k²) seams die in principle, not by enumeration.
+
+WHAT REMAINS BUILT-IN, honestly: the operator set and seam list (the
+model's shape — as it should be), the cap vocabulary, the dispatch
+tables (kernels are finite). Extension scenarios that now cost zero DSL
+change: new PEFT variant = new expression; new mask policy = new
+expression (doc-isolation already has this shape); new SnapKV-like = a
+capped attachment; new kernel = a table row.
+
+MIGRATION LADDER (the goldens/oracle battery is the safety net at every
+rung): ① seam/signature vocabulary into trace.rs; hook_site, the lora
+guard, and boundary stages re-expressed as seams; traces byte-identical
+(goldens pin it). ② scan first-class + the class parameter removed —
+one trace per model; family.rs post-processing deleted. ③ signature-
+table ABI replaces the scalar words. ④ Gray cutover + gather fallback
+live; stash/restore deleted. Each rung ends at the same bar: solo
+oracle byte-equal, census 15/15 PRODUCT, S-B identity, zero incidents.
