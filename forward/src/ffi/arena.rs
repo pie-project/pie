@@ -367,18 +367,29 @@ fn flatten_kind(arena: &mut PlanArena, interner: &mut Interner, kind: &OpKind) -
             };
         }
         // Loop peeling (A3): prefix-region length in param0, tail-region
-        // length in param1; the row split (fast_rows) is a runtime input
-        // of the fire, so nothing else crosses.
+        // length in param1; the row split is a runtime input of the
+        // fire. The window AXIS crosses as a one-word aux run — absent
+        // for the default hook-free axis (pre-window consumers read an
+        // empty run), `[1]` for the unmasked-prefix axis (the spatial
+        // mask split).
         OpKind::Peel {
             prefix_ops,
             tail_ops,
-        } => (
-            PieForwardOpKind::Peel,
-            PIE_FORWARD_NO_NAME,
-            *prefix_ops,
-            *tail_ops,
-            PIE_FORWARD_NO_VALUE,
-        ),
+            window,
+        } => {
+            let aux = match window {
+                crate::trace::PeelWindow::HookFreePrefix => store_ids(arena, &[]),
+                crate::trace::PeelWindow::UnmaskedPrefix => store_ids(arena, &[1]),
+            };
+            return OpParts {
+                kind: PieForwardOpKind::Peel,
+                weight_name: PIE_FORWARD_NO_NAME,
+                param0: *prefix_ops,
+                param1: *tail_ops,
+                selector: PIE_FORWARD_NO_VALUE,
+                aux_names: aux,
+            };
+        }
     })
 }
 

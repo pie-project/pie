@@ -663,6 +663,20 @@ void llama_like_forward_declared(
         WinRegion region = WinRegion::Full;
     };
     std::vector<WinEvent> win_events;
+    // The UnmaskedPrefix peel's region marker (NS-4 in the IR): which
+    // face of the spatial mask split the current launch serves — the
+    // attention call forms below key their addressing on it. `None`
+    // outside such peels, and inside one at its UNPLANNED endpoint
+    // (prepare kept the fire-level arm; the tail runs full-N). A
+    // separate axis from win_region: the hook window and the mask
+    // split never nest (the engine plans UNPLANNED for hooked fires).
+    enum class MaskRegion { None, Prefix, Tail };
+    MaskRegion mask_region = MaskRegion::None;
+    struct MaskEvent {
+        std::size_t at;
+        MaskRegion region;
+    };
+    std::vector<MaskEvent> mask_events;
     for (std::size_t i = 0; i < op_count; ++i) {
         for (;;) {
             if (!guard_skips.empty() && i == guard_skips.back().first) {
@@ -675,6 +689,11 @@ void llama_like_forward_declared(
                 win_len = win_events.back().len;
                 win_region = win_events.back().region;
                 win_events.pop_back();
+                continue;
+            }
+            if (!mask_events.empty() && i == mask_events.back().at) {
+                mask_region = mask_events.back().region;
+                mask_events.pop_back();
                 continue;
             }
             break;
@@ -1132,6 +1151,23 @@ void llama_like_forward_declared(
                              fwd_cfg.per_layer_window_left.size()))
                         ? fwd_cfg.per_layer_window_left[L]
                         : fwd_cfg.sliding_window;
+                if (mask_region == MaskRegion::Prefix) {
+                    // The UnmaskedPrefix peel's prefix region (NS-4 in
+                    // the IR): the plain rows `[0, split)` against the
+                    // recursively-prepared prefix decode plan — RAW
+                    // CSR base addressing, no hook page views (the
+                    // engine plans UNPLANNED for hooked fires, so a
+                    // planned split never composes with the sideband
+                    // brackets).
+                    ops::dispatch_attention_flashinfer_decode(
+                        *decode_plan,
+                        attn_q, kv_view, attn_out_buf,
+                        kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        attn_ws, stream, layer_window_left,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                    break;
+                }
                 resolve_masked_pages(/*takes_paged_decode=*/true);
                 ops::dispatch_attention_flashinfer_decode(
                     *decode_plan,
@@ -1201,7 +1237,14 @@ void llama_like_forward_declared(
             }
             case LaunchKernel::DequantKvCacheLayerToBf16Active: {
                 auto kv_view = cache.layer_view(L);
-                const int num_pages_in_batch = kv_page_indptr_h[R];
+                // In a mask peel's prefix region the staging covers the
+                // PLAIN lanes' pages only — beyond the split the host
+                // CSR may be a composed-envelope placeholder, and the
+                // suffix's custom dispatch takes the layer view whole.
+                const int num_pages_in_batch =
+                    mask_region == MaskRegion::Prefix
+                        ? kv_page_indptr_h[plan_state.spatial_mask_split]
+                        : kv_page_indptr_h[R];
                 kernels::launch_dequant_kv_cache_layer_to_bf16_active(
                     kv_view, kv_page_indices, num_pages_in_batch, stream);
                 break;
@@ -1225,63 +1268,19 @@ void llama_like_forward_declared(
                         "prefill kernel but prepare built no plan");
                 }
                 auto kv_view = cache.layer_view(L);
-                // NS-2 (the spatial mask fire): the attention SPLITS —
-                // the deployment's decode dispatch serves the unmasked
-                // prefix rows and the custom kernel serves the REBASED
-                // masked suffix. Everything else in the walk stays
-                // full-N shared (the work-sharing). The stated kernel is
-                // still the custom dispatch; the prefix's decode launch
-                // is this site's NS-2 sibling until the NS-4 union pass
-                // states both.
-                if (is_pure_decode && plan_state.spatial_mask_split >= 0 &&
-                    unmasked_prefix_rows != 0xffffffffu) {
+                // NS-4 in the IR: the spatial mask split is the
+                // TRACE's word (the UnmaskedPrefix peel, which
+                // validated planned/drift/qo-identity) — this launch
+                // only spells its region's addressing. Tail = the
+                // REBASED masked suffix, hybrid addressing, measured
+                // live: the kernel's q/o rows are plan/qo[0]-relative
+                // (offset pointers + the identity qo), the KV side
+                // reads the device CSR ABSOLUTELY (base indices +
+                // `+split` indptr — the composed device truth,
+                // composed-envelope lanes' host views are
+                // placeholders, no host rebase).
+                if (mask_region == MaskRegion::Tail) {
                     const int split = plan_state.spatial_mask_split;
-                    if (split !=
-                        static_cast<int>(unmasked_prefix_rows)) {
-                        throw std::runtime_error(
-                            "spatial mask: the planned split and the "
-                            "prepared split drifted");
-                    }
-                    if (plan_state.use_xqa_decode) {
-                        throw std::runtime_error(
-                            "spatial mask: the XQA prefix is not wired "
-                            "yet (its fire-wide prepare is R-shaped)");
-                    }
-                    if (split > 0) {
-                        if (decode_plan == nullptr) {
-                            throw std::runtime_error(
-                                "spatial mask: split active but prepare "
-                                "built no prefix decode plan");
-                        }
-                        const int layer_window_left =
-                            (!fwd_cfg.per_layer_window_left.empty() &&
-                             L < static_cast<int>(
-                                     fwd_cfg.per_layer_window_left
-                                         .size()))
-                                ? fwd_cfg.per_layer_window_left[L]
-                                : fwd_cfg.sliding_window;
-                        ops::dispatch_attention_flashinfer_decode(
-                            *decode_plan,
-                            attn_q, kv_view, attn_out_buf,
-                            kv_page_indices, kv_page_indptr,
-                            kv_last_page_lens,
-                            attn_ws, stream, layer_window_left,
-                            /*logits_soft_cap=*/0.f, sm_scale_override);
-                    }
-                    // The suffix: BASE buffers + device CSR pointers at
-                    // +split with their ABSOLUTE values — the kernel
-                    // indexes rows through the indptr values, so the
-                    // composed device truth needs no rebasing and no
-                    // host knowledge (composed-envelope lanes' host
-                    // views are placeholders).
-                    if (mask_suffix_qo_indptr_d == nullptr) {
-                        throw std::runtime_error(
-                            "spatial mask: suffix qo identity missing");
-                    }
-                    // Hybrid addressing, measured live: the kernel's q/o rows are
-                    // plan/qo[0]-relative (offset pointers + the identity qo), the
-                    // KV side reads the device CSR ABSOLUTELY (base indices +
-                    // +split indptr — the composed device truth, no host rebase).
                     ops::dispatch_attention_flashinfer_prefill_custom(
                         *mask_plan,
                         bf16_row(attn_q, split, Hq), kv_view,
@@ -1409,6 +1408,30 @@ void llama_like_forward_declared(
                 // body's final else runs the PLAN-LESS prefill launcher;
                 // mirror it launcher for launcher (qwen2_5, the first
                 // force-prefill deployment through the walk).
+                if (mask_region == MaskRegion::Prefix) {
+                    // The mask peel's prefix region on a force-prefill
+                    // deployment: the plan-free launcher over the PLAIN
+                    // rows — pure decode, so tokens == rows == split
+                    // and every CSR's `[0, split]` head is the prefix's
+                    // truth (the launcher reads no further).
+                    const int split = plan_state.spatial_mask_split;
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    auto kv_view = cache.layer_view(L);
+                    ops::launch_attention_flashinfer_prefill(
+                        attn_q, kv_view, attn_out_buf,
+                        qo_indptr, kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        qo_indptr_h, kv_page_indptr_h,
+                        split, split, num_q_heads, attn_ws, stream,
+                        layer_window_left,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                    break;
+                }
                 const ops::PrefillPlanCache* pp =
                     is_pure_decode ? prefill_decode_plan : prefill_plan;
                 if (pp == nullptr) {
@@ -1480,6 +1503,54 @@ void llama_like_forward_declared(
             const std::size_t tail_len = op.param1;
             const std::size_t tail_start = i + 1 + prefix_len;
             const std::size_t end = tail_start + tail_len;
+            {
+                // The peel's AXIS rides the aux run (PeelWindow):
+                // empty = the hook-free prefix (fast_rows, below),
+                // [1] = the unmasked prefix — the spatial mask split,
+                // NS-4 stated in the IR. The mask axis never touches
+                // the win_start/len machinery (that word is the hook
+                // axis's): it only marks regions, and the attention
+                // call forms key their addressing on the marker.
+                const auto aux = plan.aux_names(op);
+                if (aux.size >= 1 && aux[0] == 1) {
+                    const bool planned =
+                        plan_state.spatial_mask_split >= 0 &&
+                        unmasked_prefix_rows != 0xffffffffu;
+                    if (!planned) {
+                        // The UNPLANNED endpoint: the tail region IS
+                        // the fire-level custom dispatch, full-N.
+                        mask_region = MaskRegion::None;
+                        i = tail_start - 1;  // skip the prefix region
+                        break;
+                    }
+                    if (plan_state.spatial_mask_split !=
+                        static_cast<int>(unmasked_prefix_rows)) {
+                        throw std::runtime_error(
+                            "spatial mask: the planned split and the "
+                            "prepared split drifted");
+                    }
+                    if (plan_state.use_xqa_decode) {
+                        throw std::runtime_error(
+                            "spatial mask: the XQA prefix is not wired "
+                            "(its fire-wide prepare is R-shaped)");
+                    }
+                    if (mask_suffix_qo_indptr_d == nullptr) {
+                        throw std::runtime_error(
+                            "spatial mask: suffix qo identity missing");
+                    }
+                    mask_events.push_back({end, MaskRegion::None});
+                    if (plan_state.spatial_mask_split > 0) {
+                        mask_events.push_back(
+                            {tail_start, MaskRegion::Tail});
+                        mask_region = MaskRegion::Prefix;
+                    } else {
+                        // The all-masked composed fire: no prefix.
+                        mask_region = MaskRegion::Tail;
+                        i = tail_start - 1;
+                    }
+                    break;
+                }
+            }
             if (peel_window_d != nullptr) {
                 // Device-window capture: BOTH regions are emitted — an
                 // empty region's kernels launch and early-out on the

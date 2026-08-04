@@ -374,7 +374,7 @@ fn emit_class_fn(
 /// `peel_window_d` word ({tail_start, tail_len}); the prefix region is
 /// [0, word[0]) and every windowed launch takes the devwin kernel at
 /// the full-N grid, so a captured exec replays across row splits.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Win {
     Host {
         start: &'static str,
@@ -382,6 +382,15 @@ enum Win {
     },
     DevPrefix,
     DevTail,
+    /// A [`PeelWindow::UnmaskedPrefix`] peel's PREFIX region (the
+    /// spatial mask split): the deployment's decode dispatch over the
+    /// plain rows `[0, split)` — raw CSR base addressing, the prefix
+    /// decode plan.
+    MaskPrefix,
+    /// Its TAIL region: the custom dispatch over the masked suffix
+    /// `[split, N)` — hybrid addressing (qo[0]-relative q/o, absolute
+    /// device CSR at `+split`).
+    MaskTail,
 }
 
 /// Emit ops `[start, end)`: a Guard consumes its region ops into an
@@ -435,8 +444,62 @@ fn emit_range(
         if let OpKind::Peel {
             prefix_ops,
             tail_ops,
+            window,
         } = &op.kind
         {
+            if *window == crate::trace::PeelWindow::UnmaskedPrefix {
+                // The spatial mask split, STATED (NS-4 landed in the
+                // IR): the declaration's peel names the axis and the
+                // two regions; this emitter only spells the window
+                // plumbing — planned (prepare built both plans) runs
+                // prefix then rebased tail, UNPLANNED collapses to the
+                // tail full-N with fire-level addressing.
+                let region = i + 1;
+                let tail_lo = region + *prefix_ops as usize;
+                let tail_hi = tail_lo + *tail_ops as usize;
+                if sg.is_some() {
+                    // The retired union's mask arm was the fire-level
+                    // custom dispatch: the peel's UNPLANNED endpoint.
+                    emit_range(
+                        b, plan, facts, cuda, is_decode, sg, tail_lo, tail_hi, None,
+                    );
+                    i = tail_hi;
+                    continue;
+                }
+                b.stmt("if (plan_state.spatial_mask_split >= 0 &&");
+                b.stmt("    unmasked_prefix_rows != 0xffffffffu) {");
+                b.indent += 1;
+                b.stmt("const int split = plan_state.spatial_mask_split;");
+                b.stmt("if (split !=");
+                b.stmt("    static_cast<int>(unmasked_prefix_rows)) {");
+                b.stmt("    throw std::runtime_error(");
+                b.stmt("        \"spatial mask: planned/prepared split drift\");");
+                b.stmt("}");
+                b.stmt("if (mask_suffix_qo_indptr_d == nullptr) {");
+                b.stmt("    throw std::runtime_error(");
+                b.stmt("        \"spatial mask: suffix qo identity missing\");");
+                b.stmt("}");
+                b.stmt("if (split > 0) {");
+                b.indent += 1;
+                emit_range(
+                    b, plan, facts, cuda, is_decode, sg, region, tail_lo,
+                    Some(Win::MaskPrefix),
+                );
+                b.indent -= 1;
+                b.stmt("}");
+                emit_range(
+                    b, plan, facts, cuda, is_decode, sg, tail_lo, tail_hi,
+                    Some(Win::MaskTail),
+                );
+                b.indent -= 1;
+                b.stmt("} else {");
+                b.indent += 1;
+                emit_range(b, plan, facts, cuda, is_decode, sg, tail_lo, tail_hi, None);
+                b.indent -= 1;
+                b.stmt("}");
+                i = tail_hi;
+                continue;
+            }
             if sg.is_some() {
                 // Peel, RESOLVED (two-path form): the union's graph
                 // fires carry no hooked rows (eligibility), so
@@ -797,6 +860,9 @@ fn emit_op(
                 Some(Win::DevPrefix) => {
                     panic!("emitter: the tail split in a Peel prefix region")
                 }
+                Some(Win::MaskPrefix) | Some(Win::MaskTail) => {
+                    panic!("emitter: the qkv split in a mask peel region")
+                }
                 None => {
                     b.stmt("kernels::launch_split_qkv_bf16(");
                     b.stmt("    ws.qkv_fused.data(),");
@@ -1096,6 +1162,9 @@ fn emit_launch(
                     panic!("emitter: the fused epilogue in a Peel tail region")
                 }
                 Some(Win::DevPrefix) => unreachable!(),
+                Some(Win::MaskPrefix) | Some(Win::MaskTail) => {
+                    panic!("emitter: the fused epilogue in a mask peel region")
+                }
                 None => "R",
             };
             b.stmt(&format!("    {rows}, num_q_heads, num_kv_heads, d,"));
@@ -1247,12 +1316,24 @@ fn emit_launch(
         }
         "launch_dequant_kv_cache_layer_to_bf16_active" => {
             let layer = state.expect("dequant addresses kv state").layer;
+            // In a mask peel's prefix region the staging covers the
+            // PLAIN lanes' pages only — `kv_page_indptr_h[split]`.
+            // Beyond the split the host CSR may be a composed-envelope
+            // placeholder, and the suffix's custom dispatch takes the
+            // layer view whole (no staging) anyway.
+            let pages = if win == Some(Win::MaskPrefix) {
+                "kv_page_indptr_h[split]"
+            } else {
+                "kv_page_indptr_h[R]"
+            };
             b.stmt(&format!("{{"));
             b.stmt(&format!(
                 "    auto kv_view = cache.layer_view({layer});"
             ));
             b.stmt("    kernels::launch_dequant_kv_cache_layer_to_bf16_active(");
-            b.stmt("        kv_view, kv_page_indices, kv_page_indptr_h[R], stream);");
+            b.stmt(&format!(
+                "        kv_view, kv_page_indices, {pages}, stream);"
+            ));
             b.stmt("}");
         }
         "dispatch_attention_flashinfer_prefill_bf16" => {
@@ -1286,12 +1367,23 @@ fn emit_launch(
                     "            ? fwd_cfg.per_layer_window_left[{layer}]"
                 ));
                 b.stmt("            : fwd_cfg.sliding_window;");
+                // A mask peel's prefix region: the plan-free launcher
+                // over the plain rows — pure decode, so tokens == rows
+                // == split, and every CSR's `[0, split]` head is the
+                // prefix's truth (the launcher reads no further).
+                let (n_rows, n_reqs) = if win == Some(Win::MaskPrefix) {
+                    ("split", "split")
+                } else {
+                    ("N", "R")
+                };
                 b.stmt("    ops::launch_attention_flashinfer_prefill(");
                 b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                 b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
                 b.stmt("        kv_last_page_lens,");
                 b.stmt("        qo_indptr_h, kv_page_indptr_h,");
-                b.stmt("        N, R, num_q_heads, attn_ws, stream,");
+                b.stmt(&format!(
+                    "        {n_rows}, {n_reqs}, num_q_heads, attn_ws, stream,"
+                ));
                 b.stmt("        layer_window_left,");
                 b.stmt("        /*logits_soft_cap=*/0.f,");
                 b.stmt(&format!("        {scale});"));
@@ -1323,6 +1415,49 @@ fn emit_launch(
         }
         "dispatch_attention_flashinfer_decode" => {
             let layer = state.expect("attention addresses kv state").layer;
+            if win == Some(Win::MaskPrefix) {
+                // The UnmaskedPrefix peel's PREFIX region (NS-4 in the
+                // IR): the deployment's decode dispatch over the plain
+                // rows `[0, split)` — the prefix decode plan prepare
+                // built recursively, RAW CSR base addressing (no hook
+                // page views: the engine plans UNPLANNED for hooked
+                // fires, so a planned split never composes with masks'
+                // sideband brackets).
+                b.stmt("if (!plan_state.decode_plan) {");
+                b.stmt("    throw std::runtime_error(");
+                b.stmt("        \"spatial mask: split active but prepare built \"");
+                b.stmt("        \"no prefix decode plan\");");
+                b.stmt("}");
+                b.stmt(&format!("{{"));
+                b.stmt(&format!(
+                    "    auto kv_view = cache.layer_view({layer});"
+                ));
+                b.stmt(&format!(
+                    "    const int layer_window_left ="
+                ));
+                b.stmt(&format!(
+                    "        (!fwd_cfg.per_layer_window_left.empty() &&"
+                ));
+                b.stmt(&format!(
+                    "         {layer} < static_cast<int>(fwd_cfg.per_layer_window_left.size()))"
+                ));
+                b.stmt(&format!(
+                    "            ? fwd_cfg.per_layer_window_left[{layer}]"
+                ));
+                b.stmt("            : fwd_cfg.sliding_window;");
+                b.stmt("    ops::dispatch_attention_flashinfer_decode(");
+                b.stmt("        *plan_state.decode_plan,");
+                b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
+                b.stmt("        kv_page_indices, kv_page_indptr,");
+                b.stmt("        kv_last_page_lens,");
+                b.stmt("        attn_ws, stream, layer_window_left,");
+                b.stmt(&format!(
+                    "        /*logits_soft_cap=*/0.f, {scale});"
+                ));
+                strip(b);
+                b.stmt("}");
+                return;
+            }
             emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
             // Per-layer window resolution is RUNTIME cfg reads
             // (per_layer_window_left / sliding_window) — placement-
@@ -1382,62 +1517,41 @@ fn emit_launch(
             b.stmt(&format!(
                 "    auto kv_view = cache.layer_view({layer});"
             ));
-            if is_decode && !padded {
-                // NS-4: the spatial split, stated statically — the mask
-                // Guard's fire-level arm dissolves into the windowed pair
-                // (decode kernel over the unmasked prefix, custom kernel
-                // over the rebased suffix; the interpreter's split branch,
-                // minus the choosing).
-                b.stmt("    if (plan_state.spatial_mask_split >= 0 &&");
-                b.stmt("        unmasked_prefix_rows != 0xffffffffu) {");
-                b.stmt("        const int split = plan_state.spatial_mask_split;");
-                b.stmt("        if (split !=");
-                b.stmt("            static_cast<int>(unmasked_prefix_rows)) {");
-                b.stmt("            throw std::runtime_error(");
-                b.stmt("                \"spatial mask: planned/prepared split drift\");");
-                b.stmt("        }");
-                b.stmt("        if (mask_suffix_qo_indptr_d == nullptr) {");
-                b.stmt("            throw std::runtime_error(");
-                b.stmt("                \"spatial mask: suffix qo identity missing\");");
-                b.stmt("        }");
-                b.stmt("        if (split > 0) {");
-                b.stmt("            if (!plan_state.decode_plan) {");
-                b.stmt("                throw std::runtime_error(");
-                b.stmt("                    \"spatial mask: no prefix decode plan\");");
-                b.stmt("            }");
-                b.stmt("            ops::dispatch_attention_flashinfer_decode(");
-                b.stmt("                *plan_state.decode_plan,");
-                b.stmt(&format!("                {q_buf}, kv_view, {out_buf},"));
-                b.stmt("                kv_page_indices, kv_page_indptr,");
-                b.stmt("                kv_last_page_lens,");
-                b.stmt("                attn_ws, stream, fwd_cfg.sliding_window,");
-                b.stmt(&format!("                /*logits_soft_cap=*/0.f, {scale});"));
-                b.stmt("        }");
-                b.stmt("        ops::dispatch_attention_flashinfer_prefill_custom(");
-                b.stmt(&format!("            *{plan_cache},"));
-                b.stmt(&format!("            bf16_row({q_buf}, split, Hq), kv_view,"));
-                b.stmt(&format!("            bf16_row({out_buf}, split, Hq),"));
-                b.stmt("            mask_suffix_qo_indptr_d,");
-                b.stmt("            kv_page_indices,");
-                b.stmt("            kv_page_indptr + split,");
-                b.stmt("            kv_last_page_lens + split,");
-                b.stmt("            custom_mask_d, custom_mask_indptr_d + split,");
-                b.stmt("            attn_ws, stream);");
-                b.stmt("    } else {");
-                b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
-                b.stmt(&format!("        *{plan_cache},"));
-                b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
-                b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
-                b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
-                b.stmt("        attn_ws, stream);");
-                b.stmt("    }");
-            } else {
-                b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
-                b.stmt(&format!("        *{plan_cache},"));
-                b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
-                b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
-                b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
-                b.stmt("        attn_ws, stream);");
+            match win {
+                // The UnmaskedPrefix peel's TAIL region (NS-4 in the
+                // IR): the choosing is the TRACE's — this arm spells
+                // only the region's addressing. Hybrid, measured live:
+                // the kernel's q/o rows are plan/qo[0]-relative
+                // (offset pointers + the identity qo), the KV side
+                // reads the device CSR ABSOLUTELY (base indices +
+                // `+split` indptr — the composed device truth, no host
+                // rebase). `split` is the peel's emitted local.
+                Some(Win::MaskTail) => {
+                    b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
+                    b.stmt(&format!("        *{plan_cache},"));
+                    b.stmt(&format!("        bf16_row({q_buf}, split, Hq), kv_view,"));
+                    b.stmt(&format!("        bf16_row({out_buf}, split, Hq),"));
+                    b.stmt("        mask_suffix_qo_indptr_d,");
+                    b.stmt("        kv_page_indices,");
+                    b.stmt("        kv_page_indptr + split,");
+                    b.stmt("        kv_last_page_lens + split,");
+                    b.stmt("        custom_mask_d, custom_mask_indptr_d + split,");
+                    b.stmt("        attn_ws, stream);");
+                }
+                // Fire-level: outside a peel (prefill-shaped masked
+                // fires, padded/XQA deployments) and the peel's
+                // UNPLANNED endpoint alike.
+                None => {
+                    b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
+                    b.stmt(&format!("        *{plan_cache},"));
+                    b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
+                    b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
+                    b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
+                    b.stmt("        attn_ws, stream);");
+                }
+                Some(_) => panic!(
+                    "emitter: the custom dispatch in a foreign peel region"
+                ),
             }
             strip(b);
             b.stmt("}");

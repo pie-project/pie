@@ -1734,17 +1734,39 @@ void llama_like_forward_paged(
                         "split drifted");
                 }
                 if (split > 0) {
-                    if (decode_plan == nullptr) {
+                    if (fwd_cfg.force_prefill_path) {
+                        // The deployment's decode form is the plan-free
+                        // prefill dispatch (GQA ratio outside the decode
+                        // kernel's set): stage the PLAIN lanes' pages
+                        // (beyond the split the host CSR may be a
+                        // composed-envelope placeholder) and run it over
+                        // the prefix — pure decode, so tokens == rows ==
+                        // split and every CSR's `[0, split]` head is the
+                        // prefix's truth.
+                        kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+                            kv_view, kv_page_indices,
+                            kv_page_indptr_h[split], stream);
+                        ops::launch_attention_flashinfer_prefill(
+                            attn_q, kv_view, attn_out_buf,
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            qo_indptr_h, kv_page_indptr_h,
+                            split, split, num_q_heads_local, attn_ws,
+                            stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, sm_scale_override);
+                    } else if (decode_plan == nullptr) {
                         throw std::runtime_error(
                             "spatial mask: split active but prepare built "
                             "no prefix decode plan");
+                    } else {
+                        ops::dispatch_attention_flashinfer_decode(
+                            *decode_plan,
+                            attn_q, kv_view, attn_out_buf,
+                            kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, sm_scale_override);
                     }
-                    ops::dispatch_attention_flashinfer_decode(
-                        *decode_plan,
-                        attn_q, kv_view, attn_out_buf,
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, sm_scale_override);
                 }
                 // BASE buffers + ABSOLUTE device CSR values at +split —
                 // see the interpreter's split branch for why no rebasing.

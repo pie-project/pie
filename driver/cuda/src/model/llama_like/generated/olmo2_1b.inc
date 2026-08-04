@@ -85,6 +85,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                            ws.gate.data());
     }
 
+    const int fast_rows = hooks == nullptr
+        ? R
+        : (static_cast<int>(hooks->hook_free_prefix_rows) < R
+               ? static_cast<int>(hooks->hook_free_prefix_rows)
+               : R);
+
     kernels::launch_embed_bf16(
         token_ids, require(w.embed, "embed")->data(), ws.y.data(),
         N, H, V, stream);
@@ -160,37 +166,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 0u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(0);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(0);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[0]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(0);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -201,13 +216,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(0);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -446,37 +468,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 1u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(1);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(1);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[1]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(1);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -487,13 +518,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(1);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -732,37 +770,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 2u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(2);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(2);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[2]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(2);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -773,13 +820,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(2);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -1018,37 +1072,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 3u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(3);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(3);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[3]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(3);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -1059,13 +1122,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(3);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -1304,37 +1374,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 4u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(4);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(4);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[4]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(4);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -1345,13 +1424,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(4);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -1590,37 +1676,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 5u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(5);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(5);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[5]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(5);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -1631,13 +1726,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(5);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -1876,37 +1978,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 6u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(6);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(6);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[6]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(6);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -1917,13 +2028,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(6);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -2162,37 +2280,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 7u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(7);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(7);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[7]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(7);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -2203,13 +2330,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(7);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -2448,37 +2582,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 8u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(8);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(8);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[8]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(8);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -2489,13 +2632,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(8);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -2734,37 +2884,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 9u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(9);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(9);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[9]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(9);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -2775,13 +2934,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(9);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -3020,37 +3186,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 10u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(10);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(10);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[10]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(10);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -3061,13 +3236,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(10);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -3306,37 +3488,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 11u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(11);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(11);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[11]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(11);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -3347,13 +3538,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(11);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -3592,37 +3790,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 12u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(12);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(12);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[12]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(12);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -3633,13 +3840,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(12);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -3878,37 +4092,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 13u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(13);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(13);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[13]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(13);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -3919,13 +4142,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(13);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -4164,37 +4394,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 14u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(14);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(14);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[14]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(14);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -4205,13 +4444,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(14);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -4450,37 +4696,46 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 15u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(15);
-            if (plan_state.spatial_mask_split >= 0 &&
-                unmasked_prefix_rows != 0xffffffffu) {
-                const int split = plan_state.spatial_mask_split;
-                if (split !=
-                    static_cast<int>(unmasked_prefix_rows)) {
+        if (plan_state.spatial_mask_split >= 0 &&
+            unmasked_prefix_rows != 0xffffffffu) {
+            const int split = plan_state.spatial_mask_split;
+            if (split !=
+                static_cast<int>(unmasked_prefix_rows)) {
+                throw std::runtime_error(
+                    "spatial mask: planned/prepared split drift");
+            }
+            if (mask_suffix_qo_indptr_d == nullptr) {
+                throw std::runtime_error(
+                    "spatial mask: suffix qo identity missing");
+            }
+            if (split > 0) {
+                if (!plan_state.decode_plan) {
                     throw std::runtime_error(
-                        "spatial mask: planned/prepared split drift");
+                        "spatial mask: split active but prepare built "
+                        "no prefix decode plan");
                 }
-                if (mask_suffix_qo_indptr_d == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: suffix qo identity missing");
-                }
-                if (split > 0) {
-                    if (!plan_state.decode_plan) {
-                        throw std::runtime_error(
-                            "spatial mask: no prefix decode plan");
-                    }
+                {
+                    auto kv_view = cache.layer_view(15);
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[15]
+                            : fwd_cfg.sliding_window;
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
                         kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        attn_ws, stream, fwd_cfg.sliding_window,
+                        attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
+            }
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(15);
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *plan_state.mask_decode_plan,
                     bf16_row(ws.q.data(), split, Hq), kv_view,
@@ -4491,13 +4746,20 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);
-            } else {
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            }
+        } else {
+            if (!plan_state.mask_decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no custom-mask plan");
+            }
+            {
+                auto kv_view = cache.layer_view(15);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *plan_state.mask_decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
             }
         }
         if (hooks != nullptr) {
@@ -8431,6 +8693,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
                            ws.gate.data());
     }
 
+    const int fast_rows = hooks == nullptr
+        ? R
+        : (static_cast<int>(hooks->hook_free_prefix_rows) < R
+               ? static_cast<int>(hooks->hook_free_prefix_rows)
+               : R);
+
     {
         auto __sg_mask = sg.open_cond(4, true);
         sg.begin_body(__sg_mask.if_body);
@@ -8493,49 +8761,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(0);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -8644,49 +8875,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(1);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -8795,49 +8989,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(2);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -8946,49 +9103,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(3);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -9097,49 +9217,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(4);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -9248,49 +9331,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(5);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -9399,49 +9445,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(6);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -9550,49 +9559,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(7);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -9701,49 +9673,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(8);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -9852,49 +9787,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(9);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -10003,49 +9901,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(10);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -10154,49 +10015,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(11);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -10305,49 +10129,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(12);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -10456,49 +10243,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(13);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -10607,49 +10357,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(14);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(
@@ -10758,49 +10471,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d,
     }
     {
         auto kv_view = cache.layer_view(15);
-        if (plan_state.spatial_mask_split >= 0 &&
-            unmasked_prefix_rows != 0xffffffffu) {
-            const int split = plan_state.spatial_mask_split;
-            if (split !=
-                static_cast<int>(unmasked_prefix_rows)) {
-                throw std::runtime_error(
-                    "spatial mask: planned/prepared split drift");
-            }
-            if (mask_suffix_qo_indptr_d == nullptr) {
-                throw std::runtime_error(
-                    "spatial mask: suffix qo identity missing");
-            }
-            if (split > 0) {
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: no prefix decode plan");
-                }
-                ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, fwd_cfg.sliding_window,
-                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-            }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                bf16_row(ws.q.data(), split, Hq), kv_view,
-                bf16_row(ws.attn_out.data(), split, Hq),
-                mask_suffix_qo_indptr_d,
-                kv_page_indices,
-                kv_page_indptr + split,
-                kv_last_page_lens + split,
-                custom_mask_d, custom_mask_indptr_d + split,
-                attn_ws, stream);
-        } else {
         ops::dispatch_attention_flashinfer_prefill_custom(
             *plan_state.mask_decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr,
             kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
             attn_ws, stream);
-        }
     }
     if (hooks != nullptr) {
         invoke_stage_hook(

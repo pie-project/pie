@@ -239,6 +239,57 @@ fn llama_like_text(
                         (!fused_post).then(|| general_qkv());
                     let (g, a) =
                         dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
+                    // The masked attention states its SPATIAL SPLIT as
+                    // vocabulary (NS-4 landed in the IR): a Peel on the
+                    // unmasked-prefix axis — the deployment's decode
+                    // dispatch serves the plain prefix rows, the custom
+                    // dispatch the masked suffix, the split a runtime
+                    // input, UNPLANNED collapsing to tail-only full-N
+                    // (the fire-level dispatch as the peel's endpoint).
+                    // Padded head dims keep the fire-level word (the
+                    // split's row offsets are logical-width, the padded
+                    // staging is not), and XQA deployments too (the XQA
+                    // fire-wide prepare is R-shaped) — both mirror the
+                    // prepare gate exactly, so the trace never states a
+                    // split prepare refuses to plan.
+                    let masked_attention = |q: &Val| {
+                        if c.xqa_decode || c.head_dim_padded {
+                            cuda::attention_flashinfer_prefill_custom_region(q, &w.kv);
+                        } else {
+                            dsl::peel_masked(
+                                m.trace(),
+                                Some(l),
+                                || {
+                                    // The prefix states THE DEPLOYMENT'S
+                                    // decode form, windowed to the plain
+                                    // rows: the force_prefill fallback
+                                    // (GQA ratio outside the decode
+                                    // kernel's set) is the plan-free
+                                    // prefill dispatch behind its
+                                    // dequant staging, everyone else
+                                    // the planned decode dispatch —
+                                    // `attn_with_sites`' choice, minus
+                                    // the sites (a planned split never
+                                    // carries hooks).
+                                    if c.force_prefill_path {
+                                        cuda::dequant_only(&w.kv);
+                                        cuda::attention_flashinfer_prefill_region(
+                                            q, &w.kv,
+                                        );
+                                    } else {
+                                        cuda::attention_flashinfer_decode_region(
+                                            q, &w.kv,
+                                        );
+                                    }
+                                },
+                                || {
+                                    cuda::attention_flashinfer_prefill_custom_region(
+                                        q, &w.kv,
+                                    )
+                                },
+                            );
+                        }
+                    };
                     let attn_with_sites = |q: &Val| {
                         dsl::hook_site(HookStage::OnAttnProj, q, l);
                         if c.xqa_decode {
@@ -269,7 +320,7 @@ fn llama_like_text(
                             // publish-gated contract).
                             let q = general_qkv();
                             dsl::hook_site(HookStage::OnAttnProj, &q, l);
-                            cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
+                            masked_attention(&q);
                             dsl::hook_site(HookStage::OnAttn, &q, l);
                         })
                         // The lora arm: the fused epilogue writes V
@@ -325,7 +376,7 @@ fn llama_like_text(
                         g.arm(GuardPred::HasCustomMask, || {
                             // Masked+hooked (the fused arm's comment).
                             dsl::hook_site(HookStage::OnAttnProj, q, l);
-                            cuda::attention_flashinfer_prefill_custom_region(q, &w.kv);
+                            masked_attention(q);
                             dsl::hook_site(HookStage::OnAttn, q, l);
                         })
                         .otherwise(|| attn_with_sites(q));

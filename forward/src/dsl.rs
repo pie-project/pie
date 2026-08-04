@@ -725,7 +725,7 @@ pub fn peel(
     let (idx, outs) = {
         let mut b = t.inner.borrow_mut();
         b.set_layer(layer);
-        b.open_peel(vec![shape])
+        b.open_peel(vec![shape], crate::trace::PeelWindow::HookFreePrefix)
     };
     prefix_f();
     let prefix = {
@@ -743,6 +743,37 @@ pub fn peel(
         id: outs[0],
         layer,
     }
+}
+
+/// Record an [`OpKind::Peel`] on the UNMASKED-PREFIX axis (the spatial
+/// mask split, NS-2/NS-4): the prefix region serves the plain decode
+/// rows `[0, unmasked_prefix_rows)`, the tail the masked suffix — both
+/// run, the split a runtime input, UNPLANNED collapsing to the tail
+/// full-N (the fire-level custom dispatch as the peel's endpoint).
+/// Output-less: the peel sits inside the mask Guard arm, whose value is
+/// the attention output the regions' launches jointly bind.
+pub fn peel_masked(
+    t: &Trace,
+    layer: Option<u32>,
+    prefix_f: impl FnOnce(),
+    tail_f: impl FnOnce(),
+) {
+    let (idx, _outs) = {
+        let mut b = t.inner.borrow_mut();
+        b.set_layer(layer);
+        b.open_peel(vec![], crate::trace::PeelWindow::UnmaskedPrefix)
+    };
+    prefix_f();
+    let prefix = {
+        let b = t.inner.borrow();
+        (b.op_count_now() - idx - 1) as u32
+    };
+    tail_f();
+    let total = {
+        let b = t.inner.borrow();
+        (b.op_count_now() - idx - 1) as u32
+    };
+    t.inner.borrow_mut().close_peel(idx, prefix, total - prefix);
 }
 
 /// [`guard`] for declarations that carry no [`M`] (the qwen3_5 bodies

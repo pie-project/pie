@@ -518,7 +518,46 @@ pub enum OpKind {
     /// are the PEEL's outputs and both regions' launches bind disjoint
     /// row windows of the same buffers, recording no SSA outputs of
     /// their own — dataflow sees one producer, jointly lowered.
-    Peel { prefix_ops: u32, tail_ops: u32 },
+    ///
+    /// `window` names WHICH runtime row count is the split
+    /// ([`PeelWindow`]): the op is one region-word over every axis the
+    /// scheduler seriates, not one word per axis.
+    Peel {
+        prefix_ops: u32,
+        tail_ops: u32,
+        #[serde(default, skip_serializing_if = "PeelWindow::is_hook_free")]
+        window: PeelWindow,
+    },
+}
+
+/// The runtime row count a [`OpKind::Peel`]'s split reads — the peel's
+/// AXIS. Every axis the scheduler seriates into a prefix/suffix order
+/// gets a variant here, and the regions' meaning is fixed by the op
+/// (both run, complementary windows); only the split's SOURCE varies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeelWindow {
+    /// The hook-free prefix (`fast_rows`, A3): the prefix region is the
+    /// fused fast path, the tail the hook-visible general sequence.
+    #[default]
+    HookFreePrefix,
+    /// The unmasked prefix (the spatial mask split, NS-2/NS-4): the
+    /// prefix region serves the PLAIN decode rows, the tail the masked
+    /// suffix rows — the work-sharing fire's one divergent op, stated.
+    /// UNPLANNED (`unmasked_prefix_rows == u32::MAX`, or prepare kept
+    /// the fire-level arm) means the tail region runs FULL-N with
+    /// fire-level addressing and the prefix region is skipped: the
+    /// fire-level custom dispatch is this peel's degenerate endpoint,
+    /// not a separate op.
+    UnmaskedPrefix,
+}
+
+impl PeelWindow {
+    /// Serde skip for the default axis — every pre-window golden stays
+    /// byte-identical.
+    pub fn is_hook_free(&self) -> bool {
+        matches!(self, PeelWindow::HookFreePrefix)
+    }
 }
 
 /// Which implicit store an op addresses. Both stores are per-layer and
@@ -686,11 +725,16 @@ impl TraceBuilder {
     /// one producer, jointly lowered by both regions) and returns its
     /// index for [`Self::close_peel`]. Region ops follow consecutively,
     /// prefix first; guards may nest inside either region.
-    pub(crate) fn open_peel(&mut self, out_shapes: Vec<(Shape, DType)>) -> (usize, Vec<ValueId>) {
+    pub(crate) fn open_peel(
+        &mut self,
+        out_shapes: Vec<(Shape, DType)>,
+        window: PeelWindow,
+    ) -> (usize, Vec<ValueId>) {
         let outs = self.push(
             OpKind::Peel {
                 prefix_ops: 0,
                 tail_ops: 0,
+                window,
             },
             vec![],
             out_shapes,
@@ -702,6 +746,7 @@ impl TraceBuilder {
         let OpKind::Peel {
             prefix_ops,
             tail_ops,
+            ..
         } = &mut self.ops[peel_idx].kind
         else {
             panic!("close_peel: not a peel at {peel_idx}");
