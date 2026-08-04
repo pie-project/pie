@@ -327,12 +327,12 @@ fn build_verify(
         let picked = reduce_argmax(intrinsics::logits()); // [k+1] target (k verify + bonus)
         let head = gather(&picked, iota(k)); // [k] picked[0..k]
         let hit = eq(&head, &draft_v); // [k] bool
-        let ones = broadcast(Tensor::constant(1.0f32), [k]);
-        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
+        let ones = broadcast(1.0f32, [k]);
+        let zeros = broadcast(0.0f32, [k]);
         let run = cumprod(select(&hit, &ones, &zeros)); // [k]
         let n_acc = cast(reduce_sum(run), dtype::u32); // accepted-prefix length
         let keep = ge(broadcast(&n_acc, [kp1]), iota(kp1)); // [k+1] i <= n_acc
-        let neg1 = broadcast(Tensor::constant(-1i32), [kp1]);
+        let neg1 = broadcast(-1i32, [kp1]);
         let commit = select(&keep, &picked, &neg1); // accepted prefix + bonus + -1s
 
         let mtp = intrinsics::mtp_logits(k); // [k, vocab]
@@ -343,7 +343,7 @@ fn build_verify(
         // of a sentinel tail. Publishing it directly is what lets the commit
         // fire be traced BEFORE anyone knows its value.
         if let Some(sink) = clen_sink {
-            let clen = cast(add(&n_acc, 1u32), dtype::u32);
+            let clen = cast(&n_acc + 1u32, dtype::u32);
             if let Some(echo) = clen_echo {
                 echo.put(&clen);
             }

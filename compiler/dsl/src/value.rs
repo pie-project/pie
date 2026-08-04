@@ -96,7 +96,9 @@ impl Arg {
 }
 
 /// Anything usable as a tensor operand: a `Tensor`, a channel take/read result,
-/// or a scalar literal (`u32` / `f32`; integer literals resolve to `u32`).
+/// or a scalar literal (`u32`, `i32`, `f32` or `bool`). A scalar operand takes
+/// on the dtype of the tensor it is combined with, so the literal's own suffix
+/// only matters when both operands are scalars.
 pub trait AsTensor {
     #[doc(hidden)]
     fn to_arg(&self) -> Arg;
@@ -114,24 +116,16 @@ impl AsTensor for &Tensor {
         (*self).to_arg()
     }
 }
-impl AsTensor for u32 {
-    fn to_arg(&self) -> Arg {
-        Arg::Const(ConstData {
-            shape: Shape::SCALAR,
-            dtype: DType::U32,
-            bytes: self.to_le_bytes().to_vec(),
-        })
-    }
+macro_rules! as_tensor_scalar {
+    ($($t:ty),*) => {$(
+        impl AsTensor for $t {
+            fn to_arg(&self) -> Arg {
+                Arg::Const((*self).into_const())
+            }
+        }
+    )*};
 }
-impl AsTensor for f32 {
-    fn to_arg(&self) -> Arg {
-        Arg::Const(ConstData {
-            shape: Shape::SCALAR,
-            dtype: DType::F32,
-            bytes: self.to_le_bytes().to_vec(),
-        })
-    }
-}
+as_tensor_scalar!(u32, i32, f32, bool);
 
 // ---------------------------------------------------------------------------
 // Constant → IR op materialization
@@ -552,6 +546,83 @@ pub fn max_elem(a: impl AsTensor, b: impl AsTensor) -> Tensor {
 /// Elementwise minimum of `a` and `b`; same dtype/shape rule as [`add`].
 pub fn min_elem(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::MinElem, |d| d)
+}
+
+// -- map: binary, spelled as Rust operators --
+//
+// The five arithmetic intrinsics above are also reachable as `+ - * / %` so
+// that page arithmetic and score math read as arithmetic. Comparisons are not:
+// `PartialOrd` must yield `bool`, so [`lt`] and friends stay functions.
+
+macro_rules! tensor_binop {
+    ($($trait:ident, $method:ident, $intrinsic:ident;)*) => {$(
+        impl<T: AsTensor> core::ops::$trait<T> for Tensor {
+            type Output = Tensor;
+            fn $method(self, rhs: T) -> Tensor {
+                $intrinsic(self, rhs)
+            }
+        }
+        impl<T: AsTensor> core::ops::$trait<T> for &Tensor {
+            type Output = Tensor;
+            fn $method(self, rhs: T) -> Tensor {
+                $intrinsic(self, rhs)
+            }
+        }
+        tensor_binop!(@scalar $trait, $method, $intrinsic, u32, i32, f32);
+    )*};
+    (@scalar $trait:ident, $method:ident, $intrinsic:ident, $($t:ty),*) => {$(
+        impl core::ops::$trait<Tensor> for $t {
+            type Output = Tensor;
+            fn $method(self, rhs: Tensor) -> Tensor {
+                $intrinsic(self, rhs)
+            }
+        }
+        impl core::ops::$trait<&Tensor> for $t {
+            type Output = Tensor;
+            fn $method(self, rhs: &Tensor) -> Tensor {
+                $intrinsic(self, rhs)
+            }
+        }
+    )*};
+}
+
+tensor_binop! {
+    Add, add, add;
+    Sub, sub, sub;
+    Mul, mul, mul;
+    Div, div, div;
+    Rem, rem, rem;
+}
+
+macro_rules! tensor_binop_assign {
+    ($($trait:ident, $method:ident, $intrinsic:ident;)*) => {$(
+        impl<T: AsTensor> core::ops::$trait<T> for Tensor {
+            fn $method(&mut self, rhs: T) {
+                *self = $intrinsic(&*self, rhs);
+            }
+        }
+    )*};
+}
+
+tensor_binop_assign! {
+    AddAssign, add_assign, add;
+    SubAssign, sub_assign, sub;
+    MulAssign, mul_assign, mul;
+    DivAssign, div_assign, div;
+    RemAssign, rem_assign, rem;
+}
+
+impl core::ops::Neg for Tensor {
+    type Output = Tensor;
+    fn neg(self) -> Tensor {
+        neg(self)
+    }
+}
+impl core::ops::Neg for &Tensor {
+    type Output = Tensor;
+    fn neg(self) -> Tensor {
+        neg(self)
+    }
 }
 
 // -- compare / logic (bool results) --

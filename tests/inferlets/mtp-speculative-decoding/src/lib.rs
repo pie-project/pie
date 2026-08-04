@@ -173,12 +173,12 @@ async fn main(input: Input) -> Result<String> {
         let base = len.take();
         kv_len.take();
         let stop_prev = stopped.take();
-        let neg1_w = broadcast(Tensor::constant(TOKEN_PAD), [w]);
+        let neg1_w = broadcast(TOKEN_PAD, [w]);
 
         // Verify: row i holds the truth for window slot i + 1. A draft is
         // accepted while every draft before it matched (cumprod prefix).
         let targets = reduce_argmax(intrinsics::logits());
-        let drafts = gather(&win, add(iota(k), 1u32));
+        let drafts = gather(&win, iota(k) + 1u32);
         let truth = gather(&targets, iota(k));
         let acc = cumprod(cast(eq(&drafts, &truth), dtype::f32));
         let m = reshape(cast(reduce_sum(&acc), dtype::u32), [1]);
@@ -192,25 +192,18 @@ async fn main(input: Input) -> Result<String> {
 
         // Stop once any committed token is a stop token: later fires carry
         // all-`-1` windows and the frozen length below.
-        let mut eos_hit = broadcast(Tensor::constant(false), [w]);
+        let mut eos_hit = broadcast(false, [w]);
         for &stop in &stage_stop_tokens {
-            eos_hit = or(&eos_hit, eq(&committed, Tensor::constant(stop as i32)));
+            eos_hit = or(&eos_hit, eq(&committed, stop as i32));
         }
-        let eos_any = ne(
-            reduce_max(cast(&eos_hit, dtype::u32)),
-            Tensor::constant(0u32),
-        );
+        let eos_any = ne(reduce_max(cast(&eos_hit, dtype::u32)), 0u32);
         let stop_next = or(&stop_prev, reshape(eos_any, [1]));
         stopped.put(&stop_next);
 
         // Loop-carry: the length advances by the accepted count only —
         // rejected drafts stay above it and are overwritten next fire.
-        let advance = select(
-            &stop_prev,
-            broadcast(Tensor::constant(0u32), [1]),
-            add(&m, 1u32),
-        );
-        let next_base = add(&base, &advance);
+        let advance = select(&stop_prev, broadcast(0u32, [1]), &m + 1u32);
+        let next_base = &base + &advance;
 
         // Next window: the correction/bonus token followed by fresh MTP
         // drafts, or all `-1` once stopped.
@@ -218,30 +211,26 @@ async fn main(input: Input) -> Result<String> {
         let drafts_next = reduce_argmax(intrinsics::mtp_logits(k));
         let win_next = scatter_set(
             scatter_set(&neg1_w, Tensor::constant(vec![0u32]), &x_next),
-            add(iota(k), 1u32),
+            iota(k) + 1u32,
             &drafts_next,
         );
         let stop_next_w = broadcast(&stop_next, [w]);
         let next_window = select(&stop_next_w, &neg1_w, &win_next);
-        let next_live = ne(&next_window, Tensor::constant(TOKEN_PAD));
+        let next_live = ne(&next_window, TOKEN_PAD);
         let next_live_u32 = cast(&next_live, dtype::u32);
         let next_live_f32 = cast(&next_live, dtype::f32);
-        let next_rank = cast(sub(cumsum(&next_live_f32), &next_live_f32), dtype::u32);
-        let next_positions = add(broadcast(&next_base, [w]), &next_rank);
+        let next_rank = cast(cumsum(&next_live_f32) - &next_live_f32, dtype::u32);
+        let next_positions = broadcast(&next_base, [w]) + &next_rank;
 
-        let next_kv_len = add(&next_positions, &next_live_u32);
-        let page_counts = div(add(&next_kv_len, PAGE_T - 1), PAGE_T);
+        let next_kv_len = &next_positions + &next_live_u32;
+        let page_counts = (&next_kv_len + (PAGE_T - 1)) / PAGE_T;
         let page_tail = cast(cumsum(cast(&page_counts, dtype::f32)), dtype::u32);
-        let next_page_indptr = scatter_set(
-            broadcast(Tensor::constant(0u32), [w + 1]),
-            add(iota(w), 1u32),
-            &page_tail,
-        );
+        let next_page_indptr = scatter_set(broadcast(0u32, [w + 1]), iota(w) + 1u32, &page_tail);
         len.put(&next_base);
         kv_len.put(&next_kv_len);
         positions.put(&next_positions);
-        w_slot.put(div(&next_positions, PAGE_T));
-        w_off.put(rem(&next_positions, PAGE_T));
+        w_slot.put(&next_positions / PAGE_T);
+        w_off.put(&next_positions % PAGE_T);
         page_indptr.take();
         page_indptr.put(&next_page_indptr);
         window.put(&next_window);

@@ -54,7 +54,7 @@ fn sample_token(r: &Tensor, temperature: f32, top_p: f32, vocab: u32) -> Tensor 
     if temperature == 0.0 {
         return cast(&reduce_argmax(&logits), dtype::i32);
     }
-    let scaled = div(&logits, temperature.max(1e-4));
+    let scaled = &logits / temperature.max(1e-4);
     let _ = vocab;
     nucleus_sample(&scaled, top_p, r)
 }
@@ -146,7 +146,7 @@ async fn main(input: Input) -> Result<String> {
         fwd_p.epilogue(move || {
             let r = rng_p.take();
             let tok = sample_token(&r, temperature, top_p, vocab);
-            let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
+            let r_next = &r + iota(2); // advance ctr: [key, ctr+1]
             g0_ch.put(&tok);
             rng_p.put(&r_next);
         });
@@ -222,17 +222,17 @@ async fn main(input: Input) -> Result<String> {
         let r = rng.take();
 
         let tok = sample_token(&r, temperature, top_p, vocab); // [1] i32
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
 
-        let logical_slot = div(&base, PAGE_T);
+        let logical_slot = &base / PAGE_T;
         let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = rem(&base, PAGE_T);
-        let klen_v = add(&base, 1u32);
-        let next_free = add(&base, 1u32);
+        let w_off_v = &base % PAGE_T;
+        let klen_v = &base + 1u32;
+        let next_free = &base + 1u32;
         let pages_v = reshape(&pids, [pool_pages]);
         // Page count tracks the new kv length, never the pool size.
-        let page_count = div(add(&klen_v, PAGE_T - 1), PAGE_T);
-        let pidx_v = mul(iota(2), broadcast(&page_count, [2]));
+        let page_count = (&klen_v + (PAGE_T - 1)) / PAGE_T;
+        let pidx_v = iota(2) * broadcast(&page_count, [2]);
 
         // Device-resolved geometry is loop-carried: the host never drains
         // these rings, so the graph has to take before it puts or the

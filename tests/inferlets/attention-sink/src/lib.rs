@@ -175,8 +175,8 @@ async fn main(input: Input) -> Result<String> {
             sink_window_mask(&base, pool_len, sink, window),
             [1, pool_len],
         );
-        let logical_slot = div(&base, PAGE_T);
-        let next = add(&base, 1u32);
+        let logical_slot = &base / PAGE_T;
+        let next = &base + 1u32;
 
         // Device-resolved geometry is loop-carried: the host never drains
         // these rings, so the graph has to take before it puts or the
@@ -192,14 +192,14 @@ async fn main(input: Input) -> Result<String> {
         write_slot.take();
         write_slot.put(gather(&ids, &logical_slot));
         write_offset.take();
-        write_offset.put(rem(&base, PAGE_T));
+        write_offset.put(&base % PAGE_T);
         mask.take();
         mask.put(&next_mask);
         pages.take();
         pages.put(reshape(&ids, [pool_pages]));
         page_indptr.take();
-        let page_count = div(add(&next, PAGE_T - 1), PAGE_T);
-        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        let page_count = (&next + (PAGE_T - 1)) / PAGE_T;
+        page_indptr.put(iota(2) * broadcast(&page_count, [2]));
         pool_ids_input.put(&ids);
     });
 

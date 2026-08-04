@@ -46,15 +46,15 @@ fn default_alpha() -> f32 {
     0.1
 }
 
-fn contrastive_pick(amateur_logits: impl AsTensor, lambda: f32, alpha: f32, vocab: u32) -> Tensor {
+fn contrastive_pick(amateur_logits: &Tensor, lambda: f32, alpha: f32, vocab: u32) -> Tensor {
     let expert = log_softmax(intrinsics::logits());
     let amateur = log_softmax(amateur_logits);
-    let score = sub(&expert, mul(&amateur, lambda));
+    let score = &expert - &amateur * lambda;
 
     let best = reduce_max(&expert);
-    let threshold = add(best, alpha.ln());
+    let threshold = best + alpha.ln();
     let plausible = ge(&expert, broadcast(threshold, [vocab]));
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     reshape(reduce_argmax(select(plausible, score, neg_inf)), [1])
 }
 
@@ -200,7 +200,7 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     expert_prefill.epilogue(move || {
-        let token = contrastive_pick(expert_prefill_amateur.take(), lambda, alpha, vocab);
+        let token = contrastive_pick(&expert_prefill_amateur.take(), lambda, alpha, vocab);
         first_out.put(token);
     });
 
@@ -260,26 +260,26 @@ async fn main(input: Input) -> Result<String> {
         let next_mask = reshape(
             and(
                 le(&columns, &base_columns),
-                gt(add(&columns, window), &base_columns),
+                gt(&columns + window, &base_columns),
             ),
             [1, pool_len],
         );
-        let next = add(&base, 1u32);
+        let next = &base + 1u32;
 
         amateur_logits_out.put(intrinsics::logits());
         amateur_position.put(&base);
         amateur_fill.put(&next);
         amateur_klen.take();
         amateur_klen.put(&next);
-        amateur_write_slot.put(gather(&ids, div(&base, PAGE_T)));
-        amateur_write_offset.put(rem(&base, PAGE_T));
+        amateur_write_slot.put(gather(&ids, &base / PAGE_T));
+        amateur_write_offset.put(&base % PAGE_T);
         amateur_mask.take();
         amateur_mask.put(next_mask);
         amateur_pages.take();
         amateur_pages.put(reshape(&ids, [pool_pages]));
         amateur_page_indptr.take();
-        let amateur_page_count = div(add(&next, PAGE_T - 1), PAGE_T);
-        amateur_page_indptr.put(mul(iota(2), broadcast(&amateur_page_count, [2])));
+        let amateur_page_count = (&next + (PAGE_T - 1)) / PAGE_T;
+        amateur_page_indptr.put(iota(2) * broadcast(&amateur_page_count, [2]));
         amateur_ids_input.put(&ids);
     });
 
@@ -315,17 +315,17 @@ async fn main(input: Input) -> Result<String> {
     )?;
     expert_decode.epilogue(move || {
         let length = expert_kv_len.take();
-        let token = contrastive_pick(expert_amateur.take(), lambda, alpha, vocab);
-        let next_length = add(&length, 1u32);
-        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+        let token = contrastive_pick(&expert_amateur.take(), lambda, alpha, vocab);
+        let next_length = &length + 1u32;
+        let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
 
         expert_token.put(&token);
         expert_kv_len.put(&next_length);
         expert_position.put(&length);
-        expert_write_slot.put(div(&length, PAGE_T));
-        expert_write_offset.put(rem(&length, PAGE_T));
+        expert_write_slot.put(&length / PAGE_T);
+        expert_write_offset.put(&length % PAGE_T);
         expert_page_indptr.take();
-        expert_page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        expert_page_indptr.put(iota(2) * broadcast(&page_count, [2]));
         expert_token_out.put(&token);
     });
 

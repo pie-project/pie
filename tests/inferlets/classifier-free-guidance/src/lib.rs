@@ -59,15 +59,15 @@ fn default_guidance() -> f32 {
 /// Eqn 4 of 2306.17806 in the log-domain, plus the two diagnostics that prove
 /// the γ = 1 identity: `shift` is 1 when guidance moved the argmax, and `kl` is
 /// KL(P_cfg ‖ P_cond), which is exactly 0 at γ = 1.
-fn guided_pick(uncond_logits: impl AsTensor, gamma: f32) -> (Tensor, Tensor, Tensor) {
+fn guided_pick(uncond_logits: &Tensor, gamma: f32) -> (Tensor, Tensor, Tensor) {
     let cond = log_softmax(intrinsics::logits());
     let uncond = log_softmax(uncond_logits);
-    let guided = log_softmax(add(&uncond, mul(sub(&cond, &uncond), gamma)));
+    let guided = log_softmax(&uncond + (&cond - &uncond) * gamma);
 
     let token = reduce_argmax(&guided);
     let cond_token = reduce_argmax(&cond);
     let shift = cast(ne(&token, &cond_token), dtype::i32);
-    let kl = reduce_sum(mul(exp(&guided), sub(&guided, &cond)));
+    let kl = reduce_sum(exp(&guided) * (&guided - &cond));
     (
         reshape(cast(&token, dtype::i32), [1]),
         reshape(shift, [1]),
@@ -197,7 +197,7 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     cond_prefill.epilogue(move || {
-        let (token, shift, kl) = guided_pick(c_pre_uncond.take(), gamma);
+        let (token, shift, kl) = guided_pick(&c_pre_uncond.take(), gamma);
         first_out.put(&token);
         first_shift.put(&shift);
         first_kl.put(&kl);
@@ -251,16 +251,16 @@ async fn main(input: Input) -> Result<String> {
     )?;
     uncond_decode.epilogue(move || {
         let length = u_klen.take();
-        let next_length = add(&length, 1u32);
-        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+        let next_length = &length + 1u32;
+        let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
 
         u_logits_out.put(intrinsics::logits());
         u_klen.put(&next_length);
         u_pos.put(&length);
-        u_slot.put(div(&length, PAGE_T));
-        u_off.put(rem(&length, PAGE_T));
+        u_slot.put(&length / PAGE_T);
+        u_off.put(&length % PAGE_T);
         u_page_indptr.take();
-        u_page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        u_page_indptr.put(iota(2) * broadcast(&page_count, [2]));
     });
 
     let c_token = Channel::from([first as i32]).named("cond_token");
@@ -300,17 +300,17 @@ async fn main(input: Input) -> Result<String> {
     )?;
     cond_decode.epilogue(move || {
         let length = c_klen.take();
-        let (token, shift, kl) = guided_pick(c_uncond.take(), gamma);
-        let next_length = add(&length, 1u32);
-        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+        let (token, shift, kl) = guided_pick(&c_uncond.take(), gamma);
+        let next_length = &length + 1u32;
+        let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
 
         c_token.put(&token);
         c_klen.put(&next_length);
         c_pos.put(&length);
-        c_slot.put(div(&length, PAGE_T));
-        c_off.put(rem(&length, PAGE_T));
+        c_slot.put(&length / PAGE_T);
+        c_off.put(&length % PAGE_T);
         c_page_indptr.take();
-        c_page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        c_page_indptr.put(iota(2) * broadcast(&page_count, [2]));
         c_token_out.put(&token);
         c_shift_out.put(&shift);
         c_kl_out.put(&kl);

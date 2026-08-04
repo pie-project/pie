@@ -112,21 +112,21 @@ fn typical_keep(logits: &Tensor, vocab: u32, k_max: u32, mass: f32) -> (Tensor, 
     // H = -sum(p log p), a scalar.
     let h = entropy_from_logprobs(&probs, &logprobs);
     // deviation = log p(x) + H, i.e. signed typicality.
-    let deviation = add(&logprobs, broadcast(&h, [vocab]));
+    let deviation = &logprobs + broadcast(&h, [vocab]);
     let score = abs(&deviation);
 
     // Ascending typicality == descending (-score), capped at k_max candidates.
-    let (_sorted_score, order) = top_k(neg(&score), k_max);
+    let (_sorted_score, order) = top_k(-&score, k_max);
     let probs_sorted = gather(&probs, &order);
     // Exclusive prefix mass, so the most typical candidate always passes.
-    let exclusive = sub(cumsum(&probs_sorted), &probs_sorted);
-    let keep_sorted = lt(&exclusive, broadcast(Tensor::constant(mass), [k_max]));
+    let exclusive = cumsum(&probs_sorted) - &probs_sorted;
+    let keep_sorted = lt(&exclusive, broadcast(mass, [k_max]));
 
-    let zeros = broadcast(Tensor::constant(0.0f32), [k_max]);
+    let zeros = broadcast(0.0f32, [k_max]);
     let kept_mass = reshape(reduce_sum(select(&keep_sorted, &probs_sorted, &zeros)), [1]);
     let kept = reshape(reduce_sum(cast(&keep_sorted, dtype::f32)), [1]);
 
-    let base = broadcast(Tensor::constant(false), [vocab]);
+    let base = broadcast(false, [vocab]);
     let keep = scatter_set(base, &order, keep_sorted);
     (keep, kept, kept_mass)
 }
@@ -138,17 +138,17 @@ fn typical_step(
     k_max: u32,
     temperature: f32,
     mass: f32,
-    rng_state: impl AsTensor,
+    rng_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor) {
     // Temperature first, matching the reference implementations: typicality is
     // measured on the distribution actually being sampled from.
     let scaled = if temperature == 1.0 {
         logits
     } else {
-        div(&logits, temperature)
+        &logits / temperature
     };
     let (keep, kept, kept_mass) = typical_keep(&scaled, vocab, k_max, mass);
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     let token = gumbel_max(masked, rng_state);
     (token, kept, kept_mass)
@@ -235,7 +235,7 @@ async fn main(input: Input) -> Result<Output> {
         let r = rng_p.take();
         let logits = intrinsics::logits();
         let (token, kept, kmass) = typical_step(logits, vocab, k_max, temperature, mass, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         kept_out_p.put(&kept);
         mass_out_p.put(&kmass);
@@ -296,17 +296,17 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let (token, kept, kmass) = typical_step(logits, vocab, k_max, temperature, mass, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             kept_out.put(&kept);
             mass_out.put(&kmass);

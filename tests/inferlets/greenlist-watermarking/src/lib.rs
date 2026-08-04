@@ -50,18 +50,14 @@ fn green_mask(vocab: u32, previous_token: u32, gamma: f32) -> Vec<bool> {
 }
 
 fn watermarked_sample(
-    logits: impl AsTensor,
-    green: impl AsTensor,
-    rng_state: impl AsTensor,
+    logits: &Tensor,
+    green: &Tensor,
+    rng_state: &Tensor,
     delta: f32,
     vocab: u32,
 ) -> Tensor {
-    let bias = select(
-        green,
-        broadcast(Tensor::constant(delta), [vocab]),
-        broadcast(Tensor::constant(0.0f32), [vocab]),
-    );
-    gumbel_max(add(logits, bias), rng_state)
+    let bias = select(green, broadcast(delta, [vocab]), broadcast(0.0f32, [vocab]));
+    gumbel_max(logits + bias, rng_state)
 }
 
 #[inferlet::main]
@@ -123,9 +119,9 @@ async fn main(input: Input) -> Result<String> {
     prefill.epilogue(move || {
         let green = prefill_green.take();
         let rng = prefill_rng.take();
-        let token = watermarked_sample(intrinsics::logits(), &green, &rng, delta, vocab);
+        let token = watermarked_sample(&intrinsics::logits(), &green, &rng, delta, vocab);
         first_out.put(&token);
-        prefill_rng.put(add(&rng, iota(2)));
+        prefill_rng.put(&rng + iota(2));
     });
 
     prefill_green.put(green_mask(vocab, *prompt.last().unwrap_or(&0), input.gamma));
@@ -178,20 +174,25 @@ async fn main(input: Input) -> Result<String> {
             let length = kv_len.take();
             let green_value = green.take();
             let rng_value = rng.take();
-            let token =
-                watermarked_sample(intrinsics::logits(), &green_value, &rng_value, delta, vocab);
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let token = watermarked_sample(
+                &intrinsics::logits(),
+                &green_value,
+                &rng_value,
+                delta,
+                vocab,
+            );
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             token_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             token_out.put(&token);
-            rng.put(add(&rng_value, iota(2)));
+            rng.put(&rng_value + iota(2));
         });
 
         // The greenlist is keyed on the PREVIOUS OUTPUT token, so the host

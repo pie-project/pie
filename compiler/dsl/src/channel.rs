@@ -343,6 +343,45 @@ impl AsTensor for &Taken {
     }
 }
 
+// A take is a tensor operand, so it is also an operand of `+ - * / %`.
+macro_rules! taken_binop {
+    ($($trait:ident, $method:ident, $intrinsic:ident;)*) => {$(
+        impl<T: AsTensor> core::ops::$trait<T> for Taken {
+            type Output = Tensor;
+            fn $method(self, rhs: T) -> Tensor {
+                crate::value::$intrinsic(self, rhs)
+            }
+        }
+        impl<T: AsTensor> core::ops::$trait<T> for &Taken {
+            type Output = Tensor;
+            fn $method(self, rhs: T) -> Tensor {
+                crate::value::$intrinsic(self, rhs)
+            }
+        }
+    )*};
+}
+
+taken_binop! {
+    Add, add, add;
+    Sub, sub, sub;
+    Mul, mul, mul;
+    Div, div, div;
+    Rem, rem, rem;
+}
+
+impl core::ops::Neg for Taken {
+    type Output = Tensor;
+    fn neg(self) -> Tensor {
+        crate::value::neg(self)
+    }
+}
+impl core::ops::Neg for &Taken {
+    type Output = Tensor;
+    fn neg(self) -> Tensor {
+        crate::value::neg(self)
+    }
+}
+
 // Host-side await surface (wires real async over the driver channel).
 impl Taken {
     /// Await the host value. Consumes the cell for `take`, copies for `read`.

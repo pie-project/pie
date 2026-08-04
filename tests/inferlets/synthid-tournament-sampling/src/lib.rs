@@ -175,10 +175,7 @@ const DECOY_SALT: u32 = 0x0200_0000;
 /// candidate token, so `g` is a pure function of the same three inputs.
 fn g_layer(secret: u32, counter: &Tensor, layer: u32, vocab: u32) -> Tensor {
     let state = rng_state(secret ^ (G_SALT.wrapping_mul(layer + 1)), counter);
-    cast(
-        ge(rng(&state, [vocab]), Tensor::constant(0.5f32)),
-        dtype::f32,
-    )
+    cast(ge(rng(&state, [vocab]), 0.5f32), dtype::f32)
 }
 
 /// Rolling hash of the `context_width` tokens ending at `hlen - 1`.
@@ -188,33 +185,23 @@ fn g_layer(secret: u32, counter: &Tensor, layer: u32, vocab: u32) -> Tensor {
 /// same offset sees the same clamped prefix, so the counter stays a pure
 /// function of the context.
 fn context_counter(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
-    let last = sub(cast(hlen, dtype::i32), Tensor::constant(1i32));
-    let mut h = broadcast(Tensor::constant(0u32), [1]);
+    let last = cast(hlen, dtype::i32) - 1i32;
+    let mut h = broadcast(0u32, [1]);
     // Oldest token first, so the hash is the usual left-to-right polynomial.
     for d in (0..cfg.context_width).rev() {
-        let idx = max_elem(
-            sub(&last, Tensor::constant(d as i32)),
-            Tensor::constant(0i32),
-        );
+        let idx = max_elem(&last - d as i32, 0i32);
         // `+1` lifts the `-1` padding sentinel to 0 and keeps every real token
         // distinguishable from it.
-        let tok = cast(add(gather(hist, &idx), Tensor::constant(1i32)), dtype::u32);
-        h = rem(
-            add(mul(&h, Tensor::constant(HASH_MULTIPLIER)), tok),
-            Tensor::constant(HASH_MODULUS),
-        );
+        let tok = cast(gather(hist, &idx) + 1i32, dtype::u32);
+        h = (&h * HASH_MULTIPLIER + tok) % HASH_MODULUS;
     }
     h
 }
 
 /// Assembles the `[2]` u32 `[key, ctr]` rng state from two `[1]` parts.
 fn rng_state(key: u32, counter: &Tensor) -> Tensor {
-    let is_counter = eq(iota(2), broadcast(Tensor::constant(1u32), [2]));
-    select(
-        &is_counter,
-        broadcast(counter, [2]),
-        broadcast(Tensor::constant(key), [2]),
-    )
+    let is_counter = eq(iota(2), broadcast(1u32, [2]));
+    select(&is_counter, broadcast(counter, [2]), broadcast(key, [2]))
 }
 
 /// The host mirror of `context_counter`, used to find which steps saw a context
@@ -238,9 +225,9 @@ fn host_counter(history: &[i32], hlen: usize, context_width: u32) -> u32 {
 fn mean_g(gs: &[Tensor], token: &Tensor) -> Tensor {
     let mut total = scalar_gather(&gs[0], token);
     for g in &gs[1..] {
-        total = add(total, scalar_gather(g, token));
+        total += scalar_gather(g, token);
     }
-    reshape(div(total, gs.len() as f32), [1])
+    reshape(total / gs.len() as f32, [1])
 }
 
 /// One sampling step.
@@ -253,12 +240,12 @@ fn step(
     hist: &Tensor,
     hlen: &Tensor,
     chist: &Tensor,
-    free_state: impl AsTensor + Copy,
+    free_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
     let scaled = if cfg.temperature == 1.0 {
         logits
     } else {
-        div(&logits, cfg.temperature)
+        &logits / cfg.temperature
     };
 
     let counter = context_counter(hist, hlen, cfg);
@@ -269,7 +256,7 @@ fn step(
             eq(chist, broadcast(&counter, [cfg.history_size])),
             dtype::u32,
         )),
-        Tensor::constant(0u32),
+        0u32,
     );
 
     let base = softmax(&scaled);
@@ -282,15 +269,15 @@ fn step(
     // `g ∈ {0,1}` and `E_p[g] ∈ [0,1]`, and preserves normalisation exactly.
     let mut watermarked = base.clone();
     for g in &gs {
-        let mass = reduce_sum(mul(&watermarked, g));
-        let offset = broadcast(sub(Tensor::constant(1.0f32), &mass), [vocab]);
-        watermarked = mul(&watermarked, add(&offset, g));
+        let mass = reduce_sum(&watermarked * g);
+        let offset = broadcast(1.0f32 - &mass, [vocab]);
+        watermarked = &watermarked * (&offset + g);
     }
 
     let effective = select(broadcast(&repeated, [vocab]), &base, &watermarked);
     // `log` of a probability that underflowed would be -inf and would poison
     // the Gumbel-max comparison, so the floor is applied before the log.
-    let wm_logits = log(max_elem(&effective, Tensor::constant(1e-30f32)));
+    let wm_logits = log(max_elem(&effective, 1e-30f32));
 
     let token = if cfg.watermark {
         gumbel_max(&wm_logits, free_state)
@@ -307,7 +294,7 @@ fn step(
     let null_score = mean_g(&decoy_gs, &token);
 
     let hist_next = scatter_set(hist, hlen, &token);
-    let chist_next = scatter_set(chist, rem(hlen, cfg.history_size), &counter);
+    let chist_next = scatter_set(chist, hlen % cfg.history_size, &counter);
     (token, hist_next, chist_next, score, null_score)
 }
 
@@ -422,13 +409,13 @@ async fn main(input: Input) -> Result<Output> {
         let logits = intrinsics::logits();
         let (token, hist_next, chist_next, score, null) =
             step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         score_out_p.put(&score);
         null_out_p.put(&null);
         chist_p.put(&chist_next);
         hist_p.put(&hist_next);
-        hlen_p.put(add(&hlen, 1u32));
+        hlen_p.put(&hlen + 1u32);
         rng_p.put(&r_next);
     });
 
@@ -501,23 +488,23 @@ async fn main(input: Input) -> Result<Output> {
             let (token, hist_next, chist_next, score, null) =
                 step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             score_out.put(&score);
             null_out.put(&null);
             chist_c.put(&chist_next);
             hist_c.put(&hist_next);
-            hlen_c.put(add(&hlen, 1u32));
+            hlen_c.put(&hlen + 1u32);
             rng.put(&r_next);
         });
 

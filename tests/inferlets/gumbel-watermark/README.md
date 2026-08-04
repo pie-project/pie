@@ -76,7 +76,7 @@ which is the interesting part: the watermark is not free, so the comparison is
 telling us something about the measurement rather than about the algorithm.
 
 This inferlet contains its own A/B: with `watermark=true` it samples via
-`reduce_argmax(add(scaled, gumbel(...)))`, and with `watermark=false` it calls
+`reduce_argmax(scaled + gumbel(...))`, and with `watermark=false` it calls
 the `gumbel_max` helper.
 
 | Sampling spelling | ms/token |

@@ -263,12 +263,12 @@ async fn verify_window(
         let picked = reduce_argmax(intrinsics::logits()); // [k+1]
         let head = gather(&picked, iota(k));
         let hit = eq(&head, &draft_v);
-        let ones = broadcast(Tensor::constant(1.0f32), [k]);
-        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
+        let ones = broadcast(1.0f32, [k]);
+        let zeros = broadcast(0.0f32, [k]);
         let run = cumprod(select(&hit, &ones, &zeros));
         let n_acc = cast(reduce_sum(run), dtype::u32);
         let keep = ge(broadcast(&n_acc, [kp1]), iota(kp1));
-        let neg1 = broadcast(Tensor::constant(-1i32), [kp1]);
+        let neg1 = broadcast(-1i32, [kp1]);
         let commit = select(&keep, &picked, &neg1);
 
         let mtp = intrinsics::mtp_logits(k);

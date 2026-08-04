@@ -185,11 +185,11 @@ struct Output {
     score_head: Vec<String>,
 }
 
-fn step(logits: Tensor, temperature: f32, rng_state: impl AsTensor + Copy) -> Tensor {
+fn step(logits: Tensor, temperature: f32, rng_state: &Tensor) -> Tensor {
     let scaled = if temperature == 1.0 {
         logits
     } else {
-        div(&logits, temperature)
+        &logits / temperature
     };
     gumbel_max(scaled, rng_state)
 }
@@ -294,7 +294,7 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
             tok_out_c.put(&token);
-            rng_c.put(&add(&r, iota(2)));
+            rng_c.put(&(&r + iota(2)));
         });
         fwd_c
             .submit(&pipe)
@@ -364,8 +364,8 @@ async fn main(input: Input) -> Result<Output> {
         let prev = acc.take();
         let ct = layer_ct.take();
         let scores = intrinsics::attn_score(kv_max);
-        acc.put(&add(&prev, &scores));
-        layer_ct.put(&add(&ct, 1u32));
+        acc.put(&(&prev + &scores));
+        layer_ct.put(&(&ct + 1u32));
     });
 
     fwd_p.epilogue(move || {
@@ -373,7 +373,7 @@ async fn main(input: Input) -> Result<Output> {
         let logits = intrinsics::logits();
         let token = step(logits, temperature, &r);
         tok_out_p.put(&token);
-        rng_p.put(&add(&r, iota(2)));
+        rng_p.put(&(&r + iota(2)));
 
         // Fold positions into pages. `reduce_sum` reduces the last axis per row
         // and `kv_max = p_max * page_size` exactly (it was derived from the page
@@ -470,18 +470,18 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
 
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
-            rng.put(&add(&r, iota(2)));
+            rng.put(&(&r + iota(2)));
         });
 
         let budget_n = max_tokens - 1;

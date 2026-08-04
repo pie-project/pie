@@ -169,33 +169,23 @@ struct Cfg {
 /// same offset sees the same clamped prefix, so the counter stays a pure
 /// function of the context.
 fn context_counter(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
-    let last = sub(cast(hlen, dtype::i32), Tensor::constant(1i32));
-    let mut h = broadcast(Tensor::constant(0u32), [1]);
+    let last = cast(hlen, dtype::i32) - 1i32;
+    let mut h = broadcast(0u32, [1]);
     // Oldest token first, so the hash is the usual left-to-right polynomial.
     for d in (0..cfg.context_width).rev() {
-        let idx = max_elem(
-            sub(&last, Tensor::constant(d as i32)),
-            Tensor::constant(0i32),
-        );
+        let idx = max_elem(&last - d as i32, 0i32);
         // `+1` lifts the `-1` padding sentinel to 0 and keeps every real token
         // distinguishable from it.
-        let tok = cast(add(gather(hist, &idx), Tensor::constant(1i32)), dtype::u32);
-        h = rem(
-            add(mul(&h, Tensor::constant(HASH_MULTIPLIER)), tok),
-            Tensor::constant(HASH_MODULUS),
-        );
+        let tok = cast(gather(hist, &idx) + 1i32, dtype::u32);
+        h = (&h * HASH_MULTIPLIER + tok) % HASH_MODULUS;
     }
     h
 }
 
 /// Assembles the `[2]` u32 `[key, ctr]` rng state from two `[1]` parts.
 fn rng_state(key: u32, counter: &Tensor) -> Tensor {
-    let is_counter = eq(iota(2), broadcast(Tensor::constant(1u32), [2]));
-    select(
-        &is_counter,
-        broadcast(counter, [2]),
-        broadcast(Tensor::constant(key), [2]),
-    )
+    let is_counter = eq(iota(2), broadcast(1u32, [2]));
+    select(&is_counter, broadcast(counter, [2]), broadcast(key, [2]))
 }
 
 /// The host mirror of `context_counter`, used to find which steps saw a context
@@ -221,9 +211,9 @@ fn host_counter(history: &[i32], hlen: usize, context_width: u32) -> u32 {
 /// float epsilon of 1, and `-log(1 - r)` would otherwise be infinite.
 fn aaronson_score(noise: &Tensor, token: &Tensor) -> Tensor {
     let g = scalar_gather(noise, token);
-    let r = exp(neg(exp(neg(&g))));
-    let tail = max_elem(sub(Tensor::constant(1.0f32), &r), Tensor::constant(1e-7f32));
-    reshape(neg(log(&tail)), [1])
+    let r = exp(-exp(-&g));
+    let tail = max_elem(1.0f32 - &r, 1e-7f32);
+    reshape(-log(&tail), [1])
 }
 
 /// One sampling step.
@@ -235,12 +225,12 @@ fn step(
     cfg: Cfg,
     hist: &Tensor,
     hlen: &Tensor,
-    free_state: impl AsTensor + Copy,
+    free_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor) {
     let scaled = if cfg.temperature == 1.0 {
         logits
     } else {
-        div(&logits, cfg.temperature)
+        &logits / cfg.temperature
     };
 
     let counter = context_counter(hist, hlen, cfg);
@@ -254,7 +244,7 @@ fn step(
     // detector statistic needs the noise tensor itself, not just the argmax.
     let noise = gumbel(&keyed, [vocab]);
     let token = if cfg.watermark {
-        reduce_argmax(add(&scaled, &noise))
+        reduce_argmax(&scaled + &noise)
     } else {
         gumbel_max(&scaled, free_state)
     };
@@ -358,12 +348,12 @@ async fn main(input: Input) -> Result<Output> {
         let hlen = hlen_p.take();
         let logits = intrinsics::logits();
         let (token, hist_next, score, null) = step(logits, vocab, cfg, &hist, &hlen, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         score_out_p.put(&score);
         null_out_p.put(&null);
         hist_p.put(&hist_next);
-        hlen_p.put(add(&hlen, 1u32));
+        hlen_p.put(&hlen + 1u32);
         rng_p.put(&r_next);
     });
 
@@ -427,22 +417,22 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let (token, hist_next, score, null) = step(logits, vocab, cfg, &hist, &hlen, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             score_out.put(&score);
             null_out.put(&null);
             hist_c.put(&hist_next);
-            hlen_c.put(add(&hlen, 1u32));
+            hlen_c.put(&hlen + 1u32);
             rng.put(&r_next);
         });
 

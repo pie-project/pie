@@ -125,15 +125,15 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
         fwd.epilogue(move || {
             let length = kv_len.take();
             let t = reduce_argmax(intrinsics::logits());
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
             tok_in.put(&t);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, PAGE_T));
-            w_off.put(rem(&length, PAGE_T));
+            w_slot.put(&length / PAGE_T);
+            w_off.put(&length % PAGE_T);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             out.put(&t);
         });
         for step in 1..k {
@@ -203,11 +203,11 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
         let draft = gather(&toks_val, Tensor::constant(draft_positions.clone())); // [k] i32
         let target = reduce_argmax(intrinsics::logits()); // [k] i32
         let hit = eq(&target, &draft); // [k] bool
-        let ones = broadcast(Tensor::constant(1.0f32), [k]);
-        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
+        let ones = broadcast(1.0f32, [k]);
+        let zeros = broadcast(0.0f32, [k]);
         let n_acc = cast(reduce_sum(cumprod(select(&hit, &ones, &zeros))), dtype::u32);
         let keep = ge(broadcast(&n_acc, [k]), iota(k)); // [k] bool: i <= n_acc
-        let zeros_i32 = broadcast(Tensor::constant(0i32), [k]);
+        let zeros_i32 = broadcast(0i32, [k]);
         let verify = select(&keep, &target, &zeros_i32); // accepted prefix + correction + 0s
         verify_out.put(&verify);
     });

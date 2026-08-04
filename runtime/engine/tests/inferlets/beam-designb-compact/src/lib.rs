@@ -113,19 +113,17 @@ async fn main(input: String) -> Result<String> {
     )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block (identical to beam-designb).
-        let cand = add(
-            broadcast(reshape(scores.take(), [B, 1]), [B, v]),
-            log_softmax(intrinsics::logits()),
-        );
+        let cand =
+            broadcast(reshape(scores.take(), [B, 1]), [B, v]) + log_softmax(intrinsics::logits());
         let (s, i) = top_k(reshape(cand, [B * v]), B);
-        let parent = div(&i, v);
-        let tok_i = cast(rem(&i, v), dtype::i32);
+        let parent = &i / v;
+        let tok_i = cast(&i % v, dtype::i32);
 
         // 2. flat tail-append positions: wpos = fill + lane.
         let base = fill.take();
         let lane = iota(B);
         let base_b = broadcast(reshape(&base, [1]), [B]);
-        let wpos = add(&base_b, &lane);
+        let wpos = &base_b + &lane;
 
         // 3. mask evolution: inherit parent's ancestry, OR the new position.
         let inherited = gather(mask.take(), &parent);
@@ -153,20 +151,20 @@ async fn main(input: String) -> Result<String> {
 
         // 4. explicit write descriptor (B2 write_kv_explicit).
         let pids = pool_ids_ch.take();
-        let logical_slot = div(&wpos, PAGE_T);
+        let logical_slot = &wpos / PAGE_T;
         let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = rem(&wpos, PAGE_T);
+        let w_off_v = &wpos % PAGE_T;
         w_slot.put(&w_slot_v);
         w_off.put(&w_off_v);
 
-        let filled = add(&base, B);
+        let filled = &base + B;
         klen.take();
         klen.put(broadcast(
             reshape(&Tensor::constant(vec![PAGE_T]), [1]),
             [B],
         ));
 
-        pos.put(add(pos.take(), 1u32));
+        pos.put(pos.take() + 1u32);
         fill.put(&filled);
         scores.put(&s);
         toks.put(&tok_i);

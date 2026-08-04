@@ -130,15 +130,15 @@ async fn verify_window(
         let a = allow.take(); // [k, vocab] bool per-position mask
         let d = draft_ch.take(); // [k] i32 submit draft
         let logits = intrinsics::logits(); // [k, vocab] f32 target
-        let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [k, vocab]);
+        let neg_inf = broadcast(f32::NEG_INFINITY, [k, vocab]);
         let masked = select(&a, &logits, &neg_inf); // per-position mask
         let tgt = reduce_argmax(masked); // [k] grammar-constrained per-row argmax
         let hit = eq(&tgt, &d); // [k] bool
-        let ones = broadcast(Tensor::constant(1.0f32), [k]);
-        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
+        let ones = broadcast(1.0f32, [k]);
+        let zeros = broadcast(0.0f32, [k]);
         // Cross-row prefix-AND: the first reject zeroes the whole suffix.
         let keep = gt(cumprod(select(&hit, &ones, &zeros)), 0.5f32);
-        let neg1 = broadcast(Tensor::constant(-1i32), [k]);
+        let neg1 = broadcast(-1i32, [k]);
         let ver = select(&keep, &d, &neg1); // accepted prefix, then -1
         out.put(&ver);
     });

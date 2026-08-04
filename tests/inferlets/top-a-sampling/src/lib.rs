@@ -95,31 +95,26 @@ struct Cfg {
 fn top_a_keep(logits: &Tensor, vocab: u32, a: f32) -> (Tensor, Tensor, Tensor) {
     let probs = softmax(logits);
     let p_max = reduce_max(&probs);
-    let threshold = mul(Tensor::constant(a), mul(&p_max, &p_max));
+    let threshold = a * (&p_max * &p_max);
     let keep = ge(&probs, broadcast(&threshold, [vocab]));
 
-    let zeros = broadcast(Tensor::constant(0.0f32), [vocab]);
+    let zeros = broadcast(0.0f32, [vocab]);
     let kept_mass = reshape(reduce_sum(select(&keep, &probs, &zeros)), [1]);
     let kept = reshape(reduce_sum(cast(&keep, dtype::f32)), [1]);
     (keep, kept, kept_mass)
 }
 
 /// One sampling step: temperature, quadratic floor, Gumbel-max draw.
-fn step(
-    logits: Tensor,
-    vocab: u32,
-    cfg: Cfg,
-    rng_state: impl AsTensor + Copy,
-) -> (Tensor, Tensor, Tensor) {
+fn step(logits: Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
     // Temperature first: `p_max` has to be measured on the distribution being
     // sampled from, or the floor tracks the wrong peak.
     let scaled = if cfg.temperature == 1.0 {
         logits
     } else {
-        div(&logits, cfg.temperature)
+        &logits / cfg.temperature
     };
     let (keep, kept, kept_mass) = top_a_keep(&scaled, vocab, cfg.a);
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     (gumbel_max(masked, rng_state), kept, kept_mass)
 }
@@ -200,7 +195,7 @@ async fn main(input: Input) -> Result<Output> {
         let r = rng_p.take();
         let logits = intrinsics::logits();
         let (token, a, b) = step(logits, vocab, cfg, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         s1_out_p.put(&a);
         s2_out_p.put(&b);
@@ -261,17 +256,17 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let (token, a, b) = step(logits, vocab, cfg, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             s1_out.put(&a);
             s2_out.put(&b);

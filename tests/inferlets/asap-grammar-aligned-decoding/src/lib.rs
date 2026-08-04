@@ -356,16 +356,16 @@ async fn main(input: Input) -> Result<Output> {
                 let (token, mass, prob, wmass) =
                     asap_step(intrinsics::logits(), vocab, &allowed, &idx, &val, &r);
 
-                let next_length = add(&length, 1u32);
-                let page_count = div(add(&next_length, page_size - 1), page_size);
+                let next_length = &length + 1u32;
+                let page_count = (&next_length + (page_size - 1)) / page_size;
                 token_in.put(&token);
                 kv_len.put(&next_length);
                 positions.put(&length);
-                w_slot.put(div(&length, page_size));
-                w_off.put(rem(&length, page_size));
+                w_slot.put(&length / page_size);
+                w_off.put(&length % page_size);
                 page_indptr.take();
-                page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
-                rng.put(add(&r, iota(2)));
+                page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+                rng.put(&r + iota(2));
                 token_out.put(&token);
                 mass_out.put(&mass);
                 prob_out.put(&prob);
@@ -497,20 +497,20 @@ fn asap_step(
     allowed: &Tensor,
     alpha_idx: &Tensor,
     alpha_val: &Tensor,
-    state: impl AsTensor + Copy,
+    state: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor) {
     let probabilities = softmax(logits);
-    let zero = broadcast(Tensor::constant(0.0f32), [vocab]);
+    let zero = broadcast(0.0f32, [vocab]);
     let masked = select(allowed, &probabilities, &zero);
     let mass = reduce_sum(&masked);
 
     // `α` is scattered into a `[vocab + 1]` base so the padding index `vocab`
     // has somewhere to land; duplicate padding writes are all 1.0, so their
     // undefined ordering does not matter.
-    let base = broadcast(Tensor::constant(1.0f32), [vocab + 1]);
+    let base = broadcast(1.0f32, [vocab + 1]);
     let alpha = gather(scatter_set(&base, alpha_idx, alpha_val), iota(vocab));
 
-    let weighted = mul(&masked, &alpha);
+    let weighted = &masked * &alpha;
     let weighted_mass = reduce_sum(&weighted);
 
     // Gumbel-max, but spelled out rather than taken from `gumbel_max`, so that
@@ -520,8 +520,8 @@ fn asap_step(
     // chosen_score = -1e9 against best_score = -0.06). `masked_argmax` applies
     // a true -inf after the noise is already in place, which is the same
     // primitive the grammar-constrained-decoding inferlet relies on.
-    let floored = log(max_elem(&weighted, Tensor::constant(1e-30f32)));
-    let scores = add(&floored, gumbel(state, [vocab]));
+    let floored = log(max_elem(&weighted, 1e-30f32));
+    let scores = &floored + gumbel(state, [vocab]);
     let token = masked_argmax(&scores, allowed);
 
     let probability = scalar_gather(&masked, &token);

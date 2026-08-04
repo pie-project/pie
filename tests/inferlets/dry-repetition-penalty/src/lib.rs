@@ -178,30 +178,30 @@ struct Cfg {
 fn suffix_match(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
     let l = cfg.capacity;
     let pos = cast(iota(l), dtype::i32);
-    let zero_i = broadcast(Tensor::constant(0i32), [l]);
-    let last = sub(cast(hlen, dtype::i32), Tensor::constant(1i32));
+    let zero_i = broadcast(0i32, [l]);
+    let last = cast(hlen, dtype::i32) - 1i32;
 
     // A position is a candidate only if the token after it was actually
     // written, which rules out the tail itself.
     let mut alive = lt(&pos, broadcast(&last, [l]));
-    let mut m = broadcast(Tensor::constant(0.0f32), [l]);
+    let mut m = broadcast(0.0f32, [l]);
 
     for d in 0..cfg.max_ngram {
-        let d_i = Tensor::constant(d as i32);
+        let d_i = d as i32;
         let d_row = broadcast(d_i, [l]);
         // Indices are clamped rather than guarded, so the gathers stay in
         // bounds; the corresponding `alive` terms discard the clamped lanes.
-        let src = max_elem(sub(&pos, &d_row), &zero_i);
-        let tail = sub(&last, Tensor::constant(d as i32));
+        let src = max_elem(&pos - &d_row, &zero_i);
+        let tail = &last - d as i32;
         let window = gather(hist, &src);
-        let target = gather(hist, max_elem(&tail, Tensor::constant(0i32)));
+        let target = gather(hist, max_elem(&tail, 0i32));
 
         let matches = eq(&window, broadcast(&target, [l]));
         let in_window = ge(&pos, &d_row);
-        let tail_ok = broadcast(ge(&tail, Tensor::constant(0i32)), [l]);
+        let tail_ok = broadcast(ge(&tail, 0i32), [l]);
 
         alive = and(and(alive, matches), and(in_window, tail_ok));
-        m = add(&m, cast(&alive, dtype::f32));
+        m = &m + cast(&alive, dtype::f32);
     }
     m
 }
@@ -217,24 +217,21 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: Cfg) -> (Tensor, T
     // scatter in bounds over the buffer's unwritten tail, whose lanes carry a
     // zero vote anyway.
     let next_idx = min_elem(
-        add(cast(iota(l), dtype::i32), Tensor::constant(1i32)),
-        broadcast(Tensor::constant(l as i32 - 1), [l]),
+        cast(iota(l), dtype::i32) + 1i32,
+        broadcast(l as i32 - 1, [l]),
     );
-    let next_tok = max_elem(
-        gather(hist, &next_idx),
-        broadcast(Tensor::constant(0i32), [l]),
-    );
+    let next_tok = max_elem(gather(hist, &next_idx), broadcast(0i32, [l]));
 
-    let vocab_zero = broadcast(Tensor::constant(0.0f32), [vocab]);
-    let mut penalty = broadcast(Tensor::constant(0.0f32), [vocab]);
+    let vocab_zero = broadcast(0.0f32, [vocab]);
+    let mut penalty = broadcast(0.0f32, [vocab]);
     // Ascending, so the longest match is written last and wins.
     for n in cfg.allowed_length..=cfg.max_ngram {
-        let hit = ge(&m, broadcast(Tensor::constant(n as f32), [l]));
+        let hit = ge(&m, broadcast(n as f32, [l]));
         let votes = scatter_add(&vocab_zero, &next_tok, cast(&hit, dtype::f32));
         let charge = cfg.multiplier * cfg.base.powi((n - cfg.allowed_length) as i32);
         penalty = select(
             gt(&votes, &vocab_zero),
-            broadcast(Tensor::constant(charge), [vocab]),
+            broadcast(charge, [vocab]),
             &penalty,
         );
     }
@@ -254,16 +251,16 @@ fn step(
     cfg: Cfg,
     hist: &Tensor,
     hlen: &Tensor,
-    rng_state: impl AsTensor + Copy,
+    rng_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor) {
     let (penalty, count, peak) = dry_penalty(hist, hlen, vocab, cfg);
     // DRY is defined as a subtraction on raw logits, so temperature comes after
     // it — scaling first would make the penalty's strength depend on it.
-    let penalized = sub(&logits, &penalty);
+    let penalized = &logits - &penalty;
     let scaled = if cfg.temperature == 1.0 {
         penalized
     } else {
-        div(&penalized, cfg.temperature)
+        &penalized / cfg.temperature
     };
     let token = gumbel_max(scaled, rng_state);
     // `gumbel_max` reduces the row away, so `token` is rank-0 — which is
@@ -390,12 +387,12 @@ async fn main(input: Input) -> Result<Output> {
         let hlen = hlen_p.take();
         let logits = intrinsics::logits();
         let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         cnt_out_p.put(&count);
         peak_out_p.put(&peak);
         hist_p.put(&hist_next);
-        hlen_p.put(add(&hlen, 1u32));
+        hlen_p.put(&hlen + 1u32);
         rng_p.put(&r_next);
     });
 
@@ -461,22 +458,22 @@ async fn main(input: Input) -> Result<Output> {
             let logits = intrinsics::logits();
             let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = (&next_length + (page_size - 1)) / page_size;
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
             page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             tok_out.put(&token);
             cnt_out.put(&count);
             peak_out.put(&peak);
             hist_c.put(&hist_next);
-            hlen_c.put(add(&hlen, 1u32));
+            hlen_c.put(&hlen + 1u32);
             rng.put(&r_next);
         });
 
