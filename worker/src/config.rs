@@ -839,7 +839,11 @@ impl Default for SchedulerConfig {
 /// submit simply waits for a slot and every submit re-serializes with no
 /// diagnostic at all. That silence is why this is rejected here rather than
 /// clamped: the config layer is the only place it can be caught.
-const UPLOAD_STAGING_DEPTH: u32 = 13;
+/// Public because `pie config optimize` enumerates knob candidates against
+/// this bound rather than generating combinations the engine will refuse --
+/// and a second copy of the number is exactly the disagreement this
+/// constant's own doc warns about.
+pub const UPLOAD_STAGING_DEPTH: u32 = 13;
 
 impl SchedulerConfig {
     fn validate(&self) -> Result<()> {

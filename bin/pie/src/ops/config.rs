@@ -11,7 +11,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
 
 
+mod optimize;
 mod template;
+pub use optimize::Objective;
 use template::default_config_content;
 
 #[derive(Subcommand, Debug)]
@@ -55,9 +57,51 @@ pub enum ConfigCmd {
         #[arg(long)]
         force: bool,
     },
+
+    /// Measure this machine and report the batching knobs that suit it.
+    ///
+    /// Boots the model once and runs a synthetic fleet against each candidate,
+    /// so it holds the whole device: this is a provisioning command, not one to
+    /// run against a machine that is serving. Reports by default; `--write`
+    /// applies.
+    Optimize {
+        /// Which serving shape to optimize for. Sets `[driver] memory_profile`
+        /// as well as choosing the load. Required when the profile is `auto`.
+        #[arg(long = "for", value_name = "SHAPE")]
+        objective: Option<Objective>,
+
+        /// The inferlet to drive the load with, e.g. `generate@0.1.0`.
+        /// `pie inferlet list` shows what is available.
+        #[arg(long)]
+        program: String,
+
+        /// Lanes per fleet.
+        #[arg(long, default_value_t = 16)]
+        fleet: usize,
+
+        /// Fleets per candidate. Below 3 the spread means little, and the
+        /// spread is what decides whether a difference is real.
+        #[arg(long, default_value_t = 3)]
+        repeats: usize,
+
+        /// Tokens each lane decodes. Shorter fleets are measurably noisier,
+        /// and the noise decides what counts as a win — at 48 tokens the sweep
+        /// reported a 20% improvement that a longer fleet showed was nothing.
+        #[arg(long, default_value_t = 256)]
+        tokens: usize,
+
+        /// Stop after this many candidates. Counts candidates, not minutes: an
+        /// operator cannot predict how many fleets fit in a wall-clock budget.
+        #[arg(long)]
+        budget: Option<usize>,
+
+        /// Apply the winner to the config file.
+        #[arg(long)]
+        write: bool,
+    },
 }
 
-pub fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
+pub async fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
     match cmd {
         ConfigCmd::List { prefix, json } => list(global, prefix, json),
         ConfigCmd::Show { key } => show(global, key),
@@ -65,6 +109,29 @@ pub fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
         ConfigCmd::Unset { key } => unset(global, key),
         ConfigCmd::Edit => edit(global),
         ConfigCmd::Init { force } => init(global, force),
+        ConfigCmd::Optimize {
+            objective,
+            program,
+            fleet,
+            repeats,
+            tokens,
+            budget,
+            write,
+        } => {
+            optimize::run(
+            global,
+            optimize::Args {
+                objective,
+                program,
+                fleet,
+                repeats,
+                tokens,
+                budget,
+                write,
+            },
+        )
+            .await
+        }
     }
 }
 

@@ -151,7 +151,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             // Python-WASM runtime through `reqwest::blocking`, which builds a
             // tokio runtime and drops it inside this one. Writing a config file
             // no longer reaches the network, so there is nothing to isolate.
-            ops::config::run(cmd, &cli.global)?;
+            ops::config::run(cmd, &cli.global).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Inferlet { cmd } => {

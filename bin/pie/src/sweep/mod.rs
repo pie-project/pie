@@ -129,16 +129,43 @@ fn median_and_rel_sigma(samples: &[f64]) -> (f64, f64) {
 /// because a warmup folded into every round would pay the cost N times and
 /// hide it. The first round is the one that is different; the rest are not.
 pub async fn warmup(addr: &str, program: &str, inputs: &[String]) -> Result<()> {
-    let run = fleet::run(addr, program, inputs).await;
-    if run.failed_lanes() > 0 {
-        anyhow::bail!(
-            "{} of {} lanes failed during warmup; the fleet cannot run here at all",
-            run.failed_lanes(),
-            inputs.len()
-        );
+    // Until two consecutive fleets agree, not a fixed count. One round was not
+    // enough: with a single warmup the first MEASURED candidate absorbed what
+    // was left and came back at +/-18.2% spread where every later candidate sat
+    // near 2%. That candidate is the baseline everything else is ranked
+    // against, so its inflated spread made `Round::beats` nearly unsatisfiable
+    // and the sweep reported "nothing is faster" from a noisy reference rather
+    // than from the machine.
+    let mut previous: Option<f64> = None;
+    for round in 0..MAX_WARMUP_ROUNDS {
+        let run = fleet::run(addr, program, inputs).await;
+        if run.failed_lanes() > 0 {
+            anyhow::bail!(
+                "{} of {} lanes failed during warmup; the fleet cannot run here at all",
+                run.failed_lanes(),
+                inputs.len()
+            );
+        }
+        let rate = run.throughput_tok_s();
+        if let Some(previous) = previous
+            && (rate - previous).abs() / previous.max(f64::EPSILON) < WARMUP_SETTLED
+        {
+            return Ok(());
+        }
+        previous = Some(rate);
+        let _ = round;
     }
+    // Not an error. A machine that never settles still gets measured; what it
+    // does not get is a claim that the measurement is tight, and the spread on
+    // every round will say so.
     Ok(())
 }
+
+/// Two consecutive warmup fleets this close means the machine has settled.
+const WARMUP_SETTLED: f64 = 0.05;
+/// Give up warming and measure anyway. A busy host may never settle, and
+/// refusing to measure it is worse than measuring it with an honest spread.
+const MAX_WARMUP_ROUNDS: usize = 5;
 
 /// Set the knobs, run the load, report.
 ///
@@ -191,8 +218,9 @@ pub async fn measure(
 /// is what makes it small — at a staging depth of 13 there are only a few dozen
 /// combinations, most of which the bound removes.
 pub fn candidates(staging_depth: usize) -> Vec<Knobs> {
-    let mut out = Vec::new();
+    let mut groups: Vec<Vec<Knobs>> = Vec::new();
     for frame_size in [1usize, 2, 3, 4] {
+        let mut group = Vec::new();
         for dispatch_depth in 1usize..=4 {
             if frame_size * dispatch_depth >= staging_depth {
                 continue;
@@ -201,11 +229,27 @@ pub fn candidates(staging_depth: usize) -> Vec<Knobs> {
             // the rest stay queued, and 1 leaves nothing queued. Its own field
             // doc has the argument, and `SchedulerConfig::validate` enforces it.
             for submit_depth in 2usize..=6 {
-                out.push(Knobs {
+                group.push(Knobs {
                     frame_size,
                     submit_depth,
                     dispatch_depth,
                 });
+            }
+        }
+        groups.push(group);
+    }
+
+    // Round-robin across frame sizes rather than lexicographic order, because
+    // `--budget` truncates this list and a lexicographic one spends the whole
+    // budget in a single corner. Measured: a budget of six explored k=1 five
+    // times and nothing else, so the report ranked one axis and called it a
+    // sweep. Interleaved, the same six touch every k.
+    let longest = groups.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for index in 0..longest {
+        for group in &groups {
+            if let Some(knobs) = group.get(index) {
+                out.push(*knobs);
             }
         }
     }
@@ -229,6 +273,22 @@ mod tests {
             );
             assert!(knobs.submit_depth >= 2, "{knobs} leaves nothing queued");
         }
+    }
+
+    #[test]
+    fn a_budget_sees_every_frame_size_before_it_sees_a_second_of_any() {
+        // A lexicographic list spent a budget of six entirely on k=1. The
+        // report then ranked one axis and presented it as a sweep.
+        let candidates = candidates(13);
+        let first_four: Vec<usize> = candidates.iter().take(4).map(|k| k.frame_size).collect();
+        let mut distinct = first_four.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            first_four.len(),
+            "the first four candidates repeat a frame size: {first_four:?}"
+        );
     }
 
     #[test]
