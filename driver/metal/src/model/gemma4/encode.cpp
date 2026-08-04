@@ -407,35 +407,27 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
             grid = Grid{std::uint32_t(g.hidden), 1, 1};
             tg = Threadgroup{64, 1, 1};
             return;
+        // The residual kinds sit with the norms because in this family they
+        // ARE norms: they run the FUSED `rms_residual`, which reads 4 elements
+        // per thread like any other. A plain `residual_add` here would need one
+        // thread per element instead.
         case Kind::AttnNorm: case Kind::FfnNorm: case Kind::FinalRms:
         case Kind::PostAttnResidual: case Kind::PostFfnResidual:
-        case Kind::PleResidualScaled: {
-            const int threads = (g.hidden + 3) / 4;
-            grid = Grid{std::uint32_t(threads), 1, 1};
-            tg = Threadgroup{std::uint32_t(threads), 1, 1};
+        case Kind::PleResidualScaled:
+            rms_dispatch(g.hidden, 1, grid, tg);
             return;
-        }
-        case Kind::QNorm: {
-            const int threads = (hd + 3) / 4;
-            grid = Grid{std::uint32_t(threads) * std::uint32_t(g.n_q_heads), 1, 1};
-            tg = Threadgroup{std::uint32_t(threads), 1, 1};
+        case Kind::QNorm:
+            rms_dispatch(hd, g.n_q_heads, grid, tg);
             return;
-        }
-        case Kind::KNorm: {
-            const int threads = (hd + 3) / 4;
-            grid = Grid{std::uint32_t(threads) * std::uint32_t(g.n_kv_heads), 1, 1};
-            tg = Threadgroup{std::uint32_t(threads), 1, 1};
+        case Kind::KNorm:
+            rms_dispatch(hd, g.n_kv_heads, grid, tg);
             return;
-        }
         // Only `per_layer_projection_norm` is the ple_dim-wide norm, over
         // n_layers rows; `post_per_layer_input_norm` is hidden-wide and now
         // rides inside `PleResidualScaled`.
-        case Kind::PleProjNorm: {
-            const int threads = (g.per_layer_emb_dim + 3) / 4;
-            grid = Grid{std::uint32_t(threads) * std::uint32_t(g.n_layers), 1, 1};
-            tg = Threadgroup{std::uint32_t(threads), 1, 1};
+        case Kind::PleProjNorm:
+            rms_dispatch(g.per_layer_emb_dim, g.n_layers, grid, tg);
             return;
-        }
         case Kind::VNorm:
             vnorm_dispatch(g.n_kv_heads, hd, grid, tg);
             return;
@@ -443,16 +435,13 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
         // reads the pair offset off head_dim, so a full-attention layer rotates
         // 64 pairs of a 512-wide head rather than 64 pairs of a 128-wide prefix.
         case Kind::RopeQ:
-            grid = Grid{std::uint32_t(g.rotary_dims_of(L) / 2), std::uint32_t(g.n_q_heads), 1};
-            tg = Threadgroup{std::uint32_t(g.rotary_dims_of(L) / 2), 1, 1};
+            rope_dispatch(g.rotary_dims_of(L), g.n_q_heads, grid, tg);
             return;
         case Kind::RopeK:
-            grid = Grid{std::uint32_t(g.rotary_dims_of(L) / 2), std::uint32_t(g.n_kv_heads), 1};
-            tg = Threadgroup{std::uint32_t(g.rotary_dims_of(L) / 2), 1, 1};
+            rope_dispatch(g.rotary_dims_of(L), g.n_kv_heads, grid, tg);
             return;
         case Kind::KvAppend:
-            grid = Grid{std::uint32_t(hd), std::uint32_t(g.n_kv_heads), 1};
-            tg = Threadgroup{std::uint32_t(hd), 1, 1};
+            kv_append_dispatch(hd, g.n_kv_heads, grid, tg);
             return;
         case Kind::Sdpa:
             sdpa_sliding_dispatch(g.n_q_heads, grid, tg);

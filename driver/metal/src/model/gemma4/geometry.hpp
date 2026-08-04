@@ -40,6 +40,18 @@ struct Gemma4Geometry {
     int n_kv_heads = 1;
     /// Sliding layers. Full layers use `global_head_dim`.
     int head_dim = 256;
+    /// The affine quantization width every kernel name here is spelled with.
+    /// The checkpoint's `config.json` states it; g64/b8 and g128/b4 pack to
+    /// identical shapes, so the tensors cannot. A width with no instantiation
+    /// fails to build a pipeline BY NAME rather than reading the bytes at the
+    /// wrong stride and returning a fluent wrong answer.
+    int quant_bits = 4;
+    /// The affine quantization GROUP every kernel name here is spelled with.
+    /// Same reasoning as the width, and the same failure mode: g64/b8 and
+    /// g128/b4 pack to identical shapes, so reading a g32 checkpoint with a
+    /// g64 pipeline is not a load error -- it is scales applied to the wrong
+    /// sixty-four weights, which reads as fluent text that is not the model's.
+    int quant_group_size = 64;
     int global_head_dim = 512;
     /// Full layers rotate a quarter of their head; sliding layers rotate all of it.
     float full_partial_rotary = 0.25f;
@@ -60,9 +72,6 @@ struct Gemma4Geometry {
 
     /// `out = cap * tanh(logits / cap)`; 0 disables.
     float final_softcap = 30.0f;
-
-    int q_group = 64;
-    int q_bits = 4;
 
     /// Tokens the KV cache is sized for. The SDPA and append strides are read
     /// off it ([n_kv_heads, kv_max_ctx, head_dim]), so it has no useful default:

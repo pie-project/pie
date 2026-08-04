@@ -425,12 +425,53 @@ impl ModelConfig {
 pub struct SchedulerConfig {
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// How long a pipeline that is HARD-BLOCKING a frame's seal may go
+    /// without submitting before the engine stops waiting for it, in
+    /// microseconds.
+    ///
+    /// This does not fail the pipeline. At the deadline the lane is dropped
+    /// from the wait-set — an involuntary `forward.park()` — so the boundary
+    /// seals at once; frames it already submitted still dispatch, and its
+    /// next fire rejoins it. What the number buys is therefore epoch density,
+    /// not safety: how long the fleet waits for a straggler before going on
+    /// without it. Setting it too low costs a little density and never a
+    /// request. Termination is a separate and far longer verdict, in
+    /// `silence_timeout_secs`.
+    ///
+    /// Small (50ms) because it measures a much narrower interval than its size
+    /// suggests. The clock runs only while the lane is an awaited member with
+    /// nothing submitted — it is stopped by run-ahead (a lane with a queued
+    /// frame is not blocking), by an unretired dispatch (the engine owes it a
+    /// result, so the whole GPU wave is free), by a bind in flight, and by
+    /// `forward.park()`. The host resubmit turnaround already has its own
+    /// headroom in `HOST_TURNAROUND_WAVES`.
+    ///
+    /// Measured: on the contention suite a breach happens roughly once in
+    /// several thousand requests, and when it does the lane is 0.1-3ms over
+    /// the line — an ordinary task-wakeup tail, not a broken guest. Killing
+    /// for that was the wrong response, which is why this only leashes now.
+    ///
+    /// Exposed to guests verbatim as `model.submit-deadline-us()`.
+    #[serde(default = "default_submit_deadline_us")]
+    pub submit_deadline_us: u64,
+    /// How long a lane may stay silent in total — through the leash above and
+    /// on past it — before the engine terminates its process, in seconds.
+    ///
+    /// This one IS a verdict, so it is generous. A pipeline that means to go
+    /// quiet calls `forward.park()`, which ends the silence and is never
+    /// killed however long it stays away; that is the contract this enforces.
+    /// The leash already keeps a straggler from holding the fleet, so nothing
+    /// but a genuinely abandoned process ever reaches this.
+    #[serde(default = "default_silence_timeout_secs")]
+    pub silence_timeout_secs: u64,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_request_timeout_secs(),
+            submit_deadline_us: default_submit_deadline_us(),
+            silence_timeout_secs: default_silence_timeout_secs(),
         }
     }
 }
@@ -441,12 +482,33 @@ impl SchedulerConfig {
             self.request_timeout_secs > 0,
             "scheduler.request_timeout_secs must be > 0"
         );
+        ensure!(
+            self.submit_deadline_us > 0,
+            "scheduler.submit_deadline_us must be > 0"
+        );
+        ensure!(
+            self.silence_timeout_secs > 0,
+            "scheduler.silence_timeout_secs must be > 0"
+        );
+        ensure!(
+            self.silence_timeout_secs * 1_000_000 >= self.submit_deadline_us,
+            "scheduler.silence_timeout_secs must not be shorter than submit_deadline_us: \
+             a kill that lands before the leash would fail guests the leash exists to spare"
+        );
         Ok(())
     }
 }
 
 fn default_request_timeout_secs() -> u64 {
     120
+}
+
+fn default_submit_deadline_us() -> u64 {
+    50_000
+}
+
+fn default_silence_timeout_secs() -> u64 {
+    30
 }
 
 // -----------------------------------------------------------------------------

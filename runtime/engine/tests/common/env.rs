@@ -180,6 +180,8 @@ impl MockEnv {
                 drivers,
                 scheduler: SchedulerConfig {
                     request_timeout_secs: 30,
+                    submit_deadline_us: 50_000,
+                    silence_timeout_secs: 30,
                 },
             },
             runtime: RuntimeConfig {

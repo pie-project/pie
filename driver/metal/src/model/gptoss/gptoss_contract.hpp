@@ -238,6 +238,25 @@ inline void declare_mxfp4_experts(ModelContract& out, const std::vector<SourceTe
     }
 }
 
+/// Declare an MXFP4 projection the way `mlx_lm` REPACKS it.
+///
+/// Same weights, same bytes, a different container. Where the published
+/// checkpoint writes `X_blocks` as `[experts, rows, groups, 16]` of U8 beside
+/// `X_scales`, `mlx_lm`'s conversion writes `X.weight` as
+/// `[experts, rows, groups*4]` of U32 beside `X.scales` -- eight nibbles to a
+/// word instead of two to a byte, which on a little-endian device is the same
+/// byte stream with a different element width declared over it.
+///
+/// It is also already SPLIT: `gate_proj` and `up_proj` are separate tensors
+/// rather than one interleaved `gate_up_proj`. So none of the striding the
+/// published layout needs applies, and neither do its internal intermediates:
+/// each source is a whole tensor, which is the case a width-changing transmute
+/// is allowed in. This is the simpler half of the same job, which is why it is
+/// a few lines against sixty.
+///
+/// Both spellings end in the same place -- decode to values, re-encode as the
+/// affine-U4 the matvecs read -- because `mxfp4_values` takes expressions and
+/// does not care where they came from.
 }  // namespace contract_detail
 
 /// The `model_type` strings whose decoder this schema describes.
@@ -300,13 +319,17 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
                 fail("Metal GptOss: '" + std::string(raw.name) +
                      "' is a packed weight with no scales, which no scheme here describes");
             }
+            // Scales with no zero points is MXFP4, which `mlx_lm convert -q`
+            // leaves the MoE experts in because that is the mode openai shipped
+            // them in. Every published mlx conversion of this family is like
+            // this, so refusing it would refuse the family -- and the loader
+            // decodes MXFP4 already, for exactly this reason (`load_plan.hpp`).
+            // The refusal that used to be here told the user to convert offline
+            // for a transform the driver performs at load.
             if (biases == nullptr) {
-                fail("Metal GptOss: '" + std::string(raw.name) +
-                     "' has scales but no zero points, which is MXFP4 (E2M1 nibbles + E8M0 "
-                     "block scales). `mlx_lm convert -q` leaves the MoE experts in the mode "
-                     "the checkpoint shipped them in; convert with --dequantize first, then "
-                     "quantize, so every module is affine-U4 -- the one scheme this driver's "
-                     "kernels read");
+                push_mlx_mxfp4_stacked(out, raw, *scales, std::move(*output));
+                ++declared;
+                continue;
             }
             // Width comes from the tensors, not from the config: `mlx_lm`'s
             // quantization predicate leaves the router at 8 bits while
@@ -333,7 +356,8 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
                 fail("Metal GptOss: '" + std::string(raw.name) + "' is " +
                      std::to_string(bits) + "-bit, and only 4 and 8 are described here");
             }
-            push_mlx_affine_stacked(out, raw, *scales, *biases, bits, std::move(*output));
+            push_mlx_affine_stacked(out, raw, *scales, *biases, bits, /*declared_group_size=*/64,
+                                    std::move(*output));
         } else if (ends_with(raw.name, ".weight") && raw.shape.size() == 2 &&
                    is_raw(raw.encoding, PieLoaderDType::BF16)) {
             // A projection the published checkpoint left in BF16. gpt-oss ships

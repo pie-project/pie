@@ -182,8 +182,13 @@ async fn main(input: Input) -> Result<String> {
     let klen = Channel::from(vec![n + 1; 1]).named("klen");
     let w_slot = Channel::from(vec![slot_n; 1]).named("w_slot");
     let w_off = Channel::from(vec![n % PAGE_T; 1]).named("w_off");
-    let seed_mask: Vec<bool> = (0..pool).map(|j| j <= n).collect();
-    let mask = Channel::from_shaped([1, pool], seed_mask).named("mask");
+    // No AttnMask port: a decode query attends every key up to `klen`, which
+    // this pass already carries on device, so a causal mask would only restate
+    // it. Binding one would also cost the whole run-ahead: the mask port is a
+    // per-lane dense buffer, so a pass that binds it needs the driver to carry
+    // per-lane mask state through batch composition, which the CUDA backend
+    // does not advertise — the pass would fall out of the decode-envelope class
+    // and lose the only descriptor resolver that works inside one frame.
     let pages = Channel::from(pool_ids.clone()).named("pages");
     let page_indptr =
         Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]).named("page_indptr");
@@ -207,7 +212,7 @@ async fn main(input: Input) -> Result<String> {
             w_slot: &w_slot,
             w_off: &w_off,
             positions: &pos,
-            mask: Some(&mask),
+            mask: None,
         },
     )?;
     fwd.epilogue(move || {
@@ -218,11 +223,6 @@ async fn main(input: Input) -> Result<String> {
 
         let tok = sample_token(&r, temperature, top_p, vocab); // [1] i32
         let r_next = add(&r, iota(2));
-
-        // Full causal mask for the query at `base`: attend all j <= base.
-        let col = iota(pool);
-        let base_b = broadcast(reshape(&base, [1]), [pool]);
-        let new_mask = reshape(le(&col, &base_b), [1, pool]);
 
         let logical_slot = div(&base, PAGE_T);
         let w_slot_v = gather(&pids, &logical_slot);
@@ -240,8 +240,6 @@ async fn main(input: Input) -> Result<String> {
         tok_in.take();
         tok_in.put(&tok);
         out.put(&tok);
-        mask.take();
-        mask.put(&new_mask);
         w_slot.take();
         w_slot.put(&w_slot_v);
         w_off.take();

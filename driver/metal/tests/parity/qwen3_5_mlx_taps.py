@@ -7,30 +7,28 @@ coherent text on these checkpoints. driver/metal/tests/mlx is a second reference
 but it has drifted from the family it models, so parity should be judged against
 mlx-lm.
 
-Usage: mlx_lm_taps.py <model_path> <comma_token_ids> <out_dir>
+Usage: qwen3_5_mlx_taps.py <model_path> <comma_token_ids> <out_dir>
 """
-import os
 import sys
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
-from mlx_lm import load
+from taps_common import open_taps
 
 
 def main():
-    model_path, ids_csv, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-    ids = [int(x) for x in ids_csv.strip().split(",") if x]
-    os.makedirs(out_dir, exist_ok=True)
-
-    model, _ = load(model_path)
+    model, ids, dump, out_dir = open_taps(sys.argv)
     lm = model.language_model.model
     head = getattr(model.language_model, "lm_head", None)
 
-    def dump(name, t):
-        a = np.array(mx.astype(t, mx.float32)).reshape(len(ids), -1)
-        np.save(os.path.join(out_dir, name + ".npy"), a)
-
+    # The three projections that end a residual branch -- `gdn_out`, `o_proj`
+    # and `down_proj` -- are published here with their residual ALREADY ADDED,
+    # because that is what the driver publishes under those names. It fuses the
+    # add into the projection's epilogue (`affine_qmv_fast_residual`,
+    # `MetalExecutor::Impl::fuse_residual_`), so the value that reaches the tap
+    # is the sum and there is no separate dispatch to tap instead. Dumping the
+    # bare projection here reads as a real divergence -- cosine 0.81 and 0.47 on
+    # Qwen3.5-0.8B -- that is entirely the residual the reference left out.
     x = mx.array([ids])
     h = lm.embed_tokens(x)
     dump("embed", h)
@@ -75,7 +73,7 @@ def main():
             out = la.norm(out, z.reshape(B, S, la.num_v_heads, la.head_v_dim))
             dump(f"{il}.gdn_core", out)
             r = la.out_proj(out.reshape(B, S, -1))
-            dump(f"{il}.gdn_out", r)
+            dump(f"{il}.gdn_out", h + r)
         else:
             at = layer.self_attn
             B, S = 1, n
@@ -103,7 +101,7 @@ def main():
             o = o * mx.sigmoid(gate)
             dump(f"{il}.attn_gated", o)
             r = at.o_proj(o)
-            dump(f"{il}.o_proj", r)
+            dump(f"{il}.o_proj", h + r)
 
         h = h + r
         dump(f"{il}.attn_resid", h)
@@ -116,7 +114,7 @@ def main():
         act = nn.silu(g) * u
         dump(f"{il}.swiglu", act)
         d = layer.mlp.down_proj(act)
-        dump(f"{il}.down_proj", d)
+        dump(f"{il}.down_proj", h + d)
         h = h + d
         dump(f"{il}.layer_out", h)
 

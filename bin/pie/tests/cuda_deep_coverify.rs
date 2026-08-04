@@ -218,7 +218,6 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
         q.avg_missing_at_fire
     );
     eprintln!("  escape_fires                   = {}", q.escape_fires);
-    eprintln!("  cold_hold_fires                = {}", q.cold_hold_fires);
     eprintln!("  ── carrier reduce-R (context) ──");
     eprintln!(
         "  post_dispatch_to_fire_us (avg) = {}   (host round-trip — the carrier's target)",

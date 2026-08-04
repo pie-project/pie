@@ -1320,6 +1320,32 @@ pub fn frame_size() -> usize {
     FRAME_SIZE.with(|k| *k.get_or_init(|| crate::model::frame_size().max(1) as usize))
 }
 
+/// How long a pipeline may hold a frame's wait-set without submitting before
+/// the engine stops waiting for it (cached; static, like `frame_size`).
+///
+/// Measures consecutive silence while actually blocking a seal, and stops
+/// while the engine is what you are waiting on — so a pipeline that keeps
+/// submitting can never trip it. To stop legitimately, call `Pipeline::park`.
+///
+/// Overrunning it is not fatal: the slot leaves the frame, work already
+/// submitted still runs, and the next submit rejoins. It costs a boundary,
+/// not the instance. (Going silent for orders of magnitude longer without
+/// parking is read as an abandoned pipeline and is terminated.)
+///
+/// Note that work between receiving a result and submitting the next fire is
+/// on this clock: the fleet is stalled on you and nothing is owed back. Park
+/// around anything that can outlast the bound — tokenizing a large document,
+/// compiling a grammar, an RPC, waiting on a user turn — and simply submit
+/// again to rejoin. Parking is cheap and unparking is implicit.
+pub fn submit_deadline() -> std::time::Duration {
+    thread_local! {
+        static DEADLINE: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
+    }
+    std::time::Duration::from_micros(
+        DEADLINE.with(|d| *d.get_or_init(crate::model::submit_deadline_us)),
+    )
+}
+
 /// Host-reader channel capacity, in cells, that sustains the engine's
 /// run-ahead for one lane. Size every host-reader channel to at least this.
 ///
@@ -1592,6 +1618,22 @@ impl Pipeline {
     /// take-able; later submissions fail. Dropping a pipeline is identical.
     pub fn close(&self) {
         self.wit.close();
+    }
+
+    /// Leave the frame wait-set until this pipeline submits again — the way
+    /// to go idle, block on a user turn, or wait on a peer without holding
+    /// the frame, without running down `submit_deadline`, and without ever
+    /// looking abandoned however long you stay away.
+    ///
+    /// Ordered against this pipeline's own submits, so outstanding fires are
+    /// fine: their results still arrive, and the exit follows them. The next
+    /// `submit` rejoins automatically; there is no explicit rejoin. Unlike
+    /// `close`, the pipeline stays usable.
+    pub fn park(&self) {
+        // Every forward interface declares the same `park`; the engine
+        // implements all three with one function, so the pass kind (which we
+        // do not have here — park carries no pass) is irrelevant.
+        wit_attention::park(&self.wit);
     }
 }
 

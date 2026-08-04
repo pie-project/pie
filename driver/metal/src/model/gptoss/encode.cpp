@@ -68,7 +68,7 @@ Kernel shared_kind(Kind k) {
     switch (k) {
         // No weights: the gather is pure dataflow.
         case Kind::RowGather:     return Kernel::G4RowGather;
-        case Kind::EmbedGather:   return Kernel::GoEmbed;
+        case Kind::EmbedGather:   return Kernel::EmbedUntied;
         case Kind::AttnNorm:      return Kernel::Rms;        // input_layernorm
         case Kind::FfnNorm:       return Kernel::FfnRms;     // post_attention_layernorm
         case Kind::FinalRms:      return Kernel::FinalRms;
@@ -89,7 +89,7 @@ Kernel shared_kind(Kind k) {
         case Kind::ExpertDown:    return Kernel::GoExpertDown;
         case Kind::ExpertCombine: return Kernel::GoExpertCombine;
         case Kind::FfnResidual:   return Kernel::LayerOut;
-        case Kind::LmHead:        return Kernel::GoLmHead;
+        case Kind::LmHead:        return Kernel::LmHeadUntied;
         case Kind::Argmax:        return Kernel::Argmax;
     }
     return Kernel::Argmax;
@@ -130,10 +130,6 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const GptOssPsos& go)
 
 void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Threadgroup& tg) {
     if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
-        if (d.kind == Kind::RouterGemv && g.router_bits == 8) {
-            qmv_u8_dispatch(kn.N, grid, tg);
-            return;
-        }
         // A routed projection gets one grid plane per selected expert; a dense
         // one gets a single plane. Same kernel, same shape otherwise.
         const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
@@ -290,10 +286,6 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
 
     if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
-        if (d.kind == Kind::RouterGemv && g.router_bits == 8) {
-            qmv_u8_dispatch(kn.N, grid, tg, N);
-            return;
-        }
         const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
                             d.kind == Kind::ExpertDown;
         const int m = d.kind == Kind::LmHead ? S : N;

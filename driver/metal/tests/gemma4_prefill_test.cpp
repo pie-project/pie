@@ -486,7 +486,7 @@ int main(int argc, char** argv) {
     }
     Gemma4Psos psos;
     std::string error;
-    if (!build_gemma4_psos(*ctx, kernels_dir, psos, &error)) {
+    if (!build_gemma4_psos(*ctx, kernels_dir, Gemma4Geometry{}, psos, &error)) {
         std::printf("  FAIL  build_gemma4_psos: %s\n", error.c_str());
         return 1;
     }

@@ -26,7 +26,28 @@ bool load_decode_psos(RawMetalContext& ctx,
                       bool with_argmax = false,
                       std::string* err = nullptr,
                       bool fuse_residual = false,
-                      bool gdn_prep = false);
+                      bool gdn_prep = false,
+                      /// Compile the routed mixture's kernels. Only a
+                      /// checkpoint whose geometry has experts dispatches them.
+                      bool routed = false,
+                      /// Claim `EmbedUntied`/`LmHeadUntied` for the shared
+                      /// embed/matvec entrypoints. Off by default, and the
+                      /// default is load-bearing: the llama family compiles
+                      /// its OWN kernels for these kinds at its own group size
+                      /// and bit width, and looks here only as a fallback. A
+                      /// table that claimed them unconditionally would hand it
+                      /// a valid gs_64/b_4 PSO for a checkpoint that is
+                      /// neither, and a wrong-but-valid PSO is silent.
+                      bool untied = false,
+                      /// The affine width the checkpoint's config declares.
+                      /// Every quantized entrypoint here is named with it, so a
+                      /// width with no instantiation fails to build a pipeline
+                      /// rather than reading the bytes at the wrong stride.
+                      int quant_bits = 4,
+                      /// And the group it declares, for the same reason: a
+                      /// g64 pipeline over a g32 checkpoint is not a load
+                      /// error, it is scales applied to the wrong weights.
+                      int quant_group_size = 64);
 
 // ── M>1 multi-batch PSOs (beta, multi-batch lane) ─────────────────────────────
 // The 4 kernel kinds whose M>1 form differs from the M=1 PSO (the rest just grid-widen
@@ -57,6 +78,12 @@ struct MultiBatchPsos {
     // rather than packed at `K`.
     // Split-K: [bm_wide] x {gemm, reduce}.  MLX sends every transposed
     // non-batched decode down this path; the split is chosen per shape.
+    /// The mixture's batched form: the same GEMM with the weight stack indexed
+    /// per TILE rather than per dispatch. `bm` is fixed at `kMoeTileRows`,
+    /// because that is what the sort padded every expert's run to -- a tile
+    /// that spanned two experts would read one expert's weights for the
+    /// other's rows. Three column tiles, as elsewhere.
+    Pso qmm_routed[3]{};
     Pso qmm_t_splitk[2]{};
     Pso qmm_splitk_reduce{};
     Pso qmm_splitk_reduce_residual{};
@@ -71,7 +98,6 @@ struct MultiBatchPsos {
     Pso rms_strided{};
     Pso silu_mul_strided{};
     Pso gated_rms_strided{};
-    Pso dense_gemv_strided{};
     // GDN over a whole prompt in one dispatch (prep is token-parallel, the
     // recurrent scan runs in registers) instead of one serialized pair per token.
     Pso gdn_prep_prefill{};
@@ -89,6 +115,11 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           const std::string& kernels_dir,
                           MultiBatchPsos& out,
                           bool with_d512 = false,
-                          std::string* err = nullptr);
+                          std::string* err = nullptr,
+                          /// Compile the mixture's batched projections. Only a
+                          /// checkpoint whose geometry has experts runs them.
+                          bool routed = false,
+                          int quant_bits = 4,
+                          int quant_group_size = 64);
 
 }  // namespace pie::metal

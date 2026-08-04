@@ -158,6 +158,20 @@ pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Close).await;
 }
 
+/// `forward.park()`: the lane is leaving the frame wait-set until it fires
+/// again. Broadcast to every driver's scheduler and fire-and-forget — a
+/// policy that has never seen the lane fire ignores it, and the exit is
+/// ordered by `seq` against that lane's own submits rather than against this
+/// call. Deliberately NOT routed through the control path: park exists to
+/// release a gather, and the control slot is depth 1, so a park queued behind
+/// the dispatch the gather is holding could never arrive.
+pub(crate) fn notify_lane_park(pid: ProcessId, seq: u64) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::LanePark { lane: pid, seq });
+    }
+}
+
 /// A retiring process released its capped execution permit (capped
 /// deployments only). Broadcast to every driver's scheduler (mirrors
 /// [`notify_pipeline_leave`]): a policy with no staged successor ignores it,
@@ -187,7 +201,8 @@ pub(crate) fn notify_process_quiesced(pid: ProcessId) {
 }
 
 /// A parked process acquired its execution permit: its first fire is
-/// imminent, and the frame seal waits for it by identity. Sent BEFORE the
+/// imminent, so it is a named join in flight and the cohort-boundary window
+/// stays open until it lands. Sent BEFORE the
 /// process's first fire enters the mailbox (same producer), so the policy
 /// sees consume-then-fire; a reordered arrival is harmless (the policy's
 /// staged guard skips a lane that already fired).
@@ -195,6 +210,23 @@ pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
         let _ = handle.send(SchedulerItem::ExecutionSlotConsumed(pid));
+    }
+}
+
+/// A process joined the execution-admission FIFO. Announced before the
+/// permit wait so the frame policy can earmark it by identity.
+pub(crate) fn notify_admission_queued(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::AdmissionQueued(pid));
+    }
+}
+
+/// A process left the FIFO -- it took its permit, or it was cancelled.
+pub(crate) fn notify_admission_dequeued(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::AdmissionDequeued(pid));
     }
 }
 
@@ -411,8 +443,27 @@ pub(crate) struct LaunchGrouping {
     has_device_geometry: bool,
 }
 
+/// A fire the driver will resolve a DENSE per-cell attention mask for out of
+/// a descriptor channel. Such a fire composes only SOLO: the driver's
+/// multi-program batch has no way to merge one program's dense mask with
+/// another's geometry (v1 scope), and it throws
+/// `RetryableLaunchError("dense device mask in a multi-program batch")`
+/// rather than execute a wrong one.
+///
+/// `dense_device_mask` is the program's own binding — an `AttnMask` port
+/// sourced from a channel — and is the SAME predicate the driver resolves
+/// on. The second clause is the older inference (a user mask with no wire
+/// BRLE rows must be device-carried); it is kept because it covers fires
+/// whose mask is device-carried without the port binding being visible here.
+///
+/// The inference alone was not enough. `cuda_runahead_concurrent` runs 8
+/// pipelines of a sink/sliding-window decode program: every fire carried
+/// BOTH wire BRLE rows (`masks` non-empty, so the second clause is false)
+/// AND a channel-bound `AttnMask`, so the batcher merged them and the first
+/// concurrent step failed the driver's contract, poisoned descriptor
+/// channel 0, and lost all 8 streams.
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
-    request.has_user_mask && request.masks.is_empty()
+    request.dense_device_mask || (request.has_user_mask && request.masks.is_empty())
 }
 
 impl LaunchGrouping {
@@ -444,9 +495,7 @@ impl LaunchGrouping {
         // RS rows are one per request across the whole composed batch, so a
         // fire that binds recurrent state and one that does not cannot share
         // a wave: the driver would see fewer slot ids than requests.
-        if self.count != 0
-            && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows
-        {
+        if self.count != 0 && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows {
             return false;
         }
         // Custom wire masks co-batch freely with other wire-geometry fires —
@@ -652,6 +701,11 @@ enum SchedulerItem {
     /// waits for this exact process's first fire (identity-paired with the
     /// release above — the two race through the mailbox in either order).
     ExecutionSlotConsumed(ProcessId),
+    /// A process is queued for an execution permit; it is the identified
+    /// taker of the next slot to free (the semaphore is FIFO-fair).
+    AdmissionQueued(ProcessId),
+    /// It took the permit, or went away before it could.
+    AdmissionDequeued(ProcessId),
     /// The planner concluded a suspended process is runnable again (restore
     /// committed, or the eviction rolled back): its lanes may rejoin the
     /// wait-set and batch full frames again. Process-keyed.
@@ -664,6 +718,15 @@ enum SchedulerItem {
         lane: ProcessId,
         seq: u64,
         submitted: u32,
+    },
+    /// `forward.park()`: the guest is leaving the seal's wait-set until it
+    /// fires again. Ordered against that lane's submits by `seq` — the exit
+    /// lands once every frame submitted before it has sealed, so a guest may
+    /// park with fires still outstanding (frame mode only; a no-op
+    /// otherwise).
+    LanePark {
+        lane: ProcessId,
+        seq: u64,
     },
     /// Snapshot the run loop's state as a human-readable dump (queue
     /// composition, in-flight work, barrier membership). Answered inline on
@@ -1789,7 +1852,93 @@ struct PendingControl {
     /// false for standalone copies — their pages are grant-pinned and no
     /// queued fire references them, so frames keep posting while
     /// suspend/restore traffic settles.
+    ///
+    /// It is also the exclusivity test: a control that holds launches needs
+    /// the whole in-flight set empty and blocks every other control while it
+    /// settles, exactly as the original single slot did.
     holds_launches: bool,
+}
+
+/// The async-completing controls the worker is waiting on — copies and pool
+/// resizes; lifecycle controls execute on the lane without ever entering
+/// here.
+///
+/// Two classes share this set. An **exclusive** control (a `PreLaunchCopy`,
+/// whose consumer fire is queued directly behind it, and a pool resize, whose
+/// pipe drain IS its ordering mechanism) keeps the original rule: it needs
+/// the set empty and, once posted, nothing else may join it.
+///
+/// **Standalone copies** — the residency planner's suspend/restore traffic —
+/// instead settle concurrently with one another. Nothing queued orders
+/// against them: their pages are grant-pinned and no queued fire can name
+/// one, which `pipe_concurrent_control` already relies on. So a single slot
+/// bought no safety, only a queue, and the queue was on the planner's
+/// critical path. Measured at 512-way KV contention: up to 7 restores wanted
+/// the slot at once (`restoring` p90 = 4, max = 7) and each H2D copy took
+/// 22.8 ms end to end against ~3.3 ms of transfer — 1.528 ms/page, versus
+/// 0.227 ms/page on the D2H side, which the planner itself issues strictly
+/// one at a time and which therefore never queued. The 6.7x asymmetry was
+/// the wait for this slot, not the device.
+///
+/// Nothing here needs a concurrency ceiling: the pending queue is the bound.
+/// Only copies the planner has already enqueued can be in flight, and the
+/// planner enqueues at most one per suspending or restoring process.
+#[derive(Default)]
+struct InFlightControls {
+    settling: Vec<PendingControl>,
+}
+
+impl InFlightControls {
+    fn is_empty(&self) -> bool {
+        self.settling.is_empty()
+    }
+
+    /// Whether anything is still settling.
+    fn is_settling(&self) -> bool {
+        !self.settling.is_empty()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, PendingControl> {
+        self.settling.iter()
+    }
+
+    /// Whether a standalone copy may be posted now: only an exclusive
+    /// control can refuse one.
+    fn admits_copy(&self) -> bool {
+        self.settling.iter().all(|control| !control.holds_launches)
+    }
+
+    /// Whether `item` may be posted into this set now. A standalone copy and
+    /// a lifecycle control are each refused only by an EXCLUSIVE control: the
+    /// copy addresses grant-pinned pages nothing queued can name, and a
+    /// lifecycle control never enters this set at all — it executes on the
+    /// lane, its driver order guaranteed by the lane FIFO. Blocking lifecycle
+    /// controls on a settling copy wedged the fleet: the planner's copies are
+    /// in flight almost continuously under churn, so every bind waited out the
+    /// whole strict-watchdog window (measured on `churn`: 270 binds at 1.0-2.4 s
+    /// end to end against a 59 us driver bind).
+    fn admits(&self, item: &QueuedItem) -> bool {
+        if BatchScheduler::standalone_copy(item) || BatchScheduler::lifecycle_control(item) {
+            !self.holds_launches()
+        } else {
+            self.is_empty()
+        }
+    }
+
+    /// Whether any settling control makes queued launches wait.
+    fn holds_launches(&self) -> bool {
+        self.settling.iter().any(|control| control.holds_launches)
+    }
+
+    fn push(&mut self, control: PendingControl) {
+        self.settling.push(control);
+    }
+
+    fn position_posted(&self, token: u64) -> Option<usize> {
+        self.settling.iter().position(
+            |control| matches!(control.state, ControlSlotState::Posted { token: t } if t == token),
+        )
+    }
 }
 
 /// What one pass over the pending queue tells the frame dispatcher — see
@@ -2137,7 +2286,6 @@ impl SchedulerHandle {
     pub(crate) fn nudge(&self) -> Result<()> {
         self.send(SchedulerItem::Nudge)
     }
-
     pub async fn register_program(&self, plan: ProgramRegistration) -> Result<u64> {
         let program_hash = plan.program_hash;
         {
@@ -2396,7 +2544,7 @@ impl BatchScheduler {
         let mut slot_buffer = SlotBuffer::new();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
-        let mut in_flight_control = None;
+        let mut in_flight_control = InFlightControls::default();
         let mut stopping = false;
         // THE fire rule: the wait-for-all-active-lanes frame policy, one
         // instance per driver thread, mirroring `instances`/`channels` above.
@@ -2496,6 +2644,7 @@ impl BatchScheduler {
                 &mut instances,
                 &mut pending,
                 &stats,
+                &mut frame_policy,
             );
             progress |= Self::retire_ready_control(&mut in_flight_control);
             let retire_done = Instant::now();
@@ -2565,14 +2714,14 @@ impl BatchScheduler {
             if stopping
                 && pending.is_empty()
                 && in_flight_launches.is_empty()
-                && in_flight_control.is_none()
+                && in_flight_control.is_empty()
                 && lane_inflight == 0
             {
                 break;
             }
 
-            // Cohort-boundary bind deferral: while the seal waits on a
-            // successor's arrival, hold back the bind permits that retiring
+            // Cohort-boundary bind deferral: while a successor's arrival is
+            // imminent, hold back the bind permits that retiring
             // processes return, so the staged cohort's working-set
             // declaration and prefill construction do not compete with the
             // boundary's own bring-up. Cleared the moment this pass has
@@ -2581,7 +2730,9 @@ impl BatchScheduler {
             crate::inferlet::process::set_bind_release_hold(
                 !stopping
                     && frame_policy.is_joining()
-                    && (progress || !in_flight_launches.is_empty() || in_flight_control.is_some()),
+                    && (progress
+                        || !in_flight_launches.is_empty()
+                        || in_flight_control.is_settling()),
             );
 
             if progress {
@@ -2592,7 +2743,7 @@ impl BatchScheduler {
 
             let item = if pending.is_empty()
                 && in_flight_launches.is_empty()
-                && in_flight_control.is_none()
+                && in_flight_control.is_empty()
                 && !stopping
             {
                 match rx.recv() {
@@ -2620,7 +2771,7 @@ impl BatchScheduler {
                         LaunchState::Failed(_) => armed = false,
                     }
                 }
-                if let Some(control) = in_flight_control.as_ref() {
+                for control in in_flight_control.iter() {
                     match &control.state {
                         ControlSlotState::Posted { .. } => {}
                         ControlSlotState::Ready(completion) => {
@@ -2657,7 +2808,7 @@ impl BatchScheduler {
                         // the wait's own cadence), so it never counts here.
                         let missed = in_flight_launches.front().is_some_and(|front| {
                             matches!(&front.state, LaunchState::Accepted(c) if c.is_settled())
-                        }) || in_flight_control.as_ref().is_some_and(|control| {
+                        }) || in_flight_control.iter().any(|control| {
                             matches!(&control.state, ControlSlotState::Ready(c) if c.is_settled())
                         });
                         if missed && !stopping && wait_hint.is_none() {
@@ -2747,7 +2898,7 @@ impl BatchScheduler {
     fn render_debug_dump(
         pending: &VecDeque<QueuedItem>,
         in_flight_launches: &VecDeque<PendingLaunchBatch>,
-        in_flight_control: &Option<PendingControl>,
+        in_flight_control: &InFlightControls,
         instances: &HashMap<u64, TrackedInstance>,
         frame_policy: &FramePolicy,
     ) -> String {
@@ -2801,21 +2952,19 @@ impl BatchScheduler {
                 batch.started.elapsed(),
             );
         }
-        match in_flight_control {
-            Some(control) => {
-                let state = match &control.state {
-                    ControlSlotState::Posted { token } => format!("posted(token={token})"),
-                    ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
-                };
-                let _ = writeln!(
-                    out,
-                    "in_flight_control: {} pipeline {:?} {state}",
-                    control.operation, control.pipeline_id,
-                );
-            }
-            None => {
-                let _ = writeln!(out, "in_flight_control: none");
-            }
+        if in_flight_control.is_empty() {
+            let _ = writeln!(out, "in_flight_control: none");
+        }
+        for control in in_flight_control.iter() {
+            let state = match &control.state {
+                ControlSlotState::Posted { token } => format!("posted(token={token})"),
+                ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
+            };
+            let _ = writeln!(
+                out,
+                "in_flight_control: {} pipeline {:?} {state}",
+                control.operation, control.pipeline_id,
+            );
         }
         let _ = write!(out, "{}", frame_policy.debug_summary());
         out
@@ -2825,7 +2974,7 @@ impl BatchScheduler {
     fn enqueue_item(
         pending: &mut PendingQueue,
         terminated_processes: &mut HashSet<ProcessId>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         instances: &HashMap<u64, TrackedInstance>,
         limits: SchedulerLimits,
         page_size: u32,
@@ -2857,6 +3006,12 @@ impl BatchScheduler {
             SchedulerItem::ExecutionSlotConsumed(pid) => {
                 frame_policy.on_execution_slot_consumed(pid);
             }
+            SchedulerItem::AdmissionQueued(pid) => {
+                frame_policy.on_admission_queued(pid);
+            }
+            SchedulerItem::AdmissionDequeued(pid) => {
+                frame_policy.on_admission_dequeued(pid);
+            }
             SchedulerItem::PipelineLeave(pid, owner, kind, response) => {
                 if kind == LeaveKind::Terminate {
                     if !terminated_processes.insert(pid) {
@@ -2875,8 +3030,8 @@ impl BatchScheduler {
                     // ragged-boundary guard — see on_slotted_terminate).
                     frame_policy.on_slotted_terminate(pid);
                     let protected = in_flight_control
-                        .as_ref()
-                        .filter(|control| control.process_id == Some(pid))
+                        .iter()
+                        .find(|control| control.process_id == Some(pid))
                         .and_then(|control| control.logical_completion.clone());
                     if let Some(completion) = &protected {
                         completion.request_cancel();
@@ -3003,6 +3158,9 @@ impl BatchScheduler {
                 submitted,
             } => {
                 frame_policy.on_frame_truncated(lane, seq, submitted);
+            }
+            SchedulerItem::LanePark { lane, seq } => {
+                frame_policy.on_lane_park(lane, seq);
             }
             SchedulerItem::RegisterProgram { plan, response } => {
                 pending.push_back(QueuedItem::RegisterProgram { plan, response });
@@ -3331,7 +3489,15 @@ impl BatchScheduler {
     }
 
     /// launch that reached the queue front has no queued copy left).
-    fn rotate_launch_for_wave_work(pending: &mut PendingQueue, allow_controls: bool) -> bool {
+    ///
+    /// `allow_lifecycle` is the wider of the two flags: a lifecycle control
+    /// needs no control slot, so a standalone copy in flight does not stop
+    /// it from being worth exposing at the front.
+    fn rotate_launch_for_wave_work(
+        pending: &mut PendingQueue,
+        allow_slot: bool,
+        allow_lifecycle: bool,
+    ) -> bool {
         if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
             return false;
         }
@@ -3340,9 +3506,8 @@ impl BatchScheduler {
         };
         let work = &pending[run_len];
         if !(Self::standalone_copy(work)
-            || (allow_controls
-                && (Self::lifecycle_control(work)
-                    || matches!(work, QueuedItem::PreLaunchCopy { .. }))))
+            || (allow_lifecycle && Self::lifecycle_control(work))
+            || (allow_slot && matches!(work, QueuedItem::PreLaunchCopy { .. })))
         {
             return false;
         }
@@ -3358,7 +3523,7 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
@@ -3405,6 +3570,22 @@ impl BatchScheduler {
         // closes rotate and drain during the next generation's execution.
         // Shutdown never holds (the drain must retire everything).
         let hold_closes = !stopping && frame_policy.has_pending_binds();
+        // The control SLOT (depth 1) exists for controls that settle
+        // asynchronously; lifecycle controls execute on the lane FIFO and
+        // never take it (see `post_control`). So a standalone copy holding
+        // the slot must not block them: it addresses grant-pinned pages no
+        // bind, register or close can reference, and the lane FIFO already
+        // fixes their driver order. Blocking them on it wedged the fleet —
+        // the planner's suspend/restore copies are in flight almost
+        // continuously under churn, so every bind waited out the whole
+        // strict-watchdog window, its process sat in `staged` for the
+        // duration, and the cohort-boundary window it therefore held open
+        // (which then still held the seal) stalled the very traffic the copy
+        // was waiting behind. Measured on
+        // `churn`: every one of 270 binds took 1.0-2.4 s end to end against
+        // a 59 us driver bind, and the probe found the slot held by a
+        // tracked KV copy in 100% of the samples.
+        let slot_blocks_lifecycle = in_flight_control.holds_launches();
         loop {
             let Some(item) = pending.front() else {
                 break;
@@ -3415,7 +3596,11 @@ impl BatchScheduler {
                     // id, not queue position). A launch at the queue front
                     // only needs to yield to any dispatchable control behind
                     // it.
-                    if Self::rotate_launch_for_wave_work(pending, in_flight_control.is_none()) {
+                    if Self::rotate_launch_for_wave_work(
+                        pending,
+                        in_flight_control.is_empty(),
+                        !slot_blocks_lifecycle,
+                    ) {
                         progress = true;
                         continue;
                     }
@@ -3429,7 +3614,11 @@ impl BatchScheduler {
                     // whole-pipe drain stalled every launch queued behind a
                     // front close during cohort swaps and made freshly-bound
                     // pipelines' credits ragged (V6 iteration 3).
-                    if in_flight_control.is_some() {
+                    // A close needs no control slot either (see
+                    // `slot_blocks_lifecycle`), only its own instance
+                    // quiesced — a settling standalone copy addresses
+                    // grant-pinned pages no close can name.
+                    if slot_blocks_lifecycle {
                         break;
                     }
                     let id = *id;
@@ -3526,12 +3715,14 @@ impl BatchScheduler {
                     let item = pending.pop_front().expect("close front");
                     pending.push_back(item);
                 }
-                // Single control slot: a settling copy/resize blocks the
-                // next control (the slot only ever holds async-completing
-                // controls now — lifecycle controls execute on the lane
-                // without occupying it, their driver order guaranteed by the
-                // lane FIFO).
-                _ if in_flight_control.is_some() => break,
+                // A settling exclusive control (a `PreLaunchCopy` or a
+                // pool resize) blocks the next control. Standalone copies and
+                // lifecycle controls are refused by nothing else — see
+                // `InFlightControls::admits`. The front-rotation this arm used
+                // to need is gone with the single slot: a copy that cannot post
+                // is blocked by an exclusive control, and so is everything
+                // behind it, so giving up its position buys nothing.
+                _ if !in_flight_control.admits(item) => break,
                 _ if !in_flight_launches.is_empty() && !Self::pipe_concurrent_control(item) => {
                     break;
                 }
@@ -3559,11 +3750,21 @@ impl BatchScheduler {
         // copies ARE the residency planner's forward progress — leaving
         // them positional starved the very traffic that unsticks a held
         // frame (CONTENTION_FOLLOWUP.md §12).
+        //
+        // They also pipeline: the sweep keeps posting while no exclusive
+        // control holds the set, so a restore never waits out an unrelated
+        // copy's device time. Serialized, the wait WAS the cost — 22.8 ms
+        // per H2D restore against ~3.3 ms of transfer at 512-way
+        // contention. The queue bounds the depth: only what the planner
+        // enqueued can be posted.
         let copy_t = probe_disp.then(Instant::now);
-        if in_flight_control.is_none()
-            && let Some(index) = pending.iter().position(|item| Self::standalone_copy(item))
-            && let Some(item) = pending.remove(index)
-        {
+        while in_flight_control.admits_copy() {
+            let Some(index) = pending.iter().position(|item| Self::standalone_copy(item)) else {
+                break;
+            };
+            let Some(item) = pending.remove(index) else {
+                break;
+            };
             Self::post_control(
                 driver_lane,
                 lane_inflight,
@@ -3616,7 +3817,7 @@ impl BatchScheduler {
         lane_inflight: &mut u64,
         lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         frame_policy: &mut FramePolicy,
         item: QueuedItem,
     ) {
@@ -3705,11 +3906,12 @@ impl BatchScheduler {
         }
         *lane_token += 1;
         let token = *lane_token;
-        // Async-completing controls hold the single control slot from POST:
-        // the copy's coupled consumer launch (and any later control) must
-        // not pass it, exactly as before the lane existed. Exactly the
-        // standalone copies do NOT hold launches — one classification,
-        // shared with the out-of-band dispatch that relies on it.
+        // Async-completing controls enter the in-flight set from POST: an
+        // exclusive one (the copy's coupled consumer launch, a resize) must
+        // not be passed by any later control, exactly as before the lane
+        // existed. Exactly the standalone copies do NOT hold launches — one
+        // classification, shared with the out-of-band dispatch and the
+        // concurrency rule in `InFlightControls` that both rely on it.
         let holds_launches = !Self::standalone_copy(&item);
         match &item {
             QueuedItem::PreLaunchCopy {
@@ -3718,7 +3920,7 @@ impl BatchScheduler {
                 process_id,
                 pipeline_id,
             } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: Some(logical_completion.clone()),
                     process_id: *process_id,
@@ -3729,7 +3931,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::CopyKv { .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -3740,7 +3942,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::CopyKvTracked { completion, .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -3751,7 +3953,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::CopyState { .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -3762,7 +3964,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::ResizePool { .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -3850,7 +4052,7 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &Option<PendingControl>,
+        in_flight_control: &InFlightControls,
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
@@ -3868,10 +4070,7 @@ impl BatchScheduler {
             // frames under it. A settling standalone copy holds nothing
             // (`PendingControl::holds_launches`) — frames keep posting
             // while suspend/restore traffic settles.
-            if in_flight_control
-                .as_ref()
-                .is_some_and(|control| control.holds_launches)
-            {
+            if in_flight_control.holds_launches() {
                 break;
             }
             // Run-ahead depth in FRAMES: the enqueue horizon. Retirement
@@ -3918,6 +4117,34 @@ impl BatchScheduler {
                         break;
                     }
                     FramePlan::Park => break,
+                    FramePlan::Terminate(pids) => {
+                        // Abandoned pipeline. This is NOT the submit
+                        // deadline: that one only leashes (drops the lane
+                        // from the wait-set and lets it rejoin), so a guest
+                        // that is merely slow never lands here. Reaching this
+                        // means the lane was silent for the whole silence
+                        // timeout without ever calling `forward.park()`, so
+                        // nothing but a wedged process is being reclaimed.
+                        // The policy has already dropped these lanes, so the
+                        // `continue` re-plans a gather that no longer waits
+                        // on them; the terminate is asynchronous and arrives
+                        // back as the usual leave.
+                        for pid in pids {
+                            tracing::error!(
+                                pid = %pid,
+                                "scheduler: terminating abandoned pipeline (silent for the \
+                                 whole silence timeout without submitting and without \
+                                 calling forward.park())"
+                            );
+                            crate::inferlet::process::terminate(
+                                pid,
+                                Err("pipeline abandoned: silent past the silence timeout \
+                                     without submitting and without parking"
+                                    .to_string()),
+                            );
+                        }
+                        continue;
+                    }
                 }
             };
             if let Some(plan_started) = plan_started {
@@ -4202,6 +4429,7 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         stats: &Arc<SchedulerStats>,
+        frame_policy: &mut FramePolicy,
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
@@ -4224,6 +4452,10 @@ impl BatchScheduler {
                 _ => None,
             };
             let mut retired = in_flight_launches.pop_front().expect("front batch exists");
+            // The engine has answered these lanes: re-arm their submit
+            // deadline from here so the wave they waited on is not charged
+            // to them (see `FramePolicy::on_frame_retired`).
+            frame_policy.on_frame_retired(retired.requests.iter().filter_map(|r| r.pipeline_id));
             let native_complete_us = retired.timing.as_ref().map(|_| super::fire_timing_now_us());
             let timing_snapshots = retired
                 .timing
@@ -4688,43 +4920,41 @@ impl BatchScheduler {
         }
     }
 
-    fn retire_ready_control(in_flight_control: &mut Option<PendingControl>) -> bool {
-        let operation = in_flight_control
-            .as_ref()
-            .map(|pending| pending.operation)
-            .unwrap_or("control operation");
-        let Some(result) = in_flight_control
-            .as_ref()
-            .and_then(|pending| match &pending.state {
+    /// Retire every settled control this pass. Concurrent standalone copies
+    /// settle in device order, not post order, so the sweep cannot stop at
+    /// the first control that is still outstanding.
+    fn retire_ready_control(in_flight_control: &mut InFlightControls) -> bool {
+        let mut retired = false;
+        let mut index = 0;
+        while index < in_flight_control.settling.len() {
+            let ready = match &in_flight_control.settling[index].state {
                 // Still waiting for the lane's reply to install the driver
-                // completion (or clear the slot on rejection).
+                // completion (or drop the entry on rejection).
                 ControlSlotState::Posted { .. } => None,
                 ControlSlotState::Ready(completion) => completion.check(),
-            })
-        else {
-            return false;
-        };
-        if let Some(tracked) = in_flight_control
-            .as_ref()
-            .and_then(|pending| pending.tracked_completion.as_ref())
-        {
-            tracked.resolve(&result);
-        }
-        if let Err(ref err) = result {
-            tracing::warn!(
-                ?err,
-                operation,
-                "direct control completion closed before callback"
-            );
-            if let Some(logical) = in_flight_control
-                .as_ref()
-                .and_then(|pending| pending.logical_completion.as_ref())
-            {
-                logical.reject_unsubmitted(format!("pre-launch {operation} failed: {err:#}"));
+            };
+            let Some(result) = ready else {
+                index += 1;
+                continue;
+            };
+            let pending = in_flight_control.settling.remove(index);
+            let operation = pending.operation;
+            if let Some(tracked) = pending.tracked_completion.as_ref() {
+                tracked.resolve(&result);
             }
+            if let Err(ref err) = result {
+                tracing::warn!(
+                    ?err,
+                    operation,
+                    "direct control completion closed before callback"
+                );
+                if let Some(logical) = pending.logical_completion.as_ref() {
+                    logical.reject_unsubmitted(format!("pre-launch {operation} failed: {err:#}"));
+                }
+            }
+            retired = true;
         }
-        *in_flight_control = None;
-        true
+        retired
     }
 
     /// Apply a driver-lane reply on the worker thread: fill in a posted
@@ -4734,7 +4964,7 @@ impl BatchScheduler {
         reply: LaneReply,
         lane_inflight: &mut u64,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         instances: &mut HashMap<u64, TrackedInstance>,
         frame_policy: &mut FramePolicy,
         rollback_tx: &crossbeam::channel::Sender<SchedulerItem>,
@@ -4914,25 +5144,26 @@ impl BatchScheduler {
                     }
                 }
                 LaneCommit::AsyncControl { result } => {
-                    let holds_token = in_flight_control.as_ref().is_some_and(
-                        |control| matches!(control.state, ControlSlotState::Posted { token: t } if t == token),
-                    );
-                    if !holds_token {
+                    // Replies arrive in lane FIFO order, but several
+                    // standalone copies can be posted at once, so the reply
+                    // is matched to its own entry by token.
+                    let Some(index) = in_flight_control.position_posted(token) else {
                         tracing::error!(
                             token,
                             "lane async-control reply without a matching control slot"
                         );
                         return;
-                    }
+                    };
                     match result {
                         Ok(completion) => {
-                            if let Some(control) = in_flight_control.as_mut() {
-                                control.state = ControlSlotState::Ready(completion);
-                            }
+                            in_flight_control.settling[index].state =
+                                ControlSlotState::Ready(completion);
                         }
                         // The lane already rejected/resolved the control's
-                        // completions; the slot just frees.
-                        Err(_) => *in_flight_control = None,
+                        // completions; the entry just leaves.
+                        Err(_) => {
+                            in_flight_control.settling.remove(index);
+                        }
                     }
                 }
             },
@@ -5380,7 +5611,7 @@ mod tests {
         let (rollback_tx, rollback_rx) = crossbeam::channel::unbounded();
         let mut lane_inflight = 1;
         let mut launches = VecDeque::new();
-        let mut control = None;
+        let mut control = InFlightControls::default();
         let mut instances = HashMap::new();
         let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
 
@@ -6269,7 +6500,7 @@ mod tests {
         let mut lane_token = 0u64;
         let mut instances = HashMap::new();
         let mut in_flight_launches = VecDeque::new();
-        let mut in_flight_control = None;
+        let mut in_flight_control = InFlightControls::default();
         let limits = SchedulerLimits {
             max_forward_requests: 64,
             max_forward_tokens: 64,
@@ -6766,7 +6997,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn two_pipelines_coalesce_into_one_wave_after_cold_hold() -> anyhow::Result<()> {
+    async fn two_pipelines_coalesce_into_one_wave() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound_a, _endpoints) = setup_scheduler_with_limits(
             DummyDriverOptions {
@@ -6784,8 +7015,7 @@ mod tests {
 
         // Submitted back-to-back, no await in between: both land in the
         // scheduler's queue before it next drains, so both `on_pipeline_
-        // request` calls land in the SAME wave-gather — no timing race
-        // with the 500us cold-hold window.
+        // request` calls land in the SAME wave-gather.
         let first = bound_a.reserve_completion();
         crate::scheduler::submit_async(
             dummy_launch(),
@@ -6805,10 +7035,10 @@ mod tests {
             second.clone(),
         )?;
 
-        // The wait-all quorum's bootstrap cold-hold gathers both pipelines'
-        // first requests into ONE dense wave (`requests=2`) instead of two
-        // solo fires — the dummy driver's launch-shape trace names the
-        // program count directly.
+        // The wait-all gate holds the seal until every member is ready, so
+        // both pipelines' first requests land in ONE dense wave
+        // (`requests=2`) instead of two solo fires — the dummy driver's
+        // launch-shape trace names the program count directly.
         let coalesced = timeout(Duration::from_secs(5), async {
             loop {
                 let hit = operation_log
@@ -7234,6 +7464,31 @@ mod tests {
             !ordinary_group.accepts(&host_on_device, limits, 16),
             "resolved-geometry host masks remain incompatible with reordered wire rows"
         );
+
+        // The wire rows above are an INFERENCE, not the binding. A program
+        // that binds `AttnMask` to a channel gets its dense mask resolved on
+        // device whether or not this fire also lowered BRLE rows, so the
+        // binding itself has to keep the fire solo. `cuda_runahead_concurrent`
+        // is the case: 8 pipelines of a sink/sliding-window decode program,
+        // every fire carrying BOTH wire rows and the channel binding, batched
+        // into one step that the driver rejects — the failed prepare poisons
+        // descriptor channel 0 and every stream is lost.
+        let mut bound_dense = dummy_launch_request(ProcessId::new_v4(), 6);
+        bound_dense.request.dense_device_mask = true;
+        bound_dense.request.has_user_mask = true;
+        bound_dense.request.masks = vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+        bound_dense.request.mask_indptr = vec![0, 1];
+        let mut grouping = LaunchGrouping::default();
+        assert!(
+            grouping.push(&bound_dense, limits, 16),
+            "a channel-bound dense mask seals its step even with wire rows"
+        );
+        let mut ordinary_group = LaunchGrouping::default();
+        ordinary_group.push(&dummy_launch_request(ProcessId::new_v4(), 7), limits, 16);
+        assert!(
+            !ordinary_group.accepts(&bound_dense, limits, 16),
+            "and never joins a step that already has a member"
+        );
     }
 
     /// Rotating held launches behind wave work must move the WHOLE contiguous
@@ -7263,6 +7518,7 @@ mod tests {
 
         assert!(BatchScheduler::rotate_launch_for_wave_work(
             &mut pending,
+            true,
             true
         ));
 
@@ -7315,13 +7571,14 @@ mod tests {
 
         let mut pending = make_pending();
         assert!(
-            !BatchScheduler::rotate_launch_for_wave_work(&mut pending, false),
+            !BatchScheduler::rotate_launch_for_wave_work(&mut pending, false, false),
             "a settling control slot (controls disallowed) must keep launch order"
         );
 
         let mut pending = make_pending();
         assert!(BatchScheduler::rotate_launch_for_wave_work(
             &mut pending,
+            true,
             true
         ));
         assert!(
@@ -7467,7 +7724,7 @@ mod tests {
         let mut lane_token = 0u64;
         let mut instances = HashMap::new();
         let mut in_flight_launches = VecDeque::new();
-        let mut in_flight_control = None;
+        let mut in_flight_control = InFlightControls::default();
         let limits = SchedulerLimits {
             max_forward_requests: 64,
             max_forward_tokens: 64,
@@ -7497,11 +7754,243 @@ mod tests {
             "the gathering frame must not post"
         );
         assert_eq!(
-            in_flight_control.as_ref().map(|control| control.operation),
+            in_flight_control
+                .iter()
+                .next()
+                .map(|control| control.operation),
             Some("tracked KV copy"),
             "the copy dispatches out-of-band past the launch and the resize"
         );
         assert_eq!(pending.len(), 2, "launch and resize keep their positions");
+    }
+
+    /// Standalone copies pipeline instead of queueing for one slot. Nothing
+    /// queued orders against them, so the single control slot only ever made
+    /// each restore wait out the ones ahead of it: measured at 512-way KV
+    /// contention, up to 7 restores wanted the slot at once and each H2D
+    /// copy billed 22.8 ms against ~3.3 ms of transfer, while the D2H side —
+    /// which the planner already issues one at a time, so it never queued —
+    /// ran 6.7x cheaper per page. An exclusive control still takes the whole
+    /// set (the next test).
+    #[test]
+    fn concurrent_standalone_copies_all_dispatch_in_one_pass() {
+        let (copy_tx, _copy_rx) = tokio::sync::oneshot::channel();
+        let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
+        let mut pending: PendingQueue = VecDeque::from([
+            QueuedItem::CopyKvTracked {
+                plan: crate::driver::KvCopyPlan::default(),
+                completion: ControlCompletion::new(),
+            },
+            QueuedItem::CopyKv {
+                plan: crate::driver::KvCopyPlan::default(),
+                response: copy_tx,
+            },
+            QueuedItem::CopyKvTracked {
+                plan: crate::driver::KvCopyPlan::default(),
+                completion: ControlCompletion::new(),
+            },
+            QueuedItem::ResizePool {
+                plan: PoolResizePlan::default(),
+                response: resize_tx,
+            },
+        ])
+        .into();
+        let (lane, _lane_rx) = test_lane(None);
+        let mut lane_inflight = 0u64;
+        let mut lane_token = 0u64;
+        let mut instances = HashMap::new();
+        let mut in_flight_launches = VecDeque::new();
+        let mut in_flight_control = InFlightControls::default();
+        let limits = SchedulerLimits {
+            max_forward_requests: 64,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let stats = Arc::new(SchedulerStats::default());
+        let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+
+        let (progress, _) = BatchScheduler::dispatch_ready_items(
+            &lane,
+            &mut lane_inflight,
+            &mut lane_token,
+            &mut instances,
+            &mut pending,
+            &mut in_flight_launches,
+            &mut in_flight_control,
+            16,
+            limits,
+            &stats,
+            &mut frame_policy,
+            &mut ScanCache::default(),
+            &mut SlotBuffer::new(),
+            false,
+        );
+
+        assert!(progress);
+        assert_eq!(
+            in_flight_control.settling.len(),
+            3,
+            "every queued standalone copy is in flight after one pass"
+        );
+        assert_eq!(lane_inflight, 3, "each copy was posted to the lane");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the resize stays queued behind the settling copies"
+        );
+    }
+
+    /// The exclusivity half: an exclusive control (a `PreLaunchCopy`, whose
+    /// consumer fire is queued behind it, or a pool resize, whose pipe drain
+    /// IS its ordering mechanism) keeps the original single-slot rule in
+    /// both directions.
+    #[test]
+    fn an_exclusive_control_never_shares_the_in_flight_set() {
+        let settling = |holds_launches: bool| {
+            let mut controls = InFlightControls::default();
+            controls.push(PendingControl {
+                state: ControlSlotState::Posted { token: 1 },
+                logical_completion: None,
+                process_id: None,
+                pipeline_id: None,
+                tracked_completion: None,
+                operation: "settling",
+                holds_launches,
+            });
+            controls
+        };
+        let run = |mut in_flight_control: InFlightControls, item: QueuedItem| {
+            let mut pending: PendingQueue = VecDeque::from([item]).into();
+            let (lane, _lane_rx) = test_lane(None);
+            let mut lane_inflight = 1u64;
+            let mut lane_token = 1u64;
+            let mut instances = HashMap::new();
+            let mut in_flight_launches = VecDeque::new();
+            let limits = SchedulerLimits {
+                max_forward_requests: 64,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            };
+            let stats = Arc::new(SchedulerStats::default());
+            let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+            BatchScheduler::dispatch_ready_items(
+                &lane,
+                &mut lane_inflight,
+                &mut lane_token,
+                &mut instances,
+                &mut pending,
+                &mut in_flight_launches,
+                &mut in_flight_control,
+                16,
+                limits,
+                &stats,
+                &mut frame_policy,
+                &mut ScanCache::default(),
+                &mut SlotBuffer::new(),
+                false,
+            );
+            (pending.len(), in_flight_control.settling.len())
+        };
+
+        assert_eq!(
+            run(
+                settling(true),
+                QueuedItem::CopyKvTracked {
+                    plan: crate::driver::KvCopyPlan::default(),
+                    completion: ControlCompletion::new(),
+                }
+            ),
+            (1, 1),
+            "a settling exclusive control admits no standalone copy"
+        );
+
+        let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            run(
+                settling(false),
+                QueuedItem::ResizePool {
+                    plan: PoolResizePlan::default(),
+                    response: resize_tx,
+                }
+            ),
+            (1, 1),
+            "a resize waits for the settling copies to drain"
+        );
+    }
+
+    /// A lifecycle control never enters the in-flight set, so a settling
+    /// standalone copy must not delay one. Under churn the planner's
+    /// suspend/restore copies are in flight nearly continuously, and gating
+    /// binds on them made every bind wait out the strict-watchdog window: the
+    /// process stayed in `staged`, which pinned the cohort-boundary window
+    /// open (back when that still held the seal) and stalled the very traffic
+    /// the copy was settling behind.
+    #[test]
+    fn a_bind_dispatches_past_a_settling_standalone_copy() {
+        let mut pending: PendingQueue = VecDeque::from([QueuedItem::BindInstance {
+            pipeline_id: Some(ProcessId::new_v4()),
+            plan: InstanceBindingPlan {
+                driver_id: 0,
+                program_id: 0,
+                requested_instance_id: 0,
+                pacing_wait_id: 0,
+                channel_ids: Vec::new(),
+                seed_values: Vec::new(),
+                geometry_class: pie_driver_abi::GeometryClass::Host,
+            },
+            response: tokio::sync::oneshot::channel().0,
+        }])
+        .into();
+        let (lane, _lane_rx) = test_lane(None);
+        let mut lane_inflight = 0u64;
+        let mut lane_token = 0u64;
+        let mut instances = HashMap::new();
+        let mut in_flight_launches = VecDeque::new();
+        let mut in_flight_control = InFlightControls::default();
+        in_flight_control.push(PendingControl {
+            state: ControlSlotState::Posted { token: 1 },
+            logical_completion: None,
+            process_id: None,
+            pipeline_id: None,
+            tracked_completion: Some(ControlCompletion::new()),
+            operation: "tracked KV copy",
+            holds_launches: false,
+        });
+        let limits = SchedulerLimits {
+            max_forward_requests: 64,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let stats = Arc::new(SchedulerStats::default());
+        let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+
+        let (progress, _) = BatchScheduler::dispatch_ready_items(
+            &lane,
+            &mut lane_inflight,
+            &mut lane_token,
+            &mut instances,
+            &mut pending,
+            &mut in_flight_launches,
+            &mut in_flight_control,
+            16,
+            limits,
+            &stats,
+            &mut frame_policy,
+            &mut ScanCache::default(),
+            &mut SlotBuffer::new(),
+            false,
+        );
+
+        assert!(progress, "the bind dispatched");
+        assert!(
+            pending.is_empty(),
+            "the bind must not wait out a copy it shares nothing with"
+        );
+        assert_eq!(
+            in_flight_control.settling.len(),
+            1,
+            "the bind enters no in-flight set, so the copy is still alone"
+        );
     }
 
     /// §12 regression, barrier half: queued standalone copies and resizes
@@ -7697,7 +8186,8 @@ mod tests {
             let mut lane_token = 1u64;
             let mut instances = HashMap::new();
             let mut in_flight_launches = VecDeque::new();
-            let mut in_flight_control = Some(PendingControl {
+            let mut in_flight_control = InFlightControls::default();
+            in_flight_control.push(PendingControl {
                 state: ControlSlotState::Posted { token: 1 },
                 logical_completion: None,
                 process_id: None,

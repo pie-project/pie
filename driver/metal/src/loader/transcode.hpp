@@ -16,10 +16,20 @@
 // enough to be uninteresting; a compute kernel would buy bandwidth this is not
 // bound by.
 //
-// The affine encoder is a transcription of `mlx/backend/cpu/quantized.cpp`,
-// mirrored in `loader/src/testkit/host_executor.rs`. It has to be: a checkpoint
-// converted by MLX and a checkpoint converted here must produce the same codes,
-// or the two paths would disagree about what the same weights mean.
+// The affine encoder is a transcription of MLX's METAL quantizer,
+// `mlx/backend/metal/kernels/quantized.h::affine_quantize`, which the wheel
+// ships in source form because it is compiled at runtime. It used to be a
+// transcription of the CPU one, and those two are not the same function: on a
+// lattice-valued input MLX's own backends disagree on 5.47% of codes, always by
+// one, and on one scale in sixteen. mlx-lm quantizes on the GPU here, so the
+// GPU one is the only one worth agreeing with.
+//
+// It is mirrored in `loader/src/testkit/host_executor.rs`, and it has to be: a
+// checkpoint converted by MLX and a checkpoint converted here must produce the
+// same codes, or the two paths disagree about what the same weights mean.
+// `tests/loader_fill_test.cpp` holds both this encoder and the Metal one
+// against a pinned `mx.quantize` output, because nothing else does -- no
+// checkpoint on disk reaches `push_encoded_affine`.
 
 #pragma once
 
@@ -89,6 +99,38 @@ inline std::uint16_t f32_to_bf16(float value) {
     return static_cast<std::uint16_t>(rounded >> 16);
 }
 
+/// IEEE-754 binary16 as a float.
+///
+/// Written out rather than leaned on `_Float16` because this runs on the host
+/// for whole tensors and the whole point is that the bit layout is EXPLICIT:
+/// F16 and BF16 differ in where the exponent ends, which is precisely the
+/// confusion that reading one as the other produces.
+inline float f16_to_f32(std::uint16_t bits) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000u) << 16;
+    const std::uint32_t exp = (bits >> 10) & 0x1fu;
+    const std::uint32_t mant = bits & 0x3ffu;
+    std::uint32_t wide = 0;
+    if (exp == 0x1fu) {
+        wide = sign | 0x7f800000u | (mant << 13);
+    } else if (exp == 0) {
+        if (mant != 0) {
+            // Subnormal: renormalise into binary32, which has the range for it.
+            std::uint32_t m = mant;
+            std::int32_t e = -1;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            m &= 0x3ffu;
+            wide = sign | (static_cast<std::uint32_t>(e + 127 - 14) << 23) | (m << 13);
+        } else {
+            wide = sign;
+        }
+    } else {
+        wide = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float out;
+    std::memcpy(&out, &wide, sizeof(out));
+    return out;
+}
+
 /// One MXFP4 nibble as a float. E2M1: sign, two exponent bits, one mantissa
 /// bit, with the all-zero exponent denormal at ±0.5.
 inline float mxfp4_nibble(std::uint8_t code) {
@@ -107,14 +149,37 @@ inline float e8m0_scale(std::uint8_t code) {
 
 // ── MLX affine quantization ──────────────────────────────────────────────────
 
-/// The (scale, bias) MLX would pick for one group, and the codes that follow.
+/// The (scale, bias) for one group, at the precision they are STORED in.
 ///
-/// Two details are load-bearing and neither is guessable:
+/// Two details of the endpoints are load-bearing and neither is guessable:
 ///   * the scale is NEGATED unless the negative extreme is the larger in
 ///     magnitude, so scales are usually negative;
-///   * the endpoint, not the scale, is snapped — `scale = edge / rint(edge /
-///     scale)` — which keeps the largest-magnitude weight exactly representable
-///     and is why a naive `(max - min) / 15` disagrees with MLX on real data.
+///   * the endpoint, not the scale, is snapped -- `scale = edge / round(edge /
+///     scale)` -- which keeps the largest-magnitude weight exactly representable
+///     and is why a naive `(max - min) / 15` disagrees with MLX on real data;
+///   * `w_max` starts at ZERO, not at negative infinity, so a group whose
+///     values are all negative is quantized over the range up to zero rather
+///     than up to its own largest element. Nothing about the arithmetic
+///     suggests this; it is simply what MLX does.
+///
+/// The rounding is `round`, half AWAY FROM ZERO, and not `rint`, half to even.
+/// That one character was the whole of a long-standing 8.2% disagreement with
+/// `mx.quantize`. A tie at k+0.5 goes up under MLX and down-to-even here, which
+/// is why every mismatch was by exactly one and almost always in the same
+/// direction -- and why the rate was 0.2% on gaussian weights and 8.2% on an
+/// MXFP4-derived expert bank, whose values sit on half-integers by
+/// construction. It was previously read as evidence that agreement with MLX was
+/// not purchasable at all, and the encoder was changed to pick codes against
+/// the BF16-rounded scale instead. It is purchasable, and it is exact: with
+/// `round`, zero-initialised `w_max`, and the f32 parameters, this reproduces
+/// `mx.quantize` bit for bit on every distribution tried.
+///
+/// The cost of going back to the f32 parameters is real and tiny. MLX's own
+/// codes are not the best ones for the BF16 scale MLX itself stores -- 0.23% of
+/// them could be moved and reduce the error -- but the reconstruction RMSE
+/// differs in the fifth significant digit, and mlx-lm redeems those same codes
+/// at that same scale. Matching the thing being compared against beats being
+/// 0.001% better than it.
 struct AffineGroup {
     float scale = 0.0f;
     float bias = 0.0f;
@@ -122,7 +187,7 @@ struct AffineGroup {
 
 inline AffineGroup mlx_affine_group_params(const float* values, std::int64_t count) {
     float w_min = std::numeric_limits<float>::infinity();
-    float w_max = -std::numeric_limits<float>::infinity();
+    float w_max = 0.0f;
     for (std::int64_t i = 0; i < count; ++i) {
         w_min = std::min(w_min, values[i]);
         w_max = std::max(w_max, values[i]);
@@ -131,12 +196,14 @@ inline AffineGroup mlx_affine_group_params(const float* values, std::int64_t cou
     float scale = std::max((w_max - w_min) / 15.0f, 1e-7f);
     if (!mask) scale = -scale;
     const float edge = mask ? w_min : w_max;
-    const float q0 = std::rint(edge / scale);
+    const float q0 = std::round(edge / scale);
     float bias = 0.0f;
     if (q0 != 0.0f) {
         scale = edge / q0;
         bias = edge;
     }
+    // At f32, the width MLX picks codes at. They are written as BF16 by the
+    // caller, which is also what MLX does -- it rounds only on store.
     return AffineGroup{scale, bias};
 }
 
@@ -152,6 +219,39 @@ inline void require(bool condition, const char* what) {
     if (!condition) {
         throw std::runtime_error(std::string("metal transcode: ") + what);
     }
+}
+
+/// Rewrite `count` F16 or F32 elements as BF16.
+///
+/// The narrowing every checkpoint that is not already BF16 needs, and the one
+/// that cannot be skipped: `mlx-community` publishes some conversions in F16
+/// and some in BF16, the two are the same width, and a driver that transmuted
+/// rather than cast would read one as the other without a single byte moving.
+/// The result is not noise -- it is a model that loads, runs and says the same
+/// token forever.
+///
+/// Widths are 2 and 4 rather than a dtype enum because this file has no
+/// dependency on the loader's ABI and does not want one; the caller has the
+/// dtype and this wants only how wide it is.
+inline void cast_float_to_bf16(const std::uint8_t* src, std::uint32_t src_bytes,
+                               std::int64_t count, Region dst) {
+    require(src_bytes == 2 || src_bytes == 4, "a float cast reads 2 or 4 bytes per element");
+    require(dst.bytes >= static_cast<std::uint64_t>(count) * 2,
+            "a float cast has no room for its output");
+    auto* out = reinterpret_cast<std::uint16_t*>(dst.data);
+    parallel_ranges(count, [&](std::int64_t begin, std::int64_t end) {
+        for (std::int64_t i = begin; i < end; ++i) {
+            float value;
+            if (src_bytes == 2) {
+                std::uint16_t bits;
+                std::memcpy(&bits, src + i * 2, 2);
+                value = f16_to_f32(bits);
+            } else {
+                std::memcpy(&value, src + i * 4, 4);
+            }
+            out[i] = f32_to_bf16(value);
+        }
+    });
 }
 
 /// Multiply `payload` by per-block factors, writing BF16.
@@ -232,14 +332,14 @@ inline void encode_mlx_affine_u4(
                 const AffineGroup params = mlx_affine_group_params(group.data(), kAffineGroup);
                 scale_out[r * groups + g] = f32_to_bf16(params.scale);
                 bias_out[r * groups + g] = f32_to_bf16(params.bias);
-                // Codes come from the f32 parameters, not their BF16 rounding:
-                // MLX rounds only on store, and matching it matters more than
-                // being self-consistent with what the runtime will read back.
+                // Against the f32 parameters, not the BF16 ones written above:
+                // that is what MLX does, and being interchangeable with an
+                // `mlx_lm convert` output is the entire purpose of this file.
                 for (std::int64_t w = 0; w < kAffineGroup / 8; ++w) {
                     std::uint32_t packed = 0;
                     for (std::int64_t k = 0; k < 8; ++k) {
                         const float value = group[static_cast<std::size_t>(w * 8 + k)];
-                        const float q = std::rint((value - params.bias) / params.scale);
+                        const float q = std::round((value - params.bias) / params.scale);
                         const auto code = static_cast<std::uint32_t>(
                             std::min(15.0f, std::max(0.0f, q)));
                         packed |= code << (4 * k);

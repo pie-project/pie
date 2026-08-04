@@ -34,7 +34,10 @@ inline void qmv_dispatch(int N, Grid& g, Threadgroup& tg) {
 //   * QNorm: n_rows=n_q_heads(8), row_size=head_dim(256) → grid=(512,1,1) tg=(64,1,1)
 //   * KNorm: n_rows=n_kv_heads(2), row_size=head_dim(256) → grid=(128,1,1) tg=(64,1,1)
 inline void rms_dispatch(int row_size, int n_rows, Grid& g, Threadgroup& tg) {
-    const uint32_t t = uint32_t(row_size) / 4;  // N_READS = 4
+    // Rounded UP: `rms_single_row` guards its own tail, but a truncating
+    // thread count silently drops the last partial group of 4 for any row
+    // width that is not a multiple of N_READS.
+    const uint32_t t = (uint32_t(row_size) + 3) / 4;  // N_READS = 4
     g  = Grid{t * uint32_t(n_rows), 1, 1};
     tg = Threadgroup{t, 1, 1};
 }
@@ -98,16 +101,5 @@ inline void gated_rms_dispatch(int v_heads, int v_dim, Grid& g, Threadgroup& tg)
     tg = Threadgroup{uint32_t(v_dim), 1, 1};
 }
 
-// dense_gemv (GdnInA / GdnInB): cooperative simdgroup K-reduction — ONE simdgroup
-// (32 lanes) per output row. The lanes stride K (coalesced loads, latency hidden
-// across 32 lanes) then simd_sum reduces. Replaces the old serial grid=(N,1,1)
-// tg=(N,1,1) (one 16-thread group serially walking K=1024 → ~93µs/disp, 50× the
-// launch floor, 43% of the decode step across GdnInA/B×36). Bit-identical output
-// (bf16 round absorbs the sub-ULP reassociation diff; verified 0/16). grid=(32,N,1)
-// tg=(32,1,1) → threadgroup_position.y = output row. Pairs with dense_gemv_coop.
-inline void dense_gemv_dispatch(int N, Grid& g, Threadgroup& tg) {
-    g  = Grid{32u, uint32_t(N), 1};
-    tg = Threadgroup{32u, 1, 1};
-}
 
 }  // namespace pie::metal

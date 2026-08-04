@@ -116,7 +116,7 @@ pub mod model {
     pub use crate::pie::inferlet::model::{
         ForwardKind, architecture, arena_block_size, channel_capacity, default_system_speculation,
         frame_size, kv_page_size, max_embed_length, name, output_vocab_size, pass_kind,
-        rs_buffer_page_size, rs_fold_granularity, rs_state_size,
+        rs_buffer_page_size, rs_fold_granularity, rs_state_size, submit_deadline_us,
     };
     // Tokenizer functions split into the `tokenizer` interface (§2.2); re-exported
     // here so `model::encode`/`model::decode`/… keep working for inferlet source.

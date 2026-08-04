@@ -33,26 +33,18 @@ mod common;
 
 /// Draft window k, kept in lockstep with the driver's `max_drafts`.
 ///
-/// The guest asks for `k` draft rows via `intrinsics::mtp_logits(k)`; the
-/// driver sizes `max_drafts` from `PIE_MTP_DRAFT_TOKENS`, falling back to
-/// `cfg.model.mtp_num_drafts` — which the test TOML does not set. So a bare
-/// `cargo test` used to run a guest wanting 4 drafts against a driver
-/// providing the config default, and fail deep in frame prepare with
-/// "MtpLogits draft-row requirement exceeds the production layout". Two
-/// defaults for one number is a trap, so this EXPORTS the value it returns:
-/// the env is the single source of truth, and the test supplies it when the
-/// caller did not. Must run before `boot_4090_mtp`, since the driver reads the
-/// variable once at init.
+/// The guest asks for `k` draft rows via `intrinsics::mtp_logits(k)`, and the
+/// driver sizes `max_drafts` from `mtp_num_drafts`. Two defaults for one number
+/// is a trap -- a guest wanting 4 drafts against a driver built for some other
+/// count fails deep in frame prepare with "MtpLogits draft-row requirement
+/// exceeds the production layout" -- so this ONE value feeds both: pass it to
+/// `boot_4090_mtp` and to the guest. `PIE_MTP_DRAFT_TOKENS` overrides it.
 fn draft_k() -> u32 {
-    let k = std::env::var("PIE_MTP_DRAFT_TOKENS")
+    std::env::var("PIE_MTP_DRAFT_TOKENS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .filter(|&k| k >= 2)
-        .unwrap_or(4);
-    // SAFETY: set before the engine boots, while the test is still
-    // single-threaded with respect to any driver init that reads it.
-    unsafe { std::env::set_var("PIE_MTP_DRAFT_TOKENS", k.to_string()) };
-    k
+        .unwrap_or(4)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -78,7 +70,7 @@ async fn mtp_logits_value_verify() -> Result<()> {
         .success();
     anyhow::ensure!(ok, "wasm build failed for mtp-native-verify");
 
-    let pie = common::boot_4090_mtp().await?;
+    let pie = common::boot_4090_mtp(k).await?;
     eprintln!(
         "[mtp-native-verify] booted Qwen3.5-0.8B, listen_addr={}",
         pie.listen_addr
@@ -198,7 +190,7 @@ async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
         .success();
     anyhow::ensure!(ok, "wasm build failed for mtp-native-verify");
 
-    let pie = common::boot_4090_mtp().await?;
+    let pie = common::boot_4090_mtp(k).await?;
     let url = format!("ws://{}/v1/ws", pie.listen_addr);
 
     let setup = Client::connect_with_identity(&url, "test-user")
@@ -294,10 +286,7 @@ async fn mtp_logits_capability_false() -> Result<()> {
     // hybrid model gates the SAME intrinsic through the SAME validator path, so
     // nothing is lost by pinning this test to the reachable configuration.
     //
-    // Read once at driver init (entry.cpp:106), so it must be set before boot.
-    // Safe here because a test process boots exactly one worker.
-    unsafe { std::env::set_var("PIE_MTP_DRAFT_TOKENS", "0") };
-    let pie = common::boot_4090_mtp().await?;
+    let pie = common::boot_4090_mtp(0).await?;
     let endpoint = format!("ws://{}/v1/ws", pie.listen_addr);
     let setup = Client::connect_with_identity(&endpoint, "test-user")
         .await
