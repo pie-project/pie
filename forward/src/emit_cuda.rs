@@ -1514,13 +1514,13 @@ fn emit_launch(
         "dispatch_attention_flashinfer_decode" => {
             let layer = state.expect("attention addresses kv state").layer;
             if win == Some(Win::MaskPrefix) {
-                // The UnmaskedPrefix peel's PREFIX region (NS-4 in the
-                // IR): the deployment's decode dispatch over the plain
-                // rows `[0, split)` — the prefix decode plan prepare
-                // built recursively, RAW CSR base addressing (no hook
-                // page views: the engine plans UNPLANNED for hooked
-                // fires, so a planned split never composes with masks'
-                // sideband brackets).
+                // The UnmaskedPrefix peel's PREFIX region (NS-4/AC-4):
+                // the decode dispatch over the plain rows `[0, split)`.
+                // Hooked lanes ride this prefix, so the dispatch
+                // consumes the ATTN page views (hook-narrowed when
+                // sites ran; raw aliases otherwise) — the bracket is
+                // the interpreter's resolve_masked_pages.
+                emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
                 b.stmt("if (!plan_state.decode_plan) {");
                 b.stmt("    throw std::runtime_error(");
                 b.stmt("        \"spatial mask: split active but prepare built \"");
@@ -1546,8 +1546,8 @@ fn emit_launch(
                 b.stmt("    ops::dispatch_attention_flashinfer_decode(");
                 b.stmt("        *plan_state.decode_plan,");
                 b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
-                b.stmt("        kv_page_indices, kv_page_indptr,");
-                b.stmt("        kv_last_page_lens,");
+                b.stmt("        attn_page_indices, attn_page_indptr,");
+                b.stmt("        attn_last_page_lens,");
                 b.stmt("        attn_ws, stream, layer_window_left,");
                 b.stmt(&format!(
                     "        /*logits_soft_cap=*/0.f, {scale});"
