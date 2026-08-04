@@ -1957,3 +1957,35 @@ THE COMPOSE LADDER (AC):
   AC-5 triples and the 2^k battery: one fire holding
        [plain, masked, lora, draft] — the user's R=4 example — and
        the product-space census.
+
+## AC-1 DESIGN DECISION (2026-08-04): stash/restore beats two-slab
+
+The mask x depth conflict, resolved without touching the 880-line
+body's row addressing. Order stays [plain | truncated | masked] (the
+CURRENT seriation key — custom_mask outranks truncated, no swap):
+the mask window stays a SUFFIX (mask machinery unchanged at every
+layer), the truncated block is a MIDDLE window [t_start, m_start),
+and the full-depth rows are non-contiguous {[0,t_start) ∪ [m_start,N)}
+— which is exactly the shape two-slab execution cannot serve without
+offsetting every kernel call.
+
+The resolution: DON'T window range 2 — run it FULL-N and make the
+truncated rows' results DISCARDED rather than absent:
+  at layer k:   stash rows [t_start, m_start) of the residual stream
+                (one D2D copy, contiguous rows x H);
+  layers [k,L): run EVERY row (truncated rows compute garbage that
+                nothing reads; their KV writes land in layer slabs
+                [k,L) which their OWN next step never reads — the
+                truncated fire re-runs [0,k) only — so the pollution
+                is dead weight, not corruption);
+  before tail:  restore the stashed rows — the tail reads layer-k
+                hidden for the truncated rows (the logit-lens head)
+                and layer-L hidden for everyone else.
+Cost: wasted tail-layer compute for the truncated rows (bounded by
+their row share) + two row-slab copies. Correctness: exact. The
+windowed range-2 (true two-slab) remains the recorded optimization.
+
+Engine side: the depth planner admits masked members (they are
+FULL-DEPTH — the suffix after the truncated block must be all-masked,
+the middle all-truncated); m_start (= the truncated block's end)
+derives from the mask word when planned, else N — NO new ABI word.
