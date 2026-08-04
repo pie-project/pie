@@ -1,4 +1,4 @@
-// GPT-OSS's own kernels: the router's top-k, its SwiGLU, and the expert sum.
+// GPT-OSS's own kernels: the shared router top-k and its model-specific SwiGLU.
 //
 // Everything else this family needs is either shared (rms, kv_append, embed,
 // argmax) or a variant living beside the kernel it varies (the routed matvec in
@@ -182,42 +182,3 @@ template <typename T>
       constant GptOssSwiGluParams&, uint);
 
 instantiate_gptoss_swiglu(bfloat16, bfloat)
-
-struct ExpertCombineParams {
-  uint width;              // hidden
-  uint experts_per_token;  // 4
-};
-
-// Sum the k experts' outputs, weighted by the router's softmax.
-//
-// One thread per hidden channel. `y` is [k, width] -- the routed down-projection
-// wrote each expert's slot -- and the weights are the k the router emitted.
-template <typename T>
-[[kernel]] void expert_combine(
-    const device T* y                [[buffer(0)]],
-    const device T* expert_weights   [[buffer(1)]],
-    device T* out                    [[buffer(2)]],
-    constant ExpertCombineParams& p  [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]]) {
-  const uint c = gid.x;
-  if (c >= p.width) return;
-  // `gid.y` is the token row. `y` is [rows, k, width] -- the routed
-  // down-projection wrote each (row, slot) -- and the weights are [rows, k].
-  const uint row = gid.y;
-  y += size_t(row) * size_t(p.experts_per_token) * size_t(p.width);
-  expert_weights += size_t(row) * size_t(p.experts_per_token);
-  out += size_t(row) * size_t(p.width);
-  float acc = 0;
-  for (uint e = 0; e < p.experts_per_token; ++e) {
-    acc += float(expert_weights[e]) * float(y[e * p.width + c]);
-  }
-  out[c] = static_cast<T>(acc);
-}
-
-#define instantiate_expert_combine(name, itype)                    \
-  template [[host_name("expert_combine_" #name)]]                  \
-  [[kernel]] void expert_combine<itype>(                           \
-      const device itype*, const device itype*, device itype*,     \
-      constant ExpertCombineParams&, uint2);
-
-instantiate_expert_combine(bfloat16, bfloat)

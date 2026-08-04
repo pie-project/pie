@@ -57,7 +57,6 @@ bool load_decode_psos(RawMetalContext& ctx,
 struct MultiBatchPsos {
     Pso embed_mb{};        // embed_gather_mb_4bit_bfloat16_gs_64_b_4   (per-row id[m])
     Pso rope_mb{};         // rope_neox_mb_bfloat16                     (per-row position[m])
-    Pso gdn_slotted{};     // gdn_core_slotted_bfloat16                 (slot_ids[b_idx])
     Pso gdn_prep_slotted{};      // gdn_prep_slotted_bfloat16
     Pso gdn_recurrent_slotted{}; // gdn_core_recurrent_slotted_bfloat16
     Pso sdpa_paged{};      // sdpa_paged_decode_bfloat16_d_256          (page-table gather)
@@ -94,9 +93,7 @@ struct MultiBatchPsos {
     Pso qmm_t_splitk_fp16_precast_f32[3]{};
     Pso qmm_cast_bf16_f16{};
     Pso qmm_splitk_reduce{};
-    Pso qmm_splitk_reduce_residual{};
     Pso qmm_splitk_reduce_f32{};
-    Pso qmm_splitk_reduce_residual_f32{};
     Pso qmm_t_strided{};
     Pso qmm_t_strided_wide{};
     Pso qmm_t_strided_wide_residual{};
@@ -119,8 +116,7 @@ struct MultiBatchPsos {
     Pso gdn_prep_prefill{};
     Pso gdn_core_prefill{};
     bool valid() const {
-        return embed_mb.valid() && rope_mb.valid() && gdn_slotted.valid() &&
-               gdn_prep_slotted.valid() &&
+        return embed_mb.valid() && rope_mb.valid() && gdn_prep_slotted.valid() &&
                gdn_recurrent_slotted.valid() && sdpa_paged.valid() && kv_append_paged.valid();
     }
 };

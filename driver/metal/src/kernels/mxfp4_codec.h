@@ -17,6 +17,9 @@
 // E8M0: an unsigned power of two, 127-biased, one per 32-element block, with
 // 0xff reserved for NaN.
 
+#ifndef PIE_METAL_MXFP4_CODEC_H
+#define PIE_METAL_MXFP4_CODEC_H
+
 constant float kMxfp4Lut[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
                                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
@@ -30,3 +33,5 @@ inline float mxfp4_hi(uint8_t byte) { return kMxfp4Lut[byte >> 4]; }
 inline float mxfp4_block_scale(uint8_t code) {
   return code == 0xff ? NAN : metal::ldexp(1.0f, int(code) - 127);
 }
+
+#endif

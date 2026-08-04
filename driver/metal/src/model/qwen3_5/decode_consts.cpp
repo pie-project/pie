@@ -131,14 +131,6 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         const int ord = d.ordinal;
         switch (d.kind) {
             case Kernel::LlExpertSiluMul:
-                // The routed stack's gate and up are `moe_intermediate` wide
-                // and there is one row per sorted (token, slot) pair, padding
-                // included -- the padding rows are real rows of the buffers
-                // this reads. This is the one SwiGLU whose extent moves with
-                // the batch; the shared expert's does not, which is why only
-                // this one is here.
-                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
-                                sorted * g.moe_intermediate, &count);
                 break;
 
             case Kernel::LlMoeSort:
@@ -335,16 +327,8 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<int>(ctx, ord, (uint8_t)bind::SdpaPaged::Window, 0, &count);
                 break;
 
-            case Kernel::AttnGate:
-                bind_const<int>(ctx, ord, (uint8_t)bind::AttnGate::Width,
-                                g.n_q_heads * g.head_dim, &count);
-                break;
             case Kernel::SiluMul:
-                // Dense, the FFN's own SwiGLU; routed, the SHARED expert's --
-                // one row per token either way, so the width does not move
-                // with the batch and this stays out of `bind_token_consts`.
-                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
-                                g.is_moe() ? g.shared_intermediate : g.intermediate, &count);
+            case Kernel::AttnGate:
                 break;
             case Kernel::LlExpertSiluMul:
             case Kernel::LlMoeSort:
@@ -376,15 +360,8 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                      (uint32_t)g.hidden, &count);
                 break;
 
-            // Both residual adds. `LayerOut` is the fused one and `Residual`
-            // the standalone; they are the same kernel and take the same
-            // width. Do not let anything be inserted between these two labels:
-            // `bind::Residual::Width` and `bind::GoRouterTopK::Params` are
-            // both index 3, so a kind that falls into the wrong arm here is
-            // bound to a plausible slot with the wrong TYPE in it.
             case Kernel::Residual:
             case Kernel::LayerOut:
-                bind_const<int>(ctx, ord, (uint8_t)bind::Residual::Width, g.hidden, &count);
                 break;
 
             // No const params: Argmax.
