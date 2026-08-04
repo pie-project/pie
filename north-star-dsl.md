@@ -2540,3 +2540,32 @@ MIGRATION (the cross-check precedent, three steps):
 Window class (multi_token, bit0) rides the table from ③a but its
 consumer — the dispatch statement as a region table — is rung ③'s
 second act, after the words die.
+
+## RUNG ③ COMPLETES (2026-08-04): one table, one era
+
+③a (657d93718): the region table rides the wire beside the words,
+cross-checked where planned. ③b (1692737d2): the driver mirrors EVERY
+plan/decline rule (+ the LORA sig bit) and proves strict equality on
+all four words, UNPLANNED included — zero drift across census 15/15,
+the depth battery, both-axes and mixed-k decline probes. ③c-i
+(2e70d5d49): the derivation moves to the one StepLaunch→LaunchView
+assembly boundary (region_plans.hpp); every consumer reads
+table-derived plans; words become a tripwire. ③c-ii (f1148a2f6): the
+four words DIE — PieStepDesc sheds them (one era bump), the engine
+sheds their feeders and the uniform-k stamp, and apply_region_plans
+becomes the plans' birth. Net: -390/+29 lines, and the axis ABI is
+SHAPE-INVARIANT — a new axis is a new sig bit, not a new appended
+word. The 2026 accretion pattern (fast_rows, then unmasked_prefix,
+then max_layers, then full_depth_rows, each a hand-cut word with its
+own sentinel) is structurally over.
+
+Word-free era verified live at every rung: census 15/15 PRODUCT, solo
+oracle byte-equal to the pre-campaign reference, depth-union battery,
+decline probes, zero incidents, scheduler tests 111/111.
+
+Remaining in ③: the window class (bit0) has no consumer yet — the
+dispatch statement as a region table is the second act, entangled with
+rung ④'s Gray cutover (non-nesting combinations need gather). Deferred
+deliberately: per-region k COULD now arm non-uniform depth fires, but
+the depth walkers still assume one boundary — that arming belongs with
+④'s generalized consumers.
