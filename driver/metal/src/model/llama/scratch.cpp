@@ -181,7 +181,9 @@ ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeo
             case Kind::RouterTopK:
                 // Two outputs, and both outlive the three matvecs that follow.
                 expert_ids = fresh();
+                plan.expert_ids_by_layer.push_back(expert_ids);
                 expert_weights = fresh();
+                plan.expert_weights_by_layer.push_back(expert_weights);
                 rd(o, bi::RouterLogits, router_logits);
                 wr(o, bi::RouterIds, expert_ids);
                 wr(o, bi::RouterWeights, expert_weights);
@@ -293,8 +295,6 @@ ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeo
         }
     }
     plan.value_count = next_value;
-    plan.expert_ids_value = expert_ids;
-    plan.expert_weights_value = expert_weights;
     return plan;
 }
 

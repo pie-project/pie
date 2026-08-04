@@ -102,6 +102,13 @@ struct ModelFacts {
     float g4_rope_theta_full = 1.0e6f;
     float g4_rope_theta_sliding = 1.0e4f;
     float g4_full_partial_rotary = 0.25f;
+    // The mixture (gemma-4-26B-A4B) and its k-eq-V attention.
+    bool g4_enable_moe = false;
+    int g4_num_experts = 0;
+    int g4_experts_per_token = 0;
+    int g4_moe_intermediate = 0;
+    bool g4_attention_k_eq_v = false;
+    int g4_num_global_kv_heads = 0;
     // ── The llama-shaped families ──
     // `llama`, `llama3`, `mistral`, `qwen2`, `qwen3` and the two MoE variants.
     // One set of fields, because they differ in VALUES and not in shape: a

@@ -99,7 +99,7 @@ fn convert_writes_a_zt_checkpoint() {
     let reader = ztensor::Source::open(&artifact).unwrap();
     for name in ["w", "w_scale"] {
         assert!(
-            reader.tensor(name).unwrap().verify().unwrap().checked(),
+            reader.tensor(name).unwrap().verify().unwrap().is_checked(),
             "{name} carries no digest"
         );
     }

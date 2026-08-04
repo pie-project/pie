@@ -24,6 +24,7 @@ struct RmsParams {
   uint axis_size;   // feature dim (hidden), e.g. 1024
   uint w_stride;    // weight stride along axis (1 for contiguous)
   uint plus_one;    // 1 => effective gain is (1.0f + weight) [Gemma/qwen3.5]
+  float gain;       // constant multiplier on the weight; 1.0 unless stated
 };
 
 template <typename T, int N_READS>
@@ -79,13 +80,15 @@ template <typename T, int N_READS>
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+      T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
       out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+        T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
         out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
       }
     }
@@ -151,13 +154,15 @@ template <typename T, int N_READS>
   out += row_base + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+      T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
       out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+        T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
         out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
       }
     }
@@ -259,7 +264,8 @@ METAL_FUNC void rms_residual_impl(
   out += row + lid * N_READS;
   for (int i = 0; i < N_READS; i++) {
     if (lid * N_READS + N_READS <= axis_size || (lid * N_READS + i) < axis_size) {
-      const float wv = p.plus_one ? (1.0f + float(w[w_stride * i])) : float(w[w_stride * i]);
+      const float wv = p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                         : float(w[w_stride * i]));
       const float normed = wv * (float(x[i]) * local_inv_mean[0]);
       out[i] = static_cast<T>((normed + float(r[i])) * scale);
     }

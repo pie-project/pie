@@ -85,8 +85,11 @@ class SimpleFamilyEngine {
     /// Takes the switch as a bit rather than a `SetupConfig`: qwen3.5 asks
     /// this from a path that has a `DecodeGeometry` and no config, and the
     /// predicate never wanted more than the one bit anyway.
+    /// `slab_paging` says the bank will be PAGED rather than mapped, which
+    /// changes one thing: a per-expert bias must join the slab instead of
+    /// staying resident, because paging renumbers the buffer that indexes it.
     static std::function<bool(const std::string&)> stream_predicate(
-        bool stream_routed_experts);
+        bool stream_routed_experts, bool slab_paging = false);
 
     /// One fire: several requests' new tokens sharing a command buffer.
     ///

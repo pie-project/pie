@@ -28,6 +28,10 @@ struct Use {
 struct ScratchPlan {
     std::vector<Use> uses;
     int value_count = 0;
+    /// The value the routing decision lands in. The host reads and rewrites it
+    /// when the experts are paged: the ids the router produced are expert
+    /// numbers, and the kernels beside a bounded slab need slot numbers.
+    std::vector<int> expert_ids_by_layer;
     /// The value the logits land in — what the sampler reads.
     int logits_value = -1;
 };

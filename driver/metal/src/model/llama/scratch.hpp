@@ -33,12 +33,16 @@ struct ScratchPlan {
     int value_count = 0;
     /// The value the logits land in -- what the sampler reads.
     int logits_value = -1;
-    /// The routing decision, live from `RouterTopK` to `ExpertCombine`. -1 on a
-    /// dense model. Recorded because these two are the only values a routed
-    /// layer keeps alive ACROSS the expert projections, so a pool that colours
-    /// them like ordinary temporaries would recycle them mid-FFN.
-    int expert_ids_value = -1;
-    int expert_weights_value = -1;
+    /// The routing decision of each mixture layer, in DAG order. Empty on a
+    /// dense model. Per LAYER rather than one value for the stack, because the
+    /// host rewrites this buffer when the experts are paged and has to rewrite
+    /// the one the NEXT segment will read. A single value silently assumed
+    /// every layer's ids colour onto the same pool slot -- true today, a
+    /// property of a greedy colouring rather than a guarantee, and wrong tokens
+    /// rather than an error on the day it stops holding.
+    std::vector<int> expert_ids_by_layer;
+    /// The routing WEIGHTS of each mixture layer, same axis.
+    std::vector<int> expert_weights_by_layer;
 };
 
 /// Element width, in units of the model's hidden size, of each activation.

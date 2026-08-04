@@ -204,20 +204,33 @@ void test_the_declared_width_is_checked_against_the_shapes() {
               "an 8-bit g64 triplet is described as 8-bit g64 when the config says 8 bits");
     }
     {
-        // The same bytes, read at the width nobody declared. Without the
-        // config's word this is indistinguishable, and the shapes agree with
-        // it -- 4096 * 2 columns over 64 groups is g128 -- which is precisely
-        // why the check has to be against the DECLARED group and not against
-        // anything derivable here.
+        // The same bytes with the config's width set to 4 -- which is what a
+        // file-wide `quantization` block says about a checkpoint whose per
+        // tensor overrides push a few projections to 8. The GROUP is the
+        // number that holds for the whole file, so it wins, and the width is
+        // read back out of the shapes as 8 rather than believed as 4.
+        pie_loader::ModelContract contract;
+        pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales, biases,
+                                                                     4, 64, "w");
+        const auto v = contract.view();
+        check(v.tensors.len == 1 && v.tensors.ptr[0].encoding.quant.group_size == 64 &&
+                  v.tensors.ptr[0].encoding.quant.bits_per_element == 8,
+              "a file-wide 4-bit declaration does not override an 8-bit tensor's own shapes");
+    }
+    {
+        // The group is now the one told number, so a wrong one is the one way
+        // left to mis-describe these bytes -- and it has to fail rather than
+        // resolve, because g32 over these shapes implies a 16-bit width that
+        // no affine kernel here reads.
         pie_loader::ModelContract contract;
         bool threw = false;
         try {
             pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales,
-                                                                         biases, 4, 64, "w");
+                                                                         biases, 8, 32, "w");
         } catch (const std::exception&) {
             threw = true;
         }
-        check(threw, "reading an 8-bit g64 triplet as 4-bit is refused, not silently called g128");
+        check(threw, "a declared group the shapes contradict is refused, not silently widened");
     }
 }
 

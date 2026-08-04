@@ -520,7 +520,7 @@ impl CheckpointWriter {
             // XXH3 rather than SHA-256 because an artifact in the local model
             // store is neither signed nor distributed, and this is the digest
             // every tensor in it already carries (§6.5).
-            let identity = ztensor::shard_identity(path, ztensor::DigestAlgorithm::Xxh3)
+            let identity = ztensor::read::shard_identity(path, ztensor::DigestAlgorithm::Xxh3)
                 .map_err(Error::from)?;
             root.add_shard(name.clone(), &identity)
                 .map_err(Error::from)?;

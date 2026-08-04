@@ -40,12 +40,18 @@ struct RouterParams {
 constant constexpr uint kRouterMaxTopK = 16;
 constant constexpr uint kRouterMaxSimdgroups = 32;  // 1024 threads / 32
 
-template <typename T>
+// SCALED: gemma 4's router applies a LEARNED per-expert gain after its softmax,
+// indexed by the selection. Two instantiations rather than an optional buffer:
+// an unbound buffer is not a null pointer here, so a kernel that read it "only
+// when scaled" would still have to be bound by llama and gpt-oss, which have no
+// such tensor to bind.
+template <typename T, bool SCALED>
 [[kernel]] void router_topk(
     const device T* logits     [[buffer(0)]],
     device int* expert_ids     [[buffer(1)]],
     device T* expert_weights   [[buffer(2)]],
     constant RouterParams& p   [[buffer(3)]],
+    const device T* per_expert_scale [[buffer(4)]],
     // uint3 rather than uint: Metal requires every position input to have the
     // same dimensionality, and the threadgroup position below is 3D.
     uint3 lid3 [[thread_position_in_threadgroup]],
@@ -118,16 +124,24 @@ template <typename T>
       sum += chosen[r];
     }
     for (uint r = 0; r < k; ++r) {
-      expert_weights[r] = static_cast<T>(chosen[r] / sum);
+      float w = chosen[r] / sum;
+      if (SCALED) w *= float(per_expert_scale[uint(expert_ids[r])]);
+      expert_weights[r] = static_cast<T>(w);
     }
   }
 }
 
 #define instantiate_router_topk(name, itype)                       \
   template [[host_name("router_topk_" #name)]]                     \
-  [[kernel]] void router_topk<itype>(                              \
+  [[kernel]] void router_topk<itype, false>(                       \
       const device itype*, device int*, device itype*,             \
-      constant RouterParams&, uint3, uint, uint, uint3, uint3);
+      constant RouterParams&, const device itype*,                 \
+      uint3, uint, uint, uint3, uint3);                            \
+  template [[host_name("router_topk_scaled_" #name)]]              \
+  [[kernel]] void router_topk<itype, true>(                        \
+      const device itype*, device int*, device itype*,             \
+      constant RouterParams&, const device itype*,                 \
+      uint3, uint, uint, uint3, uint3);
 
 instantiate_router_topk(bfloat16, bfloat)
 

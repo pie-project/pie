@@ -157,7 +157,7 @@ int main(int argc, char** argv) {
             int missing = 0, oversized = 0, empty_grid = 0;
             std::uint32_t worst_cap = 0;
             for (const auto& d : dag) {
-                const auto pso = pie::metal::gemma4::pso_for(d, base, psos);
+                const auto pso = pie::metal::gemma4::pso_for(d, g, base, psos);
                 if (!pso.valid()) {
                     ++missing;
                     continue;
@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
                         d.kind == pie::metal::gemma4::Kind::Sdpa;
                     if (changes) {
                         const pie::metal::Pso m1 =
-                            pie::metal::gemma4::pso_for(d, base, psos);
+                            pie::metal::gemma4::pso_for(d, g, base, psos);
                         if (p.obj == m1.obj) ++still_m1;
                     }
                 }

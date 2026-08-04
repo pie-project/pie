@@ -798,17 +798,20 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
         case model::ModelFamily::Llama:
             break;
         case model::ModelFamily::GptOss:
-            // It has a routed bank, but every expert also carries a BIAS that
-            // stays resident and is indexed by the very buffer paging
-            // renumbers into slot space -- so it would read one expert's bias
-            // beside another's weights. Fluent wrong tokens, not a failure.
-            why = "gpt-oss: expert_slab_bytes is not supported -- its per-expert bias is "
-                  "indexed by the routing decision that paging renumbers";
+            // Was refused here for its per-expert bias, which is indexed by
+            // the very buffer paging renumbers. The fix was to page the bias
+            // too, as one more band of the same slot, rather than to keep a
+            // family out -- see `stream_predicate`.
             break;
         case model::ModelFamily::Gemma4:
-            // Nothing to page: dense, no routed bank at all.
-            why = "gemma4: expert_slab_bytes has nothing to page -- this family is dense "
-                  "and has no routed expert bank";
+            // The family has both shapes. E2B/E4B are dense and have no bank to
+            // page; the 26B mixture has 128 experts per layer and pages exactly
+            // as the others do. Asked of the CONFIG rather than of the loaded
+            // tensors because this runs before the engine exists.
+            if (cfg.gemma4.n_experts <= 1) {
+                why = "gemma4: expert_slab_bytes has nothing to page -- this checkpoint is "
+                      "dense and has no routed expert bank";
+            }
             break;
         default:
             why = "expert_slab_bytes is only supported for the llama family";
@@ -820,7 +823,7 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
         }
     }
     const auto streams =
-        SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts || slab);
+        SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts || slab, slab);
     // Not gated on `streams`: a checkpoint that places its tensors where a
     // device pointer may point has EVERY weight bound over its own mapping,
     // whether or not anything asked for expert streaming.

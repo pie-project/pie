@@ -99,6 +99,13 @@ void bind_gemma4_dag(RawMetalContext& ctx, const BoundGemma4& b, const std::vect
                 bind_slot(ctx, ord, (std::uint8_t)bind::Sdpa::N, io(IoSlot::SeqLen));
                 break;
             }
+            // Declared by the shared routed template, never read at
+            // BIASED=false. See `BoundGemma4::zero_bias`.
+            case Kind::ExpertGate:
+            case Kind::ExpertUp:
+            case Kind::ExpertDown:
+                bind_slot(ctx, ord, (std::uint8_t)bind::GoQmv::Bias, b.zero_bias);
+                break;
             case Kind::RowGather:
                 bind_slot(ctx, ord, (std::uint8_t)bind::RowGather::Rows,
                           io(IoSlot::SampleRows));
@@ -160,6 +167,13 @@ void bind_gemma4_dag_mb(RawMetalContext& ctx, const BoundGemma4& b,
             case Kind::RopeQ:
             case Kind::RopeK:
                 bind_row(ord, (std::uint8_t)bind::Rope::Position, IoSlot::Position);
+                break;
+            // Declared by the shared routed template, never read at
+            // BIASED=false. See `BoundGemma4::zero_bias`.
+            case Kind::ExpertGate:
+            case Kind::ExpertUp:
+            case Kind::ExpertDown:
+                bind_slot(ctx, ord, (std::uint8_t)bind::GoQmv::Bias, b.zero_bias);
                 break;
             // NOT row-offset: it indexes the fire's rows, so it reads the slot
             // whole.
