@@ -458,11 +458,7 @@ void llama_like_forward_declared(
     // complete): the emitter constructs the lora staging AND the hook
     // sidebands (page mask, score captures) and spells the sites,
     // brackets and corrections with constant layers.
-    if (generated_forward_enabled() &&
-        !(unmasked_prefix_rows != 0xffffffffu &&
-          plan_state.spatial_mask_split >= 0)) {
-        // (Spatial-mask fires walk the interpreter until the NS-4 union
-        // pass reaches the emitter.)
+    if (generated_forward_enabled()) {
         const auto run = [&](auto decode_fn, auto prefill_fn) {
             (is_pure_decode ? decode_fn : prefill_fn)(
                 w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
@@ -473,7 +469,8 @@ void llama_like_forward_declared(
                 logit_row_indices_d, num_logit_rows,
                 w_page_d, w_off_d, row_valid_d, has_write_desc,
                 custom_mask_d, custom_mask_indptr_d,
-                stage_hooks, lora, peel_window_d);
+                stage_hooks, lora, peel_window_d,
+                unmasked_prefix_rows, mask_suffix_qo_indptr_d);
         };
         if (declared.facts_digest == kGeneratedDigest_qwen3_0_6b) {
             run(generated_llama_like_decode_qwen3_0_6b,
@@ -1765,7 +1762,9 @@ bool llama_like_forward_supergraph_build(
                  row_valid_d, has_write_desc, custom_mask_d,
                  custom_mask_indptr_d,
                  /*hooks=*/nullptr, /*lora=*/nullptr,
-                 /*peel_window_d=*/nullptr, sg);
+                 /*peel_window_d=*/nullptr,
+                 /*unmasked_prefix_rows=*/0xffffffffu,
+                 /*mask_suffix_qo_indptr_d=*/nullptr, sg);
     };
     if (declared.facts_digest == kGeneratedDigest_qwen3_0_6b) {
         run(generated_llama_like_decode_qwen3_0_6b_supergraph_build);

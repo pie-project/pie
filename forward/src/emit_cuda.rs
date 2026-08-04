@@ -168,7 +168,9 @@ const PARAMS: &str = "\
     const std::int32_t* custom_mask_indptr_d,\n\
     const StageHooks* hooks,\n\
     const LoraTable* lora,\n\
-    const std::uint32_t* peel_window_d";
+    const std::uint32_t* peel_window_d,\n\
+    std::uint32_t unmasked_prefix_rows,\n\
+    const std::uint32_t* mask_suffix_qo_indptr_d";
 
 fn emit_class_fn(
     plan: &ForwardPlan,
@@ -1380,12 +1382,63 @@ fn emit_launch(
             b.stmt(&format!(
                 "    auto kv_view = cache.layer_view({layer});"
             ));
-            b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
-            b.stmt(&format!("        *{plan_cache},"));
-            b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
-            b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
-            b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
-            b.stmt("        attn_ws, stream);");
+            if is_decode && !padded {
+                // NS-4: the spatial split, stated statically — the mask
+                // Guard's fire-level arm dissolves into the windowed pair
+                // (decode kernel over the unmasked prefix, custom kernel
+                // over the rebased suffix; the interpreter's split branch,
+                // minus the choosing).
+                b.stmt("    if (plan_state.spatial_mask_split >= 0 &&");
+                b.stmt("        unmasked_prefix_rows != 0xffffffffu) {");
+                b.stmt("        const int split = plan_state.spatial_mask_split;");
+                b.stmt("        if (split !=");
+                b.stmt("            static_cast<int>(unmasked_prefix_rows)) {");
+                b.stmt("            throw std::runtime_error(");
+                b.stmt("                \"spatial mask: planned/prepared split drift\");");
+                b.stmt("        }");
+                b.stmt("        if (mask_suffix_qo_indptr_d == nullptr) {");
+                b.stmt("            throw std::runtime_error(");
+                b.stmt("                \"spatial mask: suffix qo identity missing\");");
+                b.stmt("        }");
+                b.stmt("        if (split > 0) {");
+                b.stmt("            if (!plan_state.decode_plan) {");
+                b.stmt("                throw std::runtime_error(");
+                b.stmt("                    \"spatial mask: no prefix decode plan\");");
+                b.stmt("            }");
+                b.stmt("            ops::dispatch_attention_flashinfer_decode(");
+                b.stmt("                *plan_state.decode_plan,");
+                b.stmt(&format!("                {q_buf}, kv_view, {out_buf},"));
+                b.stmt("                kv_page_indices, kv_page_indptr,");
+                b.stmt("                kv_last_page_lens,");
+                b.stmt("                attn_ws, stream, fwd_cfg.sliding_window,");
+                b.stmt(&format!("                /*logits_soft_cap=*/0.f, {scale});"));
+                b.stmt("        }");
+                b.stmt("        ops::dispatch_attention_flashinfer_prefill_custom(");
+                b.stmt(&format!("            *{plan_cache},"));
+                b.stmt(&format!("            bf16_row({q_buf}, split, Hq), kv_view,"));
+                b.stmt(&format!("            bf16_row({out_buf}, split, Hq),"));
+                b.stmt("            mask_suffix_qo_indptr_d,");
+                b.stmt("            kv_page_indices,");
+                b.stmt("            kv_page_indptr + split,");
+                b.stmt("            kv_last_page_lens + split,");
+                b.stmt("            custom_mask_d, custom_mask_indptr_d + split,");
+                b.stmt("            attn_ws, stream);");
+                b.stmt("    } else {");
+                b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
+                b.stmt(&format!("        *{plan_cache},"));
+                b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
+                b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
+                b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
+                b.stmt("        attn_ws, stream);");
+                b.stmt("    }");
+            } else {
+                b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
+                b.stmt(&format!("        *{plan_cache},"));
+                b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
+                b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
+                b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
+                b.stmt("        attn_ws, stream);");
+            }
             strip(b);
             b.stmt("}");
         }

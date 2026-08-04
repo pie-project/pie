@@ -704,6 +704,9 @@ void prepare_llama_like_decode_plan(
     if (spatial_mask_on && have_custom_mask && is_pure_decode &&
         unmasked_prefix_rows != 0xffffffffu &&
         unmasked_prefix_rows < static_cast<std::uint32_t>(num_requests) &&
+        // Padded head dims (phi3) keep the fire-level arm: the split's
+        // row offsets are logical-width, the padded staging is not.
+        cfg.head_dim == cfg.head_dim_kernel &&
         // The XQA prefix is not wired (its fire-wide prepare is R-shaped);
         // deployments that would pick XQA keep the fire-level mask arm.
         !(fwd_cfg.use_xqa_decode && cache.format().is_native_bf16() &&
