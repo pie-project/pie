@@ -1757,3 +1757,30 @@ until slice B lands the WIT surface. Next rungs stand as recorded:
 S-B the inferlet-facing channel, S-2 depth seriation + wire, S-3 the
 FullDepthPrefix peel in the declaration, S-4 the walkers, S-5 the
 union oracle and the 1.53x measurement.
+
+## DESIGN NOTE (2026-08-04): the PEFT correction surface — form joins structure and contents
+
+From the user's question ("how would LoRA-family PEFT express elegantly,
+no shape limits, covering the variants"), worked against the live WIT:
+the WIT is ALREADY shape-agnostic (channel(shape, dtype, capacity));
+every restriction lives in the DSL's named sink `kernel::lora(a, b,
+sites)` — trace-known rank (bucket per rank), packed per-site shapes
+(the lora-probe q+v pain), one hardcoded form. The generalization keeps
+§6.5's principle and adds a third term: placement is STRUCTURE (one
+`correct(site, region)` declaration per site, shapes free per site),
+weights are CONTENTS (channels), and FORM is a small closed expression
+over (x, y): {mm-by-channel-tensor, elementwise scale, add, reshape}.
+The compiler CLASSIFIES the expression — recognized forms lower to the
+existing span-grouped CORRECTION kernels (LoRA/AdaLoRA `y+B(Ax)`, VeRA
+`y+Λb·B(Λd·Ax)`, DoRA `s⊙(y+B(Ax))` with s precomputed per adapter,
+IA3 `l⊙y`, BitFit `y+bias`, LoKr via reshape+two-small-mm) — unknown
+forms refuse loudly (v0 closed world; the driver stays dumb). Rank
+stops being trace-known: grouped GEMM takes per-problem shapes, so
+ragged per-layer/per-member ranks become instance data; graphs bucket
+on (form structure, shape class) or stay eager first. Honest class
+boundaries: LoHa (Hadamard of matrices does not distribute over
+matvec) is Div::WEIGHT (merge per-adapter ΔW, the MoE organ);
+prefix/prompt tuning is the KV axis (learned pages), not a correction.
+Composition: the form's structure hash joins the seriation key —
+same-form adapters span-group exactly as lora does today, cross-form
+v0 solo, later a row window like every axis before it.
