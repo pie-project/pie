@@ -460,10 +460,7 @@ void llama_like_forward_declared(
     // complete): the emitter constructs the lora staging AND the hook
     // sidebands (page mask, score captures) and spells the sites,
     // brackets and corrections with constant layers.
-    if (generated_forward_enabled() &&
-        // NO-DEMOTION: the generated prefix does not state the middle
-        // decode dispatch yet — 3-way fires walk the interpreter.
-        plan_state.mixed_mid_start < 0) {
+    if (generated_forward_enabled()) {
         const auto run = [&](auto decode_fn, auto prefill_fn) {
             (is_pure_decode ? decode_fn : prefill_fn)(
                 w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,

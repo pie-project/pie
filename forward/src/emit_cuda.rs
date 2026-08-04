@@ -1508,6 +1508,42 @@ fn emit_launch(
             b.stmt("        kv_last_page_lens,");
             b.stmt("        attn_ws, stream, /*logits_soft_cap=*/0.f,");
             b.stmt(&format!("        {scale});"));
+            if win == Some(Win::MaskPrefix) {
+                // NO-DEMOTION (3-way, generated leg): when prepare armed
+                // the middle decode plan, the causal above was re-planned
+                // to the prefill lanes — the plain-decode middle takes
+                // the decode kernel (the interpreter's launch verbatim).
+                b.stmt("    if (plan_state.mixed_mid_decode_plan &&");
+                b.stmt("        plan_state.mixed_mid_start >= 0) {");
+                b.stmt("        const int mid_P = plan_state.mixed_mid_start;");
+                b.stmt("        const int mid_row =");
+                b.stmt("            static_cast<int>(qo_indptr_h[mid_P]);");
+                b.stmt("        const int mid_wl =");
+                b.stmt("            (!fwd_cfg.per_layer_window_left.empty() &&");
+                b.stmt(&format!(
+                    "             {layer} < static_cast<int>(fwd_cfg.per_layer_window_left.size()))"
+                ));
+                b.stmt(&format!(
+                    "                ? fwd_cfg.per_layer_window_left[{layer}]"
+                ));
+                b.stmt("                : fwd_cfg.sliding_window;");
+                b.stmt("        ops::dispatch_attention_flashinfer_decode(");
+                b.stmt("            *plan_state.mixed_mid_decode_plan,");
+                b.stmt(&format!(
+                    "            bf16_row({q_buf}, mid_row, Hq), kv_view,"
+                ));
+                b.stmt(&format!(
+                    "            bf16_row({out_buf}, mid_row, Hq),"
+                ));
+                b.stmt("            kv_page_indices,");
+                b.stmt("            kv_page_indptr + mid_P,");
+                b.stmt("            kv_last_page_lens + mid_P,");
+                b.stmt("            attn_ws, stream, mid_wl,");
+                b.stmt(&format!(
+                    "            /*logits_soft_cap=*/0.f, {scale});"
+                ));
+                b.stmt("    }");
+            }
             strip(b);
             b.stmt("}");
         }

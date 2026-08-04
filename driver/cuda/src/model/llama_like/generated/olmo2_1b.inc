@@ -6008,6 +6008,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[0]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -6287,6 +6307,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[1]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -6566,6 +6606,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[2]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -6845,6 +6905,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[3]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -7124,6 +7204,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[4]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -7403,6 +7503,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[5]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -7682,6 +7802,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[6]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -7961,6 +8101,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[7]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -8240,6 +8400,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[8]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -8519,6 +8699,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[9]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -8798,6 +8998,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[10]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -9077,6 +9297,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[11]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -9356,6 +9596,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[12]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -9635,6 +9895,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[13]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -9914,6 +10194,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[14]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -10193,6 +10493,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[15]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
