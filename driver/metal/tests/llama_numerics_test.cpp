@@ -859,6 +859,14 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     }
     const MultiBatchPsos* mbp = paged ? &mb : nullptr;
     bind_llama_consts(ctx, dag, g, R, paged);
+    // A split projection is two dispatches sharing one argument table, and the
+    // second one reads the partials the first wrote. Skipping this bind is not
+    // an unbound-slot crash: the reduce sums whatever the partials buffer holds
+    // and writes it over the projection's output.
+    SlotHandle splitk_partial = ctx.heap_alloc(
+        sizeof(float) * llama::llama_splitk_partial_elems(R));
+    std::vector<SlotHandle> splitk_keep;
+    llama::bind_llama_splitk(ctx, dag, g, R, splitk_partial, splitk_keep);
     try {
         bind_llama_dag(ctx, b, dag, g, col, /*ordinal_base=*/0, paged);
     } catch (const std::exception& e) {

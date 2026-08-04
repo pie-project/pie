@@ -268,6 +268,17 @@ int main(int argc, char** argv) {
     }
     const int n_prompt = argc > 2 ? std::atoi(argv[2]) : 128;
     const int n_decode = argc > 3 ? std::atoi(argv[3]) : 64;
+    // Concurrent sequences for the throughput block at the end. One means the
+    // block does not run at all, and -- more importantly -- that none of the
+    // sizing below changes, so every number this harness has ever printed
+    // stays comparable with every number it prints now. A fleet needs a wider
+    // request limit, a wider fire and n times the ring, and all three feed the
+    // scratch sizer.
+    const int n_seqs = [] {
+        const char* e = std::getenv("PIE_BENCH_TPUT");
+        const int v = e != nullptr ? std::atoi(e) : 1;
+        return v > 1 ? v : 1;
+    }();
 
     if (ckpt.empty() || !exists(ckpt)) {
         std::printf("llama_bench: SKIP (no checkpoint at '%s')\n", ckpt.c_str());
@@ -285,12 +296,17 @@ int main(int argc, char** argv) {
     cfg.snapshot_dir = ckpt;
     cfg.vocab_size = facts.vocab_size;
     // The timing prompt, or the long gate below -- whichever fire is wider.
+    // The timing prompt, the long gate, or a whole decoding fleet in one fire
+    // -- whichever is widest.
     cfg.max_forward_tokens =
         std::uint32_t(std::max<std::size_t>(std::size_t(std::max(n_prompt, 32)),
                                             long_gate_prompt().size()));
+    if (std::uint32_t(n_seqs) > cfg.max_forward_tokens) {
+        cfg.max_forward_tokens = std::uint32_t(n_seqs);
+    }
     // Two: the batch check below fires a pair in ONE pass, and a driver set up
     // for one request would refuse it rather than answer it wrongly.
-    cfg.max_forward_requests = 2;
+    cfg.max_forward_requests = std::uint32_t(std::max(2, n_seqs));
     cfg.kv_page_size = 32;
     // Off by default, so the numbers below stay comparable with every earlier
     // run. Turned on it maps the routed expert bank instead of copying it, and
@@ -309,9 +325,11 @@ int main(int argc, char** argv) {
     // 64-request fleet and does not scale with the model: at 48 layers it is
     // 13 GiB of KV, which beside a 17 GiB checkpoint does not fit a 32 GiB
     // machine at all. A stopwatch that cannot load the model measures nothing.
-    cfg.max_ctx_tokens = std::uint32_t(
-        std::max<std::size_t>(std::size_t(std::max(n_prompt + n_decode, 1)),
-                              long_gate_prompt().size() + 8) + 64);
+    cfg.max_ctx_tokens =
+        std::uint32_t(std::max<std::size_t>(std::size_t(std::max(n_prompt + n_decode, 1)),
+                                            long_gate_prompt().size() + 8) +
+                      64) *
+        std::uint32_t(n_seqs);
     fill_family_geometry(cfg, facts);
     const BenchShape shape = bench_shape(cfg);
     std::printf("  %s [%s]: %d layers, hidden %d, %d/%d heads x %d", cfg.model_type.c_str(),
@@ -404,7 +422,16 @@ int main(int argc, char** argv) {
     // An arbitrary but fixed token stream. What is being timed is arithmetic on
     // weights, and that cost does not depend on which tokens they are.
     std::vector<std::uint32_t> prompt;
-    for (int i = 0; i < n_prompt; ++i) prompt.push_back(std::uint32_t((i * 137 + 11) % 100000));
+    // The real sentence, repeated to length. This used to be `(i*137+11) %
+    // 100000` -- ids that spell nothing -- and that left the logits nearly flat,
+    // so the greedy argmax was a coin flip and any comparison of two token
+    // streams was unfalsifiable: the fleet check below read "agrees for 1 of 64
+    // steps" on a driver that was perfectly correct. These kernels' timing is
+    // data-independent (fixed loop bounds, no early exit), so the change costs
+    // the comparison against mlx-lm nothing and buys the check its teeth.
+    while (int(prompt.size()) < n_prompt)
+        prompt.insert(prompt.end(), kGatePrompt.begin(), kGatePrompt.end());
+    prompt.resize(std::size_t(n_prompt));
 
     // ── does it compute the right thing at all? ──
     //
@@ -905,6 +932,116 @@ int main(int argc, char** argv) {
     }
     const double pipelined_s = now_s() - t2;
 
+    // ── throughput ──
+    //
+    // The figures above are LATENCY: one sequence, one token at a time, the
+    // host in the loop. A server is not that shape. `PIE_BENCH_TPUT=n` fires n
+    // independent sequences in ONE forward and feeds every member its own
+    // greedy token, which is what a batched sampler does and the only form
+    // comparable to mlx-lm's batch generation.
+    //
+    // Every member gets its own sequence id and its own pages out of one
+    // counter -- the ring is one pool and nothing here frees -- and its own
+    // recurrent slot, because a hybrid family's linear-attention state does not
+    // live in the KV pages and two members sharing a slot compute each other's
+    // history.
+    double tput_tps = 0.0;
+    if (n_seqs > 1) {
+        const std::size_t nf = std::size_t(n_seqs);
+        std::vector<Seq> fleet(nf);
+        std::uint32_t fpage = 0;
+        bool bad = false;
+        for (int i = 0; i < n_seqs && !bad; ++i) {
+            fleet[std::size_t(i)].id = std::uint32_t(100 + i);
+            fleet[std::size_t(i)].tokens = prompt;
+            fleet[std::size_t(i)].tokens.resize(std::size_t(n_prompt + n_decode), 1u);
+            fleet[std::size_t(i)].rs_slot = exec.rs_slots() > 0 ? i % exec.rs_slots() : 0;
+            // Prefilled one at a time and UNTIMED. What is being measured is
+            // the decode fleet; folding a prefill into it would report one
+            // number for two regimes.
+            if (fire(exec, fleet[std::size_t(i)], std::uint32_t(n_prompt), page_size, fpage) < 0) {
+                bad = true;
+            }
+        }
+        if (!bad) {
+            std::vector<int> fleet_diverged(nf, -1);
+            const double t3 = now_s();
+            for (int step = 0; step < n_decode && !bad; ++step) {
+                std::vector<MemberForwardDesc> descs;
+                descs.reserve(nf);
+                for (int i = 0; i < n_seqs; ++i) {
+                    descs.push_back(desc_for(fleet[std::size_t(i)], 1, page_size, fpage,
+                                             exec.rs_slots()));
+                }
+                std::vector<LogitsOut> outs(nf);
+                int first_tok = -1;
+                std::vector<std::uint8_t> ok(nf, 0);
+                std::vector<std::string> errs(nf);
+                exec.forward_batch(descs, outs, ok, errs);
+                for (int i = 0; i < n_seqs; ++i) {
+                    if (ok[std::size_t(i)] == 0) {
+                        std::printf("  FAIL  throughput fire: %s\n", errs[std::size_t(i)].c_str());
+                        bad = true;
+                        break;
+                    }
+                    Seq& m = fleet[std::size_t(i)];
+                    const int t = argmax_of(outs[std::size_t(i)], 0);
+                    // Members are identical sequences in ONE fire through ONE
+                    // kernel, so they are not merely close -- they are the same
+                    // arithmetic and must agree exactly. This catches a fire
+                    // that mixes rows up between members, which comparing each
+                    // member to a differently-shaped reference cannot.
+                    if (i == 0) {
+                        first_tok = t;
+                    } else if (t != first_tok) {
+                        std::printf("  FAIL  members of one fire disagree at step %d: "
+                                    "member %d says %d, member 0 says %d\n",
+                                    step, i, t, first_tok);
+                        bad = true;
+                        break;
+                    }
+                    // Every member was given the SAME prompt, so the fleet is n
+                    // copies of the sequence the latency loop above already
+                    // decoded alone. That makes the fleet's tokens checkable
+                    // for free against a reference this file already holds --
+                    // and a throughput number off a wrong forward is not a
+                    // throughput number. The batched GEMM is a different kernel
+                    // than the batch-1 GEMV so the two are not bit-identical
+                    // and a late greedy flip on near-tied logits is fair; a
+                    // member that leaves the reference in the first few steps
+                    // is not.
+                    const std::size_t ref = std::size_t(n_prompt + 1 + step);
+                    if (ref < s.tokens.size() && fleet_diverged[std::size_t(i)] < 0 &&
+                        std::uint32_t(t) != s.tokens[ref]) {
+                        fleet_diverged[std::size_t(i)] = step;
+                    }
+                    m.next_position += 1;
+                    if (m.next_position < m.tokens.size()) m.tokens[m.next_position] = std::uint32_t(t);
+                }
+            }
+            if (!bad) {
+                const double tput_s = now_s() - t3;
+                tput_tps = double(n_decode) * double(n_seqs) / tput_s;
+                int worst = n_decode;
+                for (int i = 0; i < n_seqs; ++i) {
+                    const int d = fleet_diverged[std::size_t(i)];
+                    if (d >= 0 && d < worst) worst = d;
+                }
+                // A fleet member that never matches the reference is a broken
+                // forward, not a rounding difference.
+                if (worst == 0) {
+                    std::printf("  FAIL  the fleet decodes a different token than the "
+                                "same prompt does alone, from its very first step\n");
+                    bad = true;
+                } else {
+                    std::printf("  PASS  fleet agrees with the single-sequence decode for "
+                                "%d of %d steps\n", worst, n_decode);
+                }
+            }
+        }
+        if (bad) return 1;
+    }
+
     const double prefill_tps = double(n_prompt) / prefill_s;
     const double decode_tps = double(n_decode) / decode_s;
     std::printf("  prefill: %d tok in %.4f s  =  %.1f tok/s\n", n_prompt, prefill_s, prefill_tps);
@@ -914,6 +1051,10 @@ int main(int argc, char** argv) {
                 "scheduler's ceiling, NOT comparable]\n",
                 n_decode, pipelined_s, double(n_decode) / pipelined_s,
                 1000.0 * pipelined_s / double(n_decode));
+    if (tput_tps > 0.0) {
+        std::printf("  tput   : %d seqs x %d tok  =  %.1f tok/s  (%.1f tok/s per seq)\n", n_seqs,
+                    n_decode, tput_tps, tput_tps / double(n_seqs));
+    }
 
     // Decode at batch one reads (almost) every weight once per token, so
     // tokens/s times bytes-read is the bandwidth actually achieved. Stating it
@@ -960,6 +1101,22 @@ int main(int argc, char** argv) {
     // fraction from the wrong family's geometry -- which read as zero -- once
     // claimed 824 GB/s on a bus that does 400.
     if (shape.n_experts > 0 && shape.experts_per_token > 0) {
+        // The routed bank is what the discount is TAKEN FROM, so a mixture
+        // whose heap counted no routed bytes has not been discounted at all --
+        // and the inactive-bytes check below cannot see it, because both of
+        // its sides come from the same match. That is exactly how gemma4's
+        // 26B came to claim 806 GB/s: its experts are staged as
+        // `layers.N.experts.` and the rule matched `mlp.experts.`, so
+        // `routed_resident` was zero, `inactive` was zero, and zero unread
+        // bytes was duly found to be at least zero. This asks the question the
+        // other way round -- the config says there IS a bank, so the heap has
+        // to have found one.
+        if (shape.experts_per_token < shape.n_experts && wb.routed_resident == 0) {
+            std::printf("  FAIL  the config declares %d experts top-%d, but no staged weight "
+                        "was counted as routed, so the %.1f GB/s above is the whole heap\n",
+                        shape.n_experts, shape.experts_per_token, wb.per_token * decode_tps / 1e9);
+            return 1;
+        }
         const double inactive =
             double(wb.routed_resident) *
             (1.0 - double(shape.experts_per_token) / double(shape.n_experts));

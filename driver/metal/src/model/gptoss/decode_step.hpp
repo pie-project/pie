@@ -119,6 +119,24 @@ inline std::vector<Dispatch> build_gptoss_dag(const GptOssGeometry& g, bool with
         emit(Kind::FfnNorm, L, sliding);
         emit(Kind::RouterGemv, L, sliding);
         emit(Kind::RouterTopK, L, sliding);
+        // NO ExpertSort/ExpertGather, unlike llama's mixture and gemma4's.
+        // The three routed projections below therefore stay MATVECS at every
+        // batch size: each (row, slot) pair re-reads its expert's weight
+        // instead of a sorted run of rows amortizing one read.
+        //
+        // Measured, PIE_METAL_DISPATCH_TRACE on a 128-token prefill: 89% of
+        // the fire is mxfp4_qmv_routed_bias. The dense projections here have
+        // been a GEMM since the batched path landed and cost 6%. With top-4
+        // over 32 experts a 128-row prompt sends ~16 rows to each expert, so
+        // the sorted form would read each weight once rather than sixteen
+        // times.
+        //
+        // It is not wired because the GEMM does not exist for this codec:
+        // affine_qmm_t_routed dequantizes through QuantizedBlockLoader, whose
+        // `scale * code + bias` is linear and MXFP4's E8M0 lookup is not --
+        // the same reason the matvec needed a separate codec. Closing it means
+        // an MXFP4 block loader, a routed GEMM over it, and the sort/gather/
+        // scatter stage this DAG has never emitted.
         emit(Kind::ExpertGate, L, sliding);
         emit(Kind::ExpertUp, L, sliding);
         emit(Kind::ExpertSwiGlu, L, sliding);

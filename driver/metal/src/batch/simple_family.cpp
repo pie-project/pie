@@ -1278,7 +1278,13 @@ class LlamaEngine final : public SimpleFamilyEngine {
             return false;
         }
 
+        // Split-K partials: the widest projection that takes a split, times the
+        // widest padded batch, times the deepest split. lm_head is excluded by
+        // `kQmmSplitMaxOut`, which is what keeps this to megabytes.
+        splitk_partial_ = ctx.heap_alloc(sizeof(float) *
+                                         llama::llama_splitk_partial_elems(max_rows_));
         llama::bind_llama_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true);
+        llama::bind_llama_splitk(ctx, dag_, g_, /*rows=*/1, splitk_partial_, splitk_keep_);
         bound_rows_ = 1;
         try {
             llama::bind_llama_dag(ctx, b_, dag_, g_, coloring_, /*ordinal_base=*/0,
@@ -1358,6 +1364,12 @@ class LlamaEngine final : public SimpleFamilyEngine {
         // anything that switches back.
         write_i32(b_.io[int(IoSlot::SeqLen)], std::int32_t(csr.position_ids.back()) + 1);
         const int head_rows = csr.sample_rows.empty() ? rows : int(csr.sample_rows.size());
+        // How many requests these rows came from. `qo_indptr` is one entry per
+        // request plus a terminator, so this is the CSR's own answer rather than
+        // a second opinion. Attention needs it: the row count alone cannot tell a
+        // 32-row prefill from 32 members decoding a token each, and those two want
+        // opposite kernels.
+        const int requests = csr.qo_indptr.size() >= 2 ? int(csr.qo_indptr.size()) - 1 : 1;
         if (csr.sample_rows.empty()) {
             std::vector<std::uint32_t> every;
             every.resize(std::size_t(rows));
@@ -1374,14 +1386,15 @@ class LlamaEngine final : public SimpleFamilyEngine {
         // and only then, because this is every dispatch's argument table.
         if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
             llama::bind_llama_consts(ctx, dag_, g_, rows, /*paged=*/true);
+            llama::bind_llama_splitk(ctx, dag_, g_, rows, splitk_partial_, splitk_keep_);
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
-        if (paging_.active()) return fire_segmented(ctx, rows, head_rows, pre, post);
+        if (paging_.active()) return fire_segmented(ctx, rows, head_rows, requests, pre, post);
         return ctx.run_step([&](StepEncoder& se) {
             if (pre) pre(se);
             llama::encode_llama_step(se, dag_, g_, base_, psos_, /*ordinal_base=*/0, &mb_, rows,
-                                     head_rows);
+                                     head_rows, requests);
             if (post) post(se);
         });
     }
@@ -1441,16 +1454,16 @@ class LlamaEngine final : public SimpleFamilyEngine {
                             g_.experts_per_token, max_rows_, "llama", err);
     }
 
-    StepTiming fire_segmented(RawMetalContext& ctx, int rows, int head_rows,
+    StepTiming fire_segmented(RawMetalContext& ctx, int rows, int head_rows, int requests,
                               const EncodeHook& pre, const EncodeHook& post) {
         const std::size_t n = dag_.size();
         return paging_.fire(
             ctx, rows,
-            [this, rows, head_rows, n, &pre, &post](StepEncoder& se, std::size_t begin,
+            [this, rows, head_rows, requests, n, &pre, &post](StepEncoder& se, std::size_t begin,
                                                     std::size_t end) {
                 if (begin == 0 && pre) pre(se);
                 llama::encode_llama_step(se, dag_, g_, base_, psos_, /*ordinal_base=*/0, &mb_,
-                                         rows, head_rows, begin, end);
+                                         rows, head_rows, requests, begin, end);
                 if (end == n && post) post(se);
             });
     }
@@ -1472,6 +1485,12 @@ class LlamaEngine final : public SimpleFamilyEngine {
     int bound_rows_ = 0;
     int bound_head_rows_ = 0;
     SlotHandle logits_{};
+    /// The split GEMM's partial [M, N] slices, and the small constant buffers
+    /// the argument tables point at. One partials buffer serves every split
+    /// projection: they are serialized by barriers and each is reduced before
+    /// the next one runs.
+    SlotHandle splitk_partial_{};
+    std::vector<SlotHandle> splitk_keep_{};
     /// The routed experts' paging cache, when a budget asked for one.
     std::shared_ptr<ExpertSlab> slab_{};
     ExpertPaging paging_{};
