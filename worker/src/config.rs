@@ -1062,9 +1062,9 @@ pub struct MetalDriverOptions {
     pub kv_page_size: u32,
     /// KV pages to allocate. Used directly, and 1024 is a real default.
     ///
-    /// Not the CUDA driver's `total_pages`, which it resembles: there the
-    /// field is an optional hard cap over a value derived from
-    /// `gpu_mem_utilization`.
+    /// The CUDA driver's nearest equivalent is `max_total_pages`, which is a
+    /// different quantity with a name that now says so: a ceiling over a
+    /// derived number, usually absent.
     pub total_pages: u32,
     /// Tokens one forward pass may carry, across all requests in the batch.
     pub max_forward_tokens: u32,
@@ -1160,7 +1160,7 @@ pub struct CudaNativeDriverOptions {
     /// Fraction of each GPU's memory pie may use, weights included.
     ///
     /// What is left after the weights becomes the KV pool, so this is the
-    /// knob that sizes it -- `total_pages` only caps the result.
+    /// knob that sizes it -- `max_total_pages` only caps the result.
     pub gpu_mem_utilization: f64,
     /// Which serving shape the memory planner optimizes its layout for:
     /// `auto` to infer it, `latency` for few concurrent requests, or
@@ -1184,9 +1184,13 @@ pub struct CudaNativeDriverOptions {
     /// for contention/preempt tests + CI, independent of the forward-layout
     /// floor.
     ///
-    /// Note this is NOT the metal driver's `total_pages`, which it resembles:
-    /// there the value is used directly and 1024 is a real default.
-    pub total_pages: Option<u32>,
+    /// Named for what it is rather than for what Metal calls its own field.
+    /// Both were `total_pages` and they are not the same quantity: there the
+    /// value IS the pool and 1024 is a real default; here it is a ceiling over
+    /// a number derived from `gpu_mem_utilization`, and its absence is the
+    /// normal case. One name for two meanings is a question a reader cannot
+    /// answer from the file.
+    pub max_total_pages: Option<u32>,
     /// Dtype weights are materialized in. Separate from `activation_dtype`:
     /// narrower weights and wider compute is a normal combination.
     pub weight_dtype: String,
@@ -1285,7 +1289,7 @@ impl Default for CudaNativeDriverOptions {
             kv_page_size: None,
             kv_cache_dtype: "auto".to_string(),
             swap_pool_size: 0,
-            total_pages: None,
+            max_total_pages: None,
             weight_dtype: "bfloat16".to_string(),
             device: String::new(),
             verbose: false,
@@ -1346,10 +1350,10 @@ impl CudaNativeDriverOptions {
                  omit it for no host tier"
             );
         }
-        if let Some(pages) = self.total_pages {
+        if let Some(pages) = self.max_total_pages {
             ensure!(
                 pages > 0,
-                "model.driver.options.total_pages must be > 0; \
+                "model.driver.options.max_total_pages must be > 0; \
                  omit it to derive from gpu_mem_utilization"
             );
         }
@@ -1729,6 +1733,30 @@ device = "cuda:0"
             undocumented.is_empty(),
             "config fields with no doc comment: {undocumented:?}"
         );
+    }
+
+    #[test]
+    fn rejects_the_cuda_total_pages_spelling() {
+        // Metal's `total_pages` IS the pool; CUDA's was a ceiling over a
+        // derived number. Two meanings behind one name is a question a reader
+        // cannot answer from the file, so the CUDA one became
+        // `max_total_pages` -- and an existing config carrying the old
+        // spelling must say so rather than silently losing its cap.
+        let legacy = r#"
+[model]
+name = "a"
+hf_repo = "x"
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+[model.driver.options]
+total_pages = 512
+"#;
+        let err = Config::parse(legacy).unwrap_err().to_string();
+        assert!(err.contains("total_pages"), "got: {err}");
+        // The rejection lists what IS accepted, which is how the new name is
+        // discoverable without reading this test.
+        assert!(err.contains("max_total_pages"), "got: {err}");
     }
 
     #[test]

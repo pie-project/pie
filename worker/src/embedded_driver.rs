@@ -491,7 +491,7 @@ pub(crate) fn write_cuda_startup_toml(
         insert_int(&mut batching, "kv_page_size", size);
     }
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
-    if let Some(pages) = opts.total_pages {
+    if let Some(pages) = opts.max_total_pages {
         insert_int(&mut batching, "total_pages", pages);
     }
     insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());

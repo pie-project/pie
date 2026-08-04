@@ -46,6 +46,9 @@ pub enum ConfigCmd {
         key: String,
     },
 
+    /// Open the config in `$EDITOR`, and refuse to save something invalid.
+    Edit,
+
     /// Write a default config file. Refuses to overwrite unless `--force`.
     Init {
         #[arg(long)]
@@ -59,6 +62,7 @@ pub fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
         ConfigCmd::Show { key } => show(global, key),
         ConfigCmd::Set { key, value } => set(global, key, value),
         ConfigCmd::Unset { key } => unset(global, key),
+        ConfigCmd::Edit => edit(global),
         ConfigCmd::Init { force } => init(global, force),
     }
 }
@@ -476,6 +480,64 @@ fn candidates(value: &str) -> Vec<toml::Value> {
     }
     out.push(toml::Value::String(value.to_string()));
     out
+}
+
+/// `pie config edit` -- `$EDITOR`, then validate before keeping the result.
+///
+/// The point is the last part. Hand-editing is how anything the CLI cannot
+/// express gets set, and the way that goes wrong is a typo discovered at the
+/// next boot rather than at the moment of saving. The edit happens on a copy;
+/// the original is only replaced once the copy parses.
+fn edit(global: &startup::GlobalArgs) -> Result<()> {
+    let (cfg_path, _) = startup::cli_config_path(global);
+    if !cfg_path.exists() {
+        bail!(
+            "no config file at {}; `pie config init` writes one",
+            crate::ui::short_path(&cfg_path)
+        );
+    }
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .map_err(|_| anyhow!("set $EDITOR (or $VISUAL) to the editor to open"))?;
+
+    // Beside the real file rather than in a temp dir, so the editor sees the
+    // same filesystem and the replace below is a rename rather than a copy
+    // across devices.
+    let scratch = cfg_path.with_extension("toml.editing");
+    std::fs::copy(&cfg_path, &scratch).map_err(|e| anyhow!("prepare {scratch:?}: {e}"))?;
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\"", editor = editor))
+        .arg("sh")
+        .arg(&scratch)
+        .status()
+        .map_err(|e| anyhow!("run {editor}: {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&scratch);
+        bail!("{editor} exited with {status}; config unchanged");
+    }
+
+    let edited =
+        std::fs::read_to_string(&scratch).map_err(|e| anyhow!("read {scratch:?}: {e}"))?;
+    if let Err(error) = crate::derive::derive_standalone(&edited) {
+        // The edit is kept, not discarded: it may be twenty minutes of work
+        // with one typo in it, and deleting that to protect a file the user
+        // asked to change would be the worse failure.
+        return Err(error).with_context(|| {
+            format!(
+                "the edit is invalid and was NOT saved; it is kept at {}",
+                crate::ui::short_path(&scratch)
+            )
+        });
+    }
+    std::fs::rename(&scratch, &cfg_path).map_err(|e| anyhow!("replace {cfg_path:?}: {e}"))?;
+    println!(
+        "{} saved {}",
+        crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
+        crate::ui::short_path(&cfg_path)
+    );
+    Ok(())
 }
 
 fn unset(global: &startup::GlobalArgs, key: String) -> Result<()> {
