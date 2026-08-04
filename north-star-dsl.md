@@ -2296,3 +2296,13 @@ reproduce across five traced rounds this boot (suffix plans all
 monotone, counts-sourced) — re-filed as PROBABILISTIC (first-boot
 window suspected), with the kvpp dumps (PIE_KVPP_TRACE) now permanent
 instrumentation for the next occurrence.
+
+## BLINDING IN THE MOST COMPLEX CELL (2026-08-04)
+
+The review's safety gap, closed: the doc-isolation policy lane inside
+the FULL four-axis fire (co-firing with snapkv's page narrowing, an
+adapter correction, a layerskip draft, and a plain anchor) — 57
+four-axis fires across three rounds, and the planted code word NEVER
+leaks (blinding held every round, varying seeds). The safety
+argument's strongest form: composition preserves policy semantics in
+exactly the cell where the most machinery is simultaneously active.
