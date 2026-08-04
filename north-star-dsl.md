@@ -2694,3 +2694,19 @@ incidents. Banded depth now exists in every walker the driver owns —
 the axis is total across legs, exactly what the v2 thesis demands of
 an axis: one vocabulary, one scheduler output, every consumer serves
 it or loudly declines.
+
+## BANDS COMPOSE (2026-08-04): the census increment lands
+
+The rung-③ spec's promissory note — "per-region k arms the
+non-uniform depth fire behind a census increment" — is paid: bands ×
+LORA is PRODUCT (15-24 fires per run carry lora=1 beside
+[depth-bands] R=4 — the correction lands on the plain row while the
+truncated rows band, one fire; note the fire trace prints k=-1 there
+because mixed-k derives max_layers FULL — banding is proven by the
+adjacent [depth-bands] line, a read-the-trace subtlety that cost one
+false alarm). Bands × MASK and bands × HOOK decline safely (lanes
+complete, zero incidents, the solo drain even exercised the DECLINE
+trace). The battery is formalized as .wiki/tart/bands_comp.py. The
+composition table's depth column now reads: uniform-k unions (S-2),
+mixed-k bands (Act 1), each composing with lora, degrading safely
+against mask/hooks until Act 2's (start,len)/gather admits them.
