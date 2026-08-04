@@ -96,6 +96,11 @@ struct ModelConfig {
     // resident. Off by default: it trades resident memory for page faults,
     // which only pays when the weights do not comfortably fit.
     bool stream_routed_experts = false;
+    // How many bytes the routed experts may occupy on the device. Zero keeps
+    // the whole bank resident. Non-zero is the only setting under which a
+    // model can exceed the machine, and it costs a submit-and-wait per
+    // mixture layer -- set it when the alternative is not running at all.
+    std::uint64_t expert_slab_bytes = 0;
 };
 
 struct BatchingConfig {
@@ -127,6 +132,9 @@ Config load_config(const std::filesystem::path& path) {
         config.model.stream_routed_experts =
             (*model)["stream_routed_experts"].value_or(
                 config.model.stream_routed_experts);
+        config.model.expert_slab_bytes = std::uint64_t(
+            (*model)["expert_slab_bytes"].value_or(
+                std::int64_t(config.model.expert_slab_bytes)));
     }
     if (auto batching = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {
@@ -2138,6 +2146,7 @@ class Context::Impl {
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
         setup_cfg.stream_routed_experts = cfg_.model.stream_routed_experts;
+        setup_cfg.expert_slab_bytes = cfg_.model.expert_slab_bytes;
         fill_family_geometry(setup_cfg, facts_);
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):

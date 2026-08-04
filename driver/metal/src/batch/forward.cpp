@@ -777,17 +777,29 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // a heap sized for weights that are then ALSO mapped is the footprint
     // doubled rather than halved, and on a machine where the model only just
     // fits that is the difference between running and reading zeros.
-    const auto streams = SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts);
+    // A budget for the routed experts changes BOTH numbers below, in opposite
+    // directions, and that is the whole shape of the feature. The bank leaves
+    // the heap as it does when streamed -- but a slab of the budget's size
+    // joins it, and unlike a mapping the bank never becomes resident at all.
+    // So the ask falls from the model to the dense weights plus the budget,
+    // which is what lets a model bigger than the GPU be admitted.
+    const bool slab = cfg.expert_slab_bytes > 0;
+    const auto streams =
+        SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts || slab);
     // Not gated on `streams`: a checkpoint that places its tensors where a
     // device pointer may point has EVERY weight bound over its own mapping,
     // whether or not anything asked for expert streaming.
-    const std::size_t streamed = std::size_t(streamable_plan_bytes(load_plan, streams));
+    //
+    // With a slab the mapping is off, so only the routed banks leave the heap.
+    const std::size_t streamed =
+        std::size_t(streamable_plan_bytes(load_plan, streams, slab));
     // Saturating, not `>` -- when EVERY weight is bound where it lies the two
     // are equal, and a guard that fell back to the full `weights` on equality
     // is the one case that matters most: it re-reserved the entire model
     // alongside its own mapping and the first command buffer came back out of
     // memory.
     const std::size_t heap_bytes = (weights >= streamed ? weights - streamed : 0) +
+                                   (slab ? std::size_t(cfg.expert_slab_bytes) : 0) +
                                    SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
     // What to ALLOCATE and what must be RESIDENT are two numbers, and this
     // refusal is about the second. Weights bound where they lie leave the heap
@@ -799,7 +811,14 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     //
     // `create` here takes no elastic budget, so the whole ask is the heap plus
     // whatever was bound outside it.
-    if (!fits_on_this_gpu(heap_bytes + streamed, 0, weights, err)) return false;
+    //
+    // A slab makes `streamed` mean something else: those bytes are read from an
+    // mmap the GPU never sees, so they are neither allocated nor resident, and
+    // adding them here would refuse exactly the models this exists to run.
+    if (!fits_on_this_gpu(slab ? heap_bytes : heap_bytes + streamed, 0,
+                          slab ? heap_bytes : weights, err)) {
+        return false;
+    }
     // Two marks, because between them lies the answer to "why is loading slow"
     // and the two halves have completely different causes. Everything up to
     // `staged` is the driver's own work -- copying, dequantizing, allocating --

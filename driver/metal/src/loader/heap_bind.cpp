@@ -19,9 +19,9 @@
 #include "heap_bind_metal.hpp"
 
 #include <map>
+#include <set>
 
 #include <algorithm>
-#include <map>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -718,15 +718,24 @@ std::unordered_map<std::uint32_t, MappedSource> plan_map_in_place(
 }  // namespace
 
 std::uint64_t streamable_plan_bytes(const pie_loader::LoadPlan& load,
-                                    const std::function<bool(const std::string&)>& streams) {
+                                    const std::function<bool(const std::string&)>& streams,
+                                    bool slab_paging) {
     const auto plan = load.view();
     pie_loader::LoadPlanIndex index("metal load executor");
     index.reset(plan);
     // Mapping in place takes EVERY weight out of the heap, so it is asked
     // first and it subsumes streaming: there is no pack to carve out when
     // nothing was copied anywhere to begin with.
-    const auto direct = plan_map_in_place(
-        plan, index, std::max<std::uint64_t>(1, load.preferred_alignment()));
+    //
+    // Paging is the one thing it does NOT subsume. A slab exists to keep the
+    // bank off the device entirely, and a mapping cannot do that -- every
+    // mapped page is wired -- so `stage_plan_weights` turns mapping off when a
+    // budget is set. This must agree with it or the heap is sized for a
+    // checkpoint that will not be loaded that way.
+    const auto direct = slab_paging
+        ? std::unordered_map<std::uint32_t, MappedSource>{}
+        : plan_map_in_place(plan, index,
+                            std::max<std::uint64_t>(1, load.preferred_alignment()));
     if (!direct.empty()) {
         std::uint64_t bytes = 0;
         for (const auto& [id, src] : direct) bytes += src.bytes;
@@ -758,7 +767,15 @@ WeightBytes weight_bytes(const std::unordered_map<std::string, SlotHandle>& weig
                              ? double(experts_per_token) / double(n_experts)
                              : 1.0;
     WeightBytes out;
+    // Counted once per REGION rather than once per name. Expert paging binds
+    // every mixture layer's bank to the same slab -- that sharing is the whole
+    // point of a budget -- so summing by name reported 48 copies of one slab
+    // and claimed a 0.34 GB cache was 16 GB resident. Two names over one
+    // region is one region's worth of memory whatever the reason for it.
+    std::set<std::pair<const void*, std::uint64_t>> counted;
     for (const auto& [name, slot] : weights) {
+        const bool first = counted.emplace(slot.contents(), std::uint64_t(slot.size)).second;
+        if (!first) continue;
         out.resident += slot.size;
         // `mlp.experts.` is the runtime name every family's routed bank is
         // staged under -- llama's, qwen3.5's and gpt-oss's alike -- and the
@@ -796,10 +813,21 @@ StagedWeights stage_plan_weights(
 
 StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
-    std::shared_ptr<pie_loader::CheckpointSource> view_owned,
+    std::shared_ptr<pie_loader::CheckpointSource> view,
     const pie_loader::LoadPlan& load,
     std::size_t weights_bytes,
     const std::function<bool(const std::string&)>& streams) {
+    return stage_plan_weights(ctx, std::move(view), load, weights_bytes, streams,
+                              ExpertSlabRequest{});
+}
+
+StagedWeights stage_plan_weights(
+    RawMetalContext& ctx,
+    std::shared_ptr<pie_loader::CheckpointSource> view_owned,
+    const pie_loader::LoadPlan& load,
+    std::size_t weights_bytes,
+    const std::function<bool(const std::string&)>& streams,
+    const ExpertSlabRequest& slab_req) {
     if (!view_owned) throw std::runtime_error("metal load executor: no checkpoint mapping");
     const pie_loader::CheckpointSource& view = *view_owned;
     StagedWeights b;
@@ -862,13 +890,24 @@ StagedWeights stage_plan_weights(
     // The SAME call `streamable_plan_bytes` made when the heap was sized. If
     // these two ever disagreed the heap would be wrong in one direction or the
     // other, so they ask one function rather than each deciding.
-    const auto direct = plan_map_in_place(load_plan, index, align);
+    //
+    // Paging the experts turns this OFF, and that is not an optimization being
+    // declined -- it is the point. Mapping a file means wrapping it as one
+    // no-copy MTLBuffer, and wrapping wires every page of it, expert bank
+    // included. A slab beside a wired mapping of the same bytes is the
+    // footprint doubled, not bounded. So when a slab is asked for, the dense
+    // weights are copied into the heap exactly as they would be from a
+    // checkpoint that could not be mapped, and the mmap survives only as the
+    // host pointer the slab copies FROM.
+    const bool slab_on = slab_req.valid() && !mapped.empty();
+    auto direct = slab_on ? std::unordered_map<std::uint32_t, MappedSource>{}
+                          : plan_map_in_place(load_plan, index, align);
     // The pack is the OTHER way to keep weights out of the heap, and it is for
     // checkpoints this one cannot help: it re-places misaligned tensors by
     // copying them once. When anything maps, nothing needs re-placing.
     std::unordered_map<std::uint32_t, MappedSource> all_sources =
         resolve_mappable(load_plan, index, [](const std::string&) { return true; });
-    bool compact_around_pack = direct.empty() && !mapped.empty() && !all_sources.empty();
+    bool compact_around_pack = !slab_on && direct.empty() && !mapped.empty() && !all_sources.empty();
     if (compact_around_pack) {
         for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
             const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
@@ -992,6 +1031,118 @@ StagedWeights stage_plan_weights(
         }
     }
 
+    // ── Page the routed experts through a bounded slab. ──
+    //
+    // The banks are not bound; a fixed region is, and the host swaps what is in
+    // it between layers. Everything needed to do that is already in `mapped`:
+    // each entry is a bank buffer with the file range it occupies, and the
+    // arity is the mixture's own. No contract declaration, no plan change and
+    // no new loader concept -- the streamed set was already identified by name
+    // for the mapping work, and this reuses that answer rather than asking a
+    // second question that could disagree with it.
+    //
+    // Grouped by what the tensor IS and indexed by which layer it belongs to,
+    // because a slot has to mean one expert across every routed tensor at once
+    // -- see `expert_slab.hpp`. The name is where both facts are written down.
+    std::shared_ptr<ExpertSlab> slab;
+    std::unordered_map<std::uint32_t, std::size_t> slab_kind_of;  // buffer id -> tensor kind
+    std::vector<SlotHandle> slab_regions;
+    if (slab_on) {
+        std::map<std::string, std::map<int, std::uint32_t>> by_suffix;  // suffix -> layer -> id
+        for (const auto& [id, src] : mapped) {
+            static const std::string kPrefix = "layers.";
+            if (src.name.compare(0, kPrefix.size(), kPrefix) != 0) {
+                throw std::runtime_error("metal expert slab: '" + src.name +
+                                         "' is streamed but names no layer");
+            }
+            const std::size_t dot = src.name.find('.', kPrefix.size());
+            if (dot == std::string::npos) {
+                throw std::runtime_error("metal expert slab: '" + src.name + "' has no suffix");
+            }
+            const int layer = std::stoi(src.name.substr(kPrefix.size(), dot - kPrefix.size()));
+            const std::string suffix = src.name.substr(dot + 1);
+            if (!by_suffix[suffix].emplace(layer, id).second) {
+                throw std::runtime_error("metal expert slab: two '" + suffix +
+                                         "' on layer " + std::to_string(layer));
+            }
+        }
+        const auto experts = std::uint32_t(slab_req.n_experts);
+        std::vector<SlabTensor> tensors;
+        std::vector<std::vector<std::uint32_t>> ids_of_kind;
+        std::uint64_t slot_bytes = 0;
+        for (const auto& [suffix, layers] : by_suffix) {
+            SlabTensor t;
+            t.suffix = suffix;
+            std::vector<std::uint32_t> ids;
+            for (const auto& [layer, id] : layers) {
+                const MappedSource& src = mapped.at(id);
+                // A bank that is not a whole number of equal experts is not a
+                // bank this can band, and guessing a stride would read as a
+                // quality regression rather than a failure.
+                if (src.bytes % experts != 0) {
+                    throw std::runtime_error(
+                        "metal expert slab: '" + src.name + "' is " +
+                        std::to_string(src.bytes) + " bytes, which is not " +
+                        std::to_string(experts) + " equal experts");
+                }
+                const std::uint64_t band = src.bytes / experts;
+                if (t.band_bytes == 0) t.band_bytes = band;
+                if (t.band_bytes != band) {
+                    throw std::runtime_error("metal expert slab: '" + src.name +
+                                             "' bands differently from its own kind");
+                }
+                const auto [base, file_bytes] = view.mapped_file(src.file_id);
+                if (base == nullptr || src.file_offset + src.bytes > file_bytes) {
+                    throw std::runtime_error("metal expert slab: '" + src.name +
+                                             "' lies outside its file's mapping");
+                }
+                t.layer_base.push_back(base + src.file_offset);
+                ids.push_back(id);
+                (void)layer;
+            }
+            slot_bytes += t.band_bytes;
+            tensors.push_back(std::move(t));
+            ids_of_kind.push_back(std::move(ids));
+        }
+        // Floored, and refused below one: a budget that cannot hold a single
+        // expert has not configured a small cache.
+        const std::uint64_t want = slab_req.budget_bytes / std::max<std::uint64_t>(1, slot_bytes);
+        if (want == 0) {
+            throw std::runtime_error(
+                "metal expert slab: a budget of " + std::to_string(slab_req.budget_bytes) +
+                " bytes cannot hold one expert, which costs " + std::to_string(slot_bytes));
+        }
+        const std::uint64_t instances = std::uint64_t(tensors.front().layer_base.size()) * experts;
+        // Capped at the mixture's arity, and this is a KERNEL constraint rather
+        // than a policy: `moe_route_sort` histograms the routing decision into
+        // `counts[n_experts]` and drops any id at or past it, so a slot number
+        // the slab handed out above the arity would be silently unrouted --
+        // an expert contribution zeroed, which reads as a quality regression.
+        // It is also the right cap anyway: one layer's worth of experts is all
+        // a single layer can want at once.
+        const auto slots = std::uint32_t(
+            std::min<std::uint64_t>({want, instances, std::uint64_t(experts)}));
+        std::vector<std::uint8_t*> bases;
+        for (std::size_t k = 0; k < tensors.size(); ++k) {
+            SlotHandle region = ctx.heap_alloc(std::size_t(std::uint64_t(slots) * tensors[k].band_bytes),
+                                               std::size_t(align));
+            if (!region.valid()) {
+                throw std::runtime_error("metal expert slab: heap_alloc failed for '" +
+                                         tensors[k].suffix + "'");
+            }
+            bases.push_back(static_cast<std::uint8_t*>(region.contents()));
+            for (const std::uint32_t id : ids_of_kind[k]) slab_kind_of[id] = k;
+            slab_regions.push_back(region);
+        }
+        slab = std::make_shared<ExpertSlab>(std::move(tensors), experts, std::move(bases), slots);
+        // The mmap is the slab's SOURCE, not something the GPU reads, so it is
+        // kept alive without ever being wrapped as a device buffer -- which is
+        // exactly the wiring this exists to avoid.
+        b.weight_mapping = view_owned;
+        b.slab = slab;
+        for (const auto& [id, src] : mapped) b.streamed_bytes += src.bytes;
+    }
+
     // What the heap still has to hold.
     //
     // The plan lays every persistent buffer out in one arena at a fixed offset,
@@ -1005,7 +1156,7 @@ StagedWeights stage_plan_weights(
     // error against the model -- 0.0 MB for Qwen3.5-0.8B, 201 MB of 1.7 GB for
     // Llama-3.2-3B -- and on a checkpoint that needs no transform at all it is
     // zero and no region is allocated.
-    const bool compact = map_in_place || compact_around_pack;
+    const bool compact = map_in_place || compact_around_pack || slab_on;
     std::unordered_map<std::uint32_t, std::uint64_t> compact_offset;
     std::uint64_t compact_bytes = 0;
     if (compact) {
@@ -1041,7 +1192,9 @@ StagedWeights stage_plan_weights(
         std::fprintf(stderr,
                      "[pie-metal] %.2f GB of weights %s, and out of the heap\n",
                      double(b.streamed_bytes) / 1e9,
-                     map_in_place ? "bound where they lie" : "packed once, then mapped");
+                     slab_on ? "paged through a bounded slab"
+                             : (map_in_place ? "bound where they lie"
+                                             : "packed once, then mapped"));
     }
     if (compact) {
         // Each buffer pulls its own bytes, so the bulk writes are skipped below:
@@ -1183,6 +1336,13 @@ StagedWeights stage_plan_weights(
                     buffers.emplace(decl.id,
                                     slice_slot(file_slots.at(in_file->second.file_id),
                                                in_file->second.file_offset, decl.bytes));
+                } else if (slab_on && mapped.count(decl.id) != 0) {
+                    // The bank becomes the slab: a SHORTER expert stack, which
+                    // the routed matvec cannot tell from the real one because
+                    // it addresses experts as `e * rows * row_stride` with `e`
+                    // read from a buffer. Writing slot numbers into that
+                    // buffer is the whole of the kernel-side change.
+                    buffers.emplace(decl.id, slab_regions[slab_kind_of.at(decl.id)]);
                 } else if (mapped.count(decl.id) != 0) {
                     buffers.emplace(decl.id,
                                     slice_slot(pack_slot, pack_offset.at(decl.id), decl.bytes));
