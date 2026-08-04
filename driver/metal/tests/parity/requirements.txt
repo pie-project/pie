@@ -1,0 +1,20 @@
+# The oracle these parity scripts diff against.
+#
+# mlx-lm is not a build dependency of the driver -- nothing in `ctest` imports
+# it, and a machine that only builds and runs the suite does not need it. It is
+# the dependency of the ANSWER: every `Known` gate entry in `llama_bench` and
+# every reference tap under `*_mlx_taps.py` is what this exact version of
+# mlx-lm produced on this exact checkpoint. So the version is pinned rather
+# than floated. A newer mlx-lm that changed a rope, a norm epsilon or a
+# quantization detail would move the reference, and a gate that moved with it
+# would agree with whatever it was compared against and prove nothing.
+#
+#   python3.14 -m venv ~/.cache/pie-metal/mlxenv
+#   ~/.cache/pie-metal/mlxenv/bin/pip install -r requirements.txt
+#
+# `~/.cache/pie-metal` because the driver already keeps its PSO archive there
+# (`RawMetalContext::pso_archive_dir`), and because the env spent a while in
+# /tmp -- where it is one reboot away from taking every reference with it.
+mlx==0.32.0
+mlx-lm==0.31.3
+numpy==2.5.1

@@ -54,7 +54,7 @@ struct M1ResolvedShape {
 };
 
 M1ResolvedShape resolve_m1_shape_for_test(
-    const pie_native::launch::plan::ValueType& type,
+    const pie::driver::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents);
 
 struct M1DeviceInputs {

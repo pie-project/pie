@@ -48,6 +48,23 @@ pub struct LaunchPlan {
     pub rs_fold_lens: Vec<u32>,
     pub rs_buffer_slot_ids: Vec<u32>,
     pub rs_buffer_slot_indptr: Vec<u32>,
+    /// The buffered prefix each row REPLAYS ahead of its own tokens: the slabs
+    /// (`rs_buffer_read_slot_ids`), the row CSR over them
+    /// (`rs_buffer_read_indptr`, `R + 1`), and how many tokens of them to
+    /// replay (`rs_buffer_read_lens`, `R`). Empty when nothing is buffered.
+    pub rs_buffer_read_slot_ids: Vec<u32>,
+    pub rs_buffer_read_indptr: Vec<u32>,
+    pub rs_buffer_read_lens: Vec<u32>,
+    /// Physical offset of each row's logical buffer token 0 (`R`). A fold that
+    /// lands mid-page cannot release the page it half-consumed, so the
+    /// survivors keep their offsets and every buffer span is `head + logical`.
+    pub rs_buffer_heads: Vec<u32>,
+    /// WorkingSet-relative buffer page -> physical slot, for channel-resolved
+    /// `rs-geometry`. Per REQUEST ROW, unlike [`Self::kv_translation`]: a pass
+    /// binds one RS working set per request, so there is no single table for
+    /// the fire. `rs_translation_indptr` is the row CSR, `R + 1` entries.
+    pub rs_translation: Vec<u32>,
+    pub rs_translation_indptr: Vec<u32>,
     pub masks: Vec<EncodedMask>,
     pub mask_indptr: Vec<u32>,
     pub sampling_indices: Vec<u32>,
@@ -56,25 +73,16 @@ pub struct LaunchPlan {
     pub single_token_mode: bool,
     pub device_resolved_geometry: bool,
     pub has_user_mask: bool,
-    /// A device-derived mask (`has_user_mask` with no wire `masks` rows)
-    /// whose producing op chain statically recognizes as a structured mask
-    /// (`causal_mask` / `sliding_window_mask` / `sink_window_mask`, seen
-    /// through reshapes) — the same walk the driver performs
-    /// (`pie_native::launch::structured_mask_descriptor`). A scheduler fact
-    /// only: the driver re-derives the structure from its adopted trace and
-    /// lowers it per lane, so nothing on the launch wire consumes this.
+    /// The program binds an `AttnMask` descriptor port to a CHANNEL, so the
+    /// driver resolves a dense per-cell mask pre-forward. Such a fire must be
+    /// submitted SOLO: a multi-program batch cannot merge one program's dense
+    /// mask with another's geometry, and the driver fails loud rather than
+    /// execute a wrong one.
     #[serde(default)]
-    pub structured_device_mask: bool,
+    pub dense_device_mask: bool,
     /// Exclusive physical KV page high-water required before this launch.
     #[serde(default)]
     pub required_kv_pages: u32,
-    /// STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
-    /// take the head at layer `k` (the logit-lens / layerskip-draft
-    /// class). `None` = the full model — every pre-S1 request. v0 keeps
-    /// truncated fires SOLO (the scheduler's blocking rule); the depth
-    /// UNION (a `FullDepthPrefix` peel) is the recorded next rung.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_layers: Option<u32>,
     pub image_indptr: Vec<u32>,
     pub image_grids: Vec<u32>,
     pub image_anchor_positions: Vec<u32>,
@@ -106,6 +114,10 @@ pub struct LaunchPlan {
 
 pub const RS_FLAG_RESET: u8 = 1;
 pub const RS_FLAG_FOLD: u8 = 2;
+pub const RS_FLAG_BUFFER_WRITE: u8 = 4;
+/// This row's fold length is not host-known; it comes from the `rs_fold_len`
+/// descriptor port and `rs_fold_lens[r]` is a placeholder.
+pub const RS_FLAG_FOLD_LEN_DEVICE: u8 = 8;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramRegistration {

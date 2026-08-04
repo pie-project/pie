@@ -10,7 +10,7 @@
 //! RS mappings now publish at prepare, in slot order, under the store lock,
 //! so slot i+1 classifies against slot i's decision without waiting for it.
 //! This binary pins `PIE_FRAME_SIZE=3` and runs a GDN/hybrid model (the mock
-//! reports a recurrent-state pool, so `model.is-linear()` is true) two ways:
+//! reports a recurrent-state pool, so `model.pass-kind()` is not attention) two ways:
 //!
 //!  * `generate-gdn` — one live RS slot per frame, the shape that used to be
 //!    the ONLY legal one. Proves run-ahead across frames still works.
@@ -167,7 +167,7 @@ fn full_width_recurrent_frames_do_not_leak_slots() {
 
 /// FOLD-COMMIT end to end: a prefill folds, a chunk is buffered with the
 /// fold suppressed, and only the accepted prefix is folded back from the
-/// buffer. This is the shape `model.is-linear()` exists to select, and it
+/// buffer. This is the shape `model.pass-kind()` exists to select, and it
 /// exercises the three launch fields the engine never used to populate
 /// (`rs_fold_lens`, `rs_buffer_slot_ids`, `rs_buffer_slot_indptr`) —
 /// the dummy driver validates their CSR well-formedness on every launch.

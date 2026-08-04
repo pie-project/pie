@@ -2,10 +2,10 @@
 #include <iostream>
 #include <vector>
 
-#include "pie_native/fire/descriptor.hpp"
+#include "pie/driver/fire/descriptor.hpp"
 
-namespace ptir = pie_native::launch;
-namespace descriptor = pie_native::launch::descriptor;
+namespace ptir = pie::driver::launch;
+namespace descriptor = pie::driver::fire::descriptor;
 
 int main() {
     ptir::Trace trace;

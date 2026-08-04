@@ -51,7 +51,7 @@
 //!
 //! Input: `"<max_tokens> [depth=<k>] [no-rollback-probe]"` (default 8 / 4).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat};
 
 const SYSTEM: &str = "You are a helpful assistant.";
@@ -93,20 +93,13 @@ impl Stream {
     /// channel each fire (D2), exactly like the templates.
     fn submit(&self) -> Result<()> {
         self.pool_ids_ch.put(self.pool_ids.clone());
-        self.decode
-            .submit(&self.pipeline)
-            .map_err(|e| format!("decode submit: {e}"))
+        self.decode.submit(&self.pipeline).context("decode submit")
     }
 
     /// Harvest one fire's sampled token off the `out` channel (blocks by
     /// awaiting the in-flight fire; poison surfaces as `Err`).
     async fn take_token(&self) -> Result<u32> {
-        let v = self
-            .out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("out take: {e}"))?;
+        let v = self.out.take_host::<Vec<i32>>().await?;
         Ok(v.first().copied().unwrap_or(0) as u32)
     }
 }
@@ -122,25 +115,23 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let pool = pool_pages * PAGE_T;
 
     let ws = WorkingSet::new();
-    let grant = ws
-        .reserve(pool_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    let grant = ws.reserve(pool_pages).context("ws.reserve")?;
     let pool_ids = grant.ids().to_vec();
 
     // ── 1. PREFILL FIRE (N-wide): causal [N, POOL] mask, N-cell KV write,
     //       read-out row N−1, greedy argmax → g0. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
 
     let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
     let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
     let w_slot_p = Channel::from(w_slot_pv).named("w_slot_p");
     let w_off_p = Channel::from(w_off_pv).named("w_off_p");
-    let klen_p = Channel::from(vec![n; 1]).named("klen_p");
+    let klen_p = Channel::from([n]).named("klen_p");
     let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
-    let page_indptr_p = Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p");
+    let page_indptr_p = Channel::from([0u32, pool_pages]).named("pidx_p");
     let mask_pv: Vec<bool> = (0..n)
         .flat_map(|i| (0..pool).map(move |j| j <= i))
         .collect();
@@ -151,15 +142,17 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &klen_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        Some(&mask_p),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &klen_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: Some(&mask_p),
+        },
     )?;
     fwd_p.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits()); // greedy over row N−1
@@ -170,53 +163,49 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     // fire of this generation submit here (the Stream carries it). The g0
     // handoff still rides the host (awaited take), unchanged.
     let pipeline = Pipeline::new();
-    fwd_p
-        .submit(&pipeline)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?;
+    fwd_p.submit(&pipeline).context("prefill submit")?;
+    let g0 = g0_ch.take_host::<Vec<i32>>().await?;
     let g0 = g0.first().copied().unwrap_or(0) as u32;
 
     // ── 2. DECODE PASS (1-wide, device loop-carried): the epilogue carries
     //       the sampled token into the next fire's embed (the run-ahead
     //       carrier) and advances geometry + mask in-graph. ──
     let phys_n = pool_ids[(n / PAGE_T) as usize];
-    let tok_in = Channel::from(vec![g0 as i32; 1]).named("tok_in");
-    let pos = Channel::from(vec![n; 1]).named("pos");
-    let fill = Channel::from(vec![n + 1; 1]).named("fill");
-    let klen = Channel::from(vec![n + 1; 1]).named("klen");
-    let w_slot = Channel::from(vec![phys_n; 1]).named("w_slot");
-    let w_off = Channel::from(vec![n % PAGE_T; 1]).named("w_off");
+    let tok_in = Channel::from([g0 as i32]).named("tok_in");
+    let pos = Channel::from([n]).named("pos");
+    let fill = Channel::from([n + 1]).named("fill");
+    let klen = Channel::from([n + 1]).named("klen");
+    let w_slot = Channel::from([phys_n]).named("w_slot");
+    let w_off = Channel::from([n % PAGE_T]).named("w_off");
     let seed_mask: Vec<bool> = (0..pool).map(|j| j <= n).collect();
     let mask = Channel::from_shaped([1, pool], seed_mask).named("mask");
     let pages = Channel::from(pool_ids.clone()).named("pages");
-    let page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr");
+    let page_indptr = Channel::from([0u32, pool_pages]).named("page_indptr");
     let pool_ids_ch = Channel::new([pool_pages], dtype::u32).named("pool_ids");
     let out = Channel::new([1], dtype::i32)
         .capacity(budget as u32 + 1)
         .named("out");
-    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+    let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
     fwd.attention(
         &ws,
-        ..,
-        (n / ws.page_size())..,
-        &klen,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &pos,
-        Some(&mask),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (n / kv_page_size())..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &pos,
+            mask: Some(&mask),
+        },
     )?;
     fwd.epilogue(move || {
         // Takes + compute first, puts last (value-id discipline).
-        let base = fill.take().tensor(); // [1] u32: position this fire writes
+        let base = fill.take(); // [1] u32: position this fire writes
         let pids = pool_ids_ch.take();
 
         let tok = reduce_argmax(intrinsics::logits()); // [1] i32, greedy
@@ -226,27 +215,23 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
         let base_b = broadcast(reshape(&base, [1]), [pool]);
         let new_mask = reshape(le(&col, &base_b), [1, pool]);
 
-        let logical_slot = div(&base, PAGE_T);
+        let logical_slot = &base / PAGE_T;
         let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = rem(&base, PAGE_T);
-        let klen_v = add(&base, 1u32);
-        let next_free = add(&base, 1u32);
+        let w_off_v = &base % PAGE_T;
+        let klen_v = &base + 1u32;
+        let next_free = &base + 1u32;
         let pages_v = reshape(&pids, [pool_pages]);
-        let pidx_v = mul(&iota(2), pool_pages);
+        let pidx_v = &iota(2) * pool_pages;
 
         tok_in.put(&tok); // the device carrier: next fire embeds this token
         out.put(&tok);
-        mask.take();
         mask.put(&new_mask);
         w_slot.put(&w_slot_v);
         w_off.put(&w_off_v);
-        klen.take();
         klen.put(&klen_v);
         pos.put(&base);
         fill.put(&next_free);
-        pages.take();
         pages.put(&pages_v);
-        page_indptr.take();
         page_indptr.put(&pidx_v);
     });
 
@@ -433,7 +418,7 @@ async fn main(input: String) -> Result<String> {
     };
 
     // Chat-decode the pipelined stream to text (thin WIT `chat::Decoder`).
-    let mut dec = chat::Decoder::new();
+    let dec = chat::Decoder::new();
     let mut text = String::new();
     for t in &tokens_p {
         match dec.feed(core::slice::from_ref(t))? {

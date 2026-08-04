@@ -25,17 +25,67 @@ Kernel shared_kind(Kind k);
 Kernel pso_kind(Kind k);
 
 /// The pipeline a dispatch runs on.
-Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const Gemma4Psos& g4);
+Pso pso_for(const Dispatch& d, const Gemma4Geometry& g, const DecodeStepPsos& base,
+            const Gemma4Psos& g4);
 
 /// Its grid and threadgroup, from the geometry and this dispatch's layer.
 void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Threadgroup& tg);
 
-// gemma4_run_ends moved to scratch.hpp: it is pure (the colourer's host-side
-// contract) and the encoder below is just one of its readers.
+/// The same, for a batch of `rows` tokens. At rows==1 it must agree with
+/// `launch_shape` exactly -- one path, checked, rather than two that drift.
+/// How many rows a projection's GEMM runs over, given the fire's `rows`.
+///
+/// Padded up to a whole `BM` tile so the GEMM engages at any batch instead of
+/// only at exact multiples of it. The pool holds `gemma4_qmm_pool_rows(max)`
+/// rows so the padding always lands somewhere allocated.
+int gemma4_qmm_rows(int rows);
+
+/// How many rows the activation pool must hold for `max_rows` to be paddable.
+int gemma4_qmm_pool_rows(int max_rows);
+
+/// `head_rows` is how many rows the fire SAMPLES -- what `Kind::RowGather`
+/// compacts, and what the tail after it runs on. 0 means every row.
+void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
+                     Threadgroup& tg, int head_rows = 0);
+
+/// The pipeline a dispatch runs on at M>1. Differs from `pso_for` only where the
+/// kernel itself changes with the batch; everything else falls through.
+Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
+               const DecodeStepPsos& base, const MultiBatchPsos& mb,
+               const Gemma4Psos& g4, int head_rows = 0);
+
+/// Encode the step for a batch of `rows` tokens. Same walk as
+/// `encode_gemma4_step` -- the DAG, its order and its concurrency runs belong to
+/// the model, not to the batch size -- differing only in shape and pipeline.
+/// Whether a dispatch's weights are in the geometry's SECOND affine format.
+///
+/// Exactly the dense FFN's three projections and the router -- what mlx_lm's
+/// quantization predicate spares on gemma-4-26B. Asked in one place so the PSO
+/// choice cannot disagree with the fit check.
+bool gemma4_uses_alt_quant(Kind k);
+
+void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
+                           const Gemma4Geometry& g, int rows,
+                           const DecodeStepPsos& base, const MultiBatchPsos& mb,
+                           const Gemma4Psos& g4, int ordinal_base = 0, int head_rows = 0,
+                           /// The tables at `g.ffn_quant`, when the checkpoint
+                           /// has a second affine format. Null means it has one.
+                           const DecodeStepPsos* base_alt = nullptr,
+                           const MultiBatchPsos* mb_alt = nullptr,
+                           /// The half-open slice of the DAG to encode. The
+                           /// default is the whole of it; a paging engine asks
+                           /// for one segment at a time so the host can refill
+                           /// the expert slab between command buffers.
+                           std::size_t begin = 0, std::size_t end = 0);
+
+/// `run_ends[i]`: the last ordinal of the concurrency run containing `i`. What
+/// the colourer needs to know about which barriers the encoder will drop.
+std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag);
 
 /// Walk the DAG with a real encoder.
 void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                         const Gemma4Geometry& g, const DecodeStepPsos& base,
-                        const Gemma4Psos& g4, int ordinal_base = 0);
+                        const Gemma4Psos& g4, int ordinal_base = 0,
+                        const DecodeStepPsos* base_alt = nullptr);
 
 }  // namespace pie::metal::gemma4

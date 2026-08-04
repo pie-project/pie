@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "pie_driver_abi.h"
-#include "pie_native/launch/image.hpp"
+#include "pie/driver/testing/image.hpp"
 
 namespace pie_cuda_driver::tests {
 
@@ -101,7 +101,7 @@ class HostKernelFixture {
 // `emit_driver_test_kernel_fixtures`.
 //
 //   `<name>.launch`  -- a relocatable image of the `PieLaunch*` records
-//                       (`pie_native::launch::PackageImage`).
+//                       (`pie::driver::testing::PackageImage`).
 //   `<name>.regions` -- `region <stage> <region> <flags> <argmax-count> [skipped...]`
 //                       followed by `argmax <node> <source_value> <intrinsic> <single_row>`.
 class HostRegionFixture {
@@ -167,7 +167,7 @@ class HostRegionFixture {
     std::vector<std::vector<std::uint32_t>> skipped_;
 };
 
-using HostLaunchFixture = pie_native::launch::PackageImage;
+using HostLaunchFixture = pie::driver::testing::PackageImage;
 
 // A channel declaration in the shape `register_channel` wants it. Tests used to
 // read this off a decoded container; the launch package carries the same facts

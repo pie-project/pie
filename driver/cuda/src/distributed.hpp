@@ -41,6 +41,24 @@ void nccl_check_async(ncclResult_t result,
             _r, (comm), #expr, __FILE__, __LINE__);                            \
     } while (0)
 
+// True when every ordered pair of visible devices can actually move bytes over
+// the peer path. `cudaDeviceCanAccessPeer` is not enough: on PCIe machines with
+// ACS enabled (common in VMs) it answers "yes" for every pair while the copies
+// land as zeros. This measures a real round trip and caches the verdict, so any
+// transport that assumes direct peer access (NCCL P2P, the custom all-reduce)
+// can be refused on the same evidence.
+bool p2p_transport_usable();
+
+// Abort every communicator still alive in this process.
+//
+// TP ranks are threads here, so a rank that dies leaves its peers waiting on
+// collectives it will never join. A host-side flag cannot interrupt those:
+// the wait is on the device, inside a kernel that spins on peer flags. Only
+// aborting the communicators turns that wait into an error. Cold path — this
+// is called once, from the handler that has already decided the group is
+// unrecoverable.
+void nccl_abort_all_comms() noexcept;
+
 // Hex-encode / decode an `ncclUniqueId`. The wrapper passes the id to the
 // driver as 256 hex chars (NCCL_UNIQUE_ID_BYTES = 128 bytes).
 std::string nccl_unique_id_to_hex(const ncclUniqueId& id);

@@ -40,7 +40,7 @@
 //!
 //! JSON/plain input: an optional token budget (defaults to 8), e.g. `"16"`.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const PROMPT: &str = "hello world";
@@ -80,9 +80,7 @@ impl Decoder {
     fn new(capacity_tokens: u32) -> Result<Decoder> {
         let pool_pages = capacity_tokens.div_ceil(PAGE_T).max(1);
         let ws = WorkingSet::new();
-        let grant = ws
-            .reserve(pool_pages)
-            .map_err(|e| format!("ws.reserve: {e}"))?;
+        let grant = ws.reserve(pool_pages).context("ws.reserve")?;
         let pool_ids = grant.ids().to_vec();
         Ok(Decoder {
             ws,
@@ -108,7 +106,7 @@ impl Decoder {
 
         let toks_v: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let toks = Channel::from(toks_v).named("toks_p"); // [N] i32 (seeded)
-        let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+        let embed_indptr = Channel::from([0u32, n]).named("embed_indptr_p");
         let pos_v: Vec<u32> = (base..base + n).collect();
         let pos = Channel::from(pos_v).named("pos_p");
         // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
@@ -118,9 +116,9 @@ impl Decoder {
         let w_off_v: Vec<u32> = (base..base + n).map(|c| c % PAGE_T).collect();
         let w_slot = Channel::from(w_slot_v).named("w_slot_p");
         let w_off = Channel::from(w_off_v).named("w_off_p");
-        let klen = Channel::from(vec![base + n; 1]).named("klen_p");
+        let klen = Channel::from([base + n]).named("klen_p");
         let pages = Channel::from(self.pool_ids.clone()).named("pages_p");
-        let page_indptr = Channel::from_shaped([2], vec![0u32, self.pool_pages]).named("pidx_p");
+        let page_indptr = Channel::from([0u32, self.pool_pages]).named("pidx_p");
         // Causal mask [N, POOL]: query row i (abs pos base+i) attends j <= base+i.
         let mask_v: Vec<bool> = (0..n)
             .flat_map(|i| (0..self.pool).map(move |j| j <= base + i))
@@ -132,29 +130,26 @@ impl Decoder {
         fwd.embed(&toks, &embed_indptr)?;
         fwd.attention(
             &self.ws,
-            ..,
-            (base / self.ws.page_size())..,
-            &klen,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &pos,
-            Some(&mask),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (base / kv_page_size())..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &pos,
+                mask: Some(&mask),
+            },
         )?;
         fwd.epilogue(move || {
             let tok = reshape(reduce_argmax(intrinsics::logits()), [1]); // [1] i32
             g_ch.put(&tok);
         });
 
-        fwd.submit(&pipeline)
-            .map_err(|e| format!("prefill submit: {e}"))?;
+        fwd.submit(&pipeline).context("prefill submit")?;
         self.seq += n;
-        let g0 = g_ch
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("g0 take: {e}"))?[0];
+        let g0 = g_ch.take_host::<i32>().await?;
         Ok(g0 as u32)
     }
 
@@ -168,39 +163,41 @@ impl Decoder {
         let pool_pages = self.pool_pages;
         let phys_n = self.pool_ids[(n / PAGE_T) as usize];
 
-        let tok_in = Channel::from(vec![g0 as i32; 1]).named("tok_in");
-        let pos = Channel::from(vec![n; 1]).named("pos");
-        let fill = Channel::from(vec![n + 1; 1]).named("fill");
-        let klen = Channel::from(vec![n + 1; 1]).named("klen");
-        let w_slot = Channel::from(vec![phys_n; 1]).named("w_slot");
-        let w_off = Channel::from(vec![n % PAGE_T; 1]).named("w_off");
+        let tok_in = Channel::from([g0 as i32]).named("tok_in");
+        let pos = Channel::from([n]).named("pos");
+        let fill = Channel::from([n + 1]).named("fill");
+        let klen = Channel::from([n + 1]).named("klen");
+        let w_slot = Channel::from([phys_n]).named("w_slot");
+        let w_off = Channel::from([n % PAGE_T]).named("w_off");
         let seed_mask: Vec<bool> = (0..pool).map(|j| j <= n).collect();
         let mask = Channel::from_shaped([1, pool], seed_mask).named("mask");
         let pages = Channel::from(self.pool_ids.clone()).named("pages");
-        let page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr");
+        let page_indptr = Channel::from([0u32, pool_pages]).named("page_indptr");
         let pool_ids_ch = Channel::new([pool_pages], dtype::u32)
             .capacity(RING)
             .named("pool_ids");
         let out = Channel::new([1], dtype::i32).capacity(RING).named("out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &self.ws,
-            ..,
-            (n / self.ws.page_size())..,
-            &klen,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &pos,
-            Some(&mask),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / kv_page_size())..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &pos,
+                mask: Some(&mask),
+            },
         )?;
         fwd.epilogue(move || {
             // Takes + compute first, puts last (value-id discipline).
-            let base = fill.take().tensor(); // [1] u32 — position this next fire writes
+            let base = fill.take(); // [1] u32 — position this next fire writes
             let pids = pool_ids_ch.take();
 
             let tok = reshape(reduce_argmax(intrinsics::logits()), [1]); // [1] i32
@@ -210,27 +207,23 @@ impl Decoder {
             let base_b = broadcast(reshape(&base, [1]), [pool]);
             let new_mask = reshape(le(&col, &base_b), [1, pool]);
 
-            let logical_slot = div(&base, PAGE_T);
+            let logical_slot = &base / PAGE_T;
             let w_slot_v = gather(&pids, &logical_slot);
-            let w_off_v = rem(&base, PAGE_T);
-            let klen_v = add(&base, 1u32);
-            let next_free = add(&base, 1u32);
+            let w_off_v = &base % PAGE_T;
+            let klen_v = &base + 1u32;
+            let next_free = &base + 1u32;
             let pages_v = reshape(&pids, [pool_pages]);
-            let pidx_v = mul(&iota(2), pool_pages);
+            let pidx_v = &iota(2) * pool_pages;
 
             tok_in.put(&tok);
             out.put(&tok);
-            mask.take();
             mask.put(&new_mask);
             w_slot.put(&w_slot_v);
             w_off.put(&w_off_v);
-            klen.take();
             klen.put(&klen_v);
             pos.put(&base);
             fill.put(&next_free);
-            pages.take();
             pages.put(&pages_v);
-            page_indptr.take();
             page_indptr.put(&pidx_v);
         });
 
@@ -256,21 +249,14 @@ impl DecodeLoop {
     /// the decoder cursor on SUBMIT, like the classic probe.
     fn submit(&self, d: &mut Decoder) -> Result<()> {
         d.pool_ids_ch_put(&self.pool_ids_ch);
-        self.fwd
-            .submit(&self.pipeline)
-            .map_err(|e| format!("decode submit: {e}"))?;
+        self.fwd.submit(&self.pipeline).context("decode submit")?;
         d.seq += 1;
         Ok(())
     }
 
     /// Drain the oldest in-flight fire's token (blocks until committed).
     async fn take(&self) -> Result<u32> {
-        let t = self
-            .out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("out.take: {e}"))?;
+        let t = self.out.take_host::<Vec<i32>>().await?;
         Ok(*t.first().unwrap_or(&0) as u32)
     }
 

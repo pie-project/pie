@@ -54,14 +54,15 @@ impl pie::inferlet::chat::Host for ProcessCtx {
         Ok(pie_model::model().instruct().seal())
     }
 
-    async fn create_decoder(&mut self) -> Result<Resource<Decoder>> {
+}
+
+impl pie::inferlet::chat::HostDecoder for ProcessCtx {
+    async fn new(&mut self) -> Result<Resource<Decoder>> {
         let inner = pie_model::model().instruct().chat_decoder();
         let decoder = Decoder { inner };
         Ok(self.ctx().table.push(decoder)?)
     }
-}
 
-impl pie::inferlet::chat::HostDecoder for ProcessCtx {
     async fn feed(
         &mut self,
         this: Resource<Decoder>,

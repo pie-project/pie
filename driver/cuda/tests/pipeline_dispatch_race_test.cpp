@@ -178,23 +178,23 @@ int main() {
     {
         PieTerminalCell retry_terminal{};
         PieTerminalCell* retry_cells[1] = {&retry_terminal};
-        pie_native::LaunchView retry_view{};
-        retry_view.terminal_cells = pie_native::slice_from(
+        pie::driver::fire::LaunchView retry_view{};
+        retry_view.terminal_cells = pie::driver::slice_from(
             const_cast<PieTerminalCell* const*>(retry_cells), 1);
         retry_view.sampling_indptr =
-            pie_native::slice_from_u32(sampling_indptr, 2);
+            pie::driver::slice_from_u32(sampling_indptr, 2);
         retry_view.ptir_program_hashes =
-            pie_native::slice_from_u64(&hash, 1);
+            pie::driver::slice_from_u64(&hash, 1);
         retry_view.ptir_program_instances =
-            pie_native::slice_from_u64(instance_ids, 1);
+            pie::driver::slice_from_u64(instance_ids, 1);
         const std::uint64_t retry_heads[2] = {0, kNoTicket};
         const std::uint64_t retry_tails[2] = {kNoTicket, 0};
         retry_view.channel_expected_head =
-            pie_native::slice_from_u64(retry_heads, 2);
+            pie::driver::slice_from_u64(retry_heads, 2);
         retry_view.channel_expected_tail =
-            pie_native::slice_from_u64(retry_tails, 2);
+            pie::driver::slice_from_u64(retry_tails, 2);
         retry_view.channel_ticket_indptr =
-            pie_native::slice_from_u32(channel_ticket_indptr, 2);
+            pie::driver::slice_from_u32(channel_ticket_indptr, 2);
         auto* reader_words =
             reinterpret_cast<std::uint64_t*>(endpoints[1].word_base);
         const std::uint64_t tail_before =
@@ -227,7 +227,7 @@ int main() {
 
         PieTerminalCell committed_terminal{};
         PieTerminalCell* committed_cells[1] = {&committed_terminal};
-        retry_view.terminal_cells = pie_native::slice_from(
+        retry_view.terminal_cells = pie::driver::slice_from(
             const_cast<PieTerminalCell* const*>(committed_cells), 1);
         if (!expect(dispatch.run(
                         retry_view, d_logits, kVocab, stream, &runtime,
@@ -285,22 +285,22 @@ int main() {
                 next_sequence + static_cast<std::uint64_t>(burst);
             PieTerminalCell* cell = &terminals[fired++];
             PieTerminalCell* cells[1] = {cell};
-            pie_native::LaunchView view{};
-            view.terminal_cells = pie_native::slice_from(
+            pie::driver::fire::LaunchView view{};
+            view.terminal_cells = pie::driver::slice_from(
                 const_cast<PieTerminalCell* const*>(cells), 1);
             view.sampling_indptr =
-                pie_native::slice_from_u32(sampling_indptr, 2);
-            view.ptir_program_hashes = pie_native::slice_from_u64(&hash, 1);
+                pie::driver::slice_from_u32(sampling_indptr, 2);
+            view.ptir_program_hashes = pie::driver::slice_from_u64(&hash, 1);
             view.ptir_program_instances =
-                pie_native::slice_from_u64(instance_ids, 1);
+                pie::driver::slice_from_u64(instance_ids, 1);
             const std::uint64_t ticket_heads[2] = {fire_sequence, kNoTicket};
             const std::uint64_t ticket_tails[2] = {kNoTicket, fire_sequence};
             view.channel_expected_head =
-                pie_native::slice_from_u64(ticket_heads, 2);
+                pie::driver::slice_from_u64(ticket_heads, 2);
             view.channel_expected_tail =
-                pie_native::slice_from_u64(ticket_tails, 2);
+                pie::driver::slice_from_u64(ticket_tails, 2);
             view.channel_ticket_indptr =
-                pie_native::slice_from_u32(channel_ticket_indptr, 2);
+                pie::driver::slice_from_u32(channel_ticket_indptr, 2);
             g_stage = "validate_launch";
             const int validate_rc = dispatch.validate_launch(view, &err);
             if (!expect(validate_rc == PIE_STATUS_OK, err.c_str())) return 1;

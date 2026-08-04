@@ -16,7 +16,7 @@
 
 #include <pie_driver_abi.h>
 
-#include "pie_native/launch_view.hpp"
+#include "pie/driver/fire/view.hpp"
 #include "pipeline/dispatch.hpp"
 
 namespace pie_cuda_driver::pipeline {
@@ -68,7 +68,7 @@ class Registry {
     int resolve_instances(const PieU64Slice& instance_ids,
                          std::vector<InstanceRecord>* out) const;
 
-    int validate_launch(const pie_native::LaunchView& view, std::string* err) {
+    int validate_launch(const pie::driver::fire::LaunchView& view, std::string* err) {
         return dispatch_.validate_launch(view, err);
     }
 

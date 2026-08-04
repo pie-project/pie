@@ -12,7 +12,8 @@
 #include "pipeline/descriptor_resolve.hpp"
 
 using namespace pie::metal::pipeline;
-namespace launch = pie_native::launch;
+namespace launch = pie::driver::launch;
+namespace fire = pie::driver::fire;
 
 namespace {
 
@@ -131,7 +132,7 @@ int main() {
     {
         Trace t = make_trace(1, {{kPortPositions, 0, false}});
         InterpInstance inst = make_inst(1);
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const GeometryResolveResult typed =
             resolve_fire_geometry_typed(t, inst, 4, fg, &err);
@@ -150,7 +151,7 @@ int main() {
         Trace t = make_trace(1, {{kPortPositions, 0, false}});
         InterpInstance inst = make_inst(1);
         put(inst, 0, Value::f32({1.0f}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const GeometryResolveResult typed =
             resolve_fire_geometry_typed(t, inst, 4, fg, &err);
@@ -166,7 +167,7 @@ int main() {
         Trace t = make_trace(1, {{kPortPositions, 0, false}});
         InterpInstance inst = make_inst(1);
         put(inst, 0, Value::u32({5, 6, 7}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds when positions ready");
@@ -187,7 +188,7 @@ int main() {
         InterpInstance inst = make_inst(2);
         put(inst, 0, Value::u32({10, 11, 99, 99}));  // fixed shape[4]
         put(inst, 1, Value::u32({0, 2}));            // prefix len 2
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds for CSR-prefix trim case (" + err + ")");
@@ -226,7 +227,7 @@ int main() {
         put(inst, 1, Value::u32({7, 7}));
         put(inst, 2, Value::u32({5, 6, 0, 5, 6, 0}));
         put(inst, 3, Value::u32({7, 7}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const auto result =
             resolve_fire_geometry_typed(plan, inst, 4, fg, &err);
@@ -251,7 +252,7 @@ int main() {
         Trace t = make_trace(1, {{kPortKvLen, 0, false}});
         InterpInstance inst = make_inst(1);
         put(inst, 0, Value::u32({7, 8, 0, 1}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds for kv_len case");
@@ -268,7 +269,7 @@ int main() {
         InterpInstance inst = make_inst(2);
         put(inst, 0, Value::i32({100, 101, 102, 103, 104}));  // 5 tokens
         put(inst, 1, Value::u32({0, 2, 5}));                  // 2 lanes
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds for default-readout case (" + err + ")");
@@ -286,7 +287,7 @@ int main() {
         InterpInstance inst = make_inst(2);
         put(inst, 0, Value::i32({1, 2, 3}));
         put(inst, 1, Value::u32({0, 2}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds for explicit readout case (" + err + ")");
@@ -303,7 +304,7 @@ int main() {
         Trace t = make_trace(1, {{kPortEmbedTokens, 0, false}});
         InterpInstance inst = make_inst(1);
         put(inst, 0, Value::i32({7, 7, 7}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds for default-positions case");
@@ -317,7 +318,7 @@ int main() {
         Trace t = make_trace(1, {{kPortEmbedTokens, 0, false}});
         InterpInstance inst = make_inst(1);
         put(inst, 0, Value::i32({9, 9, 9, 9}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds for default-qo_indptr case");
@@ -331,7 +332,7 @@ int main() {
         InterpInstance inst = make_inst(2);
         put(inst, 0, Value::u32({3, 4}));
         put(inst, 1, Value::u32({1, 2}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds for w_slot/w_off case");
@@ -356,7 +357,7 @@ int main() {
         t.stages.push_back(std::move(stage));
         InterpInstance inst = make_inst(1);
         put(inst, 0, Value::boolean({1, 0, 1, 1}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds for attn_mask case");
@@ -366,7 +367,7 @@ int main() {
               "mask bytes == [1,0,1,1]");
         expect(
             fg.structured_mask.kind ==
-                   launch::StructuredMaskKind::SlidingWindow &&
+                   fire::StructuredMaskKind::SlidingWindow &&
                 fg.structured_mask.key_len == 4 &&
                 fg.structured_mask.window == 2,
             "semantic mask provenance accompanies its dense fallback");
@@ -387,14 +388,14 @@ int main() {
         t.stages.push_back(std::move(stage));
         InterpInstance inst = make_inst(1);
         put(inst, 0, Value::boolean({1, 0, 0, 1, 1, 0}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(
             ok && fg.has_mask &&
                 fg.mask == std::vector<std::uint8_t>({1, 0, 0, 1, 1, 0}) &&
                 fg.structured_mask.kind ==
-                    launch::StructuredMaskKind::None,
+                    fire::StructuredMaskKind::None,
             "row_membership-style general SSA uses dense Bool attention fallback");
     }
 
@@ -405,7 +406,7 @@ int main() {
         Trace t = make_trace(2, {{kPortEmbedTokens, 0, false}, {kPortPositions, 1, false}});
         InterpInstance inst = make_inst(2);
         put(inst, 0, Value::i32({1, 2}));
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(!ok && contains(err, "not ready"),
@@ -417,7 +418,7 @@ int main() {
 
     // Both Pages and WSlot translate through the same segment.
     {
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         fg.kv_page_indices = {0, 1, 2};
         fg.w_page = {2, 0};
         const std::vector<std::uint32_t> tr = {50, 51, 52};  // relative -> physical
@@ -432,7 +433,7 @@ int main() {
     // An out-of-range relative index maps to physical page 0 (reserved-but-
     // unwritten / masked-only candidate), never left dangling.
     {
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         fg.kv_page_indices = {0, 5, 1};  // index 5 is past tr_len==3
         fg.w_page = {9};                // also past tr_len
         const std::vector<std::uint32_t> tr = {70, 71, 72};
@@ -445,7 +446,7 @@ int main() {
 
     // Zero is a valid relative index too (translates like any other).
     {
-        launch::FireGeometry fg;
+        fire::FireGeometry fg;
         fg.kv_page_indices = {0};
         const std::vector<std::uint32_t> tr = {100};
         translate_kv_pages(tr.data(), tr.size(), fg);

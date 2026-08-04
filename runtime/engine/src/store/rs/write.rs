@@ -29,6 +29,21 @@ pub struct RsStateTarget {
     pub fold_tokens: Option<u32>,
 }
 
+/// What a prepared buffer span MEANS. Both intents name the same pages, but
+/// they move tokens in opposite directions, so the occupancy each implies is
+/// opposite too.
+///
+/// - `Write` — the fire scatters activations INTO the span, so the buffer now
+///   holds at least `start + len` tokens.
+/// - `Replay` — the fire gathers the span on its way into the folded state.
+///   Those tokens LEAVE the buffer; counting them as written would re-add
+///   exactly what `advance_fold` just subtracted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RsBufferIntent {
+    Write,
+    Replay,
+}
+
 /// One buffered-page write target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsBufferTarget {
@@ -61,13 +76,36 @@ pub struct RsPreparedWrite {
     pub(crate) state: Option<RsStateTarget>,
     pub(crate) buffers: Vec<RsBufferTarget>,
     pub(crate) allocated: Vec<RsSlotId>,
+    /// The `(start, len)` token span this write buffers, if any. Pages are the
+    /// allocation unit but NOT the accounting unit: a reserved page is not a
+    /// written token, and conflating the two made a freshly allocated (and
+    /// genuinely empty) buffer read as a full page of occupancy. Publishing
+    /// this span is what lets `RsStore::buffer_tokens` be exact.
+    pub(crate) buffer_span: Option<(u32, u32, RsBufferIntent)>,
     /// Submission sequence stamped at prepare (see `KvPreparedWrite::seq`).
     pub(crate) seq: u64,
+    /// The fold this write commits has a length the HOST never learned: the
+    /// device computed it and only the driver resolved it. The state target
+    /// still carries a `fold_tokens`, but it is an upper bound, so publishing
+    /// it must not advance the boundary by that much or retire pages against
+    /// it — see `store::rs::Occupancy`.
+    pub(crate) fold_len_is_bound: bool,
 }
 
 impl RsPreparedWrite {
     pub fn working_set(&self) -> RsWorkingSetId {
         self.ws
+    }
+
+    /// Declare that this write's fold length is device-resident. The caller
+    /// supplied the host's upper bound so the allocation and the CSR had a
+    /// shape; the real length reaches only the driver.
+    pub fn mark_fold_len_device(&mut self) {
+        self.fold_len_is_bound = true;
+    }
+
+    pub fn fold_len_is_bound(&self) -> bool {
+        self.fold_len_is_bound
     }
 
     /// Submission sequence for epoch retirement at finalize.
@@ -90,6 +128,23 @@ impl RsPreparedWrite {
             _ => None,
         })
     }
+}
+
+/// The fold advances a `publish_batch` deferred, to be applied with
+/// `RsStore::commit_folds` once the fire's wire arrays have been built
+/// against the pre-fold buffer they describe.
+#[derive(Debug, Default)]
+#[must_use = "a deferred fold that is never committed leaves the boundary behind"]
+pub struct RsPendingFolds(pub(crate) Vec<RsPendingFold>);
+
+/// One deferred fold. `tokens` is exact unless `len_is_bound`, in which case
+/// the length lives on the device and was never read back — the store may
+/// then only narrow its bound on the live buffer, never state it.
+#[derive(Debug, Clone, Copy)]
+pub struct RsPendingFold {
+    pub(crate) ws: super::RsWorkingSetId,
+    pub(crate) tokens: u32,
+    pub(crate) len_is_bound: bool,
 }
 
 /// The receipt for one fire's published RS rows. The mapping is already

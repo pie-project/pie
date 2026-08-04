@@ -11,6 +11,7 @@
 #include <utility>
 
 #include <config.hpp>
+#include "loader/group_stream_cache.hpp"
 #include "loader/load_plan.hpp"
 #include "model/config.hpp"
 #include "model/contract.hpp"
@@ -66,6 +67,16 @@ public:
     model::Mxfp4MoePolicy mxfp4_moe_policy() const noexcept {
         return mxfp4_moe_policy_;
     }
+    /// The routed-expert slab, or null when the experts are resident.
+    ///
+    /// Null is the whole signal, the way `moe_gate_up_bf16` being null is:
+    /// a forward pass asks whether there is a cache, not whether a flag was
+    /// set, so a model whose contract declared no groups and a model with
+    /// streaming turned off are the same model to it.
+    GroupStreamCache* group_cache() const noexcept {
+        return group_cache_.get();
+    }
+
     LoadedModelCapabilities capabilities() const;
 
     /// Number of weights resident on device.
@@ -91,6 +102,16 @@ private:
     WeightStore weights_;
     model::Mxfp4MoePolicy mxfp4_moe_policy_ =
         model::Mxfp4MoePolicy::EagerBf16;
+
+    // Streaming keeps the load alive past the load. A group is paged in by
+    // running its plan, so the plan and the file handles it reads through
+    // outlive `load()` instead of being torn down at the end of it -- and they
+    // are held indirectly because the cache refers to both and this class
+    // moves. Empty unless a contract declared groups and streaming was asked
+    // for; then the destruction order is cache, source, plan.
+    std::unique_ptr<pie_loader::LoadPlan> stream_plan_;
+    std::unique_ptr<pie_loader::CheckpointSource> stream_source_;
+    std::unique_ptr<GroupStreamCache> group_cache_;
 };
 
 namespace ops { struct RuntimeQuantScratchSpec; }

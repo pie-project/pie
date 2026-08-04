@@ -32,17 +32,17 @@
 #include <utility>
 #include <vector>
 
-#include "pie_native/launch/plan.hpp"
-#include "pie_native/launch/program.hpp"
+#include "pie/driver/launch/plan.hpp"
+#include "pie/driver/launch/program.hpp"
 #include "pipeline/channel_registry.hpp"
 #include "pipeline/tier0/tier0_runner.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
 // The driver's execution model (trace/op-table/plan) lives in
-// pie_native::launch (driver/abi); bring it into scope so the CUDA-side
+// pie::driver::launch (driver/common); bring it into scope so the CUDA-side
 // tier-0/1 code below can use it unqualified.
-using namespace pie_native::launch;
+using namespace pie::driver::launch;
 
 // A per-channel host-supplied byte value — mirrors the wire `PtirChannelValue`.
 // Seeds are per-instance init (D2, not in the hash).
@@ -77,7 +77,7 @@ class PtirProgramCache {
                                  "package");
 
         AdoptedProgram adopted;
-        adopted.trace = pie_native::launch::adopt(package);
+        adopted.trace = pie::driver::launch::adopt(package);
         adopted.plans.reserve(package.plans.len);
         adopted.graph_stage_identities.reserve(package.plans.len);
         for (std::size_t i = 0; i < package.plans.len; ++i) {

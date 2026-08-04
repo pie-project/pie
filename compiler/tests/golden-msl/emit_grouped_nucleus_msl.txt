@@ -21,7 +21,7 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: additive corpus growth: new lora_prologue golden (stage-4 lora sink); every pre-existing case's emitted text is unchanged — only the new case's sections were appended
+#   reason: cumsum/cumprod widened from F32-only to every numeric dtype; the m1 runtime's scan block now branches on the operand dtype instead of loading every lane through m1_load_f. The oracle dumps change only because that block is embedded verbatim in every emitted source -- no emitted structure moved, and the f32 path is byte-for-byte the arithmetic the oracle recorded.
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -122,7 +122,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_b4fadd8446eb58dd_r35
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51055 prefix=@runtime+@grouped tail_bytes=10474
+source: bytes=51943 prefix=@runtime+@grouped tail_bytes=10474
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -484,7 +484,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_4f4b856e5ef3e8b4_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51050 prefix=@runtime+@grouped tail_bytes=10469
+source: bytes=51938 prefix=@runtime+@grouped tail_bytes=10469
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -826,33 +826,6 @@ function_name: ptir_m3_f2566cc0c1e0529a_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=2
 skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]/outputs[0] without checking region.library)
 === end
-=== lora_prologue#0 singleton#0
-function_name: ptir_m3_26849b68dee54237_r0
-region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
-skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]/outputs[0] without checking region.library)
-=== end
-=== lora_prologue#0 singleton#2
-function_name: ptir_m3_26849b68dee54237_r2
-region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
-skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]/outputs[0] without checking region.library)
-=== end
-=== lora_prologue#0 singleton#3
-function_name: ptir_m3_26849b68dee54237_r3
-region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
-ok: false
-error: invalid grouped nucleus library region
-=== end
-=== lora_prologue#0 fused#0
-function_name: ptir_m3_26849b68dee54237_r0
-region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
-skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]/outputs[0] without checking region.library)
-=== end
-=== lora_prologue#0 fused#1
-function_name: ptir_m3_26849b68dee54237_r1
-region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
-ok: false
-error: invalid grouped nucleus library region
-=== end
 === matrix_mask_apply_packed#0 singleton#0
 function_name: ptir_m3_6612fe00a51d7edc_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
@@ -907,7 +880,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_101abcfb79b08b89_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51050 prefix=@runtime+@grouped tail_bytes=10469
+source: bytes=51938 prefix=@runtime+@grouped tail_bytes=10469
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1213,7 +1186,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_963137d4ffed0445_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51050 prefix=@runtime+@grouped tail_bytes=10469
+source: bytes=51938 prefix=@runtime+@grouped tail_bytes=10469
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1611,7 +1584,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_82921040f7bc2612_r12
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51054 prefix=@runtime+@grouped tail_bytes=10473
+source: bytes=51942 prefix=@runtime+@grouped tail_bytes=10473
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1912,7 +1885,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_82921040f7bc2612_r1
 region: library=1 library_op=0 schedule=3 nodes=13 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51051 prefix=@runtime+@grouped tail_bytes=10470
+source: bytes=51939 prefix=@runtime+@grouped tail_bytes=10470
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -2297,7 +2270,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_dff3bc6795a9dcdf_r23
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51054 prefix=@runtime+@grouped tail_bytes=10473
+source: bytes=51942 prefix=@runtime+@grouped tail_bytes=10473
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -2695,7 +2668,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_4cf3882bf2fff913_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51050 prefix=@runtime+@grouped tail_bytes=10469
+source: bytes=51938 prefix=@runtime+@grouped tail_bytes=10469
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {

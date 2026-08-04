@@ -193,9 +193,14 @@ fn fusion_needs_every_conjunct() {
 
 #[test]
 fn backends_without_transform_kernels_decide_nothing() {
-    // Metal binds tensors into a heap and runs no transforms, so its mask is
-    // empty and every lowering is the default.
-    assert_eq!(METAL_TILE_MAP_MASK, 0);
+    // Metal runs its transforms on the host, over the shared heap it is about
+    // to bind, so it advertises the kinds it executes but asks for none of the
+    // tiling or fusion the lowering can offer: there is no staging buffer to
+    // size and no kernel to fuse into.
+    assert_eq!(
+        METAL_TILE_MAP_MASK,
+        TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE
+    );
     let target = StorageTarget {
         backend: BackendKind::Metal,
         fusion_mask: FUSION_FP8_TO_MXFP4,

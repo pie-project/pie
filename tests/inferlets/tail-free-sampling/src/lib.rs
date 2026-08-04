@@ -37,8 +37,7 @@
 //! also indexes unsorted logits with a sorted rank, which is a plain bug. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::ptir::prelude::*;
-use inferlet::{Result, model as wit_model};
+use inferlet::ptir::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -106,7 +105,7 @@ struct Cfg {
 /// `x[i + 1]`, with the final element repeated so the difference vanishes at
 /// the end of the candidate window instead of wrapping.
 fn shift1(x: &Tensor, k: u32) -> Tensor {
-    let idx = min_elem(add(iota(k), 1u32), broadcast(Tensor::constant(k - 1), [k]));
+    let idx = min_elem(iota(k) + 1u32, broadcast(k - 1, [k]));
     gather(x, &idx)
 }
 
@@ -122,44 +121,39 @@ fn tail_free_keep(logits: &Tensor, vocab: u32, k_max: u32, z: f32) -> (Tensor, T
     let (_sorted, order) = top_k(logits, k_max);
     let p = gather(&probs, &order);
 
-    let d1 = sub(&p, shift1(&p, k_max));
-    let d2 = sub(&d1, shift1(&d1, k_max));
+    let d1 = &p - shift1(&p, k_max);
+    let d2 = &d1 - shift1(&d1, k_max);
     // |d2| without an abs op.
-    let curvature = max_elem(&d2, neg(&d2));
+    let curvature = max_elem(&d2, -&d2);
 
     // A perfectly flat curve has zero curvature everywhere; floor the total so
     // the normalization cannot divide by zero.
-    let total = max_elem(reduce_sum(&curvature), Tensor::constant(1e-9f32));
-    let norm = div(&curvature, broadcast(&total, [k_max]));
+    let total = max_elem(reduce_sum(&curvature), 1e-9f32);
+    let norm = &curvature / broadcast(&total, [k_max]);
     // Exclusive prefix, so the most likely candidate always passes.
-    let exclusive = sub(cumsum(&norm), &norm);
-    let keep_sorted = lt(&exclusive, broadcast(Tensor::constant(z), [k_max]));
+    let exclusive = cumsum(&norm) - &norm;
+    let keep_sorted = lt(&exclusive, broadcast(z, [k_max]));
 
-    let zeros = broadcast(Tensor::constant(0.0f32), [k_max]);
+    let zeros = broadcast(0.0f32, [k_max]);
     let kept_mass = reshape(reduce_sum(select(&keep_sorted, &p, &zeros)), [1]);
-    let kept = reshape(reduce_sum(cast(&keep_sorted, DType::F32)), [1]);
+    let kept = reshape(reduce_sum(cast(&keep_sorted, dtype::f32)), [1]);
 
-    let base = broadcast(Tensor::constant(false), [vocab]);
+    let base = broadcast(false, [vocab]);
     let keep = scatter_set(base, &order, keep_sorted);
     (keep, kept, kept_mass)
 }
 
 /// One sampling step: temperature, curvature mask, Gumbel-max draw.
-fn step(
-    logits: Tensor,
-    vocab: u32,
-    cfg: Cfg,
-    rng_state: impl AsTensor + Copy,
-) -> (Tensor, Tensor, Tensor) {
+fn step(logits: Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
     // Temperature first: the curve whose curvature we measure has to be the
     // curve we actually sample from.
     let scaled = if cfg.temperature == 1.0 {
         logits
     } else {
-        div(&logits, cfg.temperature)
+        &logits / cfg.temperature
     };
     let (keep, kept, kept_mass) = tail_free_keep(&scaled, vocab, cfg.k_max, cfg.z);
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     (gumbel_max(masked, rng_state), kept, kept_mass)
 }
@@ -172,20 +166,20 @@ async fn main(input: Input) -> Result<Output> {
     if !input.temperature.is_finite() || input.temperature <= 0.0 {
         return Err("temperature must be finite and greater than 0".into());
     }
-    let vocab_probe = wit_model::output_vocab_size();
+    let vocab_probe = model::output_vocab_size();
     // Three points are the minimum for a second difference.
     if input.k_max < 3 || input.k_max > vocab_probe {
         return Err(format!("k_max must be in 3..={vocab_probe}"));
     }
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let cfg = Cfg {
         z: input.z,
         k_max: input.k_max,
         temperature: input.temperature,
     };
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -200,14 +194,13 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut s1: Vec<f32> = Vec::with_capacity(max_tokens);
@@ -216,15 +209,14 @@ async fn main(input: Input) -> Result<Output> {
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
+    let rng_p = Channel::from([input.seed, 0]).named("rng_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
     let s1_out_p = Channel::new([1], dtype::f32).named("s1_out_p");
     let s2_out_p = Channel::new([1], dtype::f32).named("s2_out_p");
@@ -233,21 +225,23 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::logits();
         let (token, a, b) = step(logits, vocab, cfg, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         s1_out_p.put(&a);
         s2_out_p.put(&b);
@@ -255,33 +249,19 @@ async fn main(input: Input) -> Result<Output> {
     });
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let a0 = s1_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("s1 take: {e}"))?[0];
-    let b0 = s2_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("s2 take: {e}"))?[0];
+    let g0 = tok_out_p.take_host::<i32>().await?;
+    let a0 = s1_out_p.take_host::<f32>().await?;
+    let b0 = s2_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
     s1.push(a0);
     s2.push(b0);
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
+        let tok_in = Channel::from([g0]).named("tok_in");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
@@ -291,47 +271,47 @@ async fn main(input: Input) -> Result<Output> {
         let s2_out = Channel::new([1], dtype::f32)
             .capacity(channel_capacity() as u32)
             .named("s2_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
             let logits = intrinsics::logits();
             let (token, a, b) = step(logits, vocab, cfg, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
-            page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
+            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             s1_out.put(&a);
             s2_out.put(&b);
@@ -341,20 +321,17 @@ async fn main(input: Input) -> Result<Output> {
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             let a = s1_out
-                .take()
-                .get::<f32>()
+                .take_host::<f32>()
                 .await
-                .map_err(|e| format!("s1_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             let b = s2_out
-                .take()
-                .get::<f32>()
+                .take_host::<f32>()
                 .await
-                .map_err(|e| format!("s2_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);
             s1.push(a);
             s2.push(b);
@@ -373,7 +350,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "tail-free",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         z: cfg.z,
         k_max: cfg.k_max,

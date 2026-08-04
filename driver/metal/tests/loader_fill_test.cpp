@@ -32,9 +32,11 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -47,6 +49,7 @@
 
 #include "heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
+#include "loader/transcode.hpp"
 #include "model/qwen3_5/geometry.hpp"
 #include "mtl4_context.hpp"
 
@@ -261,10 +264,11 @@ bool a_padded_contract_stages_zeros_where_no_source_reaches() {
     auto ctx = RawMetalContext::create(16u << 20, 64u << 20);
     if (!expect(ctx != nullptr, "RawMetalContext::create succeeds")) return false;
 
-    pie_loader::CheckpointSource source(view);
+    auto source = std::make_shared<pie_loader::CheckpointSource>(view);
     pie::metal::BoundDecode bound;
     try {
-        bound = pie::metal::stage_decode_storage(*ctx, source, plan, geometry, heap_plan);
+        bound = pie::metal::stage_decode_storage(*ctx, std::move(source), plan, geometry,
+                                                 heap_plan);
     } catch (const std::exception& error) {
         expect(false, std::string("staging the padded plan: ") + error.what());
         return false;
@@ -306,10 +310,188 @@ bool a_padded_contract_stages_zeros_where_no_source_reaches() {
     return true;
 }
 
+/// The encoder either reproduces `mx.quantize` or it does not.
+///
+/// This is the only test in the tree with a hardcoded oracle, and it earns it.
+/// `push_encoded_affine` exists so a checkpoint MLX has not quantized can be
+/// read by kernels that only speak MLX affine U4 -- gpt-oss's openai-native
+/// `_blocks`/`_scales` experts and its unquantized BF16 attention. No
+/// checkpoint on disk takes that path, so no end-to-end gate covers it, and the
+/// encoder drifted 8.2% away from `mx.quantize` without anything going red.
+///
+/// Two of the three ways it had drifted are pinned below; the third, `round`
+/// rather than `rint` on the endpoint snap, is not. `edge / scale` is within a
+/// hair of +/-15 by construction and never lands on a half-integer for any
+/// input tried, so the two spellings cannot be told apart there. It is written
+/// MLX's way anyway, because the reason to write it either way is fidelity.
+///
+/// The values below are `mx.quantize(x, group_size=64, bits=4)` on the input
+/// generated below, with the scales and biases rounded to BF16 as the encoder
+/// stores them.
+const std::uint32_t kOracleCodes[] = {
+    0xd8859cb8u, 0x64c53cf7u, 0x98fba0f9u, 0xa05f8484u, 0x8d88c9b9u, 0x998884fbu, 0xb683b698u, 0xd9dacf7du,
+    0x5c8eb59eu, 0x95ebfb6bu, 0xbc97759bu, 0xcb86b579u, 0x3ba9bb65u, 0x8b0ecb90u, 0x8850b9e5u, 0x558e90b5u,
+    0xd37df964u, 0x4d470997u, 0x8b45c56au, 0x848379c9u, 0x8da84897u, 0x76a7f7f6u, 0x76fbb838u, 0x77a488cbu,
+    0x9b4d8044u, 0xc6947f85u, 0x99c34bf6u, 0xca530aa8u, 0xd756bf8cu, 0x789a8f88u, 0x88663477u, 0xc457479du,
+    0x98667459u, 0x087a4d49u, 0xf84cc984u, 0x5989647du, 0xa74975d9u, 0xdcf09aa7u, 0xaa87d456u, 0x69ab373du,
+    0xbaf6fcf3u, 0x5d675608u, 0x69899b79u, 0xdd0348f3u, 0xd7b7b986u, 0x8f8f9894u, 0x4737d898u, 0x7d07a999u,
+    0x978fb9fcu, 0x8d83777bu, 0x8ad00378u, 0xcca540a3u, 0xbb588c08u, 0x70668533u, 0x9d496998u, 0x93c498ccu,
+    0xd08f0d79u, 0x7b73950du, 0x804f0d88u, 0x4b3a74f3u, 0xc8c7b0cbu, 0xbf89f667u, 0xd8963f7au, 0x0a5f77bfu,
+    0x9b777098u, 0x40470c07u, 0x8067afd8u, 0x9d89ff0du, 0xd77898fau, 0x5a654a09u, 0x7a73ca69u, 0x777b58bcu,
+    0x6339d8ffu, 0xd8769a7bu, 0x697c8780u, 0x0ca933c9u, 0x39774dc7u, 0xf68b970bu, 0x475a3707u, 0x877fdcd8u,
+    0x798bfb98u, 0x965f0b74u, 0xdd795858u, 0xb78b9c8au, 0x685dcbc7u, 0x86989966u, 0x4679887bu, 0x47858a8bu,
+    0x998ad7bdu, 0x933d7f9cu, 0x95f9c867u, 0xd8997cfdu, 0xfa7c3330u, 0x99484d50u, 0xa687a6bbu, 0x9473b070u,
+    0xad7b5c7fu, 0x96a089d7u, 0xd8937c99u, 0xc5c86a3au, 0xfb583ac7u, 0x6d64c309u, 0x99778977u, 0x96ffa866u,
+    0x6b6a3b8fu, 0x8d590957u, 0x77075090u, 0xfc754594u, 0x099d4db7u, 0xa5b459a4u, 0xdf966d68u, 0xa846a085u,
+    0x9f88335fu, 0x69cd8596u, 0x9790b8c7u, 0x789058bbu, 0x88839739u, 0x947778d5u, 0xa58849a9u, 0x747ff4acu,
+    0x008e8b8bu, 0x080eeeeeu, 0xbb8800bbu, 0xbebe88bbu, 0xbe8e80b8u, 0x8bbee08eu, 0x8088eeeeu, 0xb0e0e800u,
+};
+const std::uint16_t kOracleScales[] = {
+    0xbe40u, 0xc02bu, 0xbf40u, 0xbf40u, 0xc040u, 0xbf40u, 0xbf40u, 0xbfc0u,
+    0xc040u, 0xc040u, 0xbf40u, 0xbfc0u, 0xbec0u, 0xbf40u, 0xbec0u, 0x3e4du,
+};
+const std::uint16_t kOracleBiases[] = {
+    0x3fc0u, 0x41c0u, 0x40c0u, 0x40c0u, 0x41c0u, 0x40c0u, 0x40c0u, 0x4140u,
+    0x41c0u, 0x41c0u, 0x40c0u, 0x4140u, 0x4040u, 0x40c0u, 0x4040u, 0xc040u,
+};
+
+void the_encoder_reproduces_mlx_quantize_exactly() {
+    std::printf("[affine encoding]\n");
+    using namespace pie::metal::transcode;
+    constexpr std::int64_t kRows = 8;
+    constexpr std::int64_t kCols = 128;  // two groups of 64
+
+    // MXFP4-derived values: eight E2M1 levels times a per-group power of two,
+    // which is exactly what `push_encoded_affine`'s live caller feeds it -- a
+    // gpt-oss expert bank dequantized from `_blocks`/`_scales`. It matters that
+    // the input is this and not uniform noise: on a lattice, `(w - bias)/scale`
+    // lands on an exact half-integer often, and a half-integer is the only
+    // place a rounding mode is visible at all. The seed is chosen, not
+    // arbitrary: most seeds put every tie at 7.5, where half-away-from-zero and
+    // half-to-even both answer 8 and the choice cannot be seen. This one puts
+    // 22 of them elsewhere.
+    static const float kE2M1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    std::vector<float> values(static_cast<std::size_t>(kRows * kCols));
+    std::uint32_t seed = 0x17u;
+    auto next = [&seed] {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 16;
+    };
+    for (std::int64_t r = 0; r < kRows; ++r) {
+        for (std::int64_t g = 0; g < 2; ++g) {
+            const float sc = std::ldexp(1.0f, -2 + int(next() % 5u));
+            // The last group is forced entirely negative. It is the only way the
+            // zero-initialised `w_max` becomes visible: everywhere else the
+            // group maximum is above zero and the initial value is overwritten.
+            const bool all_negative = (r == kRows - 1 && g == 1);
+            for (std::int64_t i = 0; i < 64; ++i) {
+                const std::uint32_t t = next();
+                float v = kE2M1[all_negative ? ((t & 7u) | 1u) : (t & 7u)] * sc;
+                if (all_negative || (t & 8u)) v = -v;
+                values[static_cast<std::size_t>(r * kCols + g * 64 + i)] = v;
+            }
+        }
+    }
+
+    std::vector<std::uint32_t> codes(static_cast<std::size_t>(kRows * kCols / 8));
+    std::vector<std::uint16_t> scales(static_cast<std::size_t>(kRows * 2));
+    std::vector<std::uint16_t> biases(scales.size());
+    encode_mlx_affine_u4(
+        reinterpret_cast<const std::uint8_t*>(values.data()), /*input_element_bytes=*/4, kRows,
+        kCols,
+        Region{reinterpret_cast<std::uint8_t*>(codes.data()), codes.size() * 4},
+        Region{reinterpret_cast<std::uint8_t*>(scales.data()), scales.size() * 2},
+        Region{reinterpret_cast<std::uint8_t*>(biases.data()), biases.size() * 2});
+
+    static_assert(sizeof(kOracleCodes) / sizeof(kOracleCodes[0]) == kRows * kCols / 8, "");
+    int wrong_codes = 0;
+    for (std::size_t i = 0; i < codes.size(); ++i) {
+        for (int k = 0; k < 8; ++k) {
+            const auto mine = int((codes[i] >> (4 * k)) & 0xf);
+            const auto want = int((kOracleCodes[i] >> (4 * k)) & 0xf);
+            if (mine != want) ++wrong_codes;
+        }
+    }
+    expect(wrong_codes == 0, "every code is the one mx.quantize picked (" +
+                                 std::to_string(wrong_codes) + " of " +
+                                 std::to_string(kRows * kCols) + " are not)");
+
+    int wrong_params = 0;
+    for (std::size_t i = 0; i < scales.size(); ++i) {
+        if (scales[i] != kOracleScales[i]) ++wrong_params;
+        if (biases[i] != kOracleBiases[i]) ++wrong_params;
+    }
+    expect(wrong_params == 0, "and every scale and bias is bit-identical to MLX's, at BF16 (" +
+                                  std::to_string(wrong_params) + " are not)");
+
+    // The host encoder above is the FALLBACK. `heap_bind.cpp` reaches for
+    // `transcode.metal` first and only falls back when the kernels will not
+    // compile, so the same oracle has to be held against the GPU arm or the
+    // path that actually runs is the untested one. The two implementations are
+    // separate transcriptions of the same MLX kernel and have already drifted
+    // apart once.
+    auto owned = RawMetalContext::create(4u << 20);
+    if (!expect(owned != nullptr, "RawMetalContext::create succeeds")) return;
+    RawMetalContext& ctx = *owned;
+    const char* env = std::getenv("PIE_METAL_KERNELS_DIR");
+    std::string dir = env != nullptr ? std::string(env) : std::string(PIE_METAL_KERNELS_DIR_DEFAULT);
+    if (!dir.empty() && dir.back() != '/') dir += '/';
+    std::string error;
+    const auto pso =
+        ctx.compile_precise_pso_from_file(dir + "transcode.metal", "affine_encode_u4_f32", &error);
+    if (!expect(pso.valid(), "affine_encode_u4_f32 compiles: " + error)) return;
+
+    const std::uint32_t groups = std::uint32_t(kRows * kCols / 64);
+    SlotHandle in = ctx.create_standalone_buffer(values.size() * 4);
+    SlotHandle gc = ctx.create_standalone_buffer(codes.size() * 4);
+    SlotHandle gs = ctx.create_standalone_buffer(scales.size() * 2);
+    SlotHandle gb = ctx.create_standalone_buffer(biases.size() * 2);
+    SlotHandle params = ctx.create_standalone_buffer(256);
+    if (!expect(in.valid() && gc.valid() && gs.valid() && gb.valid() && params.valid(),
+                "the encode buffers allocate")) {
+        return;
+    }
+    std::memcpy(in.contents(), values.data(), values.size() * 4);
+    const std::uint32_t args[2] = {groups, 64u};
+    std::memcpy(params.contents(), args, sizeof(args));
+    constexpr int kOrdinal = 30001;
+    ctx.arg_bind_ordinal(kOrdinal, 0, in);
+    ctx.arg_bind_ordinal(kOrdinal, 1, gc);
+    ctx.arg_bind_ordinal(kOrdinal, 2, gs);
+    ctx.arg_bind_ordinal(kOrdinal, 3, gb);
+    ctx.arg_bind_ordinal(kOrdinal, 4, params);
+    ctx.make_resident();
+    const std::uint32_t width = std::max(1u, std::min({ctx.pso_max_threads(pso), 256u, groups}));
+    const auto timing = ctx.run_step([&](pie::metal::StepEncoder& encoder) {
+        encoder.set_pso(pso);
+        encoder.set_argtable_ordinal(kOrdinal);
+        encoder.dispatch(pie::metal::Grid{groups, 1, 1}, pie::metal::Threadgroup{width, 1, 1});
+    });
+    if (!expect(!timing.timed_out, "the encode dispatch completes")) return;
+
+    int gpu_wrong = 0;
+    for (std::size_t i = 0; i < codes.size(); ++i) {
+        const auto word = static_cast<const std::uint32_t*>(gc.contents())[i];
+        for (int k = 0; k < 8; ++k) {
+            if (((word >> (4 * k)) & 0xf) != ((kOracleCodes[i] >> (4 * k)) & 0xf)) ++gpu_wrong;
+        }
+    }
+    for (std::size_t i = 0; i < scales.size(); ++i) {
+        if (static_cast<const std::uint16_t*>(gs.contents())[i] != kOracleScales[i]) ++gpu_wrong;
+        if (static_cast<const std::uint16_t*>(gb.contents())[i] != kOracleBiases[i]) ++gpu_wrong;
+    }
+    expect(gpu_wrong == 0, "and the Metal encoder -- the one that actually runs -- agrees with "
+                           "the same oracle (" + std::to_string(gpu_wrong) + " do not)");
+
+    for (const SlotHandle& h : {in, gc, gs, gb, params}) ctx.release_standalone_buffer(h);
+    ctx.release_argtable_ordinal(kOrdinal);
+}
+
 }  // namespace
 
 int main() {
     std::printf("[loader Fill on Metal]\n");
+    the_encoder_reproduces_mlx_quantize_exactly();
     heap_storage_is_host_visible_and_slices_are_exact();
     the_heap_arrives_zeroed();
     a_padded_contract_stages_zeros_where_no_source_reaches();

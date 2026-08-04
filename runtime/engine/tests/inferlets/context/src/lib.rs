@@ -2,7 +2,7 @@
 //! APIs on the raw keep-core surface (off the `Context` facade).
 
 use inferlet::working_set::KvWorkingSet;
-use inferlet::{model, Result};
+use inferlet::{Result, model};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
@@ -16,13 +16,16 @@ async fn main(_input: String) -> Result<String> {
     // `buffer()` staging is now a plain guest-held Vec).
     let buffered = encoded.clone();
 
-    // Query page info off the working set.
-    let page_size = kv.page_size();
+    // Page size is a driver constant, so it comes off `model`; the extent is
+    // a property of this working set, so it comes off `kv`.
+    let page_size = model::kv_page_size();
+    let page_len = kv.page_len();
 
     Ok(format!(
-        "encoded:{} buffered:{} page_size:{}",
+        "encoded:{} buffered:{} page_size:{} page_len:{}",
         encoded.len(),
         buffered.len(),
-        page_size
+        page_size,
+        page_len
     ))
 }

@@ -1,0 +1,14 @@
+{
+  "architectures": [
+    "Gemma3ForCausalLM"
+  ],
+  "hidden_size": 128,
+  "max_position_embeddings": 2048,
+  "model_type": "gemma3_text",
+  "num_attention_heads": 8,
+  "num_hidden_layers": 4,
+  "rope_local_base_freq": 10000.0,
+  "sliding_window": 256,
+  "sliding_window_pattern": 3,
+  "vocab_size": 1000
+}

@@ -9,4 +9,21 @@ interface system {
     // Returns the username of the user who invoked the inferlet
     username: func() -> string;
 
+    // Declare that this program may be re-run from the beginning by the
+    // runtime, discarding everything it has produced so far.
+    //
+    // The runtime reclaims KV pages from a live process only by destroying
+    // its working set. Without this declaration the only honest outcome is
+    // to fail the request loud, because re-running an inferlet that has
+    // already written a file, sent a request or streamed output to a client
+    // would duplicate those effects. A program that declares itself
+    // restartable asserts that a full re-run is equivalent to its first
+    // run, and in exchange the runtime restarts it instead of failing it.
+    //
+    // The restarted run keeps the caller's reply channel and the program's
+    // position in the FCFS admission clock, so a restart is never a
+    // demotion and cannot repeat indefinitely: an aging process eventually
+    // becomes the queue head, and the head is never chosen as a victim.
+    declare-restartable: func();
+
 }

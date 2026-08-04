@@ -59,7 +59,11 @@ pub async fn submit_inferlet(
     manifest_path: &Path,
     input: &str,
 ) -> Result<String> {
-    let client = Client::connect(ws_host)
+    // The gateway's `/v1/ws` upgrade rejects a missing `x-pie-identity` with a
+    // 401 before the socket opens, so a standalone engine (no edge proxy to
+    // terminate identity) needs the header supplied here.
+    let identity = std::env::var("PIE_IDENTITY").unwrap_or_else(|_| "test-user".to_string());
+    let client = Client::connect_with_identity(ws_host, &identity)
         .await
         .with_context(|| format!("connect to engine at {ws_host}"))?;
 

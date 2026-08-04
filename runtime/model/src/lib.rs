@@ -57,6 +57,54 @@ fn read_snapshot_num_layers(tokenizer_path: &std::path::Path) -> Option<u32> {
         .and_then(|layers| u32::try_from(layers).ok())
 }
 
+/// The compiled metadata a `.zt` artifact carries, lifted out by the worker.
+///
+/// Present, the runtime builds its tokenizer and reads its model facts from
+/// here. Absent, it falls back to parsing the files beside a snapshot — the
+/// path this format exists to retire, kept until serving from an artifact has
+/// been exercised on real hardware.
+#[derive(Clone, Debug)]
+pub struct ArtifactMetadata {
+    /// The `pie.tokenizer/1` objects, by their name under `__meta__/`.
+    pub tokenizer: Vec<(String, Vec<u8>)>,
+    /// The `pie.model/1` descriptor, as JSON.
+    pub descriptor: Vec<u8>,
+}
+
+impl ArtifactMetadata {
+    /// Rebuilds the tokenizer without touching the filesystem.
+    fn tokenizer(&self) -> Result<Tokenizer> {
+        let canonical = pie_tokenizer::canonical::CanonicalTokenizer::from_objects(|name| {
+            self.tokenizer
+                .iter()
+                .find(|(have, _)| have == name)
+                .map(|(_, bytes)| bytes.clone())
+        })?;
+        Tokenizer::from_canonical(&canonical)
+    }
+
+    /// The descriptor, parsed once.
+    ///
+    /// Reading it per field would re-parse the whole document each time — two
+    /// fields, two parses — for a document that only grows as architectures
+    /// land.
+    fn descriptor(&self) -> Result<serde_json::Value> {
+        serde_json::from_slice(&self.descriptor)
+            .map_err(|err| anyhow!("the artifact's model descriptor is not JSON: {err}"))
+    }
+}
+
+/// One `u32` field of a parsed descriptor. Every field is present by
+/// construction — the writer resolves them all — so a missing one is a broken
+/// artifact rather than a case to default around.
+fn descriptor_field(descriptor: &serde_json::Value, key: &str) -> Result<u32> {
+    descriptor
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| anyhow!("the artifact's model descriptor has no {key}"))
+}
+
 pub fn register(
     name: String,
     arch_name: &str,
@@ -64,24 +112,39 @@ pub fn register(
     rs: RsCaps,
     ptir: PtirCaps,
     tokenizer_path: PathBuf,
+    artifact: Option<ArtifactMetadata>,
 ) -> Result<()> {
-    let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
-    let instruct = instruct::create(arch_name, tokenizer.clone());
-
-    // Logits dim = the model's hf_config.vocab_size (read from the snapshot's
-    // config.json beside the tokenizer). Falls back to the tokenizer vocab for
-    // mock/fixture setups without a config.json. This is the dim the sampler
-    // operates on + the driver's recognizer table is keyed by — NOT the
+    // Logits dim = the model's `vocab_size`. This is the dim the sampler
+    // operates on and the driver's recognizer table is keyed by — NOT the
     // tokenizer token count, which may be smaller (qwen3: 151669 vs 151936).
-    let vocab_size =
-        read_snapshot_vocab_size(&tokenizer_path).unwrap_or_else(|| tokenizer.vocab_size() as u32);
-    let num_layers = read_snapshot_num_layers(&tokenizer_path).ok_or_else(|| {
-        anyhow!(
-            "model config beside {} does not declare num_hidden_layers, num_layers, n_layer, \
-             or text_config.num_hidden_layers",
-            tokenizer_path.display()
-        )
-    })?;
+    // Getting that wrong is the vocab-padding device fault the note above
+    // describes, which is exactly the skew an artifact removes: there,
+    // tokenizer and config are one object under one digest.
+    let (tokenizer, vocab_size, num_layers) = match &artifact {
+        Some(artifact) => {
+            let descriptor = artifact.descriptor()?;
+            (
+                artifact.tokenizer()?,
+                descriptor_field(&descriptor, "vocab_size")?,
+                descriptor_field(&descriptor, "num_hidden_layers")?,
+            )
+        }
+        None => {
+            let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+            let vocab_size = read_snapshot_vocab_size(&tokenizer_path)
+                .unwrap_or_else(|| tokenizer.vocab_size() as u32);
+            let num_layers = read_snapshot_num_layers(&tokenizer_path).ok_or_else(|| {
+                anyhow!(
+                    "model config beside {} does not declare num_hidden_layers, num_layers, \
+                     n_layer, or text_config.num_hidden_layers",
+                    tokenizer_path.display()
+                )
+            })?;
+            (tokenizer, vocab_size, num_layers)
+        }
+    };
+    let tokenizer = Arc::new(tokenizer);
+    let instruct = instruct::create(arch_name, tokenizer.clone());
 
     let model = Arc::new(Model {
         name,

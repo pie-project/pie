@@ -12,6 +12,7 @@ namespace pie_cuda_driver {
 
 void SwapPool::synchronize() const {
     if (stream_ != nullptr) CUDA_CHECK(cudaStreamSynchronize(stream_));
+    if (restore_stream_ != nullptr) CUDA_CHECK(cudaStreamSynchronize(restore_stream_));
 }
 
 SwapPool SwapPool::allocate(int num_layers,
@@ -37,6 +38,7 @@ SwapPool SwapPool::allocate(int num_layers,
     if (num_pages <= 0 || num_layers <= 0) return s;
 
     CUDA_CHECK(cudaStreamCreateWithFlags(&s.stream_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&s.restore_stream_, cudaStreamNonBlocking));
     s.host_pools_.reserve(num_layers);
     for (int layer = 0; layer < num_layers; ++layer) {
         std::vector<HostBuffer> pools;
@@ -64,6 +66,7 @@ SwapPool SwapPool::allocate_for_cache(const KvCache& cache, int num_pages)
     if (num_pages <= 0 || cache.num_layers() <= 0) return s;
 
     CUDA_CHECK(cudaStreamCreateWithFlags(&s.stream_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&s.restore_stream_, cudaStreamNonBlocking));
 
     s.host_pools_.reserve(cache.num_layers());
     for (int layer = 0; layer < cache.num_layers(); ++layer) {
@@ -91,9 +94,11 @@ SwapPool::SwapPool(SwapPool&& o) noexcept
       head_dim_(o.head_dim_),
       page_bytes_(o.page_bytes_),
       host_pools_(std::move(o.host_pools_)),
-      stream_(o.stream_) {
+      stream_(o.stream_),
+      restore_stream_(o.restore_stream_) {
     o.num_pages_ = 0;
     o.stream_ = nullptr;
+    o.restore_stream_ = nullptr;
 }
 
 SwapPool& SwapPool::operator=(SwapPool&& o) noexcept {
@@ -102,6 +107,7 @@ SwapPool& SwapPool::operator=(SwapPool&& o) noexcept {
             for (auto& p : layer) cudaFreeHost(p.data);
         }
         if (stream_) cudaStreamDestroy(stream_);
+        if (restore_stream_) cudaStreamDestroy(restore_stream_);
         num_layers_ = o.num_layers_;
         num_pages_ = o.num_pages_;
         page_size_ = o.page_size_;
@@ -110,8 +116,10 @@ SwapPool& SwapPool::operator=(SwapPool&& o) noexcept {
         page_bytes_ = o.page_bytes_;
         host_pools_ = std::move(o.host_pools_);
         stream_ = o.stream_;
+        restore_stream_ = o.restore_stream_;
         o.num_pages_ = 0;
         o.stream_ = nullptr;
+        o.restore_stream_ = nullptr;
     }
     return *this;
 }
@@ -121,6 +129,7 @@ SwapPool::~SwapPool() {
         for (auto& p : layer) cudaFreeHost(p.data);
     }
     if (stream_) cudaStreamDestroy(stream_);
+    if (restore_stream_) cudaStreamDestroy(restore_stream_);
 }
 
 namespace {
@@ -146,17 +155,32 @@ inline void* page_addr(void* base, std::uint32_t page_idx, std::size_t page_byte
 // end-to-end while pinned PCIe sustains ~0.07 ms/page). One
 // cudaMemcpyBatchAsync amortizes submission and lets the CUDA driver
 // coalesce the transfers.
+//
+// Toolkit portability: the batch API is CUDA 12.8+, but its signature changed
+// between 12.x and 13.x (12.x takes an extra `failIdx` out-param before the
+// stream), and the underlying `cuMemcpyBatchAsync` needs an r570+ driver — so
+// on a 12.x toolkit paired with an older driver it would fail at runtime even
+// if it compiled. CMakeLists still HINTS at cuda-12/12.8, so 12.x must build.
+// Below 13.0 we fall back to the per-copy loop the batch call replaced: same
+// semantics, just without the submission-overhead win.
 inline void submit_batch(const std::vector<void*>& dsts,
                          const std::vector<const void*>& srcs,
                          const std::vector<std::size_t>& sizes,
                          cudaStream_t stream) {
     if (dsts.empty()) return;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
     cudaMemcpyAttributes attrs{};
     attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     std::size_t attrs_index = 0;
     CUDA_CHECK(cudaMemcpyBatchAsync(
         const_cast<void* const*>(dsts.data()), srcs.data(), sizes.data(),
         dsts.size(), &attrs, &attrs_index, 1, stream));
+#else
+    for (std::size_t i = 0; i < dsts.size(); ++i) {
+        CUDA_CHECK(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i],
+                                   cudaMemcpyDefault, stream));
+    }
+#endif
 }
 
 }  // namespace
@@ -222,7 +246,7 @@ void SwapPool::copy_h2d_async(KvCache& cache,
             }
         }
     }
-    submit_batch(dsts, srcs, sizes, stream_);
+    submit_batch(dsts, srcs, sizes, restore_stream_);
 }
 
 void SwapPool::copy_d2d(KvCache& cache,

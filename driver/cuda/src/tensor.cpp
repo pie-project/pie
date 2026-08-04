@@ -84,27 +84,6 @@ void free_device_memory(DeviceMemoryBlock block) noexcept {
     sample_memory_callback();
 }
 
-DType dtype_from_safetensors(const std::string& s) {
-    if (s == "BF16") return DType::BF16;
-    if (s == "F16")  return DType::FP16;
-    if (s == "F32")  return DType::FP32;
-    if (s == "I8")   return DType::INT8;
-    if (s == "I32")  return DType::INT32;
-    if (s == "I64")  return DType::INT64;
-    if (s == "U8")   return DType::UINT8;
-    // FP8 carries its own dtype tag so the GEMM dispatcher can route to a
-    // native FP8 cuBLAS path (or a dequant-on-load fallback in mistral3).
-    if (s == "F8_E4M3") return DType::FP8_E4M3;
-    if (s == "F8_E5M2") return DType::FP8_E5M2;
-    // MXFP4 (F4_E2M1) rides on UINT8 storage: two nibbles per byte plus a
-    // side E8M0 scale tensor described by QuantSpec. Target lowering decides
-    // whether those bytes remain native QuantPacked runtime tensors or
-    // dequantize to BF16 during materialization.
-    if (s == "F4_E2M1") return DType::UINT8;
-    if (s == "F8_E8M0") return DType::UINT8;
-    throw std::runtime_error("unsupported safetensors dtype: " + s);
-}
-
 DeviceTensor DeviceTensor::allocate(DType dtype, std::vector<std::int64_t> shape) {
     DeviceTensor t;
     t.dtype_ = dtype;

@@ -533,6 +533,9 @@ pub enum PieLoaderScaleForm {
     RawE8M0 = 0,
     /// F32 multipliers; expand before the GEMM sees them.
     F32Factors = 1,
+    /// BF16 multipliers paired with the zero points named by
+    /// `zero_point_tensor_id`: an element is `code * scale + zero`.
+    Bf16AffineFactors = 2,
 }
 
 impl From<QuantGranularity> for PieLoaderQuantGranularity {
@@ -569,6 +572,7 @@ impl From<ScaleForm> for PieLoaderScaleForm {
         match value {
             ScaleForm::RawE8M0 => Self::RawE8M0,
             ScaleForm::F32Factors => Self::F32Factors,
+            ScaleForm::Bf16AffineFactors => Self::Bf16AffineFactors,
         }
     }
 }
@@ -578,6 +582,7 @@ impl From<PieLoaderScaleForm> for ScaleForm {
         match value {
             PieLoaderScaleForm::RawE8M0 => Self::RawE8M0,
             PieLoaderScaleForm::F32Factors => Self::F32Factors,
+            PieLoaderScaleForm::Bf16AffineFactors => Self::Bf16AffineFactors,
         }
     }
 }
@@ -588,6 +593,7 @@ impl TryFrom<u32> for PieLoaderScaleForm {
         Ok(match value {
             0 => Self::RawE8M0,
             1 => Self::F32Factors,
+            2 => Self::Bf16AffineFactors,
             other => return Err(other),
         })
     }
@@ -604,6 +610,12 @@ impl TryFrom<u32> for PieLoaderScaleForm {
 pub struct PieLoaderQuantAttachmentView {
     pub tensor_id: u32,
     pub scale_tensor_id: u32,
+    /// The tensor holding this weight's zero points, for an affine scheme, or
+    /// [`PIE_LOADER_NO_TENSOR`] for a symmetric one. An affine weight without it
+    /// cannot be dequantized, so a driver reading a `Bf16AffineFactors`
+    /// attachment is entitled to treat the sentinel as a malformed plan rather
+    /// than as an offset of zero.
+    pub zero_point_tensor_id: u32,
     pub granularity: PieLoaderQuantGranularity,
     pub group_size: u32,
     pub channel_axis: u32,
@@ -612,6 +624,49 @@ pub struct PieLoaderQuantAttachmentView {
 
 pub type PieLoaderQuantAttachmentSlice = PieLoaderSlice<PieLoaderQuantAttachmentView>;
 
+/// Where one instruction of a group's plan reads, for one instance.
+///
+/// The whole of what distinguishes instance `i` from instance 0: a group did
+/// not compile unless every other field of every instruction agreed across all
+/// of them. `instr_id` names the instruction in
+/// [`PieLoaderGroupView::plan`](PieLoaderGroupView) whose source extent these
+/// three fields replace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PieLoaderSourceBindingView {
+    pub instr_id: u32,
+    pub file_id: u32,
+    pub tensor_id: u32,
+    pub file_offset: u64,
+}
+
+pub type PieLoaderSourceBindingSlice = PieLoaderSlice<PieLoaderSourceBindingView>;
+
+/// A set of interchangeable tensors: one plan, `arity` instances.
+///
+/// The driver decides what to do with it. Running `plan` `arity` times into
+/// `arity` destinations makes the group resident, which is what a driver that
+/// has never heard of streaming should do; running it on demand into a bounded
+/// set of slots is streaming. The loader states only that the two are the same
+/// program.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieLoaderGroupView {
+    pub name: PieLoaderBytes,
+    pub arity: u32,
+    /// The program one instance runs, compiled at index 0. A whole plan, so it
+    /// goes to the same executor the resident load already uses.
+    pub plan: *const PieLoaderPlan,
+    /// `arity * bindings_per_instance` entries, instance-major. Instance `i`
+    /// owns `[i * bindings_per_instance, (i + 1) * bindings_per_instance)`.
+    pub bindings: PieLoaderSourceBindingSlice,
+    /// How many instructions of `plan` name a source. Zero only if the group's
+    /// plan reads nothing, which no group does.
+    pub bindings_per_instance: usize,
+}
+
+pub type PieLoaderGroupSlice = PieLoaderSlice<PieLoaderGroupView>;
+
 /// Which on-disk format a checkpoint file uses.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -619,6 +674,13 @@ pub enum PieLoaderCheckpointFormat {
     Safetensors = 0,
     Gguf = 1,
     Unknown = 2,
+    /// Appended: adding a value in the middle would renumber `Unknown` under
+    /// every driver already compiled against this header.
+    Zt = 3,
+    Npz = 4,
+    Pt = 5,
+    Hdf5 = 6,
+    Onnx = 7,
 }
 
 impl From<crate::types::CheckpointFormat> for PieLoaderCheckpointFormat {
@@ -627,6 +689,11 @@ impl From<crate::types::CheckpointFormat> for PieLoaderCheckpointFormat {
             crate::types::CheckpointFormat::Safetensors => Self::Safetensors,
             crate::types::CheckpointFormat::Gguf => Self::Gguf,
             crate::types::CheckpointFormat::Unknown => Self::Unknown,
+            crate::types::CheckpointFormat::Zt => Self::Zt,
+            crate::types::CheckpointFormat::Npz => Self::Npz,
+            crate::types::CheckpointFormat::Pt => Self::Pt,
+            crate::types::CheckpointFormat::Hdf5 => Self::Hdf5,
+            crate::types::CheckpointFormat::Onnx => Self::Onnx,
         }
     }
 }
@@ -763,16 +830,20 @@ pub enum PieLoaderStorageOp {
         /// constant the contract named — `__uint_as_float` on the CUDA side
         /// costs nothing and cannot round.
         transform_scale_factor_bits: u32,
-        /// Elements per factor along `transform_scale_axis` for a per-group
-        /// [`PieLoaderTileMapKind::Scale`]; zero when the factor is the uniform
-        /// constant above.
+        /// Elements of the operand per factor, on each axis, for a per-block
+        /// [`PieLoaderTileMapKind::Scale`]; empty when the factor is the
+        /// uniform constant above.
         ///
-        /// Non-zero is what tells the executor to read its factors from
+        /// Non-empty is what tells the executor to read its factors from
         /// `input_buffers[0]` — the operand the contract paired with the
         /// payload — instead of from `transform_scale_factor_bits`.
-        transform_scale_group: u32,
-        /// The axis `transform_scale_group` counts along.
-        transform_scale_axis: u8,
+        ///
+        /// One entry per axis of the destination, so a DeepSeek-style FP8
+        /// checkpoint's two-dimensional block scale is `[128, 128]` and the
+        /// ordinary row-wise case is `[1, 32]`. The executor already knows both
+        /// shapes, so this is a statement it can check rather than one it must
+        /// trust.
+        transform_scale_blocks: PieLoaderI64Slice,
     } = 2,
     CreateView {
         input_buffer: u32,
@@ -879,6 +950,9 @@ pub struct PieLoaderPlan {
     /// dump. Rendered by the loader so no driver keeps a second table of
     /// instruction names to fall out of step with this one.
     pub stats_json: PieLoaderBytes,
+    /// Interchangeable tensor sets, each compiled once. Empty for a plan whose
+    /// contract declared no group, which is every contract that predates them.
+    pub groups: PieLoaderGroupSlice,
     pub owner: *mut std::ffi::c_void,
 }
 

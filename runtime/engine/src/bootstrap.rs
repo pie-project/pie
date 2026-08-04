@@ -138,7 +138,18 @@ pub struct ModelConfig {
     pub name: String,
     pub arch_name: String,
     pub kv_page_size: usize,
+    /// The tokenizer file, for a model served from a HuggingFace snapshot.
+    ///
+    /// Only consulted when `artifact` is `None`. A served `.zt` carries its
+    /// tokenizer compiled, so there is no file to point at — this then holds
+    /// the artifact's own path, which is what the diagnostics want anyway.
     pub tokenizer_path: PathBuf,
+    /// Compiled metadata lifted out of a `.zt` artifact.
+    ///
+    /// Present means the runtime reads the tokenizer and the model facts from
+    /// here instead of parsing `tokenizer.json` and probing `config.json` at
+    /// every boot — which is the whole point of the artifact.
+    pub artifact: Option<pie_model::ArtifactMetadata>,
     pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
@@ -175,6 +186,13 @@ pub struct DriverConfig {
 pub struct SchedulerConfig {
     /// Wall-clock cap on a single forward-pass request, in seconds.
     pub request_timeout_secs: u64,
+    /// How long a lane holding the frame wait-set may go without submitting
+    /// before the leash drops it from the wait-set. Not a verdict. See
+    /// `crate::scheduler::configured_submit_deadline`.
+    pub submit_deadline_us: u64,
+    /// How long a lane may stay silent in total before its process is
+    /// terminated. See `crate::scheduler::configured_silence_timeout`.
+    pub silence_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +282,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         arch_name,
         kv_page_size,
         tokenizer_path,
+        artifact,
         drivers: driver_configs,
         scheduler,
     } = config.model;
@@ -320,6 +339,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         rs_caps,
         ptir_caps,
         tokenizer_path.clone(),
+        artifact,
     )?;
 
     let arena_kv_pages: Vec<usize> = driver_configs.iter().map(|d| d.total_pages).collect();
@@ -414,17 +434,20 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 // boots with `skip_tracing` and installs no subscriber, so
                 // a tracing event here would go nowhere.
                 println!(
-                    "[planner-trace] queue={} head_pages={} head_kind={} accum={} \
+                    "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
-                     parks={} serves={} evictions={} \
+                     parks={} serves={} evictions={} deferrals={} \
                      evict_rollbacks={} restores={} restore_failures={} gate_parks={} \
-                     hogs={} starved={} salvaged={} swapfull={}/{} e6_relax={} \
+                     hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} \
                      d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
                     d.queue.len(),
-                    d.queue.first().map_or(0, |w| w.pages),
-                    d.queue.first().map_or("-", |w| w.kind),
+                    d.unmet_queued,
+                    d.unmet_head_pages,
+                    d.unmet_head_kind,
+                    d.bypassable_entries,
+                    d.bypassable_pages,
                     d.accumulation,
                     d.device_pages_free,
                     d.device_pages_total,
@@ -436,12 +459,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.parks_total,
                     d.serves_total,
                     d.evictions_total,
+                    d.eviction_deferrals_total,
                     d.eviction_rollbacks_total,
                     d.restores_total,
                     d.restore_failures_total,
                     d.gate_parks_total,
                     d.hog_failures_total,
                     d.starvations_total,
+                    d.starvation_restarts_total,
                     d.salvages_total,
                     d.host_swap_exhaustions_total,
                     d.host_swap_unblocks_total,
@@ -467,6 +492,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     // (Context actor `context::spawn` removed — Phase 5. The unified arena
     // registry above is the per-model/driver physical home now.)
+    crate::scheduler::set_submit_deadline(std::time::Duration::from_micros(
+        scheduler.submit_deadline_us,
+    ));
+    crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
+        scheduler.silence_timeout_secs,
+    ));
     let scheduler_shutdown = crate::scheduler::spawn(
         &drivers,
         kv_page_size as u32,
@@ -583,8 +614,11 @@ fn verify_config(config: &Config) -> Result<()> {
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
 
     let model = &config.model;
+    // An artifact carries its tokenizer inside it, so there is no file to
+    // check for — the artifact itself was already opened to lift the metadata
+    // out.
     ensure!(
-        model.tokenizer_path.exists(),
+        model.artifact.is_some() || model.tokenizer_path.exists(),
         "Model {:?}: tokenizer not found at {:?}",
         model.name,
         model.tokenizer_path
@@ -614,6 +648,24 @@ fn verify_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Per-component ceiling on the wasmtime resource classes a COMPONENT
+/// multiplies. A component is not one core module: a Rust `wasm32-wasip2`
+/// guest is linked from the guest module plus the preview1 adapter plus a
+/// shim, and instantiating it takes one core-instance slot per module and one
+/// table slot per module that defines a table. Measured over all 34 inferlets
+/// pie ships, every one is exactly 3 core instances / 2 tables / 1 memory /
+/// 1 fiber stack.
+///
+/// Declaring the ceiling matters as much as its value: without it, a guest
+/// built from more modules than expected does not fail at instantiation, it
+/// silently divides the engine's effective inferlet capacity and then fails
+/// under load at a concurrency that depends on the traffic. With it, wasmtime
+/// rejects such a guest deterministically and names the limit.
+///
+/// The headroom over the measured 3/2 is cheap: these pools cost reserved
+/// address space for instance metadata, not committed memory or KV.
+const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
+
 fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
     // wasmtime 46: `async_support` is a deprecated no-op (async is always
@@ -621,17 +673,35 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     // no explicit flags are needed to enable async host calls / fibers.
 
     // Every wasmtime knob comes from the caller — Python is the source
-    // of truth for defaults. The `wasm_max_instances` knob covers four
-    // wasmtime resource classes (pie uses one of each per inferlet).
+    // of truth for defaults. `wasm_max_instances` is a cap on concurrent
+    // INFERLETS, and each pool below is sized so that it can actually seat
+    // that many.
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
-    // Lockstep bump on the five "total_*" caps. wasmtime defaults all of them
-    // to 1000; pie uses exactly one of each per inferlet (one core instance,
-    // one component instance, one memory, one table, one async fiber stack).
-    pooling_config.total_core_instances(runtime.wasm_max_instances);
+    // One per inferlet, exactly: pie runs one component instance in one
+    // store with one linear memory and one async fiber stack. These are also
+    // the expensive pools — a memory slot reserves a whole wasm32 range so
+    // bounds checks can be elided — so they must not be inflated.
     pooling_config.total_component_instances(runtime.wasm_max_instances);
     pooling_config.total_memories(runtime.wasm_max_instances);
-    pooling_config.total_tables(runtime.wasm_max_instances);
     pooling_config.total_stacks(runtime.wasm_max_instances);
+    // Several per inferlet, however many core modules the component was
+    // linked from. Sizing these at `wasm_max_instances` capped pie at
+    // `wasm_max_instances / 3` concurrent inferlets: at 512-wide admission,
+    // where prewarm + bind hold ~1536 live inferlets, a 4096 pool ran out of
+    // core instances (1536 x 3 = 4608) and 55% of requests died with
+    // "maximum concurrent limit of 4096 for core instances reached".
+    pooling_config.max_core_instances_per_component(CORE_RESOURCES_PER_COMPONENT);
+    pooling_config.max_tables_per_component(CORE_RESOURCES_PER_COMPONENT);
+    pooling_config.total_core_instances(
+        runtime
+            .wasm_max_instances
+            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
+    );
+    pooling_config.total_tables(
+        runtime
+            .wasm_max_instances
+            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
+    );
     pooling_config.max_memory_size(runtime.wasm_max_memory_mb.saturating_mul(1024 * 1024));
     pooling_config
         .linear_memory_keep_resident(runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024));

@@ -4,9 +4,12 @@
 //! [`LoadPlan`](crate::plan::LoadPlan) into it, and `entry` holds the
 //! `extern "C"` functions the driver calls. `contract` and `checkpoint` read the
 //! two inputs back the other way — what the driver asks for, and which
-//! checkpoint to ask it of. The generated header (`loader/include/pie_loader.h`)
-//! is the C view of exactly those five files; `view` is Rust-side borrowing
-//! helpers over them and publishes nothing.
+//! checkpoint to ask it of. `weight_store` is a surface of its own: the
+//! materialized-weight artifact, which is about finished device memory rather
+//! than about compiling anything, and carries its own entry points for that
+//! reason. The generated header (`loader/include/pie_loader.h`) is the C view of
+//! exactly those six files; `view` is Rust-side borrowing helpers over them and
+//! publishes nothing.
 //!
 //! This is the only boundary the design has (`architecture.md` §10). There is
 //! no serialized form: a plan is compiled and executed in one process, so a
@@ -19,6 +22,7 @@ pub mod contract;
 pub mod entry;
 pub mod types;
 pub mod view;
+pub mod weight_store;
 
 pub use entry::{
     PieLoaderDiagnostic, PieLoaderDiagnostics, PieLoaderSeverity, PieLoaderStatus,

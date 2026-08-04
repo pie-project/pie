@@ -1,8 +1,10 @@
 # oracle dump: pie_cuda_driver::pipeline::generated::emit_singleton_region_cuda
 # source of truth: compiler/codegen/src/cuda/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 19
+# emitter_version: 21
 # @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
 # cases: 263
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: cumsum/cumprod widened from F32-only to every numeric dtype; the m1 runtime's scan block now branches on the operand dtype instead of loading every lane through m1_load_f. The oracle dumps change only because that block is embedded verbatim in every emitted source -- no emitted structure moved, and the f32 path is byte-for-byte the arithmetic the oracle recorded.
 === tag_0x00
 entry_name: ptir_singleton_0x00
 ok: false
@@ -16,7 +18,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x01
 op_tag: 0x01
-source: bytes=45755 prefix=@runtime tail_bytes=478
+source: bytes=46713 prefix=@runtime tail_bytes=478
 
 extern "C" __global__ void ptir_singleton_0x01(
     M1Status* status,
@@ -40,7 +42,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x02
 op_tag: 0x02
-source: bytes=45755 prefix=@runtime tail_bytes=478
+source: bytes=46713 prefix=@runtime tail_bytes=478
 
 extern "C" __global__ void ptir_singleton_0x02(
     M1Status* status,
@@ -64,7 +66,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x03
 op_tag: 0x03
-source: bytes=45755 prefix=@runtime tail_bytes=478
+source: bytes=46713 prefix=@runtime tail_bytes=478
 
 extern "C" __global__ void ptir_singleton_0x03(
     M1Status* status,
@@ -88,7 +90,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x04
 op_tag: 0x04
-source: bytes=45755 prefix=@runtime tail_bytes=478
+source: bytes=46713 prefix=@runtime tail_bytes=478
 
 extern "C" __global__ void ptir_singleton_0x04(
     M1Status* status,
@@ -112,7 +114,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x05
 op_tag: 0x05
-source: bytes=45755 prefix=@runtime tail_bytes=478
+source: bytes=46713 prefix=@runtime tail_bytes=478
 
 extern "C" __global__ void ptir_singleton_0x05(
     M1Status* status,
@@ -136,7 +138,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x06
 op_tag: 0x06
-source: bytes=45755 prefix=@runtime tail_bytes=478
+source: bytes=46713 prefix=@runtime tail_bytes=478
 
 extern "C" __global__ void ptir_singleton_0x06(
     M1Status* status,
@@ -160,7 +162,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x07
 op_tag: 0x07
-source: bytes=45755 prefix=@runtime tail_bytes=478
+source: bytes=46713 prefix=@runtime tail_bytes=478
 
 extern "C" __global__ void ptir_singleton_0x07(
     M1Status* status,
@@ -240,7 +242,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x10
 op_tag: 0x10
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x10(
     M1Status* status,
@@ -264,7 +266,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x11
 op_tag: 0x11
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x11(
     M1Status* status,
@@ -288,7 +290,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x12
 op_tag: 0x12
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x12(
     M1Status* status,
@@ -312,7 +314,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x13
 op_tag: 0x13
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x13(
     M1Status* status,
@@ -336,7 +338,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x14
 op_tag: 0x14
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x14(
     M1Status* status,
@@ -360,7 +362,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x15
 op_tag: 0x15
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x15(
     M1Status* status,
@@ -384,7 +386,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x16
 op_tag: 0x16
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x16(
     M1Status* status,
@@ -408,7 +410,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x17
 op_tag: 0x17
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x17(
     M1Status* status,
@@ -432,7 +434,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x18
 op_tag: 0x18
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x18(
     M1Status* status,
@@ -456,7 +458,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x19
 op_tag: 0x19
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x19(
     M1Status* status,
@@ -480,7 +482,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x1a
 op_tag: 0x1a
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x1a(
     M1Status* status,
@@ -504,7 +506,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x1b
 op_tag: 0x1b
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x1b(
     M1Status* status,
@@ -528,7 +530,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x1c
 op_tag: 0x1c
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x1c(
     M1Status* status,
@@ -552,7 +554,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x1d
 op_tag: 0x1d
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x1d(
     M1Status* status,
@@ -576,7 +578,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x1e
 op_tag: 0x1e
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x1e(
     M1Status* status,
@@ -600,7 +602,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x1f
 op_tag: 0x1f
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x1f(
     M1Status* status,
@@ -624,7 +626,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x20
 op_tag: 0x20
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x20(
     M1Status* status,
@@ -753,7 +755,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x30
 op_tag: 0x30
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x30(
     M1Status* status,
@@ -777,7 +779,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x31
 op_tag: 0x31
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x31(
     M1Status* status,
@@ -801,7 +803,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x32
 op_tag: 0x32
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x32(
     M1Status* status,
@@ -825,7 +827,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x33
 op_tag: 0x33
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x33(
     M1Status* status,
@@ -877,7 +879,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x38
 op_tag: 0x38
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x38(
     M1Status* status,
@@ -901,7 +903,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x39
 op_tag: 0x39
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x39(
     M1Status* status,
@@ -925,7 +927,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x3a
 op_tag: 0x3a
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x3a(
     M1Status* status,
@@ -984,7 +986,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x40
 op_tag: 0x40
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x40(
     M1Status* status,
@@ -1008,7 +1010,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x41
 op_tag: 0x41
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x41(
     M1Status* status,
@@ -1130,7 +1132,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x50
 op_tag: 0x50
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x50(
     M1Status* status,
@@ -1154,7 +1156,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x51
 op_tag: 0x51
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x51(
     M1Status* status,
@@ -1199,7 +1201,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x55
 op_tag: 0x55
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x55(
     M1Status* status,
@@ -1237,7 +1239,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x58
 op_tag: 0x58
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x58(
     M1Status* status,
@@ -1310,7 +1312,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x60
 op_tag: 0x60
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x60(
     M1Status* status,
@@ -1334,7 +1336,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x61
 op_tag: 0x61
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x61(
     M1Status* status,
@@ -1358,7 +1360,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x62
 op_tag: 0x62
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x62(
     M1Status* status,
@@ -1382,7 +1384,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x63
 op_tag: 0x63
-source: bytes=45756 prefix=@runtime tail_bytes=479
+source: bytes=46714 prefix=@runtime tail_bytes=479
 
 extern "C" __global__ void ptir_singleton_0x63(
     M1Status* status,
@@ -1406,7 +1408,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x64
 op_tag: 0x64
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x64(
     M1Status* status,
@@ -1430,7 +1432,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x65
 op_tag: 0x65
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x65(
     M1Status* status,
@@ -1454,7 +1456,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x66
 op_tag: 0x66
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x66(
     M1Status* status,
@@ -1478,7 +1480,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x67
 op_tag: 0x67
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x67(
     M1Status* status,
@@ -1502,7 +1504,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x68
 op_tag: 0x68
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x68(
     M1Status* status,
@@ -1575,7 +1577,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x70
 op_tag: 0x70
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x70(
     M1Status* status,
@@ -1599,7 +1601,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x71
 op_tag: 0x71
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x71(
     M1Status* status,
@@ -1728,7 +1730,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x81
 op_tag: 0x81
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x81(
     M1Status* status,
@@ -1850,7 +1852,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x90
 op_tag: 0x90
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x90(
     M1Status* status,
@@ -1874,7 +1876,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x91
 op_tag: 0x91
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x91(
     M1Status* status,
@@ -1898,7 +1900,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0x92
 op_tag: 0x92
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0x92(
     M1Status* status,
@@ -2013,7 +2015,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0xa0
 op_tag: 0xa0
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0xa0(
     M1Status* status,
@@ -2037,7 +2039,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0xa1
 op_tag: 0xa1
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0xa1(
     M1Status* status,
@@ -2061,7 +2063,7 @@ ok: true
 error: 
 entry_name: ptir_singleton_0xa2
 op_tag: 0xa2
-source: bytes=45757 prefix=@runtime tail_bytes=480
+source: bytes=46715 prefix=@runtime tail_bytes=480
 
 extern "C" __global__ void ptir_singleton_0xa2(
     M1Status* status,
@@ -2736,7 +2738,7 @@ ok: true
 error: 
 entry_name: ptir_fused_0123456789abcdef_r0
 op_tag: 0x10
-source: bytes=45767 prefix=@runtime tail_bytes=490
+source: bytes=46725 prefix=@runtime tail_bytes=490
 
 extern "C" __global__ void ptir_fused_0123456789abcdef_r0(
     M1Status* status,
@@ -2788,7 +2790,7 @@ ok: true
 error: 
 entry_name: _underscore_start
 op_tag: 0x10
-source: bytes=45754 prefix=@runtime tail_bytes=477
+source: bytes=46712 prefix=@runtime tail_bytes=477
 
 extern "C" __global__ void _underscore_start(
     M1Status* status,
@@ -2812,7 +2814,7 @@ ok: true
 error: 
 entry_name: A
 op_tag: 0x10
-source: bytes=45738 prefix=@runtime tail_bytes=461
+source: bytes=46696 prefix=@runtime tail_bytes=461
 
 extern "C" __global__ void A(
     M1Status* status,

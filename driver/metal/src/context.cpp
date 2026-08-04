@@ -1,4 +1,4 @@
-#include <pie_native/step_launch.hpp>
+#include <pie/driver/fire/step.hpp>
 #include "context.hpp"
 
 #include <algorithm>
@@ -11,6 +11,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -26,15 +27,19 @@
 #include <unistd.h>
 
 #include <nlohmann/json.hpp>
+
+#include "model_facts.hpp"
 #include <toml++/toml.hpp>
 
-#include "pie_native/launch_view.hpp"
+#include "pie/driver/fire/view.hpp"
 #include "loader/load_plan.hpp"
 #include "pipeline/interp.hpp"
 #include "pipeline/descriptor_resolve.hpp"
 #include "pipeline/registry.hpp"
 #include "batch/compose.hpp"
 #include "batch/forward.hpp"
+#include "model/qwen3_5/geometry_facts.hpp"
+#include "batch/simple_family.hpp"
 #include "batch/scratch.hpp"
 #include "batch/worker.hpp"
 #include "decode_abi.hpp"
@@ -77,7 +82,25 @@ struct RuntimeConfig {
 
 struct ModelConfig {
     std::string hf_path;
+
+    // Path to a `pie.model/1` descriptor: HuggingFace's `config.json`
+    // normalized once at import, written beside this TOML by the worker.
+    //
+    // Empty for a snapshot that predates the artifact format, in which case
+    // `read_model_facts` parses `hf_path/config.json` as before. Same
+    // arrangement as the CUDA driver's `ModelConfig::descriptor`.
+    std::string descriptor;
+
     std::string backend = "metal:0";
+    // Page routed experts in from a mapping rather than keeping them
+    // resident. Off by default: it trades resident memory for page faults,
+    // which only pays when the weights do not comfortably fit.
+    bool stream_routed_experts = false;
+    // How many bytes the routed experts may occupy on the device. Zero keeps
+    // the whole bank resident. Non-zero is the only setting under which a
+    // model can exceed the machine, and it costs a submit-and-wait per
+    // mixture layer -- set it when the alternative is not running at all.
+    std::uint64_t expert_slab_bytes = 0;
 };
 
 struct BatchingConfig {
@@ -104,7 +127,14 @@ Config load_config(const std::filesystem::path& path) {
     Config config;
     if (auto model = tbl["model"].as_table()) {
         config.model.hf_path = (*model)["hf_path"].value_or(std::string{});
+        config.model.descriptor = (*model)["descriptor"].value_or(std::string{});
         config.model.backend = (*model)["backend"].value_or(config.model.backend);
+        config.model.stream_routed_experts =
+            (*model)["stream_routed_experts"].value_or(
+                config.model.stream_routed_experts);
+        config.model.expert_slab_bytes = std::uint64_t(
+            (*model)["expert_slab_bytes"].value_or(
+                std::int64_t(config.model.expert_slab_bytes)));
     }
     if (auto batching = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {
@@ -167,55 +197,6 @@ void publish_terminal(PieTerminalCell* cell, std::uint32_t outcome) {
     std::atomic_ref<std::uint32_t>(cell->outcome).store(outcome, std::memory_order_release);
 }
 
-// Slice member `m`'s forward fields out of the batch-wide CSR view (§5.2).
-// `member_count` is `members.size()` for THIS launch — every CSR indptr
-// slice must carry exactly `member_count + 1` entries when present.
-//
-// `resolved` (Phase 2, C3): when non-null, the member's token/position/KV-
-// page/readout fields come from the descriptor-resolved `FireGeometry`
-// INSTEAD of the wire CSR slices — a device-geometry program's wire span is
-// an empty placeholder (`pie_native::LaunchView`'s own doc comment); the
-// channel-resolved geometry is the only truth for those fields. The
-// recurrent-state slot bookkeeping (rs_slot_id/rs_reset) is unrelated to
-// device-geometry classification and always comes from the wire.
-struct ModelFacts {
-    std::uint32_t vocab_size = 32000;
-    std::uint32_t max_model_len = 8192;
-    std::string arch_name = "llama";
-    bool has_linear_attn = false;
-    // Qwen3.5/3.6 carry the RoPE hyperparameters in a nested `rope_parameters`
-    // object rather than at the top level, so a reader that only knows the flat
-    // key finds nothing and silently keeps its default. Nothing fails: the
-    // rotated channels just come out wrong, and the error compounds layer over
-    // layer until the activations saturate. tests/mlx/loader/hf_config.cpp
-    // reads the nested form; this must agree with it.
-    float rope_theta = 1.0e7f;
-    float partial_rotary_factor = 0.25f;
-    // ── Gemma 4 ──
-    // Its shape is per attention type, and `rope_parameters` is nested one
-    // level deeper again: `{full_attention: {...}, sliding_attention: {...}}`
-    // rather than one object for the whole stack. Defaults are E2B's.
-    int g4_num_hidden_layers = 0;   // non-zero marks "this config was read as gemma4"
-    int g4_hidden_size = 0;
-    int g4_intermediate_size = 0;
-    int g4_num_attention_heads = 0;
-    int g4_num_key_value_heads = 0;
-    int g4_head_dim = 0;            // sliding layers
-    int g4_global_head_dim = 0;     // full layers
-    int g4_sliding_window = 0;
-    int g4_num_kv_shared_layers = 0;
-    int g4_per_layer_emb_dim = 0;   // hidden_size_per_layer_input
-    int g4_full_attn_interval = 0;  // derived from `layer_types`
-    bool g4_double_wide_mlp = false;
-    float g4_final_softcap = 0.0f;
-    float g4_rope_theta_full = 1.0e6f;
-    float g4_rope_theta_sliding = 1.0e4f;
-    float g4_full_partial_rotary = 0.25f;
-    // Which storage schema this driver authors against. Parsed here because
-    // this is already the driver's one read of `config.json`; the loader no
-    // longer opens it (`loader/architecture.md` §10.4).
-    std::string model_type;
-};
 
 // Phase 1a (metal_ptir_plan.md §5.4, §12 "Caps honesty"): the Metal forward
 // is ONE resident linear-sequence MetalExecutor — a fixed
@@ -234,167 +215,116 @@ std::uint32_t effective_total_pages(const Config& cfg, bool rs_cache_required) {
                              : cfg.batching.total_pages;
 }
 
-ModelFacts read_model_facts(const std::string& hf_path) {
-    ModelFacts facts;
-    if (hf_path.empty()) return facts;
-    const std::filesystem::path cfg =
-        std::filesystem::path(hf_path) / "config.json";
-    std::ifstream f(cfg);
-    if (!f) return facts;
-    try {
-        nlohmann::json j;
-        f >> j;
-        // A multimodal release nests the text decoder's facts under
-        // `text_config` and leaves the root to the wrapper. `model_type` and
-        // the linear-attention probe below already read through that view;
-        // `vocab_size` and `max_position_embeddings` used to read the root
-        // only, so on the very family this driver targets they silently kept
-        // their defaults and the vocab cross-check rejected the checkpoint as
-        // "32000 != 248320".
-        const nlohmann::json& tc =
-            (j.contains("text_config") && j["text_config"].is_object())
-                ? j["text_config"]
-                : j;
-        const auto u32_of = [](const nlohmann::json& obj, const char* key,
-                               std::uint32_t& out) {
-            if (obj.contains(key) && obj[key].is_number_integer()) {
-                out = obj[key].get<std::uint32_t>();
-                return true;
-            }
-            return false;
-        };
-        if (!u32_of(tc, "vocab_size", facts.vocab_size)) {
-            u32_of(j, "vocab_size", facts.vocab_size);
-        }
-        if (!u32_of(tc, "max_position_embeddings", facts.max_model_len)) {
-            u32_of(j, "max_position_embeddings", facts.max_model_len);
-        }
-        const auto f32_of = [](const nlohmann::json& obj, const char* key,
-                               float& out) {
-            if (obj.contains(key) && obj[key].is_number()) {
-                out = obj[key].get<float>();
-                return true;
-            }
-            return false;
-        };
-        // `rope_parameters` first (the current schema), then the flat key.
-        const nlohmann::json* rp = nullptr;
-        for (const nlohmann::json* scope : {&tc, const_cast<const nlohmann::json*>(&j)}) {
-            if (scope->contains("rope_parameters") &&
-                (*scope)["rope_parameters"].is_object()) {
-                rp = &(*scope)["rope_parameters"];
-                break;
-            }
-        }
-        if (rp == nullptr || !f32_of(*rp, "rope_theta", facts.rope_theta)) {
-            if (!f32_of(tc, "rope_theta", facts.rope_theta)) {
-                f32_of(j, "rope_theta", facts.rope_theta);
-            }
-        }
-        if (rp == nullptr ||
-            !f32_of(*rp, "partial_rotary_factor", facts.partial_rotary_factor)) {
-            if (!f32_of(tc, "partial_rotary_factor", facts.partial_rotary_factor)) {
-                f32_of(j, "partial_rotary_factor", facts.partial_rotary_factor);
-            }
-        }
-        if (j.contains("architectures") && j["architectures"].is_array() &&
-            !j["architectures"].empty()) {
-            std::string a = j["architectures"][0].get<std::string>();
-            for (auto& c : a) c = static_cast<char>(std::tolower(c));
-            const std::string suffix = "forcausallm";
-            if (a.size() > suffix.size() &&
-                a.compare(a.size() - suffix.size(), suffix.size(), suffix) == 0) {
-                a.erase(a.size() - suffix.size());
-            }
-            if (!a.empty()) facts.arch_name = a;
-        }
-        if (tc.contains("linear_num_value_heads") &&
-            tc["linear_num_value_heads"].is_number_integer() &&
-            tc["linear_num_value_heads"].get<int>() > 0) {
-            facts.has_linear_attn = true;
-        }
-        if (tc.contains("layer_types") && tc["layer_types"].is_array()) {
-            for (const auto& t : tc["layer_types"]) {
-                if (t.is_string() && t.get<std::string>() == "linear_attention") {
-                    facts.has_linear_attn = true;
-                    break;
-                }
-            }
-        }
-        const auto str_of = [](const nlohmann::json& obj, const char* key) {
-            return obj.contains(key) && obj[key].is_string()
-                       ? obj[key].get<std::string>()
-                       : std::string{};
-        };
-        facts.model_type = str_of(tc, "model_type");
-        if (facts.model_type.empty()) facts.model_type = str_of(j, "model_type");
 
-        // ── Gemma 4 ──
-        // Read only when the config says so, so nothing here can perturb the
-        // family that already works.
-        if (facts.model_type == "gemma4" || facts.model_type == "gemma4_text") {
-            const auto i32_of = [](const nlohmann::json& obj, const char* key, int& out) {
-                if (obj.contains(key) && obj[key].is_number_integer()) {
-                    out = obj[key].get<int>();
-                    return true;
-                }
-                return false;
-            };
-            i32_of(tc, "num_hidden_layers", facts.g4_num_hidden_layers);
-            i32_of(tc, "hidden_size", facts.g4_hidden_size);
-            i32_of(tc, "intermediate_size", facts.g4_intermediate_size);
-            i32_of(tc, "num_attention_heads", facts.g4_num_attention_heads);
-            i32_of(tc, "num_key_value_heads", facts.g4_num_key_value_heads);
-            i32_of(tc, "head_dim", facts.g4_head_dim);
-            i32_of(tc, "global_head_dim", facts.g4_global_head_dim);
-            i32_of(tc, "sliding_window", facts.g4_sliding_window);
-            i32_of(tc, "num_kv_shared_layers", facts.g4_num_kv_shared_layers);
-            i32_of(tc, "hidden_size_per_layer_input", facts.g4_per_layer_emb_dim);
-            if (tc.contains("use_double_wide_mlp") && tc["use_double_wide_mlp"].is_boolean()) {
-                facts.g4_double_wide_mlp = tc["use_double_wide_mlp"].get<bool>();
-            }
-            f32_of(tc, "final_logit_softcapping", facts.g4_final_softcap);
-            // Per-attention-type rope.
-            if (rp != nullptr) {
-                if (rp->contains("full_attention") && (*rp)["full_attention"].is_object()) {
-                    const auto& full = (*rp)["full_attention"];
-                    f32_of(full, "rope_theta", facts.g4_rope_theta_full);
-                    f32_of(full, "partial_rotary_factor", facts.g4_full_partial_rotary);
-                }
-                if (rp->contains("sliding_attention") && (*rp)["sliding_attention"].is_object()) {
-                    f32_of((*rp)["sliding_attention"], "rope_theta",
-                           facts.g4_rope_theta_sliding);
-                }
-            }
-            // The full-attention schedule, derived from `layer_types` rather
-            // than assumed: the interval is the distance between the first two
-            // full-attention layers, and the list is then checked against it so
-            // an irregular stack is refused instead of silently mis-scheduled.
-            if (tc.contains("layer_types") && tc["layer_types"].is_array()) {
-                std::vector<int> full;
-                int idx = 0;
-                for (const auto& t : tc["layer_types"]) {
-                    if (t.is_string() && t.get<std::string>() == "full_attention") {
-                        full.push_back(idx);
-                    }
-                    ++idx;
-                }
-                if (!full.empty()) {
-                    const int interval = full[0] + 1;
-                    bool regular = true;
-                    for (std::size_t k = 0; k < full.size(); ++k) {
-                        regular = regular &&
-                                  full[k] == static_cast<int>(k + 1) * interval - 1;
-                    }
-                    facts.g4_full_attn_interval = regular ? interval : -1;
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "[pie-driver-metal] warning: failed to parse "
-                  << cfg.string() << ": " << e.what() << "\n";
+/// How many rows per fire a `SimpleFamilyEngine` family can afford.
+///
+/// Derived from the activation pool that will actually be allocated, not from
+/// a per-row price. The shipped price charges every prefill row a `vocab * 2`
+/// slice of logits, which stopped being true when `Kind::RowGather` moved the
+/// LM head onto the sampled rows -- and it is a HARD bound, because a prompt
+/// longer than this is refused rather than chunked. Measured before this
+/// change: a 650-token prompt failed on all three families.
+///
+/// One function, called by the capabilities pass and by setup, because a
+/// capability advertising more rows than setup allocates is a fire the driver
+/// accepts and cannot hold.
+///
+/// Only these families. qwen3.5's bound is STRUCTURAL, not a memory budget:
+/// its prefill claims `kPrefillOrdinalStride` argument-table ordinals PER ROW,
+/// so `kPrefillOrdinalMaxRows` rows is where that range meets PTIR's base --
+/// a collision that has happened once already and read as "no argument table
+/// bound for ordinal=100038". These families bind ONE DAG and pass the row
+/// count as a launch parameter, so their ordinal use does not grow with rows
+/// and only memory bounds them.
+std::uint32_t simple_family_row_budget(const Config& cfg, const ModelFacts& facts);
+
+/// The rows-per-fire this config should ADVERTISE and then set up with.
+///
+/// One function, called from both places, because the capability and the setup
+/// must name the same number: advertising more rows than setup allocates is a
+/// fire the driver accepts and cannot hold.
+///
+/// Three answers. gemma4 and gpt-oss batch, and their bound is the memory their
+/// pool costs, so it is derived. Everything else keeps the config's.
+std::uint32_t simple_family_max_forward_tokens(const Config& cfg, const ModelFacts& facts) {
+    switch (pie::metal::model::model_family_of(facts.model_type)) {
+        case pie::metal::model::ModelFamily::Gemma4:
+        case pie::metal::model::ModelFamily::GptOss:
+        // Llama used to advertise one row here, because its engine was
+        // ring-backed and refused the batch path. It pages and batches now, so
+        // it is budgeted like the others -- and it is the family that gains the
+        // most from a real budget, because a batch of rows on a dense
+        // projection is a GEMM rather than R matvecs re-reading the weight.
+        case pie::metal::model::ModelFamily::Llama:
+            return simple_family_row_budget(cfg, facts);
+        case pie::metal::model::ModelFamily::Qwen35:
+        case pie::metal::model::ModelFamily::Unknown:
+            break;
     }
-    return facts;
+    return cfg.batching.max_forward_tokens;
+}
+
+
+/// How much heap the activation pool may spend on rows.
+///
+/// One number for all three families, because rows mean the same thing to all
+/// three: the longest prompt the driver will ACCEPT, since a longer one is
+/// refused rather than chunked. `kPagedForwardRowBudgetBytes` holds it, and
+/// this is the only place it is read.
+///
+/// It is 1 GB rather than the 384 MB it began as, and the difference is free.
+/// Measured through `pie serve`:
+///
+///   gemma4    384 MB ->  256 rows (351 MB pool), 1 GB -> 4096 rows (984 MB)
+///             peak RSS 2.84 GB at BOTH
+///   qwen3.5   384 MB ->  566 rows,               1 GB -> 1024 rows
+///             peak RSS 2.36 vs 2.35 GB, same wall clock
+///
+/// A Metal heap allocation is a reservation and a fire touches only the rows it
+/// has. `PIE_METAL_ROW_BUDGET_MB` lowers it for a machine where the reservation
+/// is itself the problem -- and lowering it is visible exactly where it should
+/// be: a 650-token prompt that qwen3.5 completes at 1 GB is refused at 384 MB.
+std::uint64_t row_budget_bytes() {
+    if (const char* e = std::getenv("PIE_METAL_ROW_BUDGET_MB"); e != nullptr && *e != '\0') {
+        const long v = std::atol(e);
+        if (v > 0) return std::uint64_t(v) << 20;
+    }
+    return pie::metal::batch::kPagedForwardRowBudgetBytes;
+}
+
+std::uint32_t simple_family_row_budget(const Config& cfg, const ModelFacts& facts) {
+    pie::metal::batch::SetupConfig probe;
+    fill_family_geometry(probe, facts);
+    probe.vocab_size = facts.vocab_size;
+    probe.max_forward_requests = cfg.batching.max_forward_requests;
+    const int max_ctx =
+        int(facts.max_model_len > 0 ? facts.max_model_len : kMetalPhase1aMaxCtxTokens);
+    const std::uint32_t derived =
+        pie::metal::batch::SimpleFamilyEngine::max_forward_tokens_for_budget(
+            pie::metal::model::model_family_of(facts.model_type), probe, max_ctx,
+            row_budget_bytes());
+    const std::uint32_t want = cfg.batching.max_forward_tokens;
+    const std::uint32_t rows = std::min(want == 0 ? derived : want, derived);
+    // Said once, because a refused prompt reports only the limit and not how
+    // the limit was arrived at. Caps runs on the calling thread and setup on
+    // the worker, so the guard is a magic static rather than a plain bool.
+    [[maybe_unused]] static const bool announced = [&] {
+        const auto family = pie::metal::model::model_family_of(facts.model_type);
+        pie::metal::batch::SetupConfig at = probe;
+        at.max_forward_tokens = 1;
+        const std::uint64_t floor =
+            pie::metal::batch::SimpleFamilyEngine::extra_heap_bytes(family, at, max_ctx);
+        at.max_forward_tokens = rows;
+        const std::uint64_t full =
+            pie::metal::batch::SimpleFamilyEngine::extra_heap_bytes(family, at, max_ctx);
+        std::fprintf(stderr,
+                     "[pie-metal] rows per fire: %u (activation pool %.0f MB of a %.0f MB "
+                     "budget; a longer prompt is refused, not chunked)\n",
+                     rows, double(full - floor) / (1024.0 * 1024.0),
+                     double(row_budget_bytes()) / (1024.0 * 1024.0));
+        return true;
+    }();
+    return rows;
 }
 
 std::string build_caps_json(const Config& cfg,
@@ -419,7 +349,7 @@ std::string build_caps_json(const Config& cfg,
         return executor::paged_max_forward_tokens(
             facts.vocab_size != 0 ? facts.vocab_size : std::uint32_t(g.vocab),
             std::uint32_t(backend::scratch_widest_elems(g)),
-            executor::kPagedScratchColors);
+            executor::kPagedScratchColors, row_budget_bytes());
     }();
     // Phase 1b: the GDN recurrent-state region is genuinely sized for
     // `batch::kPhase1bRsSlots` addressable slots (heap_layout.hpp
@@ -430,34 +360,49 @@ std::string build_caps_json(const Config& cfg,
     // request synchronously; the extra slots exist purely as addressable
     // copy_state destinations/sources (e.g. warm-starting/branching a
     // resident sequence's state), not concurrent forward execution.
-    const std::uint32_t rs_cache_slots =
-        rs_cache_required ? executor::kPhase1bRsSlots : 0u;
-    // Static per-slot byte formula mirrors MetalExecutor::rs_slot_bytes()
-    // exactly (conv_state + conv_state_out + recurrent_state per GDN layer),
-    // computed here from the shipped qwen3.6 DecodeGeometry{} defaults
-    // directly since no live executor/decoder exists yet at capabilities-
-    // build time (mirrors how vocab_size is cross-checked without a live
-    // decoder).
+    // The slot count and the slot SIZE, both from this checkpoint's geometry.
+    //
+    // Both were read off a default-constructed `DecodeGeometry` -- one preview
+    // model's dimensions, compiled in as the defaults -- so every other member
+    // of the family advertised a slot size that was not its own, and reserved
+    // a count chosen for a slot three times smaller than the one it has.
+    // Qwen3.5-35B-A3B's sixty-four slots are 4.3 GiB, which is most of the
+    // reason it did not fit a machine that would otherwise have held it.
+    //
+    // `rs_slots_for_budget` is the SAME function setup calls, because a
+    // capability advertising more slots than setup allocates is a request the
+    // driver accepts and cannot hold.
+    std::uint32_t rs_cache_slots = 0u;
     std::uint32_t rs_cache_slot_bytes = 0u;
     if (rs_cache_required) {
-        const backend::DecodeGeometry g{};
-        const std::uint64_t conv_stride = g.gdn_conv_stride_bytes();
-        const std::uint64_t recur_stride = g.gdn_recurrent_stride_bytes();
-        int gdn_layers = 0;
-        for (int l = 0; l < g.n_layers; ++l) {
-            if (!g.is_full_attn(l)) ++gdn_layers;
+        backend::DecodeGeometry g{};
+        pie::metal::batch::SetupConfig probe;
+        fill_family_geometry(probe, facts);
+        std::string gerr;
+        if (!pie::metal::geometry_from_facts(probe.qwen35, g, &gerr)) {
+            g = backend::DecodeGeometry{};
         }
-        rs_cache_slot_bytes = static_cast<std::uint32_t>(
-            std::uint64_t(gdn_layers) * (2 * conv_stride + recur_stride));
+        rs_cache_slot_bytes =
+            static_cast<std::uint32_t>(executor::rs_slot_bytes_for(g));
+        rs_cache_slots = executor::rs_slots_for_budget(
+            g, executor::kRsSlotBudgetBytes,
+            std::min(cfg.batching.max_forward_requests,
+                     kMetalPagedMaxForwardRequests));
     }
     const std::uint32_t max_forward_requests =
-        rs_cache_required ? std::min(cfg.batching.max_forward_requests,
-                                     kMetalPagedMaxForwardRequests)
+        rs_cache_required ? std::min(cfg.batching.max_forward_requests, rs_cache_slots)
                           : cfg.batching.max_forward_requests;
+    // The families `SimpleFamilyEngine` serves allocate their activation pool
+    // for `max_forward_tokens` ROWS at setup, so echoing the config's value
+    // advertises a fire the driver then cannot allocate -- gpt-oss's pool at
+    // 10240 rows is 1.6 GB on top of an 11.8 GB checkpoint, and the heap
+    // creation fails with no mention of which row budget caused it. `512` is
+    // `kPagedMaxForwardTokensCeiling`, the same bound qwen3.5's paged path
+    // measured its way to; a longer prompt is chunked, exactly as it is there.
     const std::uint32_t max_forward_tokens =
         rs_cache_required
             ? std::min(cfg.batching.max_forward_tokens, kMetalPagedMaxForwardTokens)
-            : cfg.batching.max_forward_tokens;
+            : simple_family_max_forward_tokens(cfg, facts);
     const std::uint32_t max_model_len =
         rs_cache_required ? std::min(facts.max_model_len, kMetalPhase1aMaxCtxTokens)
                           : facts.max_model_len;
@@ -499,6 +444,53 @@ std::string build_caps_json(const Config& cfg,
 }
 
 }  // namespace
+
+
+/// Everything `run_launch_job`'s four phases hand to each other.
+///
+/// The phases were one 750-line function whose only real coupling was this
+/// state; naming it lets each phase be read on its own.
+struct LaunchJobState {
+    std::size_t M = 0;
+    std::vector<std::uint32_t> outcomes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
+    std::string kv_commit_error;
+    bool kv_commit_failed = false;
+    M0TimingSnapshot timing_before{};
+
+    // Phase 1 -> Phase 2.
+    std::vector<executor::LogitsOut> fwd_outs;
+    std::vector<std::uint8_t> fwd_ok;
+    std::vector<std::string> fwd_err;
+    std::string setup_err;
+    bool executor_ready = true;
+
+#if defined(__APPLE__)
+    struct PendingM3Group {
+        std::vector<std::size_t> members;
+        std::vector<pipeline::M3LaneCandidate> candidates;
+        std::vector<std::uint8_t> accepted;
+        std::vector<std::size_t> accepted_members;
+        std::shared_ptr<pipeline::M3GroupCommand> command;
+        bool finalized = false;
+        std::size_t leader = std::numeric_limits<std::size_t>::max();
+    };
+    pipeline::M3GroupStats m3_before{};
+    std::vector<std::shared_ptr<pipeline::M1PreparedFire>> prepared;
+    std::vector<std::shared_ptr<pipeline::M2CommandPlan>> m2_commands;
+    std::vector<std::uint8_t> m2_active;
+    std::vector<std::shared_ptr<PendingM3Group>> m3_for_member;
+    std::vector<pipeline::M1ExecuteOutcome> m3_outcomes;
+    // Why, parallel to the outcome. The grouped path settles its lanes ahead of
+    // the settlement loop, so unlike the singleton and M2 paths it has no
+    // `failure` string in scope when it decides -- and its reason used to be
+    // printed only under `verbose` and then dropped. A member that failed for a
+    // stated reason would report an empty one.
+    std::vector<std::string> m3_errors;
+    std::vector<std::uint8_t> m3_active;
+    std::vector<std::shared_ptr<PendingM3Group>> m3_groups;
+#endif
+};
 
 class Context::Impl {
   public:
@@ -542,7 +534,7 @@ class Context::Impl {
             {"backend", "metal"},
             {"unified_memory", true},
             {"fp8_native", false},
-            {"native_mxfp4_moe", false},
+            {"native_mxfp4_moe", true},
             {"storage_alignment", alignment},
             {"storage_max_tile_bytes", kMetalMaxTileBytes},
             {"storage_tile_map_mask", kMetalTileMapMask},
@@ -573,7 +565,14 @@ class Context::Impl {
         // `load.runtime_quant` and `load.mxfp4_moe` are deliberately not read:
         // this driver binds what the checkpoint holds. They were plumbed through
         // three layers to an author that never looked at them.
-        facts_ = read_model_facts(cfg_.model.hf_path);
+        // An artifact carries its model config already normalized; a snapshot
+        // does not, and `read_model_facts` derives it as before.
+        if (auto from_descriptor =
+                read_model_facts_from_descriptor(cfg_.model.descriptor)) {
+            facts_ = std::move(*from_descriptor);
+        } else {
+            facts_ = read_model_facts(cfg_.model.hf_path);
+        }
         std::string error;
         if (!ensure_executor(error)) {
             std::cerr << "[pie-driver-metal] load_model: " << error << "\n";
@@ -697,7 +696,7 @@ class Context::Impl {
     // §4.4 publication (channel words → terminals → per-channel notifies → the
     // batch notify, exactly once) off the caller thread. Non-forward
     // (channel-plane C1) members settle the same way, just without a forward.
-    static LaunchDemand launch_demand(const pie_native::StepLaunch& launch) {
+    static LaunchDemand launch_demand(const pie::driver::fire::StepLaunch& launch) {
         LaunchDemand demand;
         demand.kv_pages = launch.required_kv_pages;
         auto include_pages = [&demand](PieU32Slice pages) {
@@ -744,28 +743,10 @@ class Context::Impl {
         // ABI v14 says a frame carries k steps the driver runs as one closed
         // system. Whether the engine actually sends k > 1 decides whether the
         // per-step host round trip is the driver's to remove or the engine's.
-        if (std::getenv("PIE_METAL_FRAME_TRACE") != nullptr) {
-            // Whether a step's tokens come off the device decides whether a
-            // non-tail step could commit without waiting. Measured: every step
-            // carries HOST token ids (device=0 host=256), so `commit_step_async`
-            // cannot be used here without double-buffering the per-step IO --
-            // the host's write for step i+1 would race step i's read.
-            for (std::size_t si = 0; si < step_count; ++si) {
-                static int dg = 0, hg = 0;
-                (steps[si].token_ids.len == 0 ? dg : hg) += 1;
-                if ((dg + hg) % 512 == 0)
-                    std::fprintf(stderr, "[geom] device-carried=%d host-carried=%d\n", dg,
-                                 hg);
-            }
-            static std::map<std::size_t, int> hist;
-            static int n = 0;
-            ++hist[step_count];
-            if (++n % 256 == 0) {
-                std::fprintf(stderr, "[frame] steps-per-launch:");
-                for (const auto& [k, c] : hist) std::fprintf(stderr, " %zux%d", k, c);
-                std::fprintf(stderr, "\n");
-            }
-        }
+        // Measured (PIE_METAL_FRAME_TRACE, since removed): every step carries
+        // HOST token ids (device=0 host=256), so `commit_step_async` cannot be
+        // used here without double-buffering the per-step IO -- the host's
+        // write for step i+1 would race step i's read.
         for (std::size_t i = 0; i < step_count; ++i) {
             StepExpansion expansion;
             expand_step(frame, steps[i], &expansion);
@@ -783,7 +764,7 @@ class Context::Impl {
         std::vector<std::uint64_t> instance_ids;
         std::vector<std::uint32_t> kv_translation;
         std::vector<std::uint32_t> kv_translation_indptr;
-        pie_native::StepLaunch launch{};
+        pie::driver::fire::StepLaunch launch{};
     };
 
     static void expand_step(
@@ -809,7 +790,7 @@ class Context::Impl {
             out->kv_translation_indptr.push_back(
                 static_cast<std::uint32_t>(out->kv_translation.size()));
         }
-        pie_native::StepLaunch& launch = out->launch;
+        pie::driver::fire::StepLaunch& launch = out->launch;
         launch.instance_ids = {
             out->instance_ids.data(), out->instance_ids.size()};
         launch.terminal_cells = step.terminal_cells;
@@ -824,6 +805,8 @@ class Context::Impl {
         launch.rs_fold_lens = step.rs_fold_lens;
         launch.rs_buffer_slot_ids = step.rs_buffer_slot_ids;
         launch.rs_buffer_slot_indptr = step.rs_buffer_slot_indptr;
+        launch.rs_translation = step.rs_translation;
+        launch.rs_translation_indptr = step.rs_translation_indptr;
         launch.masks = step.masks;
         launch.sampling_indices = step.sampling_indices;
         launch.sampling_indptr = step.sampling_indptr;
@@ -867,7 +850,7 @@ class Context::Impl {
     }
 
     int launch_impl(
-        const pie_native::StepLaunch& launch,
+        const pie::driver::fire::StepLaunch& launch,
         PieCompletion completion) {
         std::unique_lock<std::mutex> lock_holder(state_mutex_);
         std::vector<InstanceRecord*> members;
@@ -989,55 +972,27 @@ class Context::Impl {
     // mutex. Item 3: exceptions from the forward or a member's settlement are
     // caught and translated to that member's terminal FAILED with the original
     // what() diagnostic — never swallowed, never left pending.
-    void run_launch_job(std::shared_ptr<LaunchJobData> job) {
-        const M0TimingSnapshot timing_before =
-            m0_timing_counters().snapshot();
+    /// Phase 0: execution-time ticket validation against the channel rings.
+    void launch_validate(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
 #if defined(__APPLE__)
-        const pipeline::M3GroupStats m3_before =
-            m1_runtime_ != nullptr ? m1_runtime_->m3_stats()
-                                   : pipeline::M3GroupStats{};
-#endif
-        const std::size_t M = job->members.size();
-        std::vector<std::uint32_t> outcomes(M, PIE_TERMINAL_OUTCOME_SUCCESS);
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
-        std::string kv_commit_error;
-        const bool kv_commit_failed =
-            job->launch.required_kv_pages != 0 &&
-            (executor_ == nullptr ||
-             !executor_->ensure_kv_pages(
-                 job->launch.required_kv_pages, &kv_commit_error));
-        if (kv_commit_failed && kv_commit_error.empty()) {
-            kv_commit_error = "Metal KV commit failed";
-        }
-#if defined(__APPLE__)
-        struct PendingM3Group {
-            std::vector<std::size_t> members;
-            std::vector<pipeline::M3LaneCandidate> candidates;
-            std::vector<std::uint8_t> accepted;
-            std::vector<std::size_t> accepted_members;
-            std::shared_ptr<pipeline::M3GroupCommand> command;
-            bool finalized = false;
-            std::size_t leader = std::numeric_limits<std::size_t>::max();
-        };
-        std::vector<std::shared_ptr<pipeline::M1PreparedFire>> prepared(M);
-        std::vector<std::shared_ptr<pipeline::M2CommandPlan>> m2_commands(M);
-        std::vector<std::uint8_t> m2_active(M, 0);
-        std::vector<std::shared_ptr<PendingM3Group>> m3_for_member(M);
-        std::vector<pipeline::M1ExecuteOutcome> m3_outcomes(
-            M, pipeline::M1ExecuteOutcome::Failed);
-        // Why, parallel to the outcome. The grouped path settles its lanes
-        // ahead of the settlement loop, so unlike the singleton and M2 paths it
-        // has no `failure` string in scope when it decides — and its reason used
-        // to be printed only under `verbose` and then dropped. A member that
-        // failed for a stated reason would report an empty one.
-        std::vector<std::string> m3_errors(M);
-        std::vector<std::uint8_t> m3_active(M, 0);
-        std::vector<std::shared_ptr<PendingM3Group>> m3_groups;
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
 #endif
 
+        auto& kv_commit_error = st.kv_commit_error;
+        const bool kv_commit_failed = st.kv_commit_failed;
         // ── Phase 0: execution-time ticket validation directly against the
         // authoritative Shared-storage channel rings. ──
-        const pie_native::LaunchView view = job->launch.view();
+        const pie::driver::fire::LaunchView view = job->launch.view();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             job->fwd_descs.clear();
@@ -1122,12 +1077,24 @@ class Context::Impl {
             }
         }
 
-        // ── Phase 1: GPU forward (no mutex; executor is worker-owned) ──
-        std::vector<executor::LogitsOut> fwd_outs;
-        std::vector<std::uint8_t> fwd_ok;
-        std::vector<std::string> fwd_err;
-        std::string setup_err;
-        bool executor_ready = true;
+    }
+
+    /// Phase 1a: group members by channel and prepare the M3 lanes.
+    void plan_m3_groups(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
+#if defined(__APPLE__)
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
+#endif
+
 #if defined(__APPLE__)
         {
             std::unordered_map<std::string, std::vector<std::size_t>>
@@ -1190,6 +1157,70 @@ class Context::Impl {
             }
         }
 #endif
+    }
+
+    /// Phase 1c: settle each prepared M3 group and record its lane outcomes.
+    void finish_m3_groups(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
+#if defined(__APPLE__)
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
+#endif
+
+#if defined(__APPLE__)
+        for (const auto& group : m3_groups) {
+            if (group->command == nullptr) continue;
+            std::string group_error;
+            const auto group_outcomes =
+                m1_runtime_->finish_m3_group(
+                    group->command, group_error);
+            for (std::size_t lane = 0;
+                 lane < group_outcomes.size() &&
+                 lane < group->accepted_members.size();
+                 ++lane) {
+                m3_outcomes[group->accepted_members[lane]] =
+                    group_outcomes[lane];
+                m3_errors[group->accepted_members[lane]] = group_error;
+            }
+            if (!group_error.empty() && cfg_.runtime.verbose) {
+                std::cerr << "[pie-driver-metal] M3 finish: "
+                          << group_error << "\n";
+            }
+        }
+#endif
+    }
+    /// Phase 1: GPU forward (no mutex; executor is worker-owned).
+    void launch_forward(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
+#if defined(__APPLE__)
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
+#endif
+
+        auto& fwd_outs = st.fwd_outs;
+        auto& fwd_ok = st.fwd_ok;
+        auto& fwd_err = st.fwd_err;
+        auto& setup_err = st.setup_err;
+        auto& executor_ready = st.executor_ready;
+
+        // ── Phase 1: GPU forward (no mutex; executor is worker-owned) ──
+        plan_m3_groups(job, st);
         bool has_forward = false;
         for (std::size_t m = 0; m < M; ++m)
             if (outcomes[m] == PIE_TERMINAL_OUTCOME_SUCCESS &&
@@ -1512,28 +1543,33 @@ class Context::Impl {
                 setup_err = "forward raised: unknown exception";
             }
         }
+        finish_m3_groups(job, st);
+
+    }
+
+    /// Phase 2: generated singleton execution + channel settlement.
+    void launch_settle(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
 #if defined(__APPLE__)
-        for (const auto& group : m3_groups) {
-            if (group->command == nullptr) continue;
-            std::string group_error;
-            const auto group_outcomes =
-                m1_runtime_->finish_m3_group(
-                    group->command, group_error);
-            for (std::size_t lane = 0;
-                 lane < group_outcomes.size() &&
-                 lane < group->accepted_members.size();
-                 ++lane) {
-                m3_outcomes[group->accepted_members[lane]] =
-                    group_outcomes[lane];
-                m3_errors[group->accepted_members[lane]] = group_error;
-            }
-            if (!group_error.empty() && cfg_.runtime.verbose) {
-                std::cerr << "[pie-driver-metal] M3 finish: "
-                          << group_error << "\n";
-            }
-        }
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
 #endif
 
+        auto& fwd_outs = st.fwd_outs;
+        auto& fwd_ok = st.fwd_ok;
+        auto& fwd_err = st.fwd_err;
+        auto& setup_err = st.setup_err;
+        auto& executor_ready = st.executor_ready;
+
+        auto& notifications = st.notifications;
         // ── Phase 2: generated singleton execution + channel settlement. ──
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1670,6 +1706,29 @@ class Context::Impl {
             }
         }
 
+    }
+
+    /// Phase 3: publication of terminals and notifications.
+    void launch_publish(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
+#if defined(__APPLE__)
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
+#endif
+
+        auto& notifications = st.notifications;
+        const auto& timing_before = st.timing_before;
+#if defined(__APPLE__)
+        const auto& m3_before = st.m3_before;
+#endif
         // ── Phase 3: publication (no mutex — leased terminal cells + notify
         //    callbacks): terminals, per-channel notifies, then the batch notify
         //    exactly once. Always runs, so a fault above still settles here. ──
@@ -1727,6 +1786,37 @@ class Context::Impl {
         }
     }
 
+    void run_launch_job(std::shared_ptr<LaunchJobData> job) {
+        LaunchJobState st;
+        st.M = job->members.size();
+        st.timing_before = m0_timing_counters().snapshot();
+        st.outcomes.assign(st.M, PIE_TERMINAL_OUTCOME_SUCCESS);
+        st.kv_commit_failed =
+            job->launch.required_kv_pages != 0 &&
+            (executor_ == nullptr ||
+             !executor_->ensure_kv_pages(
+                 job->launch.required_kv_pages, &st.kv_commit_error));
+        if (st.kv_commit_failed && st.kv_commit_error.empty()) {
+            st.kv_commit_error = "Metal KV commit failed";
+        }
+#if defined(__APPLE__)
+        st.m3_before = m1_runtime_ != nullptr ? m1_runtime_->m3_stats()
+                                              : pipeline::M3GroupStats{};
+        st.prepared.resize(st.M);
+        st.m2_commands.resize(st.M);
+        st.m2_active.assign(st.M, 0);
+        st.m3_for_member.resize(st.M);
+        st.m3_outcomes.assign(st.M, pipeline::M1ExecuteOutcome::Failed);
+        st.m3_errors.resize(st.M);
+        st.m3_active.assign(st.M, 0);
+#endif
+        launch_validate(job, st);
+        launch_forward(job, st);
+        launch_settle(job, st);
+        launch_publish(job, st);
+    }
+
+
     // Phase 1b/3 paged-KV bridge: real, page-addressable KV pool copy — see
     // MetalExecutor::copy_kv_pages/copy_kv_cells (memcpy over the SEPARATE
     // Shared-storage NHD standalone pool — genuinely page-addressable,
@@ -1740,10 +1830,15 @@ class Context::Impl {
     // thin public wrapper just forwards to the worker and returns its status;
     // `worker_.run` rethrows a job exception, which the extern "C" wrapper maps
     // to DRIVER_ERROR.
-    int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {
+    template <class Body>
+    int on_worker(Body&& body) {
         int status = PIE_STATUS_OK;
-        worker_.run([&] { status = copy_kv_impl(copy, completion); });
+        worker_.run([&] { status = body(); });
         return status;
+    }
+
+    int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {
+        return on_worker([&] { return copy_kv_impl(copy, completion); });
     }
 
     int copy_kv_impl(const PieKvCopyDesc& copy, PieCompletion completion) {
@@ -1808,9 +1903,7 @@ class Context::Impl {
     }
 
     int copy_state(const PieStateCopyDesc& copy, PieCompletion completion) {
-        int status = PIE_STATUS_OK;
-        worker_.run([&] { status = copy_state_impl(copy, completion); });
-        return status;
+        return on_worker([&] { return copy_state_impl(copy, completion); });
     }
 
     int copy_state_impl(const PieStateCopyDesc& copy, PieCompletion completion) {
@@ -1848,9 +1941,7 @@ class Context::Impl {
     }
 
     int resize_pool(const PiePoolResizeDesc& resize, PieCompletion completion) {
-        int status = PIE_STATUS_OK;
-        worker_.run([&] { status = resize_pool_impl(resize, completion); });
-        return status;
+        return on_worker([&] { return resize_pool_impl(resize, completion); });
     }
 
     int resize_pool_impl(const PiePoolResizeDesc& resize, PieCompletion completion) {
@@ -1944,9 +2035,7 @@ class Context::Impl {
     // thread and can never race an in-flight forward or its settlement. The
     // map mutation takes the state mutex (shared with launch preflight).
     int close_instance(std::uint64_t instance_id) {
-        int status = PIE_STATUS_OK;
-        worker_.run([&] { status = close_instance_impl(instance_id); });
-        return status;
+        return on_worker([&] { return close_instance_impl(instance_id); });
     }
 
     int close_instance_impl(std::uint64_t instance_id) {
@@ -1964,9 +2053,7 @@ class Context::Impl {
     }
 
     int close_channel(std::uint64_t channel_id) {
-        int status = PIE_STATUS_OK;
-        worker_.run([&] { status = close_channel_impl(channel_id); });
-        return status;
+        return on_worker([&] { return close_channel_impl(channel_id); });
     }
 
     int close_channel_impl(std::uint64_t channel_id) {
@@ -2053,28 +2140,14 @@ class Context::Impl {
         // over a pool bigger or smaller than what the driver claims to have.
         setup_cfg.total_pages = effective_total_pages(cfg_, facts_.has_linear_attn);
         setup_cfg.kv_page_size = cfg_.batching.kv_page_size;
-        setup_cfg.max_forward_tokens = cfg_.batching.max_forward_tokens;
+        // The same bound the capabilities advertised, from the same function:
+        // these families allocate their pool for this many rows.
+        setup_cfg.max_forward_tokens = simple_family_max_forward_tokens(cfg_, facts_);
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
-        setup_cfg.model_type = facts_.model_type;
-        setup_cfg.rope_theta = facts_.rope_theta;
-        setup_cfg.partial_rotary_factor = facts_.partial_rotary_factor;
-        setup_cfg.gemma4.n_layers = facts_.g4_num_hidden_layers;
-        setup_cfg.gemma4.hidden = facts_.g4_hidden_size;
-        setup_cfg.gemma4.intermediate = facts_.g4_intermediate_size;
-        setup_cfg.gemma4.n_q_heads = facts_.g4_num_attention_heads;
-        setup_cfg.gemma4.n_kv_heads = facts_.g4_num_key_value_heads;
-        setup_cfg.gemma4.head_dim = facts_.g4_head_dim;
-        setup_cfg.gemma4.global_head_dim = facts_.g4_global_head_dim;
-        setup_cfg.gemma4.sliding_window = facts_.g4_sliding_window;
-        setup_cfg.gemma4.num_kv_shared_layers = facts_.g4_num_kv_shared_layers;
-        setup_cfg.gemma4.per_layer_emb_dim = facts_.g4_per_layer_emb_dim;
-        setup_cfg.gemma4.full_attn_interval = facts_.g4_full_attn_interval;
-        setup_cfg.gemma4.double_wide_mlp = facts_.g4_double_wide_mlp;
-        setup_cfg.gemma4.final_softcap = facts_.g4_final_softcap;
-        setup_cfg.gemma4.rope_theta_full = facts_.g4_rope_theta_full;
-        setup_cfg.gemma4.rope_theta_sliding = facts_.g4_rope_theta_sliding;
-        setup_cfg.gemma4.full_partial_rotary = facts_.g4_full_partial_rotary;
+        setup_cfg.stream_routed_experts = cfg_.model.stream_routed_experts;
+        setup_cfg.expert_slab_bytes = cfg_.model.expert_slab_bytes;
+        fill_family_geometry(setup_cfg, facts_);
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):
         // MetalExecutor::setup builds the Metal device/heap/PSOs, which must
@@ -2104,7 +2177,7 @@ class Context::Impl {
     // once by `forward_batch` (Phase 3, §7); this only prepares one member's
     // descriptor + arbitrates its device geometry.
     ForwardBuildResult build_forward_desc_for_member(
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         std::size_t m,
         std::size_t member_count,
         InstanceRecord& member,
@@ -2113,7 +2186,7 @@ class Context::Impl {
         std::string& failure) {
         desc.sequence_id = member.instance_id;
 
-        pie_native::launch::FireGeometry resolved;
+        pie::driver::fire::FireGeometry resolved;
         // The runtime states the class at bind; trust it. The trace-shape
         // predicate stays as the fallback for a HOST-class instance whose
         // program nonetheless traces its geometry.
@@ -2167,7 +2240,7 @@ class Context::Impl {
             }
             const std::uint32_t device_pages =
                 effective_total_pages(cfg_, facts_.has_linear_attn);
-            if (!pie_native::launch::validate_fire_geometry(
+            if (!pie::driver::fire::validate_fire_geometry(
                     resolved, device_pages, cfg_.batching.kv_page_size, &failure)) {
                 return ForwardBuildResult::Failed;
             }

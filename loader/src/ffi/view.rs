@@ -30,11 +30,96 @@ pub fn verify_marshalled(
         return Err(vec![Violation::plan("plan could not be marshalled")]);
     }
     let outcome = match unsafe { plan_view(&*pod) } {
-        Ok(view) => verify(&view, contract),
+        Ok(view) => verify(&view, contract).and_then(|certificate| {
+            let groups = unsafe { slice_of((*pod).groups.ptr, (*pod).groups.len) };
+            let mut found = Vec::new();
+            for group in groups {
+                unsafe { verify_group(group, &mut found) };
+            }
+            if found.is_empty() {
+                Ok(certificate)
+            } else {
+                Err(found)
+            }
+        }),
         Err(err) => Err(vec![Violation::plan(err)]),
     };
     unsafe { arena::release(pod) };
     outcome
+}
+
+/// Verify a group: its plan, and then every instance's reads.
+///
+/// The instances are the point. A group's plan is compiled at index 0, so
+/// verifying it alone would check one instance out of `arity` and leave the
+/// other bindings -- which are what the driver will actually read -- unchecked.
+/// Rewriting the template's reads with each instance's binding and running the
+/// same file-bounds check over the result is the cheapest way to say "every
+/// instance stays inside its file", and it reuses the check rather than
+/// restating it.
+///
+/// # Safety
+///
+/// `group`'s plan pointer and slices are those of a plan produced by
+/// [`arena::build`].
+unsafe fn verify_group(group: &PieLoaderGroupView, found: &mut Vec<Violation>) {
+    let name = unsafe { as_str(&group.name, "group.name") }.unwrap_or("<unnamed>");
+    let Ok(mut template) = (unsafe { plan_view(&*group.plan) }) else {
+        found.push(Violation::plan(format!(
+            "group '{name}': plan is malformed"
+        )));
+        return;
+    };
+    if let Err(mut violations) = verify(&template, None) {
+        for violation in &mut violations {
+            violation.message = format!("group '{name}': {}", violation.message);
+        }
+        found.append(&mut violations);
+        return;
+    }
+
+    let per = group.bindings_per_instance;
+    let bindings = unsafe { slice_of(group.bindings.ptr, group.bindings.len) };
+    if per != template.reads.len() || bindings.len() != per * group.arity as usize {
+        found.push(Violation::plan(format!(
+            "group '{name}': {} bindings for {} instances of a plan with {} \
+             reads",
+            bindings.len(),
+            group.arity,
+            template.reads.len()
+        )));
+        return;
+    }
+
+    // Mutated in place, one instance at a time: every read's file and offset is
+    // overwritten on each pass, so there is nothing to restore between them.
+    for index in 0..group.arity as usize {
+        for (read, binding) in template
+            .reads
+            .iter_mut()
+            .zip(&bindings[index * per..(index + 1) * per])
+        {
+            if read.instr != binding.instr_id {
+                found.push(Violation::plan(format!(
+                    "group '{name}' index {index}: binding names instruction {} \
+                     where the plan reads at instruction {}",
+                    binding.instr_id, read.instr
+                )));
+                return;
+            }
+            read.file_id = binding.file_id;
+            read.file_offset = binding.file_offset;
+        }
+        if let Err(violations) = verify(&template, None) {
+            for violation in violations {
+                found.push(Violation::plan(format!(
+                    "group '{name}' index {index}: {}",
+                    violation.message
+                )));
+            }
+            return;
+        }
+    }
 }
 
 /// Borrow a POD slice, treating a null pointer as empty.

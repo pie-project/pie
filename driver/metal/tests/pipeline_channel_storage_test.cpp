@@ -12,7 +12,7 @@
 using namespace pie::metal;
 using namespace pie::metal::batch;
 using namespace pie::metal::pipeline;
-namespace launch = pie_native::launch;
+namespace launch = pie::driver::launch;
 
 namespace {
 

@@ -398,7 +398,16 @@ fn default_max_upload_mb() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub name: String,
-    pub hf_repo: String,
+    /// What to serve: a store name (`Qwen--Qwen3-0.6B`, as `pie model list`
+    /// prints it) or a path to a `.zt` artifact. See `weights::resolve`.
+    ///
+    /// Named `hf_repo` until the store existed, and still accepted under that
+    /// name — `pie config init` has been writing it into `~/.pie/config.toml`
+    /// since long before this, and the struct is `deny_unknown_fields`, so a
+    /// bare rename would greet those users with *unknown field `hf_repo`* and
+    /// *missing field `model`* at startup rather than with a working boot.
+    #[serde(alias = "hf_repo")]
+    pub model: String,
     pub driver: DriverConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
@@ -409,6 +418,11 @@ impl ModelConfig {
         ensure!(
             !self.name.is_empty(),
             "model.name must be a non-empty string"
+        );
+        ensure!(
+            !self.model.trim().is_empty(),
+            "model.model must name a stored artifact or a path to one \
+             (`pie model list` shows what is available)"
         );
         self.driver.validate()?;
         self.scheduler.validate()?;
@@ -425,12 +439,53 @@ impl ModelConfig {
 pub struct SchedulerConfig {
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// How long a pipeline that is HARD-BLOCKING a frame's seal may go
+    /// without submitting before the engine stops waiting for it, in
+    /// microseconds.
+    ///
+    /// This does not fail the pipeline. At the deadline the lane is dropped
+    /// from the wait-set — an involuntary `forward.park()` — so the boundary
+    /// seals at once; frames it already submitted still dispatch, and its
+    /// next fire rejoins it. What the number buys is therefore epoch density,
+    /// not safety: how long the fleet waits for a straggler before going on
+    /// without it. Setting it too low costs a little density and never a
+    /// request. Termination is a separate and far longer verdict, in
+    /// `silence_timeout_secs`.
+    ///
+    /// Small (50ms) because it measures a much narrower interval than its size
+    /// suggests. The clock runs only while the lane is an awaited member with
+    /// nothing submitted — it is stopped by run-ahead (a lane with a queued
+    /// frame is not blocking), by an unretired dispatch (the engine owes it a
+    /// result, so the whole GPU wave is free), by a bind in flight, and by
+    /// `forward.park()`. The host resubmit turnaround already has its own
+    /// headroom in `HOST_TURNAROUND_WAVES`.
+    ///
+    /// Measured: on the contention suite a breach happens roughly once in
+    /// several thousand requests, and when it does the lane is 0.1-3ms over
+    /// the line — an ordinary task-wakeup tail, not a broken guest. Killing
+    /// for that was the wrong response, which is why this only leashes now.
+    ///
+    /// Exposed to guests verbatim as `model.submit-deadline-us()`.
+    #[serde(default = "default_submit_deadline_us")]
+    pub submit_deadline_us: u64,
+    /// How long a lane may stay silent in total — through the leash above and
+    /// on past it — before the engine terminates its process, in seconds.
+    ///
+    /// This one IS a verdict, so it is generous. A pipeline that means to go
+    /// quiet calls `forward.park()`, which ends the silence and is never
+    /// killed however long it stays away; that is the contract this enforces.
+    /// The leash already keeps a straggler from holding the fleet, so nothing
+    /// but a genuinely abandoned process ever reaches this.
+    #[serde(default = "default_silence_timeout_secs")]
+    pub silence_timeout_secs: u64,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_request_timeout_secs(),
+            submit_deadline_us: default_submit_deadline_us(),
+            silence_timeout_secs: default_silence_timeout_secs(),
         }
     }
 }
@@ -441,12 +496,33 @@ impl SchedulerConfig {
             self.request_timeout_secs > 0,
             "scheduler.request_timeout_secs must be > 0"
         );
+        ensure!(
+            self.submit_deadline_us > 0,
+            "scheduler.submit_deadline_us must be > 0"
+        );
+        ensure!(
+            self.silence_timeout_secs > 0,
+            "scheduler.silence_timeout_secs must be > 0"
+        );
+        ensure!(
+            self.silence_timeout_secs * 1_000_000 >= self.submit_deadline_us,
+            "scheduler.silence_timeout_secs must not be shorter than submit_deadline_us: \
+             a kill that lands before the leash would fail guests the leash exists to spare"
+        );
         Ok(())
     }
 }
 
 fn default_request_timeout_secs() -> u64 {
     120
+}
+
+fn default_submit_deadline_us() -> u64 {
+    50_000
+}
+
+fn default_silence_timeout_secs() -> u64 {
+    30
 }
 
 // -----------------------------------------------------------------------------
@@ -625,6 +701,18 @@ pub struct MetalDriverOptions {
     pub max_forward_requests: u32,
     pub cpu_pages: u32,
     pub kv_cache_dtype: String,
+    /// Page routed MoE experts in from a mapping of the checkpoint instead of
+    /// keeping every expert resident in the heap.
+    ///
+    /// The same knob, spelled the same way, as the CUDA driver's -- because it
+    /// is the same decision: a residency trade the operator makes about a
+    /// model. What the two backends *do* with it differs (CUDA copies through
+    /// a bounded slab, Metal binds over a file-backed mapping and lets the
+    /// kernel evict), which is a backend's business and not the operator's.
+    ///
+    /// Off by default: it trades resident memory for page faults, which only
+    /// pays when the weights do not comfortably fit.
+    pub stream_routed_experts: bool,
     #[serde(skip)]
     pub device: String,
     #[serde(skip)]
@@ -645,6 +733,7 @@ impl Default for MetalDriverOptions {
             max_forward_requests: 512,
             cpu_pages: 0,
             kv_cache_dtype: "auto".to_string(),
+            stream_routed_experts: false,
             device: "metal:0".to_string(),
             verbose: false,
             ready_timeout_s: 120.0,
@@ -663,7 +752,7 @@ impl Default for MetalDriverOptions {
 #[serde(deny_unknown_fields)]
 pub struct DummyDriverOptions {
     /// Vocabulary size advertised in the caps handshake. Should match
-    /// the tokenizer at `hf_repo/tokenizer.json`. When `None` the
+    /// the tokenizer the artifact carries. When `None` the
     /// standalone reads `vocab_size` from `<snapshot_dir>/config.json`
     /// before launching the driver.
     #[serde(default)]
@@ -729,6 +818,25 @@ pub struct CudaNativeDriverOptions {
     pub mtp_assistant_snapshot_dir: String,
     /// Maximum number of MTP draft tokens returned per system-spec step.
     pub mtp_num_drafts: u32,
+    /// Page routed MoE experts through a bounded VRAM slab instead of keeping
+    /// every expert resident. Bounds the resident set by the slab rather than
+    /// by the model, which is what lets a large MoE run on a GPU that cannot
+    /// hold it. Off by default: for a model that fits, this is strictly
+    /// slower, and it disables CUDA graph capture besides.
+    pub stream_routed_experts: bool,
+    /// The expert slab, in GiB. 0 = derive one at startup from what is left
+    /// after the resident weights and the KV pool. Ignored unless
+    /// `stream_routed_experts` is set.
+    pub expert_cache_gb: f64,
+    /// A pinned host DRAM tier behind the slab, in GiB. 0 = none.
+    ///
+    /// The slab bounds what the GPU holds; this bounds what host memory holds
+    /// behind it, in the same slot-shaped form. A miss the tier can serve is
+    /// one host-to-device copy of bytes already in the form the kernels read,
+    /// instead of a checkpoint read, a plan and a transform -- so it is worth
+    /// setting exactly when the experts do not fit in VRAM but do fit in RAM.
+    /// Ignored unless `stream_routed_experts` is set.
+    pub expert_host_cache_gb: f64,
     /// Operator opt-in for system speculation (MTP). Default false: the runtime
     /// drives the auto-drafter only when this is true. Speculation is a
     /// latency-regime win (helps at low batch, costs at compute saturation), so
@@ -767,6 +875,9 @@ impl Default for CudaNativeDriverOptions {
             mxfp4_moe: "auto".to_string(),
             mtp_assistant_snapshot_dir: String::new(),
             mtp_num_drafts: 3,
+            stream_routed_experts: false,
+            expert_cache_gb: 0.0,
+            expert_host_cache_gb: 0.0,
             enable_system_speculation: false,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
@@ -804,6 +915,16 @@ impl CudaNativeDriverOptions {
             self.mtp_num_drafts <= 32,
             "model.driver.options.mtp_num_drafts must be in 0..=32"
         );
+        ensure!(
+            self.expert_cache_gb.is_finite() && self.expert_cache_gb >= 0.0,
+            "model.driver.options.expert_cache_gb must be >= 0 (0 = derive one \
+             at startup)"
+        );
+        ensure!(
+            self.expert_host_cache_gb.is_finite() && self.expert_host_cache_gb >= 0.0,
+            "model.driver.options.expert_host_cache_gb must be >= 0 (0 = no \
+             host tier)"
+        );
         Ok(())
     }
 }
@@ -829,6 +950,38 @@ device = ["cpu"]
         assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
         assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    /// `model` is the name now, `hf_repo` still parses.
+    ///
+    /// Not politeness: the struct is `deny_unknown_fields` and the field is
+    /// required, so without the alias every config `pie config init` ever wrote
+    /// would fail at startup with two errors at once — *unknown field
+    /// `hf_repo`* and *missing field `model`* — instead of booting.
+    #[test]
+    fn the_old_spelling_of_the_model_key_still_parses() {
+        let with_new = MINIMAL_METAL.replace("hf_repo =", "model =");
+        assert_ne!(
+            with_new, MINIMAL_METAL,
+            "the fixture should use the old key"
+        );
+
+        let old: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        let new: Config = toml::from_str(&with_new).unwrap();
+        old.validate().unwrap();
+        new.validate().unwrap();
+        assert_eq!(old.model.model, new.model.model);
+        assert!(!new.model.model.is_empty());
+    }
+
+    /// An empty model is caught at parse rather than at driver boot, where it
+    /// would surface as a path error.
+    #[test]
+    fn an_empty_model_is_refused() {
+        let blank = MINIMAL_METAL.replace("hf_repo = \"Qwen/Qwen3-0.6B\"", "hf_repo = \"\"");
+        let cfg: Config = toml::from_str(&blank).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("model.model"), "{err}");
     }
 
     #[test]

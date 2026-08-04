@@ -121,6 +121,10 @@ profile-all = ["profile-fire"]       # everything
 tempfile = "3"
 pie-ir = { path = "../../compiler/ir" }
 criterion = { version = "0.8", features = ["html_reports"] }
+# Benchmarks must allocate the way production does. Every engine entry point
+# links `pie-worker`, which sets mimalloc as the global allocator; a bench that
+# omitted it would measure glibc malloc and report a machine nobody runs.
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 
 [[bench]]
 name = "grammar_wit"

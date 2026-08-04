@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use super::{ProcessId, ResidencyPlanner};
 
-/// Step markers for the opt-in stall sampler (`PIE_CONTENTION_TRACE_MS`):
+/// Step markers for the opt-in event trace (`PIE_CONTENTION_TRACE_EVENTS`):
 /// one line per executor step pins down exactly where a transfer stalls or
 /// why it rolled back. Format and clock come from the shared
 /// [`crate::planner::trace_mark`] owner.
@@ -328,7 +328,7 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         Ok(KvSuspendPrepare::Prepared(txn)) => txn,
         Ok(KvSuspendPrepare::Deferred(disposition)) => {
             step!(pid, "evict rollback: prepare deferred ({disposition:?})");
-            planner.eviction_failed(pid);
+            planner.eviction_failed_prepare_deferred(pid);
             return;
         }
         Err(error @ crate::store::kv::KvStoreError::HostSwapFull { .. }) => {

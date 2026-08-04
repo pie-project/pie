@@ -74,6 +74,42 @@ impl Error {
     }
 }
 
+/// zTensor's failures, mapped onto the loader's — in one place, because the
+/// distinction is load-bearing and easy to lose.
+///
+/// `Unsupported` is the one that matters: a file that is perfectly valid but
+/// uses a layout, encoding or capability this build does not implement is not
+/// a malformed checkpoint, and it crosses the C ABI as a different
+/// [`code`](Error::code). Flattening every zTensor error to `Checkpoint` would
+/// tell a caller its file was broken when it was only unfamiliar.
+impl From<ztensor::Error> for Error {
+    fn from(err: ztensor::Error) -> Self {
+        match err {
+            ztensor::Error::Unsupported(_) => Self::Unsupported(err.to_string()),
+            // A rejected file, a name that is not there, bad input on the
+            // write path, an I/O failure while reading a header — from the
+            // loader's side these are all "the checkpoint did not deliver".
+            _ => Self::Checkpoint(err.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod ztensor_conversion {
+    use super::*;
+
+    /// The two zTensor outcomes a caller must be able to tell apart across the
+    /// C ABI, where only the code survives.
+    #[test]
+    fn unsupported_survives_as_unsupported() {
+        let unfamiliar = ztensor::Error::Unsupported("layout \"x.future/1\"".into());
+        assert_eq!(Error::from(unfamiliar).code(), 4);
+
+        let broken = ztensor::Error::NotFound("tensor \"w\"".into());
+        assert_eq!(Error::from(broken).code(), 3);
+    }
+}
+
 /// Every fallible step in the loader answers with this.
 pub type Result<T> = std::result::Result<T, Error>;
 

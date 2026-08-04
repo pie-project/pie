@@ -96,17 +96,30 @@ def _read_spec(r: _Reader):
     return name, dtype, shape
 
 
+# Kept in step with weight_store_codec.hpp by hand; the assert above is what
+# turns a drift into an error instead of into wrong numbers.
+FORMAT_VERSION = 5
+BLOB_ALIGN = 16384
+
+
 def read_cache(path: str) -> dict[str, Tensor]:
     """Parse a .weights file -> {name: Tensor} of final materialized tensors."""
     r = _Reader(open(path, "rb").read())
     magic = r.take(8)
     assert magic == b"PIEWSTOR", f"bad magic {magic!r}"
-    r.u32()                 # format_version
+    version = r.u32()
+    # This file is a second implementation of the format, so it has to fail
+    # loudly on a layout it was not written for. Reading an unknown version
+    # would not crash -- the fields it wants are still there, at the wrong
+    # offsets -- it would produce tensors made of the wrong bytes.
+    assert version == FORMAT_VERSION, (
+        f"cache is format v{version}, this parser reads v{FORMAT_VERSION}")
     r.s()                   # cache_key
     n_owned = r.u64()
     n_views = r.u64()
     n_quant = r.u64()
     r.u64()                 # blob_section_bytes
+    blob_base = r.u64()     # where the blob section starts
 
     owned = []  # (name, dtype, shape, nbytes, blob_offset)
     for _ in range(n_owned):
@@ -124,7 +137,11 @@ def read_cache(path: str) -> dict[str, Tensor]:
     for _ in range(n_quant):
         r.s(); r.u8(); r.s(); r.s(); r.i32(); r.i32()
 
-    blob_base = r.p
+    # blob_base was read from the header, not taken from where the tables
+    # happened to end: the tables are followed by padding that puts the blob
+    # section on a page boundary, so the cursor is no longer the answer.
+    assert blob_base >= r.p, "blob section overlaps the manifest"
+    assert blob_base % BLOB_ALIGN == 0, f"blob section not aligned: {blob_base}"
     root_bytes: list[bytes] = []
     out: dict[str, Tensor] = {}
     for name, dtype, shape, nbytes, blob_offset in owned:

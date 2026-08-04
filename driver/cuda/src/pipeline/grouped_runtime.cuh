@@ -28,7 +28,7 @@
 #include <cub/block/block_scan.cuh>
 
 #include "cuda_check.hpp"
-#include "pie_native/launch/plan.hpp"
+#include "pie/driver/launch/plan.hpp"
 #include "pipeline/channels.hpp"
 #include "pipeline/grouped_copy.hpp"
 #include "pipeline/library_region.hpp"
@@ -131,6 +131,14 @@ struct GroupedLaneBinding {
     const void* layer_base = nullptr;
     const std::vector<std::uint64_t>* logits_bf16_rows = nullptr;
     const std::vector<std::uint64_t>* mtp_logits_bf16_rows = nullptr;
+    // Per-lane row pointers to already-reduced i32 token ids, laid out exactly
+    // like `logits_bf16_rows` (a lane's sampled rows are not contiguous) but
+    // addressing one token each instead of one vocabulary row. Set only when
+    // the driver folded the argmax into the LM head GEMM so the logits never
+    // materialised (§20.37). The epilogue still runs and still performs its
+    // side effects; the `logits` intrinsic slot just resolves to these instead
+    // of a vocabulary to scan. Null on every other path.
+    const std::vector<std::uint64_t>* presampled_token_rows = nullptr;
     std::uint64_t sample_output_channel_mask = 0;
     const std::uint8_t* row_valid = nullptr;
     std::uint32_t row_valid_offset = 0;
@@ -1502,6 +1510,13 @@ class GroupedStageAccumulator {
         if ((lane.logits_bf16_rows != nullptr) !=
             (first_lane_.logits_bf16_rows != nullptr)) {
             return fail("group mixes FP32 and direct BF16 logits");
+        }
+        // Same reason, for the fused LM head argmax (§20.37): a lane without a
+        // presampled table falls back to binding `logits_base`, which on that
+        // path is slab scratch rather than a vocabulary.
+        if ((lane.presampled_token_rows != nullptr) !=
+            (first_lane_.presampled_token_rows != nullptr)) {
+            return fail("group mixes presampled and materialised logits");
         }
         if ((lane.mtp_logits_bf16_rows != nullptr) !=
             (first_lane_.mtp_logits_bf16_rows != nullptr)) {

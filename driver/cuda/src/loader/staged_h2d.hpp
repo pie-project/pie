@@ -12,6 +12,33 @@
 // boundary, and no device pre-warm assumptions); any hard failure surfaces at
 // the caller's next device synchronize. Lane setup (streams/events/pinned
 // buffers) runs on the calling thread and does throw via CUDA_CHECK.
+//
+// Why there is no GPUDirect Storage path
+// --------------------------------------
+// GDS exists to delete the bounce buffer this file is built around, so it is
+// the obvious thing to reach for. Measured on this box (RTX 4090, PCIe 4 x16,
+// NVMe ext4), at the 2 MiB chunk these lanes use:
+//
+//     NVMe, O_DIRECT sequential read        4.63 GB/s
+//     memcpy -> pinned -> H2D, ONE lane     7.34 GB/s
+//     pinned -> H2D alone (PCIe ceiling)   19.30 GB/s
+//
+// The bounce is not the bottleneck. A single staging lane already outruns the
+// disk by 1.6x and this engine runs four of them, so the bytes arrive as fast
+// as storage can produce them; the copy that GDS removes is hidden behind I/O
+// that has to happen anyway. The headroom GDS competes for is the gap between
+// 7.34 and 19.30, and nothing can reach it while the source is a file on this
+// device. Skipping the page cache would also cost the second load of the same
+// checkpoint, which is free today.
+//
+// Independently: GDS needs the `nvidia_fs` kernel module, which is not loaded
+// here. Without it cuFile silently falls back to compatibility mode -- a POSIX
+// read into its own bounce buffer -- which is this path with an extra layer.
+//
+// So the number to watch is the disk's, not the copy engine's. Revisit if
+// checkpoints ever come off storage faster than ~7 GB/s per reader (a RAID of
+// Gen5 NVMe, or a warm page cache serving most of the file), because that is
+// the point where the staging memcpy starts to be the thing in the way.
 
 #include <cstdint>
 

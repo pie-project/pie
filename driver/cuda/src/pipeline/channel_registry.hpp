@@ -38,15 +38,15 @@
 
 #include "batch/fire_timing.hpp"
 #include "pipeline/channels.hpp"  // kMaxRing + the (unchanged) ring kernels
-#include "pie_native/launch/program.hpp"
+#include "pie/driver/launch/program.hpp"
 #include "cuda_check.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
+// fire-geometry) now lives in pie::driver::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::launch;
+using namespace pie::driver::launch;
 
 // Registry device-array capacity in SLOTS (grows on demand). One inferlet's
 // live channel count is small; this is a generous initial reservation.
@@ -478,7 +478,18 @@ class DeviceChannelRegistry {
             if (!decl_matches(slot, decl)) {
                 if (err)
                     *err = "ptir: channel " + std::to_string(id) +
-                           " re-bound with a conflicting shape/dtype/capacity decl";
+                           " re-bound with a conflicting shape/dtype/capacity decl"
+                           " (have bytes=" + std::to_string(cell_bytes_[slot]) +
+                           " cap1=" + std::to_string(host_cap1_[slot]) +
+                           " dtype=" + std::to_string(dtype_[slot]) +
+                           " seeded=" + std::to_string(seeded_[slot]) +
+                           " role=" + std::to_string(host_role_[slot]) +
+                           "; want bytes=" + std::to_string(decl_cell_bytes(decl)) +
+                           " cap1=" + std::to_string(cap1_of(decl)) +
+                           " dtype=" + std::to_string(static_cast<int>(decl.type.dtype)) +
+                           " seeded=" + std::to_string(decl.has_seed) +
+                           " reader=" + std::to_string(decl.host_reader) +
+                           " visible=" + std::to_string(decl.host_visible) + ")";
                 return kBadSlot;
             }
             // Same-guest cross-pass sharing (F8, unconditional): a

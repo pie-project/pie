@@ -52,13 +52,7 @@ struct Glm5LayerWeights {
     std::optional<QuantMeta> q_a_proj_quant;
     std::optional<QuantMeta> q_b_proj_quant;
     std::optional<QuantMeta> kv_a_proj_with_mqa_quant;
-    std::optional<QuantMeta> kv_b_proj_quant;
     std::optional<QuantMeta> o_proj_quant;
-
-    // kv_b_proj dequantized to BF16. The kimi_mla kernels operate on bf16
-    // kv_b_proj only; we materialise this once at bind time when the
-    // on-disk weight is FP8 quantised.
-    std::unique_ptr<DeviceTensor> kv_b_proj_bf16;
 
     // ── DSA (DeepSeek Sparse Attention) "lightning indexer" ──────────────
     // Selects the top-`index_topk` keys per query that the main MLA attends

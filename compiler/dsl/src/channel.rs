@@ -173,6 +173,12 @@ impl Channel {
     pub fn dtype(&self) -> DType {
         self.state.borrow().dtype
     }
+
+    /// The channel's name, as set by [`named`](Self::named) — `chN` if it was
+    /// never named. Frontends use it to label host-readback errors.
+    pub fn name(&self) -> String {
+        self.state.borrow().name.clone()
+    }
     /// The [`Shape`] of one cell (a single queue slot's tensor).
     pub fn shape(&self) -> Shape {
         self.state.borrow().shape
@@ -191,6 +197,21 @@ impl Channel {
     #[track_caller]
     pub fn note_host_put(&self) {
         self.state.borrow_mut().host_puts.push(Span::here());
+    }
+
+    /// Record a host-consumer endpoint span for a `take` — the readback
+    /// counterpart of [`note_host_put`](Self::note_host_put). The bytes cross
+    /// the driver boundary, so there is no in-program value to hand back.
+    #[track_caller]
+    pub fn note_host_take(&self) {
+        self.state.borrow_mut().host_takes.push(Span::here());
+    }
+
+    /// Record a host-consumer endpoint span for a `read` (a peek). Same as
+    /// [`note_host_take`](Self::note_host_take) otherwise.
+    #[track_caller]
+    pub fn note_host_read(&self) {
+        self.state.borrow_mut().host_reads.push(Span::here());
     }
 
     /// Record a descriptor endpoint claim (take vs read per the port's
@@ -212,36 +233,42 @@ impl Channel {
         }
     }
 
-    /// `take()` — full ⇒ value + empty; empty ⇒ block. In-program: returns the
-    /// taken `Tensor`. On the host: an awaitable yielding a wasm `Vec`.
+    /// `take()` — full ⇒ value + empty; empty ⇒ block. The in-program taken
+    /// [`Tensor`], for use inside a stage closure. A host channel has no
+    /// in-program value: use [`note_host_take`](Self::note_host_take) and read
+    /// the bytes across the driver instead.
     #[track_caller]
-    pub fn take(&self) -> Taken {
+    pub fn take(&self) -> Tensor {
         let span = Span::here();
         if context::is_tracing() {
             let (id, ty) = context::record_channel_read(&self.state, true, span);
-            Taken::in_program(Tensor::node(id, ty))
+            Tensor::node(id, ty)
         } else {
-            self.state.borrow_mut().host_takes.push(span);
-            Taken::host(self.state.clone(), true)
+            host_take_poison(&self.state)
         }
     }
 
     /// `read()` — full ⇒ copy, stays full; empty ⇒ block. A peek (does not claim
-    /// the consumer endpoint).
+    /// the consumer endpoint). Same in-program/host rule as [`take`](Self::take).
     #[track_caller]
-    pub fn read(&self) -> Taken {
+    pub fn read(&self) -> Tensor {
         let span = Span::here();
         if context::is_tracing() {
             let (id, ty) = context::record_channel_read(&self.state, false, span);
-            Taken::in_program(Tensor::node(id, ty))
+            Tensor::node(id, ty)
         } else {
-            self.state.borrow_mut().host_reads.push(span);
-            Taken::host(self.state.clone(), false)
+            host_take_poison(&self.state)
         }
     }
 
     /// `put(v)` — empty ⇒ fill + full; full ⇒ block (back-pressure). In-program
     /// `v` is a `Tensor` (reshaped to fit the cell); on the host `v` is data.
+    ///
+    /// On a channel bound to a *peeked* descriptor port (geometry, masks — the
+    /// ports whose discipline is read, not take) the put drains the stale value
+    /// first, so a loop-carried update is one call whichever side of
+    /// [`pie_ir::registry::Port::consumes`] the port falls on. An explicit
+    /// `take` in the same trace is honoured and not repeated.
     #[track_caller]
     pub fn put(&self, v: impl IntoPut) -> Put {
         let span = Span::here();
@@ -267,51 +294,12 @@ impl Channel {
     }
 }
 
-/// The result of `channel.take()` / `channel.read()`. In a program it is a
-/// `Tensor` (via [`AsTensor`]); on the host it is `.await`-able.
-pub struct Taken {
-    inner: TakenInner,
-}
-
-enum TakenInner {
-    InProgram(Tensor),
-    Host { chan: ChannelRef, consume: bool },
-}
-
-impl Taken {
-    fn in_program(t: Tensor) -> Taken {
-        Taken {
-            inner: TakenInner::InProgram(t),
-        }
-    }
-    fn host(chan: ChannelRef, consume: bool) -> Taken {
-        Taken {
-            inner: TakenInner::Host { chan, consume },
-        }
-    }
-    /// The in-program `Tensor`.
-    ///
-    /// A host take has no in-program value: its bytes cross the driver
-    /// boundary and only exist after the program has run. Asking for one is
-    /// recorded as an authoring error and answered with a stand-in, so
-    /// [`Builder::build`] reports it with the rest.
-    ///
-    /// [`Builder::build`]: crate::builder::Builder::build
-    #[track_caller]
-    pub fn tensor(self) -> Tensor {
-        match self.inner {
-            TakenInner::InProgram(t) => t,
-            TakenInner::Host { chan, .. } => host_take_poison(&chan),
-        }
-    }
-}
-
 /// Stand-in for a host take asked to act as an in-program value, typed as the
 /// channel it came from so the rest of the trace still checks.
 #[track_caller]
 fn host_take_poison(chan: &ChannelRef) -> Tensor {
     let st = chan.borrow();
-    crate::value::poison(
+    crate::value::poison_const(
         alloc::format!(
             "channel {} is a host channel: its take crosses the driver boundary and has no \
              in-program value",
@@ -320,55 +308,6 @@ fn host_take_poison(chan: &ChannelRef) -> Tensor {
         ValueType::new(st.shape, st.dtype),
     )
 }
-
-impl AsTensor for Taken {
-    #[track_caller]
-    fn to_arg(&self) -> crate::value::Arg {
-        match &self.inner {
-            TakenInner::InProgram(t) => t.to_arg(),
-            TakenInner::Host { chan, .. } => host_take_poison(chan).to_arg(),
-        }
-    }
-}
-impl AsTensor for &Taken {
-    #[track_caller]
-    fn to_arg(&self) -> crate::value::Arg {
-        (*self).to_arg()
-    }
-}
-
-// Host-side await surface (wires real async over the driver channel).
-impl Taken {
-    /// Await the host value. Consumes the cell for `take`, copies for `read`.
-    pub async fn get<T: HostElem>(self) -> Result<Vec<T>, HostError> {
-        match self.inner {
-            TakenInner::Host { chan, consume } => {
-                let _ = (&chan, consume);
-                Err(HostError::NotBound)
-            }
-            TakenInner::InProgram(_) => Err(HostError::InProgram),
-        }
-    }
-}
-
-/// Host errors surfaced by a blocked `take`/`read` (poison).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum HostError {
-    /// The `take`/`read` resolved to poison instead of a value.
-    Poisoned,
-    /// The channel has no host transport bound yet, so there is nothing to await.
-    NotBound,
-    /// `get` was called on an in-program take, which has no host value: its
-    /// tensor lives in the trace, not across the driver boundary.
-    InProgram,
-}
-
-/// A host-readable element type.
-pub trait HostElem: Copy {}
-impl HostElem for i32 {}
-impl HostElem for u32 {}
-impl HostElem for f32 {}
 
 /// The (fire-and-forget) result of a `put`. Host puts coalesce before the next
 /// submit; the handle exists so back-pressure can be awaited.

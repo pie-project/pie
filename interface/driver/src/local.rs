@@ -30,7 +30,37 @@ use crate::geometry::GeometryClass;
 /// verdicts and intrinsic side-table analysis the CUDA driver derives for
 /// itself in `region_support.hpp`. Additive, and empty means "not supplied",
 /// but the struct grew, so drivers and workers ship together.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 19;
+/// v21: `PieLaunchDesc::rs_buffer_read_*` — the buffered prefix a fire must
+/// REPLAY before its own tokens, so a recurrence can start from
+/// `folded ⊕ replay(buffer)` instead of only from the folded boundary.
+/// Separate from the write CSR because a write may allocate a slab and a read
+/// must not. Additive, and an empty read side means "nothing to replay", but
+/// the struct grew, so drivers and workers ship together.
+/// v22: `PieLaunchDesc::rs_buffer_heads` — where each row's logical buffer
+/// token 0 physically sits. A fold absorbs tokens off the front of the buffer
+/// but can only release WHOLE covered pages, and `fold_granularity` is 1 while
+/// a buffer page is the KV page size, so a fold routinely lands mid-page and
+/// the survivors keep their offsets. Every buffer span the driver walks is
+/// therefore `head + logical`. Zero for a buffer that was never partially
+/// folded, which is why this was invisible until the replay path landed.
+/// v23: `PIE_RS_FLAG_BUFFER_WRITE` — a new bit in `rs_slot_flags` marking a
+/// row whose buffer span is a WRITE. Orthogonal to `PIE_RS_FLAG_FOLD`: a pass
+/// may scatter its own tokens into the buffer AND fold a prefix of the result
+/// in one go, and the two flags together are what tell a write-and-fold (run
+/// the extended `[buffered | new]` layout, snapshot the state at
+/// `rs_fold_lens[r]`) apart from a pure commit (whose rows ARE the replay).
+/// No struct grew, but an older driver rejects the unknown bit, so drivers and
+/// workers ship together.
+/// v24: `PIE_RS_FLAG_FOLD_LEN_DEVICE` — a new bit in `rs_slot_flags` marking a
+/// row whose fold length the WORKER DOES NOT KNOW. The value lives in the
+/// `rs_fold_len` descriptor port, which the driver resolves at compose time,
+/// so a speculative decode's accepted count never has to round-trip through
+/// the host between the fire that computes it and the fire that folds it.
+/// `rs_fold_lens[r]` is a placeholder for such a row and MUST be ignored; the
+/// driver clamps the resolved value to the row's replay length. No struct
+/// grew, but an older driver rejects the unknown bit, so drivers and workers
+/// ship together.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 24;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -78,6 +108,18 @@ const _: () = {
 pub const PIE_RS_FLAG_RESET: u8 = 1;
 /// Fold buffered recurrent-state data into the slot after the pass.
 pub const PIE_RS_FLAG_FOLD: u8 = 2;
+/// The pass SCATTERS its own tokens into the buffer. Orthogonal to `FOLD`: a
+/// pass may write the buffer and fold a prefix of the result in one go, and
+/// the two together are what distinguishes a write-and-fold (which runs the
+/// extended `[buffered | new]` layout and snapshots the state at
+/// `rs_fold_lens[r]`) from a pure commit (whose rows ARE the replay, gathered
+/// straight from the slabs).
+pub const PIE_RS_FLAG_BUFFER_WRITE: u8 = 4;
+/// This row's fold length is NOT host-known. `rs_fold_lens[r]` is a
+/// placeholder and must be ignored; the real value comes from the
+/// `rs_fold_len` descriptor port, which the driver resolves once the fire that
+/// computes it has completed, and clamps to the row's replay length.
+pub const PIE_RS_FLAG_FOLD_LEN_DEVICE: u8 = 8;
 
 /// Concrete F32 channel element type.
 pub const PIE_CHANNEL_DTYPE_F32: u8 = 0;
@@ -1130,6 +1172,25 @@ pub struct PieStepDesc {
     pub rs_fold_lens: PieU32Slice,
     pub rs_buffer_slot_ids: PieU32Slice,
     pub rs_buffer_slot_indptr: PieU32Slice,
+    /// Buffered slabs the fire REPLAYS, with the row CSR (`rows + 1`), and the
+    /// token count to replay from each row's slabs (`rows` entries).
+    ///
+    /// Distinct from `rs_buffer_slot_ids`, which is what the fire WRITES: a
+    /// write may materialize or privatize a slab, a read must not, and a read
+    /// of a merely reserved page would gather uninitialized activations
+    /// straight into the recurrent state. All three are empty when no row has
+    /// anything buffered, which is the common case.
+    pub rs_buffer_read_slot_ids: PieU32Slice,
+    pub rs_buffer_read_indptr: PieU32Slice,
+    pub rs_buffer_read_lens: PieU32Slice,
+    pub rs_buffer_heads: PieU32Slice,
+    /// WorkingSet-relative buffer page -> physical slot for channel-resolved
+    /// `rs-geometry`, concatenated over request rows. `rs_translation_indptr`
+    /// is the row CSR (`rows + 1`). Per ROW, unlike `kv_translation`, because
+    /// a pass binds one RS working set per request rather than one per pass.
+    /// `0xFFFF_FFFF` marks a reserved-but-unmaterialized page.
+    pub rs_translation: PieU32Slice,
+    pub rs_translation_indptr: PieU32Slice,
     pub masks: PieMaskWordsDesc,
     /// Model readout rows, flattened across the batch.
     pub sampling_indices: PieU32Slice,
@@ -1254,7 +1315,13 @@ impl Default for PieStepDesc {
             rs_slot_flags: PieU8Slice::default(),
             rs_fold_lens: PieU32Slice::default(),
             rs_buffer_slot_ids: PieU32Slice::default(),
+            rs_buffer_read_slot_ids: PieU32Slice::default(),
+            rs_buffer_read_indptr: PieU32Slice::default(),
+            rs_buffer_read_lens: PieU32Slice::default(),
+            rs_buffer_heads: PieU32Slice::default(),
             rs_buffer_slot_indptr: PieU32Slice::default(),
+            rs_translation: PieU32Slice::default(),
+            rs_translation_indptr: PieU32Slice::default(),
             masks: PieMaskWordsDesc::default(),
             sampling_indices: PieU32Slice::default(),
             sampling_indptr: PieU32Slice::default(),
@@ -2056,6 +2123,10 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
         "launch rs_buffer_slot_ids ptr/len mismatch",
     )?;
     validate_u32_slice(
+        desc.rs_translation,
+        "launch rs_translation ptr/len mismatch",
+    )?;
+    validate_u32_slice(
         desc.sampling_indices,
         "launch sampling_indices ptr/len mismatch",
     )?;
@@ -2196,6 +2267,13 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
             desc.rs_buffer_slot_indptr,
             "launch rs_buffer_slot_indptr malformed",
             desc.rs_buffer_slot_ids.len,
+            wire_row_count,
+            true,
+        )?;
+        validate_csr(
+            desc.rs_translation_indptr,
+            "launch rs_translation_indptr malformed",
+            desc.rs_translation.len,
             wire_row_count,
             true,
         )?;
@@ -2348,7 +2426,10 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
             unsafe { std::slice::from_raw_parts(desc.rs_slot_flags.ptr, desc.rs_slot_flags.len) };
         if flags
             .iter()
-            .any(|flag| flag & !(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD) != 0)
+            .any(|flag| flag & !(PIE_RS_FLAG_RESET
+                    | PIE_RS_FLAG_FOLD
+                    | PIE_RS_FLAG_BUFFER_WRITE
+                    | PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0)
         {
             return Err(invalid_argument(
                 "launch rs_slot_flags contains unknown bits",

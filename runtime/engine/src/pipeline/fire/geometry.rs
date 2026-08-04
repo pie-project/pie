@@ -50,12 +50,16 @@ impl DecodeEnvelope {
             Some(bytes) => as_u32(Port::Positions, bytes)?,
             None => vec![0; token_count as usize],
         };
+        let mut readout_defaulted = false;
         let readout = match const_port(container, Port::Readout) {
             Some(bytes) => as_u32(Port::Readout, bytes)?,
-            None => qo_indptr
-                .windows(2)
-                .map(|lane| lane[1].saturating_sub(1))
-                .collect(),
+            None => {
+                readout_defaulted = true;
+                qo_indptr
+                    .windows(2)
+                    .map(|lane| lane[1].saturating_sub(1))
+                    .collect()
+            }
         };
         let mut sampling_indices = Vec::with_capacity(readout.len());
         let mut sampling_indptr = Vec::with_capacity(qo_indptr.len());
@@ -79,6 +83,7 @@ impl DecodeEnvelope {
             qo_indptr,
             sampling_indptr,
             sampling_indices,
+            readout_defaulted,
             ..ReqGeometry::default()
         })
     }
@@ -407,6 +412,16 @@ pub struct ReqGeometry {
     pub sampling_indices: Vec<u32>,
     /// Per-lane read-out CSR.
     pub sampling_indptr: Vec<u32>,
+    /// True when `readout` was ABSENT and the last row of each lane was
+    /// synthesized as a convenience default.
+    ///
+    /// A fold fire samples nothing — the linear layers return before the output
+    /// projection — so this default silently made every fold fire invalid, and
+    /// a guest had no way to say "sample no rows" (omitting the binding means
+    /// "the last row", and an empty channel has no expressible shape).
+    /// `rs_plan_for`'s callers drop the synthesized rows for a folding fire;
+    /// an EXPLICIT readout is left alone so the driver still refuses it loudly.
+    pub readout_defaulted: bool,
 }
 
 /// A geometry-mapping failure.
@@ -782,16 +797,52 @@ pub fn map_geometry_evaluated(
     let lanes = g.qo_indptr.len().saturating_sub(1);
     g.position_ids = required_u32(Port::Positions)?;
 
+    // A fire that spans NO TOKENS AT ALL is a pure replay: "compute nothing,
+    // only move the recurrent boundary". Its per-token channels cannot be
+    // empty, because the IR has no zero-sized tensor (`Shape::new` refuses a
+    // 0 dim), so the emptiness lives in the token CSR and the channels carry
+    // one unreferenced element that is dropped here.
+    //
+    // ONLY in that case. Everywhere else a per-token channel that disagrees
+    // with the CSR is a guest bug, and it used to be caught -- by the ABI,
+    // which requires `qo_indptr[rows] == token_ids.len` exactly. Truncating
+    // unconditionally would have swallowed that check for every fire in
+    // order to serve the one shape that needs it.
+    let spanned = g.qo_indptr.last().copied().unwrap_or(0) as usize;
+    for (port, tokens) in [
+        (Port::EmbedTokens, &mut g.token_ids),
+        (Port::Positions, &mut g.position_ids),
+    ] {
+        if spanned == 0 {
+            tokens.clear();
+        } else if tokens.len() != spanned {
+            return Err(EvaluatedGeometryError::BadValue {
+                port,
+                reason: format!(
+                    "the token CSR spans {spanned} rows but {} were supplied",
+                    tokens.len()
+                ),
+            });
+        }
+    }
+
     // Read-out rows distribute over lanes as LANE-RELATIVE indices (the
     // multi-row wire contract; identical to the envelope template). Absent
     // readout samples each lane's last row.
     let readout = match optional_u32(Port::Readout)? {
         Some(readout) => readout,
-        None => g
-            .qo_indptr
-            .windows(2)
-            .map(|lane| lane[1].saturating_sub(1))
-            .collect(),
+        None => {
+            g.readout_defaulted = true;
+            // A lane spanning no rows has no last row to sample. That is
+            // not a degenerate case to paper over: a row carrying zero
+            // tokens is how a guest says "compute nothing, only move the
+            // recurrent boundary".
+            g.qo_indptr
+                .windows(2)
+                .filter(|lane| lane[1] > lane[0])
+                .map(|lane| lane[1] - 1)
+                .collect()
+        }
     };
     let mut sampling_indices = Vec::with_capacity(readout.len());
     let mut sampling_indptr = Vec::with_capacity(g.qo_indptr.len());

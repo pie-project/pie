@@ -79,9 +79,9 @@ struct KvShare {
 inline std::optional<std::string> runtime_name(std::string_view raw_name,
                                                const KvShare& kv_share) {
     // The towers. Text decode binds none of it.
-    for (std::string_view skip : {"model.audio_tower.", "model.vision_tower.",
-                                  "model.embed_audio.", "model.embed_vision."}) {
-        if (raw_name.rfind(skip, 0) == 0) {
+    for (std::string_view skip : {"audio_tower.", "vision_tower.", "embed_audio.",
+                                  "embed_vision."}) {
+        if (has_wrapper_member(raw_name, skip)) {
             return std::nullopt;
         }
     }
@@ -96,12 +96,12 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name,
                std::string(raw_name.substr(std::string_view("lm_head.").size()));
     }
 
-    constexpr std::string_view kLm = "model.language_model.";
-    if (raw_name.rfind(kLm, 0) != 0) {
+    const std::optional<std::string_view> decoder = decoder_member(raw_name);
+    if (!decoder) {
         contract_detail::fail("Metal Gemma4 schema has no declared mapping or skip for '" +
                               std::string(raw_name) + "'");
     }
-    const std::string_view rest = raw_name.substr(kLm.size());
+    const std::string_view rest = *decoder;
 
     constexpr std::string_view kEmbed = "embed_tokens.";
     if (rest.rfind(kEmbed, 0) == 0) {
@@ -171,7 +171,8 @@ inline bool is_supported_model_type(std::string_view model_type) {
 /// its KV.
 inline void author_model_contract(const Checkpoint& checkpoint, std::string_view model_type,
                                   const pie_loader::DeviceTarget& target, ModelContract& out,
-                                  int first_kv_shared_layer) {
+                                  int first_kv_shared_layer, int quant_bits,
+                                  int quant_group_size) {
     using namespace pie::metal::model::contract_detail;
     using contract_detail::KvShare;
     using contract_detail::runtime_name;
@@ -208,7 +209,8 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
                 fail("Metal affine-U4 weight '" + std::string(raw.name) +
                      "' is missing scales or biases");
             }
-            push_mlx_affine_u4(out, raw, *scales, *biases, std::move(*output));
+            push_mlx_affine_declared(out, raw, *scales, *biases, quant_bits, quant_group_size,
+                                     std::move(*output));
         } else {
             push_direct(out, raw, std::move(*output));
         }

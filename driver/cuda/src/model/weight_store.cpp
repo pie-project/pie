@@ -301,6 +301,14 @@ void WeightStore::validate_tensor_records() const {
                     "weight store: owned tensor '" + name +
                     "' does not own its backing allocation");
             }
+        } else if (record.spec.ownership == TensorOwnershipKind::External) {
+            // The mirror of the `Owned` check: the lender frees this, so a
+            // handle that would free it too is the bug.
+            if (record.tensor.owns_memory()) {
+                throw std::runtime_error(
+                    "weight store: external tensor '" + name +
+                    "' unexpectedly owns its backing allocation");
+            }
         } else {
             if (record.spec.backing_tensor.empty()) {
                 throw std::runtime_error(

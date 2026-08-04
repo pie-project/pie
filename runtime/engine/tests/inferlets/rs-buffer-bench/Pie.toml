@@ -1,0 +1,4 @@
+[package]
+name = "rs-buffer-bench"
+version = "0.1.0"
+description = "Prices the RS buffer: an identical device-carried decode loop run once folding every fire and once buffering every fire"

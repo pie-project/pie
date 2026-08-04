@@ -27,14 +27,6 @@ const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
 }
 
-bool mtp_int8_lm_head_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MTP_INT8_LM_HEAD");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
 bool fused_full_attn_qgkv_weights_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_FUSED_FULL_ATTN_QGKV");
@@ -43,27 +35,6 @@ bool fused_full_attn_qgkv_weights_enabled() {
     return enabled;
 }
 
-
-// Materialise an owned fp32 copy of `t`, accepting either fp32 or bf16
-// on disk. Copies even when the source is already fp32 so the bound
-// pointer is owned by `Qwen3_5Weights::owned_fp32_buffers` (uniform
-// lifetime).
-DeviceBuffer<float> to_fp32(const DeviceTensor& t) {
-    std::size_t n = 1;
-    for (auto d : t.shape()) n *= static_cast<std::size_t>(d);
-    auto buf = DeviceBuffer<float>::alloc(n);
-    if (t.dtype() == DType::FP32) {
-        CUDA_CHECK(cudaMemcpy(buf.data(), t.data(),
-                              n * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
-    } else if (t.dtype() == DType::BF16) {
-        kernels::launch_bf16_to_fp32(t.data(), buf.data(), n, /*stream=*/0);
-        CUDA_CHECK(cudaDeviceSynchronize());
-    } else {
-        throw std::runtime_error("qwen3_5: unsupported dtype for fp32 conversion");
-    }
-    return buf;
-}
 
 // Qwen3.5 (multimodal config) nests the text tower under
 // `model.language_model.`; the vision tower lives under `model.visual.`
@@ -106,12 +77,6 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
     // ascending order. Linear layers don't occupy KV-cache slots —
     // their state lives in the recurrent/conv caches built by the
     // forward.
-    // owned_bf16_buffers must not reallocate after we hand out pointers
-    // — `Lw.la_in_proj_qkv` etc. are observers into this vector. Reserve
-    // up front for the worst case (3 sliced tensors + 2 fused GDN
-    // tensors + fused full-attn QGKV, plus MTP) so push_back never
-    // moves the storage.
-    w.owned_bf16_buffers.reserve(static_cast<std::size_t>(L) * 6 + 4);
 
     int kv_slot = 0;
     for (int li = 0; li < L; ++li) {
@@ -152,13 +117,12 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             Lw.la_conv1d_w = &must(engine, la + "conv1d.weight");
             Lw.la_conv1d_b = maybe(engine, la + "conv1d.bias");
             Lw.la_dt_bias  = &must(engine, la + "dt_bias");
-            // Materialise fp32 copies of A_log + RMSNormGated.weight.
-            // HF ships these as fp32 on Qwen3.5-4B and bf16 on
-            // Qwen3.6-35B-A3B; the kernels read fp32 either way.
-            w.owned_fp32_buffers.push_back(to_fp32(must(engine, la + "A_log")));
-            Lw.la_A_log_fp32  = w.owned_fp32_buffers.back().data();
-            w.owned_fp32_buffers.push_back(to_fp32(must(engine, la + "norm.weight")));
-            Lw.la_norm_w_fp32 = w.owned_fp32_buffers.back().data();
+            // fp32 by contract (`gdn_fp32_parameters`), so these are the
+            // loaded bytes rather than a bind-time copy of them.
+            Lw.la_A_log_fp32 =
+                static_cast<const float*>(must(engine, la + "A_log").data());
+            Lw.la_norm_w_fp32 =
+                static_cast<const float*>(must(engine, la + "norm.weight").data());
             Lw.la_out_proj = &must(engine, la + "out_proj.weight");
             Lw.kv_layer = -1;
         } else if (kind == "full_attention") {
@@ -226,24 +190,15 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
         Lw.gate_up_proj_fused =
             maybe(engine, lp + "mlp.gate_up_proj.fused.weight");
         Lw.kv_layer = kv_slot++;
-        if (mtp_int8_lm_head_enabled() &&
-            mtp.lm_head != nullptr &&
-            mtp.lm_head->dtype() == DType::BF16) {
-            const auto& shape = mtp.lm_head->shape();
-            const int rows = static_cast<int>(shape[0]); // vocab
-            const int cols = static_cast<int>(shape[1]); // hidden
-            w.owned_int8_buffers.push_back(
-                DeviceTensor::allocate(DType::INT8, shape));
-            w.owned_scale_buffers.push_back(
-                DeviceBuffer<float>::alloc(static_cast<std::size_t>(rows)));
-            kernels::quantize_bf16_to_int8_per_channel(
-                mtp.lm_head->data(),
-                static_cast<std::int8_t*>(w.owned_int8_buffers.back().data()),
-                w.owned_scale_buffers.back().data(),
-                rows, cols, /*stream=*/0);
-            CUDA_CHECK(cudaStreamSynchronize(0));
-            mtp.lm_head = &w.owned_int8_buffers.back();
-            mtp.lm_head_scale_inv = &w.owned_scale_buffers.back();
+        // `mtp_int8_lm_head` publishes this beside the bf16 head when
+        // `PIE_QWEN35_MTP_INT8_LM_HEAD` is set; absent, the draft step reads
+        // the same bf16 head as the main path.
+        if (const DeviceTensor* int8_head = maybe(engine, "mtp.lm_head")) {
+            const std::optional<ops::QuantMeta> meta = engine.quant_meta("mtp.lm_head");
+            if (meta.has_value() && meta->scale != nullptr) {
+                mtp.lm_head = int8_head;
+                mtp.lm_head_scale_inv = meta->scale;
+            }
         }
         w.mtp = mtp;
     }

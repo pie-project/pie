@@ -12,14 +12,28 @@ namespace pie::metal {
 
 inline constexpr int kMultiBatchOrdinalBase = 1024;
 inline constexpr int kPrefillOrdinalBase = 2048;
-inline constexpr int kPrefillOrdinalStride = 512;
+// Ordinals claimed by ONE prefill row's DAG. It must exceed the DAG's own
+// length, and the DAG's length is the model's: a 24-layer dense Qwen3.5 emits
+// about 260 dispatches per row, and the 40-layer 256-expert MoE emits 1083 --
+// which walked straight through a stride of 512 and refused to prefill at all.
+// Twenty-seven dispatches per layer is the rate, so 4096 holds a decoder of
+// about 150 layers. The space itself is free: argument tables live in a map
+// keyed by ordinal and are created on demand, so a wide stride costs nothing
+// that is not used. `qwen3_5_geometry_test` asserts the routed DAG fits.
+inline constexpr int kPrefillOrdinalStride = 4096;
 // One past the highest ordinal a prefill row can claim.  The PTIR runtime
 // allocates its own ordinals and must start at or above this: the two spaces
 // were separated only by both being small, and raising the rows-per-fire bound
 // from 64 to 512 walked the prefill range straight through PTIR's base at
 // 100000, which showed up as "no argument table bound for ordinal=100038".
 // Deriving one from the other means they cannot silently overlap again.
-inline constexpr int kPrefillOrdinalMaxRows = 512;  // == executor::kPagedMaxForwardTokensCeiling
+//
+// Raised 512 -> 1024 with `kPagedMaxForwardTokensCeiling`, because rows are the
+// longest prompt this driver accepts and a 650-token one was being refused. The
+// ordinal space itself is free -- argument tables are created on demand, keyed
+// by ordinal -- and the per-row prefill DAGs measured free too: 566 rows and
+// 1024 rows give the same 2.35GB peak RSS and the same wall clock.
+inline constexpr int kPrefillOrdinalMaxRows = 1024;  // == executor::kPagedMaxForwardTokensCeiling
 inline constexpr int kPrefillOrdinalLimit =
     kPrefillOrdinalBase + kPrefillOrdinalMaxRows * kPrefillOrdinalStride;
 

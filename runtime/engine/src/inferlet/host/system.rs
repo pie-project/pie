@@ -21,4 +21,9 @@ impl pie::inferlet::system::Host for ProcessCtx {
     async fn username(&mut self) -> Result<String> {
         Ok(self.get_username())
     }
+
+    async fn declare_restartable(&mut self) -> Result<()> {
+        crate::inferlet::process::declare_restartable(self.id());
+        Ok(())
+    }
 }

@@ -1236,8 +1236,8 @@ mod tests {
         let page = 4u32;
         let parent = store.create_working_set();
         prefill(&mut store, parent, &[1, 2, 3, 4, 5, 6], &[6], page);
-        let synchronous = store.fork(parent).unwrap();
-        let runahead = store.fork(parent).unwrap();
+        let synchronous = store.fork(parent, Default::default()).unwrap();
+        let runahead = store.fork(parent, Default::default()).unwrap();
 
         let (_, _, _, sync_first) =
             prepare(&mut store, synchronous, 6, &[7], page, Some(&[7])).unwrap();
@@ -1321,7 +1321,7 @@ mod tests {
         .unwrap();
         finalize(&mut store, txn, true).unwrap();
 
-        let forked = store.fork(ws).unwrap();
+        let forked = store.fork(ws, Default::default()).unwrap();
         let shared_tail = store.lookup(forked, 1).unwrap();
         let (proj, (src, dst), _tr, txn) =
             prepare(&mut store, forked, 6, &[7], page, Some(&[7])).unwrap();
@@ -1351,7 +1351,7 @@ mod tests {
         prefill(&mut store, parent, &(1..=8).collect::<Vec<_>>(), &[8], 4);
         let parent_tail = store.lookup(parent, 1).unwrap();
 
-        let child = store.fork(parent).unwrap();
+        let child = store.fork(parent, Default::default()).unwrap();
         let ((copy_src, copy_dst), txn) = realize_declaration(&mut store, child, 1..2).unwrap();
         assert_eq!(copy_src, vec![parent_tail.0]);
         assert_eq!(copy_dst.len(), 1);
@@ -1432,7 +1432,7 @@ mod tests {
         let page = 4u32;
         let a = store.create_working_set();
         prefill(&mut store, a, &[1, 2, 3, 4, 5, 6], &[6], page);
-        let b = store.fork(a).unwrap();
+        let b = store.fork(a, Default::default()).unwrap();
 
         // The same next token on both branches (one CoW, one shared-blocked
         // CoW as well) must produce the same slot identity.
@@ -1466,7 +1466,7 @@ mod tests {
 
         // Forked decode: entry 0 = shared committed page, entry 1 = the CoW
         // destination of THIS fire (not the shared source).
-        let forked = store.fork(ws).unwrap();
+        let forked = store.fork(ws, Default::default()).unwrap();
         let shared_head = store.lookup(forked, 0).unwrap().0;
         let shared_tail = store.lookup(forked, 1).unwrap().0;
         let (_, _, tr, txn) = prepare(&mut store, forked, 6, &[7], page, None).unwrap();

@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <set>
 #include <string>
 
 #include "model/registry.hpp"
@@ -23,6 +24,10 @@ using pie_cuda_driver::model::arch_table;
 
 int g_failures = 0;
 
+// Every `model_type` an assertion below has named, so the table can be checked
+// against the assertions rather than against a number.
+std::set<std::string> g_asserted;
+
 bool expect(bool condition, const std::string& message) {
     if (!condition) {
         std::fprintf(stderr, "FAIL: %s\n", message.c_str());
@@ -34,6 +39,7 @@ bool expect(bool condition, const std::string& message) {
 // Looks up `model_type`, then asserts it resolves to `family`/`binder_key`
 // and carries a usable (non-empty) bind + create_model factory pair.
 void expect_entry(const char* model_type, Family family, const char* binder_key) {
+    g_asserted.insert(model_type);
     const auto* entry = find_arch_entry(model_type);
     if (!expect(entry != nullptr, std::string(model_type) + ": not found in arch table")) {
         return;
@@ -90,6 +96,7 @@ int main() {
     expect_entry("deepseek_v2", Family::Kimi, "kimi");
     expect_entry("deepseek_v3", Family::Kimi, "kimi");
     expect_entry("kimi_k2", Family::Kimi, "kimi");
+    expect_entry("kimi_k3", Family::KimiK3, "kimi_k3");
     expect_entry("glm_moe_dsa", Family::Glm5, "glm5");
 
     // ── Qwen3.5 hybrid dense/MoE (aliases share one binder per variant).
@@ -106,12 +113,20 @@ int main() {
 
     // ── Table shape: exactly the allowlisted set, one row per string, no
     //    duplicates.
+    //
+    // Stated as a set, not a count. A count is a number someone has to remember
+    // to change, and it drifted the first time a row was added without one --
+    // the table held 34 rows against a literal 33, and the failure named
+    // neither the row nor the model it was about. Checking the table against
+    // the assertions instead says which row nobody declared, which is the thing
+    // a reader of the failure needs. The other direction is already covered:
+    // `expect_entry` fails on a `model_type` the table does not hold.
     const auto& table = arch_table();
-    const std::size_t expected_rows =
-        33;
-    expect(table.size() == expected_rows,
-           "arch table has the wrong number of supported model_type strings, got " +
-               std::to_string(table.size()));
+    for (const auto& row : table) {
+        expect(g_asserted.count(row.model_type) != 0,
+               "arch table row '" + row.model_type +
+                   "' is not asserted above; add an expect_entry for it");
+    }
     for (std::size_t i = 0; i < table.size(); ++i) {
         for (std::size_t j = i + 1; j < table.size(); ++j) {
             expect(table[i].model_type != table[j].model_type,

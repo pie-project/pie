@@ -3,9 +3,9 @@
 """
 Multimodal input — vision, video, audio. See MULTIMODAL.md.
 
-Source of truth for the `pie:core` package. Vendored copies live under the
-builds' `deps/core/` trees (kept in sync via `wit-deps`); this file is what
-`wit-deps` pulls from.
+Part of the `pie:inferlet` package. The vendored copies live under the
+builds' `deps/` trees (kept in sync via `scripts/sync-wit.sh` / `wit-deps`);
+this file is the source of truth.
 
 Model-agnostic by construction: the inferlet hands the host raw encoded
 bytes (a PNG/JPEG, an animated GIF, a WAV) and the host — which knows the

@@ -89,10 +89,10 @@ def generate_tsconfig(project_dir: Path) -> None:
 # =============================================================================
 
 
-def generate_rust_lib(project_dir: Path, _name: str) -> None:
+def generate_rust_lib(project_dir: Path, name: str) -> None:
     """Generate the src/lib.rs file for Rust inferlet."""
     template = get_template("rust/lib.rs.template")
-    content = template.substitute()
+    content = template.substitute(name=name)
     src_dir = project_dir / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
     (src_dir / "lib.rs").write_text(content)
@@ -215,3 +215,15 @@ def handle_create_command(
         console.print(f"   cd {project_dir}")
         console.print("   npm install")
         console.print(f"   bakery build . -o {project_name}.wasm")
+
+        # Say plainly that this scaffold cannot run a model, rather than
+        # letting the user find out when they go looking for a `generate`.
+        console.print(
+            "\n[yellow]Note:[/yellow] the JavaScript SDK does not expose the "
+            "forward-pass surface yet, so this scaffold reads model info and "
+            "builds a prompt but does not generate text."
+        )
+        console.print(
+            "   For anything that runs a model, drop [bold]--ts[/bold] and "
+            "scaffold in Rust."
+        )

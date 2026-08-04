@@ -69,12 +69,12 @@ fn quest_tap() -> Traced {
     let acc_epi = acc.clone();
     let mut b = Builder::new(V, PAGE_T);
     b.stage(Stage::OnAttnProj, move || {
-        let prev = acc_tap.take().tensor();
+        let prev = acc_tap.take();
         let scores = intrinsics::kernel::envelope_dot(PAGES);
         acc_tap.put(max_elem(&prev, &scores));
     });
     b.stage(Stage::Epilogue, move || {
-        out.put(acc_epi.take().tensor());
+        out.put(acc_epi.take());
         acc_epi.put(broadcast(f32::NEG_INFINITY, [PAGES]));
     });
     b.build().expect("the quest tap traces")

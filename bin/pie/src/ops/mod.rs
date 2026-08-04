@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod bakery;
 pub mod config;
+pub mod convert;
 pub mod diag;
 pub mod doctor;
 pub mod driver;
@@ -13,3 +14,4 @@ pub mod hf;
 pub mod inferlet;
 pub mod model;
 pub mod py_runtime;
+pub mod store;

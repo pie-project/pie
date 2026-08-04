@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ctypes
 import ctypes.util
 import json
 import math
 import os
+import random
 import re
 import statistics
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -124,6 +127,77 @@ def percentile(xs: list[float], q: float) -> float | None:
     if lo == hi:
         return s[int(k)]
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def arrival_schedule(
+    n: int, rate: float, process: str, seed: int
+) -> list[float]:
+    """Offsets in seconds, from the start of the measured run, at which each
+    request should be submitted.
+
+    `rate <= 0` reproduces the historical behaviour: every request is offered
+    at t=0 and the engine's admission cap is the only thing pacing them. That
+    is a closed-loop saturation test and it cannot distinguish an engine that
+    is fast from one that is merely deep, because the offered load adapts to
+    whatever the engine can absorb. A finite rate makes the load exogenous, so
+    queueing delay shows up as latency instead of hiding in the arrival
+    process.
+
+    The schedule is derived from `seed` alone, so every engine in a comparison
+    is offered the byte-identical arrival pattern.
+    """
+    if rate <= 0:
+        return [0.0] * n
+    rng = random.Random(seed)
+    offsets: list[float] = []
+    t = 0.0
+    for _ in range(n):
+        offsets.append(t)
+        # Poisson arrivals are the bursty case: the exponential gap
+        # distribution produces clumps that a uniform schedule never does, and
+        # clumps are what actually exercise admission.
+        t += rng.expovariate(rate) if process == "poisson" else 1.0 / rate
+    return offsets
+
+
+class ArrivalPacer:
+    """Holds a submission schedule so both harnesses pace identically.
+
+    Also records how far behind schedule each submission actually went out.
+    A large lag means the *client* saturated, not the engine, and any latency
+    read from that run is measuring asyncio rather than the server.
+    """
+
+    def __init__(self, offsets: list[float]) -> None:
+        self._offsets = offsets
+        self._t0: float | None = None
+        self.lag_s: list[float] = []
+
+    @property
+    def enabled(self) -> bool:
+        return any(o > 0.0 for o in self._offsets)
+
+    def start(self) -> None:
+        self._t0 = time.perf_counter()
+
+    async def wait(self, index: int) -> None:
+        if self._t0 is None or index >= len(self._offsets):
+            return
+        due = self._t0 + self._offsets[index]
+        delay = due - time.perf_counter()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        self.lag_s.append(max(0.0, time.perf_counter() - due))
+
+    def stats(self) -> dict[str, Any]:
+        if not self.lag_s:
+            return {}
+        return {
+            "arrival_lag_p50_ms": (percentile(self.lag_s, 0.50) or 0.0) * 1e3,
+            "arrival_lag_p99_ms": (percentile(self.lag_s, 0.99) or 0.0) * 1e3,
+            "arrival_lag_max_ms": max(self.lag_s) * 1e3,
+            "arrival_span_s": self._offsets[-1] if self._offsets else 0.0,
+        }
 
 
 def summarize(
@@ -316,6 +390,16 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
              "Pair with prefix caching on engines that support it.",
     )
     p.add_argument(
+        "--output-spread",
+        type=float,
+        default=0.0,
+        help="Fan per-request output budgets out over "
+             "[max_tokens*(1-F), max_tokens*(1+F)] on a deterministic "
+             "sawtooth with mean exactly max_tokens. Breaks the lockstep a "
+             "uniform shape imposes on a closed-loop client without changing "
+             "the total work.",
+    )
+    p.add_argument(
         "--mixed-phase",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -335,6 +419,28 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=16,
         help="max_tokens for the prefill-heavy half in --mixed-phase.",
+    )
+    p.add_argument(
+        "--arrival-rate",
+        type=float,
+        default=0.0,
+        help="Open-loop offered load in requests/second. 0 (the default) "
+             "offers every request at t=0, which measures saturation only. "
+             "A finite rate makes the load exogenous so queueing delay shows "
+             "up in TTFT instead of being absorbed by the arrival process.",
+    )
+    p.add_argument(
+        "--arrival-process",
+        choices=["poisson", "uniform"],
+        default="poisson",
+        help="Inter-arrival distribution for --arrival-rate.",
+    )
+    p.add_argument(
+        "--arrival-seed",
+        type=int,
+        default=20260730,
+        help="Seeds the arrival schedule. Engines compared against each "
+             "other must share this so they see the identical pattern.",
     )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument(
@@ -396,6 +502,36 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--sglang-attention-backend", default=None)
     p.add_argument("--sglang-sampling-backend", default=None)
+    p.add_argument(
+        "--sglang-max-total-tokens",
+        type=int,
+        default=None,
+        help="Pin SGLang's KV pool to this many tokens. The cross-engine "
+             "analogue of pie's `--total-pages P` and vLLM's "
+             "`--num-gpu-blocks-override P --block-size B`: without it the "
+             "pool is sized from --gpu-mem-util and the three engines are "
+             "not given the same KV budget.",
+    )
+    p.add_argument(
+        "--sglang-page-size",
+        type=int,
+        default=None,
+        help="SGLang KV page size in tokens. Defaults to SGLang's own "
+             "default (1). Set to 16 to match vLLM's --block-size and pie's "
+             "page granularity so internal fragmentation is comparable too.",
+    )
+    p.add_argument(
+        "--sglang-cuda-graph-max-bs",
+        type=int,
+        default=None,
+        help="Largest decode batch SGLang captures a CUDA graph for. "
+             "SGLang's default is a hardware-tier heuristic keyed on total "
+             "GPU memory (32 on an L40S at tp<4), so a decode batch of 128 "
+             "runs eager and a small model loses most of its throughput to "
+             "launch overhead. vLLM captures up to max_num_seqs, so leaving "
+             "this at SGLang's default measures the heuristic, not the "
+             "engine. Set it to the concurrency.",
+    )
     p.add_argument("--sglang-disable-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--sglang-disable-piecewise-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
@@ -492,11 +628,31 @@ def _filler_words(count: int) -> str:
     return " ".join(base[i % len(base)] for i in range(count))
 
 
+OUTPUT_SPREAD_PERIOD = 16
+
+
 def request_max_tokens(args: argparse.Namespace, i: int) -> int:
-    """Per-request output budget: uniform unless --mixed-phase."""
+    """Per-request output budget: uniform unless --mixed-phase.
+
+    `--output-spread` fans the budget out around `--max-tokens` on a
+    deterministic sawtooth whose mean over each period is exactly 1, so the
+    total output token count is preserved and the ledger's same-work guard
+    still holds. Both engines call this, so they see identical budgets.
+    """
     if getattr(args, "mixed_phase", False) and i % 2 == 0:
         return args.mixed_short_output
+    spread = getattr(args, "output_spread", 0.0) or 0.0
+    if spread > 0.0:
+        frac = (i % OUTPUT_SPREAD_PERIOD) / (OUTPUT_SPREAD_PERIOD - 1)
+        return max(1, round(args.max_tokens * (1.0 + spread * (2.0 * frac - 1.0))))
     return args.max_tokens
+
+
+def request_max_tokens_varies(args: argparse.Namespace) -> bool:
+    """True when `request_max_tokens` is not constant across requests."""
+    if getattr(args, "mixed_phase", False):
+        return True
+    return (getattr(args, "output_spread", 0.0) or 0.0) > 0.0
 
 
 def hash_output_tokens(token_ids: list[int]) -> str:

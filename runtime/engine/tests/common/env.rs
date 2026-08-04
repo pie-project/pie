@@ -82,7 +82,7 @@ pub struct MockEnv {
     temp_cache: TempDir,
     /// Recurrent-state pool the model reports (`rs_cache_slots` /
     /// `rs_cache_slot_bytes`). Zero — the default — makes the mock a
-    /// pure-attention model; non-zero makes `model.is-linear()` true and
+    /// pure-attention model; non-zero makes `model.pass-kind()` non-attention and
     /// gives the engine an `RsStore` to bind, which is what the GDN/linear
     /// inferlets need.
     rs_slots: usize,
@@ -180,9 +180,13 @@ impl MockEnv {
                 arch_name: String::new(),
                 kv_page_size: 16,
                 tokenizer_path,
+                // A fixture snapshot, not an artifact.
+                artifact: None,
                 drivers,
                 scheduler: SchedulerConfig {
                     request_timeout_secs: 30,
+                    submit_deadline_us: 50_000,
+                    silence_timeout_secs: 30,
                 },
             },
             runtime: RuntimeConfig {

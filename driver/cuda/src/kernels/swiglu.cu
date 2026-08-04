@@ -61,7 +61,40 @@ __global__ void swiglu_clamp_bf16_kernel(
     y[idx] = __float2bfloat16((g / (1.f + expf(-g))) * u);
 }
 
+__global__ void situ_bf16_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ y,
+    int n,
+    float beta,
+    float linear_beta)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    const float g = __bfloat162float(gate[idx]);
+    float u = __bfloat162float(up[idx]);
+    const float situ = beta * tanhf(g / beta) / (1.f + expf(-g));
+    if (linear_beta > 0.f) {
+        u = linear_beta * tanhf(u / linear_beta);
+    }
+    y[idx] = __float2bfloat16(situ * u);
+}
+
 }  // namespace
+
+void launch_situ_bf16(
+    const void* gate, const void* up, void* y,
+    int num_elements, float beta, float linear_beta, cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    const int grid = (num_elements + BLOCK - 1) / BLOCK;
+    situ_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const __nv_bfloat16*>(up),
+        static_cast<__nv_bfloat16*>(y),
+        num_elements, beta, linear_beta);
+}
 
 void launch_swiglu_clamp_bf16(
     const void* gate, const void* up, void* y,
@@ -168,6 +201,27 @@ void launch_sigmoid_gate_inplace_bf16(
 }
 
 namespace {
+
+template <bool GateSecond>
+__global__ void chunked_situ_bf16_kernel(
+    const __nv_bfloat16* __restrict__ packed,
+    __nv_bfloat16*       __restrict__ y,
+    int N, int I, float beta, float linear_beta)
+{
+    const int n = blockIdx.x;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (n >= N || i >= I) return;
+
+    const long long row = static_cast<long long>(n) * I;
+    const long long packed_row = row * 2;
+    const float g = __bfloat162float(packed[packed_row + (GateSecond ? I + i : i)]);
+    float u = __bfloat162float(packed[packed_row + (GateSecond ? i : I + i)]);
+    const float situ = beta * tanhf(g / beta) / (1.f + __expf(-g));
+    if (linear_beta > 0.f) {
+        u = linear_beta * tanhf(u / linear_beta);
+    }
+    y[row + i] = __float2bfloat16(situ * u);
+}
 
 template <bool GateSecond>
 __global__ void chunked_swiglu_bf16_kernel(
@@ -655,6 +709,24 @@ void launch_sigmoid_dot_scalar_gate_add_bf16(
         static_cast<__nv_bfloat16*>(out),
         static_cast<const __nv_bfloat16*>(y),
         H);
+}
+
+void launch_chunked_situ_bf16(
+    const void* packed, void* y, int N, int I, float beta, float linear_beta,
+    bool gate_second, cudaStream_t stream)
+{
+    if (N <= 0 || I <= 0) return;
+    constexpr int BLOCK = 128;
+    const auto* p = static_cast<const __nv_bfloat16*>(packed);
+    auto* yp = static_cast<__nv_bfloat16*>(y);
+    dim3 grid(N, (I + BLOCK - 1) / BLOCK);
+    if (gate_second) {
+        chunked_situ_bf16_kernel<true><<<grid, BLOCK, 0, stream>>>(
+            p, yp, N, I, beta, linear_beta);
+    } else {
+        chunked_situ_bf16_kernel<false><<<grid, BLOCK, 0, stream>>>(
+            p, yp, N, I, beta, linear_beta);
+    }
 }
 
 }  // namespace pie_cuda_driver::kernels

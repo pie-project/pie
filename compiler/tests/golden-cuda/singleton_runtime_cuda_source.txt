@@ -1,9 +1,11 @@
 # oracle dump: pie_cuda_driver::pipeline::generated::singleton_runtime_cuda_source
 # source of truth: compiler/codegen/src/cuda/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 19
-# @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
+# emitter_version: 21
+# @runtime: bytes=46235 fnv1a64=0x7d926cdb88ba105b
 # cases: 1
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: cumsum/cumprod widened from F32-only to every numeric dtype; the m1 runtime's scan block now branches on the operand dtype instead of loading every lane through m1_load_f. The oracle dumps change only because that block is embedded verbatim in every emitted source -- no emitted structure moved, and the f32 path is byte-for-byte the arithmetic the oracle recorded.
 === runtime
-bytes: 45277
-fnv1a64: 0x41b1d45aaef71184
+bytes: 46235
+fnv1a64: 0x7d926cdb88ba105b
 === end

@@ -29,7 +29,7 @@ pub use backend::{
 pub use channel::{ChannelCloser, ChannelEndpoint, ChannelValue, RegisteredChannel};
 pub use command::{
     ChannelRegistrationPlan, KvCopyPlan, LaunchPlan, PoolResizePlan, ProgramRegistration,
-    RS_FLAG_FOLD, RS_FLAG_RESET, StateCopyPlan,
+    RS_FLAG_BUFFER_WRITE, RS_FLAG_FOLD, RS_FLAG_FOLD_LEN_DEVICE, RS_FLAG_RESET, StateCopyPlan,
 };
 pub(crate) use completion::WorkItemAttemptOutcome;
 pub use completion::{CompletionBroker, SubmissionCompletion, WorkItemCompletion};

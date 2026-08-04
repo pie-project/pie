@@ -54,13 +54,46 @@ using namespace pie::metal::model::contract_detail;
 /// Every name is either mapped or explicitly skipped; an unrecognised one is an
 /// error rather than a pass-through, because a tensor this driver silently
 /// declared under its checkpoint name would never be found by the binder.
-inline std::optional<std::string> runtime_name(std::string_view raw_name) {
-    if (raw_name.rfind("model.visual.", 0) == 0 || raw_name.rfind("mtp.", 0) == 0) {
-        return std::nullopt;
+/// Whether this checkpoint's `lm_head` IS its embedding table.
+///
+/// A struct rather than a bare bool so a call site cannot pass it positionally
+/// to the wrong parameter -- the same reason the llama schema has one.
+struct HeadTying {
+    bool tied = true;
+};
+
+inline std::optional<std::string> runtime_name(std::string_view raw_name,
+                                               const HeadTying& head_tying = {}) {
+    // Not the text decoder. The vision tower has the same two spellings as the
+    // decoder does; `mtp.` is the multi-token-prediction head, which this
+    // driver does not run. Skipping is a declaration too -- an unlisted tensor
+    // is an error below, not a pass-through.
+    for (std::string_view skip : {"visual.", "vision_tower.", "mtp."}) {
+        if (has_wrapper_member(raw_name, skip)) {
+            return std::nullopt;
+        }
     }
-    if (raw_name.rfind("lm_head.", 0) == 0) {
-        return "shared_embedding." +
-               std::string(raw_name.substr(std::string_view("lm_head.").size()));
+    // The output projection. Spelled bare by the HF release, which puts it
+    // outside `model`, and under the wrapper by the mlx repack -- the same
+    // two-tools-one-tensor split as the decoder prefix. The dense members of
+    // this family tie: 0.8B has no `lm_head` at all. Every ROUTED member is
+    // untied and ships one, which is why this is not a detail.
+    //
+    // Untied it keeps its own name and `LmHeadUntied` binds it. Tied it lands
+    // on `shared_embedding` beside the table it IS -- and if a checkpoint that
+    // says it ties nonetheless ships the tensor, both would land there and the
+    // load would fail as a duplicate. That is why the caller decides tying from
+    // the TENSORS and not from the config alone.
+    for (std::string_view head : {"lm_head.", "language_model.lm_head."}) {
+        if (raw_name.rfind(head, 0) == 0) {
+            const std::string tail(raw_name.substr(head.size()));
+            return head_tying.tied ? "shared_embedding." + tail : "lm_head." + tail;
+        }
+    }
+    const std::optional<std::string_view> decoder = decoder_member(raw_name);
+    if (!decoder) {
+        fail("Metal Qwen3.5 schema has no declared mapping or skip for '" + std::string(raw_name) +
+             "'");
     }
     // The tied half of the same slot. `EmbedGather` and `QmvLmHead` both bind
     // `shared_embedding.*`, and this family ships tied — so its checkpoint has
@@ -70,19 +103,20 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
     // A checkpoint carrying both would declare `shared_embedding` twice and be
     // rejected as a duplicate, which is the truthful outcome: there is one
     // shared slot here, not two.
-    constexpr std::string_view kEmbed = "model.language_model.embed_tokens.";
-    if (raw_name.rfind(kEmbed, 0) == 0) {
-        return "shared_embedding." + std::string(raw_name.substr(kEmbed.size()));
+    constexpr std::string_view kEmbed = "embed_tokens.";
+    if (decoder->rfind(kEmbed, 0) == 0) {
+        const std::string tail(decoder->substr(kEmbed.size()));
+        return head_tying.tied ? "shared_embedding." + tail : "embed_tokens." + tail;
     }
-    if (raw_name == "model.language_model.norm.weight") {
+    if (*decoder == "norm.weight") {
         return std::string("final_norm.weight");
     }
-    constexpr std::string_view kLayers = "model.language_model.layers.";
-    if (raw_name.rfind(kLayers, 0) != 0) {
+    constexpr std::string_view kLayers = "layers.";
+    if (decoder->rfind(kLayers, 0) != 0) {
         fail("Metal Qwen3.5 schema has no declared mapping or skip for '" + std::string(raw_name) +
              "'");
     }
-    const std::string_view rest = raw_name.substr(kLayers.size());
+    const std::string_view rest = decoder->substr(kLayers.size());
     const std::size_t dot = rest.find('.');
     if (dot == std::string_view::npos) {
         fail("Metal Qwen3.5 layer tensor '" + std::string(raw_name) + "' is malformed");
@@ -94,7 +128,17 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
         fail("Metal Qwen3.5 layer tensor '" + std::string(raw_name) +
              "' has an invalid layer index");
     }
-    return "layers." + std::string(layer) + "." + std::string(rest.substr(dot + 1));
+    const std::string_view member = rest.substr(dot + 1);
+    // The mixture's naming is the same rule in every routed family, so it is
+    // asked of one place rather than restated here. Until this commit the
+    // pass-through below answered for it, which meant a Qwen3-Next MoE
+    // checkpoint's experts were declared under names no dispatch reads: the
+    // driver loaded a mixture and ran nothing with it.
+    if (auto renamed = routed_expert_member(raw_name, member, "Qwen3.5",
+                                            /*has_shared_expert=*/true)) {
+        return "layers." + std::string(layer) + "." + *renamed;
+    }
+    return "layers." + std::string(layer) + "." + std::string(member);
 }
 
 }  // namespace contract_detail
@@ -104,8 +148,8 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
 /// One list, and it is this one: there is no second table keyed by the same
 /// strings anywhere in this driver.
 inline bool is_supported_model_type(std::string_view model_type) {
-    for (std::string_view name : {"qwen3_5", "qwen3_5_text", "qwen3_next", "qwen3_next_text",
-                                  "qwen3_6"}) {
+    for (std::string_view name : {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
+                                  "qwen3_next", "qwen3_next_text", "qwen3_6"}) {
         if (model_type == name) {
             return true;
         }
@@ -119,7 +163,8 @@ inline bool is_supported_model_type(std::string_view model_type) {
 /// checkpoint does not match what the schema expects. The contract is left in
 /// `out`, which must outlive the compile call that consumes its `view()`.
 inline void author_model_contract(const Checkpoint& checkpoint, std::string_view model_type,
-                                  const pie_loader::DeviceTarget& target, ModelContract& out) {
+                                  const pie_loader::DeviceTarget& target, ModelContract& out,
+                                  bool tied_embeddings, int quant_bits, int quant_group_size) {
     using namespace pie::metal::model::contract_detail;
     using namespace contract_detail;
     if (!is_supported_model_type(model_type)) {
@@ -137,9 +182,22 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
         return nullptr;
     };
 
+    // `tie_word_embeddings` is what the config SAYS; a shipped `lm_head` is
+    // what the checkpoint DOES. When they disagree the tensors win, because
+    // mapping a real `lm_head` onto `shared_embedding` beside the table it is
+    // supposed to BE declares that name twice and fails the load with a
+    // duplicate rather than with the disagreement. Both spellings are checked,
+    // for the same reason both are mapped.
+    const bool has_lm_head =
+        std::any_of(tensors.begin(), tensors.end(), [](const SourceTensor& raw) {
+            return raw.name.rfind("lm_head.", 0) == 0 ||
+                   raw.name.rfind("language_model.lm_head.", 0) == 0;
+        });
+    const HeadTying head{tied_embeddings && !has_lm_head};
+
     std::size_t declared = 0;
     for (const SourceTensor& raw : tensors) {
-        std::optional<std::string> output = runtime_name(raw.name);
+        std::optional<std::string> output = runtime_name(raw.name, head);
         if (!output.has_value()) {
             continue;
         }
@@ -152,7 +210,8 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
                 fail("Metal affine-U4 weight '" + std::string(raw.name) +
                      "' is missing scales or biases");
             }
-            push_mlx_affine_u4(out, raw, *scales, *biases, std::move(*output));
+            push_mlx_affine_declared(out, raw, *scales, *biases, quant_bits, quant_group_size,
+                                     std::move(*output));
         } else {
             push_direct(out, raw, std::move(*output));
         }

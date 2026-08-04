@@ -28,7 +28,7 @@
 #include <cstdint>
 #include <memory>
 
-#include "pie_native/launch_view.hpp"
+#include "pie/driver/fire/view.hpp"
 #include <pie_driver_abi.h>
 
 namespace pie_cuda_driver {
@@ -63,7 +63,7 @@ class PreparedStep {
 // steps share R and plan from frame-constant envelope bounds).
 void prepare_step(
     BatchEngine& engine,
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     PreparedStep& step,
     const PreparedStep* previous = nullptr);
 

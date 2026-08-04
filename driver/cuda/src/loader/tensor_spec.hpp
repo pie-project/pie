@@ -18,6 +18,14 @@ enum class TensorOwnershipKind {
     BorrowedView,
     Alias,
     Temporary,
+    /// Memory this store neither allocated nor views through another entry.
+    ///
+    /// A store built over a caller-supplied arena -- one slot of a streamed
+    /// group's slab -- holds tensors whose bytes outlive it and are freed by
+    /// whoever lent the arena. `Owned` would be a lie the invariant check
+    /// catches, and `BorrowedView` demands a backing tensor that by definition
+    /// is not in this store, so neither could describe it.
+    External,
 };
 
 /// What the store knows about a resident tensor beyond its bytes.

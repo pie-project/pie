@@ -83,6 +83,4 @@ template <typename T, int N_READS>
       const device itype*, device itype*, constant VNormParams&,       \
       uint, uint, uint, uint);
 
-instantiate_vnorm(float32, float, 4)
-instantiate_vnorm(float16, half, 4)
 instantiate_vnorm(bfloat16, bfloat, 4)

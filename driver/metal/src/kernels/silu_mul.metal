@@ -58,8 +58,6 @@ template <typename T>
       const device itype*, const device itype*, device itype*,    \
       const constant int&, const constant int&, uint2);
 
-instantiate_silu_mul_strided(float32, float)
-instantiate_silu_mul_strided(float16, half)
 instantiate_silu_mul_strided(bfloat16, bfloat)
 
 #define instantiate_silu_mul(name, itype)                         \
@@ -67,6 +65,4 @@ instantiate_silu_mul_strided(bfloat16, bfloat)
   [[kernel]] void silu_mul<itype>(                                \
       const device itype*, const device itype*, device itype*, const constant int&, uint);
 
-instantiate_silu_mul(float32, float)
-instantiate_silu_mul(float16, half)
 instantiate_silu_mul(bfloat16, bfloat)

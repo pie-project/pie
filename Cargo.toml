@@ -21,6 +21,9 @@ members = [
     "runtime/grammar",
     # Model metadata + instruct chat templates + multimodal host-decode.
     "runtime/model",
+    # HF `config.json` normalization -> the `pie.model/1` descriptor. A leaf:
+    # serde only, no driver and no runtime, so `pie model convert` can run it.
+    "runtime/model-config",
     # Shared process skeleton (paths, config sourcing, tracing/metrics, signals,
     # CLI skeleton). Depends on no role lib. Lives under `bin/` because it also
     # ships the `pie-env` command; the bins import its lib as `startup`.
@@ -95,6 +98,31 @@ exclude = [
 # a reason in the diff. Either way the number is a measurement, so re-measure
 # rather than edit it to match whatever is installed.
 rust-version = "1.91"
+
+# The checkpoint readers, in one place because releasing them is a two-repo
+# dance: `ztensor` owns the container format and its validation,
+# `ztensor-compat` owns the foreign-format projections.
+#
+# An ordinary version requirement. It was a revision-pinned git dependency
+# while the two were developed together, which `Cargo.lock` not being tracked
+# here made necessary: a branch would have resolved to whatever v2's tip was at
+# clone time, and v2 moved under us.
+#
+# The patch is named, not just `"2.1"`, because 2.1.1 broke the API on purpose
+# and says so in its changelog. This is still a caret range — it does not pin —
+# but it puts the floor above the break, so no resolution can land on 2.1.0 and
+# fail to compile. `Cargo.lock` is not tracked here, which is what makes the
+# floor the only thing deciding that.
+#
+# 2.1.0 put the modules on the spec's layers (`format` is L0+L1 and opens no
+# file, `provide` is the projection face) and scoped the object builders. 2.1.1
+# narrowed what is left: bytes are reached through `Tensor::data`, since the
+# nine shorthands for it addressed one part while `verify` on the same receiver
+# covered them all, and `Part::bytes` hands back a `Cow` rather than a
+# lookalike of one.
+[workspace.dependencies]
+ztensor = "2.1.1"
+ztensor-compat = "2.1.1"
 
 # Shared lint table. Opt in per crate with `[lints] workspace = true`; today
 # only the `compiler/*` crates do, because they are the only ones at zero

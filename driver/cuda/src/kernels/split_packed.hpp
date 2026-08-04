@@ -40,11 +40,22 @@ void launch_split_gate_up_bf16(
     int n_tokens, int inter,
     cudaStream_t stream);
 
-// Pure-decode fast path for fused QKV projections with per-head Q/K RMSNorm
-// and standard RoPE. Reads packed [R, q_dim + 2 * kv_dim], writes Q to
-// [R, num_q_heads, head_dim], and writes K/V directly into the paged cache at
-// the current decode position for each request.
-void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+// Fused postprocess for fused-QKV projections with per-head Q/K RMSNorm and
+// standard RoPE: normalize, rotate, write Q to [num_rows, num_q_heads,
+// head_dim], and append K/V straight into the paged cache -- replacing the
+// split-qkv → qk-norm+rope → write-kv chain with a single pass.
+//
+// `qo_indptr` selects the shape. Pass `nullptr` for a pure-decode fire, where
+// each row is its own request and the append target is that request's last
+// occupied slot. Pass the fire's CSR query offsets (R+1 entries) for a prefill
+// or mixed fire, where rows are query TOKENS: request `r` then owns rows
+// [qo_indptr[r], qo_indptr[r+1]) and each row appends at its own offset within
+// the span. `num_rows` is the query-token count either way; `num_requests`
+// bounds `qo_indptr` and is unused when it is null.
+//
+// Every other per-row input -- `positions`, `rope_table`, `row_valid`, and the
+// WSlot/WOff descriptor -- is indexed by row in both shapes.
+void launch_qkv_qk_norm_rope_write_kv_bf16(
     const void* packed,
     void* q_out,
     void* k_pages,
@@ -53,12 +64,14 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
     const void* k_weight,
     const std::int32_t* positions,
     const float* rope_table,
+    const std::uint32_t* qo_indptr,
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
     const std::uint32_t* w_page,
     const std::uint32_t* w_off,
     const std::uint8_t* row_valid,
+    int num_rows,
     int num_requests,
     int num_q_heads,
     int num_kv_heads,

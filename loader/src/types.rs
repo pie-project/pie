@@ -65,11 +65,32 @@ impl DType {
     }
 }
 
+/// Which on-disk format a checkpoint file is.
+///
+/// One variant per format the loader can read, which is every format
+/// `ztensor-compat` projects — the loader enables all of them. `Unknown` is
+/// therefore not a "cannot read this" marker; it is what a *newer* zTensor
+/// would report for a format this build has no name for yet, and
+/// `checkpoint_format` has a test that keeps it unreachable until then.
+///
+/// New variants are appended rather than slotted in beside their siblings:
+/// these numbers cross the C ABI, so a driver compiled against an older header
+/// must keep reading every value it knew as the number it knew.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CheckpointFormat {
     Safetensors,
     Gguf,
     Unknown,
+    /// The loader's own container (`.zt`), including a root that names shards.
+    Zt,
+    /// NumPy's zip archive (`.npz`).
+    Npz,
+    /// PyTorch's pickle archive (`.pt`).
+    Pt,
+    /// HDF5 (`.h5`), including Keras checkpoints.
+    Hdf5,
+    /// ONNX protobuf (`.onnx`), read for its initializers.
+    Onnx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -216,6 +237,25 @@ impl QuantSpec {
         }
     }
 
+    /// The block a GGUF-family scheme stores, as `(elements, bytes)`, or
+    /// `None` for a scheme whose payload is a plain bit-packing.
+    ///
+    /// GGUF blocks carry their scales *inside* the payload — Q4_0 is one F16
+    /// scale and sixteen packed bytes per 32 elements — so their size is not
+    /// `elements × bits / 8` and a span computed that way reads short. These
+    /// are the GGML reference layouts, and `gguf.rs` states the same Q4_0
+    /// numbers when it types a checkpoint.
+    pub fn block_layout(&self) -> Option<(u64, u64)> {
+        match self.scheme {
+            QuantScheme::GgufQ4_0 => Some((32, 18)),
+            QuantScheme::GgufQ5_0 => Some((32, 22)),
+            QuantScheme::GgufQ8_0 => Some((32, 34)),
+            QuantScheme::GgufQ4K => Some((256, 144)),
+            QuantScheme::GgufQ5K => Some((256, 176)),
+            _ => None,
+        }
+    }
+
     pub fn normalized_bits(&self) -> u8 {
         if self.bits_per_element == 0 {
             self.scheme.default_bits()
@@ -329,6 +369,12 @@ pub fn encoding_nbytes(shape: &[i64], encoding: &Encoding) -> Option<u64> {
         Encoding::Raw(dtype) => tensor_nbytes(shape, dtype.bytes()),
         Encoding::Quant(spec) => {
             let spec = spec.clone().normalized();
+            // A blocked scheme's scales live inside the payload, so its span
+            // is blocks × block bytes, not elements × bits.
+            if let Some((block_elements, block_bytes)) = spec.block_layout() {
+                let elements = tensor_elements(shape)?;
+                return elements.div_ceil(block_elements).checked_mul(block_bytes);
+            }
             if let Some(element_bytes) = spec.dense_element_bytes() {
                 return tensor_nbytes(shape, element_bytes);
             }
@@ -363,4 +409,15 @@ pub enum ScaleForm {
     /// Consumed as F32 multipliers. Whatever the scales were stored as (E8M0
     /// bytes, BF16, or F32 already) is expanded before the GEMM sees them.
     F32Factors,
+    /// Consumed as BF16 multipliers that are only half of the dequantization:
+    /// the scheme is affine, so a second tensor holds the zero point each group
+    /// is offset by, and an element is `code * scale + zero`.
+    ///
+    /// The zero point is named by [`QuantAttachment::zero_point_tensor`] rather
+    /// than implied by a suffix, for the same reason the scale is: a kernel that
+    /// cannot find it does not read a coarser weight, it reads a wrong one.
+    ///
+    /// New variants go on the end. The FFI discriminants follow declaration
+    /// order and the C++ side reads them as integers.
+    Bf16AffineFactors,
 }

@@ -36,6 +36,11 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 from common import BENCH_PROMPT, BENCH_SYSTEM, hf_chat_token_ids_and_counts  # noqa: E402
 
+try:  # Kimi-K3 is registered from outside vLLM; see the module docstring there.
+    from vllm_kimi_k3_register import register as _register_kimi_k3
+except ImportError:  # pragma: no cover - the harness may be used standalone
+    _register_kimi_k3 = None
+
 
 def _save(out_dir: Path, tag: str, tensor) -> None:
     import numpy as np
@@ -62,6 +67,14 @@ def main() -> None:
              "appends \"(Request #0)\". Both engines must see the "
              "same string or the dumps are not comparable.",
     )
+    ap.add_argument(
+        "--prompt-token-ids",
+        default=None,
+        help="Comma-separated token ids to run instead of rendering a chat "
+             "template. The only way to make this dump comparable with pie's "
+             "is to feed both engines the same ids, and the two render "
+             "templates differently.",
+    )
     ap.add_argument("--gpu-mem-util", type=float, default=0.55)
     ap.add_argument("--max-model-len", type=int, default=1024)
     ap.add_argument("--kv-cache-dtype", default="auto")
@@ -71,11 +84,27 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     import torch
+
+    if _register_kimi_k3 is not None:
+        try:
+            _register_kimi_k3()
+        except Exception as exc:  # noqa: BLE001
+            # The K3 shim needs config/modelling classes that only newer vLLM
+            # builds ship. Failing here would take down dumping for every OTHER
+            # model too, which is the opposite of what an optional
+            # registration should do -- so report it and carry on. A K3 run
+            # will then fail later, on its own, with vLLM's own message.
+            print(f"[act-dump] Kimi-K3 registration unavailable: {exc}",
+                  file=sys.stderr)
+
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
 
-    prompt = f"{args.prompt} (Request #0)" if args.unique_prompts else args.prompt
-    ids, _ = hf_chat_token_ids_and_counts(args.model, args.system, [prompt])
+    if args.prompt_token_ids:
+        ids = [[int(t) for t in args.prompt_token_ids.split(",") if t.strip()]]
+    else:
+        prompt = f"{args.prompt} (Request #0)" if args.unique_prompts else args.prompt
+        ids, _ = hf_chat_token_ids_and_counts(args.model, args.system, [prompt])
     kwargs = {}
     if args.kv_cache_dtype != "auto":
         kwargs["kv_cache_dtype"] = args.kv_cache_dtype
@@ -159,6 +188,16 @@ def main() -> None:
                         )
                     except Exception:
                         tag_once(f"L{idx:02d}_out", out[1])
+                elif len(out) == 3:
+                    # Kimi-K3: `(mlp_out, prefix_sum, block_residual)`. The
+                    # running sum is closed by the *next* layer, so replay it
+                    # here to get an end-of-layer residual comparable with
+                    # pie's `out`. `block_residual` is the [T, B, H] AttnRes
+                    # stack, not part of the stream.
+                    if out[1] is not None:
+                        tag_once(f"L{idx:02d}_out", out[1] + out[0])
+                    else:
+                        tag_once(f"L{idx:02d}_out", out[0])
                 elif len(out) == 2 and out[1] is not None:
                     tag_once(f"L{idx:02d}_out", out[0] + out[1])
                 else:

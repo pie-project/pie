@@ -132,6 +132,7 @@ __global__ void causal_conv1d_prefill_batched_kernel(
     const std::uint32_t* __restrict__ qo_indptr,   // [R+1]
     long long slot_stride_elems,
     int C, int K, bool write_state,
+    const std::uint8_t* __restrict__ write_state_mask,
     const int* commit_len)
 {
     const int c = blockIdx.x;
@@ -181,7 +182,9 @@ __global__ void causal_conv1d_prefill_batched_kernel(
 
     // Frozen verify (write_state=false): leave the committed conv state at its
     // pre-verify value; the repair forward advances it through [input|accepted].
-    if (state_out_base && write_state && tid == 0) {
+    if (state_out_base && write_state &&
+        (write_state_mask == nullptr || write_state_mask[r] != 0) &&
+        tid == 0) {
         for (int s = 0; s < K; ++s) {
             const int src_t = Nr - K + s;
             const float v = (src_t < 0)
@@ -207,6 +210,7 @@ __global__ void causal_conv1d_prefill_batched_channel_tile_kernel(
     const std::uint32_t* __restrict__ qo_indptr,   // [R+1]
     long long slot_stride_elems,
     int C, int K, bool write_state,
+    const std::uint8_t* __restrict__ write_state_mask,
     const int* commit_len)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -255,7 +259,8 @@ __global__ void causal_conv1d_prefill_batched_channel_tile_kernel(
     }
 
     // Frozen verify (write_state=false): see the reference kernel above.
-    if (state_out_base && write_state) {
+    if (state_out_base && write_state &&
+        (write_state_mask == nullptr || write_state_mask[r] != 0)) {
         #pragma unroll
         for (int s = 0; s < 8; ++s) {
             if (s >= K) break;
@@ -386,7 +391,8 @@ void launch_causal_conv1d_prefill_batched_bf16(
     const std::uint32_t* qo_indptr,
     long long slot_stride_elems,
     int R, int C, int K, cudaStream_t stream, bool write_state,
-    const int* commit_len)
+    const int* commit_len,
+    const std::uint8_t* write_state_mask)
 {
     if (R <= 0 || C <= 0 || K <= 0) return;
     if (R >= 8) {
@@ -401,7 +407,7 @@ void launch_causal_conv1d_prefill_batched_bf16(
             static_cast<__nv_bfloat16*>(state_out_base),
             slot_ids, qo_indptr,
             slot_stride_elems,
-            C, K, write_state, commit_len);
+            C, K, write_state, write_state_mask, commit_len);
         return;
     }
     constexpr int BLOCK = 64;
@@ -415,7 +421,7 @@ void launch_causal_conv1d_prefill_batched_bf16(
         static_cast<__nv_bfloat16*>(state_out_base),
         slot_ids, qo_indptr,
         slot_stride_elems,
-        C, K, write_state, commit_len);
+        C, K, write_state, write_state_mask, commit_len);
 }
 
 }  // namespace pie_cuda_driver::kernels

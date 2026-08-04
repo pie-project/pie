@@ -14,12 +14,15 @@ use crate::types::{
 
 pub mod build;
 pub(crate) mod geometry;
+pub mod group;
 pub mod index;
 pub mod pass;
 pub mod passes;
 
 pub use crate::extent::{Dim, Extent};
-pub use passes::tile::{CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK};
+pub use passes::tile::{
+    CONVERT_TILE_MAP_MASK, CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK,
+};
 
 /// Which tile-map transforms a target's kernels implement.
 ///
@@ -52,13 +55,17 @@ pub fn compile(
     contract: &crate::contract::ModelContract,
     target: StorageTarget,
 ) -> Result<LoadPlan> {
-    let contract =
+    let rewritten =
         crate::contract::rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
-    let mut plan = build::build(metadata, &contract, target)?;
+    let mut plan = build::build(metadata, &rewritten, target.clone())?;
     plan.passes = pass::run_all(&mut plan)?;
     // Runs last, so a plan is never observable in a state where its tiling and
     // fusion fields are still placeholders.
     passes::tile::lower(&mut plan);
+    // Compiled from the *unrewritten* contract, because `groups` is not what
+    // the row-shard rewrite looks at; each group is rewritten on its own inside
+    // `group::compile_all`, where the sub-contract it applies to exists.
+    plan.groups = group::compile_all(metadata, contract, &target)?;
     Ok(plan)
 }
 
@@ -175,6 +182,11 @@ pub struct SourceTensorDecl {
 /// has to know they belong together in order to attach the quant metadata its
 /// kernels read.
 ///
+/// An affine scheme needs a third: its groups are offset as well as scaled, and
+/// `zero_point_tensor` names the tensor holding the offsets. It is `None` for
+/// every symmetric scheme, which is to say for everything whose `scale_form` is
+/// not [`ScaleForm::Bf16AffineFactors`].
+///
 /// Every entry here is recorded by whoever declared the scale tensor, at the
 /// point of declaring it: `plan/build.rs::quant_metadata_outputs` for scales the
 /// loader creates, and [`Scales`](crate::contract::Scales) for scales the
@@ -183,6 +195,7 @@ pub struct SourceTensorDecl {
 pub struct QuantAttachment {
     pub tensor: TensorId,
     pub scale_tensor: TensorId,
+    pub zero_point_tensor: Option<TensorId>,
     pub granularity: QuantGranularity,
     pub group_size: u32,
     pub channel_axis: u32,
@@ -301,16 +314,23 @@ pub struct TransformSpec {
     /// same 32 bits the contract named rather than a widened value that would
     /// have to be narrowed again.
     pub scale_factor_bits: u32,
-    /// Elements per factor along [`scale_axis`](TransformSpec::scale_axis) for
-    /// a per-group [`TileMapKind::Scale`]; zero when the factor is the uniform
-    /// constant in [`scale_factor_bits`](TransformSpec::scale_factor_bits).
+    /// Elements of the operand per factor, on each axis, for a per-block
+    /// [`TileMapKind::Scale`]; empty when the factor is the uniform constant in
+    /// [`scale_factor_bits`](TransformSpec::scale_factor_bits).
     ///
-    /// Non-zero is what tells the executor to read its factors from the extra
+    /// Non-empty is what tells the executor to read its factors from the extra
     /// input buffer instead, so the two cases cannot be confused for one
     /// another by a field left unset.
-    pub scale_group: u32,
-    /// The axis [`scale_group`](TransformSpec::scale_group) counts along.
-    pub scale_axis: u8,
+    ///
+    /// One entry per axis, so a two-dimensional block scale — which is what a
+    /// DeepSeek-style FP8 checkpoint ships — is `[128, 128]` and the ordinary
+    /// row-wise case is `[1, 32]`. Derived here rather than restated by the
+    /// author: [`ScaleFactor::PerBlock`](crate::contract::ScaleFactor::PerBlock)
+    /// carries only the factors, and the blocking is the ratio of the two
+    /// inferred shapes. Both executors can recompute it and check this against
+    /// what they see.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scale_blocks: Vec<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +400,48 @@ pub struct LoadPlan {
     pub memory: MemoryPlan,
     /// Quantized tensors paired with the tensors holding their scales.
     pub attachments: Vec<QuantAttachment>,
+    /// Interchangeable sets of tensors, each compiled once.
+    ///
+    /// Empty for every contract that declares no group, and elided when it is:
+    /// a plan recorded before groups existed still reads, and one compiled from
+    /// a contract without groups still records identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupPlan>,
+}
+
+/// One plan, `arity` instances, differing only in which bytes they read.
+///
+/// See [`plan::group`](crate::plan::group) for what that sentence is worth and
+/// how it is proved. The driver decides what a group is *for*; the plan only
+/// says the instances are substitutable and where each one's bytes live.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPlan {
+    pub name: String,
+    pub arity: u32,
+    /// The program one instance runs, compiled at index 0.
+    ///
+    /// A whole [`LoadPlan`] rather than a bare instruction list: an instance is
+    /// a self-contained load, with its own buffers and its own memory
+    /// accounting, and the driver runs it with the executor it already has.
+    pub plan: LoadPlan,
+    /// `bindings[i]` is what instance `i` reads instead of what
+    /// [`plan`](Self::plan) says. Indexed by instance, then by the
+    /// source-naming instructions of `plan` in order.
+    pub bindings: Vec<Vec<SourceBinding>>,
+}
+
+/// Where one instruction's bytes come from, for one instance of a group.
+///
+/// Exactly the three fields that locate bytes in a checkpoint. Everything else
+/// about the read -- how many bytes, with what stride, read as what dtype --
+/// is in the template, because a group whose instances disagreed about any of
+/// those would not have compiled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceBinding {
+    pub instr: InstrId,
+    pub file_id: FileId,
+    pub tensor_id: TensorId,
+    pub file_offset: u64,
 }
 
 impl LoadPlan {
@@ -396,6 +458,7 @@ impl LoadPlan {
             schedule: Vec::new(),
             memory: MemoryPlan::default(),
             attachments: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }

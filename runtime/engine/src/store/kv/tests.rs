@@ -776,7 +776,10 @@ fn store_explicit_index_roundtrip_remove_preserves_loaded_working_set() {
         "the explicit index root retains its pages"
     );
 
-    let loaded = store.from_index(b"prompt").unwrap().unwrap();
+    let loaded = store
+        .from_index(b"prompt", Default::default())
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (0..2)
             .map(|index| store.lookup(loaded, index).unwrap())
@@ -785,7 +788,12 @@ fn store_explicit_index_roundtrip_remove_preserves_loaded_working_set() {
     );
 
     assert_eq!(store.remove_index(b"prompt").unwrap(), (true, 0));
-    assert!(store.from_index(b"prompt").unwrap().is_none());
+    assert!(
+        store
+            .from_index(b"prompt", Default::default())
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(store.lookup(loaded, 1).unwrap(), expected[1]);
     let private = store.prepare_write(loaded, &[1]).unwrap();
     assert!(matches!(
@@ -858,7 +866,12 @@ fn store_pressure_evicts_an_unowned_explicit_index() {
 
     assert_eq!(store.drop_unused_cache_leases(store.current_epoch()), 2);
     store.retire_idle();
-    assert!(store.from_index(b"evict").unwrap().is_none());
+    assert!(
+        store
+            .from_index(b"evict", Default::default())
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(store.available_pages(), 4);
 }
 
@@ -868,12 +881,18 @@ fn store_index_replacement_keeps_existing_loaded_view() {
     let first = store.create_working_set();
     let first_id = commit_fresh(&mut store, first, 1, 1)[0];
     store.update_index(b"session".to_vec(), first).unwrap();
-    let loaded_first = store.from_index(b"session").unwrap().unwrap();
+    let loaded_first = store
+        .from_index(b"session", Default::default())
+        .unwrap()
+        .unwrap();
 
     let second = store.create_working_set();
     let second_id = commit_fresh(&mut store, second, 1, 1)[0];
     store.update_index(b"session".to_vec(), second).unwrap();
-    let loaded_second = store.from_index(b"session").unwrap().unwrap();
+    let loaded_second = store
+        .from_index(b"session", Default::default())
+        .unwrap()
+        .unwrap();
 
     assert_eq!(store.lookup(loaded_first, 0).unwrap(), first_id);
     assert_eq!(store.lookup(loaded_second, 0).unwrap(), second_id);
@@ -892,8 +911,18 @@ fn store_index_count_does_not_evict_entries() {
             .unwrap();
     }
 
-    assert!(store.from_index(b"index-0").unwrap().is_some());
-    assert!(store.from_index(b"index-256").unwrap().is_some());
+    assert!(
+        store
+            .from_index(b"index-0", Default::default())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .from_index(b"index-256", Default::default())
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -1032,7 +1061,7 @@ fn store_cow_on_shared_tail() {
     let mut store = KvStore::new(16, h(42));
     let a = store.create_working_set();
     let a_ids = commit_fresh(&mut store, a, 3, 1);
-    let b = store.fork(a).unwrap();
+    let b = store.fork(a, Default::default()).unwrap();
     store.reserve(b, 2).unwrap();
 
     // b writes the shared tail page plus two fresh pages.
@@ -1065,7 +1094,7 @@ fn store_shared_write_inside_the_tail_joins_the_rebase() {
     let mut store = KvStore::new(16, h(42));
     let a = store.create_working_set();
     let a_ids = commit_fresh(&mut store, a, 3, 1);
-    let b = store.fork(a).unwrap();
+    let b = store.fork(a, Default::default()).unwrap();
 
     // Writing only index 1 rebases [1, mapped): page 2 is copied along even
     // though unwritten, because the mapping edit is a growth-boundary rebase.
@@ -1262,7 +1291,7 @@ fn store_suspend_preserves_pages_shared_with_an_external_working_set() {
     let mut store = KvStore::new_with_swap(8, 8, h(42));
     let a = store.create_working_set();
     let original = commit_fresh(&mut store, a, 3, 1);
-    let b = store.fork(a).unwrap();
+    let b = store.fork(a, Default::default()).unwrap();
     store.reserve(b, 1).unwrap();
     let prepared = store.prepare_write(b, &[3]).unwrap();
     publish_prepared(&mut store, prepared, &[pc(9)]);
@@ -1284,7 +1313,7 @@ fn post_drain_reclaimability_excludes_shared_and_cache_anchored_pages() {
     let mut store = KvStore::new_with_swap(4, 4, h(42));
     let a = store.create_working_set();
     commit_fresh(&mut store, a, 2, 1);
-    let b = store.fork(a).unwrap();
+    let b = store.fork(a, Default::default()).unwrap();
     assert_eq!(
         store
             .post_drain_reclaimable_page_count(&HashSet::from([b]))

@@ -11,10 +11,10 @@
 // 2. **Decoder** (`Decoder`, `Event`) parses the model's generated tokens
 //    back into visible text + structural events.
 //
-// Both halves wrap the host's `pie:instruct/chat` interface — chat
+// Both halves wrap the host's `pie:inferlet/chat` interface — chat
 // template knowledge lives in the Pie runtime, not in the SDK.
 
-import * as _chat from 'pie:instruct/chat';
+import * as _chat from 'pie:inferlet/chat';
 
 // =============================================================================
 // Template fillers

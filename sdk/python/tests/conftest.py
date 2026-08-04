@@ -1,21 +1,26 @@
 """
-Mock WIT bindings for unit testing the inferlet SDK outside the Pie runtime.
+Mock WIT bindings for unit-testing the inferlet SDK outside a componentize-py
+build.
 
-Installs mock ``wit_world.imports.*`` modules before any inferlet code imports.
+The real `wit_world` package only exists inside such a build, so importing
+`inferlet` on a plain interpreter fails. These stubs stand in for the imports
+the hand-written layer actually uses, and nothing else.
 
-Reflects the WASI-Preview-3 single-model + working-set bindings the SDK now
-targets:
+SCOPE: the non-forward interfaces only, which is the whole of the SDK's
+hand-written layer today. The forward-pass surface has no Python counterpart
+yet -- see `inferlet/__init__.py` and `scripts/check-sdk-interfaces.sh`. When
+it lands, the channel / working-set / pipeline / forward* stubs belong here.
 
-* ``model`` exposes GLOBAL functions over the one bound model (no
-  ``model`` / ``tokenizer`` resource handles) plus the working-set / arena
-  capability getters.
-* the opaque ``context`` resource is gone — replaced by ``kv-working-set`` /
-  ``rs-working-set`` plus explicit ``kv-context`` / ``kv-output`` forward-pass
-  descriptors (``inference``).
-* ``forward-pass.execute`` and ``session.receive*`` are component-model-async
-  — ``async def`` returning values directly, with no pollable
-  ``future-output``.
-* ``media`` (image / video / audio) is the multimodal splice surface.
+These are stubs, not a simulator: enough to prove the wrapper layer calls the
+right binding and marshals the result, and no more. That the SDK matches the
+REAL world is proven by actually building a component --
+
+    componentize-py -d interface/inferlet -w inferlet componentize \\
+        -p . -p sdk/python/src -p sdk/python/src/inferlet/bindings app
+
+-- which is the check `release-pypi.yml` notes it cannot run. A stub can be
+made to agree with a world that no longer exists; that is how the previous
+version of this file kept passing against `pie:core/inference`.
 """
 
 from __future__ import annotations
@@ -23,643 +28,238 @@ from __future__ import annotations
 import sys
 import types
 from dataclasses import dataclass
-
-import pytest
-
-# =============================================================================
-# Fake resources & types
-# =============================================================================
+from enum import Enum
 
 
-class FakePollable:
-    def block(self) -> None:
-        pass
+# ---------------------------------------------------------------------------
+# pie:inferlet/model
+# ---------------------------------------------------------------------------
 
 
-class FakeTokenizer:
-    def encode(self, text: str) -> list[int]:
-        return [ord(c) for c in text]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens if 0 <= t < 128)
-
-    def vocabs(self):
-        return (list(range(256)), [bytes([i]) for i in range(256)])
-
-    def split_regex(self) -> str:
-        return r"."
-
-    def special_tokens(self):
-        return ([0, 1, 2], [b"<pad>", b"<bos>", b"<eos>"])
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
+class ForwardKind(Enum):
+    ATTENTION = 0
+    RECURRENT = 1
+    HYBRID = 2
 
 
-# --- Working set (replaces the retired `context` resource) ---
+def _make_model() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.model")
+    m.ForwardKind = ForwardKind
+    m.name = lambda: "mock-model"
+    m.architecture = lambda: "qwen3_5"
+    m.default_system_speculation = lambda: False
+    m.is_linear = lambda: True
+    m.pass_kind = lambda: ForwardKind.HYBRID
+    m.output_vocab_size = lambda: 151936
+    m.kv_page_size = lambda: 16
+    m.frame_size = lambda: 1
+    m.channel_capacity = lambda: 8
+    m.max_embed_length = lambda: 2048
+    m.rs_state_size = lambda: 4096
+    m.rs_buffer_page_size = lambda: 64
+    m.rs_fold_granularity = lambda: 1
+    m.arena_block_size = lambda: 8192
+    return m
+
+
+# ---------------------------------------------------------------------------
+# pie:inferlet/tokenizer
+# ---------------------------------------------------------------------------
+
+
+def _make_tokenizer() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.tokenizer")
+    # Byte-identity codec: keeps assertions readable while still exercising
+    # the list()/str marshalling the wrapper does.
+    m.encode = lambda text: [ord(c) for c in text]
+    m.decode = lambda tokens: "".join(chr(t) for t in tokens)
+    m.vocabs = lambda: ([0, 1], [b"a", b"b"])
+    m.split_regex = lambda: r"\w+"
+    m.special_tokens = lambda: ([2], [b"<eos>"])
+    return m
+
+
+# ---------------------------------------------------------------------------
+# pie:inferlet/session
+# ---------------------------------------------------------------------------
+
+
+class SessionSpy:
+    """Records what the session wrapper sent; scripts what it receives."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.sent_files: list[bytes] = []
+        self.to_receive: list[str | None] = []
+        self.files_to_receive: list[bytes | None] = []
+
+    def reset(self) -> None:
+        self.sent.clear()
+        self.sent_files.clear()
+        self.to_receive.clear()
+        self.files_to_receive.clear()
+
+
+SESSION_SPY = SessionSpy()
+
+
+def _make_session(spy: SessionSpy) -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.session")
+
+    def send(message: str) -> None:
+        spy.sent.append(message)
+
+    async def receive() -> str | None:
+        return spy.to_receive.pop(0) if spy.to_receive else None
+
+    def send_file(data: bytes) -> None:
+        spy.sent_files.append(data)
+
+    async def receive_file() -> bytes | None:
+        return spy.files_to_receive.pop(0) if spy.files_to_receive else None
+
+    m.send = send
+    m.receive = receive
+    m.send_file = send_file
+    m.receive_file = receive_file
+    return m
+
+
+# ---------------------------------------------------------------------------
+# pie:inferlet/chat and pie:inferlet/reasoning
+#
+# Both are a `variant event` plus a `decoder` resource. componentize-py lowers
+# a variant to one dataclass per case, named `Event_<Case>`, and the wrappers
+# dispatch with `isinstance` -- so the stub has to keep that shape exactly.
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class PageRange:
-    start: int
-    len: int
-
-
-class FakeKvWorkingSet:
-    """Dense ordered KV page array; structural mutators bump `generation`."""
-
-    _PAGE_SIZE = 64
-
-    def __init__(self):
-        self._size = 0
-        self._generation = 0
-
-    def size(self) -> int:
-        return self._size
-
-    def generation(self) -> int:
-        return self._generation
-
-    def page_size(self) -> int:
-        return self._PAGE_SIZE
-
-    def alloc(self, n: int) -> PageRange:
-        start = self._size
-        self._size += n
-        self._generation += 1
-        return PageRange(start, n)
-
-    def free(self, indices: list[int]) -> None:
-        if len(set(indices)) != len(indices) or any(
-            i < 0 or i >= self._size for i in indices
-        ):
-            raise ValueError("free: out-of-range or duplicate indices")
-        self._size -= len(indices)
-        self._generation += 1
-
-    def reorder(self, perm: list[int]) -> None:
-        if sorted(perm) != list(range(self._size)):
-            raise ValueError("reorder: perm is not a bijection over 0..size")
-        self._generation += 1
-
-    def slice(self, start: int, length: int) -> "FakeKvWorkingSet":
-        if start < 0 or start + length > self._size:
-            raise ValueError("slice: out-of-range span")
-        new = FakeKvWorkingSet()
-        new._size = length
-        return new
-
-    def append(self, other: "FakeKvWorkingSet") -> None:
-        self._size += other._size
-        self._generation += 1
-
-    def fork(self) -> "FakeKvWorkingSet":
-        new = FakeKvWorkingSet()
-        new._size = self._size
-        new._generation = self._generation
-        return new
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-
-class FakeRsWorkingSet:
-    """Buffered recurrent-state working set (hybrid / linear-attention)."""
-
-    _PAGE_SIZE = 64
-
-    def __init__(self):
-        self._buffer = 0
-        self._generation = 0
-
-    def state_size(self) -> int:
-        return 0
-
-    def buffer_size(self) -> int:
-        return self._buffer
-
-    def buffer_page_size(self) -> int:
-        return self._PAGE_SIZE
-
-    def alloc_buffer(self, n: int) -> PageRange:
-        start = self._buffer
-        self._buffer += n
-        self._generation += 1
-        return PageRange(start, n)
-
-    def free_buffer(self, indices: list[int]) -> None:
-        if len(set(indices)) != len(indices) or any(
-            i < 0 or i >= self._buffer for i in indices
-        ):
-            raise ValueError("free-buffer: out-of-range or duplicate indices")
-        self._buffer -= len(indices)
-        self._generation += 1
-
-    def reorder_buffer(self, perm: list[int]) -> None:
-        if sorted(perm) != list(range(self._buffer)):
-            raise ValueError("reorder-buffer: perm is not a bijection")
-        self._generation += 1
-
-    def fork(self) -> "FakeRsWorkingSet":
-        new = FakeRsWorkingSet()
-        new._buffer = self._buffer
-        new._generation = self._generation
-        return new
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-
-# --- Multimodal media handles ---
-
-
-class FakeImage:
-    @classmethod
-    def from_bytes(cls, data: bytes):
-        return cls()
-
-    def token_count(self) -> int:
-        return 4
-
-    def position_span(self) -> int:
-        return 4
-
-    def grid(self):
-        return (1, 2, 2)
-
-    def prefix_tokens(self) -> list[int]:
-        return [100]
-
-    def suffix_tokens(self) -> list[int]:
-        return [101]
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-
-class FakeVideo:
-    @classmethod
-    def from_bytes(cls, data: bytes, max_frames: int):
-        return cls()
-
-    def frame_count(self) -> int:
-        return 1
-
-    def frame(self, index: int) -> FakeImage:
-        return FakeImage()
-
-    def timestamp(self, index: int) -> float:
-        return 0.0
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-
-class FakeAudio:
-    @classmethod
-    def from_bytes(cls, data: bytes):
-        return cls()
-
-    def token_count(self) -> int:
-        return 3
-
-    def position_span(self) -> int:
-        return 3
-
-    def prefix_tokens(self) -> list[int]:
-        return []
-
-    def suffix_tokens(self) -> list[int]:
-        return []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-
-# --- Forward-pass memory descriptors (records) ---
-@dataclass
-class KvContext:
-    set: object
-    start: int
-    len: int
-    valid_tokens: int
+class ChatDelta:
+    value: str
 
 
 @dataclass
-class KvOutput:
-    set: object
-    generation: int
-    indices: list
-    per_page_valid_lens: list
-
-
-@dataclass
-class RsBufferContext:
-    set: object
-    start_token: int
-    len_tokens: int
-
-
-@dataclass
-class RsBufferOutput:
-    set: object
-    start_token: int
-    len_tokens: int
-
-
-# --- Sampler variants ---
-@dataclass
-class Sampler_Multinomial:
-    value: tuple
-@dataclass
-class Sampler_TopK:
-    value: tuple
-@dataclass
-class Sampler_TopP:
-    value: tuple
-@dataclass
-class Sampler_MinP:
-    value: tuple
-@dataclass
-class Sampler_TopKTopP:
-    value: tuple
-@dataclass
-class Sampler_Embedding:
-    pass
-@dataclass
-class Sampler_Dist:
-    value: tuple
-@dataclass
-class Sampler_RawLogits:
-    pass
-@dataclass
-class Sampler_Logprob:
+class ChatInterrupt:
     value: int
+
+
 @dataclass
-class Sampler_Logprobs:
-    value: list
+class ChatDone:
+    value: str
+
+
+class _ScriptedDecoder:
+    """Replays a class-level script, one event per `feed` call.
+
+    Tests set `script` before constructing the SDK's wrapper, because the
+    wrapper builds its inner decoder in `__init__`.
+    """
+
+    script: list[object] = []
+
+    def __init__(self) -> None:
+        self.fed: list[list[int]] = []
+        self.resets = 0
+        self._queue = list(type(self).script)
+
+    def feed(self, tokens: list[int]) -> object:
+        self.fed.append(list(tokens))
+        # WIT declares `feed: func(...) -> result<event, error>`, so there is
+        # no empty return: a run off the end of the script is a test bug, not
+        # an idle event.
+        if not self._queue:
+            raise AssertionError("decoder stub: script exhausted")
+        return self._queue.pop(0)
+
+    def reset(self) -> None:
+        self.resets += 1
+        self._queue = list(type(self).script)
+
+
+class ChatDecoderStub(_ScriptedDecoder):
+    script: list[object] = []
+
+
+def _make_chat() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.chat")
+    m.Event_Delta = ChatDelta
+    m.Event_Interrupt = ChatInterrupt
+    m.Event_Done = ChatDone
+    m.Decoder = ChatDecoderStub
+    m.system = lambda message: [1, *(ord(c) for c in message)]
+    m.first_user = lambda message: [2, *(ord(c) for c in message)]
+    m.user = lambda message: [3, *(ord(c) for c in message)]
+    m.system_user = lambda system, user: [4]
+    m.assistant = lambda message: [5, *(ord(c) for c in message)]
+    m.cue = lambda: [6]
+    m.seal = lambda: [7]
+    m.stop_tokens = lambda: [8, 9]
+    m.create_decoder = ChatDecoderStub
+    return m
+
+
 @dataclass
-class Sampler_Entropy:
+class ReasoningStart:
     pass
 
-# --- Slot output variants ---
+
 @dataclass
-class SlotOutput_Token:
-    value: int
-@dataclass
-class SlotOutput_Distribution:
-    value: tuple
-@dataclass
-class SlotOutput_Logits:
-    value: bytes
-@dataclass
-class SlotOutput_Logprobs:
-    value: list
-@dataclass
-class SlotOutput_Entropy:
-    value: float
-@dataclass
-class SlotOutput_Embedding:
-    value: bytes
-
-# --- Output (record) ---
-@dataclass
-class Output:
-    slots: list
-    spec_tokens: list
-    spec_positions: list
-
-
-class FakeForwardPass:
-    """P3 forward pass: explicit kv/rs descriptors + async `execute() -> output`."""
-
-    _next_output = None
-
-    def __init__(self):
-        pass
-
-    def kv_context(self, ctx): pass
-    def kv_output(self, out): pass
-    def rs_context(self, ctx): pass
-    def rs_output(self, out): pass
-    def fold_buffered(self, tokens): pass
-    def input_tokens(self, tokens, positions): pass
-    def input_image(self, image, anchor): pass
-    def input_audio(self, audio, anchor): pass
-    def input_speculative_tokens(self, tokens, positions): pass
-    def output_speculative_tokens(self, flag): pass
-    def pass_speculation(self, flag): pass
-    def attention_mask(self, mask): pass
-    def logit_mask(self, mask): pass
-    def sampler(self, indices, sampler): pass
-    def adapter(self, adapter): pass
-
-    async def execute(self):
-        if FakeForwardPass._next_output is not None:
-            return FakeForwardPass._next_output
-        # Default: a single EOS token (id 2, see special_tokens above).
-        return Output(slots=[SlotOutput_Token(2)], spec_tokens=[], spec_positions=[])
-
-    def __enter__(self):
-        return self
-    def __exit__(self, *args):
-        pass
-
-
-class FakeGrammar:
-    @classmethod
-    def from_json_schema(cls, schema): return cls()
-    @classmethod
-    def json(cls): return cls()
-    @classmethod
-    def from_regex(cls, pattern): return cls()
-    @classmethod
-    def from_ebnf(cls, ebnf): return cls()
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
-
-
-class FakeMatcher:
-    def __init__(self, grammar):
-        self._terminated = False
-    def accept_tokens(self, token_ids): pass
-    def next_token_logit_mask(self): return [1] * 256
-    def is_terminated(self): return self._terminated
-    def reset(self): self._terminated = False
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
-
-
-# --- Chat decoder / events ---
-@dataclass
-class ChatEvent_Delta:
-    value: str
-@dataclass
-class ChatEvent_Interrupt:
-    value: int
-@dataclass
-class ChatEvent_Done:
+class ReasoningDelta:
     value: str
 
-class FakeChatDecoder:
-    def __init__(self):
-        self._call_count = 0
-    def feed(self, tokens):
-        self._call_count += 1
-        return ChatEvent_Delta("hello ")
-    def reset(self): self._call_count = 0
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
 
-# --- Reasoning decoder / events ---
 @dataclass
-class ReasoningEvent_Start:
-    pass
-@dataclass
-class ReasoningEvent_Delta:
-    value: str
-@dataclass
-class ReasoningEvent_Complete:
+class ReasoningComplete:
     value: str
 
-class FakeReasoningDecoder:
-    def feed(self, tokens): return ReasoningEvent_Delta("thinking...")
-    def reset(self): pass
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
 
-# --- Tool use decoder / events ---
-@dataclass
-class ToolEvent_Start:
-    pass
-@dataclass
-class ToolEvent_Call:
-    value: tuple
-
-class FakeToolDecoder:
-    def feed(self, tokens): return ToolEvent_Start()
-    def reset(self): pass
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
+class ReasoningDecoderStub(_ScriptedDecoder):
+    script: list[object] = []
 
 
-# --- Adapter ---
-class FakeAdapter:
-    @classmethod
-    def create(cls, name): return cls()
-    @classmethod
-    def open(cls, name): return None
-    def fork(self, new_name): return FakeAdapter()
-    def load(self, path): pass
-    def save(self, path): pass
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
+def _make_reasoning() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.reasoning")
+    m.Event_Start = ReasoningStart
+    m.Event_Delta = ReasoningDelta
+    m.Event_Complete = ReasoningComplete
+    m.Decoder = ReasoningDecoderStub
+    m.create_decoder = ReasoningDecoderStub
+    return m
 
 
-# =============================================================================
-# Module installation
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Installation
+# ---------------------------------------------------------------------------
 
 
-def _build_mock_modules():
-    """Build and install mock wit_world modules into sys.modules."""
+def install() -> None:
+    """Register the stub `wit_world` package in `sys.modules`.
 
-    # componentize_py_types
-    cpy_types = types.ModuleType("componentize_py_types")
-    cpy_types.Result = type("Result", (), {})
-    cpy_types.Ok = type("Ok", (), {})
-    cpy_types.Err = type("Err", (), {})
-    cpy_types.Some = type("Some", (), {})
+    Import-time, not fixture-time: `inferlet`'s modules bind their WIT imports
+    at module scope, so the stubs must be in place before the first
+    `import inferlet` anywhere in the session.
+    """
+    if "wit_world" in sys.modules:
+        return
 
-    # wit_world
     wit_world = types.ModuleType("wit_world")
-    wit_imports = types.ModuleType("wit_world.imports")
-    wit_world.imports = wit_imports
+    imports = types.ModuleType("wit_world.imports")
+    wit_world.imports = imports
 
-    # poll
-    poll_mod = types.ModuleType("wit_world.imports.poll")
-    poll_mod.Pollable = FakePollable
-
-    # model — the engine serves one bound model; global functions only,
-    # including the working-set / arena capability getters.
-    _tok = FakeTokenizer()
-    model_mod = types.ModuleType("wit_world.imports.model")
-    model_mod.name = lambda: "mock-model"
-    model_mod.architecture = lambda: "mock-arch"
-    model_mod.default_system_speculation = lambda: False
-    model_mod.encode = lambda text: _tok.encode(text)
-    model_mod.decode = lambda tokens: _tok.decode(tokens)
-    model_mod.vocabs = lambda: _tok.vocabs()
-    model_mod.split_regex = lambda: _tok.split_regex()
-    model_mod.special_tokens = lambda: _tok.special_tokens()
-    model_mod.rs_state_size = lambda: 0
-    model_mod.rs_buffer_page_size = lambda: 0
-    model_mod.rs_fold_granularity = lambda: 1
-    model_mod.arena_block_size = lambda: 64
-
-    # working_set — replaces the retired `context` resource.
-    ws_mod = types.ModuleType("wit_world.imports.working_set")
-    ws_mod.KvWorkingSet = FakeKvWorkingSet
-    ws_mod.RsWorkingSet = FakeRsWorkingSet
-    ws_mod.PageRange = PageRange
-
-    # media — multimodal splice surface.
-    media_mod = types.ModuleType("wit_world.imports.media")
-    media_mod.Image = FakeImage
-    media_mod.Video = FakeVideo
-    media_mod.Audio = FakeAudio
-
-    # inference
-    inf_mod = types.ModuleType("wit_world.imports.inference")
-    for cls in [
-        KvContext, KvOutput, RsBufferContext, RsBufferOutput,
-        Sampler_Multinomial, Sampler_TopK, Sampler_TopP, Sampler_MinP,
-        Sampler_TopKTopP, Sampler_Embedding, Sampler_Dist, Sampler_RawLogits,
-        Sampler_Logprob, Sampler_Logprobs, Sampler_Entropy,
-        SlotOutput_Token, SlotOutput_Distribution, SlotOutput_Logits,
-        SlotOutput_Logprobs, SlotOutput_Entropy, SlotOutput_Embedding,
-        Output,
-    ]:
-        setattr(inf_mod, cls.__name__, cls)
-    inf_mod.Sampler = (
-        Sampler_Multinomial | Sampler_TopK | Sampler_TopP | Sampler_MinP
-        | Sampler_TopKTopP | Sampler_Embedding | Sampler_Dist
-        | Sampler_RawLogits | Sampler_Logprob | Sampler_Logprobs
-        | Sampler_Entropy
-    )
-    inf_mod.SlotOutput = (
-        SlotOutput_Token | SlotOutput_Distribution | SlotOutput_Logits
-        | SlotOutput_Logprobs | SlotOutput_Entropy | SlotOutput_Embedding
-    )
-    inf_mod.ForwardPass = FakeForwardPass
-    inf_mod.Grammar = FakeGrammar
-    inf_mod.Matcher = FakeMatcher
-
-    # chat
-    chat_mod = types.ModuleType("wit_world.imports.chat")
-    chat_mod.Event_Delta = ChatEvent_Delta
-    chat_mod.Event_Interrupt = ChatEvent_Interrupt
-    chat_mod.Event_Done = ChatEvent_Done
-    chat_mod.Decoder = FakeChatDecoder
-    chat_mod.system = lambda msg: []
-    chat_mod.first_user = lambda msg: [66]
-    chat_mod.user = lambda msg: []
-    chat_mod.system_user = lambda system, user: [67]
-    chat_mod.assistant = lambda msg: []
-    chat_mod.cue = lambda: [65]
-    chat_mod.seal = lambda: []
-    chat_mod.stop_tokens = lambda: [2]
-    chat_mod.create_decoder = lambda: FakeChatDecoder()
-
-    # reasoning
-    reasoning_mod = types.ModuleType("wit_world.imports.reasoning")
-    reasoning_mod.Event_Start = ReasoningEvent_Start
-    reasoning_mod.Event_Delta = ReasoningEvent_Delta
-    reasoning_mod.Event_Complete = ReasoningEvent_Complete
-    reasoning_mod.Decoder = FakeReasoningDecoder
-    reasoning_mod.create_decoder = lambda: FakeReasoningDecoder()
-
-    # tool_use
-    tool_mod = types.ModuleType("wit_world.imports.tool_use")
-    tool_mod.Event_Start = ToolEvent_Start
-    tool_mod.Event_Call = ToolEvent_Call
-    tool_mod.Decoder = FakeToolDecoder
-    tool_mod.equip = lambda tools: []
-    tool_mod.answer = lambda name, value: []
-    tool_mod.create_decoder = lambda: FakeToolDecoder()
-    tool_mod.format = lambda tools: None
-    tool_mod.create_matcher = lambda tools: FakeMatcher(None)
-
-    # runtime
-    runtime_mod = types.ModuleType("wit_world.imports.runtime")
-    runtime_mod.version = lambda: "0.1.0-mock"
-    runtime_mod.instance_id = lambda: "mock-instance-001"
-    runtime_mod.username = lambda: "test-user"
-
-    async def _sleep(duration_ns):
-        return None
-    runtime_mod.sleep = _sleep
-
-    # session — `receive` / `receive_file` are async.
-    session_mod = types.ModuleType("wit_world.imports.session")
-    session_mod.send = lambda msg: None
-
-    async def _receive():
-        return "received"
-    session_mod.receive = _receive
-    session_mod.send_file = lambda data: None
-
-    async def _receive_file():
-        return b"file-data"
-    session_mod.receive_file = _receive_file
-
-    # adapter
-    adapter_mod = types.ModuleType("wit_world.imports.adapter")
-    adapter_mod.Adapter = FakeAdapter
-
-    # zo
-    zo_mod = types.ModuleType("wit_world.imports.zo")
-    zo_mod.adapter_seed = lambda fp, seed: None
-    zo_mod.initialize = lambda adapter, rank, alpha, pop, mu, sigma: None
-    zo_mod.update = lambda adapter, scores, seeds, max_sigma: None
-
-    # Install all
-    modules = {
-        "componentize_py_types": cpy_types,
-        "wit_world": wit_world,
-        "wit_world.imports": wit_imports,
-        "wit_world.imports.poll": poll_mod,
-        "wit_world.imports.model": model_mod,
-        "wit_world.imports.working_set": ws_mod,
-        "wit_world.imports.media": media_mod,
-        "wit_world.imports.inference": inf_mod,
-        "wit_world.imports.chat": chat_mod,
-        "wit_world.imports.reasoning": reasoning_mod,
-        "wit_world.imports.tool_use": tool_mod,
-        "wit_world.imports.runtime": runtime_mod,
-        "wit_world.imports.session": session_mod,
-        "wit_world.imports.adapter": adapter_mod,
-        "wit_world.imports.zo": zo_mod,
+    submodules = {
+        "model": _make_model(),
+        "tokenizer": _make_tokenizer(),
+        "session": _make_session(SESSION_SPY),
+        "chat": _make_chat(),
+        "reasoning": _make_reasoning(),
     }
 
-    for name, mod in modules.items():
-        sys.modules[name] = mod
-
-    for attr in [
-        "poll", "model", "working_set", "media",
-        "inference", "chat", "reasoning", "tool_use", "runtime",
-        "session", "adapter", "zo",
-    ]:
-        setattr(wit_imports, attr, sys.modules[f"wit_world.imports.{attr}"])
+    sys.modules["wit_world"] = wit_world
+    sys.modules["wit_world.imports"] = imports
+    for name, module in submodules.items():
+        setattr(imports, name, module)
+        sys.modules[f"wit_world.imports.{name}"] = module
 
 
-@pytest.fixture(autouse=True)
-def mock_wit():
-    """Install mock WIT bindings before each test."""
-    _build_mock_modules()
-    yield
-    to_remove = [k for k in sys.modules if k.startswith("inferlet")]
-    for k in to_remove:
-        del sys.modules[k]
-
-
-# Install at import time
-_build_mock_modules()
+install()

@@ -26,13 +26,13 @@ DType ChannelRecord::program_dtype() const {
 
 namespace {
 
-std::uint8_t host_role_for(const pie_native::launch::Channel& channel) {
+std::uint8_t host_role_for(const pie::driver::launch::Channel& channel) {
     if (!channel.host_visible) return PIE_CHANNEL_HOST_ROLE_NONE;
     return channel.host_reader ? PIE_CHANNEL_HOST_ROLE_READER
                                : PIE_CHANNEL_HOST_ROLE_WRITER;
 }
 
-std::uint8_t extern_dir_for(const pie_native::launch::Channel& channel) {
+std::uint8_t extern_dir_for(const pie::driver::launch::Channel& channel) {
     if (channel.extern_dir == 0) return PIE_CHANNEL_EXTERN_IMPORT;
     if (channel.extern_dir == 1) return PIE_CHANNEL_EXTERN_EXPORT;
     return PIE_CHANNEL_EXTERN_NONE;
@@ -48,7 +48,7 @@ std::uint8_t channel_dtype_for(DType dtype) {
     }
 }
 
-std::uint32_t cell_bytes_for(const pie_native::launch::Channel& channel) {
+std::uint32_t cell_bytes_for(const pie::driver::launch::Channel& channel) {
     return static_cast<std::uint32_t>(wire_cell_bytes(
         channel.type.dtype == DType::Act ? DType::F32 : channel.type.dtype,
         static_cast<std::size_t>(channel.type.shape.numel())));

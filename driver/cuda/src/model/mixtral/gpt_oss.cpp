@@ -104,8 +104,16 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
             "gpt_oss: native MXFP4 tensors were loaded, but runtime lowering "
             "did not select native MXFP4");
     }
+    // Streamed experts publish no resident weight at all, so the packed
+    // backend is announced by the group's presence instead. The group is the
+    // packed declaration; it just has the expert axis fixed at one.
+    const bool has_streamed_mxfp4_experts =
+        engine.group_cache() != nullptr &&
+        engine.group_cache()->find_group("model.layers.0.mlp.experts") !=
+            GroupStreamCache::kNoGroup;
     const bool use_mxfp4_packed_experts =
-        has_routed_mxfp4_experts || has_native_mxfp4_experts;
+        has_routed_mxfp4_experts || has_native_mxfp4_experts ||
+        has_streamed_mxfp4_experts;
     if (use_mxfp4_packed_experts) {
         if (H % 32 != 0 || I % 32 != 0) {
             throw std::runtime_error(
@@ -307,6 +315,50 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
                         {H}));
                     Ew.b_down = &w.owned_expert_buffers.back();
                 }
+            } else if (GroupStreamCache* cache = engine.group_cache();
+                       cache != nullptr &&
+                       cache->find_group(p + "mlp.experts") !=
+                           GroupStreamCache::kNoGroup) {
+                // Streamed. The weights and their factors live in the group,
+                // so there is nothing here to point at yet and the forward
+                // fills those four fields from a slot. The biases were left
+                // resident by the contract for the reason they always are:
+                // the gate/up pair arrives interleaved and splitting it is a
+                // kernel, which is host work a group plan cannot carry.
+                const std::size_t g = cache->find_group(p + "mlp.experts");
+                if (cache->arity(g) != static_cast<std::uint32_t>(E)) {
+                    throw std::runtime_error(
+                        "gpt_oss: expert group at layer " + std::to_string(li) +
+                        " holds " + std::to_string(cache->arity(g)) +
+                        " experts but the config says " + std::to_string(E));
+                }
+                Lw.expert_cache = cache;
+                Lw.expert_group = g;
+
+                const auto& b_gate_up_all =
+                    must(engine, p + "mlp.experts.gate_up_proj.bias");
+                const auto& b_down_all =
+                    must(engine, p + "mlp.experts.down_proj.bias");
+                for (int e = 0; e < E; ++e) {
+                    auto& Ew = Lw.experts[e];
+                    const auto expert_idx = static_cast<std::size_t>(e);
+                    Ew.format = MixtralExpertWeightFormat::Mxfp4RoutedDequant;
+
+                    auto gate_bias = DeviceTensor::allocate(DType::BF16, {I});
+                    auto up_bias = DeviceTensor::allocate(DType::BF16, {I});
+                    kernels::launch_deinterleave_vec_bf16(
+                        static_cast<const std::uint8_t*>(b_gate_up_all.data()) +
+                            expert_idx * mxfp4_gate_up_bias_expert_bytes,
+                        gate_bias.data(), up_bias.data(), I, /*stream=*/0);
+                    w.owned_expert_buffers.push_back(std::move(gate_bias));
+                    Ew.b_gate = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(std::move(up_bias));
+                    Ew.b_up = &w.owned_expert_buffers.back();
+
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        b_down_all, expert_idx * down_bias_expert_bytes, {H}));
+                    Ew.b_down = &w.owned_expert_buffers.back();
+                }
             } else {
                 const std::string gate_up_name =
                     p + "mlp.experts.gate_up_proj.weight";
@@ -498,23 +550,32 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
             std::vector<const std::uint8_t*> dn_packed(E), dn_scale(E);
             std::vector<const void*> gb(E), ub(E), db(E);
             bool ok = true;
+            // A streamed layer has no weight to point at yet -- the four
+            // weight arrays are rewritten each step from whichever slots the
+            // layer's routed set landed in. The biases are resident and stable,
+            // so those three are final here, which is the whole reason the
+            // per-step upload is 4 arrays and not 7.
+            const bool streamed = L.expert_cache != nullptr;
             for (std::size_t e = 0; e < E; ++e) {
                 const auto& Ew = L.experts[e];
                 if (Ew.format != MixtralExpertWeightFormat::Mxfp4RoutedDequant ||
-                    !Ew.w_gate_up || !Ew.w_gate_up_scale ||
-                    !Ew.w_down_packed || !Ew.w_down_scale ||
-                    !Ew.b_gate || !Ew.b_up || !Ew.b_down) {
+                    !Ew.b_gate || !Ew.b_up || !Ew.b_down ||
+                    (!streamed &&
+                     (!Ew.w_gate_up || !Ew.w_gate_up_scale ||
+                      !Ew.w_down_packed || !Ew.w_down_scale))) {
                     ok = false;
                     break;
                 }
-                gu_packed[e] = static_cast<const std::uint8_t*>(
-                    Ew.w_gate_up->data());
-                gu_scale[e] = static_cast<const std::uint8_t*>(
-                    Ew.w_gate_up_scale->data());
-                dn_packed[e] = static_cast<const std::uint8_t*>(
-                    Ew.w_down_packed->data());
-                dn_scale[e] = static_cast<const std::uint8_t*>(
-                    Ew.w_down_scale->data());
+                if (!streamed) {
+                    gu_packed[e] = static_cast<const std::uint8_t*>(
+                        Ew.w_gate_up->data());
+                    gu_scale[e] = static_cast<const std::uint8_t*>(
+                        Ew.w_gate_up_scale->data());
+                    dn_packed[e] = static_cast<const std::uint8_t*>(
+                        Ew.w_down_packed->data());
+                    dn_scale[e] = static_cast<const std::uint8_t*>(
+                        Ew.w_down_scale->data());
+                }
                 gb[e] = Ew.b_gate->data();
                 ub[e] = Ew.b_up->data();
                 db[e] = Ew.b_down->data();

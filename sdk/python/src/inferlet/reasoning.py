@@ -1,7 +1,7 @@
 """
 Reasoning / thinking-block decoder.
 
-Wraps the host's ``pie:instruct/reasoning.decoder``. Emits :class:`Event.Start`
+Wraps the host's ``pie:inferlet/reasoning.decoder``. Emits :class:`Event.Start`
 when the model enters a thinking block, :class:`Event.Delta` for each chunk
 of reasoning text, and :class:`Event.End` when the block closes (with the
 full accumulated reasoning text).

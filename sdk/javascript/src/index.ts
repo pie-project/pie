@@ -1,88 +1,43 @@
 // Public API for the Pie inferlet JavaScript SDK.
 //
-// Quickstart:
+// STATUS: the forward-pass surface is NOT available from JavaScript yet.
 //
-//     import { Context, Sampler } from 'inferlet';
+// The runtime's guest-facing forward-pass surface was replaced. The old
+// `pie:core/inference` interface, which exposed a fixed host-side sampler
+// (`Sampler.argmax()`, probes, `Generator`), is gone. In its place the guest
+// traces a program and ships canonical PTIR container bytes through one of
+// `pie:inferlet/forward`, `forward-recurrent`, or `forward-hybrid`.
 //
-//     const ctx = new Context();
+// Nothing in this package can produce those bytes. The Rust SDK does it with
+// `compiler/dsl` (the tracing eDSL) and `compiler/ir` (the container encoder);
+// neither has a JavaScript counterpart, and the encoder has to agree with the
+// Rust one byte for byte. Porting it is its own project — see
+// `forward_refactor.md` section 10.4 and the tracking note in
+// `scripts/check-sdk-interfaces.sh`.
 //
-//     ctx.system('You are helpful.').user('What is 2 + 2?');
-//     const text = await ctx
-//       .generate(Sampler.argmax(), { maxTokens: 64 })
-//       .collectText();
+// So the modules that were built on the removed interface — `context`,
+// `forward`, `generation`, `sample`, `grammar`, `tools`, `adapter`,
+// `runtime`, `zo`, `spec` — have been deleted rather than left importing a
+// surface that no longer exists. They were not usable; they only looked
+// usable.
 //
-// Three-layer surface:
+// What is here is the part of the SDK that survives the move unchanged: the
+// non-forward interfaces, whose WIT definitions came through the split
+// intact.
 //
-// * `Context` — KV cache + chat fillers + `forward()` / `generate()`.
-// * `Forward` (`ctx.forward()`) — single forward-pass primitive with auto
-//   page management. For prefill / scoring / custom loops.
-// * `Generator` (`ctx.generate()`) — multi-step state machine over
-//   Forward. Iterate with `for await (const step of gen)`, or use
-//   `await gen.collectText() / .collectTokens() / .collectJson()`.
+//     import { model, session, chat, reasoning } from 'inferlet';
 //
-// Streaming decoders for chat / reasoning / tools live as independent
-// modules — compose by hand, no implicit suppression:
+// `grammar` and `tools` DO exist as interfaces in the new world, but under
+// different shapes (`pie:inferlet/grammar`, `pie:inferlet/tools`) than the
+// deleted modules of those names targeted. They come back with the port, not
+// before.
 //
-//     import { chat, reasoning, tools } from 'inferlet';
-//
-//     const chatDec = new chat.Decoder();
-//     for await (const step of gen) {
-//       const out = await step.execute();
-//       const ev = chatDec.feed(out.tokens);
-//       if (ev.type === 'delta') process.stdout.write(ev.text);
-//       else if (ev.type === 'done') break;
-//     }
-//
-// Constraint specs (`jsonSchema`, `anyJson`, `regex`, `ebnf`) implement
-// the `Schema` interface — duck-typed, so your own grammar source class
-// plugs in by adding a `buildConstraint()` method.
+// The generated `bindings/` tree is current: `npm run generate-bindings`
+// regenerates it from `interface/inferlet/`, and every interface in the world
+// above is present there. Only the hand-written layer is missing.
 
-// ── Core ─────────────────────────────────────────────────────────────
 export * as model from './model.js';
-export { Adapter } from './adapter.js';
-export { Context } from './context.js';
-
-// ── Forward primitive ────────────────────────────────────────────────
-export { Forward, Output } from './forward.js';
-export type { SampleHandle, ProbeHandle, Brle } from './forward.js';
-
-// ── Generator ────────────────────────────────────────────────────────
-export { Generator, GenStep } from './generation.js';
-export type { GenerateOptions } from './generation.js';
-
-// ── Sampler / Probe ──────────────────────────────────────────────────
-export {
-  Sampler,
-  Logits,
-  Distribution,
-  Logprob,
-  Logprobs,
-  Entropy,
-} from './sample.js';
-export type { Probe, ProbeKind } from './sample.js';
-
-// ── Decoders + tools (sub-modules) ───────────────────────────────────
+export * as tokenizer from './tokenizer.js';
+export * as session from './session.js';
 export * as chat from './chat.js';
 export * as reasoning from './reasoning.js';
-export * as tools from './tools.js';
-
-// ── Constraints ──────────────────────────────────────────────────────
-export {
-  Grammar,
-  Matcher,
-  GrammarConstraint,
-  jsonSchema,
-  anyJson,
-  regex,
-  ebnf,
-  grammar,
-} from './grammar.js';
-export type { Schema, Constraint } from './grammar.js';
-
-// ── Speculation ──────────────────────────────────────────────────────
-export type { Speculator } from './spec.js';
-
-// ── Runtime / IO sub-modules ─────────────────────────────────────────
-export * as runtime from './runtime.js';
-export * as session from './session.js';
-export * as zo from './zo.js';

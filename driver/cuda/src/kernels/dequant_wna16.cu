@@ -19,24 +19,28 @@ __global__ void dequant_wna16_int4b8_kernel(
     int in_dim,
     int group_size)
 {
-    const int row = blockIdx.y;
     const int word_col = blockIdx.x * blockDim.x + threadIdx.x;
     const int words_per_row = in_dim / 8;
-    if (row >= out_dim || word_col >= words_per_row) return;
+    if (word_col >= words_per_row) return;
 
-    const int word = packed[static_cast<long long>(row) * words_per_row + word_col];
-    const int k_base = word_col * 8;
-    __nv_bfloat16* row_out = out + static_cast<long long>(row) * in_dim;
-    const __nv_bfloat16* row_scale =
-        scale + static_cast<long long>(row) * (in_dim / group_size);
+    // gridDim.y caps out at 65535, and an expert-stacked weight easily has more
+    // rows than that, so the row axis is a grid-stride loop rather than a plain
+    // block index.
+    for (int row = blockIdx.y; row < out_dim; row += gridDim.y) {
+        const int word = packed[static_cast<long long>(row) * words_per_row + word_col];
+        const int k_base = word_col * 8;
+        __nv_bfloat16* row_out = out + static_cast<long long>(row) * in_dim;
+        const __nv_bfloat16* row_scale =
+            scale + static_cast<long long>(row) * (in_dim / group_size);
 
 #pragma unroll
-    for (int lane = 0; lane < 8; ++lane) {
-        const int k = k_base + lane;
-        const int nibble = (word >> (lane * 4)) & 0xF;
-        const float q = static_cast<float>(nibble - 8);
-        const float s = __bfloat162float(row_scale[k / group_size]);
-        row_out[k] = __float2bfloat16(q * s);
+        for (int lane = 0; lane < 8; ++lane) {
+            const int k = k_base + lane;
+            const int nibble = (word >> (lane * 4)) & 0xF;
+            const float q = static_cast<float>(nibble - 8);
+            const float s = __bfloat162float(row_scale[k / group_size]);
+            row_out[k] = __float2bfloat16(q * s);
+        }
     }
 }
 
@@ -271,7 +275,9 @@ void launch_dequant_wna16_int4b8_to_bf16(
     if (in_dim % 8 != 0 || in_dim % group_size != 0) return;
     constexpr int BLOCK = 128;
     const int words_per_row = in_dim / 8;
-    dim3 grid((words_per_row + BLOCK - 1) / BLOCK, out_dim);
+    constexpr int kMaxGridY = 65535;
+    dim3 grid((words_per_row + BLOCK - 1) / BLOCK,
+              static_cast<unsigned>(out_dim < kMaxGridY ? out_dim : kMaxGridY));
     dequant_wna16_int4b8_kernel<<<grid, BLOCK, 0, stream>>>(
         packed,
         static_cast<const __nv_bfloat16*>(scale_bf16),

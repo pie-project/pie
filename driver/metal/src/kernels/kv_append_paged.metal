@@ -75,6 +75,4 @@ template <typename T>
       const device uint*, const constant int&, const device uint*, \
       const device uint*, uint3);
 
-instantiate_kv_append_paged(float32, float)
-instantiate_kv_append_paged(float16, half)
 instantiate_kv_append_paged(bfloat16, bfloat)

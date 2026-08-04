@@ -111,7 +111,7 @@ pub fn cuda_standalone_toml_capped(
          \n\
          [worker.model]\n\
          name = \"qwen3\"\n\
-         hf_repo = \"{hf_repo}\"\n\
+         model = \"{hf_repo}\"\n\
          \n\
          [worker.model.driver]\n\
          type = \"cuda_native\"\n\
@@ -169,8 +169,8 @@ pub async fn boot_4090_small_kv() -> Result<pie_bin::StandaloneHandle> {
 /// Default MTP model for the native-drafter de-risk (Qwen3.5-0.8B GDN backbone +
 /// a 1-layer MTP head). HF-cached, resolved to a local snapshot path (R3: never
 /// downloads). The MTP head auto-activates in the driver on MTP-weight presence
-/// (entry.cpp `wire_system_drafter`); `PIE_MTP_DRAFT_TOKENS` sets the draft
-/// count K (0 disables → the non-spec baseline).
+/// (entry.cpp `wire_system_drafter`); `[model.driver.options].mtp_num_drafts`
+/// sets the draft count K (0 disables → the non-spec baseline).
 pub const QWEN35_0_8B_REPO: &str = "Qwen/Qwen3.5-0.8B";
 
 /// Resolve `Qwen/Qwen3.5-0.8B` to its local HF cache snapshot dir (mirrors
@@ -205,7 +205,7 @@ pub fn resolve_qwen35_snapshot() -> Result<String> {
 /// [`cuda_standalone_toml`] but `name = "default"` so the driver auto-detects
 /// the architecture (GDN + MTP head) from the snapshot's `config.json` rather
 /// than being pinned to the dense `qwen3` path.
-pub fn cuda_mtp_standalone_toml(hf_repo: &str) -> String {
+pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
     format!(
         "[controller]\n\
          \n\
@@ -218,25 +218,39 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str) -> String {
          \n\
          [worker.model]\n\
          name = \"default\"\n\
-         hf_repo = \"{hf_repo}\"\n\
+         model = \"{hf_repo}\"\n\
          \n\
          [worker.model.driver]\n\
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
          \n\
          [worker.model.driver.options]\n\
-         gpu_mem_utilization = 0.85\n"
+         gpu_mem_utilization = 0.85\n\
+         mtp_num_drafts = {mtp_num_drafts}\n"
     )
 }
 
 /// Boot the embedded standalone with the real CUDA driver + Qwen3.5-0.8B (the
-/// MTP model) on the 4090. K (native draft tokens) is controlled out-of-band by
-/// the `PIE_MTP_DRAFT_TOKENS` env (read once at driver init, entry.cpp:106): set
-/// it BEFORE calling this. Client edge at `handle.listen_addr`.
-pub async fn boot_4090_mtp() -> Result<pie_bin::StandaloneHandle> {
+/// MTP model) on the 4090. K (native draft tokens) is `mtp_num_drafts`, passed
+/// through `[model.driver.options]` like any other driver setting -- 0 disables
+/// speculation and gives the non-spec baseline. Client edge at
+/// `handle.listen_addr`.
+pub async fn boot_4090_mtp(mtp_num_drafts: u32) -> Result<pie_bin::StandaloneHandle> {
     let snapshot = resolve_qwen35_snapshot()?;
-    let (controller, gateway, worker) = derive_standalone(&cuda_mtp_standalone_toml(&snapshot))?;
+    let (controller, gateway, worker) =
+        derive_standalone(&cuda_mtp_standalone_toml(&snapshot, mtp_num_drafts))?;
     run_standalone(controller, gateway, worker, Mode::Local).await
+}
+
+/// K for the MTP suites, from `PIE_MTP_DRAFT_TOKENS`. A harness parameter, not
+/// engine config: it selects which arm of a manual A/B to boot, and is handed
+/// to the driver as `mtp_num_drafts`.
+pub fn mtp_draft_tokens(default_k: u32) -> u32 {
+    std::env::var("PIE_MTP_DRAFT_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(|k: u32| k.min(32))
+        .unwrap_or(default_k)
 }
 
 /// Standalone TOML for the **dummy** driver: fabricates everything the portable
@@ -258,7 +272,7 @@ pub fn dummy_standalone_toml(hf_repo: &str) -> String {
          \n\
          [worker.model]\n\
          name = \"qwen3\"\n\
-         hf_repo = \"{hf_repo}\"\n\
+         model = \"{hf_repo}\"\n\
          \n\
          [worker.model.driver]\n\
          type = \"dummy\"\n\
