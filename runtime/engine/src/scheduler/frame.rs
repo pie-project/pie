@@ -63,6 +63,7 @@
 //! `on_fire_dropped` (rejected while queued).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -197,6 +198,11 @@ struct LaneState {
     /// wait-set mid-boundary starts fired so it waits for the next gate —
     /// which is where join gathering already happens.
     fired_this_boundary: bool,
+    /// Seal counter at this lane's last implicit rejoin, `u64::MAX` if it has
+    /// never parked. Probe-only: it ages a rejoin so the run-ahead accumulator
+    /// can ask whether the lanes holding a seal are the ones that just came
+    /// back from a planner park.
+    rejoin_seal: u64,
 }
 
 /// One sealed (immutable) frame, dispatched WHOLE: per-wave fire-id lists in
@@ -356,6 +362,12 @@ pub(super) struct FramePolicy {
     truncated_seqs: BTreeMap<ProcessId, u64>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
+    /// Monotonic seal counter, used only to age a lane's last implicit
+    /// rejoin for the run-ahead probe.
+    seal_seq: u64,
+    /// Probe: start of the current episode in which the wait-all gate is held
+    /// with at least one awaited lane missing.
+    gate_block_from: Option<Instant>,
     /// Lanes with fires the engine has dispatched but not yet retired: the
     /// engine owes them a result, so the submit deadline's clock must not run
     /// against them. This is the debt a lockstep guest (no run-ahead, awaits
@@ -431,6 +443,8 @@ impl FramePolicy {
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
+            seal_seq: 0,
+            gate_block_from: None,
             in_flight_lanes: BTreeSet::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
@@ -536,6 +550,7 @@ impl FramePolicy {
             }
             _ => false,
         };
+        let seal_seq = self.seal_seq;
         let lane = self.lanes.entry(stamp.lane).or_insert_with(|| LaneState {
             owner,
             awaited: !suspended,
@@ -547,6 +562,7 @@ impl FramePolicy {
             // arriving mid-boundary is not a member of it, and one arriving
             // between boundaries is picked up by the next gate.
             fired_this_boundary: true,
+            rejoin_seal: u64::MAX,
         });
         if lane.owner.is_none() {
             lane.owner = owner;
@@ -558,6 +574,10 @@ impl FramePolicy {
         if lane.parked {
             lane.parked = false;
             lane.awaited = !suspended;
+            lane.rejoin_seal = seal_seq;
+            crate::scheduler::RUN_AHEAD
+                .rejoins
+                .fetch_add(1, Ordering::Relaxed);
         }
         // Any accepted arrival is proof of life: the deadline measures
         // consecutive silence while blocking a seal, not elapsed lifetime.
@@ -855,6 +875,13 @@ impl FramePolicy {
     /// nothing and left the process in `joins_in_flight` forever, wedging
     /// the seal gate against a join that could never arrive.
     pub fn on_lane_leave(&mut self, lane: ProcessId, owner: Option<ProcessId>, purge_queued: bool) {
+        if !purge_queued {
+            let acc = &crate::scheduler::RUN_AHEAD;
+            acc.leave_close.fetch_add(1, Ordering::Relaxed);
+            if self.lanes.contains_key(&lane) {
+                acc.leave_hit.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // Recover the owner from the lane while it still exists; an explicit
         // `owner` wins, since a laneless leaver can only be identified that way.
         let owner = owner.or_else(|| self.lanes.get(&lane).and_then(|state| state.owner));
@@ -870,6 +897,9 @@ impl FramePolicy {
                 .is_some_and(|state| state.frames.is_empty());
             if drained {
                 self.lanes.remove(&lane);
+                crate::scheduler::RUN_AHEAD
+                    .leave_removed
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         if let Some(owner) = owner {
@@ -1053,6 +1083,27 @@ impl FramePolicy {
         // seals, so a call that finds nothing sealable leaves the policy
         // untouched and control at the gate.
         let mid_boundary = self.boundary_open();
+        if !mid_boundary {
+            // Run-ahead histogram, sampled once per boundary (== once per
+            // wave). `frames.len()` counts the frame about to be sealed plus
+            // whatever the guest queued behind it, so `len - 1` is this
+            // lane's run-ahead in frames.
+            let acc = &crate::scheduler::RUN_AHEAD;
+            let (mut n, mut a0, mut a1, mut a2) = (0u64, 0u64, 0u64, 0u64);
+            for lane in self.lanes.values().filter(|lane| lane.awaited) {
+                n += 1;
+                match lane.frames.len() {
+                    0 | 1 => a0 += 1,
+                    2 => a1 += 1,
+                    _ => a2 += 1,
+                }
+            }
+            acc.lanes.fetch_add(n, Ordering::Relaxed);
+            acc.ahead0.fetch_add(a0, Ordering::Relaxed);
+            acc.ahead1.fetch_add(a1, Ordering::Relaxed);
+            acc.ahead2.fetch_add(a2, Ordering::Relaxed);
+            self.seal_seq = self.seal_seq.wrapping_add(1);
+        }
 
         // ONE partition per call. Candidate order: the lowest-id lane that has
         // not fired into this boundary first (progress guarantee: every
@@ -1329,6 +1380,8 @@ impl FramePolicy {
             // busy, and a global clock would be reset by their traffic
             // forever.
             let mut expired: Vec<ProcessId> = Vec::new();
+            let mut blocking_pin = false;
+            let (mut blk_owed, mut blk_empty, mut blk_partial) = (0u64, 0u64, 0u64);
             let leash = self.submit_deadline;
             let silence = self.silence_timeout;
             for (lane_id, lane) in self.lanes.iter_mut() {
@@ -1380,6 +1433,14 @@ impl FramePolicy {
                 }
                 if blocking {
                     missing += 1;
+                    blocking_pin = true;
+                    if owes {
+                        blk_owed += 1;
+                    } else if lane.frames.is_empty() {
+                        blk_empty += 1;
+                    } else {
+                        blk_partial += 1;
+                    }
                 }
             }
             if !expired.is_empty() {
@@ -1388,6 +1449,34 @@ impl FramePolicy {
                 expired.sort_unstable();
                 expired.dedup();
                 return FramePlan::Terminate(expired);
+            }
+            {
+                // Run-ahead probe. `blocking` is summed over gate
+                // evaluations; `block_ns` times the episode the gate spends
+                // held with any awaited lane missing, which is the quantity
+                // directly comparable with the inter-wave GPU idle.
+                let acc = &crate::scheduler::RUN_AHEAD;
+                acc.blocking.fetch_add(missing as u64, Ordering::Relaxed);
+                acc.blk_owed.fetch_add(blk_owed, Ordering::Relaxed);
+                acc.blk_empty.fetch_add(blk_empty, Ordering::Relaxed);
+                acc.blk_partial.fetch_add(blk_partial, Ordering::Relaxed);
+                acc.gate_evals.fetch_add(1, Ordering::Relaxed);
+                acc.miss_max.fetch_max(missing as u64, Ordering::Relaxed);
+                if missing == 1 && blocking_pin {
+                    acc.pin_n.fetch_add(1, Ordering::Relaxed);
+                }
+                if missing > 0 {
+                    if self.gate_block_from.is_none() {
+                        acc.miss_start.fetch_add(missing as u64, Ordering::Relaxed);
+                    }
+                    self.gate_block_from.get_or_insert(now);
+                } else if let Some(from) = self.gate_block_from.take() {
+                    acc.block_ns.fetch_add(
+                        now.saturating_duration_since(from).as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    acc.block_episodes.fetch_add(1, Ordering::Relaxed);
+                }
             }
             // A joiner never holds the seal. It is by definition NOT a
             // member yet — no lane in the wait-set — so sealing without it

@@ -586,8 +586,7 @@ fn rs_plan_for(
     // the linear layers gather already-buffered activations and return before
     // the output projection -- so there is no per-row switch that would let a
     // computing row ride along.
-    if kinds.iter().any(|k| *k == Position::Commit)
-        && !kinds.iter().all(|k| *k == Position::Commit)
+    if kinds.iter().any(|k| *k == Position::Commit) && !kinds.iter().all(|k| *k == Position::Commit)
     {
         let row = kinds
             .iter()
@@ -1259,10 +1258,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.driver);
-        let (readable_pages, writable_pages) =
-            match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                let page_len = kv_store.page_len(ws.id)?;
-                Ok::<_, crate::store::kv::KvStoreError>((
+        // `page_len` reads the WorkingSet's lock-free mirror and both
+        // `resolve`s are pure, so this whole step stays off the global KV
+        // mutex — it was 42979 exclusive acquisitions per D/512 run for one
+        // integer load.
+        let (readable_pages, writable_pages) = match ws
+            .page_len()
+            .map_err(crate::store::kv::KvStoreError::from)
+            .and_then(|page_len| {
+                Ok((
                     kv_declaration.readable.resolve(page_len).map_err(|_| {
                         crate::store::kv::KvStoreError::BadWriteSet {
                             reason: "invalid readable page declaration",
@@ -1275,13 +1279,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     })?,
                 ))
             }) {
-                Ok(ranges) => ranges,
-                Err(error) => {
-                    return Ok(Err(format!(
-                        "pipeline: KV working-set declaration: {error}"
-                    )));
-                }
-            };
+            Ok(ranges) => ranges,
+            Err(error) => {
+                return Ok(Err(format!(
+                    "pipeline: KV working-set declaration: {error}"
+                )));
+            }
+        };
         // Structural declaration checks — fail fast, before anything is
         // claimed, acquired, or prepared.
         if writable_pages.is_empty() {

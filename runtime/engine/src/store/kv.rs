@@ -1307,8 +1307,12 @@ impl KvStore {
     /// of WorkingSets would ACTUALLY free, answered by the same rule
     /// `prepare_suspend` applies — with a typed reason when the answer is
     /// zero. Batched: the shared exclusions cost one pass for the whole set.
-    pub fn reclaim_quotes(&self, groups: &[HashSet<WorkingSetId>]) -> Vec<ReclaimQuote> {
-        self.table.reclaim_quotes(groups)
+    pub fn reclaim_quotes(
+        &self,
+        groups: &[HashSet<WorkingSetId>],
+        budget: u32,
+    ) -> Vec<ReclaimQuote> {
+        self.table.reclaim_quotes(groups, budget)
     }
 
     pub fn reserve_device_pages(&mut self, count: usize) -> Option<Vec<PhysicalKvPageId>> {
@@ -1559,6 +1563,17 @@ impl KvStore {
 
     pub fn page_len(&self, ws: WorkingSetId) -> Result<u64, KvStoreError> {
         Ok(self.table.page_len(ws)?)
+    }
+
+    /// The lock-free `page_len` mirror for `ws`. Handed to the
+    /// [`KvWorkingSet`](crate::store::kv::working_set::KvWorkingSet) handle
+    /// at construction so the hot readers never take this store's mutex to
+    /// load one integer.
+    pub fn page_len_mirror(
+        &self,
+        ws: WorkingSetId,
+    ) -> Result<std::sync::Arc<std::sync::atomic::AtomicU64>, KvStoreError> {
+        Ok(self.table.page_len_mirror(ws)?)
     }
 
     pub fn available_pages(&self) -> usize {

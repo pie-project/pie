@@ -4404,22 +4404,31 @@ void execute_declared_phase(
             }
         };
 
+        // The slot census below can only ever clear `independent`, so it is
+        // dead work whenever the seed is already false. That is the common
+        // case, not a corner: signature grouping folds every lane of a
+        // homogeneous decode wave into ONE group, and a single group is
+        // trivially not "independent" (there is nothing to overlap with).
+        // Measured on a 512-way decode wave, the census walked ~300 lanes'
+        // slot sets through two `unordered_set`s to re-derive a constant.
         bool independent = groups.size() > 1;
-        std::unordered_set<std::uint32_t> prior_group_slots;
-        for (const auto& group : groups) {
-            std::unordered_set<std::uint32_t> group_slots;
-            for (const auto& binding : group.bindings) {
-                group_slots.insert(
-                    binding.instance->view().slots().begin(),
-                    binding.instance->view().slots().end());
-            }
-            for (const std::uint32_t slot : group_slots) {
-                if (prior_group_slots.contains(slot)) {
-                    independent = false;
+        if (independent) {
+            std::unordered_set<std::uint32_t> prior_group_slots;
+            for (const auto& group : groups) {
+                std::unordered_set<std::uint32_t> group_slots;
+                for (const auto& binding : group.bindings) {
+                    group_slots.insert(
+                        binding.instance->view().slots().begin(),
+                        binding.instance->view().slots().end());
                 }
+                for (const std::uint32_t slot : group_slots) {
+                    if (prior_group_slots.contains(slot)) {
+                        independent = false;
+                    }
+                }
+                prior_group_slots.insert(
+                    group_slots.begin(), group_slots.end());
             }
-            prior_group_slots.insert(
-                group_slots.begin(), group_slots.end());
         }
         const auto t_execute_begin = probing
             ? fire_timing::Clock::now()

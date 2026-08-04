@@ -441,13 +441,26 @@ fn reclaim_quotes_count_only_the_private_resident_suffix() {
 
     // The 0..5 prefix is shared, so neither sharer can free it alone.
     assert_eq!(
-        t.reclaim_quotes(&[group(a), group(b)]),
+        t.reclaim_quotes(&[group(a), group(b)], u32::MAX),
         vec![ReclaimQuote::Pages(5), ReclaimQuote::Pages(2)]
     );
+    // A budget truncates the ANSWER, never the census: quoting stops as soon
+    // as the pages returned so far cover it, and the caller sees a shorter
+    // vector rather than a different one. Anything the picker would not have
+    // read is work the global KV lock was held for.
+    assert_eq!(
+        t.reclaim_quotes(&[group(a), group(b)], 5),
+        vec![ReclaimQuote::Pages(5)]
+    );
+    assert_eq!(
+        t.reclaim_quotes(&[group(a), group(b)], 6),
+        vec![ReclaimQuote::Pages(5), ReclaimQuote::Pages(2)]
+    );
+    assert!(t.reclaim_quotes(&[group(a), group(b)], 0).is_empty());
     // Sharing WITHIN one group is not sharing outward: quoted together, the
     // prefix belongs to the group and counts once.
     assert_eq!(
-        t.reclaim_quotes(&[HashSet::from([a, b])]),
+        t.reclaim_quotes(&[HashSet::from([a, b])], u32::MAX),
         vec![ReclaimQuote::Pages(12)]
     );
 
@@ -456,21 +469,27 @@ fn reclaim_quotes_count_only_the_private_resident_suffix() {
     let term_a = t.terminal(a).unwrap().unwrap();
     t.pin(term_a);
     assert_eq!(
-        t.reclaim_quotes(&[group(a)]),
+        t.reclaim_quotes(&[group(a)], u32::MAX),
         vec![ReclaimQuote::Nothing(NoReclaim::Pinned)]
     );
     t.unpin(term_a);
-    assert_eq!(t.reclaim_quotes(&[group(a)]), vec![ReclaimQuote::Pages(5)]);
+    assert_eq!(
+        t.reclaim_quotes(&[group(a)], u32::MAX),
+        vec![ReclaimQuote::Pages(5)]
+    );
 
     // Releasing b makes the shared prefix a's alone.
     let freed = t.release_working_set(b);
     assert_eq!(sorted(freed), vec![10, 11]);
-    assert_eq!(t.reclaim_quotes(&[group(a)]), vec![ReclaimQuote::Pages(10)]);
+    assert_eq!(
+        t.reclaim_quotes(&[group(a)], u32::MAX),
+        vec![ReclaimQuote::Pages(10)]
+    );
 
     // The case that livelocked victim selection: a candidate holding nothing
     // reports it, so selection can rule it out instead of re-picking it.
     assert_eq!(
-        t.reclaim_quotes(&[HashSet::new()]),
+        t.reclaim_quotes(&[HashSet::new()], u32::MAX),
         vec![ReclaimQuote::Nothing(NoReclaim::HoldsNothing)]
     );
 }
@@ -491,7 +510,10 @@ fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {
     // suffix it could actually free.
     assert_eq!(t.held_pages(&group(a)).unwrap(), 10);
     assert_eq!(t.held_pages(&group(b)).unwrap(), 7);
-    assert_eq!(t.reclaim_quotes(&[group(a)]), vec![ReclaimQuote::Pages(5)]);
+    assert_eq!(
+        t.reclaim_quotes(&[group(a)], u32::MAX),
+        vec![ReclaimQuote::Pages(5)]
+    );
 
     // THE REGRESSION THIS GUARDS (rainer_v3.md §3.3): a pin collapses the
     // quote to zero, but holdings must not move. `check_hog` read
@@ -502,7 +524,7 @@ fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {
     let term_a = t.terminal(a).unwrap().unwrap();
     t.pin(term_a);
     assert_eq!(
-        t.reclaim_quotes(&[group(a)]),
+        t.reclaim_quotes(&[group(a)], u32::MAX),
         vec![ReclaimQuote::Nothing(NoReclaim::Pinned)]
     );
     assert_eq!(
@@ -1464,4 +1486,56 @@ fn pool_recycles_only_after_epoch_retires() {
     pool.retire_through(5);
     assert_eq!(pool.available(), 4);
     assert!(pool.try_alloc_n(4).is_some());
+}
+
+// ----------------------------------------------------------------------
+// Lock-free page_len mirror
+// ----------------------------------------------------------------------
+
+/// The mirror is what the fire path and the guest's `page-len` host call
+/// read INSTEAD of taking the global KV mutex, so it has to track every
+/// logical extent change: reservation, publication, and truncation. Drift
+/// would hand a fire a stale bound and let a declaration resolve past the
+/// end of the mapping. (`KvPageTable::page_len` debug-asserts the same
+/// invariant on every locked read, which covers the rest of this suite.)
+#[test]
+fn page_len_mirror_tracks_every_extent_change() {
+    use std::sync::atomic::Ordering;
+
+    let mut t = KvPageTable::new();
+    let ws = t.create_working_set();
+    let mirror = t.page_len_mirror(ws).unwrap();
+    assert_eq!(mirror.load(Ordering::Acquire), 0);
+
+    t.reserve(ws, 7).unwrap();
+    assert_eq!(mirror.load(Ordering::Acquire), 7);
+
+    publish(&mut t, ws, 0..5);
+    assert_eq!(mirror.load(Ordering::Acquire), t.page_len(ws).unwrap());
+
+    let published = t.page_len(ws).unwrap();
+    t.discard(ws, &[3..published]).unwrap();
+    assert_eq!(mirror.load(Ordering::Acquire), t.page_len(ws).unwrap());
+    assert_eq!(mirror.load(Ordering::Acquire), 3);
+}
+
+/// A handle can outlive its WorkingSet (release races an in-flight fire).
+/// The mirror must then report the same "unknown working set" the locked
+/// read would have, not the last extent it happened to hold.
+#[test]
+fn page_len_mirror_is_tombstoned_when_the_working_set_goes_away() {
+    use std::sync::atomic::Ordering;
+
+    let mut t = KvPageTable::new();
+    let ws = t.create_working_set();
+    publish(&mut t, ws, 0..3);
+    let mirror = t.page_len_mirror(ws).unwrap();
+    assert_eq!(mirror.load(Ordering::Acquire), 3);
+
+    t.release_working_set(ws);
+    assert!(matches!(
+        t.page_len(ws),
+        Err(KvTableError::UnknownWorkingSet)
+    ));
+    assert_eq!(mirror.load(Ordering::Acquire), u64::MAX);
 }

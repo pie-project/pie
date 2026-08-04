@@ -421,6 +421,75 @@ pub(crate) struct GuestPhaseAcc {
     pub n: AtomicU64,
 }
 
+/// Per-lane run-ahead probe: at every seal, how deep each awaited lane's
+/// queue is beyond the frame being sealed. Answers whether contention
+/// collapses run-ahead per lane, and whether the lanes that hold the seal
+/// are the ones that recently rejoined the wait-set after a planner park.
+pub(crate) struct RunAheadAcc {
+    /// Awaited lanes counted at seal.
+    pub lanes: AtomicU64,
+    /// Of those, lanes with no frame queued behind the one being sealed.
+    pub ahead0: AtomicU64,
+    /// Exactly one frame queued behind.
+    pub ahead1: AtomicU64,
+    /// Two or more queued behind.
+    pub ahead2: AtomicU64,
+    /// Implicit rejoins (parked lane accepted a fire) since the last wave.
+    pub rejoins: AtomicU64,
+    /// Awaited lanes seen blocking the gate, summed over gate evaluations.
+    pub blocking: AtomicU64,
+    /// Composition of those blocking lanes: the engine owes them a retire or
+    /// a bind (`owed`), they have nothing queued at all (`empty`), or a frame
+    /// is queued but has not fully arrived (`partial`).
+    pub blk_owed: AtomicU64,
+    pub blk_empty: AtomicU64,
+    pub blk_partial: AtomicU64,
+    pub leave_close: AtomicU64,
+    pub leave_hit: AtomicU64,
+    pub leave_removed: AtomicU64,
+    pub gate_evals: AtomicU64,
+    pub miss_start: AtomicU64,
+    pub miss_max: AtomicU64,
+    pub plan_calls: AtomicU64,
+    pub plan_ns: AtomicU64,
+    pub freed_poke: AtomicU64,
+    pub freed_skip: AtomicU64,
+    /// Wall time the wait-all gate spent held with at least one awaited lane
+    /// missing, and how many such episodes closed. This is the quantity that
+    /// converts "the seal is waiting" into microseconds comparable with the
+    /// measured inter-wave GPU idle.
+    pub block_ns: AtomicU64,
+    pub block_episodes: AtomicU64,
+    /// Gate evaluations where exactly one lane blocked — the seal pinned on a
+    /// single member.
+    pub pin_n: AtomicU64,
+}
+
+pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
+    lanes: AtomicU64::new(0),
+    ahead0: AtomicU64::new(0),
+    ahead1: AtomicU64::new(0),
+    ahead2: AtomicU64::new(0),
+    rejoins: AtomicU64::new(0),
+    blocking: AtomicU64::new(0),
+    blk_owed: AtomicU64::new(0),
+    blk_empty: AtomicU64::new(0),
+    blk_partial: AtomicU64::new(0),
+    leave_close: AtomicU64::new(0),
+    leave_hit: AtomicU64::new(0),
+    leave_removed: AtomicU64::new(0),
+    gate_evals: AtomicU64::new(0),
+    miss_start: AtomicU64::new(0),
+    miss_max: AtomicU64::new(0),
+    plan_calls: AtomicU64::new(0),
+    plan_ns: AtomicU64::new(0),
+    freed_poke: AtomicU64::new(0),
+    freed_skip: AtomicU64::new(0),
+    block_ns: AtomicU64::new(0),
+    block_episodes: AtomicU64::new(0),
+    pin_n: AtomicU64::new(0),
+};
+
 /// `fire_timing_now_us` of the most recent scheduler retire resolve, used to
 /// measure how long a woken lane takes to actually resume on the runtime.
 pub(crate) static LAST_RESOLVE_US: AtomicU64 = AtomicU64::new(0);

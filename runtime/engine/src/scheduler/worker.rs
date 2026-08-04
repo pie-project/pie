@@ -4702,6 +4702,40 @@ impl BatchScheduler {
             .unwrap_or(0);
         let gacc = &super::GUEST_PHASES;
         let (wake_woken, wake_empty) = (take(&gacc.wake_woken), take(&gacc.wake_empty));
+        let racc = &super::RUN_AHEAD;
+        let (ra_lanes, ra_ahead0, ra_ahead1, ra_ahead2) = (
+            take(&racc.lanes),
+            take(&racc.ahead0),
+            take(&racc.ahead1),
+            take(&racc.ahead2),
+        );
+        let (ra_rejoins, ra_blocking, ra_block_us) = (
+            take(&racc.rejoins),
+            take(&racc.blocking),
+            take(&racc.block_ns) / 1_000,
+        );
+        let (ra_block_episodes, ra_pin_n) = (take(&racc.block_episodes), take(&racc.pin_n));
+        let (ra_blk_owed, ra_blk_empty, ra_blk_partial) = (
+            take(&racc.blk_owed),
+            take(&racc.blk_empty),
+            take(&racc.blk_partial),
+        );
+        let (ra_leave_close, ra_leave_hit, ra_leave_removed) = (
+            take(&racc.leave_close),
+            take(&racc.leave_hit),
+            take(&racc.leave_removed),
+        );
+        let (ra_gate_evals, ra_miss_start, ra_miss_max) = (
+            take(&racc.gate_evals),
+            take(&racc.miss_start),
+            racc.miss_max.swap(0, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (ra_plan_calls, ra_plan_us, ra_freed_poke, ra_freed_skip) = (
+            take(&racc.plan_calls),
+            take(&racc.plan_ns) / 1000,
+            take(&racc.freed_poke),
+            take(&racc.freed_skip),
+        );
         let (guest_resume, guest_resume_max, guest_resume_n) = (
             take(&gacc.resume_ns) / 1_000,
             take(&gacc.resume_max_ns) / 1_000,
@@ -4751,6 +4785,9 @@ impl BatchScheduler {
                 .unwrap_or(0),
             "planner_parked_now": crate::planner::planner()
                 .map(|planner| planner.park_census().1)
+                .unwrap_or(0),
+            "planner_nonresident_now": crate::planner::planner()
+                .map(|planner| planner.park_census().2)
                 .unwrap_or(0),
             "wave_id": timing.wave_id,
             "membership_hash": timing.membership_hash,
@@ -4849,6 +4886,28 @@ impl BatchScheduler {
                 ("guest_resume_max_us", guest_resume_max),
                 ("wake_woken", wake_woken),
                 ("wake_empty", wake_empty),
+                ("ra_lanes", ra_lanes),
+                ("ra_ahead0", ra_ahead0),
+                ("ra_ahead1", ra_ahead1),
+                ("ra_ahead2", ra_ahead2),
+                ("ra_rejoins", ra_rejoins),
+                ("ra_blocking", ra_blocking),
+                ("ra_blk_owed", ra_blk_owed),
+                ("ra_blk_empty", ra_blk_empty),
+                ("ra_blk_partial", ra_blk_partial),
+                ("ra_leave_close", ra_leave_close),
+                ("ra_leave_hit", ra_leave_hit),
+                ("ra_leave_removed", ra_leave_removed),
+                ("ra_gate_evals", ra_gate_evals),
+                ("ra_miss_start", ra_miss_start),
+                ("ra_miss_max", ra_miss_max),
+                ("ra_plan_calls", ra_plan_calls),
+                ("ra_plan_us", ra_plan_us),
+                ("ra_freed_poke", ra_freed_poke),
+                ("ra_freed_skip", ra_freed_skip),
+                ("ra_block_us", ra_block_us),
+                ("ra_block_episodes", ra_block_episodes),
+                ("ra_pin_n", ra_pin_n),
                 ("sub_p50_us", sub_p50),
                 ("sub_p90_us", sub_p90),
                 ("enq_max_us", enq_max),
