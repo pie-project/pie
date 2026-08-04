@@ -1694,3 +1694,31 @@ kernel inside mixed fires (they ride the causal dispatch); graph
 capture of mixed fires (eager); masked x hooks/lora (UNPLANNED as
 today); multiple masked programs already work (the N-program tiling
 carries over).
+
+## THE MIXED FIRE IS DEFAULT (2026-08-04) — the directive's example, standing
+
+The campaign closed in five commits: the driver slice (2924da047, two
+split domains + side stream), the WIP disarm (97c86c4ec), the
+workspace root-cause and fix (8c4934cae, 9a3fcc85d — two
+prefill-family plans must not share one AttentionWorkspace's
+scheduling buffers; the suffix plan owns a dedicated workspace, which
+also gives the two concurrent dispatches disjoint scratch), the
+declaration (fe4cbd236 — the prefill-class mask arm states the same
+UnmaskedPrefix peel as the decode class, goldens pin it, all three
+legs serve it, the tail's plan/workspace pairing rule stated), and
+the flip (55c022f36). The user's example — custom-mask decode +
+causal-mask decode + prefill in ONE batched forward pass, the custom
+and prefill attentions on DIFFERENT streams — is now the default
+behavior: seriation orders [wire prefill+decode | masked envelope
+suffix], the planned word (REQUEST domain — measured, the one
+surprise of the campaign) splits the fire, the prefix causal
+dispatch serves any mix of prefill and plain-decode requests on the
+main stream, the masked 1-token suffix's custom dispatch runs on the
+side stream between fork/join events.
+
+Honest edges, recorded: the overlap WIN is unmeasured at 1B scale
+(span timing is noise-level vs serialized; heavy-workload evidence
+owed); mixed numerics sit in the generic co-batch rounding class
+(control-proven, 2/8 both ways); masked x hooks/lora and padded/XQA
+shapes keep the fire-level word; graph capture does not cover
+prefill-shaped fires (eager by class).
