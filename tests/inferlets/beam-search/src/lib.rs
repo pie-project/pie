@@ -303,7 +303,7 @@ macro_rules! define_beam_search {
             mask.put(&new_mask);
 
             // 4. Explicit write descriptor for each surviving beam.
-            let pids = pool_ids_ch.take().tensor();
+            let pids = pool_ids_ch.take();
             let logical_slot = div(&wpos, PAGE_T); // [B] index into the pool
             let w_slot_v = gather(&pids, &logical_slot);
             let w_off_v = rem(&wpos, PAGE_T);
@@ -362,23 +362,19 @@ macro_rules! define_beam_search {
                 let picked = out
                     .take()
                     .to_host::<Vec<i32>>()
-                    .await
-                    .with_context(|| format!("out.take @{step}"))?;
+                    .await.with_context(|| format!("@{step}"))?;
                 let parents = out_par
                     .take()
                     .to_host::<Vec<u32>>()
-                    .await
-                    .with_context(|| format!("out_par.take @{step}"))?;
+                    .await.with_context(|| format!("@{step}"))?;
                 final_scores = out_scr
                     .take()
                     .to_host::<Vec<f32>>()
-                    .await
-                    .with_context(|| format!("out_scr.take @{step}"))?;
+                    .await.with_context(|| format!("@{step}"))?;
                 let greedy = out_greedy
                     .take()
                     .to_host::<Vec<i32>>()
-                    .await
-                    .with_context(|| format!("out_greedy.take @{step}"))?;
+                    .await.with_context(|| format!("@{step}"))?;
                 greedy_mismatches += count_greedy_mismatches(&picked, &greedy, B);
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
                 step += 1;
@@ -392,23 +388,19 @@ macro_rules! define_beam_search {
                 let picked = out
                     .take()
                     .to_host::<Vec<i32>>()
-                    .await
-                    .with_context(|| format!("out.take @{step}"))?;
+                    .await.with_context(|| format!("@{step}"))?;
                 let parents = out_par
                     .take()
                     .to_host::<Vec<u32>>()
-                    .await
-                    .with_context(|| format!("out_par.take @{step}"))?;
+                    .await.with_context(|| format!("@{step}"))?;
                 final_scores = out_scr
                     .take()
                     .to_host::<Vec<f32>>()
-                    .await
-                    .with_context(|| format!("out_scr.take @{step}"))?;
+                    .await.with_context(|| format!("@{step}"))?;
                 let greedy = out_greedy
                     .take()
                     .to_host::<Vec<i32>>()
-                    .await
-                    .with_context(|| format!("out_greedy.take @{step}"))?;
+                    .await.with_context(|| format!("@{step}"))?;
                 greedy_mismatches += count_greedy_mismatches(&picked, &greedy, B);
                 let mut next_rs = Vec::with_capacity(B as usize);
                 for lane in 0..B as usize {

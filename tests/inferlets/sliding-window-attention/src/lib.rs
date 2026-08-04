@@ -109,11 +109,7 @@ async fn main(input: Input) -> Result<String> {
     if input.max_tokens == 1 {
         pipeline.close();
     }
-    let first = first_out
-        .take()
-        .to_host::<i32>()
-        .await
-        .context("read first token")? as u32;
+    let first = first_out.take().to_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -162,8 +158,8 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     decode.epilogue(move || {
-        let base = fill.take().tensor();
-        let ids = pool_ids_input.take().tensor();
+        let base = fill.take();
+        let ids = pool_ids_input.take();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
         let next_mask = reshape(sliding_window_mask(&base, pool_len, window), [1, pool_len]);
         let logical_slot = div(&base, page_t);
@@ -196,11 +192,7 @@ async fn main(input: Input) -> Result<String> {
 
     let budget = input.max_tokens.saturating_sub(generated.len());
     run_ahead(&pipeline, &decode, budget as usize, async || {
-        let token = token_out
-            .take()
-            .to_host::<i32>()
-            .await
-            .context("read generated token")? as u32;
+        let token = token_out.take().to_host::<i32>().await? as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

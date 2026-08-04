@@ -116,7 +116,7 @@ async fn main(input: String) -> Result<String> {
         },
     )?;
     fwd.epilogue(move || {
-        let length = kv_len.take().tensor();
+        let length = kv_len.take();
         // Takes + compute first, puts last (value-id discipline). `tok` is
         // pre-reshaped to the channel cell shape so the terminal-output puts
         // (tok_out/raw, host-read) emit NO value-defining ops — their auto-
@@ -159,12 +159,12 @@ async fn main(input: String) -> Result<String> {
             .take()
             .to_host::<i32>()
             .await
-            .with_context(|| format!("tok_out.take @{step}"))? as u32;
+            .with_context(|| format!("@{step}"))? as u32;
         let logits = raw
             .take()
             .to_host::<Vec<f32>>()
             .await
-            .with_context(|| format!("raw.take @{step}"))?;
+            .with_context(|| format!("@{step}"))?;
 
         // Assert #1 CONFORM: device token == host apply_mask_argmax(raw, mask).
         let host_token = apply_mask_argmax(&logits, &packed);

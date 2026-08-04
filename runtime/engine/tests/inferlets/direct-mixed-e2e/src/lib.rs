@@ -63,14 +63,14 @@ async fn main(_input: String) -> Result<String> {
     let mixed = ForwardPass::new();
     bind_geometry(&mixed, &ws, &token, &mixed_kv_len)?;
     mixed.epilogue(move || {
-        let mixed_token_value = mixed_token_source.take().tensor();
-        let mixed_scalar_value = mixed_scalar_source.take().tensor();
-        let vector_value = vector_source.take().tensor();
-        let prefix_value = prefix_source.take().tensor();
-        let sampler_a_value = sampler_a_source.take().tensor();
-        let sampler_b_value = sampler_b_source.take().tensor();
-        let sampler_c_value = sampler_c_source.take().tensor();
-        let sampler_d_value = sampler_d_source.take().tensor();
+        let mixed_token_value = mixed_token_source.take();
+        let mixed_scalar_value = mixed_scalar_source.take();
+        let vector_value = vector_source.take();
+        let prefix_value = prefix_source.take();
+        let sampler_a_value = sampler_a_source.take();
+        let sampler_b_value = sampler_b_source.take();
+        let sampler_c_value = sampler_c_source.take();
+        let sampler_d_value = sampler_d_source.take();
 
         mixed_token_source.put(&mixed_token_value);
         mixed_scalar_source.put(&mixed_scalar_value);
@@ -93,43 +93,15 @@ async fn main(_input: String) -> Result<String> {
 
     let pipeline = Pipeline::new();
     mixed.submit(&pipeline).context("mixed submit")?;
-    let token_value = mixed_token
-        .take()
-        .to_host::<u32>()
-        .await
-        .context("mixed token")?;
-    let scalar_value = mixed_scalar
-        .take()
-        .to_host::<f32>()
-        .await
-        .context("mixed scalar")?;
-    let vector_value = vector
-        .take()
-        .to_host::<Vec<u32>>()
-        .await
-        .context("vector")?;
-    let empty_prefix = prefix_len.take().to_host::<u32>().await.context("prefix")? as usize;
+    let token_value = mixed_token.take().to_host::<u32>().await?;
+    let scalar_value = mixed_scalar.take().to_host::<f32>().await?;
+    let vector_value = vector.take().to_host::<Vec<u32>>().await?;
+    let empty_prefix = prefix_len.take().to_host::<u32>().await? as usize;
     let samplers = [
-        sampler_a
-            .take()
-            .to_host::<u32>()
-            .await
-            .context("sampler_a take")?,
-        sampler_b
-            .take()
-            .to_host::<u32>()
-            .await
-            .context("sampler_b take")?,
-        sampler_c
-            .take()
-            .to_host::<u32>()
-            .await
-            .context("sampler_c take")?,
-        sampler_d
-            .take()
-            .to_host::<u32>()
-            .await
-            .context("sampler_d take")?,
+        sampler_a.take().to_host::<u32>().await?,
+        sampler_b.take().to_host::<u32>().await?,
+        sampler_c.take().to_host::<u32>().await?,
+        sampler_d.take().to_host::<u32>().await?,
     ];
     pipeline.close();
 
@@ -140,7 +112,7 @@ async fn main(_input: String) -> Result<String> {
     let entropy_pass = ForwardPass::new();
     bind_geometry(&entropy_pass, &entropy_ws, &entropy_token, &entropy_kv_len)?;
     entropy_pass.epilogue(move || {
-        let entropy_value = entropy_source.take().tensor();
+        let entropy_value = entropy_source.take();
         entropy_source.put(&entropy_value);
         entropy.put(&entropy_value);
     });
@@ -148,7 +120,7 @@ async fn main(_input: String) -> Result<String> {
     entropy_pass
         .submit(&entropy_pipeline)
         .context("entropy submit")?;
-    let entropy_value = entropy.take().to_host::<f32>().await.context("entropy")?;
+    let entropy_value = entropy.take().to_host::<f32>().await?;
     entropy_pipeline.close();
 
     let mixed_ok = token_value == 7 && (scalar_value - 1.25).abs() < f32::EPSILON;

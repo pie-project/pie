@@ -169,18 +169,18 @@ async fn main(input: Input) -> Result<Output> {
             .take()
             .to_host::<i32>()
             .await
-            .with_context(|| format!("g0 take @{base}"))?;
+            .with_context(|| format!("@{base}"))?;
         if want_stats {
             s1_out_p
                 .take()
                 .to_host::<Vec<f32>>()
                 .await
-                .with_context(|| format!("s1 take @{base}"))?;
+                .with_context(|| format!("@{base}"))?;
             s2_out_p
                 .take()
                 .to_host::<Vec<f32>>()
                 .await
-                .with_context(|| format!("s2 take @{base}"))?;
+                .with_context(|| format!("@{base}"))?;
         }
     }
     generated.push(g0 as u32);
@@ -223,7 +223,7 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
@@ -254,18 +254,18 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             if want_stats {
                 s1_out
                     .take()
                     .to_host::<Vec<f32>>()
                     .await
-                    .with_context(|| format!("s1_out.take @{}", generated.len()))?;
+                    .with_context(|| format!("@{}", generated.len()))?;
                 s2_out
                     .take()
                     .to_host::<Vec<f32>>()
                     .await
-                    .with_context(|| format!("s2_out.take @{}", generated.len()))?;
+                    .with_context(|| format!("@{}", generated.len()))?;
             }
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))

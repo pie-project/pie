@@ -127,7 +127,7 @@ async fn forward_logits(
         .take()
         .to_host::<Vec<f32>>()
         .await
-        .with_context(|| format!("logits take {tag}"))
+        .with_context(|| format!("{tag}"))
 }
 
 #[inferlet::main]

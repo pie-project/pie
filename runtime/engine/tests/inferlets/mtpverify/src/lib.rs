@@ -127,8 +127,8 @@ async fn verify_window(
     )?;
     fwd.epilogue(move || {
         // Takes + compute first, PUTS last (value-id discipline).
-        let a = allow.take().tensor(); // [k, vocab] bool per-position mask
-        let d = draft_ch.take().tensor(); // [k] i32 submit draft
+        let a = allow.take(); // [k, vocab] bool per-position mask
+        let d = draft_ch.take(); // [k] i32 submit draft
         let logits = intrinsics::logits(); // [k, vocab] f32 target
         let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [k, vocab]);
         let masked = select(&a, &logits, &neg_inf); // per-position mask
@@ -145,7 +145,7 @@ async fn verify_window(
 
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline).context("submit")?;
-    let raw = out.take().to_host::<Vec<i32>>().await.context("out take")?;
+    let raw = out.take().to_host::<Vec<i32>>().await?;
     pipeline.close();
     Ok(accepted_prefix(&raw))
 }

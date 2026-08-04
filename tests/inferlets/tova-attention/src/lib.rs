@@ -238,7 +238,7 @@ async fn main(input: Input) -> Result<Output> {
             .take()
             .to_host::<i32>()
             .await
-            .with_context(|| format!("g0 take @{base}"))?;
+            .with_context(|| format!("@{base}"))?;
     }
     generated.push(g0 as u32);
 
@@ -303,15 +303,15 @@ async fn main(input: Input) -> Result<Output> {
         //    attention — which is what distinguishes `on_attn` from Quest's
         //    `on_attn_proj`: the scores do not exist until attention has run. ──
         fwd.on_attn(move || {
-            let prev = acc.take().tensor();
-            let ct = layer_ct.take().tensor();
+            let prev = acc.take();
+            let ct = layer_ct.take();
             let scores = intrinsics::attn_score(kv_max);
             acc.put(&add(&prev, &scores));
             layer_ct.put(&add(&ct, 1u32));
         });
 
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
@@ -330,8 +330,8 @@ async fn main(input: Input) -> Result<Output> {
             rng.put(&add(&r, iota(2)));
 
             // Publish the layer fold, then re-seed it for the next fire.
-            let folded = acc.take().tensor();
-            let layers = layer_ct.take().tensor();
+            let folded = acc.take();
+            let layers = layer_ct.take();
             scores_out.put(&folded);
             layers_out.put(&layers);
             acc.put(&broadcast(0.0f32, [kv_max]));
@@ -344,17 +344,17 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             last_scores = scores_out
                 .take()
                 .to_host::<Vec<f32>>()
                 .await
-                .with_context(|| format!("tova_scores.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             layers_observed = layers_out
                 .take()
                 .to_host::<u32>()
                 .await
-                .with_context(|| format!("tova_layer_count.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             // The fire that produced this row had `n + generated.len()` KV
             // positions live: the prompt plus every token committed before it.
             last_kv_len = n + generated.len() as u32;

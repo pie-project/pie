@@ -166,7 +166,7 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
             },
         )?;
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take(); // [2] u32 rng state
             let scaled = div(intrinsics::logits(), TEMPERATURE);
             let t = sample(kind, scaled, vocab, &r);

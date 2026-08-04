@@ -271,7 +271,7 @@ async fn main(input: Input) -> Result<Output> {
             .take()
             .to_host::<i32>()
             .await
-            .with_context(|| format!("g0 take @{base}"))?;
+            .with_context(|| format!("@{base}"))?;
     }
     generated.push(g0 as u32);
 
@@ -363,15 +363,15 @@ async fn main(input: Input) -> Result<Output> {
             // Everything below is the report, not the policy: the mask above
             // has already been applied to this layer.
             if let (Some(acc), Some(layer_ct)) = (acc.as_ref(), layer_ct.as_ref()) {
-                let prev = acc.take().tensor();
-                let ct = layer_ct.take().tensor();
+                let prev = acc.take();
+                let ct = layer_ct.take();
                 acc.put(&max_elem(&prev, &scores));
                 layer_ct.put(&add(&ct, 1u32));
             }
         });
 
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             if let Some(kvlen_out) = kvlen_out.as_ref() {
                 kvlen_out.put(&length);
             }
@@ -399,8 +399,8 @@ async fn main(input: Input) -> Result<Output> {
                 scores_out.as_ref(),
                 layers_out.as_ref(),
             ) {
-                let folded = acc.take().tensor();
-                let layers = layer_ct.take().tensor();
+                let folded = acc.take();
+                let layers = layer_ct.take();
                 scores_out.put(&folded);
                 layers_out.put(&layers);
                 acc.put(&broadcast(f32::NEG_INFINITY, [p_max]));
@@ -414,20 +414,20 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             if let Some(ch) = scores_out.as_ref() {
                 last_scores = ch
                     .take()
                     .to_host::<Vec<f32>>()
                     .await
-                    .with_context(|| format!("quest_scores.take @{}", generated.len()))?;
+                    .with_context(|| format!("@{}", generated.len()))?;
             }
             layers_observed = match layers_out.as_ref() {
                 Some(ch) => ch
                     .take()
                     .to_host::<u32>()
                     .await
-                    .with_context(|| format!("quest_layer_count.take @{}", generated.len()))?,
+                    .with_context(|| format!("@{}", generated.len()))?,
                 None => layers_observed,
             };
             kv_len_last = match kvlen_out.as_ref() {
@@ -435,7 +435,7 @@ async fn main(input: Input) -> Result<Output> {
                     .take()
                     .to_host::<u32>()
                     .await
-                    .with_context(|| format!("quest_kv_len.take @{}", generated.len()))?,
+                    .with_context(|| format!("@{}", generated.len()))?,
                 None => kv_len_last,
             };
             generated.push(t as u32);

@@ -104,14 +104,14 @@ async fn main(input: String) -> Result<String> {
     )?;
     fwd_p.epilogue(move || {
         // The fire's "sampled" token = the loop-carried echo constant.
-        let t = echo_p.take().tensor(); // [1] i32
+        let t = echo_p.take(); // [1] i32
         g0_ch.put(&t);
     });
 
     // ONE pipeline for the whole prefill→decode stream.
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
+    let g0 = g0_ch.take().to_host::<i32>().await?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     generated.push(g0 as u32);
@@ -151,8 +151,8 @@ async fn main(input: String) -> Result<String> {
             },
         )?;
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
-            let t = echo.take().tensor(); // [1] i32 — the echo token
+            let length = kv_len.take();
+            let t = echo.take(); // [1] i32 — the echo token
             let next_length = add(&length, 1u32);
             let page_count = div(add(&next_length, page_size - 1), page_size);
             let next_page_indptr = mul(iota(2), broadcast(&page_count, [2]));
@@ -176,7 +176,7 @@ async fn main(input: String) -> Result<String> {
                 .take()
                 .to_host::<Vec<i32>>()
                 .await
-                .with_context(|| format!("out.take @{step}"))?;
+                .with_context(|| format!("@{step}"))?;
             let Some(&t0) = t.first() else {
                 return Err(format!("out.take @{step}: empty tensor"));
             };

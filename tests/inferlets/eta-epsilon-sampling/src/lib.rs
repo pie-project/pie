@@ -232,17 +232,9 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
-    let k0 = kept_out_p
-        .take()
-        .to_host::<f32>()
-        .await
-        .context("k0 take")?;
-    let m0 = mass_out_p
-        .take()
-        .to_host::<f32>()
-        .await
-        .context("m0 take")?;
+    let g0 = tok_out_p.take().to_host::<i32>().await?;
+    let k0 = kept_out_p.take().to_host::<f32>().await?;
+    let m0 = mass_out_p.take().to_host::<f32>().await?;
     generated.push(g0 as u32);
     kept_sizes.push(k0);
     kept_mass.push(m0);
@@ -286,7 +278,7 @@ async fn main(input: Input) -> Result<Output> {
         )?;
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
             let logits = intrinsics::logits();
             let (token, kept, kmass) =
@@ -315,17 +307,17 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             let k = kept_out
                 .take()
                 .to_host::<f32>()
                 .await
-                .with_context(|| format!("kept_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             let m = mass_out
                 .take()
                 .to_host::<f32>()
                 .await
-                .with_context(|| format!("mass_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);
             kept_sizes.push(k);
             kept_mass.push(m);

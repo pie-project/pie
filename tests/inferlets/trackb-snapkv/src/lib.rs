@@ -362,8 +362,8 @@ async fn main(input: Input) -> Result<Output> {
     //    prefill fire the row is the mean over the observation window's query
     //    rows, which is precisely the quantity SnapKV selects on. ──
     fwd_p.on_attn(move || {
-        let prev = acc.take().tensor();
-        let ct = layer_ct.take().tensor();
+        let prev = acc.take();
+        let ct = layer_ct.take();
         let scores = intrinsics::attn_score(kv_max);
         acc.put(&add(&prev, &scores));
         layer_ct.put(&add(&ct, 1u32));
@@ -381,8 +381,8 @@ async fn main(input: Input) -> Result<Output> {
         // geometry), so the reshape is a reinterpretation rather than a resize.
         // Summing is the right collapse for a probability mass: a page's share
         // of the attention is the sum of its positions' shares.
-        let folded = acc.take().tensor();
-        let layers = layer_ct.take().tensor();
+        let folded = acc.take();
+        let layers = layer_ct.take();
         scores_out.put(&folded);
         layers_out.put(&layers);
         page_mass_out.put(&reduce_sum(&reshape(&folded, [p_max, page_size])));
@@ -394,24 +394,12 @@ async fn main(input: Input) -> Result<Output> {
         .submit(&pipe)
         .with_context(|| format!("prefill submit @{base}"))?;
 
-    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
+    let g0 = tok_out_p.take().to_host::<i32>().await?;
     generated.push(g0 as u32);
 
-    let prefill_scores = scores_out
-        .take()
-        .to_host::<Vec<f32>>()
-        .await
-        .context("snapkv_scores.take")?;
-    let layers_observed = layers_out
-        .take()
-        .to_host::<u32>()
-        .await
-        .context("snapkv_layer_count.take")?;
-    let device_page_mass = page_mass_out
-        .take()
-        .to_host::<Vec<f32>>()
-        .await
-        .context("snapkv_page_mass.take")?;
+    let prefill_scores = scores_out.take().to_host::<Vec<f32>>().await?;
+    let layers_observed = layers_out.take().to_host::<u32>().await?;
+    let device_page_mass = page_mass_out.take().to_host::<Vec<f32>>().await?;
 
     // ── DECODE LOOP (1-wide, run-ahead), enforcing the fixed keep-set. ──
     if generated.len() < max_tokens {
@@ -472,13 +460,13 @@ async fn main(input: Input) -> Result<Output> {
         //    (a fusion barrier). The backend force-keeps the request's last page
         //    whatever this says -- it holds the token this fire is writing. ──
         fwd.on_attn_proj(move || {
-            let mass = page_mass.take().tensor();
+            let mass = page_mass.take();
             intrinsics::kernel::attn_page_mask(&pivot_threshold(&mass, rank_le(effective_budget)));
             page_mass.put(&mass);
         });
 
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
@@ -503,7 +491,7 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })

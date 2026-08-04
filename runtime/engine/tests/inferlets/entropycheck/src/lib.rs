@@ -72,11 +72,7 @@ async fn main(_input: String) -> Result<String> {
 
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline).context("submit")?;
-    let entropy = entropy_out
-        .take()
-        .to_host::<f32>()
-        .await
-        .context("entropy take")?;
+    let entropy = entropy_out.take().to_host::<f32>().await?;
     pipeline.close();
 
     eprintln!("[ENTROPYCHECK] entropy={entropy}");

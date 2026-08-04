@@ -150,7 +150,7 @@ async fn main(_input: String) -> Result<String> {
     // decode fires continue the SAME growing context, so they all submit here.
     let pipeline = Pipeline::new();
     fwd_p.submit(&pipeline).context("prefill submit")?;
-    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
+    let g0 = g0_ch.take().to_host::<i32>().await?;
 
     // `count` = total tokens generated so far (across every kind), INCLUDING
     // `last_tok`; the next fire embeds `last_tok` at absolute position
@@ -207,7 +207,7 @@ async fn main(_input: String) -> Result<String> {
                 },
             )?;
             fwd.epilogue(move || {
-                let length = kv_len.take().tensor();
+                let length = kv_len.take();
                 let r = rng.take(); // [2] u32 rng state
                 let scaled = div(intrinsics::logits(), TEMPERATURE);
                 let t = sample(kind, scaled, vocab, &r);

@@ -121,7 +121,7 @@ async fn main(_input: String) -> Result<String> {
     // finish() (F7) lands after the last decode submit, not here).
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
+    let g0 = g0_ch.take().to_host::<i32>().await?;
     println!("[prefill] N-wide fire committed; first generated token g0={g0}");
 
     // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
@@ -162,7 +162,7 @@ async fn main(_input: String) -> Result<String> {
     )?;
     fwd.epilogue(move || {
         // Takes + compute first, PUTS last (value-id discipline).
-        let base = fill.take().tensor(); // [1] u32 — position this next fire writes
+        let base = fill.take(); // [1] u32 — position this next fire writes
         let pids = pool_ids_ch.take();
 
         let tok = reduce_argmax(intrinsics::logits()); // [1] i32
@@ -206,7 +206,7 @@ async fn main(_input: String) -> Result<String> {
             .take()
             .to_host::<Vec<i32>>()
             .await
-            .with_context(|| format!("out.take @{step}"))?;
+            .with_context(|| format!("@{step}"))?;
         if let Some(&t0) = t.first() {
             generated.push(t0 as u32);
         }

@@ -77,11 +77,7 @@ async fn append_tokens(
         next_token.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
     fwd.submit(pipeline).context("append shared prefix")?;
-    Ok(next_token
-        .take()
-        .to_host::<i32>()
-        .await
-        .context("read branch token")?)
+    Ok(next_token.take().to_host::<i32>().await?)
 }
 
 async fn generate(
@@ -143,7 +139,7 @@ async fn generate(
         },
     )?;
     fwd.epilogue(move || {
-        let length = kv_len.take().tensor();
+        let length = kv_len.take();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
         let next_length = add(&length, 1u32);
         let page_count = div(add(&next_length, page_size - 1), page_size);
@@ -160,11 +156,7 @@ async fn generate(
 
     let budget = max_tokens.saturating_sub(generated.len());
     run_ahead(&pipeline, &fwd, budget as usize, async || {
-        let token = token_out
-            .take()
-            .to_host::<i32>()
-            .await
-            .context("read leaf token")? as u32;
+        let token = token_out.take().to_host::<i32>().await? as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

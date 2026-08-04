@@ -117,7 +117,7 @@ async fn main(input: String) -> Result<String> {
     // zero decode fires follow.
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
+    let g0 = g0_ch.take().to_host::<i32>().await?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     generated.push(g0 as u32);
@@ -164,7 +164,7 @@ async fn main(input: String) -> Result<String> {
             },
         )?;
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let t = reduce_argmax(intrinsics::logits()); // [1] i32 greedy token
             let next_length = add(&length, 1u32);
             let page_count = div(add(&next_length, page_size - 1), page_size);
@@ -185,7 +185,7 @@ async fn main(input: String) -> Result<String> {
                 .take()
                 .to_host::<Vec<i32>>()
                 .await
-                .with_context(|| format!("out.take @{step}"))?;
+                .with_context(|| format!("@{step}"))?;
             let Some(&t0) = t.first() else {
                 return Err(format!("out.take @{step}: empty tensor"));
             };

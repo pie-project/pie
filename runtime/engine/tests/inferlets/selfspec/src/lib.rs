@@ -92,7 +92,7 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     // are one sequential stream. The g0 handoff still rides the host.
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("greedy prefill")?;
-    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
+    let g0 = g0_ch.take().to_host::<i32>().await?;
 
     let mut g: Vec<u32> = vec![g0 as u32];
     if k > 1 {
@@ -123,7 +123,7 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
             },
         )?;
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let t = reduce_argmax(intrinsics::logits());
             let next_length = add(&length, 1u32);
             let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
@@ -215,11 +215,7 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
 
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline).context("verify submit")?;
-    let v = verify_out
-        .take()
-        .to_host::<Vec<i32>>()
-        .await
-        .context("verify take")?;
+    let v = verify_out.take().to_host::<Vec<i32>>().await?;
     pipeline.close();
     Ok(v.iter().map(|&x| x as u32).collect())
 }

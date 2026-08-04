@@ -195,7 +195,7 @@ async fn main(input: Input) -> Result<Output> {
         },
     )?;
     fwd_p.epilogue(move || {
-        let mu_v = mu_p.take().tensor();
+        let mu_v = mu_p.take();
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
         let (token, surprise) = mirostat_step(floor, logits, vocab, mu_v, &r);
@@ -213,8 +213,8 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
-    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
-    let s0 = s_out_p.take().to_host::<f32>().await.context("s0 take")?;
+    let g0 = tok_out_p.take().to_host::<i32>().await?;
+    let s0 = s_out_p.take().to_host::<f32>().await?;
 
     generated.push(g0 as u32);
     surprises.push(s0);
@@ -257,8 +257,8 @@ async fn main(input: Input) -> Result<Output> {
         )?;
         fwd.epilogue(move || {
             // Takes + compute first, PUTS last (value-id discipline).
-            let length = kv_len.take().tensor();
-            let mu_v = mu_state.take().tensor(); // [1] f32, device loop-carried
+            let length = kv_len.take();
+            let mu_v = mu_state.take(); // [1] f32, device loop-carried
             let r = rng.take(); // [2] u32 rng state
             let logits = intrinsics::logits(); // [vocab] f32
             let (token, surprise) = mirostat_step(floor, logits, vocab, &mu_v, &r);
@@ -287,12 +287,12 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             let s = s_out
                 .take()
                 .to_host::<f32>()
                 .await
-                .with_context(|| format!("s_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);
             surprises.push(s);
             mu -= lr * (s - tau);

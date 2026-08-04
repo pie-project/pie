@@ -122,11 +122,7 @@ async fn main(input: Input) -> Result<String> {
         .context("attention-sink prefill")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
-    let first = first_out
-        .take()
-        .to_host::<i32>()
-        .await
-        .context("read first token")? as u32;
+    let first = first_out.take().to_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -172,8 +168,8 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     decode.epilogue(move || {
-        let base = fill.take().tensor();
-        let ids = pool_ids_input.take().tensor();
+        let base = fill.take();
+        let ids = pool_ids_input.take();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
         let next_mask = reshape(
             sink_window_mask(&base, pool_len, sink, window),
@@ -209,11 +205,7 @@ async fn main(input: Input) -> Result<String> {
 
     let budget = input.max_tokens.saturating_sub(generated.len());
     run_ahead(&pipeline, &decode, budget, async || {
-        let token = token_out
-            .take()
-            .to_host::<i32>()
-            .await
-            .context("read generated token")? as u32;
+        let token = token_out.take().to_host::<i32>().await? as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

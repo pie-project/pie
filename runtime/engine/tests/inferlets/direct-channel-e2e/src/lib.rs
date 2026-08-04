@@ -36,8 +36,8 @@ async fn main(_input: String) -> Result<String> {
         },
     )?;
     pass.epilogue(move || {
-        let current = state.take().tensor();
-        let late_increment = increment.take().tensor();
+        let current = state.take();
+        let late_increment = increment.take();
         let next = add(&current, &late_increment);
         state.put(&next);
         out.put(&next);
@@ -55,7 +55,7 @@ async fn main(_input: String) -> Result<String> {
     if late_put {
         increment.put(vec![1u32]);
     }
-    let value = out.take().to_host::<u32>().await.context("take")?;
+    let value = out.take().to_host::<u32>().await?;
     pipeline.close();
 
     Ok(format!("value={value}"))

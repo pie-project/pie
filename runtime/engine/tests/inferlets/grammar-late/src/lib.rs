@@ -126,7 +126,7 @@ async fn main(input: String) -> Result<String> {
         },
     )?;
     fwd.epilogue(move || {
-        let length = kv_len.take().tensor();
+        let length = kv_len.take();
         // Takes + compute first, PUTS last (value-id discipline).
         let m = gmask.take(); // [V] bool, host-fed per step
         let lg = intrinsics::logits(); // [V] f32 (read-out row)
@@ -167,12 +167,12 @@ async fn main(input: String) -> Result<String> {
             .take()
             .to_host::<i32>()
             .await
-            .with_context(|| format!("tok_out.take @{step}"))? as u32;
+            .with_context(|| format!("@{step}"))? as u32;
         let logits = raw
             .take()
             .to_host::<Vec<f32>>()
             .await
-            .with_context(|| format!("raw.take @{step}"))?;
+            .with_context(|| format!("@{step}"))?;
 
         // Assert #1 CONFORM: device token == host apply_mask_argmax(raw, mask).
         let host_token = apply_mask_argmax(&logits, &packed);

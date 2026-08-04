@@ -1121,7 +1121,7 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     let c_append = c.build_fire(&window, Some(&Channel::from([0u32])), "C-append", || {})?;
     c_append.submit(&pipe).context("C-append submit")?;
 
-    let argmax = raw.take().to_host::<i32>().await.context("raw take")?;
+    let argmax = raw.take().to_host::<i32>().await?;
     let expected = 1 + (argmax.rem_euclid(W as i32)) as u32;
     // As far from `expected` as the window allows: the control has to be a
     // clearly different context, not an adjacent one.
@@ -1300,7 +1300,7 @@ async fn main(input: String) -> Result<String> {
 
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
+    let g0 = g0_ch.take().to_host::<i32>().await?;
 
     // ────────────── 2. SPECULATE — `fold_len = 0`, nothing folds ──────────
     // One SPEC_TOKENS-wide fire. Its activations land in the buffered slots;
@@ -1364,11 +1364,7 @@ async fn main(input: String) -> Result<String> {
         spec_out.put(&t);
     });
     fwd_s.submit(&pipe).context("speculative submit")?;
-    let drafted = spec_out
-        .take()
-        .to_host::<i32>()
-        .await
-        .context("spec_out take")?;
+    let drafted = spec_out.take().to_host::<i32>().await?;
 
     // ─────────────── 3. COMMIT — `fold_len = accepted` ────────────────────
     // Replays only the accepted prefix into the folded state. No logits, and
@@ -1504,11 +1500,7 @@ async fn main(input: String) -> Result<String> {
             c2_out.put(&t);
         });
         fwd2.submit(&pipe).context("chain submit")?;
-        c2_out
-            .take()
-            .to_host::<Vec<i32>>()
-            .await
-            .context("c2_out take")?;
+        c2_out.take().to_host::<Vec<i32>>().await?;
         chained = "ok";
     }
 

@@ -321,15 +321,16 @@ impl Channel {
     }
 
     /// `take()` — consume a cell. In a stage closure: records a `ChanTake` and
-    /// yields an in-program value ([`AsTensor`]). On the host: [`Taken::get`]
-    /// awaits the committed value (awaits until a fire fills it; poison ⇒
-    /// `Err`).
+    /// yields an in-program value ([`AsTensor`]). On the host:
+    /// [`Taken::to_host`] awaits the committed value (awaits until a fire
+    /// fills it; poison ⇒ `Err`).
     pub fn take(&self) -> Taken {
         Taken {
             dsl: self.dsl().take(),
             wit: self.wit(),
             mode: TakenMode::Take,
             dtype: self.dtype,
+            name: self.dsl().name(),
         }
     }
 
@@ -340,6 +341,7 @@ impl Channel {
             wit: self.wit(),
             mode: TakenMode::Read,
             dtype: self.dtype,
+            name: self.dsl().name(),
         }
     }
 
@@ -402,6 +404,7 @@ pub struct Taken {
     wit: Rc<wit_channel::Channel>,
     mode: TakenMode,
     dtype: DType,
+    name: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,12 +420,15 @@ impl Taken {
     }
 
     /// Materialize the committed value to the host as raw little-endian bytes.
-    /// Awaits in-flight fires; a poisoned channel returns `Err`.
+    /// Awaits in-flight fires; a poisoned channel returns `Err`, labelled with
+    /// the channel's [`name`](Channel::named).
     pub async fn bytes(self) -> Result<Vec<u8>, String> {
+        let label = self.label();
         match self.mode {
             TakenMode::Take => self.wit.take().await,
             TakenMode::Read => self.wit.read().await,
         }
+        .map_err(|e| format!("{label}: {e}"))
     }
 
     /// Materialize the committed value to the host as `T` — either a whole
@@ -432,6 +438,9 @@ impl Taken {
     /// little-endian window, so decoding an `f32` channel as `i32` would
     /// reinterpret the bit pattern and return plausible garbage.
     ///
+    /// Errors are already labelled `"{channel} take"`, so inferlets do not
+    /// repeat the channel's name in a [`context`](crate::Context) call.
+    ///
     /// ```ignore
     /// let logits = out.take().to_host::<Vec<f32>>().await?;
     /// let count = n_ch.take().to_host::<i32>().await?;
@@ -439,13 +448,26 @@ impl Taken {
     pub async fn to_host<T: FromChannel>(self) -> Result<T, String> {
         if T::DTYPE != self.dtype {
             return Err(format!(
-                "channel holds {:?}, decoded as {:?}",
+                "{}: channel holds {:?}, decoded as {:?}",
+                self.label(),
                 self.dtype,
                 T::DTYPE
             ));
         }
+        let label = self.label();
         let raw = self.bytes().await?;
-        T::from_bytes(&raw)
+        T::from_bytes(&raw).map_err(|e| format!("{label}: {e}"))
+    }
+
+    /// `"{channel} take"` / `"{channel} read"` — the prefix on every host
+    /// readback error, so the message names the channel without the inferlet
+    /// spelling it out again.
+    fn label(&self) -> String {
+        let verb = match self.mode {
+            TakenMode::Take => "take",
+            TakenMode::Read => "read",
+        };
+        format!("{} {verb}", self.name)
     }
 }
 
@@ -457,6 +479,20 @@ impl AsTensor for Taken {
 impl AsTensor for &Taken {
     fn to_arg(&self) -> Arg {
         (*self).to_arg()
+    }
+}
+
+/// `put`ting a `Taken` straight back into another channel is the common shape
+/// of a decode loop (`positions.put(&length)`), so it does not need to be
+/// spelled `.tensor()` first.
+impl IntoPut for &Taken {
+    fn into_put(self) -> PutValue {
+        (&self.dsl).into_put()
+    }
+}
+impl IntoPut for Taken {
+    fn into_put(self) -> PutValue {
+        self.dsl.into_put()
     }
 }
 

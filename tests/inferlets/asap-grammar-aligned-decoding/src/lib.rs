@@ -296,11 +296,11 @@ async fn main(input: Input) -> Result<Output> {
         pre_alpha_val.put(val0);
         prefill.submit(&pipeline).context("ASAp prefill")?;
 
-        let first = read_i32(&pre_token).await?;
+        let first = pre_token.take().to_host::<i32>().await?;
         let mut path_nodes = vec![0usize];
-        let mut masses = vec![read_f32(&pre_mass).await?];
-        let mut probs = vec![read_f32(&pre_prob).await?];
-        let mut weighted_masses = vec![read_f32(&pre_wmass).await?];
+        let mut masses = vec![pre_mass.take().to_host::<f32>().await?];
+        let mut probs = vec![pre_prob.take().to_host::<f32>().await?];
+        let mut weighted_masses = vec![pre_wmass.take().to_host::<f32>().await?];
         // The α the step actually used for the token it took.
         let mut used_alpha = vec![alpha_of(&trie, 0, first as u32)];
 
@@ -348,7 +348,7 @@ async fn main(input: Input) -> Result<Output> {
                 },
             )?;
             decode.epilogue(move || {
-                let length = kv_len.take().tensor();
+                let length = kv_len.take();
                 let allowed = mask_ch.take().tensor();
                 let idx = alpha_idx.take().tensor();
                 let val = alpha_val.take().tensor();
@@ -381,10 +381,10 @@ async fn main(input: Input) -> Result<Output> {
                 alpha_val.put(val);
                 decode.submit(&pipeline).context("ASAp decode")?;
 
-                let token = read_i32(&token_out).await? as u32;
-                masses.push(read_f32(&mass_out).await?);
-                probs.push(read_f32(&prob_out).await?);
-                weighted_masses.push(read_f32(&wmass_out).await?);
+                let token = token_out.take().to_host::<i32>().await? as u32;
+                masses.push(mass_out.take().to_host::<f32>().await?);
+                probs.push(prob_out.take().to_host::<f32>().await?);
+                weighted_masses.push(wmass_out.take().to_host::<f32>().await?);
                 used_alpha.push(alpha_of(&trie, node, token));
                 generated.push(token);
                 constraint.accept_tokens(&[token]).map_err(|e| {
@@ -531,20 +531,4 @@ fn asap_step(
         reshape(probability, [1]),
         reshape(weighted_mass, [1]),
     )
-}
-
-async fn read_i32(channel: &Channel) -> Result<i32> {
-    channel
-        .take()
-        .to_host::<i32>()
-        .await
-        .context("read i32 channel")
-}
-
-async fn read_f32(channel: &Channel) -> Result<f32> {
-    channel
-        .take()
-        .to_host::<f32>()
-        .await
-        .context("read f32 channel")
 }

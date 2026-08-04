@@ -119,7 +119,7 @@ async fn main(_input: String) -> Result<String> {
         },
     )?;
     fwd.epilogue(move || {
-        let length = kv_len.take().tensor();
+        let length = kv_len.take();
         let r = rng.take(); // [2] u32 rng state
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
         let scaled = div(logits, TEMPERATURE);
@@ -157,7 +157,7 @@ async fn main(_input: String) -> Result<String> {
 
     // Host drain: the g0 copy first (the decode burst is already in the
     // engine while this take waits), then the decode ring with refill.
-    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
+    let g0 = g0_ch.take().to_host::<i32>().await?;
     let mut generated: Vec<u32> = Vec::with_capacity(MAX_TOKENS);
     eprintln!("[TEMPGEN_PIPELINED] got token: {g0}");
     generated.push(g0 as u32);
@@ -168,7 +168,7 @@ async fn main(_input: String) -> Result<String> {
             .take()
             .to_host::<Vec<i32>>()
             .await
-            .with_context(|| format!("out.take @{}", generated.len()))?;
+            .with_context(|| format!("@{}", generated.len()))?;
         taken += 1;
         let Some(&t0) = t.first() else {
             return Err(format!("out.take @{}: empty tensor", generated.len()));

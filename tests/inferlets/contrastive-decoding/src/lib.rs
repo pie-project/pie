@@ -161,11 +161,7 @@ async fn main(input: Input) -> Result<String> {
     amateur_prefill
         .submit(&pipeline)
         .context("amateur prefill")?;
-    let first_amateur_logits = amateur_prefill_out
-        .take()
-        .to_host::<Vec<f32>>()
-        .await
-        .context("read amateur prefill logits")?;
+    let first_amateur_logits = amateur_prefill_out.take().to_host::<Vec<f32>>().await?;
 
     // The expert keeps the complete context and consumes the amateur logits in
     // its epilogue to perform the contrastive token selection on-device.
@@ -257,8 +253,8 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     amateur_decode.epilogue(move || {
-        let base = amateur_fill.take().tensor();
-        let ids = amateur_ids_input.take().tensor();
+        let base = amateur_fill.take();
+        let ids = amateur_ids_input.take();
         let columns = iota(pool_len);
         let base_columns = broadcast(reshape(&base, [1]), [pool_len]);
         let next_mask = reshape(
@@ -318,7 +314,7 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     expert_decode.epilogue(move || {
-        let length = expert_kv_len.take().tensor();
+        let length = expert_kv_len.take();
         let token = contrastive_pick(expert_amateur.take(), lambda, alpha, vocab);
         let next_length = add(&length, 1u32);
         let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
@@ -342,11 +338,7 @@ async fn main(input: Input) -> Result<String> {
     amateur_decode.submit(&pipeline).context("amateur decode")?;
 
     for step in 0..budget {
-        let amateur_logits = amateur_logits_out
-            .take()
-            .to_host::<Vec<f32>>()
-            .await
-            .context("read amateur logits")?;
+        let amateur_logits = amateur_logits_out.take().to_host::<Vec<f32>>().await?;
 
         expert_amateur.put(amateur_logits);
         expert_decode.submit(&pipeline).context("expert decode")?;
@@ -370,8 +362,7 @@ async fn read_expert_token(channel: &Channel) -> Result<u32> {
     channel
         .take()
         .to_host::<Vec<i32>>()
-        .await
-        .context("read expert token")?
+        .await?
         .first()
         .copied()
         .map(|token| token as u32)

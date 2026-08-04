@@ -114,7 +114,7 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
     )?;
     fwd.epilogue(move || {
         // Takes + compute first, PUTS last (value-id discipline).
-        let d = draft_ch.take().tensor(); // [k] i32 submit draft
+        let d = draft_ch.take(); // [k] i32 submit draft
         let logits = intrinsics::logits(); // [k, vocab] f32 matrix intrinsic
         let tgt = reduce_argmax(logits); // [k] i32 per-row argmax
         let hit = eq(&tgt, &d); // [k] bool
@@ -130,16 +130,8 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
 
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline).context("submit")?;
-    let tgt = target_out
-        .take()
-        .to_host::<Vec<i32>>()
-        .await
-        .context("target take")?;
-    let ver = verify_out
-        .take()
-        .to_host::<Vec<i32>>()
-        .await
-        .context("verify take")?;
+    let tgt = target_out.take().to_host::<Vec<i32>>().await?;
+    let ver = verify_out.take().to_host::<Vec<i32>>().await?;
     pipeline.close();
     Ok((tgt, ver))
 }

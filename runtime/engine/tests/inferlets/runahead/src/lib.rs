@@ -149,7 +149,7 @@ impl Decoder {
 
         fwd.submit(&pipeline).context("prefill submit")?;
         self.seq += n;
-        let g0 = g_ch.take().to_host::<i32>().await.context("g0 take")?;
+        let g0 = g_ch.take().to_host::<i32>().await?;
         Ok(g0 as u32)
     }
 
@@ -197,7 +197,7 @@ impl Decoder {
         )?;
         fwd.epilogue(move || {
             // Takes + compute first, puts last (value-id discipline).
-            let base = fill.take().tensor(); // [1] u32 — position this next fire writes
+            let base = fill.take(); // [1] u32 — position this next fire writes
             let pids = pool_ids_ch.take();
 
             let tok = reshape(reduce_argmax(intrinsics::logits()), [1]); // [1] i32
@@ -260,12 +260,7 @@ impl DecodeLoop {
 
     /// Drain the oldest in-flight fire's token (blocks until committed).
     async fn take(&self) -> Result<u32> {
-        let t = self
-            .out
-            .take()
-            .to_host::<Vec<i32>>()
-            .await
-            .context("out.take")?;
+        let t = self.out.take().to_host::<Vec<i32>>().await?;
         Ok(*t.first().unwrap_or(&0) as u32)
     }
 

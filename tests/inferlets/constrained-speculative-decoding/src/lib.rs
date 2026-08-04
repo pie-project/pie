@@ -234,8 +234,7 @@ async fn verify(
     let target = target_out
         .take()
         .to_host::<Vec<i32>>()
-        .await
-        .context("read verification result")?
+        .await?
         .into_iter()
         .map(|token| token as u32)
         .collect();

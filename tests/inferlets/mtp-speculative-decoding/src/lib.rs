@@ -118,16 +118,11 @@ async fn main(input: Input) -> Result<String> {
     });
     prefill.submit(&pipeline).context("prefill")?;
 
-    let seed = seed_out
-        .take()
-        .to_host::<i32>()
-        .await
-        .context("read prefill seed")? as u32;
+    let seed = seed_out.take().to_host::<i32>().await? as u32;
     let seed_drafts = drafts_out
         .take()
         .to_host::<Vec<i32>>()
-        .await
-        .context("read prefill drafts")?
+        .await?
         .into_iter()
         .map(|token| token as u32)
         .collect::<Vec<_>>();
@@ -175,10 +170,10 @@ async fn main(input: Input) -> Result<String> {
     )?;
     let stage_stop_tokens = stop_tokens.clone();
     fwd.epilogue(move || {
-        let win = window.take().tensor();
-        let base = len.take().tensor();
+        let win = window.take();
+        let base = len.take();
         kv_len.take();
-        let stop_prev = stopped.take().tensor();
+        let stop_prev = stopped.take();
         let neg1_w = broadcast(Tensor::constant(TOKEN_PAD), [w]);
 
         // Verify: row i holds the truth for window slot i + 1. A draft is
@@ -261,11 +256,7 @@ async fn main(input: Input) -> Result<String> {
     // Every verify round commits at least one token, so `max_tokens` bounds
     // the number of rounds.
     run_ahead(&pipeline, &fwd, input.max_tokens, async || {
-        let round = committed_out
-            .take()
-            .to_host::<Vec<i32>>()
-            .await
-            .context("read committed round")?;
+        let round = committed_out.take().to_host::<Vec<i32>>().await?;
         let live = unpad_tokens(&round);
         if live.is_empty() {
             return Ok(ControlFlow::Continue(()));

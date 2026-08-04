@@ -169,7 +169,7 @@ async fn main(input: String) -> Result<String> {
             .context("buffered recurrent binding")?,
     }
     fwd.epilogue(move || {
-        let length = kv_len.take().tensor();
+        let length = kv_len.take();
         let t = reduce_argmax(intrinsics::logits());
         let next_length = add(&length, 1u32);
         let page_count = div(add(&next_length, page_size - 1), page_size);
@@ -193,7 +193,7 @@ async fn main(input: String) -> Result<String> {
     } else {
         fwd_p.submit(&pipe).context("prefill")?;
     }
-    let g0 = g0_ch.take().to_host::<i32>().await.context("g0 take")?;
+    let g0 = g0_ch.take().to_host::<i32>().await?;
     let mut generated: Vec<u32> = vec![g0 as u32];
 
     // Timed region: every decode fire, and nothing else. Allocation and
@@ -205,7 +205,7 @@ async fn main(input: String) -> Result<String> {
         submitted += 1;
     }
     for _ in 0..fires {
-        let t = out.take().to_host::<i32>().await.context("out take")?;
+        let t = out.take().to_host::<i32>().await?;
         generated.push(t as u32);
         if submitted < fires {
             fwd.submit(&pipe).context("decode")?;

@@ -172,11 +172,7 @@ async fn main(input: Input) -> Result<String> {
     // streams must share a single scope.
     let pipeline = Pipeline::new();
     uncond_prefill.submit(&pipeline).context("uncond prefill")?;
-    let first_uncond_logits = u_pre_out
-        .take()
-        .to_host::<Vec<f32>>()
-        .await
-        .context("read uncond prefill logits")?;
+    let first_uncond_logits = u_pre_out.take().to_host::<Vec<f32>>().await?;
 
     // ---- conditional stream ---------------------------------------------
     let cond_ws = WorkingSet::new();
@@ -226,9 +222,9 @@ async fn main(input: Input) -> Result<String> {
 
     c_pre_uncond.put(first_uncond_logits);
     cond_prefill.submit(&pipeline).context("cond prefill")?;
-    let first = read_i32(&first_out).await? as u32;
-    let mut shifts = read_i32(&first_shift).await? as u64;
-    let mut kl_total = read_f32(&first_kl).await? as f64;
+    let first = first_out.take().to_host::<i32>().await? as u32;
+    let mut shifts = first_shift.take().to_host::<i32>().await? as u64;
+    let mut kl_total = first_kl.take().to_host::<f32>().await? as f64;
     let mut scored = 1u64;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
@@ -271,7 +267,7 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     uncond_decode.epilogue(move || {
-        let length = u_klen.take().tensor();
+        let length = u_klen.take();
         let next_length = add(&length, 1u32);
         let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
 
@@ -320,7 +316,7 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     cond_decode.epilogue(move || {
-        let length = c_klen.take().tensor();
+        let length = c_klen.take();
         let (token, shift, kl) = cad_pick(c_uncond.take(), alpha);
         let next_length = add(&length, 1u32);
         let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
@@ -345,17 +341,13 @@ async fn main(input: Input) -> Result<String> {
     for _ in 0..budget {
         u_token.put(vec![previous as i32]);
         uncond_decode.submit(&pipeline).context("uncond decode")?;
-        let uncond_logits = u_logits_out
-            .take()
-            .to_host::<Vec<f32>>()
-            .await
-            .context("read uncond logits")?;
+        let uncond_logits = u_logits_out.take().to_host::<Vec<f32>>().await?;
 
         c_uncond.put(uncond_logits);
         cond_decode.submit(&pipeline).context("cond decode")?;
-        let token = read_i32(&c_token_out).await? as u32;
-        shifts += read_i32(&c_shift_out).await? as u64;
-        kl_total += read_f32(&c_kl_out).await? as f64;
+        let token = c_token_out.take().to_host::<i32>().await? as u32;
+        shifts += c_shift_out.take().to_host::<i32>().await? as u64;
+        kl_total += c_kl_out.take().to_host::<f32>().await? as f64;
         scored += 1;
 
         if stop_tokens.contains(&token) {
@@ -391,20 +383,4 @@ fn report(
         "{text}\n\n[cad] alpha={alpha:.2} steps={scored} context_shift={:.3} mean_kl={mean_kl:.4}{identity}",
         shifts as f64 / scored.max(1) as f64
     ))
-}
-
-async fn read_i32(channel: &Channel) -> Result<i32> {
-    channel
-        .take()
-        .to_host::<i32>()
-        .await
-        .context("read i32 channel")
-}
-
-async fn read_f32(channel: &Channel) -> Result<f32> {
-    channel
-        .take()
-        .to_host::<f32>()
-        .await
-        .context("read f32 channel")
 }

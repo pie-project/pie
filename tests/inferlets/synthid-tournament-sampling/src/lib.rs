@@ -435,17 +435,9 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
-    let s0 = score_out_p
-        .take()
-        .to_host::<f32>()
-        .await
-        .context("score take")?;
-    let n0 = null_out_p
-        .take()
-        .to_host::<f32>()
-        .await
-        .context("null take")?;
+    let g0 = tok_out_p.take().to_host::<i32>().await?;
+    let s0 = score_out_p.take().to_host::<f32>().await?;
+    let n0 = null_out_p.take().to_host::<f32>().await?;
     generated.push(g0 as u32);
     scores.push(s0);
     nulls.push(n0);
@@ -500,7 +492,7 @@ async fn main(input: Input) -> Result<Output> {
         )?;
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
             let hist = hist_c.take().tensor();
             let hlen = hlen_c.take().tensor();
@@ -535,17 +527,17 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             let s = score_out
                 .take()
                 .to_host::<f32>()
                 .await
-                .with_context(|| format!("score_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             let z = null_out
                 .take()
                 .to_host::<f32>()
                 .await
-                .with_context(|| format!("null_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);
             scores.push(s);
             nulls.push(z);

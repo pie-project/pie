@@ -180,8 +180,8 @@ async fn main(input: String) -> Result<String> {
     // zero decode fires follow.
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = tok_out_p.take().to_host::<i32>().await.context("g0 take")?;
-    let s0 = s_out_p.take().to_host::<f32>().await.context("s0 take")?;
+    let g0 = tok_out_p.take().to_host::<i32>().await?;
+    let s0 = s_out_p.take().to_host::<f32>().await?;
 
     generated.push(g0 as u32);
     surprises.push(s0);
@@ -220,7 +220,7 @@ async fn main(input: String) -> Result<String> {
         )?;
         fwd.epilogue(move || {
             // Takes + compute first, PUTS last (value-id discipline).
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let mu_v = mu_ch.take().tensor(); // [1] f32, host-updated each step
             let r = rng.take(); // [2] u32 rng state
             let logits = intrinsics::logits(); // [vocab] f32
@@ -250,12 +250,12 @@ async fn main(input: String) -> Result<String> {
                 .take()
                 .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{step}"))?;
+                .with_context(|| format!("@{step}"))?;
             let s = s_out
                 .take()
                 .to_host::<f32>()
                 .await
-                .with_context(|| format!("s_out.take @{step}"))?;
+                .with_context(|| format!("@{step}"))?;
             generated.push(t as u32);
             surprises.push(s);
             mu -= lr * (s - tau);

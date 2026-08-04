@@ -187,11 +187,7 @@ async fn main(input: Input) -> Result<String> {
         // finish() lands right after its submit (F7).
         let pipe = Pipeline::new();
         fwd_p.submit(&pipe).context("prefill submit")?;
-        let g0s: Vec<i32> = g0s_ch
-            .take()
-            .to_host::<Vec<i32>>()
-            .await
-            .context("g0s take")?;
+        let g0s: Vec<i32> = g0s_ch.take().to_host::<Vec<i32>>().await?;
         // All B candidates share the prefill's token; they diverge in the decode
         // loop, where each lane draws its own Gumbel noise.
         let g0s: Vec<i32> = vec![g0s[0]; num_candidates];
@@ -260,8 +256,8 @@ async fn main(input: Input) -> Result<String> {
         )?;
         fwd.epilogue(move || {
             // TAKES + compute first, PUTS last (value-id discipline).
-            let base = fill.take().tensor(); // [1] u32 — next fire's first append cell
-            let pids = pool_ids_ch.take().tensor();
+            let base = fill.take(); // [1] u32 — next fire's first append cell
+            let pids = pool_ids_ch.take();
             let r = rng.take();
 
             // Per-lane top-p + temperature sample over [B, vocab] logits
@@ -329,7 +325,7 @@ async fn main(input: Input) -> Result<String> {
             0
         };
         run_ahead(&pipe, &fwd, budget, async || {
-            let step: Vec<i32> = out.take().to_host::<Vec<i32>>().await.context("out.take")?;
+            let step: Vec<i32> = out.take().to_host::<Vec<i32>>().await?;
             for (c, &t) in step.iter().enumerate().take(num_candidates) {
                 if done[c] {
                     continue; // lane keeps firing; its output is ignored

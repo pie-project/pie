@@ -173,6 +173,12 @@ impl Channel {
     pub fn dtype(&self) -> DType {
         self.state.borrow().dtype
     }
+
+    /// The channel's name, as set by [`named`](Self::named) — `chN` if it was
+    /// never named. Frontends use it to label host-readback errors.
+    pub fn name(&self) -> String {
+        self.state.borrow().name.clone()
+    }
     /// The [`Shape`] of one cell (a single queue slot's tensor).
     pub fn shape(&self) -> Shape {
         self.state.borrow().shape
@@ -334,6 +340,24 @@ impl AsTensor for &Taken {
     #[track_caller]
     fn to_arg(&self) -> crate::value::Arg {
         (*self).to_arg()
+    }
+}
+
+/// Feeding one channel from another (`positions.put(&length)`) is the shape of
+/// every decode loop, so a `Taken` puts directly rather than via `.tensor()`.
+impl IntoPut for &Taken {
+    #[track_caller]
+    fn into_put(self) -> PutValue {
+        match &self.inner {
+            TakenInner::InProgram(t) => PutValue::Tensor(t.clone()),
+            TakenInner::Host { chan, .. } => PutValue::Tensor(host_take_poison(chan)),
+        }
+    }
+}
+impl IntoPut for Taken {
+    #[track_caller]
+    fn into_put(self) -> PutValue {
+        (&self).into_put()
     }
 }
 

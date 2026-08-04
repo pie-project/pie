@@ -314,7 +314,7 @@ async fn main(input: Input) -> Result<Output> {
             .take()
             .to_host::<i32>()
             .await
-            .with_context(|| format!("g0 take @{base}"))?;
+            .with_context(|| format!("@{base}"))?;
     }
     generated.push(g0 as u32);
 
@@ -425,7 +425,7 @@ async fn main(input: Input) -> Result<Output> {
         //    request's last page whatever this says -- it holds the token this
         //    fire is writing -- which doubles as H2O's local window. ──
         fwd.on_attn_proj(move || {
-            let mass = page_mass.take().tensor();
+            let mass = page_mass.take();
             intrinsics::kernel::attn_page_mask(&pivot_threshold(&mass, rank_le(page_budget)));
             page_mass.put(&mass);
         });
@@ -434,15 +434,15 @@ async fn main(input: Input) -> Result<Output> {
         //    attention — which is what distinguishes `on_attn` from
         //    `on_attn_proj`: the scores do not exist until attention has run. ──
         fwd.on_attn(move || {
-            let prev = acc.take().tensor();
-            let ct = layer_ct.take().tensor();
+            let prev = acc.take();
+            let ct = layer_ct.take();
             let scores = intrinsics::attn_score(kv_max);
             acc.put(&add(&prev, &scores));
             layer_ct.put(&add(&ct, 1u32));
         });
 
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
@@ -465,8 +465,8 @@ async fn main(input: Input) -> Result<Output> {
             // its row describes the last step; H2O's describes every step so
             // far. The layer counter is carried for the same reason, which is
             // what makes `score_mass == layers_observed` stay true as both grow.
-            let folded = acc.take().tensor();
-            let layers = layer_ct.take().tensor();
+            let folded = acc.take();
+            let layers = layer_ct.take();
             if let Some(c) = scores_out.as_ref() {
                 c.put(&folded);
             }
@@ -492,19 +492,19 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .to_host::<i32>()
                 .await
-                .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+                .with_context(|| format!("@{}", generated.len()))?;
             if let (Some(sc), Some(lc)) = (scores_out.as_ref(), layers_out.as_ref()) {
                 last_scores = sc
                     .take()
                     .to_host::<Vec<f32>>()
                     .await
-                    .with_context(|| format!("h2o_scores.take @{}", generated.len()))?;
+                    .with_context(|| format!("@{}", generated.len()))?;
                 let layers_before = layers_observed;
                 layers_observed = lc
                     .take()
                     .to_host::<u32>()
                     .await
-                    .with_context(|| format!("h2o_layer_count.take @{}", generated.len()))?;
+                    .with_context(|| format!("@{}", generated.len()))?;
                 // The fire that produced this row had `n + generated.len()` KV
                 // positions live: the prompt plus every token committed before it.
                 last_kv_len = n + generated.len() as u32;

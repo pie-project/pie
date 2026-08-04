@@ -56,15 +56,6 @@ const PROMPT: &str = "The quick brown fox jumps over";
 const MAX_TOKENS: u32 = 16;
 const PAGE_T: u32 = 16;
 
-/// Decode a `[k]`/`[k+1]` i32 host vector.
-async fn get_u32(t: inferlet::ptir::Taken) -> Result<Vec<u32>> {
-    t.to_host::<Vec<u32>>().await.context("tensor take")
-}
-
-async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
-    t.to_host::<Vec<i32>>().await.context("tensor take")
-}
-
 /// Committed length of a sentinel `[k+1]` tail = the count before the first
 /// `-1` (accepted prefix + the bonus at lane `n_acc`), always ≥ 1.
 fn committed_len(tail: &[i32]) -> usize {
@@ -241,12 +232,14 @@ async fn bootstrap(
     });
 
     fwd.submit(pipeline).context("bootstrap submit")?;
-    let seed = get_i32(seed_out.take())
+    let seed = seed_out
+        .take()
+        .to_host::<Vec<i32>>()
         .await?
         .first()
         .copied()
         .ok_or_else(|| "bootstrap: empty seed".to_string())?;
-    let drafts = get_i32(drafts_out.take()).await?;
+    let drafts = drafts_out.take().to_host::<Vec<i32>>().await?;
     Ok((seed, drafts))
 }
 
@@ -545,8 +538,8 @@ async fn main(input: String) -> Result<String> {
             c.submit(&pipeline).context("device commit submit")?;
         }
 
-        let commit = get_i32(commit_out.take()).await?;
-        let drafts = get_i32(drafts_out.take()).await?;
+        let commit = commit_out.take().to_host::<Vec<i32>>().await?;
+        let drafts = drafts_out.take().to_host::<Vec<i32>>().await?;
         let clen = committed_len(&commit); // n_acc accepted + 1 bonus (≥ 1)
 
         // The device path's whole claim is that the number the DRIVER folded is
@@ -562,7 +555,7 @@ async fn main(input: String) -> Result<String> {
         // noise forks the whole trajectory. Three identical host-mode launches
         // in one engine boot produce different token streams.
         if let Some(echo) = clen_echo {
-            let seen = get_u32(echo.take()).await?;
+            let seen = echo.take().to_host::<Vec<u32>>().await?;
             match seen.first().copied() {
                 Some(v) if v as usize == clen => clen_agreements += 1,
                 other => {

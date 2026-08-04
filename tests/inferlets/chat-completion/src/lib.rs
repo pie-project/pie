@@ -155,7 +155,7 @@ async fn main(input: Input) -> Result<String> {
         fwd_p.submit(&pipe).context("prefill submit")?;
         // max_tokens == 1: the prefill spends the whole budget, so it was
         // the stream's last submit — finish() right after it (F7).
-        g0_ch.take().to_host::<i32>().await.context("g0 take")?
+        g0_ch.take().to_host::<i32>().await?
     };
 
     let chat_dec = chat::Decoder::new();
@@ -213,8 +213,8 @@ async fn main(input: Input) -> Result<String> {
     )?;
     fwd.epilogue(move || {
         // TAKES + compute first, PUTS last (value-id discipline).
-        let base = fill.take().tensor(); // [1] u32 — position this fire writes
-        let pids = pool_ids_ch.take().tensor();
+        let base = fill.take(); // [1] u32 — position this fire writes
+        let pids = pool_ids_ch.take();
         let r = rng.take();
 
         let tok = sample_token(&r, temperature, top_p, vocab); // [1] i32
@@ -266,7 +266,7 @@ async fn main(input: Input) -> Result<String> {
         max_tokens.saturating_sub(1) // g0 already emitted
     };
     run_ahead(&pipe, &fwd, budget, async || {
-        let t = out.take().to_host::<Vec<i32>>().await.context("out.take")?;
+        let t = out.take().to_host::<Vec<i32>>().await?;
         let token = *t.first().unwrap_or(&0) as u32;
         if stop.contains(&token) {
             return Ok(ControlFlow::Break(()));

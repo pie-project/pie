@@ -191,11 +191,7 @@ async fn main(input: Input) -> Result<Output> {
     heal_mask.put(first_mask);
     let pipeline = Pipeline::new();
     prefill.submit(&pipeline).context("token-healing prefill")?;
-    let first = first_out
-        .take()
-        .to_host::<i32>()
-        .await
-        .context("read healed token")? as u32;
+    let first = first_out.take().to_host::<i32>().await? as u32;
 
     let mut generated = vec![first];
 
@@ -229,7 +225,7 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         decode.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
             let next_length = add(&length, 1u32);
             let page_count = div(add(&next_length, page_size - 1), page_size);
@@ -246,11 +242,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let budget = input.max_tokens - 1;
         run_ahead(&pipeline, &decode, budget as usize, async || {
-            let token = token_out
-                .take()
-                .to_host::<i32>()
-                .await
-                .context("read token")? as u32;
+            let token = token_out.take().to_host::<i32>().await? as u32;
             generated.push(token);
             Ok(ControlFlow::Continue(()))
         })
