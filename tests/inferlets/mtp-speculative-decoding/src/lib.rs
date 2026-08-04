@@ -171,7 +171,6 @@ async fn main(input: Input) -> Result<String> {
     fwd.epilogue(move || {
         let win = window.take();
         let base = len.take();
-        kv_len.take();
         let stop_prev = stopped.take();
         let neg1_w = broadcast(TOKEN_PAD, [w]);
 
@@ -231,7 +230,6 @@ async fn main(input: Input) -> Result<String> {
         positions.put(&next_positions);
         w_slot.put(&next_positions / PAGE_T);
         w_off.put(&next_positions % PAGE_T);
-        page_indptr.take();
         page_indptr.put(&next_page_indptr);
         window.put(&next_window);
     });

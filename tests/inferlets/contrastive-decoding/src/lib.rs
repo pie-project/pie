@@ -269,15 +269,11 @@ async fn main(input: Input) -> Result<String> {
         amateur_logits_out.put(intrinsics::logits());
         amateur_position.put(&base);
         amateur_fill.put(&next);
-        amateur_klen.take();
         amateur_klen.put(&next);
         amateur_write_slot.put(gather(&ids, &base / PAGE_T));
         amateur_write_offset.put(&base % PAGE_T);
-        amateur_mask.take();
         amateur_mask.put(next_mask);
-        amateur_pages.take();
         amateur_pages.put(reshape(&ids, [pool_pages]));
-        amateur_page_indptr.take();
         let amateur_page_count = (&next + (PAGE_T - 1)) / PAGE_T;
         amateur_page_indptr.put(iota(2) * broadcast(&amateur_page_count, [2]));
         amateur_ids_input.put(&ids);
@@ -324,7 +320,6 @@ async fn main(input: Input) -> Result<String> {
         expert_position.put(&length);
         expert_write_slot.put(&length / PAGE_T);
         expert_write_offset.put(&length % PAGE_T);
-        expert_page_indptr.take();
         expert_page_indptr.put(iota(2) * broadcast(&page_count, [2]));
         expert_token_out.put(&token);
     });

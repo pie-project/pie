@@ -363,7 +363,6 @@ async fn main(input: Input) -> Result<Output> {
                 positions.put(&length);
                 w_slot.put(&length / page_size);
                 w_off.put(&length % page_size);
-                page_indptr.take();
                 page_indptr.put(iota(2) * broadcast(&page_count, [2]));
                 rng.put(&r + iota(2));
                 token_out.put(&token);

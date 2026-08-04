@@ -139,7 +139,6 @@ async fn main(input: String) -> Result<String> {
         positions.put(&length);
         w_slot.put(&length / PAGE_T);
         w_off.put(&length % PAGE_T);
-        page_indptr.take();
         page_indptr.put(iota(2) * broadcast(&page_count, [2]));
         tok_out.put(&tok);
         raw.put(&lg);

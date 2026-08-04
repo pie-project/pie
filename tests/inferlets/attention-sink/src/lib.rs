@@ -179,25 +179,16 @@ async fn main(input: Input) -> Result<String> {
         let next = &base + 1u32;
 
         // Device-resolved geometry is loop-carried: the host never drains
-        // these rings, so the graph has to take before it puts or the
-        // readiness check sees a full ring and refuses to commit the pass.
-        token_in.take();
+        // these rings, so every fire's values are re-put here.
         token_in.put(&token);
         token_out.put(&token);
-        position.take();
         position.put(&base);
         fill.put(&next);
-        klen.take();
         klen.put(&next);
-        write_slot.take();
         write_slot.put(gather(&ids, &logical_slot));
-        write_offset.take();
         write_offset.put(&base % PAGE_T);
-        mask.take();
         mask.put(&next_mask);
-        pages.take();
         pages.put(reshape(&ids, [pool_pages]));
-        page_indptr.take();
         let page_count = (&next + (PAGE_T - 1)) / PAGE_T;
         page_indptr.put(iota(2) * broadcast(&page_count, [2]));
         pool_ids_input.put(&ids);

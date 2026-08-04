@@ -179,7 +179,6 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
             positions.put(&length);
             w_slot.put(&length / page_size);
             w_off.put(&length % page_size);
-            page_indptr.take();
             page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             out.put(&t);
             rng.put(&r_next);

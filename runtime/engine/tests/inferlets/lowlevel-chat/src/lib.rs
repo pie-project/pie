@@ -225,17 +225,13 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
 
         tok_in.put(&tok); // the device carrier: next fire embeds this token
         out.put(&tok);
-        mask.take();
         mask.put(&new_mask);
         w_slot.put(&w_slot_v);
         w_off.put(&w_off_v);
-        klen.take();
         klen.put(&klen_v);
         pos.put(&base);
         fill.put(&next_free);
-        pages.take();
         pages.put(&pages_v);
-        page_indptr.take();
         page_indptr.put(&pidx_v);
     });
 

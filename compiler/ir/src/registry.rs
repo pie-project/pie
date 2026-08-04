@@ -95,7 +95,7 @@ crate::declare_tagged_enum! {
         /// The token ids to embed, one flat run per request. Taken.
         EmbedTokens = 0, "embed_tokens";
         /// Row offsets splitting `embed_tokens` into per-request runs; one
-        /// entry more than there are requests. Taken.
+        /// entry more than there are requests. Read.
         EmbedIndptr = 1, "embed_indptr";
         /// Each token's position in its sequence, driving both RoPE and the
         /// causal masks. Taken.

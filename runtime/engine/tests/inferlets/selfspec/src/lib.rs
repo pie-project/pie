@@ -132,7 +132,6 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
             positions.put(&length);
             w_slot.put(&length / PAGE_T);
             w_off.put(&length % PAGE_T);
-            page_indptr.take();
             page_indptr.put(iota(2) * broadcast(&page_count, [2]));
             out.put(&t);
         });

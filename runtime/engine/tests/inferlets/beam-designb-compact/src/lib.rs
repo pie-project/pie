@@ -158,7 +158,6 @@ async fn main(input: String) -> Result<String> {
         w_off.put(&w_off_v);
 
         let filled = &base + B;
-        klen.take();
         klen.put(broadcast(
             reshape(&Tensor::constant(vec![PAGE_T]), [1]),
             [B],
@@ -172,9 +171,7 @@ async fn main(input: String) -> Result<String> {
             broadcast(reshape(&pids, [1, POOL_PAGES]), [B, POOL_PAGES]),
             [B * POOL_PAGES],
         );
-        pages.take();
         pages.put(&pages_ig);
-        page_indptr.take();
         page_indptr.put(&Tensor::constant(
             (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
         ));

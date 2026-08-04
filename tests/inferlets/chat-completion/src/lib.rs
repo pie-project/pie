@@ -235,23 +235,15 @@ async fn main(input: Input) -> Result<String> {
         let pidx_v = iota(2) * broadcast(&page_count, [2]);
 
         // Device-resolved geometry is loop-carried: the host never drains
-        // these rings, so the graph has to take before it puts or the
-        // readiness check sees a full ring and refuses to commit the pass.
-        tok_in.take();
+        // these rings, so every fire's values are re-put here.
         tok_in.put(&tok);
         out.put(&tok);
-        w_slot.take();
         w_slot.put(&w_slot_v);
-        w_off.take();
         w_off.put(&w_off_v);
-        klen.take();
         klen.put(&klen_v);
-        pos.take();
         pos.put(&base);
         fill.put(&next_free);
-        pages.take();
         pages.put(&pages_v);
-        page_indptr.take();
         page_indptr.put(&pidx_v);
         rng.put(&r_next);
         pool_ids_ch.put(&pids);

@@ -259,7 +259,6 @@ async fn main(input: Input) -> Result<String> {
         u_pos.put(&length);
         u_slot.put(&length / PAGE_T);
         u_off.put(&length % PAGE_T);
-        u_page_indptr.take();
         u_page_indptr.put(iota(2) * broadcast(&page_count, [2]));
     });
 
@@ -309,7 +308,6 @@ async fn main(input: Input) -> Result<String> {
         c_pos.put(&length);
         c_slot.put(&length / PAGE_T);
         c_off.put(&length % PAGE_T);
-        c_page_indptr.take();
         c_page_indptr.put(iota(2) * broadcast(&page_count, [2]));
         c_token_out.put(&token);
         c_shift_out.put(&shift);

@@ -305,22 +305,17 @@ macro_rules! define_beam_search {
             let w_slot_v = gather(&pids, &logical_slot);
             let w_off_v = &wpos % PAGE_T;
             // Device-resolved geometry is loop-carried: the host never drains
-            // these rings, so the graph has to take before it puts or the
-            // readiness check sees a full ring and refuses to commit the pass.
-            w_slot.take();
+            // these rings, so every fire's values are re-put here.
             w_slot.put(&w_slot_v);
-            w_off.take();
             w_off.put(&w_off_v);
 
             // KV span after this step's appends (the mask restricts attention).
             let filled = &base + B; // [1]
-            klen.take();
             klen.put(broadcast(reshape(&filled, [1]), [B]));
 
             pos.put(pos.take() + 1u32);
             fill.put(&filled);
             scores.put(&s);
-            toks.take();
             toks.put(&tok_i);
             // Re-emit the fixed Pages port each fire: the pool ids tiled B
             // times (every beam references all POOL_PAGES pool pages; the mask does
@@ -331,11 +326,9 @@ macro_rules! define_beam_search {
                 &pids,
                 iota(B * POOL_PAGES) % broadcast(&page_count, [B * POOL_PAGES]),
             );
-            pages.take();
             pages.put(&pages_ig);
             // Re-emit the constant page_indptr each fire (channel-bound; peeked ports
             // still want a fresh value each pass). [0, POOL_PAGES, 2*POOL_PAGES].
-            page_indptr.take();
             page_indptr.put(iota(B + 1) * broadcast(&page_count, [B + 1]));
 
             out.put(&tok_i);
