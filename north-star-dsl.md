@@ -2764,3 +2764,49 @@ the kvpp heisenbug — now sentry-fenced): the repro is
 recipe above. This is ENGINE machinery (frames/tickets/run-ahead),
 not axis machinery — the fix lives upstream of the composition
 fabric.
+
+## THE CHURN FAULT, ROOT-CAUSED (2026-08-04): a fix blueprint
+
+The mechanism, fully traced through the code:
+
+1. RESERVATIONS ARE OPTIMISTIC AND UNBOUNDED. Every submitted fire
+   reserves channel ticket sequences by incrementing
+   `device_reserved_head/tail` (channel.rs:356
+   `reserve_device_ticket`) with NO bound against ring capacity or
+   actual consumption — run-ahead reserves as deep as it likes.
+2. COMMIT HAPPENS AT SUBMIT, NOT AT TERMINAL. fire.rs:1228 commits
+   the TicketReservation as soon as submission succeeds; a fire that
+   later FAILS leaves its consume-head increments in the cell forever
+   (rollback is Drop-only and LIFO-only — fire.rs:768 — and by then
+   newer fires have reserved on top).
+3. THE DRIVER GATE IS EXACT. dispatch.cu:7735 refuses a lane when the
+   device words disagree with expectations: `consume-head-moved`
+   (head != expected — a prior fire never consumed),
+   `publish-tail-moved` / `publish-ring-full` (run-ahead published
+   deeper than cap1-1 unconsumed entries).
+4. v14 DELETED RETRY. worker.rs:4621: a surviving RETRY terminal is a
+   contract violation — "frame admission bounds every in-frame gate."
+   But no admission bound was ever implemented for the channel gates:
+   v13's RETRY was the backpressure, and its deletion left the gate
+   with only one outcome: FAIL the work item.
+5. THE CASCADE. One transiently-late lane (tight stagger: its guest
+   hasn't consumed / its ring is briefly full) fails its SHARED frame
+   step; every co-framed lane gets a Failed terminal; each failed
+   fire's committed reservations poison that instance's every later
+   expectation (head=63/exp66 = three leaked fires); fresh rounds
+   re-roll the dice each time. 63-90% lane death under 9-lane 35ms
+   churn; zero deaths when the mix or timing keeps every lane ready.
+
+THE FIX (blueprint, for a fresh context): restore the backpressure at
+ADMISSION, where v14 wants it — in fire.rs before
+`TicketReservation::new`, per cell: (a) publish tickets wait until
+`device_reserved_tail - host_consumed < cap1 - 1`
+(`await_channel_progress` exists for exactly this wait); (b) consume
+tickets wait until outstanding == 0 for the cell. With admission
+serialized per cell, rollback-on-failure becomes LIFO-trivial — roll
+reservations back on Failed terminals and the leak dies. Alternative
+smaller patch: reinstate a bounded retry FOR THE READINESS CLASS
+only (the gate already names its reason). Risk note: (a) bounds
+run-ahead depth to the ring capacity per generation channel — the
+measured run-ahead speedups should be re-priced after the fix with
+cap1 sized accordingly.
