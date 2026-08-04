@@ -2499,3 +2499,44 @@ instantiation index. Rung ③ (the signature-table ABI; the window class
 becomes a PER-ROW operand and the dispatch statement a region table)
 is the next structural act, and rung ④ (Gray+gather cutover, stash
 deletion) closes the ladder.
+
+## RUNG ③ SPEC (2026-08-04): the region table
+
+Today's axis ABI is four appended scalars at PieStepDesc's tail
+(pie_driver_abi.h:1445-1468): planned_hook_free_prefix_rows,
+planned_unmasked_prefix_rows, planned_max_layers,
+planned_full_depth_rows — one word per axis, the accretion V2 ends.
+
+THE TABLE. Three parallel slices, appended to PieStepDesc:
+  region_row_indptr : u32, len = R+1 — ascending wire-row offsets;
+                      region r spans rows [indptr[r], indptr[r+1])
+  region_sig        : u32 bitset per region — bit0 multi_token,
+                      bit1 hook, bit2 mask, bit3 truncated
+                      (= fire_plan's axis vocabulary, one word)
+  region_k          : u32 per region — the depth operand (layer count;
+                      PIE_MAX_LAYERS_FULL = full model). PER-REGION k
+                      is the first new capability: the uniform-k
+                      grouping rule becomes a per-region fact, so
+                      non-uniform truncated fires stop being refused.
+Empty table (len 0) = no plan sent (every legacy sentinel at once).
+The scheduler builds it in planned splits from the SAME MemberFacts
+seriation already orders by — the table IS the seriation's output,
+stated once instead of projected four times.
+
+DERIVATIONS (the four words become views):
+  hook_free_prefix = first row of the first region with bit1
+  unmasked_prefix  = first row of the first region with bit2
+  full_depth_rows  = first row of the first region with bit3
+  max_layers       = the k shared by bit3 regions (uniform fires)
+
+MIGRATION (the cross-check precedent, three steps):
+  ③a engine sends table AND words; driver derives the words from the
+     table and REFUSES the launch on drift (exactly the
+     planned_hook_free cross-check discipline). No behavior change.
+  ③b driver consumers (prepare, the three walkers, dispatch) read
+     derivations; the scalar words stop being read.
+  ③c the words die from the struct (one ABI era bump), and per-region
+     k arms the non-uniform depth fire behind a census increment.
+Window class (multi_token, bit0) rides the table from ③a but its
+consumer — the dispatch statement as a region table — is rung ③'s
+second act, after the words die.
