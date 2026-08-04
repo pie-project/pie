@@ -2246,3 +2246,14 @@ patch missed), so those lanes errored on the geometry gate exactly
 as designed. (Lora itself is proven at 7B separately — D=32 17.87x.)
 A clean full-census at 7B needs only the geometry args threaded into
 the census's lora lane — recorded, not urgent.
+
+## THE FABRIC AT 7B, COMPLETE (2026-08-04): 15/15 AT SCALE
+
+The calibrated census (geometry now a census argument): Mistral-7B,
+all fifteen axis subsets PRODUCT — including hook+mask+lora+depth
+(18 four-axis fires on the 7B force_prefill deployment), zero
+incidents. The composition property holds at 0.6B and at 7B, on a
+decode-kernel deployment and on a force_prefill one, at D=64
+adapter scale, under a real mask policy, and byte-neutrally against
+every pre-campaign oracle. The north star's claims, as directed,
+are now measurements.
