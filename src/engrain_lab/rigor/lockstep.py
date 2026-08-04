@@ -59,6 +59,14 @@ def main() -> int:
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
+        "--forward",
+        action="store_true",
+        help="also time an unconstrained decode step at each batch, and report "
+        "what share of it each engine's mask is. A ratio between two grammar "
+        "engines is not a system result: if theirs is 5% of the step, making "
+        "it 3x cheaper saves 3%.",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -129,11 +137,20 @@ def main() -> int:
         f"enough to time"
     )
 
+    forward: dict[int, float] = {}
+    if arguments.forward:
+        from engrain_lab.rigor.latency import forward_pass_cost
+
+        forward = forward_pass_cost(arguments.model, arguments.batches, 20)
+        if not forward:
+            print("no model weights, so no denominator")
+
     report = []
     spreads = arguments.distinct or [len(pairs)]
     print(
         f"\n{'batch':>6} {'distinct':>9} {'engrain':>12} {'xg serial':>12} "
         f"{'xg threaded':>14} {'ratio':>7}"
+        + (f" {'our share':>8} {'their share':>9}" if arguments.forward else "")
     )
     for batch, distinct in ((b, d) for b in arguments.batches for d in spreads):
         spread = max(1, min(distinct, len(pairs), batch))
@@ -210,9 +227,16 @@ def main() -> int:
             us = statistics.median(ourtimes)
             them = statistics.median(theirtimes)
             threaded = statistics.median(theirthreaded)
+            step = forward.get(batch)
+            shares = ""
+            if step:
+                shares = (
+                    f" {us / (step + us) * 100:>7.1f}%"
+                    f" {threaded / (step + threaded) * 100:>8.1f}%"
+                )
             print(
                 f"{batch:>6} {spread:>9} {us:>11.1f}u {them:>11.1f}u "
-                f"{threaded:>13.1f}u {us / threaded:>7.2f}"
+                f"{threaded:>13.1f}u {us / threaded:>7.2f}{shares}"
             )
             report.append(
                 {
@@ -221,6 +245,7 @@ def main() -> int:
                     "engrain_us": us,
                     "xgrammar_serial_us": them,
                     "xgrammar_threaded_us": threaded,
+                    "forward_us": forward.get(batch),
                 }
             )
         finally:
