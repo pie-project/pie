@@ -2359,3 +2359,13 @@ the prefix re-plan landed. Downgraded from "probabilistic fault" to
 its ops note (settle 15s on big models). The remaining niceties —
 the middle's third stream, true group splitting — are recorded
 optimizations with no correctness weight.
+
+## THE FINAL SEAL (2026-08-04)
+
+The complete tip (DepthRole vocabulary, the 3-way no-demotion on all
+three walkers, the third stream, Gray staged, every review item) at
+release, no-env, one boot: canonical 3/3, the solo oracle BYTE-EQUAL
+to the pre-campaign reference, S-B identity, and — for the first time
+at release — the census at 15/15 PRODUCT (the 15s settle removed the
+earlier phasing artifact). Zero incidents. Everything this session
+built is default, total, numerics-neutral, and instrumented.
