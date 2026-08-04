@@ -23,9 +23,10 @@
 //! converting a checkpoint far larger than memory is fine; only the decoded set
 //! is ever resident, and only GGUF checkpoints decode today.
 //!
-//! Family-aware steps — offline quantization to the configured scheme — slot
-//! in behind the same command through the driver's device-free
-//! `author_contract` entry (`pie_worker::contract_author`).
+//! The family-aware step landed as its own command: `pie model optimize`
+//! authors the serve contract through `pie_model::contract` — no FFI, no
+//! driver — and materializes it offline. This command stays the
+//! family-blind half of the pair.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};

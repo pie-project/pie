@@ -116,9 +116,6 @@ pie-model-config = { path = "../runtime/model-config" }
 pie-client = { path = "../client/rust" }
 
 [dev-dependencies]
-# The author differential (tests/author_differential.rs) authors on the
-# Rust side too.
-pie-model = { path = "../model", features = ["contract"] }
 tempfile = "3"
 pie-ir = { path = "../compiler/ir" }
 

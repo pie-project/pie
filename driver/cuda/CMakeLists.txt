@@ -414,7 +414,6 @@ set(PIE_CUDA_MODEL_SOURCES
   src/kernels/softcap.cu
   src/model/attn_page_mask.cu
   src/model/attn_score.cu
-  src/model/author_abi.cpp
   src/model/config.cpp
   src/model/descriptor.cpp
   src/model/csm/csm.cpp

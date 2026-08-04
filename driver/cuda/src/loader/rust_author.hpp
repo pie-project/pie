@@ -1,21 +1,18 @@
 #pragma once
 
-// The Rust-author boot path, behind PIE_CUDA_RUST_AUTHOR.
+// The boot's author path: facts and policy in, plan out.
 //
-// `plan/model-in-rust.md` §6: the driver sends facts and policy — a handful
-// of scalars — and authoring happens on the loader's side, in
-// `pie_model::contract`. The C++ authors in `model/*/**_contract.hpp` stay
-// beside this as the differential oracle until the two are proven
-// byte-equal per family; this toggle is what runs the comparison on real
-// hardware, and deleting the oracle is the harvest that follows it, not a
-// step of it.
+// `plan/model-in-rust.md` §6: the driver sends what only it can know — the
+// facts it parsed and the policy it decided, a handful of scalars — and
+// authoring happens on the loader's side, in `pie_model::contract`. The
+// C++ authors this replaced were proven byte-equal by the §8-3
+// differential (17 synthetic cases, ten real checkpoints, a dual boot on
+// real hardware) and then harvested; `model/facts.hpp` is what remains of
+// their vocabulary.
 //
-// Compiles on any machine with the CUDA toolchain (the workspace build
-// does); what waits for real hardware is only the differential itself.
-//
-// What the request does NOT carry mirrors what the C++ authors never read:
-// tied-embeddings and the MLX quantization facts are Metal vocabulary and
-// keep their defaults here.
+// What the request does NOT carry mirrors what the CUDA authors never
+// read: tied-embeddings and the MLX quantization facts are Metal
+// vocabulary and keep their defaults here.
 
 #include <cstdint>
 #include <cstdlib>
@@ -30,22 +27,13 @@
 #include "loader/load_plan.hpp"
 #include "loader/load_plan_bridge.hpp"
 #include "loader/loader_config.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 
 namespace pie_cuda_driver {
 
 using pie_loader::PieLoaderFamilyKnobs;
 using pie_loader::PieLoaderModelFactsView;
 using pie_loader::PieLoaderModelRequest;
-
-/// Whether the boot authors through the Rust side.
-///
-/// Off by default until the per-family differentials have run: the toggle
-/// exists so one boot can be flipped between the two authors and the plans
-/// diffed on the same machine.
-inline bool rust_author_enabled() {
-    return loader_config::env_truthy("PIE_CUDA_RUST_AUTHOR");
-}
 
 /// The per-family switches, read from the same environment the C++ authors
 /// read them from, with the same defaults. Reading them HERE and sending

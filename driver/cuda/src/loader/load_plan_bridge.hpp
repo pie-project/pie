@@ -68,49 +68,9 @@ inline std::vector<RustQuantAttachment> resolve_quant_attachments(
     return out;
 }
 
-/// Compile the plan for this device and derive everything the load path needs
-/// from it.
-///
-/// The checks this used to run after the fact — that the plan is for CUDA, that
-/// its compiler version matches, that its tile-map transforms are ones we
-/// implement — are gone. They re-derived facts the driver itself now states in
-/// the request, and the loader refuses a target it cannot satisfy
-/// (`loader/architecture.md` §9).
-/// Compile the plan for this device from a contract this driver authored.
-///
-/// Three inputs and no fourth. `checkpoint` is what the files contain,
-/// `contract` is what this driver will bind, `target` is what the GPU can do —
-/// and the driver states all three, which is what makes the loader a compiler
-/// rather than a registry of the models someone taught it (§12 row 12).
-///
-/// `checkpoint` is opened once and handed to the compile, so the tensor table
-/// the contract was written against and the one the plan is built from are
-/// provably the same parse; the previous arrangement passed a directory and
-/// read it twice.
-inline LoadPlanResult prepare_load_plan(
-    const pie_loader::Checkpoint& checkpoint,
-    const pie_loader::ModelContract& contract,
-    const pie_loader::DeviceTarget& target) {
-    const pie_loader::PieLoaderContractRequest request =
-        pie_loader::build_contract_request(checkpoint, target, contract.view());
-    LoadPlan plan = LoadPlan::compile(request);
-
-    // Re-check the plan the loader just produced against the request it came
-    // from. Compiling and verifying share no code, so this is a second opinion
-    // rather than a restatement: it walks the plan's internal invariants,
-    // stats each declared checkpoint file to catch one that changed between
-    // compile and load, and compares the plan against the contract — which is
-    // the only one of these the loader could not have made on its own, because
-    // the contract is the one input it did not author.
-    plan.verify(request);
-
-    const auto view = plan.view();
-    return {
-        .plan = std::move(plan),
-        .quant_attachments = resolve_quant_attachments(view),
-        .planned_tensor_count = view.tensors.len,
-        .cache_key = pie_loader::bytes_to_string(view.cache_key),
-    };
-}
+// `prepare_load_plan` — the contract-request compile — was harvested with
+// the C++ authors it served (`plan/model-in-rust.md` §8-5). The boot
+// compiles through `loader/rust_author.hpp`; what this header still owns is
+// the plan-side translation below.
 
 }  // namespace pie_cuda_driver

@@ -222,14 +222,13 @@ LoadedModel LoadedModel::load(
         throw std::runtime_error("engine: failed to read checkpoint: " + open_error);
     }
 
-    // What this driver will bind, stated before anything is loaded. The row is
-    // the same one `Context` will later call `bind` on, so the contract and the
-    // binder cannot be about different models; the loader type-checks the
-    // contract against what the files contain and lowers it, but does not
-    // decide *what* to build, which is why a family it has never heard of loads
-    // exactly as well as one it has (§12 row 12).
+    // The row is the same one `Context` will later call `bind` on; whether
+    // the model is supported is answered here, before anything is loaded.
+    // What to *build* is authored on the loader's side from the request
+    // below, which is why a family this driver has never heard of fails
+    // here by name rather than deep in a load.
     const model::ArchEntry* arch = model::find_arch_entry(e.hf_.model_type);
-    if (arch == nullptr || !arch->author_contract) {
+    if (arch == nullptr) {
         throw std::runtime_error("engine: unsupported model_type '" + e.hf_.model_type +
                                  "'; no row in the arch table declares what it binds");
     }
@@ -241,40 +240,23 @@ LoadedModel LoadedModel::load(
         .head_dim = static_cast<std::uint32_t>(std::max(0, e.hf_.head_dim)),
         .mamba_groups = static_cast<std::uint32_t>(std::max(0, e.hf_.mamba_n_groups)),
     };
-    // Two authors, one toggle. PIE_CUDA_RUST_AUTHOR routes the boot through
-    // pie_loader_compile_model — facts and policy in, plan out, the contract
-    // never crossing the ABI — while the C++ author below stays the default
-    // and the differential oracle until the per-family diffs have run on
-    // this hardware (`plan/model-in-rust.md` §8). Same request, same target;
-    // the plans should be byte-equal, and the cache key says whether they
-    // are.
+    // One author, on the far side of the request boundary: facts and policy
+    // in, plan out, the contract never crossing the ABI
+    // (`plan/model-in-rust.md` §2). The C++ author this replaced was proven
+    // byte-equal by the §8-3 differential — 17 synthetic cases, ten real
+    // checkpoints, and a dual boot on this hardware — before it was
+    // deleted.
     model::Mxfp4MoePolicy mxfp4_moe_policy = model::Mxfp4MoePolicy::RoutedDecode;
-    LoadPlanResult planned_load = [&]() -> LoadPlanResult {
-        if (rust_author_enabled()) {
-            return prepare_load_plan_rust_author(
-                checkpoint, facts, device_target,
-                model::resolve_runtime_quant(runtime_quant, fp8_native),
-                mxfp4_moe, component, boot_cfg.model.stream_routed_experts,
-                &mxfp4_moe_policy);
-        }
-        pie_loader::ModelContract contract;
-        model::ContractBuilder builder(
-            checkpoint, facts, device_target,
-            model::resolve_runtime_quant(runtime_quant, fp8_native),
-            mxfp4_moe, component, boot_cfg.model.stream_routed_experts,
-            contract);
-        arch->author_contract(builder);
-        builder.finish();
-        mxfp4_moe_policy = builder.mxfp4_moe();
-        return prepare_load_plan(checkpoint, contract, device_target);
-    }();
+    LoadPlanResult planned_load = prepare_load_plan_rust_author(
+        checkpoint, facts, device_target,
+        model::resolve_runtime_quant(runtime_quant, fp8_native),
+        mxfp4_moe, component, boot_cfg.model.stream_routed_experts,
+        &mxfp4_moe_policy);
 
-    // The policy is the *author's* answer, not the plan's -- and it is read
-    // back off the author rather than recomputed, so there is one answer
-    // rather than two that have to be kept agreeing. An expert weight is MXFP4
-    // in the plan because a contract node says so, and this is the decision
-    // that node was written from. The Rust author hands the same answer back
-    // through the entry's out-parameter.
+    // The policy is the *author's* answer, not the plan's — a family may
+    // override the device rule — and it comes back through the entry's
+    // out-parameter, so there is one answer rather than two that have to be
+    // kept agreeing.
     e.mxfp4_moe_policy_ = mxfp4_moe_policy;
     log_stage("compile LoadPlan done");
 
