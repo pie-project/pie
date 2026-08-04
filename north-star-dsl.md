@@ -2140,3 +2140,33 @@ share as predicted. VERDICT: the waste is real but SMALL at these
 shapes (5-7% of the fire); windowed range-2 stays a recorded
 optimization, justified only when truncated-row shares grow large
 (many drafts per fire) — not before the bigger rocks.
+
+## THE VERIFY-CLASS ROCK, REASSESSED (2026-08-04)
+
+An honest reassessment before committing a campaign to it. The
+"spec-verify as its own Div::STRUCTURAL class" rock assumed the SCS
+union needed a first customer. The evidence now on the table:
+
+1. The IR already holds service classes for spec-decode repair
+   (FireClass::CommitAdvance / StateOnly / FrozenVerify — the qwen3_5
+   MTP vocabulary): "a genuinely different pass, so a genuinely
+   different trace." The precedent exists and chose SEPARATE TRACES,
+   not an SCS union.
+2. Verification WORK already rides the fabric: verify fires are
+   prefill-class multi-token fires, and they CO-FIRE with decode
+   lanes through the mixed machinery (measured, arc 85). Nothing
+   about verify wants to share one op list with decode — the two
+   phases are sequential by nature (draft, then verify), so they
+   never contend for one fire's rows.
+3. The depth union already demonstrated "different op sets, one
+   fire" for the case where rows genuinely diverge mid-pass.
+
+VERDICT: the SCS-union-with-conditional-regions machinery (the kept
+SupergraphBuilder) currently has NO demonstrated customer. The rock
+is re-scoped from "build the verify class" to "wait for a workload
+whose phases genuinely overlap in one fire" — e.g. simultaneous
+draft+verify pipelining within a single fire, which no present
+inferlet does. The scoreboard's remaining rocks are therefore:
+R=32-scale WEIGHT (hardware-bound) and micro-items. The north star's
+STRUCTURAL claim is served by the depth union; the builder stays in
+reserve, honestly labeled.
