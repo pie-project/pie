@@ -100,34 +100,31 @@ struct TpFireCommit {
 // that same communicator. That deadlocked the pair (the follower's decode
 // attention kernel never retired).
 //
-// Debug lever, disabled by default. Before posting fire N's collectives, wait
-// for fire N-D to have retired; D=0 means no bound. This existed to work around
-// a TP hang at k > 1 that turned out to be the follower skipping
-// the attention plan-staging protocol — fixed there instead. Retained because
-// forcing D=1 collapses a whole class of cross-rank overlap bug into a clean
-// yes/no answer, which is how that one was isolated.
-int tp_fire_runahead_depth() {
-    static const int depth = [] {
-        if (const char* v = std::getenv("PIE_TP_RUNAHEAD_DEPTH")) {
-            const int parsed = std::atoi(v);
-            if (parsed >= 0 && parsed <= 8) return parsed;
-        }
-        // Depth 1 (one TP fire in flight on the device).
-        //
-        // The follower's missing attention plan-staging slot was ONE cause of
-        // the k>1 TP deadlock and is fixed at its source, but it was not the
-        // only one: with bind-time projection packing enabled the hang comes
-        // back at k=1 and k=2 (and not at k=4), which is the signature of a
-        // second overlap hazard that packing's different timing exposes. Until
-        // that one is found too, keep the bound.
-        //
-        // Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4),
-        // small because rank 0 is the rank with slack — the follower is
-        // reactive and already waits inside the payload broadcast.
-        return 1;
-    }();
-    return depth;
-}
+// ONE TP fire in flight on the device: before posting fire N's collectives,
+// wait for fire N-1 to have retired.
+//
+// This is NOT a debug lever, whatever its history says. It is a live
+// workaround for a deadlock nobody has found yet. The follower's missing
+// attention plan-staging slot was ONE cause of the k>1 TP hang and is fixed at
+// its source, but it was not the only one: with bind-time projection packing
+// enabled the hang comes back at k=1 and k=2 — and not at k=4 — which is the
+// signature of a second overlap hazard that packing's different timing
+// exposes. Until that one is found too, the bound stays.
+//
+// Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4), small
+// because rank 0 is the rank with slack: the follower is reactive and already
+// waits inside the payload broadcast.
+//
+// A constant rather than `PIE_TP_RUNAHEAD_DEPTH`, because 0 meant "no bound"
+// and no bound is the hang. A value that hangs the engine must not be a
+// supported input — the same rule that retired `PIE_FRAME_REBIND_ESCAPE`,
+// whose mode 0 was the pre-fix behaviour that wedged. Raising it when the
+// second hazard is found is a code change, and should be: it needs the
+// measurement that justifies it.
+//
+// The ring below is left generic (`kMaxDepth` slots) so that change is a
+// one-line edit here rather than a rewrite.
+constexpr int tp_fire_runahead_depth() { return 1; }
 
 // Two halves: WAIT before this fire's collectives are posted, RECORD after its
 // forward has been enqueued. Waiting on the event `depth` fires back means rank
