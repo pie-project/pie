@@ -39,11 +39,11 @@ use pie_bin::{run_standalone};
 use pie_client::client::Client;
 
 /// The one standalone TOML (`[controller]`/`[gateway]`/`[worker]` sections); `derive_standalone`
-/// splits + hands each section to its role lib's `Config::parse`. the config's loopback default pins the client edge
-/// to loopback but keeps the *configured port* (so `pie local` has a predictable address), so the test
-/// must itself request an ephemeral one — `[gateway] listen = 127.0.0.1:0` — else both checks collide on
-/// the `0.0.0.0:8080` default ("Address already in use"). `worker_listen` is already forced ephemeral by
-/// compose. The worker runs the always-linked **dummy** driver against a local snapshot (no GPU, no
+/// splits + hands each section to its role lib's `Config::parse`. The client edge binds
+/// `[worker.server] host:port`, so the test asks for an ephemeral port there — `port = 0` — else two
+/// concurrent tests collide on 8080. It used to ask via `[gateway] listen`, which is what actually
+/// bound before `[server] host` was wired to it; that there were two spellings is why one of them was
+/// silently winning. `worker_listen` is already forced ephemeral by compose. The worker runs the always-linked **dummy** driver against a local snapshot (no GPU, no
 /// download — R3); auth off. The dummy driver's `[..options]` are explicit (`vocab_size = 128`
 /// constrains synthetic samples to valid single-byte UTF-8 IDs from the 128-token fixture;
 /// `arch_name` is kept explicit while the fixture `config.json` supplies the
@@ -52,10 +52,10 @@ fn standalone_toml(snapshot: &str) -> String {
     format!(
         "[controller]\n\
          \n\
-         [gateway]\n\
-         listen = \"127.0.0.1:0\"\n\
-         \n\
          [worker]\n\
+         \n\
+         [worker.server]\n\
+         port = 0\n\
          \n\
          [worker.model]\n\
          name = \"smoke\"\n\

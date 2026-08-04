@@ -92,7 +92,9 @@ fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
     // Writing a config file does not install anything. This used to fetch the
     // Python-WASM runtime here, and told you to rerun `pie config init
     // --force` if it failed -- overwriting your config to retry a download.
-    println!("  Python inferlets also need `pie runtime install`.");
+    // No mention of a separate install step: `pie serve` provisions the
+    // Python-WASM runtime on the way up, and `pie doctor` says whether it is
+    // there.
     Ok(())
 }
 

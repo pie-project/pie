@@ -38,12 +38,6 @@ enum Command {
         cmd: ops::model::ModelCmd,
     },
 
-    /// Manage the embedded Python-WASM runtime (install / status).
-    Runtime {
-        #[command(subcommand)]
-        cmd: RuntimeCmd,
-    },
-
     /// What pie has written under `$PIE_HOME` (list / clear).
     Cache {
         #[command(subcommand)]
@@ -68,16 +62,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-}
-
-/// `pie runtime` — provision the embedded Python-WASM runtime. The download IO
-/// lives here (R3), never in the worker daemon.
-#[derive(Subcommand, Debug)]
-enum RuntimeCmd {
-    /// Download + install the runtime into the local cache (idempotent).
-    Install,
-    /// Report whether the runtime is installed and where.
-    Status,
 }
 
 /// Die quietly when a reader goes away, the way every other CLI does.
@@ -145,26 +129,6 @@ async fn run() -> anyhow::Result<ExitCode> {
             // `model::run` is synchronous + blocking (HF download); keep it off
             // the async reactor.
             tokio::task::spawn_blocking(move || ops::model::run(cmd)).await??;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Runtime { cmd } => {
-            startup::init_cli(&cli.global)?;
-            match cmd {
-                RuntimeCmd::Install => {
-                    let dir =
-                        tokio::task::spawn_blocking(|| ops::py_runtime::ensure_installed(false))
-                            .await??;
-                    println!("runtime installed at {}", dir.display());
-                }
-                RuntimeCmd::Status => {
-                    let dir = ops::py_runtime::runtime_dir();
-                    if ops::py_runtime::is_installed() {
-                        println!("runtime installed at {}", dir.display());
-                    } else {
-                        println!("runtime not installed (expected at {})", dir.display());
-                    }
-                }
-            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor { json } => {

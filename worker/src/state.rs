@@ -81,8 +81,8 @@ pub fn entries() -> Vec<Entry> {
         Entry {
             name: "py-runtime",
             path: home.join("py-runtime"),
-            what: "The embedded Python-WASM runtime. Reinstallable with \
-                   `pie runtime install`.",
+            what: "The embedded Python-WASM runtime. Re-provisioned by the \
+                   next `pie serve`.",
             reclaim: Reclaim::Safe,
         },
         Entry {

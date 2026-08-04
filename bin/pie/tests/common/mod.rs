@@ -102,10 +102,10 @@ pub fn cuda_standalone_toml_capped(
     format!(
         "[controller]\n\
          \n\
-         [gateway]\n\
-         listen = \"127.0.0.1:0\"\n\
-         \n\
          [worker]\n\
+         \n\
+         [worker.server]\n\
+         port = 0\n\
          \n\
          [worker.model]\n\
          name = \"qwen3\"\n\
@@ -222,10 +222,10 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
     format!(
         "[controller]\n\
          \n\
-         [gateway]\n\
-         listen = \"127.0.0.1:0\"\n\
-         \n\
          [worker]\n\
+         \n\
+         [worker.server]\n\
+         port = 0\n\
          \n\
          [worker.model]\n\
          name = \"default\"\n\
@@ -274,10 +274,10 @@ pub fn dummy_standalone_toml(hf_repo: &str) -> String {
     format!(
         "[controller]\n\
          \n\
-         [gateway]\n\
-         listen = \"127.0.0.1:0\"\n\
-         \n\
          [worker]\n\
+         \n\
+         [worker.server]\n\
+         port = 0\n\
          \n\
          [worker.model]\n\
          name = \"qwen3\"\n\

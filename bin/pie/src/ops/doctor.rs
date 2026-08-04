@@ -37,7 +37,7 @@ pub fn doctor(global: &startup::GlobalArgs, json: bool) -> Result<bool> {
     // thing a readiness probe reads.
     let mut sections: Vec<(&'static str, Vec<(String, String, Status)>)> = Vec::new();
 
-    sections.push(("system", vec![check_platform()]));
+    sections.push(("system", vec![check_platform(), check_py_runtime()]));
     sections.push(("gpus", check_gpus()));
     sections.push((
         "drivers",
@@ -250,6 +250,32 @@ fn check_platform() -> (String, String, Status) {
         std::env::consts::ARCH,
     );
     ("Platform".to_string(), info, Status::Pass)
+}
+
+/// Whether Python inferlets can run.
+///
+/// A warning rather than a failure, and it used to be `pie runtime status` --
+/// a top-level command for a question, next to `pie runtime install` for
+/// something `serve` already does on the way up. Both are gone: the answer
+/// belongs with the other "will this work here" answers, and the fix happens
+/// by itself.
+fn check_py_runtime() -> (String, String, Status) {
+    let dir = crate::ops::py_runtime::runtime_dir();
+    if crate::ops::py_runtime::is_installed() {
+        (
+            "python".to_string(),
+            format!("runtime at {}", crate::ui::short_path(&dir)),
+            Status::Pass,
+        )
+    } else {
+        (
+            "python".to_string(),
+            "runtime not installed — `pie serve` fetches it on the way up \
+             (Rust inferlets do not need it)"
+                .to_string(),
+            Status::Warn,
+        )
+    }
 }
 
 fn check_gpus() -> Vec<(String, String, Status)> {
