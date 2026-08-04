@@ -51,6 +51,10 @@ pie-tokenizer = { path = "../../runtime/tokenizer" }
 # writes the result as the `pie.model/1` descriptor, so the runtime and the
 # driver stop re-deriving it from HF quirks at every boot.
 pie-model-config = { path = "../../runtime/model-config" }
+# Client edge for `pie config optimize`: the sweep generates load through
+# the same websocket path a deployment is reached by, because measuring an
+# in-process shortcut would measure something nobody runs.
+pie-client = { path = "../../client/rust" }
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.

@@ -82,9 +82,14 @@ mod common;
 
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use pie_bin::sweep::fleet::{self, FleetRun};
+
+/// The inferlet every lane runs. Named here rather than inside the fleet
+/// helper because the sweep and this test drive different programs through
+/// the same load generator.
+const GENERATE: &str = "generate@0.1.0";
 use pie_client::client::Client;
 
 /// A fleet large enough that its combined KV demand exceeds the shrunk pool
@@ -123,34 +128,6 @@ fn prompt(k: usize) -> String {
     )
 }
 
-fn parse_tokens(json: &str) -> Option<Vec<i64>> {
-    let lb = json.rfind('[')?;
-    let rb = json[lb..].find(']')? + lb;
-    let toks: Vec<i64> = json[lb + 1..rb]
-        .split(',')
-        .filter_map(|s| s.trim().parse::<i64>().ok())
-        .collect();
-    if toks.is_empty() { None } else { Some(toks) }
-}
-
-/// Run one pipeline to completion. Returns `Ok(Some(tokens))` on success, or
-/// `Ok(None)` if the process returned no tokens (e.g. surfaced an error — a
-/// `WorkingSetError` would land here, which assertion 1 forbids).
-async fn run_one(addr: &str, input: &str) -> Result<Option<Vec<i64>>> {
-    let c = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "test-user").await?;
-    c.authenticate("test-user", &None).await?;
-    let mut proc = c
-        .launch_process("generate@0.1.0".into(), input.to_string(), true)
-        .await?;
-    Ok(parse_tokens(&proc.wait_for_return().await?))
-}
-
-struct FleetRun {
-    outputs: Vec<Option<Vec<i64>>>,
-    lane_latencies: Vec<Duration>,
-    elapsed: Duration,
-}
-
 const BUBBLE_HIST_UPPER_US: [u64; 16] = [
     1,
     2,
@@ -169,44 +146,6 @@ const BUBBLE_HIST_UPPER_US: [u64; 16] = [
     32_000,
     u64::MAX,
 ];
-
-async fn run_fleet_concurrent(addr: &str, inputs: &[String]) -> FleetRun {
-    let fleet_started = Instant::now();
-    let mut procs = Vec::new();
-    for input in inputs {
-        let addr = addr.to_string();
-        let input = input.clone();
-        procs.push(tokio::spawn(async move {
-            let started = Instant::now();
-            (
-                run_one(&addr, &input).await.ok().flatten(),
-                started.elapsed(),
-            )
-        }));
-    }
-    let mut outputs = Vec::new();
-    let mut lane_latencies = Vec::new();
-    for h in procs {
-        let (output, latency) = h.await.unwrap_or((None, Duration::ZERO));
-        outputs.push(output);
-        lane_latencies.push(latency);
-    }
-    FleetRun {
-        outputs,
-        lane_latencies,
-        elapsed: fleet_started.elapsed(),
-    }
-}
-
-fn percentile_us(samples: &[Duration], percentile: usize) -> u128 {
-    if samples.is_empty() {
-        return 0;
-    }
-    let mut samples: Vec<_> = samples.iter().map(Duration::as_micros).collect();
-    samples.sort_unstable();
-    let index = ((samples.len() - 1) * percentile).div_ceil(100);
-    samples[index]
-}
 
 fn bubble_percentile(histogram: &[u64], percentile: u64) -> u64 {
     let total: u64 = histogram.iter().sum();
@@ -254,9 +193,9 @@ fn write_profile_record(
         "elapsed_us": run.elapsed.as_micros(),
         "total_tokens": total_tokens,
         "throughput_tok_s": total_tokens as f64 / run.elapsed.as_secs_f64().max(1e-9),
-        "lane_p50_us": percentile_us(&run.lane_latencies, 50),
-        "lane_p95_us": percentile_us(&run.lane_latencies, 95),
-        "lane_p99_us": percentile_us(&run.lane_latencies, 99),
+        "lane_p50_us": run.lane_percentile_us(50),
+        "lane_p95_us": run.lane_percentile_us(95),
+        "lane_p99_us": run.lane_percentile_us(99),
         "batch_avg": batch_avg,
         "bubble_p50_us": bubble_p50_us,
         "bubble_p99_us": bubble_p99_us,
@@ -367,7 +306,11 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // the deterministic greedy ground truth for that prompt.
     let mut reference = Vec::new();
     for (k, input) in inputs.iter().enumerate() {
-        let r = run_one(&addr, input).await.ok().flatten();
+        let r = fleet::run(&addr, GENERATE, std::slice::from_ref(input))
+            .await
+            .outputs
+            .pop()
+            .flatten();
         anyhow::ensure!(
             r.is_some(),
             "solo lane {k} produced no tokens — the pool is too small even for ONE lane; \
@@ -417,7 +360,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     } else {
         None
     };
-    let fleet_run = run_fleet_concurrent(&addr, &inputs).await;
+    let fleet_run = fleet::run(&addr, GENERATE, &inputs).await;
     let concurrent = &fleet_run.outputs;
     ctrace_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(t) = ctrace_task {
@@ -452,9 +395,9 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         fleet_run.elapsed.as_secs_f64(),
         total_output_tokens,
         total_output_tokens as f64 / fleet_run.elapsed.as_secs_f64().max(1e-9),
-        percentile_us(&fleet_run.lane_latencies, 50) as f64 / 1_000.0,
-        percentile_us(&fleet_run.lane_latencies, 95) as f64 / 1_000.0,
-        percentile_us(&fleet_run.lane_latencies, 99) as f64 / 1_000.0,
+        fleet_run.lane_percentile_us(50) as f64 / 1_000.0,
+        fleet_run.lane_percentile_us(95) as f64 / 1_000.0,
+        fleet_run.lane_percentile_us(99) as f64 / 1_000.0,
         batch_avg,
         bubble_p50_us,
         bubble_p99_us,
