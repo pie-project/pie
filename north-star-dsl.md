@@ -2233,3 +2233,16 @@ The README's 46x is now INSIDE the measured curve's natural
 continuation (a bigger model or longer sequences at D=64+), no
 longer an extrapolation of faith. The WEIGHT-class story is closed
 to the limit of what one L40S can state.
+
+## THE FABRIC AT 7B (2026-08-04) — partial census, honest read
+
+A census run on Mistral-7B (the fire-trace instrument carried over
+unchanged): the WINDOW-axis triple hook+mask+depth fires as a full
+PRODUCT (21 fires) on the 7B force_prefill deployment, zero
+incidents — the composition fabric is not a small-model artifact.
+The lora-bearing cells of this run are VOID, not failed: the census
+script's adapter geometry was not switched to 7B (the probe args
+patch missed), so those lanes errored on the geometry gate exactly
+as designed. (Lora itself is proven at 7B separately — D=32 17.87x.)
+A clean full-census at 7B needs only the geometry args threaded into
+the census's lora lane — recorded, not urgent.
