@@ -42,13 +42,13 @@ jobs:
       # `--no-default-features` (the default features pull in ggml).
       - name: cargo check (runtime, client, no-driver pie-worker)
         run: |
-          cargo check -p pie
-          cargo check -p pie --no-default-features
+          cargo check -p pie-bin
+          cargo check -p pie-bin --no-default-features
           cargo check -p pie-client
 
       - name: cargo test (runtime, client)
         run: |
-          cargo test -p pie --lib
+          cargo test -p pie-engine --lib
           cargo test -p pie-client --lib
 
       # `pie-ir` and `pie-plan` declare `#![no_std]` behind `not(feature =
@@ -302,7 +302,7 @@ jobs:
 
       - name: cargo test (pie-worker, dummy)
         run: |
-          cargo test -p pie-worker --bin pie \
+          cargo test -p pie-worker \
             --no-default-features --features driver-dummy
 
   # macOS Metal driver build. Verifies driver/metal's cmake + link
