@@ -63,7 +63,8 @@
 //! `on_fire_dropped` (rejected while queued).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::stats::SchedulerStats;
@@ -86,15 +87,19 @@ use crate::scheduler::ProcessId;
 const DEFAULT_DISPATCH_DEPTH: usize = 2;
 
 pub(super) fn configured_dispatch_depth() -> usize {
-    *DISPATCH_DEPTH.get_or_init(|| DEFAULT_DISPATCH_DEPTH)
+    match DISPATCH_DEPTH.load(Ordering::Relaxed) {
+        0 => DEFAULT_DISPATCH_DEPTH,
+        depth => depth,
+    }
 }
 
-/// Install the configured dispatch depth at bootstrap. First writer wins.
+/// Install the configured dispatch depth at bootstrap.
 pub(crate) fn set_dispatch_depth(depth: usize) {
-    let _ = DISPATCH_DEPTH.set(depth);
+    DISPATCH_DEPTH.store(depth, Ordering::Relaxed);
 }
 
-static DISPATCH_DEPTH: OnceLock<usize> = OnceLock::new();
+/// `0` = never installed; see `crate::scheduler::reconfigure`.
+static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 /// The frame identity one fire carries from `forward.submit`: which lane
 /// (pipeline scope), which frame of that lane, which wave slot, and how many

@@ -33,6 +33,7 @@ pub mod worker;
 pub use frame::FrameStamp;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -237,16 +238,21 @@ static SILENCE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 /// is the setting (CONTENTION_FOLLOWUP §20.8). Set `[model.scheduler]
 /// frame_size = 1` to restore the per-wave path.
 pub fn configured_frame_size() -> usize {
-    *FRAME_SIZE.get_or_init(|| 2)
+    match FRAME_SIZE.load(Ordering::Relaxed) {
+        0 => DEFAULT_FRAME_SIZE,
+        k => k,
+    }
 }
 
-/// Install the configured frame size at bootstrap. First writer wins; later
-/// calls are ignored so the value a guest has already read cannot change.
+/// Install the configured frame size at bootstrap.
 pub fn set_frame_size(frame_size: usize) {
-    let _ = FRAME_SIZE.set(frame_size);
+    FRAME_SIZE.store(frame_size, Ordering::Relaxed);
 }
 
-static FRAME_SIZE: OnceLock<usize> = OnceLock::new();
+const DEFAULT_FRAME_SIZE: usize = 2;
+/// `0` = never installed, so [`configured_frame_size`] answers the default.
+/// Not a `OnceLock` any more; see [`reconfigure`].
+static FRAME_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 // =============================================================================
 // Guest run-ahead sizing
@@ -269,20 +275,85 @@ static FRAME_SIZE: OnceLock<usize> = OnceLock::new();
 /// Guests never read this directly — they get `model.channel-capacity()`, so
 /// it can move without touching the guest contract.
 pub fn configured_submit_depth() -> usize {
-    *SUBMIT_DEPTH.get_or_init(|| 3)
+    match SUBMIT_DEPTH.load(Ordering::Relaxed) {
+        0 => DEFAULT_SUBMIT_DEPTH,
+        frames => frames,
+    }
 }
 
-/// Install the configured window at bootstrap. First writer wins.
+/// Install the configured window at bootstrap.
 pub fn set_submit_depth(frames: usize) {
-    let _ = SUBMIT_DEPTH.set(frames);
+    SUBMIT_DEPTH.store(frames, Ordering::Relaxed);
 }
 
-/// Install the configured dispatch depth at bootstrap. First writer wins.
+/// Install the configured dispatch depth at bootstrap.
 pub fn set_dispatch_depth(depth: usize) {
     frame::set_dispatch_depth(depth);
 }
 
-static SUBMIT_DEPTH: OnceLock<usize> = OnceLock::new();
+const DEFAULT_SUBMIT_DEPTH: usize = 3;
+/// `0` = never installed; see [`reconfigure`].
+static SUBMIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Why a [`reconfigure`] was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconfigureRefused {
+    /// Guests are running. The count is what was seen.
+    Busy(usize),
+}
+
+impl std::fmt::Display for ReconfigureRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(n) => write!(
+                f,
+                "{n} process(es) still live; these knobs can only change while \
+                 the engine is idle"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReconfigureRefused {}
+
+/// Change the batching knobs on a running engine, between rounds of a
+/// measurement sweep.
+///
+/// **This is a quiesce gate, not a drain barrier, and the difference is the
+/// point.** A drain barrier would let in-flight frames retire and then swap.
+/// That is not sufficient here, because [`configured_frame_size`] is not
+/// engine-internal state: it is handed to guests through `model.frame-size()`
+/// (`crate::inferlet::host::model`), and the SDK caches it for the life of the
+/// program (`ptir.rs`, a per-thread `OnceLock`). A value already read cannot be
+/// recalled by anything the engine does afterwards, so a guest that survives
+/// the swap keeps building frames to the old k while the engine expects the
+/// new one. No barrier fixes that; only the absence of guests does.
+///
+/// Which costs nothing, because the sweep restarts the load between rounds
+/// anyway — restarting a guest is milliseconds and restarting the model is
+/// minutes, and that asymmetry is the whole reason these knobs became
+/// swappable rather than staying boot-fixed.
+///
+/// The joint bound against the driver's staging pool
+/// (`frame_dispatch_depth * frame_size < kUploadStagingDepth`) is NOT checked
+/// here. `SchedulerConfig::validate` owns it, is where both factors are visible
+/// at once, and is the one place that knows the driver's constant; duplicating
+/// it would create a second spelling that can disagree. Callers pass values
+/// that came through that validation.
+pub fn reconfigure(
+    frame_size: usize,
+    submit_depth: usize,
+    dispatch_depth: usize,
+) -> Result<(), ReconfigureRefused> {
+    let live = crate::inferlet::process::live_count();
+    if live > 0 {
+        return Err(ReconfigureRefused::Busy(live));
+    }
+    set_frame_size(frame_size);
+    set_submit_depth(submit_depth);
+    set_dispatch_depth(dispatch_depth);
+    Ok(())
+}
 
 /// Host-reader channel capacity, in cells, that lets a lane sustain
 /// [`configured_submit_depth`] without the ring becoming the bottleneck.

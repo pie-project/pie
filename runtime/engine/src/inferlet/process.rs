@@ -195,6 +195,15 @@ pub(crate) fn execution_slot_capacity() -> Option<usize> {
     EXECUTION_SLOT_CAPACITY.get().copied().flatten()
 }
 
+/// Processes currently registered — i.e. guests that may still submit.
+///
+/// The quiesce test for `crate::scheduler::reconfigure`: the batching knobs
+/// include one a guest has already been told (`model.frame-size()`), so they
+/// can only move when there is no guest holding the old answer.
+pub fn live_count() -> usize {
+    SERVICES.len()
+}
+
 /// The calling thread's OS id, for correlating timing records across threads.
 /// `libc::gettid` is Linux-only; Darwin spells it `pthread_threadid_np`.
 fn os_thread_id() -> u64 {
