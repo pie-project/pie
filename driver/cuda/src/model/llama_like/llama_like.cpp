@@ -618,23 +618,9 @@ struct LoraFireState {
             const LoraLaneView& v = *lane.view;
             const int t = static_cast<int>(v.token_count);
             if (v.form == LoraLaneView::Form::Scale) {
-                // IA3: y = l ⊙ y over the lane's span at each consumed
-                // site; l's layer slice is bf16 [d_out].
-                const auto* l_l =
-                    static_cast<const std::uint16_t*>(lane.a_bf16) +
-                    static_cast<std::size_t>(layer) * v.d_out;
-                if ((v.sites_bits & kLoraSiteQ) != 0) {
-                    kernels::launch_scale_rows_bf16(
-                        bf16_row(q_out,
-                                 static_cast<int>(v.token_start), Hq),
-                        l_l, t, static_cast<int>(v.d_out), stream);
-                }
-                if ((v.sites_bits & kLoraSiteV) != 0) {
-                    kernels::launch_scale_rows_bf16(
-                        bf16_row(v_out,
-                                 static_cast<int>(v.token_start), Hk),
-                        l_l, t, static_cast<int>(v.d_out), stream);
-                }
+                // Applied in the scale pass BELOW — after every delta
+                // (solo and grouped) has landed, so a same-site
+                // low-rank + scale composes as s ⊙ (y + B(Ax)) — DoRA.
                 continue;
             }
             const int R = static_cast<int>(v.rank);
@@ -697,6 +683,29 @@ struct LoraFireState {
                     handle, base, base + g.nv,
                     const_cast<void* const*>(base + 2 * g.nv),
                     g.mv.data(), g.nv, g.d_out, g.rank, /*beta=*/1.f);
+            }
+        }
+        // ── The scale pass: AFTER every delta (solo + grouped), so a
+        // same-site low-rank + scale composes as s ⊙ (y + B(Ax)) —
+        // DoRA's order; a lone scale lane is IA3 unchanged. ──
+        for (const Lane& lane : lanes) {
+            const LoraLaneView& v = *lane.view;
+            if (v.form != LoraLaneView::Form::Scale) continue;
+            const int t = static_cast<int>(v.token_count);
+            const auto* l_l =
+                static_cast<const std::uint16_t*>(lane.a_bf16) +
+                static_cast<std::size_t>(layer) * v.d_out;
+            if ((v.sites_bits & kLoraSiteQ) != 0) {
+                kernels::launch_scale_rows_bf16(
+                    bf16_row(q_out,
+                             static_cast<int>(v.token_start), Hq),
+                    l_l, t, static_cast<int>(v.d_out), stream);
+            }
+            if ((v.sites_bits & kLoraSiteV) != 0) {
+                kernels::launch_scale_rows_bf16(
+                    bf16_row(v_out,
+                             static_cast<int>(v.token_start), Hk),
+                    l_l, t, static_cast<int>(v.d_out), stream);
             }
         }
     }

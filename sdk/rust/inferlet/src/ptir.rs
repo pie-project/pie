@@ -724,7 +724,8 @@ struct ForwardInner {
     attention_ws: Option<Rc<KvWorkingSet>>,
     rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
     program_attached: bool,
-    adapter_sites: u32,
+    adapter_lowrank_sites: u32,
+    adapter_scale_sites: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -817,7 +818,8 @@ impl ForwardPass {
                 attention_ws: None,
                 rs_working_sets: Vec::new(),
                 program_attached: false,
-                adapter_sites: 0,
+                adapter_lowrank_sites: 0,
+                adapter_scale_sites: 0,
             }),
         }
     }
@@ -1019,18 +1021,64 @@ impl ForwardPass {
         let expr = f(adapter::Expr::x(), adapter::Expr::y());
         // The SCALE form (IA3): scale(y, l) — lowered to the 2-argument
         // adapter sink.
+        // DoRA: scale(y + mm(b, mm(a, x)), s) — the composite lowers to
+        // the low-rank sink THEN the scale sink on the same site (the
+        // driver applies every scale after every delta).
+        if let K::Scale(l, inner) = &expr.kind {
+            if let K::Add(lhs, rhs) = &inner.kind {
+                let delta = match (&lhs.kind, &rhs.kind) {
+                    (K::Y, _) => &rhs.kind,
+                    (_, K::Y) => &lhs.kind,
+                    _ => &inner.kind, // falls to the refusal below
+                };
+                if let K::Mm(b, mid) = delta {
+                    if let K::Mm(a, x) = &mid.kind {
+                        if matches!(x.kind, K::X) {
+                            let (a, b, l) = (a.clone(), b.clone(), l.clone());
+                            {
+                                let mut st = self.inner.borrow_mut();
+                                if (st.adapter_lowrank_sites
+                                    | st.adapter_scale_sites)
+                                    & site.bit()
+                                    != 0
+                                {
+                                    return Err(format!(
+                                        "adapter: site {site:?} already \
+                                         carries an adapter on this pass"
+                                    ));
+                                }
+                                st.adapter_lowrank_sites |= site.bit();
+                                st.adapter_scale_sites |= site.bit();
+                            }
+                            self.prologue(move || {
+                                intrinsics::kernel::lora(
+                                    a.read(),
+                                    b.read(),
+                                    Tensor::constant(site.bit()),
+                                );
+                                intrinsics::kernel::adapter_scale(
+                                    l.read(),
+                                    Tensor::constant(site.bit()),
+                                );
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
         if let K::Scale(l, inner) = &expr.kind {
             if matches!(inner.kind, K::Y) {
                 let l = l.clone();
                 {
                     let mut inner_state = self.inner.borrow_mut();
-                    if inner_state.adapter_sites & site.bit() != 0 {
+                    if inner_state.adapter_scale_sites & site.bit() != 0 {
                         return Err(format!(
-                            "adapter: site {site:?} already carries an \
-                             adapter on this pass"
+                            "adapter: site {site:?} already carries a \
+                             scale on this pass"
                         ));
                     }
-                    inner_state.adapter_sites |= site.bit();
+                    inner_state.adapter_scale_sites |= site.bit();
                 }
                 self.prologue(move || {
                     intrinsics::kernel::adapter_scale(
@@ -1082,13 +1130,13 @@ impl ForwardPass {
             // own lora sink; the driver enforces the same disjointness at
             // resolution.
             let mut inner = self.inner.borrow_mut();
-            if inner.adapter_sites & site.bit() != 0 {
+            if inner.adapter_lowrank_sites & site.bit() != 0 {
                 return Err(format!(
                     "adapter: site {site:?} already carries an adapter \
                      on this pass"
                 ));
             }
-            inner.adapter_sites |= site.bit();
+            inner.adapter_lowrank_sites |= site.bit();
         }
         self.prologue(move || {
             intrinsics::kernel::lora(

@@ -56,6 +56,11 @@ struct Input {
     /// adapter surface only).
     #[serde(default = "default_sites")]
     sites: String,
+    /// Scale-vector deviation from ones (the scale/DoRA modes):
+    /// l = 1 + scale_l * pattern. 0.0 = ones (the multiplicative
+    /// identity).
+    #[serde(default)]
+    scale_l: f32,
 }
 
 fn default_sites() -> String {
@@ -215,22 +220,31 @@ async fn main(input: Input) -> Result<Output> {
         // states the SAME thing through the PEFT v0a classifier.
         if input.surface == "adapter" {
             use inferlet::ptir::adapter::{mm, Site};
-            if input.sites != "scale_q" {
+            if input.sites != "scale_q" && input.sites != "dora_q" {
                 fwd_p
                     .adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
                     .map_err(|e| e.to_string())?;
             }
-            if input.sites == "scale_q" {
+            if input.sites == "scale_q" || input.sites == "dora_q" {
                 use inferlet::ptir::adapter::scale;
+                let scale_l = input.scale_l;
                 let l = Channel::from_shaped(
                     [NUM_LAYERS, D_OUT],
                     (0..(NUM_LAYERS * D_OUT))
                         .map(|i| 1.0f32
-                            + pattern(i, 0x0d0d_d0d0, 0.2) * adapter_scale)
+                            + pattern(i, 0x0d0d_d0d0, 0.2) * scale_l)
                         .collect::<Vec<f32>>())
                     .named("lora_l_q");
-                fwd_p.adapter(Site::Q, |_x, y| scale(y, &l))
+                if input.sites == "dora_q" {
+                    let (da, db) = make_lora_channels(&a_host, &b_host);
+                    fwd_p.adapter(Site::Q, |x, y| {
+                        scale(y + mm(&db, mm(&da, x)), &l)
+                    })
                     .map_err(|e| e.to_string())?;
+                } else {
+                    fwd_p.adapter(Site::Q, |_x, y| scale(y, &l))
+                        .map_err(|e| e.to_string())?;
+                }
             }
             if input.sites == "qv" {
                 let av = Channel::from_shaped(
@@ -316,21 +330,30 @@ async fn main(input: Input) -> Result<Output> {
         let fwd = ForwardPass::new();
         if input.surface == "adapter" {
             use inferlet::ptir::adapter::{mm, Site};
-            if input.sites != "scale_q" {
+            if input.sites != "scale_q" && input.sites != "dora_q" {
                 fwd.adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
                     .map_err(|e| e.to_string())?;
             }
-            if input.sites == "scale_q" {
+            if input.sites == "scale_q" || input.sites == "dora_q" {
                 use inferlet::ptir::adapter::scale;
+                let scale_l = input.scale_l;
                 let l = Channel::from_shaped(
                     [NUM_LAYERS, D_OUT],
                     (0..(NUM_LAYERS * D_OUT))
                         .map(|i| 1.0f32
-                            + pattern(i, 0x0d0d_d0d0, 0.2) * adapter_scale)
+                            + pattern(i, 0x0d0d_d0d0, 0.2) * scale_l)
                         .collect::<Vec<f32>>())
                     .named("lora_l_q");
-                fwd.adapter(Site::Q, |_x, y| scale(y, &l))
+                if input.sites == "dora_q" {
+                    let (da, db) = make_lora_channels(&a_host, &b_host);
+                    fwd.adapter(Site::Q, |x, y| {
+                        scale(y + mm(&db, mm(&da, x)), &l)
+                    })
                     .map_err(|e| e.to_string())?;
+                } else {
+                    fwd.adapter(Site::Q, |_x, y| scale(y, &l))
+                        .map_err(|e| e.to_string())?;
+                }
             }
             if input.sites == "qv" {
                 let av = Channel::from_shaped(

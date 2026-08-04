@@ -4394,7 +4394,12 @@ std::vector<model::LoraLaneView> resolve_lane_lora_sinks(
     const StagedLane& lane,
     const plan::StagePlan& stage) {
     std::vector<model::LoraLaneView> views;
-    std::uint64_t claimed_sites = 0;
+    // Disjointness is PER FORM: two low-rank pairs (or two scales) on
+    // one site are ambiguous and refuse; a low-rank + a scale on the
+    // SAME site compose in program order (DoRA: s ⊙ (y + B(Ax)) — the
+    // consumer applies every scale after every delta).
+    std::uint64_t claimed_lowrank = 0;
+    std::uint64_t claimed_scale = 0;
     for (const auto& normalized : stage.ops) {
         const auto& op = normalized.op;
         if (op.tag != PTIR_OP_SINK_CALL) continue;
@@ -4403,17 +4408,17 @@ std::vector<model::LoraLaneView> resolve_lane_lora_sinks(
             continue;
         }
         model::LoraLaneView view = resolve_lane_lora_one(lane, stage, &op);
-        if ((view.sites_bits & claimed_sites) != 0) {
-            // One pair per site: an overlap would leave the projection
-            // with two deltas of possibly different shapes and the
-            // consumer to pick — the silent-misapplication class the
-            // sink gates exist to prevent.
+        std::uint64_t& claimed =
+            view.form == model::LoraLaneView::Form::Scale
+                ? claimed_scale
+                : claimed_lowrank;
+        if ((view.sites_bits & claimed) != 0) {
             throw std::runtime_error(
-                "lora sinks claim overlapping sites in one prologue "
-                "(bits " + std::to_string(view.sites_bits & claimed_sites) +
-                ")");
+                "lora sinks claim overlapping sites of one form in one "
+                "prologue (bits " +
+                std::to_string(view.sites_bits & claimed) + ")");
         }
-        claimed_sites |= view.sites_bits;
+        claimed |= view.sites_bits;
         views.push_back(view);
     }
     if (views.empty()) {
@@ -4703,9 +4708,12 @@ void execute_declared_phase(
                 }
                 for (const model::LoraLaneView& view :
                      resolve_lane_lora_sinks(lane, stage)) {
+                    // The sources array is parallel PER ENTRY (the span
+                    // re-stamp indexes it 1:1), so a multi-sink lane
+                    // contributes one source per view.
                     launch.lora_lanes.push_back(view);
+                    launch.lora_lane_sources.push_back(&lane);
                 }
-                launch.lora_lane_sources.push_back(&lane);
             }
             std::uint64_t attn_score_kv_max = 0;
             std::uint32_t value_base = 0;
