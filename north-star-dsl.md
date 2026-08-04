@@ -2306,3 +2306,28 @@ four-axis fires across three rounds, and the planted code word NEVER
 leaks (blinding held every round, varying seeds). The safety
 argument's strongest form: composition preserves policy semantics in
 exactly the cell where the most machinery is simultaneously active.
+
+## GATHER AS THE DIVERGENCE PRIMITIVE, STAGED (2026-08-04) — review #2
+
+The review's deepest generalization: the O(k^2) pairwise seams (AC-1
+stash, AC-2 relax, AC-4 reorder) exist because every axis DEMANDS
+CONTIGUITY from the seriation; gather/scatter (already in the tree as
+the MoE lowering: launch_gather_bf16_rows /
+launch_scatter_add_weighted_bf16) dissolves that demand — gather an
+axis's member rows into a dense scratch, run the special kernel,
+scatter back; ANY subset serves, no ordering constraint, no per-pair
+seam. Staged honestly, like Gray:
+
+- WHY NOT CUT OVER NOW: with the nesting set every axis IS one
+  contiguous window, and a window is gather's zero-copy special case
+  — the bandwidth of a real gather/scatter round-trip per axis per
+  layer is a pure regression today (the stash A/B priced contiguity's
+  alternative at 5-7% for ONE axis's discarded compute; gather would
+  pay copies for every axis).
+- THE CUTOVER TRIGGER is the same event Gray's sentinel watches: the
+  first admitted combination outside the nesting set. At that moment
+  the three coupled generalizations land together — Gray order (fewest
+  fragments), (start,len) windows per fragment, and gather for the
+  fragments that still refuse contiguity.
+- WHAT IS IN THE TREE ALREADY: the kernels, the seriation sentinel,
+  and this design note binding the three.
