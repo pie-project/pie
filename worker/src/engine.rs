@@ -556,6 +556,10 @@ fn load_model_drivers(
         let ResolvedFlavor::Embedded(flavor) = resolved;
         let mut embedded_base_opts = preflight::build_embedded_options(m, flavor)?;
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
+        apply_embedded_calibration(
+            &mut embedded_base_opts,
+            user_cfg.server.calibrate_planner,
+        );
         let resolved_model = weights::resolve(&m.model)
             .with_context(|| format!("resolving the model for {:?}", m.name))?;
         // Lifted once, here, in one open. The drivers get the compiled model
@@ -1055,6 +1059,23 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
         }
         other => other.clone(),
     }
+}
+
+/// Carry a calibration request from the in-memory config onto the driver
+/// options, the same way `verbose` travels.
+///
+/// CUDA only, because it is the only driver with a memory planner to calibrate.
+/// A request against any other driver is silently nothing rather than an error:
+/// the caller asked for a measurement this backend does not have, and refusing
+/// the boot over it would be worse than doing the ordinary thing.
+fn apply_embedded_calibration(options: &mut DriverOptions, calibrate: bool) {
+    #[cfg(feature = "driver-cuda")]
+    if let DriverOptions::CudaNative(opts) = options {
+        opts.calibrate_planner = calibrate;
+    }
+
+    #[cfg(not(feature = "driver-cuda"))]
+    let _ = (options, calibrate);
 }
 
 fn apply_embedded_verbose(options: &mut DriverOptions, verbose: bool) {

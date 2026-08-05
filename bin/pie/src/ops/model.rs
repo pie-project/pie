@@ -1,8 +1,10 @@
-//! `pie model { list | download | remove }` — manage HF cache.
+//! `pie model { list | info | import | build | remove }` — the models pie serves.
 //!
-//! Mirrors `pie/src/pie_cli/commands/model.py` against the same
-//! `~/.cache/huggingface/hub/` layout. Models pulled via either the
-//! Python CLI or the standalone are interchangeable.
+//! `list` and `info` read the artifact store ([`crate::local::store`]) with the
+//! HF snapshot cache beside it, because "what do I have" and "where did it come
+//! from" are one question. The two that produce an artifact are big enough to
+//! own a file each: [`import`] normalizes any checkpoint into a `.zt`, and
+//! [`build`] runs the family-aware transforms a serve boot would do.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -14,28 +16,25 @@ use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
 
-use crate::ops::hf::runtime_snapshot_allow_patterns;
+use crate::local::hf::runtime_snapshot_allow_patterns;
+use crate::ui::{Align, Answer, Mark, Palette, Row, Table};
+
+pub mod build;
+pub mod import;
 
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
     /// List the artifacts pie can serve, and any raw snapshots beside them.
-    List {
-        /// Emit one JSON document instead of the table.
-        #[arg(long)]
-        json: bool,
-    },
+    List,
 
     /// Show what pie knows about one stored artifact.
     Info {
         /// The store name, as `pie model list` prints it.
         name: String,
-        /// Emit one JSON document instead of the report.
-        #[arg(long)]
-        json: bool,
     },
     /// Make a model servable: fetch it if it is remote, convert it to a
     /// `.zt` artifact, and put it in the store.
-    Import(crate::ops::convert::ConvertArgs),
+    Import(import::ImportArgs),
     /// Remove a stored artifact by name. Prompts for confirmation;
     /// `--yes` skips the prompt.
     Remove {
@@ -47,22 +46,26 @@ pub enum ModelCmd {
     },
     /// Precompute a serve boot: author the family contract, run the load
     /// transforms offline, write the runtime tensors as a `.zt` artifact.
-    ///
-    /// Not to be confused with `pie config optimize`, which measures this
-    /// machine and tunes the batching knobs. This one prepares an artifact;
-    /// that one prepares a config.
-    Optimize(crate::ops::optimize::OptimizeArgs),
+    //
+    // `optimize` until this rename. It shared a verb with `pie config
+    // optimize`, which tunes the *machine*, and the two were far enough apart
+    // that the help text had to carry a "not to be confused with" line -- a
+    // name that needs a disclaimer is the wrong name. This one builds a thing,
+    // so it is `build`. The old spelling stays as a hidden alias: it is what
+    // scripts and the docs say today, and breaking them buys nothing.
+    #[command(alias = "optimize")]
+    Build(build::BuildArgs),
 }
 
-pub fn run(cmd: ModelCmd) -> Result<()> {
+pub fn run(cmd: ModelCmd) -> Result<Answer> {
     match cmd {
-        ModelCmd::List { json } => list(json),
-        ModelCmd::Info { name, json } => info(name, json),
+        ModelCmd::List => list(),
+        ModelCmd::Info { name } => info(name),
         // `download` and `convert` were both "make this servable", so they are
         // one verb now; `import` fetches when the source is remote.
-        ModelCmd::Import(args) => crate::ops::convert::run(args),
+        ModelCmd::Import(args) => import::run(args),
         ModelCmd::Remove { name, yes } => remove(name, yes),
-        ModelCmd::Optimize(args) => crate::ops::optimize::run(args),
+        ModelCmd::Build(args) => build::run(args),
     }
 }
 
@@ -160,98 +163,159 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
 // list
 // -----------------------------------------------------------------------------
 
-fn list(json: bool) -> Result<()> {
-    if json {
-        let artifacts = crate::ops::store::entries()?;
-        return crate::ui::emit_json(&serde_json::json!({
-            "store": crate::ops::store::dir(),
-            "artifacts": artifacts
-                .iter()
-                .map(|e| serde_json::json!({
-                    "name": e.name,
-                    "root": e.root,
-                    "shards": e.shards(),
-                    "bytes": e.bytes,
-                    "tensors": e.tensors,
-                    "written_by": e.written_by,
-                    "source": e.source,
-                }))
-                .collect::<Vec<_>>(),
-        }));
-    }
-    let colorize = std::io::stdout().is_terminal();
-    let (green, dim, reset) = if colorize {
-        ("\x1b[32m", "\x1b[2m", "\x1b[0m")
-    } else {
-        ("", "", "")
-    };
+/// The artifacts pie can serve, and the raw snapshots beside them.
+#[derive(serde::Serialize)]
+pub struct ModelList {
+    store: std::path::PathBuf,
+    artifacts: Vec<Artifact>,
+    /// Where `import` reads from. Not what serving reads: the HF cache demotes
+    /// to a staging area once an artifact exists.
+    snapshots_dir: std::path::PathBuf,
+    snapshots: Vec<Snapshot>,
+    snapshot_bytes: u64,
+}
 
-    // What pie can serve. This is the store, and it comes first because it is
-    // the answer to "what models do I have" — the HF cache below it is where
-    // these came *from*.
-    let artifacts = crate::ops::store::entries()?;
-    println!("Artifacts ({}):", crate::ops::store::dir().display());
-    if artifacts.is_empty() {
-        println!("  {dim}(none — `pie model import <org>/<name>`){reset}");
-    }
-    for entry in &artifacts {
-        let shards = match entry.shards() {
-            0 => String::new(),
-            n => format!(", {n} shards"),
-        };
-        let from = entry
-            .source
-            .as_deref()
-            .map(|s| format!(" ← {s}"))
-            .unwrap_or_default();
-        let by = entry
-            .written_by
-            .as_deref()
-            .map(|v| format!(" pie {v}"))
-            .unwrap_or_else(|| " provenance missing".to_string());
+#[derive(serde::Serialize)]
+struct Artifact {
+    name: String,
+    root: std::path::PathBuf,
+    shards: usize,
+    bytes: u64,
+    tensors: usize,
+    written_by: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct Snapshot {
+    repo_id: String,
+    /// Whether any linked driver knows this family.
+    servable: bool,
+    /// The pie arch name when servable, the reason when not.
+    detail: String,
+    bytes: u64,
+}
+
+impl crate::ui::Report for ModelList {
+    fn render(&self, palette: &Palette) {
+        // What pie can serve. This is the store, and it comes first because it
+        // is the answer to "what models do I have" — the HF cache below it is
+        // where these came *from*.
+        println!("Artifacts ({}):", self.store.display());
+        if self.artifacts.is_empty() {
+            println!(
+                "  {}",
+                palette.dim("(none — `pie model import <org>/<name>`)")
+            );
+        }
+        // Four columns, not three. Folding the tensor count in with the
+        // provenance put all three facts in the column `Table` cuts to fit, so
+        // an 80-column terminal lost the tensor count *and* the source. Only
+        // the last column is ever cut, so only the least load-bearing fact --
+        // where it came from, which `pie model info` prints in full -- is at
+        // risk.
+        let mut table = Table::new([Align::Left, Align::Right, Align::Right, Align::Left], 1);
+        for artifact in &self.artifacts {
+            let shards = match artifact.shards {
+                0 => String::new(),
+                n => format!(" +{n}"),
+            };
+            let from = artifact
+                .source
+                .as_deref()
+                .map(|s| format!("← {s},"))
+                .unwrap_or_default();
+            let by = artifact
+                .written_by
+                .as_deref()
+                .map(|v| format!("pie {v}"))
+                .unwrap_or_else(|| "provenance missing".to_string());
+            table.push(Row::new(
+                // `●` here and `○`/`×` below were this command's private glyph
+                // vocabulary, three spellings of what `Mark` already names.
+                Mark::Plain,
+                [
+                    artifact.name.clone(),
+                    crate::ui::bytes(artifact.bytes),
+                    format!("{} tensors{shards}", artifact.tensors),
+                    format!("{from}{by}"),
+                ],
+            ));
+        }
+        table.print(palette);
+
+        if self.snapshots.is_empty() {
+            return;
+        }
+        // Raw snapshots, marked as what they now are: staging for conversion,
+        // and disk that `pie cache clear snapshots` reclaims.
         println!(
-            "  {green}●{reset} {} {dim}({}, {} tensors{shards}){reset}{dim}{from},{by}{reset}",
-            entry.name,
-            crate::ops::store::format_bytes(entry.bytes),
-            entry.tensors,
+            "\nRaw snapshots ({}, {}):",
+            self.snapshots_dir.display(),
+            crate::ui::bytes(self.snapshot_bytes)
         );
+        let mut table = Table::new([Align::Left, Align::Right, Align::Left], 1);
+        for snapshot in &self.snapshots {
+            table.push(Row::new(
+                // "pie cannot serve this family" is the same answer as every
+                // other absence, and gets the same glyph.
+                if snapshot.servable {
+                    Mark::Plain
+                } else {
+                    Mark::Absent
+                },
+                [
+                    snapshot.repo_id.clone(),
+                    crate::ui::bytes(snapshot.bytes),
+                    snapshot.detail.clone(),
+                ],
+            ));
+        }
+        table.print(palette);
     }
+}
 
-    // Raw snapshots, marked as what they now are: staging for conversion,
-    // and disk that `--clean` or `pie model remove --staging` reclaims.
+fn list() -> Result<Answer> {
+    let artifacts = crate::local::store::entries()?;
     let hub = hub_dir();
-    let mut staged: Vec<(String, bool, String, u64)> = match std::fs::read_dir(&hub) {
+    let mut snapshots: Vec<Snapshot> = match std::fs::read_dir(&hub) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let repo_id = dirname_to_repo_id(&name)?;
-                let (ok, info) = check_pie_compatibility(&e.path());
-                let bytes = crate::ops::store::staging_bytes(&e.path());
-                Some((repo_id, ok, info, bytes))
+                let (servable, detail) = check_pie_compatibility(&e.path());
+                Some(Snapshot {
+                    repo_id,
+                    servable,
+                    detail,
+                    bytes: crate::local::store::staging_bytes(&e.path()),
+                })
             })
             .collect(),
         Err(_) => Vec::new(),
     };
-    staged.sort_by(|a, b| a.0.cmp(&b.0));
+    snapshots.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
 
-    if !staged.is_empty() {
-        let total: u64 = staged.iter().map(|(_, _, _, b)| b).sum();
-        println!(
-            "\nRaw snapshots ({}, {}):",
-            hub.display(),
-            crate::ops::store::format_bytes(total)
-        );
-        for (repo_id, ok, info, bytes) in &staged {
-            let mark = if *ok { "○" } else { "×" };
-            println!(
-                "  {dim}{mark} {repo_id} ({}, {info}){reset}",
-                crate::ops::store::format_bytes(*bytes)
-            );
-        }
-    }
-    Ok(())
+    Ok(Answer::report(ModelList {
+        store: crate::local::store::dir(),
+        artifacts: artifacts
+            .into_iter()
+            .map(|e| Artifact {
+                shards: e.shards(),
+                name: e.name,
+                root: e.root,
+                bytes: e.bytes,
+                tensors: e.tensors,
+                written_by: e.written_by,
+                source: e.source,
+            })
+            .collect(),
+        snapshots_dir: hub,
+        snapshot_bytes: snapshots.iter().map(|s| s.bytes).sum(),
+        snapshots,
+    }))
 }
 
 /// `pie model info <name>` — one artifact, in detail.
@@ -261,55 +325,62 @@ fn list(json: bool) -> Result<()> {
 /// architecture, which stopped being the right question when the artifact
 /// became the thing pie serves: a repo is one way an artifact got here, and
 /// `source` below is where that is recorded.
-fn info(name: String, json: bool) -> Result<()> {
-    let Some(entry) = crate::ops::store::find(&name)? else {
-        bail!(
-            "no artifact {name:?} in the store; `pie model list` shows what is there"
-        );
+fn info(name: String) -> Result<Answer> {
+    let Some(entry) = crate::local::store::find(&name)? else {
+        bail!("no artifact {name:?} in the store; `pie model list` shows what is there");
     };
-    if json {
-        return crate::ui::emit_json(&serde_json::json!({
-            "name": entry.name,
-            "root": entry.root,
-            "files": entry.files,
-            "shards": entry.shards(),
-            "bytes": entry.bytes,
-            "tensors": entry.tensors,
-            "written_by": entry.written_by,
-            "source": entry.source,
-        }));
-    }
+    Ok(Answer::report(ModelInfo {
+        shards: entry.shards(),
+        name: entry.name,
+        root: entry.root,
+        files: entry.files,
+        bytes: entry.bytes,
+        tensors: entry.tensors,
+        written_by: entry.written_by,
+        source: entry.source,
+    }))
+}
 
-    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
-    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
-    println!("{bold}{}{reset}", entry.name);
-    let mut table =
-        crate::ui::Table::new([crate::ui::Align::Left, crate::ui::Align::Left], 1);
-    let mut row = |k: &str, v: String| {
-        table.push(crate::ui::Row::new(
-            crate::ui::Mark::Plain,
-            [k.to_string(), v],
-        ))
-    };
-    row("size", crate::ui::bytes(entry.bytes));
-    row("tensors", entry.tensors.to_string());
-    row(
-        "files",
-        match entry.shards() {
-            0 => "one".to_string(),
-            n => format!("root + {n} shards"),
-        },
-    );
-    if let Some(source) = &entry.source {
-        row("source", source.clone());
+/// One store entry, in detail.
+#[derive(serde::Serialize)]
+pub struct ModelInfo {
+    name: String,
+    root: std::path::PathBuf,
+    files: Vec<std::path::PathBuf>,
+    shards: usize,
+    bytes: u64,
+    tensors: usize,
+    written_by: Option<String>,
+    source: Option<String>,
+}
+
+impl crate::ui::Report for ModelInfo {
+    fn render(&self, palette: &Palette) {
+        println!("{}", palette.bold(&self.name));
+        let mut table = Table::new([Align::Left, Align::Left], 1);
+        let mut row = |k: &str, v: String| table.push(Row::new(Mark::Plain, [k.to_string(), v]));
+        row("size", crate::ui::bytes(self.bytes));
+        row("tensors", self.tensors.to_string());
+        row(
+            "files",
+            match self.shards {
+                0 => "one".to_string(),
+                n => format!("root + {n} shards"),
+            },
+        );
+        if let Some(source) = &self.source {
+            row("source", source.clone());
+        }
+        if let Some(written_by) = &self.written_by {
+            row("written by", format!("pie {written_by}"));
+        }
+        row("path", crate::ui::short_path(&self.root));
+        table.print(palette);
+        println!(
+            "\n{}",
+            palette.dim(format!("[model]\nmodel = \"{}\"", self.name))
+        );
     }
-    if let Some(written_by) = &entry.written_by {
-        row("written by", format!("pie {written_by}"));
-    }
-    row("path", crate::ui::short_path(&entry.root));
-    table.print(&palette);
-    println!("\n{dim}[model]\nmodel = \"{}\"{reset}", entry.name);
-    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -559,43 +630,33 @@ impl ProgressHandler for ProgressBar {
 /// which knows about every snapshot rather than the one beside this artifact,
 /// asks before deleting, and reports what it got back. A command that removes
 /// a model has no business deciding what else its origin is worth keeping.
-fn remove(name: String, skip_confirm: bool) -> Result<()> {
-    let Some(entry) = crate::ops::store::find(&name)? else {
+
+fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
+    let Some(entry) = crate::local::store::find(&name)? else {
         bail!(
             "no artifact named {name:?} in {}",
-            crate::ops::store::dir().display()
+            crate::local::store::dir().display()
         );
     };
 
     let bytes = entry.bytes;
     let what = format!(
         "artifact {name} ({}, {} file(s))",
-        crate::ops::store::format_bytes(bytes),
+        crate::ui::bytes(bytes),
         entry.files.len()
     );
 
-    if !skip_confirm {
-        if !std::io::stdin().is_terminal() {
-            bail!("remove requires confirmation; rerun with `pie model remove {name} --yes`");
-        }
-        eprint!("Remove {what}? [y/N] ");
-        let _ = std::io::stderr().flush();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .map_err(|e| anyhow!("read stdin: {e}"))?;
-        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
-            println!("(aborted)");
-            return Ok(());
-        }
+    if !skip_confirm
+        && !crate::ui::confirm(
+            &format!("Remove {what}?"),
+            &format!("pie model remove {name} --yes"),
+        )?
+    {
+        return Ok(Answer::noop("aborted; nothing was removed"));
     }
 
-    crate::ops::store::remove(&entry)?;
-    println!(
-        "{} removed {what}",
-        crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout))
-    );
-    Ok(())
+    crate::local::store::remove(&entry)?;
+    Ok(Answer::did(format!("removed {what}")))
 }
 
 #[cfg(test)]

@@ -344,6 +344,11 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
 /// projections the published checkpoint left in BF16 — quantize into the
 /// affine layout at load, because every matvec here is a quantized one.
 pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
+    // This family encodes its BF16 projections whatever the request says --
+    // its matvecs have no unquantized path -- so the answer is discarded and
+    // only the refusal is wanted: a request this lowering cannot serve must
+    // not be silently ignored here when the other three refuse it.
+    mlx::int4_requested(b, "GptOss")?;
     let mut declared = 0usize;
     for raw in b.tensors().to_vec() {
         // The published checkpoint's MXFP4 experts are consumed as a pair
@@ -421,6 +426,11 @@ pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
 fn gptoss_mlx_name(raw_name: &str) -> Result<Option<String>, Error> {
     // The head is its own tensor here — NOT the embedding under another name.
     if raw_name.starts_with("lm_head.") {
+        return Ok(Some(raw_name.to_string()));
+    }
+    // Its own output is a valid input: see `mlx::already_lowered`. After the
+    // `lm_head.` arm above, which this family answers with an identity anyway.
+    if mlx::already_lowered(raw_name) {
         return Ok(Some(raw_name.to_string()));
     }
     let Some(rest) = raw_name.strip_prefix("model.") else {

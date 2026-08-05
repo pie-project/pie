@@ -108,6 +108,11 @@ fn gemma4_mlx_name(raw_name: &str, first_shared_layer: i64) -> Result<Option<Str
     if let Some(tail) = raw_name.strip_prefix("lm_head.") {
         return Ok(Some(format!("shared_embedding.{tail}")));
     }
+    // Its own output is a valid input: see `mlx::already_lowered`. After the
+    // `lm_head.` arm above, which is not an identity for this family at all.
+    if mlx::already_lowered(raw_name) {
+        return Ok(Some(raw_name.to_string()));
+    }
     let Some(rest) = mlx::decoder_member(raw_name) else {
         return mlx::fail(format!(
             "Metal Gemma4 schema has no declared mapping or skip for '{raw_name}'"

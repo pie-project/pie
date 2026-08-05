@@ -210,6 +210,17 @@ impl<'a> Builder<'a> {
         self.policy.stream_routed_experts
     }
 
+    /// The load-time requantization the caller asked for, already resolved
+    /// against the device.
+    ///
+    /// The Builder's own `push_runtime_quant` serves the families that publish
+    /// through it; the MLX lowering has its own authoring loop and reads the
+    /// request here instead of growing a second policy field to mean the same
+    /// thing.
+    pub fn runtime_quant(&self) -> super::policy::RuntimeQuant {
+        self.policy.runtime_quant
+    }
+
     /// The per-family switches the caller resolved from its environment.
     pub fn knobs(&self) -> &super::policy::FamilyKnobs {
         &self.policy.knobs
@@ -959,6 +970,7 @@ impl<'a> Builder<'a> {
             RuntimeQuant::Fp8 => QuantScheme::Fp8E4M3,
             RuntimeQuant::Int8 => QuantScheme::Int8Symmetric,
             RuntimeQuant::Mxfp4 => QuantScheme::Mxfp4E2M1E8M0,
+            RuntimeQuant::Int4 => QuantScheme::MlxAffineU4,
         };
         // For FP4 a pre-quantized checkpoint is accepted (GLM-5.1 ships FP8
         // experts). For FP8/INT8 only BF16 weights are re-quantized, never an

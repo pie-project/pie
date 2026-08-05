@@ -82,7 +82,7 @@ fn fixture_artifact() -> String {
         // artifact and not the files it was made from.
         let store = tempfile::tempdir().expect("create artifact dir");
         let artifact = store.path().join("smoke.zt");
-        pie_bin::ops::convert::run(pie_bin::ops::convert::ConvertArgs {
+        pie_bin::ops::model::import::run(pie_bin::ops::model::import::ImportArgs {
             source: staging.path().to_string_lossy().into_owned(),
             out: Some(artifact.clone()),
             dry_run: false,

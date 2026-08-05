@@ -459,6 +459,10 @@ endif()
 add_metal_linked_test(pipeline_copy_ops_test tests/pipeline_copy_ops_test.cpp
   NEEDS_LOADER)
 add_metal_linked_test(caps_honesty_test tests/caps_honesty_test.cpp NEEDS_LOADER)
+add_metal_linked_test(descriptor_facts_test tests/descriptor_facts_test.cpp
+  NEEDS_LOADER)
+target_compile_definitions(descriptor_facts_test PRIVATE
+  PIE_METAL_TEST_TMP_DIR="${CMAKE_CURRENT_BINARY_DIR}")
 add_metal_linked_test(executor_geometry_test tests/executor_geometry_test.cpp
   NEEDS_LOADER)
 add_metal_linked_test(batch_schedule_plan_test tests/batch_schedule_plan_test.cpp

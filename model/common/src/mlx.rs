@@ -17,6 +17,7 @@ use pie_loader::error::Error;
 use pie_loader::types::{Axis, DType, Encoding, QuantScheme, QuantSpec};
 
 use super::builder::{Builder, is_raw};
+use super::policy::RuntimeQuant;
 
 /// Refuse, naming the tensor. `pub` for the same reason `builder::fail` is:
 /// an MLX generation refuses for its own reasons and the message has to read
@@ -47,6 +48,83 @@ pub fn decoder_member(raw_name: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Is this the name a Metal lowering already produced?
+///
+/// The bind path's namespace is closed and small — `layers.<n>.*` plus a
+/// handful of layer-less tables — and it is disjoint from the checkpoint
+/// namespace, where every decoder tensor arrives under `model.` or one of the
+/// two `language_model.` spellings. That disjointness is what makes an
+/// identity arm a fact rather than a guess: a name in this set did not come
+/// from a checkpoint.
+///
+/// Why it is needed at all: a serve boot re-authors the contract from the
+/// names its checkpoint holds, so an artifact `pie model build` wrote —
+/// whose tensors ARE the runtime tensors — is fed back through the very rename
+/// that produced them. Without an identity arm each schema refuses its own
+/// output (`no declared mapping or skip for 'final_norm.weight'`) and the
+/// artifact cannot boot. `f(f(x)) == f(x)` is the property, and it is what
+/// makes import → optimize → serve a pipeline rather than three dead ends.
+///
+/// `lm_head.` is deliberately absent. It is the one name living in both
+/// namespaces, and every family already answers it before reaching here —
+/// untied it maps to itself, tied it becomes `shared_embedding` — so an
+/// identity arm covering it would silently break the tied case for real
+/// checkpoints.
+///
+/// What this does NOT do is re-run the refusals `routed_expert_member` applies
+/// to a checkpoint's expert banks. Those describe shapes a *checkpoint* can
+/// arrive in; a lowered artifact holds only what the author already accepted,
+/// and a hand-written one that did not would fail at bind for want of the
+/// stacked bank instead.
+pub fn already_lowered(raw_name: &str) -> bool {
+    for table in [
+        "shared_embedding.",
+        "embed_tokens.",
+        // gemma4's per-layer embedding table and its two projections:
+        // layer-less, and they keep their own names through the lowering.
+        "embed_tokens_per_layer.",
+        "per_layer_model_projection.",
+        "per_layer_projection_norm.",
+    ] {
+        if raw_name.starts_with(table) {
+            return true;
+        }
+    }
+    if raw_name == "final_norm.weight" {
+        return true;
+    }
+    // `layers.<digits>.` and nothing looser. The digits are what separate a
+    // lowered name from a checkpoint that merely begins with the same word.
+    let Some(tail) = raw_name.strip_prefix("layers.") else {
+        return false;
+    };
+    let Some(dot) = tail.find('.') else {
+        return false;
+    };
+    let index = &tail[..dot];
+    !index.is_empty() && index.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Which requantization this lowering can serve, and the refusal for the rest.
+///
+/// `None` and `Int4` are the only two answers these kernels have: they read
+/// MLX affine, and `Encode` is implemented for `MlxAffineU4` on both the host
+/// and the driver. Anything else is CUDA's vocabulary, and it is refused
+/// rather than ignored — authoring an unquantized contract for `--quant int8`
+/// would hand back an artifact whose name and bytes disagree. That was the
+/// state this field was in: plumbed through three layers to authors that never
+/// looked at it.
+pub fn int4_requested(b: &Builder<'_>, schema: &str) -> Result<bool, Error> {
+    match b.runtime_quant() {
+        RuntimeQuant::None => Ok(false),
+        RuntimeQuant::Int4 => Ok(true),
+        other => fail(format!(
+            "Metal {schema}: runtime_quant={other:?} has no encoder here; these \
+             kernels read MLX affine, so `int4` is the only request they can serve"
+        )),
+    }
 }
 
 /// Declare a tensor where it lies, casting the widths no Metal kernel reads.
@@ -415,6 +493,22 @@ pub type RenameRule<'r> = &'r dyn Fn(&Builder<'_>, &str) -> Result<Option<String
 /// `rename` answers with the runtime name, `None` to skip, or an error for a
 /// tensor the schema has no opinion on — the same trichotomy every Metal
 /// header states.
+///
+/// `RuntimeQuant::Int4` adds one arm: a rank-2 `.weight` the checkpoint left
+/// in a float type is encoded to affine-U4 instead of declared as values. It
+/// is the same rule gpt-oss applies unconditionally — its published checkpoint
+/// mixes MXFP4 experts with BF16 attention, and the matvecs are quantized — and
+/// the same `Encode` op, so what runs at load without a request and offline
+/// under `pie model build --quant int4` is one transform, not two. Rank is
+/// what separates these from the norms, which must stay values.
+///
+/// F16 and F32 are cast to BF16 first rather than encoded where they lie. The
+/// two executors would not agree otherwise: the host reads the operand's
+/// declared dtype, while the driver's `encode_mlx_affine_u4` is handed a byte
+/// width and reads every 2-byte element as BF16 — so an F16 weight would be
+/// quantized correctly offline and from misread bits at load. `Cast` is in
+/// both tile-map masks and is what `push_direct` already does with these two
+/// widths, so the chain costs nothing and removes the disagreement.
 pub fn author_mlx_file(
     b: &mut Builder<'_>,
     schema: &str,
@@ -422,6 +516,7 @@ pub fn author_mlx_file(
 ) -> Result<(), Error> {
     let quant_bits = i64::from(b.facts().quant_bits);
     let quant_group = i64::from(b.facts().quant_group_size);
+    let encode_floats = int4_requested(b, schema)?;
     let mut declared = 0usize;
     for raw in b.tensors().to_vec() {
         let Some(output) = rename(b, &raw.name)? else {
@@ -439,6 +534,30 @@ pub fn author_mlx_file(
                 ));
             };
             push_mlx_affine_declared(b, raw, scales, biases, quant_bits, quant_group, output)?;
+        } else if encode_floats && raw.name.ends_with(".weight") && raw.shape.len() == 2 {
+            let value = if is_raw(&raw.encoding, DType::BF16) {
+                Expr::src(&raw.name)
+            } else if is_raw(&raw.encoding, DType::F16) || is_raw(&raw.encoding, DType::F32) {
+                // Two tile maps, not one expression: `Cast` needs a kernel, so
+                // a cast feeding an encode has to leave a buffer behind for the
+                // encode to read rather than nest inside it.
+                let widened = format!("{output}.bf16");
+                let bf16 = Encoding::Raw(DType::BF16);
+                if let Some(declared) = b.define(
+                    widened.clone(),
+                    Expr::src(&raw.name).cast(bf16.clone()),
+                    bf16,
+                    Some(raw.shape.clone()),
+                ) {
+                    b.mark_internal(declared);
+                }
+                Expr::out(&widened)
+            } else {
+                push_direct(b, raw, output);
+                declared += 1;
+                continue;
+            };
+            push_encoded_affine(b, value, raw.shape[0], raw.shape[1], output)?;
         } else {
             push_direct(b, raw, output);
         }
@@ -452,7 +571,52 @@ pub fn author_mlx_file(
 
 #[cfg(test)]
 mod tests {
-    use super::routed_expert_member;
+    use super::{already_lowered, routed_expert_member};
+
+    /// `f(f(x)) == f(x)`, checked on the names the four Metal schemas emit.
+    ///
+    /// The property is what lets a serve boot re-author from an artifact whose
+    /// tensors are already the runtime tensors. Stated over `already_lowered`
+    /// rather than over each family's rename because the four call it at the
+    /// same point and differ only in what they do *before* it.
+    #[test]
+    fn the_runtime_namespace_is_recognized_and_the_checkpoint_one_is_not() {
+        for lowered in [
+            "layers.0.self_attn.q_proj.weight",
+            "layers.31.mlp.experts.gate_proj.scales",
+            "layers.7.input_layernorm.weight",
+            "final_norm.weight",
+            "embed_tokens.weight",
+            "shared_embedding.weight",
+            "embed_tokens_per_layer.weight",
+            "per_layer_model_projection.weight",
+            "per_layer_projection_norm.weight",
+        ] {
+            assert!(already_lowered(lowered), "{lowered} is a runtime name");
+        }
+        for checkpoint in [
+            // Every decoder tensor arrives under a wrapper. That is the
+            // disjointness the identity arm rests on.
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.mlp.down_proj.weight",
+            "language_model.model.norm.weight",
+            "model.norm.weight",
+            "model.embed_tokens.weight",
+            // `lm_head.` is excluded on purpose: tied, it is NOT an identity.
+            "lm_head.weight",
+            // `layers.` without an index is not a lowered name, and neither is
+            // a bare word that merely starts with it.
+            "layers.weight",
+            "layers.attn.weight",
+            "layersomething.weight",
+            "layers.",
+        ] {
+            assert!(
+                !already_lowered(checkpoint),
+                "{checkpoint} is not a runtime name"
+            );
+        }
+    }
 
     /// The refusal that used to be pinned from Metal's C++ side
     /// (`llama_decode_step_test.cpp`), ported here when the C++ author died:

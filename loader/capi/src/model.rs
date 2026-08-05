@@ -74,7 +74,7 @@ pub struct PieLoaderModelRequest {
     /// `Naming` wire value: 0 HF, 1 MLX.
     pub naming: u32,
     /// `RuntimeQuant` wire value, already resolved against the device:
-    /// 0 none, 1 fp8, 2 int8, 3 mxfp4.
+    /// 0 none, 1 fp8, 2 int8, 3 mxfp4, 4 int4 (MLX affine, Metal's).
     pub runtime_quant: u32,
     /// `Mxfp4MoeRequest` wire value: 0 auto, 1 routed, 2 native, 3 bf16.
     pub moe_request: u32,
@@ -126,6 +126,7 @@ unsafe fn read_model_request(
                 (1, RuntimeQuant::Fp8),
                 (2, RuntimeQuant::Int8),
                 (3, RuntimeQuant::Mxfp4),
+                (4, RuntimeQuant::Int4),
             ],
             "runtime_quant",
         )

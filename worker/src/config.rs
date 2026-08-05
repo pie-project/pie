@@ -433,6 +433,20 @@ pub struct ServerConfig {
     /// debugging step -- it changes which wasmtime linker variant is built.
     #[serde(default = "default_true")]
     pub python_snapshot: bool,
+    /// Ask this boot to measure the memory planner instead of scoring it.
+    ///
+    /// Set by `pie config tune` on the config it derives in memory, never
+    /// read from a file — `#[serde(skip)]`, so it cannot be written down and
+    /// cannot outlive the boot that asked for it. See
+    /// [`CudaNativeDriverOptions::calibrate_planner`] for why a measurement
+    /// must not be a persisted setting.
+    ///
+    /// It rides here rather than in `[model.driver.options]` because that table
+    /// is the file's, and this never comes from the file. Same route as
+    /// `verbose`: a typed field the engine applies to whatever driver options it
+    /// builds.
+    #[serde(skip)]
+    pub calibrate_planner: bool,
 }
 
 impl Default for ServerConfig {
@@ -444,6 +458,7 @@ impl Default for ServerConfig {
             registry: default_registry(),
             max_concurrent_processes: None,
             python_snapshot: true,
+            calibrate_planner: false,
         }
     }
 }
@@ -839,7 +854,7 @@ impl Default for SchedulerConfig {
 /// submit simply waits for a slot and every submit re-serializes with no
 /// diagnostic at all. That silence is why this is rejected here rather than
 /// clamped: the config layer is the only place it can be caught.
-/// Public because `pie config optimize` enumerates knob candidates against
+/// Public because `pie config tune` enumerates knob candidates against
 /// this bound rather than generating combinations the engine will refuse --
 /// and a second copy of the number is exactly the disagreement this
 /// constant's own doc warns about.
@@ -1235,7 +1250,7 @@ pub struct CudaNativeDriverOptions {
     /// `kv_page_size` does — which is the point: a value measured on this
     /// machine beats one scored by a model of it.
     ///
-    /// `pie config optimize` and `calibrate_planner` are how you get a number
+    /// `pie config tune` and `calibrate_planner` are how you get a number
     /// worth pinning. A guess here is worse than absence, because absence still
     /// gets the planner's judgement.
     ///
@@ -1258,11 +1273,32 @@ pub struct CudaNativeDriverOptions {
     /// reality the driver grew per-(model, GPU) special cases carrying
     /// hand-measured constants. Setting this times the real forward body across
     /// the budget ladder on THIS device and caches the winner, so the next boot
-    /// selects by evidence instead. **Costs seconds of startup**, so it is an
-    /// action rather than a setting: turn it on, boot once, turn it off.
+    /// selects by evidence instead.
+    ///
+    /// **Not settable, and not a setting.** `pie config tune` turns it on
+    /// for the one boot it runs and never writes it anywhere; see below for why
+    /// it cannot be a key.
+    ///
+    /// It arrived as `PIE_CUDA_PLANNER_CALIBRATE`, and when the flag-deletion
+    /// rule removed that, it came back here — the choice was framed as "config
+    /// or environment variable", and both are wrong in the same way. This is not
+    /// a description of a deployment; it is one run of a measurement. Written
+    /// down, it needs the operator to perform a three-step ritual ("turn it on,
+    /// boot once, turn it off"), and forgetting the third step is not a
+    /// hypothetical failure: the planner abandons its score on a calibration
+    /// boot and builds the LARGEST forward shape it can fit, accepting the
+    /// starved KV pool that leaves, on the stated reasoning that such a boot
+    /// serves nothing. Nothing made that true. So the ritual is gone and the
+    /// third step cannot be forgotten, because there is no step to forget.
+    ///
+    /// `#[serde(skip)]` for the same reason `device` and `verbose` below are:
+    /// pie populates it, a config file does not. It also means the struct's
+    /// `deny_unknown_fields` refuses a hand-written `calibrate_planner = true`
+    /// rather than honouring it.
     ///
     /// Refused for `tensor_parallel_size > 1` and for recurrent-state models,
     /// with a reason on stderr — see `batch/planner_calibration.hpp`.
+    #[serde(skip)]
     pub calibrate_planner: bool,
     /// Dtype weights are materialized in. Separate from `activation_dtype`:
     /// narrower weights and wider compute is a normal combination.

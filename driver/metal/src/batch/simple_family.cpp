@@ -1214,6 +1214,9 @@ class LlamaEngine final : public SimpleFamilyEngine {
     bool init(RawMetalContext& ctx, const std::string& kernels_dir, const SetupConfig& cfg,
               const pie_loader::LoadPlan& load_plan, int max_ctx, std::string* err) {
         if (!llama_geometry(cfg, g_, max_ctx, err)) return false;
+        // The contract already decided this, and a config can disagree with the
+        // tensors it ships in either direction; see `plan_ties_embeddings`.
+        g_.tied_embeddings = plan_ties_embeddings(load_plan);
         max_ctx_ = max_ctx;
         g_.paged_kv_enabled = true;
         g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : 32;

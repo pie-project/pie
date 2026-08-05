@@ -11,7 +11,7 @@ use pie_engine::scheduler::{
 
 #[test]
 fn the_knobs_are_no_longer_write_once() {
-    // The regression this guards is the reason `pie config optimize` exists in
+    // The regression this guards is the reason `pie config tune` exists in
     // the shape it does. These were `OnceLock`, first-writer-wins, so a sweep
     // could measure exactly one candidate per process — which put a model-size
     // ceiling on the whole plan, because a candidate then cost whatever the

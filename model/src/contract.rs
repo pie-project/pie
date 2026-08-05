@@ -18,7 +18,7 @@
 //! `(facts, checkpoint, target, policy)` to the contract the loader
 //! compiles. Nothing here opens a file or asks a device — both of those are
 //! the caller's, which is what lets the same row serve a driver boot, an
-//! offline `pie model optimize`, and a test that authors against a fixture.
+//! offline `pie model build`, and a test that authors against a fixture.
 
 use pie_loader::checkpoint::CheckpointMetadata;
 use pie_loader::contract::ModelContract;

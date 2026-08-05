@@ -31,6 +31,30 @@ using LoadPlan = pie_loader::LoadPlan;
 inline constexpr std::uint32_t kMetalTileMapMask =
     pie_loader::kTileMapCast | pie_loader::kTileMapEncode | pie_loader::kTileMapScale;
 
+/// Did the contract tie the embedding and the head, or ship two tensors?
+///
+/// Decided ONCE, by the contract, and read back rather than decided a second
+/// time. The rule is that a shipped `lm_head` beats whatever the config says,
+/// and the config can be wrong in both directions: Qwen3.5-35B-A3B is a
+/// multimodal wrapper spelling `tie_word_embeddings` at the TOP level, outside
+/// the `text_config` its family parses, so the facts default to tied; Qwen3-
+/// 0.6B says `tie_word_embeddings: true` and then ships an `lm_head.weight`
+/// anyway. Either way the contract staged `embed_tokens` and `lm_head` while
+/// the DAG asked for `shared_embedding`, and the load stopped on "unstaged
+/// weight shared_embedding.weight" — two opinions about one fact.
+///
+/// The plan's own tensor list is the only opinion that cannot be wrong in a
+/// way the binding survives, so it is the one every family follows.
+inline bool plan_ties_embeddings(const LoadPlan& plan) {
+    const auto view = plan.view();
+    for (std::size_t i = 0; i < view.tensors.len; ++i) {
+        if (pie_loader::bytes_to_string(view.tensors.ptr[i].name) == "shared_embedding.weight") {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// This driver's storage capability. One definition, two readers: the device
 /// facts JSON published at create time, and the target spec supplied with every
 /// compile request.
@@ -89,11 +113,17 @@ inline std::string descriptor_for_testing(std::string_view model_type,
 /// them. The document travels now, so which fields matter is decided beside
 /// the authors that read them rather than at each call site.
 ///
-/// What the request does NOT carry mirrors what the Metal authors never read:
-/// no runtime quantization, no MXFP4 MoE lowering choice, no component split,
-/// no expert streaming, and none of the CUDA per-family environment knobs —
-/// zeros and defaults, stated here rather than defaulted there, so equal
-/// requests author equal contracts.
+/// What the request does NOT carry is a policy this driver has no operator
+/// knob for: no MXFP4 MoE lowering choice, no component split, no expert
+/// streaming, and none of the CUDA per-family environment knobs — zeros and
+/// defaults, stated here rather than defaulted there, so equal requests author
+/// equal contracts.
+///
+/// `runtime_quant` is zero for a reason of its own. The MLX authors DO read it
+/// now (`RuntimeQuant::Int4` encodes a float weight to affine-U4), but this
+/// driver binds what the checkpoint holds: a requantization is a decision about
+/// an artifact, made once by `pie model build --quant int4` and written
+/// down, not one to re-run over every weight on each boot.
 inline LoadPlan compile_load_plan(
     std::string_view snapshot_dir,
     const pie_loader::DeviceTarget& target,

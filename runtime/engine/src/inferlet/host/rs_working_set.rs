@@ -15,7 +15,6 @@ use crate::inferlet::host::pipeline::Pipeline;
 use crate::store::registry as store_registry;
 use crate::store::rs::RsGeometry;
 use crate::store::rs::working_set::RsWorkingSet;
-use pie_model;
 
 type WitRange = pie::inferlet::working_set::PageRange;
 

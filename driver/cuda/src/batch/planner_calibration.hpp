@@ -9,17 +9,23 @@
 // machine it is actually running on, and cache the result for the planner to
 // read on the next start (store/planner_profile_cache.hpp).
 //
-// Calibration is an explicit operator action (`[batching] calibrate_planner`
-// in the driver's startup TOML, from `[driver] calibrate_planner` in the pie
-// config), not something a serving process does behind your back — the sweep
-// costs a few seconds of startup and writes to the profile cache. A process
-// that never calibrates selects exactly as it did before.
+// Calibration is an explicit operator action (`[batching] calibrate_planner` in
+// the driver's startup TOML), not something a serving process does behind your
+// back — the sweep costs a few seconds of startup and writes to the profile
+// cache. A process that never calibrates selects exactly as it did before.
+//
+// That startup TOML is generated per boot, and stage one of `pie config tune`
+// is the only thing that ever sets the key in it. There is no key in
+// the pie config: the request is one run of a measurement, not a description of
+// a deployment, and written down it needed the operator to perform a three-step
+// ritual whose third step — turning it back off — was the one that mattered.
+// Left on, this boot serves from the arena the planner sized to be MEASURED.
 //
 // It was `PIE_CUDA_PLANNER_CALIBRATE=1` until commit b38414903 deleted the env
 // var under the flag-deletion rule and left no replacement, which made the
-// whole file unreachable. The decision it carries is a real one the code cannot
-// make for itself — whether to spend startup time measuring — so it comes back
-// as config rather than as an environment variable.
+// whole file unreachable. It came back as a pie config key, which was the same
+// mistake in a different file — env var and config were treated as the only two
+// options — and is now a command.
 
 #include <cstddef>
 

@@ -532,6 +532,15 @@ std::optional<ModelFacts> read_model_facts_from_descriptor(
     u32_of("max_position_embeddings", facts.max_model_len);
     f32_of("rope_theta", facts.rope_theta);
     f32_of("partial_rotary_factor", facts.partial_rotary_factor);
+    // The affine width and group, which the `config.json` path reads off the
+    // root `quantization` block. Leaving them zero here is not a smaller set of
+    // facts, it is a *wrong* one: every geometry defaults to `{4, 64}` and only
+    // overrides when these are non-zero, so an 8-bit checkpoint served as an
+    // artifact would be decoded by 4-bit kernels. The descriptor spells them
+    // `quant_bits` / `quant_group_size` because the schema is generated from
+    // `HfConfig`, which normalizes both quantization dialects into one pair.
+    i32_of("quant_bits", facts.quant_bits);
+    i32_of("quant_group_size", facts.quant_group_size);
 
     // The declared quantization width. `read_model_facts` took these from
     // `mlx_lm`'s bare `quantization` block, and the descriptor now carries
