@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include "model/declared/depth_window.hpp"
+#include "model/declared/value_arena.hpp"
 #include "model/declared/arms.hpp"
 #include "model/declared/weights.hpp"
 #include "batch/supergraph.hpp"
@@ -579,6 +580,13 @@ void llama_like_forward_declared(
         }
     }
     int depth_band_index = -1;
+    // The SSA value arena (`model/declared/value_arena.hpp`): values an arm
+    // asks for by id, over a workspace block. Reset once per fire; the ask
+    // order is the op order, so a value keeps its address across fires of
+    // the same plan — what a captured graph replays against.
+    declared::ValueArena values;
+    values.reset(ws.declared_values.data(), ws.declared_values.nbytes(),
+                 plan, N_fire, R_fire);
     declared::DepthWindow depth(
         declared::DepthFacts{
             .stated = depth_stated,
@@ -786,6 +794,7 @@ void llama_like_forward_declared(
         }
         if (i >= op_count) break;
         const PieForwardOp& op = plan.op(i);
+        values.begin_op(i);
         // STRUCTURAL S-4: the depth window, per op, keyed on the op's
         // OWN layer tag (the declaration's stated axis — the trace is
         // layer-unrolled while k is a runtime input, so the window is a
@@ -842,9 +851,17 @@ void llama_like_forward_declared(
                         ws.norm_x.data(), wb.require(name).data(),
                         ws.norm_y.data(), N, H, eps, stream);
                 } else {
+                    // ISLAND (value arena): the normed activation is a
+                    // TRACED VALUE, not "ws.norm_y" — that name is this
+                    // family's convention, and qwen3_5 spells the same
+                    // role `ws.norm_x`. Producer and consumer move
+                    // together; the post-norm arm above keeps its
+                    // convention until its own island moves.
                     kernels::launch_rmsnorm_bf16(
                         ws.y.data(), wb.require(name).data(),
-                        ws.norm_y.data(), N, H, eps, stream);
+                        values.slot(plan.outputs(op)[0],
+                                    plan.value(plan.outputs(op)[0])),
+                        N, H, eps, stream);
                 }
             } else if (nm.field == "q_norm") {
                 // Global qk-norm (olmo2): ONE row RMSNorm over the
@@ -959,6 +976,12 @@ void llama_like_forward_declared(
                         ws.y.data(), N, H, Hq, beta);
                 }
             } else if (nm.field == "gate_up") {
+                // The island's consumer: the same traced value the
+                // mlp_norm arm produced (pre-norm only — see there).
+                const void* const gate_up_in =
+                    post_norm ? mlp_in
+                              : values.slot(plan.inputs(op)[0],
+                                            plan.value(plan.inputs(op)[0]));
                 // The trace declares one packed matmul either way; whether
                 // the binding materialised it fused is this emitter's call,
                 // the same dispatch the hand-written `use_fused_gu` makes.
@@ -967,18 +990,18 @@ void llama_like_forward_declared(
                     !ws.gate_up_fused.empty();
                 if (gate_up_used_fused) {
                     ops::gemm_act_x_w(cublas.handle(),
-                        mlp_in,
+                        gate_up_in,
                         ops::WeightView(*layer.gate_up_proj_fused),
                         ws.gate_up_fused.data(), N, 2 * I, H);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
-                        mlp_in,
+                        gate_up_in,
                         make_weight_view(
                             &wb.require_field(nm.layer, "gate_proj", name),
                             layer.gate_proj_quant),
                         ws.gate.data(), N, I, H);
                     ops::gemm_act_x_w(cublas.handle(),
-                        mlp_in,
+                        gate_up_in,
                         make_weight_view(
                             &wb.require_field(nm.layer, "up_proj", name),
                             layer.up_proj_quant),
