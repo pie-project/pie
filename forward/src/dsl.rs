@@ -725,71 +725,127 @@ pub fn guard(m: &M, pred: crate::trace::GuardPred, then_f: impl FnOnce(), else_f
     guarded(m).arm(pred, then_f).otherwise(else_f);
 }
 
-/// Record an [`OpKind::Peel`] (A3): BOTH region closures run at trace
-/// time — the prefix over rows `[0, fast_rows)` at fire time, the tail
-/// over `[fast_rows, N)`, the split a runtime input. The returned [`Val`]s
-/// are the peel's outputs, jointly lowered: both regions' ops bind
-/// disjoint row windows of the same buffers and their own values stay
-/// region-internal.
-pub fn peel(
-    t: &Trace,
-    layer: Option<u32>,
-    shape: (Shape, DType),
-    prefix_f: impl FnOnce(),
-    tail_f: impl FnOnce(),
-) -> Val {
-    let (idx, outs) = {
-        let mut b = t.inner.borrow_mut();
-        b.set_layer(layer);
-        b.open_peel(vec![shape], crate::trace::PeelWindow::HookFreePrefix)
-    };
-    prefix_f();
-    let prefix = {
-        let b = t.inner.borrow();
-        (b.op_count_now() - idx - 1) as u32
-    };
-    tail_f();
-    let (total, _) = {
-        let b = t.inner.borrow();
-        ((b.op_count_now() - idx - 1) as u32, ())
-    };
-    t.inner.borrow_mut().close_peel(idx, prefix, total - prefix);
-    Val {
-        t: t.clone(),
-        id: outs[0],
-        layer,
+// ── The row partition ──────────────────────────────────────────────────
+
+/// WHICH ROWS of the fire an arm's statements cover
+/// (`.wiki/tart/dsl.md` ③'s `rows!(..)`).
+///
+/// A row predicate is not a deployment condition: it does not resolve at
+/// trace time and vanish, it PARTITIONS the fire. Today's tree writes
+/// both kinds as plain Rust `if`, which is why a reader cannot tell
+/// which one disappears — naming the row kind is the first half of
+/// fixing that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowPred {
+    /// Rows with nothing attached at a seam — the hook-free prefix.
+    HookFree,
+    /// Rows carrying no custom mask.
+    Unmasked,
+}
+
+impl RowPred {
+    /// The axis word today's IR carries. It is DERIVED here rather than
+    /// passed: the arm's predicate already says which rows it covers, so
+    /// stating the axis beside it was the same fact twice.
+    fn window(self) -> crate::trace::PeelWindow {
+        match self {
+            RowPred::HookFree => crate::trace::PeelWindow::HookFreePrefix,
+            RowPred::Unmasked => crate::trace::PeelWindow::UnmaskedPrefix,
+        }
     }
 }
 
-/// Record an [`OpKind::Peel`] on the UNMASKED-PREFIX axis (the spatial
-/// mask split, NS-2/NS-4): the prefix region serves the plain decode
-/// rows `[0, unmasked_prefix_rows)`, the tail the masked suffix — both
-/// run, the split a runtime input, UNPLANNED collapsing to the tail
-/// full-N (the fire-level custom dispatch as the peel's endpoint).
-/// Output-less: the peel sits inside the mask Guard arm, whose value is
-/// the attention output the regions' launches jointly bind.
-pub fn peel_masked(
+/// The arms of a [`by_rows`] partition.
+///
+/// Each arm's statements record as the arm is written — the construct is
+/// already open — and the axis word the IR carries is patched in at
+/// close from the arm's predicate.
+#[must_use = "a row partition must be closed with .rest(..)"]
+pub struct RowsCtx<'t> {
+    t: &'t Trace,
+    idx: usize,
+    prefix: Option<u32>,
+    pred: Option<RowPred>,
+}
+
+impl RowsCtx<'_> {
+    /// The rows `pred` names, and what runs over them.
+    pub fn arm(&mut self, pred: RowPred, f: impl FnOnce()) {
+        assert!(
+            self.pred.is_none(),
+            "by_rows takes one arm and a rest today — the IR's Peel is a \
+             two-region op (`.wiki/tart/dsl.md` migration step 6 flattens it)"
+        );
+        f();
+        let b = self.t.inner.borrow();
+        self.prefix = Some((b.op_count_now() - self.idx - 1) as u32);
+        drop(b);
+        self.pred = Some(pred);
+    }
+
+    /// Every other row.
+    pub fn rest(&mut self, f: impl FnOnce()) {
+        let prefix = self
+            .prefix
+            .expect("a row partition states its arm before its rest");
+        f();
+        let mut b = self.t.inner.borrow_mut();
+        let total = (b.op_count_now() - self.idx - 1) as u32;
+        b.close_peel(self.idx, prefix, total - prefix);
+        b.set_peel_window(
+            self.idx,
+            self.pred.expect("an arm was stated").window(),
+        );
+    }
+}
+
+/// THE row-partition construct (`.wiki/tart/dsl.md` ③'s `t.by_rows`):
+/// the arms' statements each cover their own rows and ALL of them run,
+/// which is what separates this from the fire-level [`GuardCtx`] chain
+/// (first matching arm wins, whole fire).
+///
+/// `shape` present makes the partition value-producing: the [`Val`] is
+/// the construct's, and each region's launches bind disjoint row windows
+/// of it, recording no SSA outputs of their own.
+///
+/// It lowers to today's [`OpKind::Peel`] — one axis word, two regions —
+/// so the goldens pin that this surface changed no traced byte. What it
+/// removes is the axis word from the call site: `peel` and `peel_masked`
+/// were two functions naming the same mechanism over two axes, and the
+/// axis is now read off the arm's predicate.
+///
+/// [`OpKind::Peel`]: crate::trace::OpKind::Peel
+pub fn by_rows(
     t: &Trace,
     layer: Option<u32>,
-    prefix_f: impl FnOnce(),
-    tail_f: impl FnOnce(),
-) {
-    let (idx, _outs) = {
+    shape: Option<(Shape, DType)>,
+    build: impl FnOnce(&mut RowsCtx<'_>),
+) -> Option<Val> {
+    let (idx, outs) = {
         let mut b = t.inner.borrow_mut();
         b.set_layer(layer);
-        b.open_peel(vec![], crate::trace::PeelWindow::UnmaskedPrefix)
+        // The axis is patched at close, once the arm has named it.
+        b.open_peel(
+            shape.into_iter().collect(),
+            crate::trace::PeelWindow::HookFreePrefix,
+        )
     };
-    prefix_f();
-    let prefix = {
-        let b = t.inner.borrow();
-        (b.op_count_now() - idx - 1) as u32
+    let mut ctx = RowsCtx {
+        t,
+        idx,
+        prefix: None,
+        pred: None,
     };
-    tail_f();
-    let total = {
-        let b = t.inner.borrow();
-        (b.op_count_now() - idx - 1) as u32
-    };
-    t.inner.borrow_mut().close_peel(idx, prefix, total - prefix);
+    build(&mut ctx);
+    assert!(
+        ctx.pred.is_some(),
+        "a row partition must state an arm and a rest"
+    );
+    outs.first().map(|&id| Val {
+        t: t.clone(),
+        id,
+        layer,
+    })
 }
 
 /// [`guard`] for declarations that carry no [`M`] (the qwen3_5 bodies

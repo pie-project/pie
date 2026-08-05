@@ -842,6 +842,16 @@ impl TraceBuilder {
         }
     }
 
+    /// Patch a peel's AXIS after its arms have run — the axis is a
+    /// consequence of the arm's row predicate ([`crate::dsl::RowPred`]),
+    /// which is only known once the arm is written.
+    pub(crate) fn set_peel_window(&mut self, peel_idx: usize, w: PeelWindow) {
+        let OpKind::Peel { window, .. } = &mut self.ops[peel_idx].kind else {
+            panic!("set_peel_window: not a peel at {peel_idx}");
+        };
+        *window = w;
+    }
+
     pub(crate) fn push_hook_site(&mut self, stage: HookStage, layer: u32, q: ValueId) {
         self.push(OpKind::HookSite { stage, layer }, vec![q], vec![]);
     }

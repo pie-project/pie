@@ -337,10 +337,8 @@ fn llama_like_cuda_text(
                         if c.head_dim_padded || (window_one && c.xqa_decode) {
                             cuda::attention_flashinfer_prefill_custom(q, &w.kv);
                         } else {
-                            dsl::peel_masked(
-                                m.trace(),
-                                Some(l),
-                                || {
+                            dsl::by_rows(m.trace(), Some(l), None, |r| {
+                                r.arm(dsl::RowPred::Unmasked, || {
                                     // The prefix states THE DEPLOYMENT'S
                                     // causal form: the planned decode
                                     // dispatch on window-one fires —
@@ -362,11 +360,11 @@ fn llama_like_cuda_text(
                                             q, &w.kv,
                                         );
                                     }
-                                },
-                                || {
+                                });
+                                r.rest(|| {
                                     cuda::attention_flashinfer_prefill_custom(q, &w.kv);
-                                },
-                            );
+                                });
+                            });
                         }
                     };
                     let attn_with_sites = |q: &Val| {
@@ -434,31 +432,34 @@ fn llama_like_cuda_text(
                             // tail — the hand-written mixed fire,
                             // launch for launch.
                             let packed = matmul(&x, &w.qkv);
-                            let q = dsl::peel(
+                            let q = dsl::by_rows(
                                 m.trace(),
                                 Some(l),
-                                attn_out_shape.clone(),
-                                || {
-                                    cuda::qkv_decode_qk_norm_rope_write_kv_region(
-                                        &packed,
-                                        &w.q_norm,
-                                        &w.k_norm,
-                                        &w.kv,
-                                        table.as_ref(),
-                                    );
+                                Some(attn_out_shape.clone()),
+                                |r| {
+                                    r.arm(dsl::RowPred::HookFree, || {
+                                        cuda::qkv_decode_qk_norm_rope_write_kv_region(
+                                            &packed,
+                                            &w.q_norm,
+                                            &w.k_norm,
+                                            &w.kv,
+                                            table.as_ref(),
+                                        );
+                                    });
+                                    r.rest(|| {
+                                        let (qt, kt, vt) = split_qkv(&packed, q_w, kv_w);
+                                        let (_qt, kt) =
+                                            cuda::qk_rmsnorm_rope(&qt, &kt, &w.q_norm, &w.k_norm);
+                                        dsl::guard(
+                                            m,
+                                            GuardPred::HasWriteDesc,
+                                            || cuda::write_kv_explicit(&kt, &vt, &w.kv),
+                                            || cuda::write_kv_to_pages(&kt, &vt, &w.kv),
+                                        );
+                                    });
                                 },
-                                || {
-                                    let (qt, kt, vt) = split_qkv(&packed, q_w, kv_w);
-                                    let (_qt, kt) =
-                                        cuda::qk_rmsnorm_rope(&qt, &kt, &w.q_norm, &w.k_norm);
-                                    dsl::guard(
-                                        m,
-                                        GuardPred::HasWriteDesc,
-                                        || cuda::write_kv_explicit(&kt, &vt, &w.kv),
-                                        || cuda::write_kv_to_pages(&kt, &vt, &w.kv),
-                                    );
-                                },
-                            );
+                            )
+                            .expect("a value-producing row partition produces its value");
                             attn_with_sites(&q);
                         });
                     } else {
