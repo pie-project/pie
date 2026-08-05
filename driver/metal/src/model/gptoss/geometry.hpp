@@ -77,6 +77,20 @@ struct GptOssGeometry {
     /// wrong text rather than as a crash.
     int router_bits = 8;
 
+    /// The attention/embedding projections' quantization width, which is a
+    /// third thing again: `mlx-community/gpt-oss-20b-MXFP4-Q8` declares a
+    /// global `{mxfp4, 4, group 32}` and then overrides `embed_tokens`, every
+    /// `q/k/v/o_proj`, every `mlp.router` and `lm_head` back to
+    /// `{affine, 8, group 64}`. Two `4`s were hardcoded against that -- the
+    /// `b_4` PSO suffix here and the `kGptOssBase` pair that builds the
+    /// prefill GEMM tables -- so an 8-bit checkpoint's projections were read
+    /// by 4-bit matvecs at half the stride. That is not a crash: it is noise
+    /// that looks like text. Solved from the staged tensors for the same
+    /// reason `router_bits` is, and by the same arithmetic -- these
+    /// projections are affine group-64 whatever their width, which is exactly
+    /// what `router_bits_from_extents` assumes.
+    int proj_bits = 4;
+
     /// The expert bank is read in the MXFP4 the checkpoint published, rather
     /// than dequantized and re-quantized to affine U4 at load. Solved the same
     /// way `router_bits` is -- from the tensors that were staged -- because

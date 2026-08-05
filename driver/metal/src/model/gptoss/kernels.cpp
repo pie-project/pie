@@ -21,6 +21,13 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // to the common one and reading the bytes at half the stride.
     const std::string router_name = "affine_qmv_tail_bias_bfloat16_gs_64_b_" +
                                     std::to_string(g.router_bits);
+    // The projections' width is the checkpoint's, not a constant: see
+    // `GptOssGeometry::proj_bits`. These entrypoints were `..._b_4` outright,
+    // which read an 8-bit checkpoint's rows at half their stride.
+    const std::string proj_name = "affine_qmv_tail_bfloat16_gs_64_b_" +
+                                  std::to_string(g.proj_bits);
+    const std::string proj_bias_name = "affine_qmv_tail_bias_bfloat16_gs_64_b_" +
+                                       std::to_string(g.proj_bits);
     const std::string sink_name = "sdpa_vector_decode_sink_bfloat16" + d;
     const std::string sink_paged_name = "sdpa_paged_decode_sink_bfloat16" + d;
     const std::string dir =
@@ -32,8 +39,8 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     };
     // bf16 throughout: the activation dtype every ported M=1 kernel already uses.
     const Spec specs[] = {
-        {"quantized_qmv.metal", "affine_qmv_tail_bfloat16_gs_64_b_4", &out.qmv_tail},
-        {"quantized_qmv.metal", "affine_qmv_tail_bias_bfloat16_gs_64_b_4", &out.qmv_tail_bias},
+        {"quantized_qmv.metal", proj_name.c_str(), &out.qmv_tail},
+        {"quantized_qmv.metal", proj_bias_name.c_str(), &out.qmv_tail_bias},
         {"quantized_qmv.metal", routed_name.c_str(), &out.qmv_routed_bias},
         {"quantized_qmv.metal", router_name.c_str(), &out.qmv_router},
         {"moe_route.metal", "router_topk_bfloat16", &out.router_topk},
