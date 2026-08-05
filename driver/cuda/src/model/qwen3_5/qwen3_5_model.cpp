@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "model/qwen3_5/declared_forward.hpp"
+#include "model/stage_hooks.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -154,6 +155,11 @@ void Qwen35Model::body(Workspace& ws,
         }
     }
 
+    // The hand-written body invokes hooks through the ambient point-first
+    // overload (stage_hooks.hpp: upstream style) — installing the fire's
+    // hooks here is what ends the merge-era dormancy. The declared walk
+    // above threads the pointer explicitly and never reads the ambient.
+    ScopedStageHooks ambient_hooks(in.stage_hooks);
     qwen3_5_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_state_,
         ws, la_ws_, kv, state_cache_,

@@ -59,6 +59,12 @@ struct Input {
     return_text: bool,
     #[serde(default)]
     wait_for_start: bool,
+    /// Attach a per-attention-layer `on_attn` counter tap to the decode pass
+    /// (a genuine hook program, numerics untouched) and return the final
+    /// count — layers-that-fired x fires. On hybrid models this is the direct
+    /// probe that the driver executes hook stages on attention layers only.
+    #[serde(default)]
+    hook_fold: bool,
     /// Accepted for input-compat; speculation is driver-side now.
     #[serde(default)]
     #[allow(dead_code)]
@@ -133,6 +139,10 @@ struct Output {
     /// reserve, build_submit] (report_timing only) — locates pre-bind time.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     prologue_us: Vec<u64>,
+    /// Final `on_attn` tap count (hook_fold only): attention-layer stage
+    /// executions summed over every settled decode fire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_fold_final: Option<u32>,
 }
 
 /// In-graph sample from `logits`: argmax at `temperature <= 0`, otherwise
@@ -170,6 +180,7 @@ struct RunResult {
     intertoken_us: Vec<u32>,
     token_monotonic_ns: Vec<u64>,
     prologue_us: Vec<u64>,
+    hook_fold_final: Option<u32>,
 }
 
 /// `run_one`, generated once per forward-pass kind.
@@ -371,6 +382,18 @@ macro_rules! define_run_one {
             let out = Channel::new([1], dtype::i32)
                 .capacity(out_capacity as u32)
                 .named("out");
+            // The tap's running count lives in a stage-only ring (`acc` —
+            // SPSC forbids a host take on a stage-taken channel), so the
+            // epilogue mirrors it into a host-Reader channel drained once
+            // per fire alongside `out`.
+            let hook_fold_chans = input.hook_fold.then(|| {
+                (
+                    Channel::from([0u32]).named("hook_fold_acc"),
+                    Channel::new([1], dtype::u32)
+                        .capacity(out_capacity as u32)
+                        .named("hook_fold_out"),
+                )
+            });
 
             // Hybrid/recurrent architectures (Qwen3.6's GDN layers, Mamba2) carry a
             // folded recurrent state per request alongside the KV pages, and the
@@ -448,6 +471,16 @@ macro_rules! define_run_one {
                     &rs_ws,
                 )
                 .context("bind decode state")?;
+                if let Some((acc, _)) = hook_fold_chans {
+                    // Take/put per attention layer: the fold keeps the stage
+                    // classifiable (a publish-only body reads as Unknown) and
+                    // the running count is the evidence the stage EXECUTED —
+                    // attention layers x fires.
+                    fwd.on_attn(move || {
+                        let prev = acc.take();
+                        acc.put(&prev + 1u32);
+                    });
+                }
                 fwd.epilogue(move || {
                     let length = kv_len.take();
                     let t = reshape(
@@ -463,6 +496,11 @@ macro_rules! define_run_one {
                     w_off.put(&length % page_size);
                     page_indptr.put(indptr(1, &page_count));
                     out.put(&t);
+                    if let Some((acc, fold_out)) = hook_fold_chans {
+                        let count = acc.take();
+                        acc.put(&count);
+                        fold_out.put(&count);
+                    }
                 });
                 Some(fwd)
             } else {
@@ -566,8 +604,13 @@ macro_rules! define_run_one {
             }
 
             let mut taken = 0usize;
+            let mut hook_fold_final: Option<u32> = None;
             while taken < submitted {
                 let t = out.take_host::<Vec<i32>>().await?;
+                if let Some((_, fold_out)) = hook_fold_chans {
+                    hook_fold_final =
+                        Some(fold_out.take_host::<u32>().await.context("fold drain")?);
+                }
                 taken += 1;
                 let Some(&t0) = t.first() else {
                     return Err("out.take: empty tensor".into());
@@ -610,6 +653,7 @@ macro_rules! define_run_one {
                 intertoken_us,
                 token_monotonic_ns,
                 prologue_us,
+                hook_fold_final,
             })
         }
     };
@@ -765,6 +809,7 @@ async fn main(input: Input) -> Result<Output> {
             intertoken_us: Vec::new(),
             token_monotonic_ns: Vec::new(),
             prologue_us: Vec::new(),
+            hook_fold_final: None,
         });
     }
 
@@ -795,5 +840,6 @@ async fn main(input: Input) -> Result<Output> {
         intertoken_us: result.intertoken_us,
         token_monotonic_ns: result.token_monotonic_ns,
         prologue_us: result.prologue_us,
+        hook_fold_final: result.hook_fold_final,
     })
 }

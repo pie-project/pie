@@ -1,5 +1,7 @@
 #include "model/qwen3_5/qwen3_5_moe_model.hpp"
 
+#include "model/stage_hooks.hpp"
+
 #include <utility>
 
 namespace pie_cuda_driver::model {
@@ -76,6 +78,9 @@ void Qwen35MoeModel::body(Workspace& ws,
                           AttentionWorkspace& attn_ws,
                           ops::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
+    // Same ambient install as the dense model: the MoE hand body's hook
+    // invocations are the point-first overload and no-op without it.
+    ScopedStageHooks ambient_hooks(in.stage_hooks);
     qwen3_5_moe_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_state_,
         ws, la_ws_, moe_ws_, kv, state_cache_,
