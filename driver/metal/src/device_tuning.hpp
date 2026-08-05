@@ -1,0 +1,68 @@
+// Per-device tuning constants.
+//
+// Every crossover in this driver was measured on one machine -- an M1 Max --
+// and then written down as a `constexpr`. That was honest while there was one
+// machine. On an M4 Pro the same constants are wrong in the direction that
+// costs the most: the GEMM crossover sits three rows too high, so the batches
+// where the GEMM already wins are still served by the GEMV.
+//
+// The rule this file exists to keep: a DEFAULT-CONSTRUCTED `DeviceTuning`
+// reproduces the M1 numbers EXACTLY. Adding a device may never change what an
+// unrecognised one does, and a machine this file has never heard of gets the
+// constants that were measured rather than an extrapolation. Overrides are
+// per-generation and each carries the measurement that justifies it.
+
+#pragma once
+
+#include <cstdint>
+
+namespace pie::metal {
+
+/// What the driver knows about the GPU it is running on. Queried once and
+/// cached; every field has a value on every path, including the one where the
+/// query fails.
+struct DeviceInfo {
+    /// `MTLGPUFamilyApple<N>`, resolved NEWEST-FIRST: the families are
+    /// cumulative, so an M4 answers `supportsFamily:` for Apple7 as well as
+    /// Apple9 and an oldest-first probe would call every Apple Silicon device
+    /// an Apple7. 0 when no Metal device answered.
+    int apple_family = 0;
+    /// From IOKit's `gpu-core-count`, which is the only place the count is
+    /// published -- `MTLDevice` does not expose it. 0 when absent.
+    int gpu_core_count = 0;
+};
+
+/// The tuned constants, defaulted to the M1 Max measurements.
+struct DeviceTuning {
+    /// The batch at which the ported steel GEMM overtakes the batched GEMV.
+    ///
+    /// M1 Max: 12. Measured -- pie's per-step cost beats mlx-lm's at every
+    /// batch up to 8 with the GEMV and only loses above it.
+    ///
+    /// M4 Pro (Apple9, 20 cores): 8. Measured on gemma-4-E4B, same binary,
+    /// alternating order: 12 -> 169.07 tok/s, 8 -> 176.14. The M4's wider
+    /// per-core matrix throughput moves the crossover down; the GEMV's
+    /// advantage at small N is a memory-bound one and does not.
+    int qmm_min_batch = 12;
+};
+
+/// The platform query. `device_tuning_apple.mm` on Apple, a stub in
+/// `device_tuning.cpp` elsewhere. Call `device_info()` instead; this is the
+/// seam, not the accessor.
+DeviceInfo query_device_info();
+
+/// The device this process is running on. Queried once on first call.
+const DeviceInfo& device_info();
+
+/// The tuning for this device. Queried once on first call.
+///
+/// `PIE_METAL_QMM_MIN_BATCH` overrides `qmm_min_batch` for a run, which is how
+/// the crossover above was measured: a rebuild between arms is a different
+/// binary, and a different binary is a different measurement.
+const DeviceTuning& device_tuning();
+
+/// The GEMM crossover for this device. A function and not a constant because
+/// it is a property of the machine; see `DeviceTuning::qmm_min_batch`.
+int qmm_min_batch();
+
+}  // namespace pie::metal

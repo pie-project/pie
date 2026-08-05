@@ -26,11 +26,11 @@ namespace pie::metal::gemma4 {
 
 int gemma4_qmm_rows(int rows) {
     const int n = rows < 1 ? 1 : rows;
-    // `kQmmMinBatch` is qwen3.5's crossover between the GEMV and the GEMM, and
+    // `qmm_min_batch()` is qwen3.5's crossover between the GEMV and the GEMM, and
     // this family inherits it. MEASURED here rather than assumed: lowering it
     // to 4, so the GEMM engages at 8 rows instead of 12, costs gemma4 17%
     // (8 lanes, 128.5 -> 106.5 tok/s). The inherited number holds.
-    if (n < kQmmMinBatch) return n;
+    if (n < qmm_min_batch()) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }

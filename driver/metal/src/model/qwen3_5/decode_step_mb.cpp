@@ -90,7 +90,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // whatever the last fire left in it.
         //
         // It survived because the split only engages at `qmm_bn != 0`, which
-        // needs a batch of at least `kQmmMinBatch`, and nothing fired one until
+        // needs a batch of at least `qmm_min_batch()`, and nothing fired one until
         // the throughput harness did. With the harness's fleet check it is a
         // one-line reproduction: sixteen copies of one prompt in one fire
         // answer 74088 and 1125 at step 0 with the split on, and agree with the
