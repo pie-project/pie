@@ -41,6 +41,19 @@ fn container_has_attention_stages(
         .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
 }
 
+/// Whether the pass carries a `lora` sink — the region table's LORA
+/// signature (an adapter fire batches, but its region must say so, so the
+/// driver's plans see the axis).
+fn container_has_lora_sink(container: &pie_ir::container::TraceContainer) -> bool {
+    container.stages.iter().flat_map(|s| s.ops.iter()).any(|op| {
+        matches!(
+            op,
+            pie_ir::op::Op::SinkCall { name, .. }
+                if container.names.get(*name as usize).map(String::as_str) == Some("lora")
+        )
+    })
+}
+
 pub mod context;
 pub mod geometry;
 pub mod kv;
@@ -1472,9 +1485,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let ticket_reservation = TicketReservation::new(&cells, &accesses);
         ticket_reservation.apply_to(&mut req);
         
-        let hook_program = {
+        let (hook_program, lora_program) = {
             let p = ctx.resources().get(&fwd)?;
-            container_has_attention_stages(&p.instance.program.bound.container)
+            let container = &p.instance.program.bound.container;
+            (
+                container_has_attention_stages(container),
+                container_has_lora_sink(container),
+            )
         };
         let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
             &scheduler,
@@ -1490,7 +1507,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             rs_copy_dst,
             frame,
             timing_enabled,
-        hook_program)
+        hook_program,
+        lora_program)
         .err()
         .map(|error| format!("{error:#}"));
         if let Some(error) = submit_error {
@@ -2775,9 +2793,13 @@ async fn fire_device_geometry<C: FireContext>(
     ticket_reservation.apply_to(&mut req);
     let last_page_len = if pages.is_empty() { 0 } else { page_size };
     
-        let hook_program = {
+        let (hook_program, lora_program) = {
             let p = ctx.resources().get(&fwd)?;
-            container_has_attention_stages(&p.instance.program.bound.container)
+            let container = &p.instance.program.bound.container;
+            (
+                container_has_attention_stages(container),
+                container_has_lora_sink(container),
+            )
         };
         let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
@@ -2793,7 +2815,8 @@ async fn fire_device_geometry<C: FireContext>(
         rs_copy_dst,
         frame,
         timing_enabled,
-        hook_program)
+        hook_program,
+        lora_program)
     .err()
     .map(|error| format!("{error:#}"));
     if let Some(error) = submit_error {

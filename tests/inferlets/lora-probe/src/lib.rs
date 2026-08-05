@@ -21,7 +21,7 @@
 //! packed layout — the algebra proof only needs one site. `v` is the
 //! documented next step.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
@@ -123,11 +123,11 @@ fn pattern(i: u32, salt: u32, amp: f32) -> f32 {
 /// One sampling step: temperature, then a Gumbel-max draw over the full
 /// vocab. Byte-for-byte the naive-baseline step — the comparison depends on
 /// it.
-fn step(logits: Tensor, temperature: f32, rng_state: impl AsTensor + Copy) -> Tensor {
+fn step(logits: Tensor, temperature: f32, rng_state: &Tensor) -> Tensor {
     let scaled = if temperature == 1.0 {
         logits
     } else {
-        div(&logits, temperature)
+        &logits / temperature
     };
     gumbel_max(scaled, rng_state)
 }
@@ -150,7 +150,7 @@ async fn main(input: Input) -> Result<Output> {
     #[allow(non_snake_case)]
     let D_OUT: u32 = input.d_out.unwrap_or(DEF_D_OUT);
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -292,21 +292,23 @@ async fn main(input: Input) -> Result<Output> {
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
-            ..,
-            ..,
-            &kv_len_p,
-            &pages_p,
-            &page_indptr_p,
-            &w_slot_p,
-            &w_off_p,
-            &positions_p,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: None,
+            },
         )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
-            let r_next = add(&r, iota(2));
+            let r_next = &r + iota(2);
             tok_out_p.put(&token);
             rng_p.put(&r_next);
         });
@@ -316,10 +318,9 @@ async fn main(input: Input) -> Result<Output> {
             .map_err(|e| format!("prefill submit @{base}: {e}"))?;
 
         g0 = tok_out_p
-            .take()
-            .get::<i32>()
+            .take_host::<i32>()
             .await
-            .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
+            .map_err(|e| format!("g0 take @{base}: {e}"))?;
     }
     generated.push(g0 as u32);
 
@@ -391,33 +392,34 @@ async fn main(input: Input) -> Result<Output> {
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
-            page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
+            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             rng.put(&r_next);
         });
@@ -425,10 +427,9 @@ async fn main(input: Input) -> Result<Output> {
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?;
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })

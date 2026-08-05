@@ -124,6 +124,7 @@ fn build_model(
                 has_kv_envelopes: g.caps.has_kv_envelopes,
                 has_attn_page_mask: g.caps.has_attn_page_mask,
                 has_attn_score: g.caps.has_attn_score,
+                has_lora: g.caps.has_lora,
                 device_geometry_port_mask: g.caps.device_geometry_port_mask,
                 limits: pie_engine::driver::SchedulerLimits {
                     max_forward_requests: g.caps.max_forward_requests as usize,

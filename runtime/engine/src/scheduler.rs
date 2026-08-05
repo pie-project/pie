@@ -1173,6 +1173,7 @@ pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
         None,
         fire_timing_request_enabled(Some(pipeline_id)),
         /*hook_program=*/false,
+        /*lora_program=*/false,
     )
 }
 
@@ -1192,6 +1193,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     frame: Option<FrameStamp>,
     timing_enabled: bool,
     hook_program: bool,
+    lora_program: bool,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
         src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
@@ -1214,6 +1216,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         frame,
         timing_enabled,
         hook_program,
+        lora_program,
     )
 }
 

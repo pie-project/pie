@@ -170,6 +170,7 @@ pub struct DriverConfig {
     pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
+    pub has_lora: bool,
     pub device_geometry_port_mask: u32,
     pub limits: crate::driver::SchedulerLimits,
     pub driver_backend: crate::driver::DriverBackend,
@@ -311,10 +312,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         }
     };
     let ptir_caps = model::PtirCaps {
-        // tart: the span-grouped adapter capability. DORMANT on the
-        // 0.3 surface until the adapter re-port (the upstream
-        // DriverConfig does not carry the handshake bit yet).
-        has_lora: false,
+        // tart: the span-grouped adapter capability, re-threaded onto
+        // the 0.3 handshake (driver context.cpp reports it; the worker
+        // translate carries it; every driver must honour the sink for
+        // the engine to advertise it).
+        has_lora: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_lora),
         has_mtp_logits: !driver_configs.is_empty()
             && driver_configs.iter().all(|d| d.has_mtp_logits),
         has_mtp_drafts: !driver_configs.is_empty()

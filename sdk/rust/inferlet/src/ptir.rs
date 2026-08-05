@@ -863,6 +863,93 @@ impl PassWit for wit_hybrid::ForwardPass {
     }
 }
 
+/// The PEFT adapter surface's expression vocabulary
+/// ([`Pass::adapter`]): a tiny CLOSED language over the site's input `x`
+/// and base output `y`, classified — never interpreted — into the
+/// driver's CORRECTION lowerings. `mm` multiplies by a channel-borne
+/// weight; `+` composes. Scale/bias join with their forms. (0.3 re-port
+/// of the 0.2 surface; lowering is guest-side into prologue sinks, so no
+/// WIT change rides along.)
+pub mod adapter {
+    use super::Channel;
+
+    /// Model projection sites, the llama-like bit vocabulary
+    /// (driver/cuda/src/model/lora.hpp `LoraSite` — placement is
+    /// structure; the driver refuses unconsumed sites loudly).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Site {
+        Q,
+        K,
+        V,
+        O,
+        GateUp,
+        Down,
+    }
+
+    impl Site {
+        pub fn bit(self) -> u32 {
+            match self {
+                Site::Q => 1 << 0,
+                Site::K => 1 << 1,
+                Site::V => 1 << 2,
+                Site::O => 1 << 3,
+                Site::GateUp => 1 << 4,
+                Site::Down => 1 << 5,
+            }
+        }
+    }
+
+    /// One adapter expression node. Built by the closure, consumed by
+    /// the classifier; never executed directly.
+    pub struct Expr {
+        pub(crate) kind: ExprKind,
+    }
+
+    pub(crate) enum ExprKind {
+        X,
+        Y,
+        Mm(Channel, Box<Expr>),
+        Add(Box<Expr>, Box<Expr>),
+        Scale(Channel, Box<Expr>),
+    }
+
+    impl Expr {
+        pub(crate) fn x() -> Self {
+            Expr { kind: ExprKind::X }
+        }
+        pub(crate) fn y() -> Self {
+            Expr { kind: ExprKind::Y }
+        }
+    }
+
+    /// `mm(w, e)` — multiply the expression by the channel-borne weight
+    /// (the channel's leading dim is the layer axis; rank rides its
+    /// shape).
+    pub fn mm(w: &Channel, e: Expr) -> Expr {
+        Expr {
+            kind: ExprKind::Mm(*w, Box::new(e)),
+        }
+    }
+
+    /// `scale(e, l)` — elementwise multiply by the channel-borne vector
+    /// `l: [num_layers, d_out]` (IA3's form; any static scale folds into
+    /// `l`'s contents).
+    pub fn scale(e: Expr, l: &Channel) -> Expr {
+        Expr {
+            kind: ExprKind::Scale(*l, Box::new(e)),
+        }
+    }
+
+    impl std::ops::Add for Expr {
+        type Output = Expr;
+        fn add(self, rhs: Expr) -> Expr {
+            Expr {
+                kind: ExprKind::Add(Box::new(self), Box::new(rhs)),
+            }
+        }
+    }
+}
+
 /// The forward-pass builder over the `W` interface. Guests name it through the
 /// per-interface aliases in [`attention`] / [`recurrent`] / [`hybrid`], which
 /// is what makes a cross-kind helper a COMPILE error rather than a silent
@@ -880,6 +967,8 @@ struct ForwardInner {
     attention_ws: Option<Rc<KvWorkingSet>>,
     rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
     program_attached: bool,
+    adapter_lowrank_sites: u32,
+    adapter_scale_sites: u32,
 }
 
 /// A [`KvGeometry`] with its ports claimed and its channels resolved to WIT
@@ -1080,6 +1169,8 @@ impl<W: PassWit> Pass<W> {
                 attention_ws: None,
                 rs_working_sets: Vec::new(),
                 program_attached: false,
+                adapter_lowrank_sites: 0,
+                adapter_scale_sites: 0,
             }),
         }
     }
@@ -1255,6 +1346,126 @@ impl<W: PassWit> Pass<W> {
     }
 
     /// Attach the `prologue` stage (overview §5.3).
+    /// Attach a PEFT adapter at `site`: `f` receives the site's input `x`
+    /// and base output `y` and returns the corrected output as an
+    /// [`adapter`] expression. v0 lowers three forms — LoRA
+    /// `y + mm(b, mm(a, x))`, IA3 `scale(y, l)`, and the DoRA composite
+    /// `scale(y + mm(b, mm(a, x)), s)` — into prologue sinks the driver
+    /// resolves per layer. One adapter per site per pass.
+    pub fn adapter(
+        &self,
+        site: adapter::Site,
+        f: impl FnOnce(adapter::Expr, adapter::Expr) -> adapter::Expr,
+    ) -> Result<(), String> {
+        use adapter::ExprKind as K;
+        let expr = f(adapter::Expr::x(), adapter::Expr::y());
+        // DoRA: scale(y + mm(b, mm(a, x)), s) — the composite lowers to
+        // the low-rank sink THEN the scale sink on the same site (the
+        // driver applies every scale after every delta).
+        if let K::Scale(l, inner) = &expr.kind {
+            if let K::Add(lhs, rhs) = &inner.kind {
+                let delta = match (&lhs.kind, &rhs.kind) {
+                    (K::Y, _) => &rhs.kind,
+                    (_, K::Y) => &lhs.kind,
+                    _ => &inner.kind, // falls to the refusal below
+                };
+                if let K::Mm(b, mid) = delta {
+                    if let K::Mm(a, x) = &mid.kind {
+                        if matches!(x.kind, K::X) {
+                            let (a, b, l) = (*a, *b, *l);
+                            {
+                                let mut st = self.inner.borrow_mut();
+                                if (st.adapter_lowrank_sites | st.adapter_scale_sites)
+                                    & site.bit()
+                                    != 0
+                                {
+                                    return Err(format!(
+                                        "adapter: site {site:?} already carries an \
+                                         adapter on this pass"
+                                    ));
+                                }
+                                st.adapter_lowrank_sites |= site.bit();
+                                st.adapter_scale_sites |= site.bit();
+                            }
+                            self.prologue(move || {
+                                intrinsics::kernel::lora(
+                                    a.read(),
+                                    b.read(),
+                                    Tensor::constant(site.bit()),
+                                );
+                                intrinsics::kernel::adapter_scale(
+                                    l.read(),
+                                    Tensor::constant(site.bit()),
+                                );
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        // The SCALE form (IA3): scale(y, l) — lowered to the 2-argument
+        // adapter sink.
+        if let K::Scale(l, inner) = &expr.kind {
+            if matches!(inner.kind, K::Y) {
+                let l = *l;
+                {
+                    let mut inner_state = self.inner.borrow_mut();
+                    if inner_state.adapter_scale_sites & site.bit() != 0 {
+                        return Err(format!(
+                            "adapter: site {site:?} already carries a scale on \
+                             this pass"
+                        ));
+                    }
+                    inner_state.adapter_scale_sites |= site.bit();
+                }
+                self.prologue(move || {
+                    intrinsics::kernel::adapter_scale(
+                        l.read(),
+                        Tensor::constant(site.bit()),
+                    );
+                });
+                return Ok(());
+            }
+        }
+        let (lhs, rhs) = match expr.kind {
+            K::Add(l, r) => (*l, *r),
+            _ => {
+                return Err("adapter: form not lowerable (v0 lowers the low-rank \
+                     form `y + mm(b, mm(a, x))` only)"
+                    .to_string());
+            }
+        };
+        let delta = match (&lhs.kind, &rhs.kind) {
+            (K::Y, _) => rhs.kind,
+            (_, K::Y) => lhs.kind,
+            _ => return Err("adapter: the base output `y` must be one addend".to_string()),
+        };
+        let (b, a) = match delta {
+            K::Mm(b, inner) => match inner.kind {
+                K::Mm(a, x) if matches!(x.kind, K::X) => (b, a),
+                _ => return Err("adapter: the delta must be mm(b, mm(a, x))".to_string()),
+            },
+            _ => return Err("adapter: the delta must be mm(b, mm(a, x))".to_string()),
+        };
+        {
+            // One pair per SITE (the per-site rung): each call emits its
+            // own lora sink; the driver enforces the same disjointness at
+            // resolution.
+            let mut inner = self.inner.borrow_mut();
+            if inner.adapter_lowrank_sites & site.bit() != 0 {
+                return Err(format!(
+                    "adapter: site {site:?} already carries an adapter on this pass"
+                ));
+            }
+            inner.adapter_lowrank_sites |= site.bit();
+        }
+        self.prologue(move || {
+            intrinsics::kernel::lora(a.read(), b.read(), Tensor::constant(site.bit()));
+        });
+        Ok(())
+    }
+
     pub fn prologue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Prologue, body);
     }
