@@ -21,6 +21,9 @@ struct Input {
     /// Maximum number of tokens to generate.
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
+    /// tart: optional layer truncation (layerskip-draft class).
+    #[serde(default)]
+    max_layers: Option<u32>,
     /// System message for the assistant.
     #[serde(default = "default_system")]
     system: String,
@@ -127,6 +130,9 @@ async fn main(input: Input) -> Result<String> {
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
         let fwd_p = ForwardPass::new();
+        if let Some(k) = input.max_layers {
+            fwd_p.set_max_layers(k).map_err(|e| e.to_string())?;
+        }
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
@@ -198,6 +204,9 @@ async fn main(input: Input) -> Result<String> {
     let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
 
     let fwd = ForwardPass::new();
+    if let Some(k) = input.max_layers {
+        fwd.set_max_layers(k).map_err(|e| e.to_string())?;
+    }
     fwd.embed(&tok_in, &lane1)?;
     fwd.attention(
         &ws,

@@ -247,8 +247,13 @@ fn planned_region_table(
             | u32::from(req.hook_program) * pie_driver_abi::PIE_REGION_SIG_HOOK
             | u32::from(req.request.has_user_mask)
                 * pie_driver_abi::PIE_REGION_SIG_MASK
+            | u32::from(req.request.max_layers.is_some())
+                * pie_driver_abi::PIE_REGION_SIG_TRUNCATED
             | u32::from(req.lora_program) * pie_driver_abi::PIE_REGION_SIG_LORA;
-        let k = pie_driver_abi::PIE_MAX_LAYERS_FULL;
+        let k = req
+            .request
+            .max_layers
+            .unwrap_or(pie_driver_abi::PIE_MAX_LAYERS_FULL);
         let end = row_indptr[member + 1];
         if sigs.last() == Some(&sig) && ks.last() == Some(&k) {
             *indptr.last_mut().expect("indptr starts nonempty") = end;
@@ -343,10 +348,8 @@ pub(crate) fn build_frame_submission(
                 hook_program: req.hook_program,
                 lora: req.lora_program,
                 custom_mask: req.request.has_user_mask,
-                // Depth facts await the set-max-layers 0.3 re-port
-                // (step 2): no truncation is expressible yet.
-                truncated: false,
-                max_layers: None,
+                truncated: req.request.max_layers.is_some(),
+                max_layers: req.request.max_layers,
                 multi_token: req
                     .request
                     .qo_indptr

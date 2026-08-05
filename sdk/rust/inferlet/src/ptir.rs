@@ -777,6 +777,9 @@ pub trait PassWit: Sized + 'static {
 
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String>;
 
+    /// tart (0.3 re-port): the pass's layer truncation.
+    fn set_max_layers(&self, max_layers: u32) -> Result<(), String>;
+
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
 
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
@@ -795,6 +798,10 @@ impl PassWit for wit_attention::ForwardPass {
     }
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
         wit_attention::ForwardPass::readout(self, indices)
+    }
+    fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
+        wit_attention::ForwardPass::set_max_layers(self, max_layers)
+            .map_err(|e| e.to_string())
     }
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_attention::ForwardPass::program(self, bytes, channels)
@@ -818,6 +825,10 @@ impl PassWit for wit_recurrent::ForwardPass {
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
         wit_recurrent::ForwardPass::readout(self, indices)
     }
+    fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
+        wit_recurrent::ForwardPass::set_max_layers(self, max_layers)
+            .map_err(|e| e.to_string())
+    }
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_recurrent::ForwardPass::program(self, bytes, channels)
     }
@@ -839,6 +850,10 @@ impl PassWit for wit_hybrid::ForwardPass {
     }
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
         wit_hybrid::ForwardPass::readout(self, indices)
+    }
+    fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
+        wit_hybrid::ForwardPass::set_max_layers(self, max_layers)
+            .map_err(|e| e.to_string())
     }
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_hybrid::ForwardPass::program(self, bytes, channels)
@@ -1230,6 +1245,13 @@ impl<W: PassWit> Pass<W> {
             .ports
             .push((Port::Readout, claim_port(Port::Readout, indices)));
         Ok(())
+    }
+
+    /// tart (0.3 re-port): run only the first `max_layers` transformer
+    /// layers for this pass's fires and take the head there (the
+    /// layerskip-draft / logit-lens class). Call before `program`.
+    pub fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
+        self.wit.set_max_layers(max_layers)
     }
 
     /// Attach the `prologue` stage (overview §5.3).

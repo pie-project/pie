@@ -162,6 +162,12 @@ interface forward-recurrent {
         /// Bind an optional readout-index channel separately from embedding.
         readout: func(indices: borrow<channel>) -> result<_, error>;
 
+        /// tart (0.3 re-port): run only the first `max-layers` transformer
+        /// layers and take the head there. Zero rejected; unset = full
+        /// model. On recurrent/hybrid passes the truncation covers the
+        /// whole backbone prefix [0, max-layers).
+        set-max-layers: func(max-layers: u32) -> result<_, error>;
+
         /// Attach canonical PTIR bytes and channel handles in dense declaration
         /// order. Validation uses the engine-owned ModelProfile, and now also
         /// rejects any stage this interface does not admit -- see the per-file

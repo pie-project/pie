@@ -1270,6 +1270,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         req.dense_device_mask = dense_mask;
         req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
             && req.qo_indptr.windows(2).all(|lane| lane[1] - lane[0] == 1);
+        // tart (0.3 re-port step 2): the pass's layer truncation rides
+        // every fire; the scheduler's region table carries it to the
+        // driver as per-region k.
+        req.max_layers = {
+            let p = ctx.resources().get(&fwd)?;
+            p.max_layers
+        };
         attn_mask.apply_to(&mut req);
         crate::pipeline::offload::try_encode(&mut req).await;
         // Resource preparation is independent of token position: realize the

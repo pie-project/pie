@@ -545,13 +545,29 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
+    async fn core_set_max_layers(
+        &mut self,
+        this: Resource<ForwardPass>,
+        max_layers: u32,
+    ) -> Anyhow<Result<(), String>> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if max_layers == 0 {
+            return Ok(Err("max-layers must be at least 1".to_string()));
+        }
+        pass.bindings.max_layers = Some(max_layers);
+        Ok(Ok(()))
+    }
+
     async fn core_program(
         &mut self,
         this: Resource<ForwardPass>,
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (embed, attention, readout, rs_working_sets, rs_fold_len, rs_fold_len_rep) = {
+        let (embed, attention, readout, rs_working_sets, rs_fold_len, rs_fold_len_rep, pass_max_layers) = {
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -578,6 +594,7 @@ impl ProcessCtx {
                     .collect::<Vec<Resource<RsWorkingSet>>>(),
                 pass.bindings.rs_fold_len.clone(),
                 pass.bindings.rs_geom.map(|geom| geom.fold_len),
+                pass.bindings.max_layers,
             )
         };
         let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
@@ -1055,6 +1072,7 @@ impl ProcessCtx {
                 fires: None,
                 kv_ws: ws_rep,
                 kv_declaration: crate::pipeline::instance::KvDeclaration { readable, writable },
+                max_layers: pass_max_layers,
                 rs_ws: rs_reps,
                 rs_fold_len,
                 kv_declaration_realized: false,
@@ -1312,6 +1330,14 @@ macro_rules! forward_pass_common {
             indices: Resource<Channel>,
         ) -> Anyhow<Result<(), String>> {
             self.core_readout(this, indices).await
+        }
+
+        async fn set_max_layers(
+            &mut self,
+            this: Resource<ForwardPass>,
+            max_layers: u32,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_set_max_layers(this, max_layers).await
         }
 
         async fn program(

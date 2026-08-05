@@ -73,6 +73,10 @@ pub struct LaunchPlan {
     pub single_token_mode: bool,
     pub device_resolved_geometry: bool,
     pub has_user_mask: bool,
+    /// tart STRUCTURAL v0/S-2 (0.3 re-port): the pass's layer truncation
+    /// (`set-max-layers`). Engine-internal — it crosses the driver ABI as
+    /// the region table's per-region k, never as a scalar word.
+    pub max_layers: Option<u32>,
     /// The program binds an `AttnMask` descriptor port to a CHANNEL, so the
     /// driver resolves a dense per-cell mask pre-forward. Such a fire must be
     /// submitted SOLO: a multi-program batch cannot merge one program's dense

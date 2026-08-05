@@ -209,6 +209,9 @@ pub struct ForwardBindings {
     /// ON DEVICE and only the driver ever resolves it. The host then plans
     /// against its own upper bound and marks the boundary indeterminate.
     pub rs_fold_len: Option<Vec<u32>>,
+    /// tart (0.3 re-port step 2): run layers [0, k) and take the head at
+    /// k for this pass's fires. None = full model.
+    pub max_layers: Option<u32>,
 }
 
 /// Where a fire's folded boundary lands — the host mirror of WIT
@@ -350,6 +353,10 @@ pub struct BoundForwardPass {
     /// borrow convention); the pass does NOT destroy it on drop.
     pub kv_ws: u32,
     pub kv_declaration: KvDeclaration,
+    /// tart (0.3 re-port step 2): the pass's layer truncation, copied
+    /// from [`ForwardBindings::max_layers`] at bind; stamped onto every
+    /// fire's [`crate::driver::LaunchPlan`].
+    pub max_layers: Option<u32>,
     /// Guest-owned recurrent-state working sets (hybrid / linear-attention
     /// models — GDN, Mamba2), in resolved forward-request order. Empty for
     /// pure-attention models.
@@ -1159,6 +1166,7 @@ mod tests {
                 fires: None,
                 kv_ws: 0,
                 kv_declaration: KvDeclaration::all(),
+                max_layers: None,
                 rs_ws: Vec::new(),
                 rs_fold_len: None,
                 kv_declaration_realized: false,

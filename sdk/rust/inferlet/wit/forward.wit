@@ -85,6 +85,14 @@ interface forward {
         /// Bind an optional readout-index channel separately from embedding.
         readout: func(indices: borrow<channel>) -> result<_, error>;
 
+        /// tart STRUCTURAL v0 (re-ported to 0.3): run only the first
+        /// `max-layers` transformer layers for this pass's fires and take
+        /// the head there (the layerskip-draft / logit-lens class).
+        /// Values at or above the model's depth are the identity; zero is
+        /// rejected. Unset = the full model. Mixed-depth co-fires run as
+        /// banded depth when the deployment supports it.
+        set-max-layers: func(max-layers: u32) -> result<_, error>;
+
         /// Attach canonical PTIR bytes and channel handles in dense declaration
         /// order. Validation uses the engine-owned ModelProfile, and now also
         /// rejects any stage this interface does not admit -- see the per-file
