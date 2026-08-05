@@ -10,121 +10,20 @@ use crate::instruct::{
 use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
-static TEMPLATE: &str = r#"
-{%- if not add_generation_prompt is defined %}
-    {%- set add_generation_prompt = false %}
-{%- endif %}
-{%- set ns = namespace(is_first=false, is_tool=false, is_output_first=true, system_prompt='', is_first_sp=true, is_last_user=false) %}
-{%- for message in messages %}
-    {%- if message['role'] == 'system' %}
-        {%- if ns.is_first_sp %}
-            {%- set ns.system_prompt = ns.system_prompt + message['content'] %}
-            {%- set ns.is_first_sp = false %}
-        {%- else %}
-            {%- set ns.system_prompt = ns.system_prompt + '\n\n' + message['content'] %}
-        {%- endif %}
-    {%- endif %}
-{%- endfor %}
-{%- if tools is defined and tools is not none %}
-    {%- set tool_ns = namespace(text='You are a helpful assistant with tool calling capabilities. ' + 'When a tool call is needed, you MUST use the following format to issue the call:\n' + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>FUNCTION_NAME\n' + '```json\n{"param1": "value1", "param2": "value2"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>\n\n' + 'Make sure the JSON is valid.' + '## Tools\n\n### Function\n\nYou have the following functions available:\n\n') %}
-    {%- for tool in tools %}
-        {%- set tool_ns.text = tool_ns.text + '\n```json\n' + (tool | tojson) + '\n```\n' %}
-    {%- endfor %}
-    {%- if ns.system_prompt|length != 0 %}
-        {%- set ns.system_prompt = ns.system_prompt + '\n\n' + tool_ns.text %}
-    {%- else %}
-        {%- set ns.system_prompt = tool_ns.text %}
-    {%- endif %}
-{%- endif %}
-{{- bos_token }}
-{{- ns.system_prompt }}
-{%- set last_index = (messages|length - 1) %}
-{%- for message in messages %}
-    {%- set content = message['content'] %}
-    {%- if message['role'] == 'user' %}
-        {%- set ns.is_tool = false -%}
-        {%- set ns.is_first = false -%}
-        {%- set ns.is_last_user = true -%}
-        {%- if loop.index0 == last_index %}
-            {{- '<｜User｜>' + content }}
-        {%- else %}
-            {{- '<｜User｜>' + content + '<｜Assistant｜>'}}
-        {%- endif %}
-    {%- endif %}
-    {%- if message['role'] == 'assistant' %}
-        {%- if '</think>' in content %}
-            {%- set content = (content.split('</think>')|last) %}
-        {%- endif %}
-    {%- endif %}
-    {%- if message['role'] == 'assistant' and message['tool_calls'] is defined and message['tool_calls'] is not none %}
-        {%- set ns.is_last_user = false -%}
-        {%- if ns.is_tool %}
-            {{- '<｜tool▁outputs▁end｜>'}}
-        {%- endif %}
-        {%- set ns.is_first = false %}
-        {%- set ns.is_tool = false -%}
-        {%- set ns.is_output_first = true %}
-        {%- for tool in message['tool_calls'] %}
-            {%- set arguments = tool['function']['arguments'] %}
-            {%- if arguments is not string %}
-                {%- set arguments = arguments|tojson %}
-            {%- endif %}
-            {%- if not ns.is_first %}
-                {%- if content is none %}
-                    {{- '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + arguments + '\n' + '```' + '<｜tool▁call▁end｜>'}}
-                }
-                {%- else %}
-                    {{- content + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + arguments + '\n' + '```' + '<｜tool▁call▁end｜>'}}
-                {%- endif %}
-                {%- set ns.is_first = true -%}
-            {%- else %}
-                {{- '\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + arguments + '\n' + '```' + '<｜tool▁call▁end｜>'}}
-            {%- endif %}
-        {%- endfor %}
-        {{- '<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}
-    {%- endif %}
-    {%- if message['role'] == 'assistant' and (message['tool_calls'] is not defined or message['tool_calls'] is none) %}
-        {%- set ns.is_last_user = false -%}
-        {%- if ns.is_tool %}
-            {{- '<｜tool▁outputs▁end｜>' + content + '<｜end▁of▁sentence｜>'}}
-            {%- set ns.is_tool = false -%}
-        {%- else %}
-            {{- content + '<｜end▁of▁sentence｜>'}}
-        {%- endif %}
-    {%- endif %}
-    {%- if message['role'] == 'tool' %}
-        {%- set ns.is_last_user = false -%}
-        {%- set ns.is_tool = true -%}
-        {%- if ns.is_output_first %}
-            {{- '<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}
-            {%- set ns.is_output_first = false %}
-        {%- else %}
-            {{- '\n<｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}
-        {%- endif %}
-    {%- endif %}
-{%- endfor -%}
-{%- if ns.is_tool %}
-    {{- '<｜tool▁outputs▁end｜>'}}
-{%- endif %}
-{#- if add_generation_prompt and not ns.is_last_user and not ns.is_tool #}
-{%- if add_generation_prompt and not ns.is_tool %}
-    {{- '<｜Assistant｜>'}}
-{%- endif %}"#;
+// The implementation below mirrors the published DeepSeek-R1 jinja chat
+// template; the verbatim copy that used to sit here as a static was never
+// read — the checkpoint's own `chat_template` is the reference.
 
 pub struct R1Instruct {
     tokenizer: Arc<Tokenizer>,
-    bos_token: Vec<u32>,
     user_prefix: Vec<u32>,
     assistant_prefix: Vec<u32>,
     eos_ids: Vec<u32>,
     think_prefix_ids: Vec<u32>,
     think_suffix_ids: Vec<u32>,
     // Tool tokens
-    tool_calls_begin: Vec<u32>,
-    tool_calls_end: Vec<u32>,
     tool_call_begin: Vec<u32>,
     tool_call_end: Vec<u32>,
-    tool_sep: Vec<u32>,
     tool_outputs_begin: Vec<u32>,
     tool_outputs_end: Vec<u32>,
     tool_output_begin: Vec<u32>,
@@ -141,17 +40,13 @@ impl R1Instruct {
             .collect();
 
         Self {
-            bos_token: encode("<｜begin▁of▁sentence｜>"),
             user_prefix: encode("<｜User｜>"),
             assistant_prefix: encode("<｜Assistant｜>"),
             eos_ids,
             think_prefix_ids: encode("<think>\n"),
             think_suffix_ids: encode("</think>\n"),
-            tool_calls_begin: encode("<｜tool▁calls▁begin｜>"),
-            tool_calls_end: encode("<｜tool▁calls▁end｜>"),
             tool_call_begin: encode("<｜tool▁call▁begin｜>"),
             tool_call_end: encode("<｜tool▁call▁end｜>"),
-            tool_sep: encode("<｜tool▁sep｜>"),
             tool_outputs_begin: encode("<｜tool▁outputs▁begin｜>"),
             tool_outputs_end: encode("<｜tool▁outputs▁end｜>"),
             tool_output_begin: encode("<｜tool▁output▁begin｜>"),
@@ -285,14 +180,13 @@ impl Instruct for R1Instruct {
         // Extract function names from tool JSON schemas for the name alternation.
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
-                if let Some(name) = parsed
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool)
+                && let Some(name) = parsed
                     .get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
-                {
-                    names.push(format!("\"{}\"", name));
-                }
+            {
+                names.push(format!("\"{}\"", name));
             }
         }
         if names.is_empty() {

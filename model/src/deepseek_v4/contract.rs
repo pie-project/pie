@@ -136,23 +136,22 @@ fn block_scales_to_fp32(b: &mut Builder<'_>) -> Result<(), Error> {
         // dropped. Both shapes are in hand, so the block size is read off
         // them instead of assumed.
         let weight_shape = companion.shape.clone();
-        if let Some(defined) = defined {
-            if let (Some(&scale_cols), Some(&weight_cols)) =
+        if let Some(defined) = defined
+            && let (Some(&scale_cols), Some(&weight_cols)) =
                 (shape.last().filter(|&&c| c > 0), weight_shape.last())
-            {
-                let block = weight_cols / scale_cols;
-                if block > 0 {
-                    b.set_scales(
-                        defined,
-                        Scales {
-                            of: b.output_name(&weight),
-                            granularity: QuantGranularity::PerGroup,
-                            group_size: block as u32,
-                            channel_axis: 0,
-                            form: ScaleForm::F32Factors,
-                        },
-                    );
-                }
+        {
+            let block = weight_cols / scale_cols;
+            if block > 0 {
+                b.set_scales(
+                    defined,
+                    Scales {
+                        of: b.output_name(&weight),
+                        granularity: QuantGranularity::PerGroup,
+                        group_size: block as u32,
+                        channel_axis: 0,
+                        form: ScaleForm::F32Factors,
+                    },
+                );
             }
         }
         b.consume(id);

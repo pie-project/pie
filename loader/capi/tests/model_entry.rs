@@ -71,31 +71,7 @@ fn write_snapshot(dir: &Path) {
             ),
         ]);
     }
-
-    let mut header = String::from("{");
-    let mut offset = 0u64;
-    for (index, (name, shape)) in tensors.iter().enumerate() {
-        let elements: i64 = shape.iter().product();
-        let nbytes = elements as u64 * 2;
-        if index > 0 {
-            header.push(',');
-        }
-        let dims: Vec<String> = shape.iter().map(ToString::to_string).collect();
-        header.push_str(&format!(
-            "\"{name}\":{{\"dtype\":\"BF16\",\"shape\":[{}],\"data_offsets\":[{offset},{}]}}",
-            dims.join(","),
-            offset + nbytes
-        ));
-        offset += nbytes;
-    }
-    header.push('}');
-
-    let mut file = Vec::with_capacity(8 + header.len() + offset as usize);
-    file.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    file.extend_from_slice(header.as_bytes());
-    file.extend(std::iter::repeat_n(0u8, offset as usize));
-    std::fs::create_dir_all(dir).expect("create snapshot dir");
-    std::fs::write(dir.join("model.safetensors"), file).expect("write snapshot");
+    pie_loader::testkit::write_safetensors_fixture(dir, &tensors);
 }
 
 /// The valid request every mutation test starts from: the `llama3` facts

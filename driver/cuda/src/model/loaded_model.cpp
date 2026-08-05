@@ -14,7 +14,6 @@
 #include "cuda_check.hpp"
 #include "distributed.hpp"
 #include "ops/gemm.hpp"
-#include "loader/load_plan_bridge.hpp"
 #include "loader/rust_author.hpp"
 #include "loader/load_plan_executor.hpp"
 #include "model/descriptor.hpp"

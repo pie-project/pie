@@ -16,117 +16,9 @@ use crate::instruct::{
 use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
-static TEMPLATE: &str = r#"
-{#- Default system message if no system prompt is passed. #}
-{%- set default_system_message = 'You are Ministral-3-14B-Instruct-2512, a Large Language Model (LLM) created by Mistral AI, a French startup headquartered in Paris.\nYou power an AI assistant called Le Chat.\nYour knowledge base was last updated on 2023-10-01.\nThe current date is {today}.\n\nWhen you\'re not sure about some information or when the user\'s request requires up-to-date or specific data, you must use the available tools to fetch the information. Do not hesitate to use tools whenever they can provide a more accurate or complete response. If no relevant tools are available, then clearly state that you don\'t have the information and avoid making up anything.\nIf the user\'s question is not clear, ambiguous, or does not provide enough context for you to accurately answer the question, you do not try to answer it right away and you rather ask the user to clarify their request (e.g. "What are some good restaurants around me?" => "Where are you?" or "When is the next flight to Tokyo" => "Where do you travel from?").\nYou are always very attentive to dates, in particular you try to resolve dates (e.g. "yesterday" is {yesterday}) and when asked about information at specific dates, you discard information that is at another date.\nYou follow these instructions in all languages, and always respond to the user in the language they use or request.\nNext sections describe the capabilities that you have.\n\n# WEB BROWSING INSTRUCTIONS\n\nYou cannot perform any web search or access internet to open URLs, links etc. If it seems like the user is expecting you to do so, you clarify the situation and ask the user to copy paste the text directly in the chat.\n\n# MULTI-MODAL INSTRUCTIONS\n\nYou have the ability to read images, but you cannot generate images. You also cannot transcribe audio files or videos.\nYou cannot read nor transcribe audio files or videos.\n\n# TOOL CALLING INSTRUCTIONS\n\nYou may have access to tools that you can use to fetch information or perform actions. You must use these tools in the following situations:\n\n1. When the request requires up-to-date information.\n2. When the request requires specific data that you do not have in your knowledge base.\n3. When the request involves actions that you cannot perform without tools.\n\nAlways prioritize using tools to provide the most accurate and helpful response. If tools are not available, inform the user that you cannot perform the requested action at the moment.' %}
-{#- Begin of sequence token. #}
-{{- bos_token }}
-{#- Handle system prompt if it exists. #}
-{#- System prompt supports text content or text chunks. #}
-{%- if messages[0]['role'] == 'system' %}
-    {{- '[SYSTEM_PROMPT]' -}}
-    {%- if messages[0]['content'] is string %}
-        {{- messages[0]['content'] -}}
-    {%- else %}        
-        {%- for block in messages[0]['content'] %}
-            {%- if block['type'] == 'text' %}
-                {{- block['text'] }}
-            {%- else %}
-                {{- raise_exception('Only text chunks are supported in system message contents.') }}
-            {%- endif %}
-        {%- endfor %}
-    {%- endif %}
-    {{- '[/SYSTEM_PROMPT]' -}}
-    {%- set loop_messages = messages[1:] %}
-{%- else %}
-    {%- set loop_messages = messages %}
-    {%- if default_system_message != '' %}
-        {{- '[SYSTEM_PROMPT]' + default_system_message + '[/SYSTEM_PROMPT]' }}
-    {%- endif %}
-{%- endif %}
-{#- Tools definition #}
-{%- set tools_definition = '' %}
-{%- set has_tools = false %}
-{%- if tools is defined and tools is not none and tools|length > 0 %}
-    {%- set has_tools = true %}
-    {%- set tools_definition = '[AVAILABLE_TOOLS]' + (tools| tojson) + '[/AVAILABLE_TOOLS]' %}
-    {{- tools_definition }}
-{%- endif %}
-{#- Checks for alternating user/assistant messages. #}
-{%- set ns = namespace(index=0) %}
-{%- for message in loop_messages %}
-    {%- if message.role == 'user' or (message.role == 'assistant' and (message.tool_calls is not defined or message.tool_calls is none or message.tool_calls | length == 0)) %}
-        {%- if (message['role'] == 'user') != (ns.index % 2 == 0) %}
-            {{- raise_exception('After the optional system message, conversation roles must alternate user and assistant roles except for tool calls and results.') }}
-        {%- endif %}
-        {%- set ns.index = ns.index + 1 %}
-    {%- endif %}
-{%- endfor %}
-{#- Handle conversation messages. #}
-{%- for message in loop_messages %}
-    {#- User messages supports text content or text and image chunks. #}
-    {%- if message['role'] == 'user' %}
-        {%- if message['content'] is string %}
-            {{- '[INST]' + message['content'] + '[/INST]' }}
-        {%- elif message['content'] | length > 0 %}
-            {{- '[INST]' }}
-            {%- if message['content'] | length == 2 %}
-                {%- set blocks = message['content'] | sort(attribute='type') %}
-            {%- else %}
-                {%- set blocks = message['content'] %}
-            {%- endif %}
-            {%- for block in blocks %}
-                {%- if block['type'] == 'text' %}
-                    {{- block['text'] }}
-                {%- elif block['type'] in ['image', 'image_url'] %}
-                    {{- '[IMG]' }}
-                {%- else %}
-                    {{- raise_exception('Only text, image and image_url chunks are supported in user message content.') }}
-                {%- endif %}
-            {%- endfor %}
-            {{- '[/INST]' }}
-        {%- else %}
-            {{- raise_exception('User message must have a string or a list of chunks in content') }}
-        {%- endif %}
-    {#- Assistant messages supports text content or text and image chunks. #}
-    {%- elif message['role'] == 'assistant' %}
-        {%- if (message['content'] is none or message['content'] == '' or message['content']|length == 0) and (message['tool_calls'] is not defined or message['tool_calls'] is none or message['tool_calls']|length == 0) %}
-            {{- raise_exception('Assistant message must have a string or a list of chunks in content or a list of tool calls.') }}
-        {%- endif %}
-        {%- if message['content'] is string %}
-            {{- message['content'] }}
-        {%- elif message['content'] | length > 0 %}
-            {%- for block in message['content'] %}
-                {%- if block['type'] == 'text' %}
-                    {{- block['text'] }}
-                {%- else %}
-                    {{- raise_exception('Only text chunks are supported in assistant message contents.') }}
-                {%- endif %}
-            {%- endfor %}
-        {%- endif %}
-        
-        {%- if message['tool_calls'] is defined and message['tool_calls'] is not none and message['tool_calls']|length > 0 %}
-            {%- for tool in message['tool_calls'] %}
-                {%- set arguments = tool['function']['arguments'] %}
-                {%- if arguments is not string %}
-                    {%- set arguments = arguments|tojson|safe %}
-                {%- elif arguments == '' %}
-                    {%- set arguments = '{}' %}
-                {%- endif %}
-                {{- '[TOOL_CALLS]' + tool['function']['name'] + '[ARGS]' + arguments }}
-            {%- endfor %}
-        {%- endif %}
-        {#- End of sequence token for each assistant messages. #}
-        {{- eos_token }}
-    {#- Tool messages only supports text content. #}
-    {%- elif message['role'] == 'tool' %}
-        {{- '[TOOL_RESULTS]' + message['content']|string + '[/TOOL_RESULTS]' }}
-    {#- Raise exception for unsupported roles. #}
-    {%- else %}
-        {{- raise_exception('Only user, assistant and tool roles are supported, got ' + message['role'] + '.') }}
-    {%- endif %}
-{%- endfor %}
-"#;
+// The implementation below mirrors the published Mistral V3 jinja chat
+// template; the verbatim copy that used to sit here as a static was never
+// read — the checkpoint's own `chat_template` is the reference.
 
 // =============================================================================
 // MistralInstruct
@@ -134,7 +26,6 @@ static TEMPLATE: &str = r#"
 
 pub struct MistralInstruct {
     tokenizer: Arc<Tokenizer>,
-    bos_token: Vec<u32>,
     stop_ids: Vec<u32>,
     // Delimiters
     inst_start: Vec<u32>,
@@ -143,8 +34,6 @@ pub struct MistralInstruct {
     sys_end: Vec<u32>,
     tools_start: Vec<u32>,
     tools_end: Vec<u32>,
-    tool_calls: Vec<u32>,
-    tool_args: Vec<u32>,
     tool_results_start: Vec<u32>,
     tool_results_end: Vec<u32>,
 }
@@ -162,7 +51,6 @@ impl MistralInstruct {
         let inst_end = encode("[/INST]");
 
         Self {
-            bos_token: encode("<s>"),
             stop_ids,
             inst_start,
             inst_end,
@@ -170,8 +58,6 @@ impl MistralInstruct {
             sys_end: encode("[/SYSTEM_PROMPT]"),
             tools_start: encode("[AVAILABLE_TOOLS]"),
             tools_end: encode("[/AVAILABLE_TOOLS]"),
-            tool_calls: encode("[TOOL_CALLS]"),
-            tool_args: encode("[ARGS]"),
             tool_results_start: encode("[TOOL_RESULTS]"),
             tool_results_end: encode("[/TOOL_RESULTS]"),
             tokenizer,
@@ -242,7 +128,6 @@ impl Instruct for MistralInstruct {
             decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
             state: ToolState::Outside,
-            stop_ids: self.stop_ids.clone(),
             current_name: None,
         })
     }
@@ -304,7 +189,6 @@ struct MistralToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,
     state: ToolState,
-    stop_ids: Vec<u32>,
     current_name: Option<String>,
 }
 

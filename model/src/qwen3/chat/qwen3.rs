@@ -16,106 +16,9 @@ use std::sync::Arc;
 // Configuration
 // =============================================================================
 
-static TEMPLATE: &str = r#"
-{%- if tools %}
-    {{- '<|im_start|>system\n' }}
-    {%- if messages[0].role == 'system' %}
-        {{- messages[0].content + '\n\n' }}
-    {%- endif %}
-    {{- " # Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
-    {%- for tool in tools %}
-        {{- "\n" }}
-        {{- tool | tojson }}
-    {%- endfor %}
-    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
-{%- else %}
-    {%- if messages[0].role == 'system' %}
-        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
-    {%- endif %}
-{%- endif %}
-{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
-{%- for forward_message in messages %}
-    {%- set index = (messages|length - 1) - loop.index0 %}
-    {%- set message = messages[index] %}
-    {%- set current_content = message.content if message.content is not none else '' %}
-    {%- set tool_start = '<tool_response>' %}
-    {%- set tool_start_length = tool_start|length %}
-    {%- set start_of_message = current_content[:tool_start_length] %}
-    {%- set tool_end = '</tool_response>' %}
-    {%- set tool_end_length = tool_end|length %}
-    {%- set start_pos = (current_content|length) - tool_end_length %}
-    {%- if start_pos < 0 %}
-        {%- set start_pos = 0 %}
-    {%- endif %}
-    {%- set end_of_message = current_content[start_pos:] %}
-    {%- if ns.multi_step_tool and message.role == "user" and not(start_of_message == tool_start and end_of_message == tool_end) %}
-        {%- set ns.multi_step_tool = false %}
-        {%- set ns.last_query_index = index %}
-    {%- endif %}
-{%- endfor %}
-{%- for message in messages %}
-    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
-        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
-    {%- elif message.role == "assistant" %}
-        {%- set content = message.content %}
-        {%- set reasoning_content = '' %}
-        {%- if message.reasoning_content is defined and message.reasoning_content is not none %}
-            {%- set reasoning_content = message.reasoning_content %}
-        {%- else %}
-            {%- if '</think>' in message.content %}
-                {%- set content = (message.content.split('</think>')|last).lstrip('\n') %}
-                {%- set reasoning_content = (message.content.split('</think>')|first).rstrip('\n') %}
-                {%- set reasoning_content = (reasoning_content.split('<think>')|last).lstrip('\n') %}
-            {%- endif %}
-        {%- endif %}
-        {%- if loop.index0 > ns.last_query_index %}
-            {%- if loop.last or (not loop.last and reasoning_content) %}
-                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
-            {%- else %}
-                {{- '<|im_start|>' + message.role + '\n' + content }}
-            {%- endif %}
-        {%- else %}
-            {{- '<|im_start|>' + message.role + '\n' + content }}
-        {%- endif %}
-        {%- if message.tool_calls %}
-            {%- for tool_call in message.tool_calls %}
-                {%- if (loop.first and content) or (not loop.first) %}
-                    {{- '\n' }}
-                {%- endif %}
-                {%- if tool_call.function %}
-                    {%- set tool_call = tool_call.function %}
-                {%- endif %}
-                {{- '<tool_call>\n{"name": "' }}
-                {{- tool_call.name }}
-                {{- '", "arguments": ' }}
-                {%- if tool_call.arguments is string %}
-                    {{- tool_call.arguments }}
-                {%- else %}
-                    {{- tool_call.arguments | tojson }}
-                {%- endif %}
-                {{- '}\n</tool_call>' }}
-            {%- endfor %}
-        {%- endif %}
-        {{- '<|im_end|>\n' }}
-    {%- elif message.role == "tool" %}
-        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
-            {{- '<|im_start|>user' }}
-        {%- endif %}
-        {{- '\n<tool_response>\n' }}
-        {{- message.content }}
-        {{- '\n</tool_response>' }}
-        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
-            {{- '<|im_end|>\n' }}
-        {%- endif %}
-    {%- endif %}
-{%- endfor %}
-{%- if add_generation_prompt %}
-    {{- '<|im_start|>assistant\n' }}
-    {%- if enable_thinking is defined and enable_thinking is false %}
-        {{- '<think>\n\n</think>\n\n' }}
-    {%- endif %}
-{%- endif %}
-"#;
+// The implementation below mirrors the published Qwen3 jinja chat template;
+// the verbatim copy that used to sit here as a static was never read — the
+// checkpoint's own `chat_template` is the reference.
 
 /// Feature flags for ChatML-family models.
 pub struct ChatMLConfig {
@@ -402,16 +305,14 @@ impl ToolDecoder for QwenToolDecoder {
                 }
                 return ToolEvent::Start;
             }
-        } else if self.accumulated.contains("</tool_call>") {
-            if let Some(pos) = self.accumulated.find("</tool_call>") {
-                let call_json = self.accumulated[..pos].trim().to_string();
-                self.accumulated = self.accumulated[pos + "</tool_call>".len()..].to_string();
-                self.inside = false;
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_json) {
-                    let name = v["name"].as_str().unwrap_or("").to_string();
-                    let args = v["arguments"].to_string();
-                    return ToolEvent::Call(name, args);
-                }
+        } else if let Some(pos) = self.accumulated.find("</tool_call>") {
+            let call_json = self.accumulated[..pos].trim().to_string();
+            self.accumulated = self.accumulated[pos + "</tool_call>".len()..].to_string();
+            self.inside = false;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_json) {
+                let name = v["name"].as_str().unwrap_or("").to_string();
+                let args = v["arguments"].to_string();
+                return ToolEvent::Call(name, args);
             }
         }
         ToolEvent::Start
@@ -604,7 +505,7 @@ mod tests {
     #[test]
     fn tool_decoder_parses_call() {
         // Build vocab with the JSON content as a single entry
-        let mut v: Vec<String> = vec![
+        let v: Vec<String> = vec![
             "<|im_start|>",
             "<|im_end|>",
             "<|endoftext|>",

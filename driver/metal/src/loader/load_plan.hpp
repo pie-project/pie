@@ -78,18 +78,14 @@ inline LoadPlan compile_load_plan(
             pie_loader::PieLoaderModelFactsView{
                 .model_type = pie_loader::borrow(model_type),
                 .quant_method = pie_loader::borrow(std::string_view{}),
-                .num_hidden_layers = static_cast<std::uint32_t>(
-                    facts.num_hidden_layers > 0 ? facts.num_hidden_layers : 0),
+                .num_hidden_layers = facts.num_hidden_layers,
                 .num_experts = 0,
                 .head_dim = 0,
                 .mamba_groups = 0,
                 .tied_embeddings = facts.tied_embeddings,
-                .mlx_quant_bits = static_cast<std::uint32_t>(
-                    facts.quant_bits > 0 ? facts.quant_bits : 0),
-                .mlx_quant_group_size = static_cast<std::uint32_t>(
-                    facts.quant_group_size > 0 ? facts.quant_group_size : 0),
-                .num_kv_shared_layers = static_cast<std::uint32_t>(
-                    facts.num_kv_shared_layers > 0 ? facts.num_kv_shared_layers : 0),
+                .mlx_quant_bits = facts.quant_bits,
+                .mlx_quant_group_size = facts.quant_group_size,
+                .num_kv_shared_layers = facts.num_kv_shared_layers,
             },
         .projections = 1,  // InPlace: the MLX lowering.
         .naming = 1,       // MLX names, which is what this bind path reads.

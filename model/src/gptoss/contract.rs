@@ -545,7 +545,7 @@ fn declare_mxfp4_experts_mlx(b: &mut Builder<'_>, declared: &mut usize) -> Resul
             }
             mlx::push_encoded_affine(
                 b,
-                Expr::out(&format!("{name}.dequantized")),
+                Expr::out(format!("{name}.dequantized")),
                 experts * rows,
                 cols,
                 format!("{name}.weight"),

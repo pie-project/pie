@@ -12,7 +12,8 @@
 //!   * **pixels** — decode (via the `image` crate), aspect-preserving resize
 //!     (CatmullRom, the same filter the SDK used), and the arch's exact patchify
 //!     + normalization: Gemma SigLIP2 channels-last `/255`; Qwen3-VL
-//!     `smart_resize` + block-merge `(3,2,16,16)` layout with `(x/255-0.5)/0.5`.
+//!       smart-resize + block-merge `(3,2,16,16)` layout, normalized as
+//!       x/255 shifted to `[-1, 1]`.
 //!   * **audio** — WAV decode, resample to 16 kHz, and the log-mel front-end
 //!     (the [`audio`] submodule), matching `Gemma4AudioFeatureExtractor`.
 //!
@@ -809,7 +810,7 @@ pub mod audio {
         // Semicausal pad: prepend frame/2 zeros.
         let pad = frame / 2;
         let mut x = Vec::with_capacity(pad + pcm_16k_mono.len());
-        x.extend(std::iter::repeat(0.0f64).take(pad));
+        x.extend(std::iter::repeat_n(0.0f64, pad));
         x.extend(pcm_16k_mono.iter().map(|&v| v as f64));
 
         // Frame: window of `frame+1` (preemphasis look-behind), step `hop`.

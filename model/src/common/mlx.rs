@@ -361,14 +361,14 @@ pub fn routed_expert_member(
         }
     }
     const EXPERTS: &str = "mlp.experts.";
-    if let Some(rest) = member.strip_prefix(EXPERTS) {
-        if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            return fail(format!(
-                "Metal {schema} schema needs the routed experts stacked on axis 0 \
-                 (one `mlp.experts.gate_proj` per layer, expert-major), but \
-                 '{raw_name}' is per-expert"
-            ));
-        }
+    if let Some(rest) = member.strip_prefix(EXPERTS)
+        && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        return fail(format!(
+            "Metal {schema} schema needs the routed experts stacked on axis 0 \
+             (one `mlp.experts.gate_proj` per layer, expert-major), but \
+             '{raw_name}' is per-expert"
+        ));
     }
     Ok(None)
 }
@@ -399,6 +399,11 @@ pub fn layer_member<'n>(
     Ok((layer, &tail[dot + 1..]))
 }
 
+/// A family's naming rule: raw checkpoint name in, runtime name out —
+/// `Ok(None)` for a tensor the schema has no opinion on, `Err` for one it
+/// refuses.
+pub type RenameRule<'r> = &'r dyn Fn(&Builder<'_>, &str) -> Result<Option<String>, Error>;
+
 /// The shared authoring loop for the affine-triplet families (llama,
 /// qwen3.5, gemma4): rename every tensor, pair the U32 weights with their
 /// scales and biases, cast the widths no kernel reads, and refuse a
@@ -410,7 +415,7 @@ pub fn layer_member<'n>(
 pub fn author_mlx_file(
     b: &mut Builder<'_>,
     schema: &str,
-    rename: &dyn Fn(&Builder<'_>, &str) -> Result<Option<String>, Error>,
+    rename: RenameRule<'_>,
 ) -> Result<(), Error> {
     let quant_bits = i64::from(b.facts().mlx_quant_bits);
     let quant_group = i64::from(b.facts().mlx_quant_group_size);

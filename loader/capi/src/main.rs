@@ -390,7 +390,7 @@ fn diff(
 fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
     let plan = compile(snapshot, contract, options)?;
     let started = Instant::now();
-    let storage = pie_loader::testkit::host_executor::execute_plan(&plan, snapshot)?;
+    let storage = pie_loader::executor::host::execute_plan(&plan, snapshot)?;
     let bytes: usize = storage.tensors.values().map(Vec::len).sum();
     eprintln!(
         "replayed {} tensors ({bytes} bytes materialized, {} arena bytes) in {:?}",
@@ -451,7 +451,7 @@ fn convert(
     let metadata = parse_checkpoint_metadata(snapshot)?;
     let plan = compile_load_plan(&metadata, contract, options.convert_target())?;
     let started = Instant::now();
-    let storage = pie_loader::testkit::host_executor::execute_plan(&plan, snapshot)?;
+    let storage = pie_loader::executor::host::execute_plan(&plan, snapshot)?;
     eprintln!(
         "executed {} instructions ({} arena bytes) in {:?}",
         plan.instrs.len(),

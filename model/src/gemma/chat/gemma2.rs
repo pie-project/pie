@@ -15,7 +15,6 @@ pub struct GemmaInstruct {
     user_prefix: Vec<u32>,
     model_prefix: Vec<u32>,
     turn_suffix: Vec<u32>,
-    bos_token: Vec<u32>,
     stop_ids: Vec<u32>,
 }
 
@@ -46,7 +45,6 @@ impl GemmaInstruct {
             user_prefix: make_prefix("user"),
             model_prefix: make_prefix("model"),
             turn_suffix,
-            bos_token: encode("<bos>"),
             stop_ids,
             tokenizer,
         }

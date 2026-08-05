@@ -85,6 +85,10 @@ fn production_lines(body: &str) -> impl Iterator<Item = (usize, &str)> {
 ///   asking whether the files still have the recorded sizes is the check, not a
 ///   leak. A `compile` that could do this would be a different function.
 /// * `main.rs` — the CLI, which is a caller, not the library.
+/// * `testkit.rs` — feature-gated test support (the fixture writer). The
+///   build this property protects — the worker's — compiles with `testkit`
+///   off, so the gate enforces for production what this exemption relaxes
+///   for tests.
 #[test]
 fn nothing_below_the_reader_opens_a_file() {
     const ALLOWED: &[&str] = &[
@@ -93,6 +97,7 @@ fn nothing_below_the_reader_opens_a_file() {
         "verify.rs",
         "weight_store.rs",
         "main.rs",
+        "testkit.rs",
     ];
     // `Path`/`PathBuf` are values and may be passed around freely; what must not
     // appear is anything that *touches* the filesystem.

@@ -101,10 +101,10 @@ pub fn is_companion_scale(name: &str) -> bool {
 /// weight, so `.weight` goes back on. All three end at `<base>.weight`.
 pub fn companion_weight_name(name: &str) -> Option<String> {
     for part in ["_scale_inv", "_scale"] {
-        if let Some(base) = name.strip_suffix(part) {
-            if base.ends_with(".weight") {
-                return Some(base.to_string());
-            }
+        if let Some(base) = name.strip_suffix(part)
+            && base.ends_with(".weight")
+        {
+            return Some(base.to_string());
         }
     }
     name.strip_suffix(".scale")

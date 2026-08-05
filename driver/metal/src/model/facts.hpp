@@ -10,6 +10,7 @@
 /// What the driver still owns is what only it can know: the facts it
 /// parsed from `config.json`, and which decode DAG it is about to run.
 
+#include <cstdint>
 #include <string_view>
 
 namespace pie::metal::model {
@@ -24,8 +25,8 @@ struct ContractFacts {
     /// which is every family except gemma4's "E" variants. (This replaced the
     /// precomputed `first_kv_shared_layer` when authoring moved: the request
     /// carries config facts, and the subtraction is the author's.)
-    int num_hidden_layers = 0;
-    int num_kv_shared_layers = 0;
+    std::uint32_t num_hidden_layers = 0;
+    std::uint32_t num_kv_shared_layers = 0;
 
     /// Whether `lm_head` IS `embed_tokens` (`tie_word_embeddings`, defaulting
     /// to true when the config omits it). The llama and Qwen3.5 schemas read
@@ -44,8 +45,8 @@ struct ContractFacts {
     /// does NOT read these: its `quantization` block sets a global mxfp4 g32
     /// and then overrides nearly every module back to affine g64, so the global
     /// pair is wrong for most of its tensors and that schema solves per tensor.
-    int quant_bits = 0;
-    int quant_group_size = 0;
+    std::uint32_t quant_bits = 0;
+    std::uint32_t quant_group_size = 0;
 };
 
 /// Which storage schema and decode DAG a checkpoint asks for.

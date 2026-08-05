@@ -3,16 +3,19 @@
 Typed weight-loading compiler: checkpoints to verified device-memory layouts.
 
 ```text
-model contract  ──compile──▶  load plan  ──C ABI──▶  driver executes
-(what a driver     (the bytes to move,     (pie_loader.h,
- declares it        where, in what          generated)
- needs)             order)
+model request  ──author──▶  model contract  ──compile──▶  load plan  ──C ABI──▶  driver executes
+(facts + policy,   (what the model         (the bytes to move,       (pie_loader.h,
+ ~20 scalars)       needs, as expressions   where, in what            generated)
+                    over the checkpoint)    order)
 ```
 
-`plan = compile(source_facts, contract, target)`. None of the three inputs is a
-model's name — the driver declares what it needs as a contract over the
-checkpoint's byte space, the loader reads the checkpoint's own metadata, and the
-target carries the numbers a device measured.
+`plan = compile(source_facts, author(facts, source, policy), target)`. The
+contract is internal IR: it is authored from the driver's request
+(`pie_model::contract`, `plan/model-in-rust.md`), compiled, and dropped in one
+call, never crossing the ABI. The compiler itself stays family-blind — none of
+its inputs is a model's name; the request's `model_type` is spent selecting the
+author, the loader reads the checkpoint's own metadata, and the target carries
+the numbers a device measured.
 
 ## Build and check
 

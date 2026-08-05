@@ -1941,7 +1941,7 @@ fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
     };
 
     let plan = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
-    let storage = pie_loader::testkit::host_executor::execute_plan(&plan, &dir)
+    let storage = pie_loader::executor::host::execute_plan(&plan, &dir)
         .expect("the padded plan does not execute");
     let got = storage.tensors.get("q_proj.weight").expect("materialized");
 

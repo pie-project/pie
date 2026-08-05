@@ -513,9 +513,8 @@ fn replay(name: &str, plan: &LoadPlan, metadata: &CheckpointMetadata) {
         return;
     }
     let snapshot = PathBuf::from(&metadata.files[0].path);
-    let storage =
-        pie_loader::testkit::host_executor::execute_plan(plan, snapshot.parent().unwrap())
-            .unwrap_or_else(|err| panic!("{name}: the plan does not execute: {err}"));
+    let storage = pie_loader::executor::host::execute_plan(plan, snapshot.parent().unwrap())
+        .unwrap_or_else(|err| panic!("{name}: the plan does not execute: {err}"));
     for tensor in &plan.tensors {
         let materialized = storage
             .tensors

@@ -12,40 +12,21 @@ use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, Tool
 use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
-static TEMPLATE: &str = r#"
-{% set has_system = messages|selectattr('role', 'equalto', 'system')|list|length > 0 %}{% if not has_system %}{{ '<|im_start|>system
-You are OLMo, a helpful function-calling AI assistant built by Ai2. Your date cutoff is November 2024, and your model weights are available at https://huggingface.co/allenai. You do not currently have access to any functions. <functions></functions><|im_end|>
-' }}{% endif %}{% for message in messages %}{% if message['role'] == 'system' %}{{ '<|im_start|>system
-' + message['content'] }}{% if message.get('functions', none) is not none %}{{ ' <functions>' + message['functions'] + '</functions><|im_end|>
-' }}{% else %}{{ ' You do not currently have access to any functions. <functions></functions><|im_end|>
-' }}{% endif %}{% elif message['role'] == 'user' %}{% if message.get('functions', none) is not none %}{{ '<|im_start|>user
-' + message['content'] + '
-' + '<functions>' + message['functions'] + '</functions><|im_end|>
-' }}{% else %}{{ '<|im_start|>user
-' + message['content'] + '<|im_end|>
-' }}{% endif %}{% elif message['role'] == 'assistant' %}{{ '<|im_start|>assistant
-' }}{% if message.get('content', none) is not none %}{{ message['content'] }}{% endif %}{% if message.get('function_calls', none) is not none %}{{ '<function_calls>' + message['function_calls'] + '</function_calls>' }}{% endif %}{% if not loop.last %}{{ '<|im_end|>' + '
-' }}{% else %}{{ eos_token }}{% endif %}{% elif message['role'] == 'environment' %}{{ '<|im_start|>environment
-' + message['content'] + '<|im_end|>
-' }}{% endif %}{% if loop.last and add_generation_prompt %}{{ '<|im_start|>assistant
-<think>' }}{% endif %}{% endfor %}"#;
+// The implementation below mirrors the published OLMo-3 jinja chat
+// template; the verbatim copy that used to sit here as a static was never
+// read — the checkpoint's own `chat_template` is the reference.
 
 pub struct OlmoInstruct {
     tokenizer: Arc<Tokenizer>,
     im_start: Vec<u32>,
     im_end: Vec<u32>,
     newline: Vec<u32>,
-    eos_token: Vec<u32>,
     // Roles
     system_role: Vec<u32>,
     user_role: Vec<u32>,
     assistant_role: Vec<u32>,
     environment_role: Vec<u32>,
     // Tools
-    functions_start: Vec<u32>,
-    functions_end: Vec<u32>,
-    fn_calls_start: Vec<u32>,
-    fn_calls_end: Vec<u32>,
     // Generation
     think_start: Vec<u32>,
     think_end: Vec<u32>,
@@ -68,15 +49,10 @@ impl OlmoInstruct {
             im_start,
             im_end,
             newline,
-            eos_token,
             system_role: encode("system"),
             user_role: encode("user"),
             assistant_role: encode("assistant"),
             environment_role: encode("environment"),
-            functions_start: encode("<functions>"),
-            functions_end: encode("</functions>"),
-            fn_calls_start: encode("<function_calls>"),
-            fn_calls_end: encode("</function_calls>"),
             think_start: encode("<think>"),
             think_end: encode("</think>"),
             stop_ids,
@@ -164,7 +140,6 @@ impl Instruct for OlmoInstruct {
             decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
             state: ToolState::Outside,
-            current_tag: String::new(),
         })
     }
 }
@@ -175,7 +150,6 @@ struct OlmoToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,
     state: ToolState,
-    current_tag: String,
 }
 
 #[derive(Debug, PartialEq)]

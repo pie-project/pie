@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 pub struct LlamaInstruct {
     tokenizer: Arc<Tokenizer>,
-    bos_token: Vec<u32>,
     stop_ids: Vec<u32>,
     // Delimiters
     inst_start: Vec<u32>,
@@ -54,7 +53,6 @@ impl LlamaInstruct {
         sys_wrapper_end.extend(encode("\n\n"));
 
         Self {
-            bos_token: encode("<s>"),
             stop_ids,
             inst_start,
             inst_end,

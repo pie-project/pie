@@ -7,7 +7,7 @@
 //! the executor that reads it.
 
 use super::arena::{self, view};
-use super::entry::{PieLoaderDiagnostics, PieLoaderStatus, PieLoaderTargetSpec};
+use super::entry::{PieLoaderDiagnostics, PieLoaderStatus};
 use super::types::*;
 use pie_loader::plan::*;
 use pie_loader::types::*;
@@ -754,21 +754,6 @@ fn bytes(s: &str) -> PieLoaderBytes {
     }
 }
 
-fn target_spec() -> PieLoaderTargetSpec {
-    PieLoaderTargetSpec {
-        backend: PieLoaderBackendKind::Cuda as u32,
-        tp_rank: 0,
-        tp_size: 1,
-        max_tile_bytes: 1 << 20,
-        preferred_alignment: 256,
-        tile_map_mask: CUDA_TILE_MAP_MASK,
-        native_mxfp4_moe: false,
-        fusion_mask: FUSION_FP8_TO_MXFP4,
-        encode_scratch_dtype: PieLoaderDType::BF16 as u32,
-        block_scale_rows: 128,
-    }
-}
-
 #[test]
 fn every_declared_enum_value_is_accepted_by_its_checked_conversion() {
     for (v, want) in [
@@ -830,7 +815,7 @@ fn the_contract_a_plan_was_compiled_from_verifies_against_it() {
 
 #[test]
 fn a_contract_naming_a_tensor_the_plan_does_not_deliver_is_a_violation() {
-    use pie_loader::contract::{Expr, ModelContract, TensorContract};
+    use pie_loader::contract::{Expr, TensorContract};
     with_fixture_plan(|plan| {
         let mut other = fused_contract();
         other.tensors.push(TensorContract::new(
@@ -956,18 +941,14 @@ fn quant_scheme_survives_the_c_boundary() {
 /// the header, so a fixture whose header did not exist would test nothing.
 fn contract_fixture() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("pie_loader_contract_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create fixture directory");
-    let path = dir.join("model.safetensors");
     // Two BF16 [2, 4] tensors, 16 bytes each, laid out back to back.
-    let header = r#"{"a.weight":{"dtype":"BF16","shape":[2,4],"data_offsets":[0,16]},"b.weight":{"dtype":"BF16","shape":[2,4],"data_offsets":[16,32]}}"#;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(header.as_bytes());
-    bytes.extend_from_slice(&[0u8; 32]);
-    // Published by rename so a parallel reader never sees a partial header.
-    let staging = dir.join(format!("model.{:?}.partial", std::thread::current().id()));
-    std::fs::write(&staging, &bytes).expect("write fixture checkpoint");
-    std::fs::rename(&staging, &path).expect("publish fixture checkpoint");
+    pie_loader::testkit::write_safetensors_fixture(
+        &dir,
+        &[
+            ("a.weight".to_string(), vec![2, 4]),
+            ("b.weight".to_string(), vec![2, 4]),
+        ],
+    );
     dir
 }
 
