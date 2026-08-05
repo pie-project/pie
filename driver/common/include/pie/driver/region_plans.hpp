@@ -31,6 +31,26 @@ struct RegionPlans {
     std::uint32_t full_depth_rows = 0xffffffffu;
 };
 
+// Tier 2: the hook rows' own truncation, from the table — 0xffffffff
+// when there is no hook region or it is full-depth. The body gates its
+// per-layer hook invocations on this (hooks fire only while the hook
+// rows are live), and both hook ledgers (prepare planned_layers,
+// finish expected_layers) bound themselves by it, so the three can
+// never disagree about how many invocations a truncated hook plans.
+inline std::uint32_t hook_region_k(const LaunchView& view) {
+    if (view.region_row_indptr.empty()) return 0xffffffffu;
+    const std::uint32_t* sig = view.region_sig.data();
+    const std::uint32_t* rk = view.region_k.data();
+    const std::size_t nreg = view.region_row_indptr.size() - 1;
+    for (std::size_t r = 0; r < nreg; ++r) {
+        if ((sig[r] & PIE_REGION_SIG_HOOK) &&
+            (sig[r] & PIE_REGION_SIG_TRUNCATED)) {
+            return rk[r];
+        }
+    }
+    return 0xffffffffu;
+}
+
 // ④/Act 3: the banded-depth derivation, SINGLE SOURCE for both the
 // frame's band stamping and the planned-words suppression below. A
 // band is a TRUNCATED region under the Act-2 order ([full | trunc
@@ -68,7 +88,12 @@ inline std::uint32_t derive_depth_bands(const LaunchView& view,
             return 0;
         }
         if (sig[r] & PIE_REGION_SIG_TRUNCATED) {
-            if (sig[r] & (PIE_REGION_SIG_LORA | PIE_REGION_SIG_HOOK)) {
+            // Tier 2: a truncated OBSERVATION hook region is a band like
+            // any other — the body gates its invocations at the region's
+            // k. Track-B (page-mask) hooks and lora-truncated lanes stay
+            // out.
+            if (sig[r] & (PIE_REGION_SIG_LORA |
+                          PIE_REGION_SIG_HOOK_PAGE_MASK)) {
                 return 0;
             }
             if (count == 3) return 0;

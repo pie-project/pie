@@ -472,6 +472,13 @@ pub(crate) struct LaunchGrouping {
     /// needs the full-R paged decode path, so the group cannot band and
     /// stays depth-homogeneous (the dsplit union's [k | full] only).
     has_page_mask_hook: bool,
+    /// A WIRE-class member with a finite truncation. The submission order
+    /// is [wire block | devgeo block] (the envelope-compose suffix is a
+    /// hard driver contract), so global fulls-first/descending-k — the
+    /// banded walk's invariant — holds exactly when every truncated
+    /// member sits in the devgeo tail block, or the group is wire-only.
+    /// A wire truncation in a mixed-class group breaks it.
+    has_wire_trunc: bool,
 }
 
 /// One token per row — the paged-decode-path shape, independent of
@@ -618,18 +625,28 @@ impl LaunchGrouping {
             let page_mask_hook = self.has_page_mask_hook
                 || (request.hook_program && request.request.hook_page_mask);
             let hook_k = self.hook_finite_k.or(joining_hook_k);
+            let wire_trunc_after = self.has_wire_trunc
+                || (request.request.max_layers.is_some()
+                    && !request.request.device_resolved_geometry);
+            let devgeo_after = self.has_device_geometry
+                || request.request.device_resolved_geometry;
+            let band_order_holds = !(wire_trunc_after && devgeo_after);
             let clashes = if page_mask_hook {
                 // Track-B hooks keep the pre-band servers: at most one
                 // distinct finite truncation beside them.
                 self.finite_k_overflow || distinct_after > 1
+            } else if bands_on && band_order_holds {
+                // Tier 2: observation hooks — truncated or full — band
+                // with up to the driver's band cap; a truncated hook's
+                // rows freeze past its k and the body gates its
+                // invocations there (hook_rows_k).
+                self.finite_k_overflow || distinct_after > 3
             } else if let Some(hk) = hook_k {
-                // A truncated hook member: every finite k must equal hk.
+                // Banding disarmed: a truncated hook member pins the
+                // group to its own k (the dsplit union's one boundary).
                 self.finite_k_overflow
                     || request.request.max_layers.is_some_and(|k| k != hk)
                     || self.finite_ks.iter().flatten().any(|&k| k != hk)
-            } else if bands_on {
-                // Full-depth hooks band with up to the driver's band cap.
-                self.finite_k_overflow || distinct_after > 3
             } else {
                 self.finite_k_overflow || distinct_after > 1
             };
@@ -681,6 +698,8 @@ impl LaunchGrouping {
             self.hook_finite_k = self.hook_finite_k.or(request.request.max_layers);
             self.has_page_mask_hook |= request.request.hook_page_mask;
         }
+        self.has_wire_trunc |= request.request.max_layers.is_some()
+            && !request.request.device_resolved_geometry;
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
             || self.count >= limits.max_forward_requests

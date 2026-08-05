@@ -1798,6 +1798,17 @@ void llama_like_forward_paged(
                                AttentionWorkspace& attn_ws,
                                const ops::PrefillPlanCache*
                                    prefill_plan_override = nullptr) {
+        // Tier 2: hook stages fire only while the hook rows are live —
+        // a truncated hook region's rows freeze past its k in the banded
+        // walk, and an invocation there would observe garbage rows. The
+        // same bound caps both ledgers (frame prep planned_layers,
+        // dispatch finish expected_layers) via hook_region_k, so the
+        // three agree by construction.
+        const model::StageHooks* layer_hooks =
+            (hooks != nullptr &&
+             static_cast<std::uint32_t>(L) < hooks->hook_rows_k)
+                ? hooks
+                : nullptr;
         const auto& layer = w.layers[L];
 
         // Pre-norm: norm(y) → norm_x; QKV reads from norm_x.
@@ -1833,9 +1844,9 @@ void llama_like_forward_paged(
         // fire. Pure decode (a predicate condition below) maps request rows
         // onto token rows 1:1, which is what lets one row count partition
         // both the QKV postprocess and the KV write.
-        const int fast_rows = hooks == nullptr
+        const int fast_rows = layer_hooks == nullptr
             ? R
-            : std::min(static_cast<int>(hooks->hook_free_prefix_rows), R);
+            : std::min(static_cast<int>(layer_hooks->hook_free_prefix_rows), R);
         const bool fused_decode_qkv_post =
             use_fused_qkv &&
             // Device-window capture (peel_window_d): the branch must not
@@ -1864,7 +1875,7 @@ void llama_like_forward_paged(
         // all-fused fire; N on the classic all-unfused one. Pure decode has
         // N == R, so the same count serves token- and request-indexed calls.
         const int unfused_tail_rows = fused_decode_qkv_post ? N - fast_rows : N;
-        if (L == 0 && hooks != nullptr && std::getenv("PIE_HOOK_PREFIX_TRACE")) {
+        if (L == 0 && layer_hooks != nullptr && std::getenv("PIE_HOOK_PREFIX_TRACE")) {
             std::fprintf(stderr,
                          "[hook-prefix] R=%d fast_rows=%d fused=%d\n",
                          R, fast_rows, fused_decode_qkv_post ? 1 : 0);
@@ -2079,7 +2090,7 @@ void llama_like_forward_paged(
         page_mask.begin_layer(stream);
 
         invoke_stage_hook(
-            hooks,
+            layer_hooks,
             StageHookPoint::OnAttnProj,
             ws.q.data(),
             static_cast<std::uint32_t>(N),
@@ -2245,13 +2256,13 @@ void llama_like_forward_paged(
         const bool prefill_capture_eligible =
             use_prefill_score_path && layer_window_left < 0;
         model::LayerScoreCapture score_capture(
-            hooks,
+            layer_hooks,
             static_cast<std::uint32_t>(L),
             static_cast<std::uint32_t>(num_q_heads_local),
             /*capturable=*/layer_window_left < 0 && !prefill_capture_eligible,
             stream);
         model::LayerPrefillScoreCapture prefill_score_capture(
-            hooks,
+            layer_hooks,
             static_cast<std::uint32_t>(L),
             static_cast<std::uint32_t>(num_q_heads_local),
             plan_state.prefill_score_window,
@@ -2612,7 +2623,7 @@ void llama_like_forward_paged(
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         }
         invoke_stage_hook(
-            hooks,
+            layer_hooks,
             StageHookPoint::OnAttn,
             ws.q.data(),
             static_cast<std::uint32_t>(N),

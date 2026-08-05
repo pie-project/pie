@@ -83,6 +83,11 @@ struct StageHooks {
     // slow path is always correct. See
     // `Dispatch::launch_hook_free_prefix_rows`.
     std::uint32_t hook_free_prefix_rows = 0;
+    // Tier 2: the hook rows' own truncation (region table's hook-region
+    // k; 0xffffffff = full). The body invokes hook stages only at layers
+    // below this — a truncated hook lane's rows are frozen past its k in
+    // the banded walk, and an invocation there would observe garbage.
+    std::uint32_t hook_rows_k = 0xffffffffu;
 
     // The grow-only device arena the fire's sideband captures draw their
     // buffers from (`hook_sideband_arena.hpp`). Engine-lifetime, owned beside
@@ -151,6 +156,14 @@ inline void invoke_stage_hook(
     bool query_is_f32 = false,
     StageHookSideband sideband = {}) {
     if (hooks == nullptr || hooks->execute == nullptr) {
+        return;
+    }
+    // Tier 2, enforced centrally so every leg (hand walker, declared,
+    // generated) obeys it: a truncated hook region's rows freeze past
+    // its k — invocations there would observe garbage rows, and the
+    // ledgers (prep planned_layers, finish expected_layers) are bounded
+    // by the same table-derived word.
+    if (layer >= hooks->hook_rows_k) {
         return;
     }
     if (sideband.observation == nullptr) {

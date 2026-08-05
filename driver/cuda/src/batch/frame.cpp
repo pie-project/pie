@@ -2947,9 +2947,14 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         // ledger. The 0-prefix case burned once: [trunc-k, hook-tail]
         // planned full_depth_rows=0, the tail's hooks invoked at
         // layers [k, L), and a k-sized ledger threw at entry k.
-        s.dispatch_view.planned_full_depth_rows != 0xffffffffu
-            ? 0xffffffffu
-            : s.dispatch_view.planned_max_layers,
+        // Tier 2 bound: a truncated hook region caps its own ledger at
+        // its k regardless of the fire-wide plan (a banded fire carries
+        // FULL planned words; the hook rows still stop at their band).
+        std::min(
+            s.dispatch_view.planned_full_depth_rows != 0xffffffffu
+                ? 0xffffffffu
+                : s.dispatch_view.planned_max_layers,
+            pie::driver::fire::hook_region_k(s.dispatch_view)),
     };
     const model::StageHooks stage_hooks{
         .context = &stage_hook_context,
@@ -2960,6 +2965,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             engine.dispatch->launch_wants_page_mask(s.dispatch_view),
         .hook_free_prefix_rows =
             engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
+        .hook_rows_k = pie::driver::fire::hook_region_k(s.dispatch_view),
         .sideband_arena = engine.sideband_arena,
         .execute = [](
             void* opaque,

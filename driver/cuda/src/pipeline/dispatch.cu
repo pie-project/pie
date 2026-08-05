@@ -34,6 +34,7 @@
 #include <cuda_bf16.h>
 
 #include "cuda_check.hpp"
+#include "pie/driver/region_plans.hpp"
 #include "runahead.hpp"
 #include "batch/fire_timing.hpp"
 #include "batch/forward_graph.hpp"
@@ -6578,11 +6579,15 @@ bool Dispatch::finish(
     // its attention phases at only the planned layers. A DEPTH-SPLIT
     // launch (full-depth rows present, truncated suffix) still walks the
     // full model — the split narrows rows, not the layer walk.
-    const std::uint32_t expected_layers =
+    const std::uint32_t expected_layers = std::min(
         view.planned_max_layers == 0xffffffffu ||
                 view.planned_full_depth_rows != 0xffffffffu
             ? impl_->model_layers
-            : std::min(impl_->model_layers, view.planned_max_layers);
+            : std::min(impl_->model_layers, view.planned_max_layers),
+        // Tier 2: a truncated hook region invokes only below its own k
+        // (the body's gate) — the coverage check bounds itself by the
+        // same table-derived word.
+        pie::driver::fire::hook_region_k(view));
     for (std::uint8_t phase :
          {std::uint8_t{PTIR_STAGE_ON_ATTN_PROJ},
           std::uint8_t{PTIR_STAGE_ON_ATTN}}) {
