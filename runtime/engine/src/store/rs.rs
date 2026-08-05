@@ -305,6 +305,28 @@ impl RsStore {
     /// recycled slot, so every pending epoch is releasable — the bound is the
     /// in-flight count, never the epoch value (host ops such as
     /// `release_working_set` tag frees with caller-supplied epochs).
+    ///
+    /// That last parenthesis is the whole reason this stays coarse, and it is
+    /// worth spelling out because the obvious improvement does not work. Under
+    /// sustained load the store is never idle, so freed slots accumulate
+    /// unretired and the pool can read empty while every slot in it is
+    /// releasable — on Qwen3.6-27B (24 slots, admission pinned to 16) that
+    /// failed 8 of 32 requests with "every RS folded slot is held". The
+    /// tempting fix is to retire by epoch instead: a slot freed at E is safe
+    /// once the oldest unsettled write is newer than E. It is not sound here.
+    /// A caller-supplied epoch records when a slot was FREED, not when the
+    /// last write touching it was prepared, so a working set released while a
+    /// newer write against it is still in flight gets a tag OLDER than that
+    /// write — and retiring on that tag hands the slot out from under the
+    /// device. Measured: the epoch-bounded version won +31% on the pinned-
+    /// admission path and then hung the uncapped one (32/32 before, a 300 s
+    /// stall after), which is what aliasing live state looks like from
+    /// outside.
+    ///
+    /// Fixing this properly means tagging frees with the newest write that
+    /// could still reference the slot rather than with the wall-clock epoch of
+    /// the free. Until then the coarse bound stays, because a pool that
+    /// sometimes refuses is strictly better than one that sometimes lies.
     pub fn retire_idle(&mut self) {
         if self.in_flight == 0 {
             self.pool.retire_through(u64::MAX);

@@ -85,7 +85,8 @@ set(PIE_METAL_EXPLICIT_SOURCES
   src/model_facts.cpp
   src/pipeline/registry.cpp
   src/batch/compose.cpp
-  src/batch/forward.cpp)
+  src/batch/forward.cpp
+  src/device_tuning.cpp)
 if(NOT APPLE)
   list(APPEND PIE_METAL_EXPLICIT_SOURCES src/pipeline/shared_storage.cpp)
 endif()
@@ -97,6 +98,7 @@ set(PIE_METAL_LIVE_SOURCES)
 if(APPLE)
   set(PIE_METAL_LIVE_SOURCES
     src/mtl4_context.mm
+    src/device_tuning_apple.mm
     src/pipeline/shared_storage.mm
     src/pipeline/m1_runtime.cpp
     src/batch/decode_timing.cpp
@@ -213,6 +215,7 @@ if(APPLE)
     "-framework Metal"
     "-framework MetalKit"
     "-framework Foundation"
+    "-framework IOKit"
     "-framework Accelerate")
 endif()
 

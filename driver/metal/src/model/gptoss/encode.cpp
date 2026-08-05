@@ -230,7 +230,7 @@ int gptoss_qmm_rows(int rows) {
     const int n = rows < 1 ? 1 : rows;
     // Inherited from qwen3.5 and measured here: lowering it to 4 costs gpt-oss
     // 1% (8 lanes, 55.5 -> 54.9 tok/s), so the inherited number holds.
-    if (n < kQmmMinBatch) return n;
+    if (n < qmm_min_batch()) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }

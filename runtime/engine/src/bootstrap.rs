@@ -296,6 +296,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // them full. Throughput +31%, and wall, mean and p99 latency ALL
     // improved -- oversubscribing R is strictly worse, not a trade.
     // An explicit operator setting always wins.
+    //
+    // Deliberately NOT also clamped to the driver's RS folded-slot count.
+    // That looks right -- a recurrent process holds a folded slot for its
+    // whole life, so the pool does bound residency -- but the pool serves
+    // folded state AND buffer pages from the same slots, so admitting exactly
+    // `rs_cache_slots` processes seats every one of them and leaves nothing to
+    // buffer with. Measured on Qwen3.6-27B (24 slots): capping admission at 24
+    // turned a loud failure into a 300 s hang, because every process is
+    // legitimately running and the planner is right to keep waiting. A useful
+    // bound here has to divide by the slots one seat actually consumes, which
+    // is context-dependent and not known at bootstrap.
     let admission_cap = config.max_concurrent_processes.or_else(|| {
         driver_configs
             .iter()

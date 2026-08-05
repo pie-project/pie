@@ -355,7 +355,7 @@ std::vector<int> llama_run_ends(const std::vector<Dispatch>& dag) {
 
 int llama_qmm_rows(int rows, int requests) {
     const int n = rows < 1 ? 1 : rows;
-    if (n < kQmmMinBatch) return n;
+    if (n < qmm_min_batch()) return n;
     const int bm = llama_dense_qmm_bm(n, requests);
     return ((n + bm - 1) / bm) * bm;
 }

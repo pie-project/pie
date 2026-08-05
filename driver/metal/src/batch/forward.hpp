@@ -213,15 +213,29 @@ inline constexpr std::uint64_t kRsSlotBudgetBytes = 1536ull << 20;
 /// the whole point. Kept beside the slot count it feeds.
 std::uint64_t rs_slot_bytes_for(const DecodeGeometry& g);
 
+/// The recurrent-state budget for THIS device: the constant above, or a tenth
+/// of the device's recommended working set, whichever is larger.
+///
+/// A fleet constant chosen on a 32 GiB M1 Max buys nine slots of Qwen3.6-27B's
+/// 170 MiB state, and the slot count is a hard concurrency ceiling -- the tenth
+/// request fails the planner with "every RS folded slot is held" rather than
+/// queueing. A 48 GiB M4 Pro has the memory for twenty-two and no way to say
+/// so. A tenth of the recommended working set leaves the M1 Max where the
+/// constant put it and gives the M4 Pro 3.74 GiB.
+std::uint64_t rs_slot_budget_bytes();
+
 /// How many slots to reserve: as many as the budget buys, never more than
-/// `kPhase1bRsSlots` and never fewer than `floor_slots`.
+/// `kPhase1bRsSlots`, and never more than `requested_slots`.
+///
+/// `requested_slots` is a CEILING. It used to be a floor, which made
+/// `budget_bytes` decorative -- see the definition for what that cost.
 ///
 /// ONE function, called by the capabilities pass and by setup, because a
 /// capability advertising more slots than setup allocates is a request the
 /// driver accepts and cannot hold -- the same rule, and the same reason, as
 /// `simple_family_max_forward_tokens`.
 std::uint32_t rs_slots_for_budget(const DecodeGeometry& g, std::uint64_t budget_bytes,
-                                  std::uint32_t floor_slots);
+                                  std::uint32_t requested_slots);
 
 // Tokens the resident KV/GDN ring holds, across the WHOLE fleet -- it is one
 // linear ring, not a per-request allocation, so the whole fleet shares it. At

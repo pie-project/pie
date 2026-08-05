@@ -366,6 +366,15 @@ pub(super) struct FramePolicy {
     /// without it an aggressive deadline would kill exactly the guests that
     /// are behaving, since they cannot submit until the engine answers.
     in_flight_lanes: BTreeSet<ProcessId>,
+    /// When each in-flight lane's debt was incurred. `in_flight_lanes` stops
+    /// the silence clock outright, which is right for a wave that will retire
+    /// and wrong for one that never will: a command buffer that came back out
+    /// of memory is never retired, `on_frame_retired` is never called, and the
+    /// lane's clock is reset on every tick forever. The engine then owes a
+    /// result it cannot produce and the scheduler waits for it without limit
+    /// -- a hang with no message, which is how the Qwen residency overrun
+    /// presented before it was diagnosed. The debt itself gets a deadline.
+    in_flight_since: BTreeMap<ProcessId, Instant>,
     /// How long a silent member may hold the boundary before the LEASH drops
     /// it from the wait-set. Not a verdict and not a failure: the lane parks,
     /// its queued frames still dispatch, and its next fire rejoins. Purely a
@@ -435,6 +444,7 @@ impl FramePolicy {
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
             in_flight_lanes: BTreeSet::new(),
+            in_flight_since: BTreeMap::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
             stats,
@@ -642,6 +652,7 @@ impl FramePolicy {
     pub fn on_frame_retired(&mut self, lanes: impl IntoIterator<Item = ProcessId>) {
         for lane in lanes {
             self.in_flight_lanes.remove(&lane);
+            self.in_flight_since.remove(&lane);
             if let Some(state) = self.lanes.get_mut(&lane) {
                 state.clock_from = None;
             }
@@ -955,6 +966,10 @@ impl FramePolicy {
     fn forget_staged(&mut self, pid: ProcessId) {
         self.staged.remove(&pid);
         self.joins_in_flight.remove(&pid);
+        // A lane that departs owing a result owes it to nobody. Dropped here
+        // as well as at retirement so the debt ledger cannot outlive the
+        // process it is keyed by.
+        self.in_flight_since.remove(&pid);
     }
 
     /// Mirror of the quorum's empty-wait-set re-arm: when the last awaited
@@ -1230,6 +1245,17 @@ impl FramePolicy {
                 // clocks stop here and only restart at `on_frame_retired`,
                 // so the wave's own latency is never charged to the guest.
                 self.in_flight_lanes.extend(frame.members.iter().copied());
+                // Stamped once per lane, not re-stamped: a lane already in
+                // debt from an earlier wave is measured from when the debt
+                // began, or a steady stream of new waves would refresh the
+                // backstop it exists to enforce.
+                // `now`, not `Instant::now()`: the scan below measures the debt
+                // against the same clock the caller passed, and two clocks
+                // that differ by a scheduling delay make the backstop fire a
+                // tick late for reasons nothing can see.
+                for member in frame.members.iter().copied() {
+                    self.in_flight_since.entry(member).or_insert(now);
+                }
                 return FramePlan::Dispatch(frame.waves);
             }
             // Boundary: the wait-all frame quorum. Seal only once every
@@ -1322,9 +1348,25 @@ impl FramePolicy {
                     lane.clock_from = None;
                     continue;
                 }
-                if owes {
+                // The debt's own deadline. Generous on purpose -- twice the
+                // silence timeout -- because this is a backstop against an
+                // engine that will never answer, not a bound on how long a
+                // legitimate wave may take. A lane past it is treated as
+                // silent again, so the ordinary expiry below reports it
+                // instead of the scheduler waiting forever without a word.
+                let debt_since = if owes { self.in_flight_since.get(lane_id).copied() } else { None };
+                let owes_forever = debt_since
+                    .is_some_and(|from| now.saturating_duration_since(from) >= silence * 2);
+                if owes && !owes_forever {
                     lane.clock_from = None;
                 } else {
+                    // Seed the silence clock from when the DEBT began, not
+                    // from now: the lane has been unanswered for twice the
+                    // timeout already, and starting a fresh clock here would
+                    // make the backstop take three timeouts to fire.
+                    if owes_forever {
+                        lane.clock_from = debt_since;
+                    }
                     match lane.clock_from {
                         Some(from) if now.saturating_duration_since(from) >= silence => {
                             // The guest has neither submitted nor parked for
@@ -2355,6 +2397,52 @@ mod tests {
         assert!(
             policy.leashed(a),
             "the clock starts at retirement and runs its full budget from there"
+        );
+    }
+
+    /// ...but the debt itself has a deadline. A wave the driver never retires
+    /// -- a command buffer returned out of memory, say -- leaves the lane in
+    /// `in_flight_lanes` forever, and the branch above resets its clock on
+    /// every tick. The scheduler then waits for a result that cannot arrive,
+    /// with no message and no bound. Past twice the silence timeout the debt
+    /// stops excusing the silence and the ordinary expiry reports it.
+    #[test]
+    fn a_result_that_never_arrives_does_not_excuse_the_silence_forever() {
+        let deadline = Duration::from_millis(50);
+        let silence = Duration::from_secs(30);
+        let mut policy = FramePolicy::new(2, 64, 4096, None)
+            .with_submit_deadline(deadline)
+            .with_silence_timeout(silence);
+        let (a, b) = (pid(), pid());
+        for (owner, base) in [(a, 400), (b, 402)] {
+            policy.on_fire_enqueued(stamp(owner, 0, 0, 2), Some(owner), base, 1, 1);
+            policy.on_fire_enqueued(stamp(owner, 0, 1, 2), Some(owner), base + 1, 1, 1);
+        }
+        let queued: QueuedFireIds = [400, 401, 402, 403].into_iter().collect();
+        let now = Instant::now();
+        assert!(matches!(plan(&mut policy, &queued, now), FramePlan::Dispatch(_)));
+
+        // b's wave retires and b keeps the fleet working; a's never does.
+        let tick = |policy: &mut FramePolicy, seq: u64, at: Instant| -> FramePlan {
+            let base = 410u64 + seq * 2;
+            policy.on_fire_enqueued(stamp(b, seq, 0, 2), Some(b), base, 1, 1);
+            policy.on_fire_enqueued(stamp(b, seq, 1, 2), Some(b), base + 1, 1, 1);
+            let queued: QueuedFireIds = [base, base + 1].into_iter().collect();
+            let out = plan(policy, &queued, at);
+            policy.on_frame_retired([b]);
+            out
+        };
+        policy.on_frame_retired([b]);
+
+        // Inside the debt's budget a is excused, however long the fleet runs.
+        assert!(
+            !matches!(tick(&mut policy, 1, now + silence), FramePlan::Terminate(_)),
+            "a wave may legitimately take a long time"
+        );
+        assert_eq!(
+            tick(&mut policy, 2, now + silence * 2),
+            FramePlan::Terminate(vec![a]),
+            "a result that never came back cannot excuse the silence forever"
         );
     }
 

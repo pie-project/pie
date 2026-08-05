@@ -22,6 +22,8 @@
 #include "decode_step_mb.hpp"  // M=1 helpers (qmv_dispatch, rms_dispatch, ...)
 #include "mtl4_context.hpp"     // Grid, Threadgroup
 
+#include "device_tuning.hpp"
+
 namespace pie::metal {
 
 // affine_qmv_fast over N token rows (batched GEMV). tid.x = token row (0..N-1), tid.y = out-row
@@ -32,9 +34,14 @@ inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
     tg = Threadgroup{32, 2, 1};
 }
 
-// Below this batch the GEMV is the faster kernel: measured, pie's per-step cost
-// beats mlx-lm's at every batch up to 8 with the GEMV and only loses above it.
-inline constexpr int kQmmMinBatch = 12;
+// Below this batch the GEMV is the faster kernel. The crossover is a property
+// of the MACHINE, not of the model: it was measured on an M1 Max, where pie's
+// per-step cost beats mlx-lm's at every batch up to 8 with the GEMV and only
+// loses above it, and an M4 Pro moves it down to 8. See `device_tuning.hpp` --
+// an unrecognised device still gets the 12 this constant was.
+//
+// A call and not a `constexpr`, which is the whole point: the value is not
+// known until there is a device to ask.
 // The ported steel GEMM is instantiated aligned-only, at BM=16 and BK=32. K is
 // not checked: every qwen3.6 projection has K % 512 == 0 (the same fact the
 // GEMV port relies on for its "fast" variant), so K % BK == 0 is free.
@@ -109,7 +116,7 @@ inline int qmm_bm_slot(int bm) {
 
 inline int qmm_bn(int out_vec, int N) {
     const int bm = qmm_bm(N);
-    if (N < kQmmMinBatch || N % bm != 0) return 0;
+    if (N < qmm_min_batch() || N % bm != 0) return 0;
     // Take the WIDEST tile that divides the output, full stop.
     //
     // This used to gate on a threadgroup count, and that was right when the
@@ -178,7 +185,7 @@ inline constexpr int kQmmBnCrossoverTg = 160;
 /// sum is.
 inline int qmm_bn_unsplit(int out_vec, int N) {
     const int bm = qmm_bm(N);
-    if (N < kQmmMinBatch || N % bm != 0 || out_vec % 16 != 0) return 0;
+    if (N < qmm_min_batch() || N % bm != 0 || out_vec % 16 != 0) return 0;
     const int row_tiles = N / bm;
     if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= kQmmBnCrossoverTg) return 32;
     return 16;
