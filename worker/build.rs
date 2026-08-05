@@ -129,6 +129,11 @@ fn build_metal() {
     }
     // Apple frameworks the metal driver pulls. -framework is macOS's -l.
     println!("cargo:rustc-link-lib=framework=Accelerate");
+    // IOKit, for the GPU core count `MTLDevice` does not publish
+    // (`driver/metal/src/device_tuning_apple.mm`). Named here as well as in
+    // `driver/metal/CMakeLists.txt` because CMake's link line does not reach
+    // the Rust test target, which links the static archive itself.
+    println!("cargo:rustc-link-lib=framework=IOKit");
     add_system_libs(/*metal=*/ true);
 
     println!(

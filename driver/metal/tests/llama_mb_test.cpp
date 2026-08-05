@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/device_tuning.hpp"
 #include "../src/model/llama/bind.hpp"
 #include "../src/model/llama/decode_consts.hpp"
 #include "../src/model/llama/decode_step.hpp"
@@ -246,9 +247,13 @@ void check_padding_fits() {
     // all -- padding there would be pure waste on the decode path, which is
     // every step of a normal generation.
     expect_eq(llama_qmm_rows(1), 1, "a decode is not padded");
-    expect_eq(llama_qmm_rows(kQmmMinBatch - 1), kQmmMinBatch - 1,
+    // Read, not restated: the minimum batch became a property of the device
+    // rather than a constant, so the test has to ask the same question the
+    // dispatch does.
+    const int min_batch = pie::metal::qmm_min_batch();
+    expect_eq(llama_qmm_rows(min_batch - 1), min_batch - 1,
               "nothing below the GEMM's minimum batch is padded");
-    expect(llama_qmm_rows(kQmmMinBatch) >= kQmmMinBatch,
+    expect(llama_qmm_rows(min_batch) >= min_batch,
            "at the minimum batch the rows round up to a tile");
 }
 

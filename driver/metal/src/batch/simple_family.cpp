@@ -885,6 +885,17 @@ class GptOssEngine final : public SimpleFamilyEngine {
             }
             return false;
         }
+        // And the projections', which is a third width again -- refused on the
+        // same grounds, because reading 8-bit rows with a 4-bit matvec is the
+        // failure that produces fluent noise rather than an error.
+        g_.proj_bits = gptoss::proj_bits_from_weights(b_.weights);
+        if (g_.proj_bits == 0) {
+            if (err) {
+                *err = "gpt-oss: could not solve the projections' quantization width from "
+                       "`layers.0.self_attn.q_proj.{weight,scales}`";
+            }
+            return false;
+        }
 
         // Paged KV. The sorted MoE is a true M>1 path: rows are grouped by
         // expert, then the native MXFP4 routed GEMM serves each run.
@@ -954,13 +965,16 @@ class GptOssEngine final : public SimpleFamilyEngine {
         }
 
         if (!gptoss::build_gptoss_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        // b4/g64, NOT the (mxfp4, 32) pair gpt-oss's config declares globally.
+        // The checkpoint's projection width at g64, NOT the (mxfp4, 32) pair
+        // gpt-oss's config declares globally.
         // That global is overridden back to affine g64 by nearly every tensor,
         // and this shared table only ever compiles the affine entrypoints --
         // gpt-oss's own mxfp4 kernels are named explicitly in `gptoss/kernels.cpp`.
-        // This used to be the parameter's default, which meant the driver was
-        // making the same choice without saying so.
-        const AffineFormat kGptOssBase{/*bits=*/4, /*group=*/64};
+        // The width used to be a literal 4 here, which was right for a
+        // uniformly-4-bit checkpoint and silently wrong for a mixed one --
+        // and this table builds the PREFILL GEMMs, so it was the more
+        // damaging of the two hardcodings.
+        const AffineFormat kGptOssBase{/*bits=*/g_.proj_bits, /*group=*/64};
         if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, err))
             return false;
         if (!load_multibatch_psos(

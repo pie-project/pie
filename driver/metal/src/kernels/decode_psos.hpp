@@ -72,7 +72,7 @@ struct MultiBatchPsos {
     Pso sdpa_paged_tiled_d512{}; // sdpa_paged_tiled_bfloat16_d_512
     Pso kv_append_paged{}; // kv_append_paged_bfloat16                  (page-table scatter write)
     // affine_qmm_t: MLX's steel quantized GEMM, for the batched decode. [0] is
-    // BN=32, [1] is BN=64. Selected only above `kQmmMinBatch`.
+    // BN=32, [1] is BN=64. Selected only above `qmm_min_batch()`.
     // [bm][bn]: `kQmmBMs` rows per block x 16/32/64 columns.
     Pso qmm_t[3][3]{};
     // Same storage ABI, but casts each tile to FP16 before the simdgroup MMA.

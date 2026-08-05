@@ -736,10 +736,21 @@ void write_u32(const SlotHandle& s, uint32_t v) {
 // and still exhaust the machine. The bar is a ceiling, not a promise, and this
 // refusal is written to catch the models that are plainly over it rather than
 // to predict the ones that are close.
+// The elastic budget's four addends, kept apart so a refusal can name the one
+// that is large. Assembled by the caller because only it knows the scratch
+// pool, which the heap plan does not carry.
+struct ElasticBreakdown {
+    std::size_t kv_ring = 0;
+    std::size_t kv_pool = 0;
+    std::size_t state = 0;
+    std::size_t scratch = 0;
+};
+
 bool fits_on_this_gpu(std::size_t heap_bytes,
                       std::size_t elastic_bytes,
                       std::size_t resident_weights,
-                      std::string* err) {
+                      std::string* err,
+                      const ElasticBreakdown* parts = nullptr) {
     const std::size_t limit = RawMetalContext::device_working_set_bytes();
     if (limit == 0) return true;  // the device would not say; do not invent one
     const std::size_t want = heap_bytes + elastic_bytes;
@@ -751,8 +762,26 @@ bool fits_on_this_gpu(std::size_t heap_bytes,
         *err = "this model does not fit this GPU: it needs " + gib(want) +
                " GiB resident (" + gib(resident_weights) + " GiB of weights, " +
                gib(elastic_bytes) + " GiB of KV, state and scratch) and the device "
-               "will hold " + gib(limit) + " GiB. A shorter context shrinks the KV; "
-               "the weights do not shrink.";
+               "will hold " + gib(limit) + " GiB.";
+        // Which region to shrink, and with which knob. "A shorter context
+        // shrinks the KV" was the whole of the old advice, and on a paged
+        // family it is wrong twice: the operator reaches for `total_pages`,
+        // the number does not move, and nothing says why. It does not move
+        // because a paged model allocates BOTH the paged pool that
+        // `total_pages` sizes AND the M=1 contiguous ring that `max_ctx`
+        // sizes -- two KV regions, one knob each. Naming them separately is
+        // the difference between a refusal an operator can act on and one
+        // they can only read.
+        if (parts != nullptr) {
+            *err += " Of that: " + gib(parts->kv_ring) +
+                    " GiB M=1 KV ring (from max_model_len), " +
+                    gib(parts->kv_pool) +
+                    " GiB paged KV pool (total_pages x kv_page_size), " +
+                    gib(parts->state) +
+                    " GiB recurrent state (max_forward_requests), " +
+                    gib(parts->scratch) + " GiB scratch.";
+        }
+        *err += " The weights do not shrink.";
     }
     return false;
 }
@@ -834,9 +863,18 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // is the one case that matters most: it re-reserved the entire model
     // alongside its own mapping and the first command buffer came back out of
     // memory.
+    const std::size_t extra = SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
     const std::size_t heap_bytes = (weights >= streamed ? weights - streamed : 0) +
-                                   (slab ? std::size_t(cfg.expert_slab_bytes) : 0) +
-                                   SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
+                                   (slab ? std::size_t(cfg.expert_slab_bytes) : 0) + extra;
+    // These families carry their KV inside `extra_heap_bytes` rather than in
+    // an elastic budget, so the breakdown the other path traces is one number
+    // here -- but it is the number `max_model_len` moves, and a knob whose
+    // effect cannot be observed is a knob nobody can tune.
+    if (std::getenv("PIE_METAL_LOAD_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[pie-metal] load: ctx %d tokens; kv, state and scratch %.1f MB\n",
+                     max_ctx_, double(extra) / (1024.0 * 1024.0));
+    }
     // What to ALLOCATE and what must be RESIDENT are two numbers, and this
     // refusal is about the second. Weights bound where they lie leave the heap
     // but not the working set -- `wrap_host_memory` puts them in the residency
@@ -999,7 +1037,22 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
 
     // Heap plus mapping: see `setup_simple`. What leaves the heap does not
     // leave the working set.
-    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err))
+    const ElasticBreakdown elastic_parts{
+        plan_.kv_bytes, plan_.kv_pool_bytes, plan_.state_bytes,
+        plan_.scratch_bytes + (taps ? 0u : scratch_pool_bytes)};
+    // The same four numbers the refusal prints, printed on the path that
+    // SUCCEEDS too. A knob whose effect is only visible when the model fails
+    // to load is a knob nobody can tune.
+    if (std::getenv("PIE_METAL_LOAD_TRACE") != nullptr) {
+        const auto mb = [](std::size_t b) { return double(b) / (1024.0 * 1024.0); };
+        std::fprintf(stderr,
+                     "[pie-metal] load: ctx %d tokens; kv ring %.1f MB, kv pool %.1f MB, "
+                     "state %.1f MB, scratch %.1f MB\n",
+                     max_ctx_, mb(elastic_parts.kv_ring), mb(elastic_parts.kv_pool),
+                     mb(elastic_parts.state), mb(elastic_parts.scratch));
+    }
+    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err,
+                          &elastic_parts))
         return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
@@ -1276,16 +1329,39 @@ std::uint64_t rs_slot_bytes_for(const DecodeGeometry& g) {
     return gdn_layers * (2 * conv + recur);
 }
 
+std::uint64_t rs_slot_budget_bytes() {
+    const std::uint64_t working_set =
+        static_cast<std::uint64_t>(RawMetalContext::device_working_set_bytes());
+    return std::max<std::uint64_t>(kRsSlotBudgetBytes, working_set / 10);
+}
+
 std::uint32_t rs_slots_for_budget(const DecodeGeometry& g, std::uint64_t budget_bytes,
-                                  std::uint32_t floor_slots) {
+                                  std::uint32_t requested_slots) {
     const std::uint64_t per_slot = rs_slot_bytes_for(g);
     // A geometry with no linear-attention layers has no state to slot; the
     // count is then whatever the caller needs, at no cost.
-    if (per_slot == 0) return std::max<std::uint32_t>(floor_slots, 1);
+    if (per_slot == 0) return std::max<std::uint32_t>(requested_slots, 1);
     const std::uint64_t affordable = budget_bytes / per_slot;
+    // `requested_slots` is a CEILING, not a floor. It used to be applied as
+    // `max(slots, requested)`, which made `budget_bytes` decorative: the
+    // request count is `kPagedMaxForwardRequests`, a constant, so every
+    // checkpoint reserved 64 slots at whatever they cost. Qwen3.6-27B's slots
+    // are 170 MiB, so that is 10.6 GiB of recurrent state -- which put the
+    // model 5.2 GiB over this device and, at the batch sizes that did load,
+    // returned `kIOGPUCommandBufferCallbackErrorOutOfMemory` from the command
+    // queue. That arrived as a command buffer which never ran, so every PTIR
+    // lane's status still held its zero fill, and the runtime read the zeros
+    // back as every lane faulting -- deterministic above concurrency 4, and
+    // naming neither memory nor the batch it came from.
+    //
+    // Reserving fewer slots than the driver ADVERTISES would hang rather than
+    // queue, so the two are kept equal: `context.cpp` derives the advertised
+    // `max_forward_requests` from this same call. Fewer admitted requests
+    // queue; a device that is overrun does not.
     std::uint64_t slots = std::min<std::uint64_t>(affordable, kPhase1bRsSlots);
-    slots = std::max<std::uint64_t>(slots, std::max<std::uint32_t>(floor_slots, 1));
-    return std::uint32_t(slots);
+    slots = std::min<std::uint64_t>(
+        slots, std::max<std::uint32_t>(requested_slots, 1));
+    return std::uint32_t(std::max<std::uint64_t>(slots, 1));
 }
 
 uint64_t MetalExecutor::Impl::rs_slot_bytes() const {
@@ -2510,7 +2586,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // floor is the concurrency the caller asked for: a driver that reserves
     // fewer slots than it accepts requests hangs rather than queues.
     geom.max_slots = int(rs_slots_for_budget(
-        geom, kRsSlotBudgetBytes,
+        geom, rs_slot_budget_bytes(),
         std::min(cfg.max_forward_requests, kPagedMaxForwardRequests)));
     // Bounded, actually allocated/bound multi-batch capacity.  The paged path
     // has no hidden ring fallback: every advertised row/request has an IO,
@@ -3334,6 +3410,12 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         schedule, in, &batch_err, dispatch_callbacks);
     impl_->pending_logits_stage_.clear();
     if (!ran) {
+        // The only account of why a paged batch was refused. Without it the
+        // caller sees a poison epoch, and any PTIR group riding this forward
+        // reports lanes that never dispatched -- neither of which names the
+        // reason. The simple-family path already prints its rejections.
+        std::cerr << "[pie-driver-metal] paged batch forward rejected: "
+                  << batch_err << "\n";
         for (const std::size_t member : accepted_members) {
             errors[member] = batch_err;
         }
