@@ -260,6 +260,11 @@ int gptoss_moe_qmm_bn(Kind k, const GptOssGeometry& g, int rows) {
     if (!routed || !g.mxfp4_experts || gptoss_moe_tile_rows(g, rows) <= 1)
         return 0;
     const KN kn = qmv_kn(k, g);
+    // The widest tile that divides, and here that IS right: the sorted mixture
+    // supplies the threadgroups a wide tile gives up, because every expert with
+    // rows contributes its own. Measured at 448 rows -- BN=16 374.7 tok/s,
+    // BN=32 420.8, BN=64 457.9 -- which is the opposite ordering to the dense
+    // projections above, and the reason they get a different rule.
     int bn = 0;
     for (const int candidate : {16, 32, 64})
         if (kn.N % candidate == 0) bn = candidate;
@@ -277,11 +282,15 @@ bool gptoss_is_dense_proj(Kind k) {
 }
 
 /// The GEMM's tile for a dense projection, or 0 to keep the matvec.
+///
+/// `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only where
+/// split-K supplies the threadgroups the wide tile gives up, and this family
+/// dispatches no split at all.
 int gptoss_qmm_bn(Kind k, const GptOssGeometry& g, int rows) {
     if (!gptoss_is_dense_proj(k)) return 0;
     const KN kn = qmv_kn(k, g);
     if (kn.N == 0) return 0;
-    return qmm_bn(kn.N, gptoss_qmm_rows(rows));
+    return qmm_bn_unsplit(int(kn.N), gptoss_qmm_rows(rows));
 }
 
 Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
