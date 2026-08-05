@@ -488,8 +488,7 @@ pub fn prepare(
     let (translation_version, translation) = match build_translation(store, ws) {
         Ok(translation) => translation,
         Err(error) => {
-            store.settle(cas_intents, false);
-            store.retire_through(seq);
+            store.settle(seq, cas_intents, false);
             return Err(error.into());
         }
     };
@@ -545,8 +544,7 @@ pub fn prepare_explicit_reserved(
     let (translation_version, translation) = match build_translation(store, ws) {
         Ok(translation) => translation,
         Err(error) => {
-            store.settle(cas_intents, false);
-            store.retire_through(seq);
+            store.settle(seq, cas_intents, false);
             return Err(error.into());
         }
     };
@@ -568,8 +566,7 @@ pub fn abandon(store: &mut KvStore, txn: KvTxn) {
     let KvTxn {
         seq, cas_intents, ..
     } = txn;
-    store.settle(cas_intents, false);
-    store.retire_through(seq);
+    store.settle(seq, cas_intents, false);
 }
 
 /// Finalize a PTIR fire's KV write after `submit_async` resolves. `success`
@@ -581,8 +578,7 @@ pub fn finalize(store: &mut KvStore, txn: KvTxn, success: bool) -> Result<(), St
     let KvTxn {
         seq, cas_intents, ..
     } = txn;
-    store.settle(cas_intents, success);
-    store.retire_through(seq);
+    store.settle(seq, cas_intents, success);
     Ok(())
 }
 

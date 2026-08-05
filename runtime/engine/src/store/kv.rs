@@ -339,9 +339,10 @@ impl KvStore {
     /// pending set retires.
     pub fn retire_idle(&mut self) {
         // Nothing in flight: everything retires, and the tracking set is
-        // resynced — `settle` drops `in_flight` without knowing its own
-        // sequence (its paired `retire_through` supplies that), so this is
-        // also the self-heal for any unpaired settle.
+        // resynced. `settle` and `cancel_prepared` both remove their own
+        // sequence, so `outstanding` should already be empty here; the clear
+        // is belt-and-braces against a future producer of sequences that has
+        // no matching consumer.
         if self.in_flight == 0 {
             self.outstanding.clear();
             self.pool.retire_through(self.seq);
@@ -988,7 +989,18 @@ impl KvStore {
         self.retire_idle();
     }
 
-    pub fn settle(&mut self, intents: Vec<CasIntent>, success: bool) {
+    /// Settle `seq`'s fire: publish its CAS intents (or discard them on
+    /// failure), drop it from the in-flight set, and retire every recycle
+    /// epoch it was gating.
+    ///
+    /// `seq` is a parameter rather than a separate `retire_through(seq)` call
+    /// because forgetting the second call is not a visible failure: the stale
+    /// entry pins `retire_idle` at `min(outstanding) - 1` forever, freed pages
+    /// stop reaching the free list, and the only self-heal is a moment of
+    /// GLOBAL quiescence — which at high concurrency never comes (that wait is
+    /// exactly the 4.5 ms per-completion supply drip of analysis.md
+    /// 10.16-10.17). One call, one signature, no discipline to remember.
+    pub fn settle(&mut self, seq: u64, intents: Vec<CasIntent>, success: bool) {
         #[cfg(test)]
         if success {
             for intent in intents {
@@ -1011,12 +1023,7 @@ impl KvStore {
         #[cfg(not(test))]
         let _ = (intents, success);
         self.in_flight = self.in_flight.saturating_sub(1);
-        self.retire_idle();
-    }
-
-    /// Settle `epoch`'s fire and retire every recycle epoch it was gating.
-    pub fn retire_through(&mut self, epoch: u64) {
-        self.outstanding.remove(&epoch);
+        self.outstanding.remove(&seq);
         self.retire_idle();
     }
 
@@ -1326,8 +1333,7 @@ impl KvStore {
             });
         }
         let (sequence, intents) = self.publish_prepared(prepared, &commits)?;
-        self.settle(intents, true);
-        self.retire_through(sequence);
+        self.settle(sequence, intents, true);
         Ok(page_count)
     }
 

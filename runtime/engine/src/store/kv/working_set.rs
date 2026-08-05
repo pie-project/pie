@@ -393,8 +393,7 @@ mod tests {
             })
             .collect();
         let (seq, intents) = kv.publish_prepared(prepared, &commits).unwrap();
-        kv.settle(intents, true);
-        kv.retire_through(seq);
+        kv.settle(seq, intents, true);
     }
 
     #[test]
