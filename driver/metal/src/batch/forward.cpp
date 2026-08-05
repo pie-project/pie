@@ -17,7 +17,7 @@
 
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"

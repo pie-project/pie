@@ -15,10 +15,19 @@ use crate::extent::Extent;
 use crate::plan::geometry::extent_storage_bytes;
 use crate::plan::index::{instr_by_id, set_instr_id};
 use crate::plan::{LoadPlan, SourceExtent, StorageInstr};
-use crate::types::{BufferId, InstrId};
+use crate::types::{BackendKind, BufferId, InstrId};
 
 pub(super) fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result<usize> {
     if program.schedule.is_empty() {
+        return Ok(0);
+    }
+    // Coalescing serves a device arena: one H2D covering adjacent buffers
+    // beats one copy per tensor. A host-executed plan has the opposite
+    // interest — the streaming executor owns each buffer separately and
+    // frees it at its last use, and an instruction that addresses the arena
+    // by offset is the one thing it cannot honour. The backend says which
+    // world the plan is for.
+    if program.target.backend == BackendKind::Unknown {
         return Ok(0);
     }
     let old_instrs = program.instrs.clone();

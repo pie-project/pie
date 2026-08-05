@@ -20,26 +20,28 @@ use crate::config::{
 };
 use crate::driver_ffi::Flavor;
 
-/// Anchors `pie-loader`'s C entry points into the final binary.
+/// Anchors the loader ABI's C entry points into the final binary.
 ///
-/// `pie-loader` is an rlib and the only callers of `pie_loader_compile_contract`
-/// and friends are the C++ drivers, which link *after* Rust. A linker never
-/// pulls an rlib member in on behalf of a C++ reference, so without a reference
-/// from reachable Rust the entry points are simply absent and the failure
-/// surfaces as an undefined symbol at final link (`loader/architecture.md`
-/// §3.4). The `#[used]` table inside `pie_loader::ffi::entry` keeps all six
-/// alive once the object is pulled in; this static is what pulls it in.
+/// `pie-loader-capi` is an rlib and the only callers of
+/// `pie_loader_compile_model` and friends are the C++ drivers, which link
+/// *after* Rust. A linker never pulls an rlib member in on behalf of a C++
+/// reference, so without a reference from reachable Rust the entry points are
+/// simply absent and the failure surfaces as an undefined symbol at final
+/// link (`loader/architecture.md` §3.4). The `#[used]` table inside
+/// `pie_loader_capi::entry` keeps all six alive once the object is pulled in;
+/// this static is what pulls it in.
 ///
 /// **This is load-bearing.** No Rust in this process calls the loader any more —
-/// §12 step 2 moved plan compilation behind the FFI and row 12 moved contract
-/// authorship to C++ — so this reference is the only thing keeping the object
-/// file in the link.
+/// §12 step 2 moved plan compilation behind the FFI, and the boot's request
+/// entry is `pie_loader_compile_model` (`plan/model-in-rust.md` §6) — so this
+/// reference is the only thing keeping the object file in the link.
 #[used]
 static PIE_LOADER_ENTRY_ANCHOR: unsafe extern "C" fn(
-    *const pie_loader::ffi::entry::PieLoaderContractRequest,
-    *mut *mut pie_loader::ffi::PieLoaderPlan,
-    *mut *mut pie_loader::ffi::PieLoaderDiagnostics,
-) -> pie_loader::ffi::PieLoaderStatus = pie_loader::ffi::entry::pie_loader_compile_contract;
+    *const pie_loader_capi::model::PieLoaderModelRequest,
+    *mut *mut pie_loader_capi::PieLoaderPlan,
+    *mut u32,
+    *mut *mut pie_loader_capi::PieLoaderDiagnostics,
+) -> pie_loader_capi::PieLoaderStatus = pie_loader_capi::model::pie_loader_compile_model;
 
 #[cfg(feature = "driver-cuda")]
 #[repr(C)]
@@ -540,7 +542,14 @@ pub(crate) fn create_driver_backend_group(
         }
         let state_dir = local_driver_state_dir(group_id, Some(tp))?;
         let toml_path = state_dir.join("driver.toml");
-        write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp), descriptor)?;
+        write_cuda_startup_toml(
+            &toml_path,
+            opts,
+            snapshot_dir,
+            group_id,
+            Some(tp),
+            descriptor,
+        )?;
         config_blobs.push(toml_path.to_string_lossy().into_owned().into_bytes());
     }
 

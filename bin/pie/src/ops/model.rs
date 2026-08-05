@@ -56,6 +56,9 @@ pub enum ModelCmd {
     },
     /// Rewrite a checkpoint as pie's canonical `.zt` artifact.
     Convert(crate::ops::convert::ConvertArgs),
+    /// Precompute a serve boot: author the family contract, run the load
+    /// transforms offline, write the runtime tensors as a `.zt` artifact.
+    Optimize(crate::ops::optimize::OptimizeArgs),
 }
 
 pub fn run(cmd: ModelCmd) -> Result<()> {
@@ -71,6 +74,7 @@ pub fn run(cmd: ModelCmd) -> Result<()> {
         } => download(repo_id, all, raw, clean, force, max_shard_size),
         ModelCmd::Remove { name, yes, staging } => remove(name, yes, staging),
         ModelCmd::Convert(args) => crate::ops::convert::run(args),
+        ModelCmd::Optimize(args) => crate::ops::optimize::run(args),
     }
 }
 

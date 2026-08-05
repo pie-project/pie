@@ -19,8 +19,10 @@ members = [
     "runtime/tokenizer",
     # Constrained-decoding grammar engine (EBNF/regex/json-schema/matcher/bitmask).
     "runtime/grammar",
-    # Model metadata + instruct chat templates + multimodal host-decode.
-    "runtime/model",
+    # The model knowledge crate: what each family is, backend-blind — instruct
+    # chat templates and multimodal host-decode today; contract authoring and
+    # forward-pass programs land here as they migrate out of the drivers.
+    "model",
     # HF `config.json` normalization -> the `pie.model/1` descriptor. A leaf:
     # serde only, no driver and no runtime, so `pie model convert` can run it.
     "runtime/model-config",
@@ -58,8 +60,12 @@ members = [
     "driver/dummy",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime (see loader/architecture.md).
+    # `loader` is the compiler alone; `loader/capi` is its C ABI — the repr(C)
+    # marshalling, the extern entry points, the committed pie_loader.h and the
+    # `pie-loader` CLI — which is what the drivers actually link.
     "loader",
-    "loader/cbindgen",
+    "loader/capi",
+    "loader/capi/cbindgen",
     "sdk/python-server",
     # Thin binary shells composing the `startup` skeleton + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).
