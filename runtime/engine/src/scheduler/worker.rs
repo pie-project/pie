@@ -452,6 +452,8 @@ pub(crate) struct LaunchGrouping {
     has_rs_rows: bool,
     has_user_mask: bool,
     has_device_geometry: bool,
+    has_hook_program: bool,
+    has_multi_token: bool,
 }
 
 /// A fire the driver will resolve a DENSE per-cell attention mask for out of
@@ -530,6 +532,21 @@ impl LaunchGrouping {
         {
             return false;
         }
+        // Hook-program fires: the driver executes ONE hook program per
+        // launch (the sideband arena is singular), and a page-list
+        // substitution written from a hook needs the PAGED DECODE path —
+        // which a batch loses the moment it carries a multi-token row
+        // (driver fail: "attn_page_mask was written but this layer does
+        // not take the paged decode path"). So a hook fire joins only
+        // all-single-token groups with no other hook member, and a
+        // multi-token fire never joins past a hook member.
+        if self.count != 0
+            && ((request.hook_program
+                && (self.has_hook_program || self.has_multi_token))
+                || (!request.request.single_token_mode && self.has_hook_program))
+        {
+            return false;
+        }
         if self.count == 0 {
             return true;
         }
@@ -557,6 +574,8 @@ impl LaunchGrouping {
         self.has_rs_rows |= request.rs_batch_kind() != RsBatchKind::None;
         self.has_user_mask |= request.request.has_user_mask;
         self.has_device_geometry |= request.request.device_resolved_geometry;
+        self.has_hook_program |= request.hook_program;
+        self.has_multi_token |= !request.request.single_token_mode;
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
             || self.count >= limits.max_forward_requests
@@ -2282,7 +2301,7 @@ impl SchedulerHandle {
                 prelaunch_state_copy,
                 frame,
                 timing_enabled,
-                /*hook_program=*/false),
+                hook_program),
         })
     }
 
