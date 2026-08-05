@@ -20,6 +20,10 @@ struct Input {
     max_tokens: usize,
     #[serde(default)]
     max_layers: Option<u32>,
+    /// BISECT: 0 = full (mask everywhere), 1 = no decode mask,
+    /// 2 = no masks at all (prefill causal channel still bound? no — none).
+    #[serde(default)]
+    bisect: u32,
 }
 
 fn default_prompt() -> String {
@@ -85,7 +89,7 @@ async fn main(input: Input) -> Result<String> {
             w_slot: &prefill_slots,
             w_off: &prefill_offsets,
             positions: &prefill_positions,
-            mask: Some(&causal),
+            mask: if input.bisect >= 2 { None } else { Some(&causal) },
         },
     )?;
     prefill.epilogue(move || {
@@ -121,7 +125,9 @@ async fn main(input: Input) -> Result<String> {
     );
     let pages = Channel::from(pool_ids.clone());
     let page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]);
-    let token_out = Channel::new([1], dtype::i32).named("token_out");
+    let token_out = Channel::new([1], dtype::i32)
+        .capacity(channel_capacity() as u32)
+        .named("token_out");
 
     let decode = ForwardPass::new();
     if let Some(k) = input.max_layers {
@@ -139,7 +145,7 @@ async fn main(input: Input) -> Result<String> {
             w_slot: &write_slot,
             w_off: &write_offset,
             positions: &position,
-            mask: Some(&mask),
+            mask: if input.bisect >= 1 { None } else { Some(&mask) },
         },
     )?;
     decode.epilogue(move || {
@@ -165,7 +171,9 @@ async fn main(input: Input) -> Result<String> {
         klen.put([pos + 1]);
         write_slot.put([pool_ids[(pos / PAGE_T) as usize]]);
         write_offset.put([pos % PAGE_T]);
-        mask.put((0..pool_len).map(|key| key <= pos).collect::<Vec<bool>>());
+        if input.bisect == 0 {
+            mask.put((0..pool_len).map(|key| key <= pos).collect::<Vec<bool>>());
+        }
         page_indptr.put([0u32, (pos + 1).div_ceil(PAGE_T)]);
         filled += 1;
     }
