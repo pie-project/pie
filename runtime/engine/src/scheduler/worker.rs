@@ -455,6 +455,14 @@ pub(crate) struct LaunchGrouping {
     has_device_geometry: bool,
     has_hook_program: bool,
     has_multi_token: bool,
+    /// First FINITE truncation (`set-max-layers`) seen in the group, and
+    /// whether a SECOND distinct one joined. Only consulted when a hook
+    /// member is (or would be) present: the dsplit union that serves a
+    /// hook-carrying mixed-depth fire has ONE depth boundary — [k | full] —
+    /// and bands decline hooks, so two distinct finite k's would demote the
+    /// deeper lane to the stamp's k. Hookless multi-k groups band fine.
+    finite_k: Option<u32>,
+    finite_k_multi: bool,
 }
 
 /// One token per row — the paged-decode-path shape, independent of
@@ -570,6 +578,23 @@ impl LaunchGrouping {
         {
             return false;
         }
+        // Hook x depth: a group that carries (or would carry) a hook member
+        // must hold at most ONE distinct finite truncation. The serving
+        // machinery for hooked mixed-depth fires is the dsplit union —
+        // [k | full], one boundary — because banding declines hooks; a
+        // second distinct k would execute at the stamp's k (silent
+        // demotion, observed live: hook@8 + k12 lanes ran the k12 rows at
+        // 8). Refused here, the odd-k lane forms its own group and runs
+        // exact.
+        if self.count != 0 && (self.has_hook_program || request.hook_program) {
+            let clashes = match (request.request.max_layers, self.finite_k) {
+                (Some(a), Some(b)) => a != b || self.finite_k_multi,
+                _ => self.finite_k_multi,
+            };
+            if clashes {
+                return false;
+            }
+        }
         if self.count == 0 {
             return true;
         }
@@ -599,6 +624,13 @@ impl LaunchGrouping {
         self.has_device_geometry |= request.request.device_resolved_geometry;
         self.has_hook_program |= request.hook_program;
         self.has_multi_token |= !one_token_rows(&request.request);
+        if let Some(k) = request.request.max_layers {
+            match self.finite_k {
+                None => self.finite_k = Some(k),
+                Some(existing) if existing != k => self.finite_k_multi = true,
+                _ => {}
+            }
+        }
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
             || self.count >= limits.max_forward_requests
