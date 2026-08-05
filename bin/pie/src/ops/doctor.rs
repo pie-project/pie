@@ -236,7 +236,7 @@ fn check_config(path: &Path, origin: startup::Origin) -> Vec<(String, String, St
     out
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Status {
     Pass,
     /// True of the machine, not wrong with the installation. Never blocks.
@@ -322,14 +322,22 @@ fn check_gpus() -> Vec<(String, String, Status)> {
 /// measured?
 ///
 /// The plan's §7 makes this mandatory rather than nice. `pie config optimize`
-/// and `[driver] calibrate_planner` write values that pin the forward shape and
-/// the batching policy; a machine where neither has run gets the analytic
-/// planner's judgement, which is a model of the machine rather than the machine.
+/// writes both of the things below: its first stage measures the forward shape
+/// and its second the batching knobs. A machine where it has not run gets the
+/// analytic planner's judgement, which is a model of the machine rather than
+/// the machine.
 /// That is a perfectly serviceable state -- it is what every deployment has had
 /// until now -- but it is not one an operator should have to infer from the
 /// absence of keys in a file.
 ///
 /// Warnings, never failures. An unmeasured machine serves.
+///
+/// This briefly grew a blocking check for a `calibrate_planner` left on in the
+/// config. The check is gone because what it guarded is gone: calibration is a
+/// stage of `pie config optimize` now, set on a config derived in memory, and
+/// the key is `#[serde(skip)]` — a file cannot carry it, so it cannot be left
+/// on. Guarding a state that no longer exists is how a checklist grows a step
+/// nobody can explain.
 fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> {
     let file: toml::Value = std::fs::read_to_string(config_path)
         .ok()
@@ -386,7 +394,7 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
     // The driver's own measurement, keyed by (device, model, tp, kv format) --
     // so its mere presence is not proof it applies HERE. Saying "measured on
     // some machine" would be worse than saying nothing, hence the wording.
-    let profile_cache = pie_worker::state::driver_cache_dir().join("cuda_memory_profiles.json");
+    let profile_cache = pie_worker::state::planner_profile_path();
     checks.push(if profile_cache.is_file() {
         (
             "planner profile".to_string(),
@@ -399,11 +407,42 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
     } else {
         (
             "planner profile".to_string(),
-            "none; the forward step has never been timed here (`[driver] calibrate_planner`)"
+            "none; the forward step has never been timed here (`pie config optimize` measures it)"
                 .to_string(),
             Status::Warn,
         )
     });
 
     checks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tuning_of(config: &str) -> Vec<(String, String, Status)> {
+        let path = std::env::temp_dir().join(format!(
+            "pie-doctor-tuning-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, config).unwrap();
+        let checks = check_tuning(&path);
+        let _ = std::fs::remove_file(&path);
+        checks
+    }
+
+    #[test]
+    fn the_unmeasured_machine_still_serves() {
+        // This section describes the machine rather than faulting the config,
+        // and an unmeasured machine is a perfectly serviceable one -- it is
+        // what every deployment had until now. Nothing here may block a boot.
+        for config in ["", "[driver]\nmemory_profile = \"latency\"\n"] {
+            let checks = tuning_of(config);
+            assert!(
+                !checks.iter().any(|(_, _, status)| *status == Status::Fail),
+                "nothing here blocks a boot: {checks:?}"
+            );
+        }
+    }
 }

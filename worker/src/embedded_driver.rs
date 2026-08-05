@@ -1185,6 +1185,49 @@ mod tests {
         );
     }
 
+    /// A calibration request reaches the driver, and only ever from memory.
+    ///
+    /// This is the whole route that replaced `[driver] calibrate_planner`:
+    /// `pie config optimize` sets `server.calibrate_planner` on a config it
+    /// derived, `engine::apply_embedded_calibration` puts it on the driver
+    /// options, and this is where it becomes something the C++ side reads. The
+    /// per-launch startup TOML is the only file it ever appears in, and that
+    /// file is regenerated every boot -- so the request cannot outlive the boot
+    /// that made it.
+    #[test]
+    fn a_calibration_request_reaches_the_driver_and_stops_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.device = "cuda:0".to_string();
+        opts.calibrate_planner = true;
+
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None, None).unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            val["batching"]["calibrate_planner"].as_bool(),
+            Some(true),
+            "the driver never hears the request"
+        );
+
+        // And the field is not part of the file format: a user config that
+        // spells it is refused, so this value can only have come from memory.
+        let asked = "\
+[model]
+name = \"m\"
+hf_repo = \"x\"
+[driver]
+type = \"cuda_native\"
+device = [\"cuda:0\"]
+calibrate_planner = true
+";
+        let err = crate::config::Config::parse(asked)
+            .expect_err("a measurement is not a setting")
+            .to_string();
+        assert!(err.contains("calibrate_planner"), "got: {err}");
+    }
+
     #[test]
     fn cuda_startup_toml_matches_driver_schema() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1222,8 +1265,11 @@ mod tests {
         );
         assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
         assert!(val["batching"].get("total_pages").is_none());
-        // An ordinary boot says nothing about calibration: it is an action an
-        // operator takes once, not a setting every startup file restates.
+        // An ordinary boot says nothing about calibration: it is one run of a
+        // measurement, not a setting every startup file restates. The only
+        // thing that ever turns it on is `pie config optimize`, on a config it
+        // derived in memory -- see `CudaNativeDriverOptions::calibrate_planner`
+        // for why it cannot come from a file.
         assert!(val["batching"].get("calibrate_planner").is_none());
         assert_eq!(val["batching"].as_table().unwrap().len(), 4);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);

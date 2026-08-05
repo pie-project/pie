@@ -378,9 +378,16 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
         policy.moe_request,
     );
 
+    // `-optimized` on both branches. It was on the store branch only, so
+    // `--out <a directory>` wrote `<name>.zt` -- which is exactly the name
+    // `pie model import` gives the plain converted artifact. Pointed at the
+    // store, `--out` therefore replaced a portable checkpoint with one whose
+    // tensors are this build's runtime layout, under a name that still said
+    // otherwise.
+    let optimized = format!("{}-optimized", source.name);
     let out_file = match &args.out {
-        Some(out) => artifact_path(out, &source.name),
-        None => store_path(&format!("{}-optimized", source.name)),
+        Some(out) => artifact_path(out, &optimized),
+        None => store_path(&optimized),
     };
     if args.dry_run {
         println!("dry run: would write {}", out_file.display());

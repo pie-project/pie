@@ -118,6 +118,10 @@ fn optimize_materializes_the_serve_contract() {
         quant: None,
         fp8_native: false,
         moe: None,
+        // The flag's own default. This test asserts CUDA's fused-bank names
+        // below, which is the layout `cuda` authors -- Metal's schemas produce
+        // in-place projections under MLX names instead.
+        backend: "cuda".to_string(),
         out: Some(artifact.clone()),
         dry_run: false,
     })

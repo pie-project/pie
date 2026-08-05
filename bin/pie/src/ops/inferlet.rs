@@ -66,6 +66,42 @@ fn programs_dir() -> std::path::PathBuf {
     pie_worker::paths::pie_home().join("programs")
 }
 
+/// The newest cached version of a bare inferlet name, if it is already here.
+///
+/// `pub(crate)` for `pie run`, which asks this before the registry. Downloading
+/// is about what the registry has, so `download` and `info` still go straight
+/// there; running is about what this machine can run, and a program already on
+/// disk needs no network to name. That is not a refinement -- the registry does
+/// not serve every inferlet in `pie inferlet list` (the test set is local), so
+/// registry-first made `pie run <one of those>` fail with a 404 for a program
+/// sitting in the cache.
+pub(crate) fn cached_version(name: &str) -> Option<ProgramName> {
+    open(String::new())
+        .cached()
+        .into_iter()
+        .map(|(program, _, _)| program)
+        .filter(|program| program.name == name)
+        .max_by(|a, b| version_order(&a.version).cmp(&version_order(&b.version)))
+}
+
+/// A `major.minor.patch` string as something that sorts like a version.
+///
+/// Not `str::cmp`: versions are three numbers, and comparing them as text puts
+/// `0.10.0` BELOW `0.9.0` -- so "the newest one cached" would start returning
+/// an older build the first time an inferlet reached its tenth minor. The
+/// shape is guaranteed by `ProgramName::parse` (`\d+\.\d+\.\d+`); anything that
+/// still fails to split falls back to text, which is no worse than what it
+/// replaces.
+fn version_order(version: &str) -> (u64, u64, u64, String) {
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Some(major)), Some(Some(minor)), Some(Some(patch))) => {
+            (major, minor, patch, String::new())
+        }
+        _ => (0, 0, 0, version.to_string()),
+    }
+}
+
 /// Open the on-disk cache. The registry URL is only needed for downloads, so
 /// listing and removing work with an empty one rather than requiring a config.
 fn open(registry_url: String) -> Repository {
@@ -235,7 +271,13 @@ struct RegistryVersion {
     num: String,
 }
 
-async fn resolve_inferlet_id(inferlet: &str, registry_url: &str) -> Result<ProgramName> {
+/// Turn what a person typed into a `name@version`, asking the registry for the
+/// version when they did not pin one.
+///
+/// `pub(crate)` for `pie run`, which resolves exactly the way `download` and
+/// `info` do -- a bare name meaning "latest" in one command and something else
+/// in another would be its own bug.
+pub(crate) async fn resolve_inferlet_id(inferlet: &str, registry_url: &str) -> Result<ProgramName> {
     match inferlet.split_once('@') {
         Some((name, "latest")) => {
             validate_bare_inferlet_name(name)?;
@@ -401,5 +443,21 @@ mod tests {
         assert!(validate_bare_inferlet_name("-bad").is_err());
         assert!(validate_bare_inferlet_name("bad/name").is_err());
         assert!(validate_bare_inferlet_name("bad.name").is_err());
+    }
+
+    #[test]
+    fn versions_order_as_numbers_rather_than_as_text() {
+        // The failure this prevents is delayed and quiet: everything is fine
+        // until an inferlet ships 0.10.0, at which point "the newest cached
+        // version" starts resolving to 0.9.0 and `pie run <name>` silently
+        // runs an older build.
+        let mut versions = ["0.9.0", "0.10.0", "0.2.0", "1.0.0", "0.10.1"];
+        versions.sort_by_key(|v| version_order(v));
+        assert_eq!(versions, ["0.2.0", "0.9.0", "0.10.0", "0.10.1", "1.0.0"]);
+        assert!(version_order("0.10.0") > version_order("0.9.0"));
+
+        // Anything that is not three numbers still orders deterministically
+        // rather than panicking or comparing as if it were 0.0.0 and equal.
+        assert_eq!(version_order("not-a-version").3, "not-a-version");
     }
 }

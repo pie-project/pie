@@ -107,6 +107,8 @@ pub struct Args {
     pub tokens: Option<usize>,
     pub budget: Option<usize>,
     pub write: bool,
+    /// Skip stage one on a machine whose planner has already been measured.
+    pub skip_planner: bool,
 }
 
 impl Args {
@@ -289,12 +291,8 @@ pub fn report(
         println!("  {skipped} candidate(s) not measured (--budget). The report ranks only what ran.");
     }
     println!();
-    println!(
-        "  Not searched: kv_page_size, max_forward_tokens and max_forward_requests are"
-    );
-    println!(
-        "  fixed at boot and belong to the driver's own sweep (`[driver] calibrate_planner`)."
-    );
+    println!("  Not searched: kv_page_size, max_forward_tokens and max_forward_requests are");
+    println!("  fixed at boot, and belong to stage 1 above rather than to this sweep.");
 }
 
 /// One lane's input. A bare integer makes the `generate` family decode that
@@ -324,7 +322,57 @@ pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
     Ok(content)
 }
 
-/// Boot once, sweep, report.
+/// When the planner profile was last written, or `None` if it is not there.
+///
+/// Modification time and length together: a calibration that replaces an entry
+/// with one the same size still moves the mtime, and a filesystem with coarse
+/// mtime still changes the length when the numbers differ. Either alone has a
+/// case where a real write looks like no write.
+fn written_at(profile: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(profile).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// Measure the memory planner on this device, in its own boot.
+///
+/// **This is why `calibrate_planner` is not a config key.** It is one run of a
+/// measurement, and the only thing that ever needs it is right here: the flag
+/// is set on a config this process derived in memory, the boot that reads it
+/// ends when this function returns, and nothing about it is written down. There
+/// is no state for an operator to leave behind, because there is no state.
+///
+/// It has to be its own boot rather than a stage of the sweep's. A calibrating
+/// planner abandons its score and builds the largest forward shape that fits —
+/// the arena the ladder needs room to sweep inside — and accepts the starved KV
+/// pool that leaves. That is the right arena to measure the forward step in and
+/// the wrong one to measure anything else in, so it goes away before stage two
+/// opens a fresh one from the profile it just wrote.
+///
+/// **The cost is a second weight load, and that is not free.** The premise the
+/// frame-knob sweep is built on is that boots are expensive and knob changes
+/// are not — a TB-scale model spends minutes loading — so a command that boots
+/// twice spends those minutes twice. There is no way around it while the arena
+/// is decided at boot: the two stages need different ones. What there is, is
+/// `--skip-planner`, which is the right flag for every run after the first on a
+/// machine whose forward step has not changed.
+async fn calibrate_planner(content: &str) -> Result<()> {
+    let (controller, gateway, mut worker) = crate::derive::derive_standalone(content)?;
+    worker.server.calibrate_planner = true;
+    // Bind an ephemeral port. The sweep boot that follows wants the configured
+    // one, and a calibration boot serves nothing that needs a stable address.
+    worker.server.port = 0;
+
+    let pie = crate::compose::run_standalone(controller, gateway, worker)
+        .await
+        .context("boot the engine to calibrate the planner")?;
+    // Calibration runs inside the driver's own startup, so by the time the boot
+    // returns the sweep is done and the profile is written. Nothing to drive.
+    pie.shutdown().await;
+    Ok(())
+}
+
+/// Calibrate the planner, then sweep the frame knobs inside the arena that
+/// produced.
 pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
     let (cfg_path, origin) = startup::cli_config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
@@ -335,12 +383,12 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
         )
     })?;
 
-    let configured_profile = pie_worker::config_schema::lookup(
-        &toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?,
-        "driver.memory_profile",
-    )
-    .and_then(|v| v.as_str().map(str::to_string))
-    .unwrap_or_else(|| "auto".to_string());
+    let file: toml::Value =
+        toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
+    let configured_profile =
+        pie_worker::config_schema::lookup(&file, "driver.memory_profile")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "auto".to_string());
     let objective = resolve_objective(args.objective, &configured_profile)?;
 
     // The objective is a config value, not just a flag: measuring for one shape
@@ -379,13 +427,49 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
     println!("  This holds the whole device. Do not run it against a machine that is serving.");
     println!();
 
+    // Stage one, and it has to come first: it decides the forward shape, and
+    // the frame knobs are measured INSIDE whatever arena that shape produces.
+    // Sweeping first would rank candidates against an arena the next boot
+    // replaces.
+    if args.skip_planner {
+        println!("Stage 1/2  planner calibration skipped (--skip-planner)");
+        println!("  The sweep runs against whatever shape the planner picks for this boot --");
+        println!("  a cached measurement if one applies, the analytic score otherwise.");
+    } else {
+        println!("Stage 1/2  calibrating the memory planner (one boot, serves nothing)");
+        // Said before it is paid, not after. The two stages need two different
+        // arenas and therefore two boots, which on a large model is the weight
+        // load twice -- and the whole reason the frame-knob sweep reuses one
+        // boot is that weight loads are the expensive part.
+        println!("  This boots the model a second time; `--skip-planner` reuses an earlier one.");
+        let profile = pie_worker::state::planner_profile_path();
+        // Observed, not assumed. The driver REFUSES to calibrate for
+        // `tensor_parallel_size > 1` and for recurrent-state models, saying so
+        // on stderr and booting normally -- so a successful boot is not a
+        // measurement, and claiming "written to ..." after one would be this
+        // command telling an operator it did something it did not.
+        let before = written_at(&profile);
+        calibrate_planner(&content).await?;
+        if written_at(&profile) == before {
+            println!("  no measurement was recorded -- the driver declined to calibrate");
+            println!("  (it refuses for tensor_parallel_size > 1 and recurrent-state models;");
+            println!("   its reason is on stderr above). Stage 2 runs against the scored shape.");
+        } else {
+            println!("  written to {}", crate::ui::short_path(&profile));
+        }
+    }
+    println!();
+    println!("Stage 2/2  sweeping the frame knobs inside that arena");
+
     let inputs = lane_inputs(workload.fleet, workload.tokens);
     // The CLI's `#[tokio::main]` owns the one runtime (see main.rs's "Model A"
     // note), so this borrows it rather than building a second one -- nesting
     // runtimes panics outright.
     let rounds = async {
-        // ONE boot. Everything after it is cheap, which is the whole reason
-        // the knobs were made swappable.
+        // ONE boot for the whole sweep. Everything after it is cheap, which is
+        // the whole reason the knobs were made swappable. This is a different
+        // boot from stage one's on purpose -- it reads the profile that one
+        // wrote, and plans the arena it will actually serve from.
         let pie = crate::compose::run_standalone(controller, gateway, worker)
             .await
             .context("boot the engine (is something already serving on this port?)")?;
@@ -470,6 +554,40 @@ mod tests {
         assert_eq!(
             resolve_objective(Some(Objective::Latency), "throughput").unwrap(),
             Objective::Latency
+        );
+    }
+
+    #[test]
+    fn a_calibration_request_cannot_be_written_down() {
+        // The whole reason calibration became a stage rather than a key. A
+        // config that asks for it is refused at parse, so there is no state an
+        // operator can leave behind -- and the sweep can never be ranked
+        // against the arena calibration builds, which is sized to be measured
+        // rather than to serve.
+        let asked = "\
+[model]
+name = \"Qwen/Qwen3-0.6B\"
+hf_repo = \"Qwen/Qwen3-0.6B\"
+
+[driver]
+type = \"cuda_native\"
+device = [\"cuda:0\"]
+calibrate_planner = true
+";
+        let error = pie_worker::Config::parse(asked)
+            .expect_err("a config cannot request a measurement")
+            .to_string();
+        assert!(
+            error.contains("calibrate_planner"),
+            "the refusal has to name the key: {error}"
+        );
+        // And it is not a settable key either, so `pie config set` cannot
+        // produce the document above in the first place.
+        assert!(
+            !pie_worker::config_schema::fields(pie_worker::config::DriverKind::CudaNative)
+                .iter()
+                .any(|f| f.key.ends_with("calibrate_planner")),
+            "a measurement is not a setting"
         );
     }
 
@@ -625,6 +743,7 @@ mod tests {
             tokens: None,
             budget: None,
             write: false,
+            skip_planner: false,
         };
         let resolved = args.workload(Objective::Latency);
         assert_eq!(resolved.fleet, 7, "an explicit flag wins");

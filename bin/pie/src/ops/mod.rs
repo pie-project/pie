@@ -12,4 +12,5 @@ pub mod inferlet;
 pub mod model;
 pub mod optimize;
 pub mod py_runtime;
+pub mod run;
 pub mod store;

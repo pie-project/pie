@@ -49,11 +49,12 @@ fn list(json: bool) -> Result<()> {
         .into_iter()
         .map(|entry| {
             let exists = entry.path.exists();
-            let size = if exists {
-                state::disk_usage(&entry.path)
-            } else {
-                0
-            };
+            // `entry.size()`, not `disk_usage(entry.path)`: the driver cache
+            // physically contains the weight cache and the planner profile,
+            // and each of those is its own row. Summing the raw trees counted
+            // their bytes twice, so the "reclaimable" total below overstated
+            // what a clear would actually free.
+            let size = if exists { entry.size() } else { 0 };
             (entry, exists, size)
         })
         .collect();
@@ -179,7 +180,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
         .into_iter()
         .filter(|entry| entry.path.exists())
         .map(|entry| {
-            let size = state::disk_usage(&entry.path);
+            let size = entry.size();
             (entry, size)
         })
         .collect();
@@ -215,12 +216,11 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
 
     let mut freed = 0u64;
     for (entry, size) in &present {
-        let result = if entry.path.is_dir() {
-            std::fs::remove_dir_all(&entry.path)
-        } else {
-            std::fs::remove_file(&entry.path)
-        };
-        match result {
+        // `entry.remove()` rather than a blanket `remove_dir_all`, so clearing
+        // `driver` leaves behind the two things inside it that are somebody
+        // else's: the weight cache, which is its own row, and the planner
+        // profile, which no boot rebuilds.
+        match entry.remove() {
             Ok(()) => freed += size,
             // Reported, not fatal: one unreadable entry must not stop the rest
             // from being reclaimed, and the total says what actually went.
