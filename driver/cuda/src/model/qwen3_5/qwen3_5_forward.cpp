@@ -1,4 +1,5 @@
 #include "model/qwen3_5/qwen3_5_forward.hpp"
+#include "model/act_dump.hpp"
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>
@@ -1038,6 +1039,42 @@ void linear_attn_layer_body(
                     }
                 }
             } else {
+                // The non-warp-tiled chunk path, per request. Named because
+                // two callers need it: the unslotted branch below, and the
+                // slotted branch when the warp-tiled kernel is gated off.
+                auto chunk_prefill_per_request = [&] {
+                    for (int r = 0; r < R; ++r) {
+                        const int t0 = static_cast<int>(qo_indptr_h[r]);
+                        const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                        if (Nr <= 0) continue;
+                        const std::size_t qk_off = static_cast<std::size_t>(t0) * qk_step;
+                        const std::size_t v_off  = static_cast<std::size_t>(t0) * v_step;
+                        const std::size_t gh_off = static_cast<std::size_t>(t0) * gh_step;
+                        void* state_slot = state_cache.recurrent_state_raw(
+                            layer_idx, slot_for(r));
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_state_bf16(
+                                q_recur_full + qk_off,
+                                k_recur_full + qk_off,
+                                la.v_fp32.data() + v_off,
+                                la.g_log.data()  + gh_off,
+                                la.beta.data()   + gh_off,
+                                state_slot,
+                                la.core_out.data() + v_off,
+                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill(
+                                q_recur_full + qk_off,
+                                k_recur_full + qk_off,
+                                la.v_fp32.data() + v_off,
+                                la.g_log.data()  + gh_off,
+                                la.beta.data()   + gh_off,
+                                static_cast<float*>(state_slot),
+                                la.core_out.data() + v_off,
+                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                        }
+                    }
+                };
                 if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
                     auto fla_pass = [&](int R, const std::int32_t* slot_ids_d,
                                         const std::uint32_t* qo_indptr_d,
@@ -1111,42 +1148,22 @@ void linear_attn_layer_body(
                         fla_pass(fold_split->segments, fold_split->slot_tail_d,
                                  fold_split->qo_d, /*write_state=*/false,
                                  nullptr);
-                    } else {
+                    } else if (use_warp_tiled_recurrent) {
                         fla_pass(R, slot_ids_d, qo_indptr_d, write_state,
                                  rs_write_state_mask);
+                    } else {
+                        // `fla_pass` has an arm for each warp-tiled shape and
+                        // no `else`, so with the kernel gated off it launched
+                        // NOTHING: `core_out` stayed at its zero-initialised
+                        // contents and every GDN layer contributed exactly
+                        // zero to the residual stream. The stopgap that gated
+                        // it says it routes these to "the proven
+                        // non-warp-tiled chunk_gated_delta path" -- this is
+                        // that route, which was never wired.
+                        chunk_prefill_per_request();
                     }
                 } else {
-                    for (int r = 0; r < R; ++r) {
-                        const int t0 = static_cast<int>(qo_indptr_h[r]);
-                        const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
-                        if (Nr <= 0) continue;
-                        const std::size_t qk_off = static_cast<std::size_t>(t0) * qk_step;
-                        const std::size_t v_off  = static_cast<std::size_t>(t0) * v_step;
-                        const std::size_t gh_off = static_cast<std::size_t>(t0) * gh_step;
-                        void* state_slot = state_cache.recurrent_state_raw(
-                            layer_idx, slot_for(r));
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_state_bf16(
-                                q_recur_full + qk_off,
-                                k_recur_full + qk_off,
-                                la.v_fp32.data() + v_off,
-                                la.g_log.data()  + gh_off,
-                                la.beta.data()   + gh_off,
-                                state_slot,
-                                la.core_out.data() + v_off,
-                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill(
-                                q_recur_full + qk_off,
-                                k_recur_full + qk_off,
-                                la.v_fp32.data() + v_off,
-                                la.g_log.data()  + gh_off,
-                                la.beta.data()   + gh_off,
-                                static_cast<float*>(state_slot),
-                                la.core_out.data() + v_off,
-                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
-                        }
-                    }
+                    chunk_prefill_per_request();
                 }
             }
         }
@@ -1794,12 +1811,14 @@ void qwen3_5_forward_paged(
             : nullptr;
 
     // 1. Embed.
+    act_dump_step_begin(stream);
     if (!commit_advance) {
         profile_forward_stage(profile, profile.embed_ms, stream, [&] {
             kernels::launch_embed_bf16(
                 token_ids, w.embed->data(), ws.y.data(),
                 N, H, cfg.vocab_size, stream);
         });
+        act_dump_bf16("embed", ws.y.data(), N, H, stream);
     }
 
     // 2. Per-layer.
@@ -1891,6 +1910,10 @@ void qwen3_5_forward_paged(
         profile_forward_stage(profile, profile.mlp_ms, stream, [&] {
             qwen35_dense_mlp_block(Lw, cfg, fwd_cfg, ws, cublas, N, stream);
         });
+        act_dump_bf16(
+            act_dump_layer_tag(is_linear ? "out_linear" : "out_full",
+                               static_cast<int>(L)).c_str(),
+            ws.y.data(), N, H, stream);
     }
 
     // 3. Final norm.
@@ -1910,6 +1933,7 @@ void qwen3_5_forward_paged(
             ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
     });
+    act_dump_bf16("final_norm", ws.norm_x.data(), N, H, stream);
 
     // 4. lm_head. For prompt/prefill-style fires the runtime may need
     // logits for only a small sampler subset. Keep the full hidden stream in
