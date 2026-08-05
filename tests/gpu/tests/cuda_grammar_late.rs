@@ -32,7 +32,7 @@
 //!     misaligned carrier ⇒ wrong mask ⇒ conform fails. No false-pass escape.
 //!
 //! Run (GPU):
-//!   cargo test -p pie-bin --features driver-cuda --test cuda_grammar_late -- --ignored --nocapture
+//!   cargo test -p pie-gpu-tests --features driver-cuda --test cuda_grammar_late -- --ignored --nocapture
 
 mod common;
 

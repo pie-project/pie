@@ -19,7 +19,7 @@
 //! embedded worker and only the first boot in a process succeeds, so running the
 //! file unfiltered fails every test after the first with "boot embedded worker".
 //! Run each by name:
-//!   PIE_MTP_DRAFT_TOKENS=4 PIE_MTP_LOGITS_TRACE=1 cargo test -p pie-bin \
+//!   PIE_MTP_DRAFT_TOKENS=4 PIE_MTP_LOGITS_TRACE=1 cargo test -p pie-gpu-tests \
 //!     --features driver-cuda --test cuda_mtp_native_verify <name> \
 //!     -- --ignored --exact --nocapture
 

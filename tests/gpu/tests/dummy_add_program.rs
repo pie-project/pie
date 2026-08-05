@@ -6,7 +6,7 @@
 //! gateway/worker turn-model bug without touching CUDA — seconds per iteration.
 //!
 //! Run:
-//!   cargo test -p pie-bin --test dummy_add_program -- --ignored --nocapture
+//!   cargo test -p pie-gpu-tests --test dummy_add_program -- --ignored --nocapture
 
 mod common;
 

@@ -6,7 +6,7 @@
 //! on the real cuda driver. This is the go-green for the classic-forward-pass
 //! removal endgame (step 2/3): the default chat-generation path now rides PTIR.
 //!
-//!   PIE_COMPILER_LAUNCHER=env cargo test -p pie-bin --features driver-cuda \
+//!   PIE_COMPILER_LAUNCHER=env cargo test -p pie-gpu-tests --features driver-cuda \
 //!     --test cuda_chat_completion_e2e -j6 -- --ignored --nocapture
 
 mod common;

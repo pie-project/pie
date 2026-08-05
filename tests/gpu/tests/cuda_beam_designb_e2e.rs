@@ -24,7 +24,7 @@
 //! primitive) is out of scope here — this exercises only the fixed-pool
 //! steady state.
 //!
-//!   PIE_PTIR_TRACE=1 cargo test -p pie-bin --features driver-cuda \
+//!   PIE_PTIR_TRACE=1 cargo test -p pie-gpu-tests --features driver-cuda \
 //!     --test cuda_beam_designb_e2e -- --ignored --nocapture
 
 mod common;

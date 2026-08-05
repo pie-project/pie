@@ -73,6 +73,11 @@ members = [
     "bin/gateway",
     "bin/worker",
     "bin/pie",
+    # The engine's on-device end-to-end suite. No code of its own; it exists so
+    # that `cargo test -p pie-bin` means the CLI's own tests rather than
+    # "compile thirty GPU test binaries". Almost everything in it is `#[ignore]`d
+    # and asks for a real device.
+    "tests/gpu",
 ]
 exclude = [
     "tests/inferlets",

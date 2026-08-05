@@ -11,7 +11,7 @@
 //! in the buffer write path shows up as a widening gap in the printed numbers.
 //!
 //! `#[ignore]`, driver-cuda. Run:
-//!   cargo test -p pie-bin --features driver-cuda --test cuda_rs_buffer_bench \
+//!   cargo test -p pie-gpu-tests --features driver-cuda --test cuda_rs_buffer_bench \
 //!     -- --ignored --nocapture
 
 use std::path::Path;

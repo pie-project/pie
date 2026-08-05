@@ -29,7 +29,7 @@
 //!   (a) NO device UAF — the retained copy is freed strictly-AFTER the consumer's
 //!       inject drains. PROVED by running THIS test under compute-sanitizer:
 //!         compute-sanitizer --tool memcheck --error-exitcode 1 \
-//!           cargo test -p pie-bin --features driver-cuda --test cuda_overlap23 \
+//!           cargo test -p pie-gpu-tests --features driver-cuda --test cuda_overlap23 \
 //!           -- --ignored --nocapture --test-threads=1
 //!       A clean sanitizer exit IS the (a) proof (no UAF on the deferred-free).
 //!   (d) the consumer CASCADE-ABORTS — the producer-fault poison surfaces to the

@@ -55,7 +55,7 @@
 //!
 //! `#[ignore]` (needs the 4090 + cuda + qwen3-0.6b). Run:
 //!   PIE_COMPILER_LAUNCHER=env \
-//!     cargo test -p pie-bin --features driver-cuda \
+//!     cargo test -p pie-gpu-tests --features driver-cuda \
 //!     --test cuda_contention -- --ignored --nocapture
 //!
 //! Quantitative A/B (each command is a separate process because boot is
@@ -63,11 +63,11 @@
 //! runs). The pre-rewrite/legacy side of an A/B is measured by checking out
 //! the baseline git ref — the runtime no longer has an error-path mode:
 //!   PIE_CONTENTION_PROFILE_MODE=baseline PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
-//!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
+//!     cargo test -p pie-gpu-tests --features driver-cuda --test cuda_contention \
 //!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
 //!   PIE_CONTENTION_PROFILE_MODE=contended PIE_CONTENTION_TOTAL_PAGES=8 \
 //!   PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
-//!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
+//!     cargo test -p pie-gpu-tests --features driver-cuda --test cuda_contention \
 //!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
 //!
 //! COORDINATION (charlie owns the harness + boot config + GPU): the small-pool

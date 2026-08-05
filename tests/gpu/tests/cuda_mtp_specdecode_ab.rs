@@ -30,7 +30,7 @@
 //! ⚠️ GPU-only (the `MtpLogits` intrinsic is disabled in the mock profile).
 //!
 //! `#[ignore]`, driver-cuda. Run:
-//!   PIE_MTP_DRAFT_TOKENS=4 cargo test -p pie-bin \
+//!   PIE_MTP_DRAFT_TOKENS=4 cargo test -p pie-gpu-tests \
 //!     --features driver-cuda --test cuda_mtp_specdecode_ab -- --ignored --nocapture
 
 use std::path::Path;

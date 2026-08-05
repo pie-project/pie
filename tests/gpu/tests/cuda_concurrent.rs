@@ -10,7 +10,7 @@
 //!   PIE_DISTINCT=1 — 8 DISTINCT prompts (no dedup) — isolates the sharing path.
 //!
 //! `#[ignore]` (needs 4090 + cuda + qwen3-0.6b). Run:
-//!   PIE_COMPILER_LAUNCHER=env cargo test -p pie-bin --features driver-cuda \
+//!   PIE_COMPILER_LAUNCHER=env cargo test -p pie-gpu-tests --features driver-cuda \
 //!     --test cuda_concurrent -- --ignored --nocapture
 
 mod common;
