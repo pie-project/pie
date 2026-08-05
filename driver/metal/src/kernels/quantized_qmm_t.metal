@@ -1727,13 +1727,23 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 ///     BM=16    affine 2741    mxfp4 3141
 ///     BM=32    affine 3741    mxfp4 4002
 ///
-/// MXFP4 is ahead at both, and in situ this kernel reaches 4404 -- above the
-/// probe, because a real mixture's tiles are shorter and its weights hotter
-/// than the probe's single expert. Where a gpt-oss prefill loses to the dense
-/// path is the two things the mixture takes away: BM cannot be 64, because the
-/// padding a wider tile costs outruns what it buys, and the input cannot be
-/// staged to FP16, because the answer this checkpoint is pinned to is mlx-lm's
-/// and a bf16 ulp moves it.
+/// and 4504 at BM=64. MXFP4 is ahead of affine at every width.
+///
+/// In situ it does not reach that. A 1024-row gpt-oss prefill puts 128 rows in
+/// each of 32 experts, which BM=64 covers in two whole tiles with NO padding at
+/// all, and the 72 dispatches then run 4892 GFLOP in 1.289 s: 3796 GFLOP/s,
+/// 16% under the probe. The difference is not bandwidth -- the same fire moves
+/// 10.2 GB of expert weight, which is 7.9 GB/s and nowhere near any roof -- it
+/// is that the probe reads ONE expert over and over where a mixture reads
+/// thirty-two. A threadgroup here reuses its weight slice across the tiles of
+/// its own expert and no further, which at two tiles an expert is a reuse of
+/// two.
+///
+/// So the remaining gap to a dense prefill is that reuse and one other thing:
+/// the input cannot be staged to FP16. Not for the reason first written here --
+/// see `llama_bench`'s gpt-oss row, whose answers turn out not to be mlx-lm's
+/// either -- but because under FP16 this checkpoint tracks mlx-lm for two
+/// tokens where BF16 tracks it for four.
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
 [[kernel]] void affine_qmm_t_routed(
     const device uint32_t* w   [[buffer(0)]],
