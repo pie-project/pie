@@ -1100,6 +1100,63 @@ pub(crate) async fn await_channel_progress(
 
 type Anyhow<T> = anyhow::Result<T>;
 
+/// One host-path fire, prepared up to its grant acquisition: the owned
+/// handoff between [`prepare_submission`] and [`complete_submission`].
+/// Nothing here borrows the caller's [`FireContext`], so the acquire await
+/// sits between the halves holding no pins, no lease, and no open
+/// transaction. The post-acquire half still reaches the resource table
+/// through `ctx` (RS scope claims, completion reservation, failure marking,
+/// shadow advance).
+struct PreparedSubmission {
+    req: crate::driver::LaunchPlan,
+    ws: KvWorkingSet,
+    stores: crate::store::registry::Stores,
+    writable_pages: std::ops::Range<u64>,
+    kv_declaration_realized: bool,
+    model: usize,
+    driver: usize,
+    pid: uuid::Uuid,
+    quorum_pipeline_id: uuid::Uuid,
+    pipeline_scope: crate::store::PipelineScope,
+    pipeline_failure: PipelineFailure,
+    pipe_fires: PendingFires,
+    rs_reps: Vec<u32>,
+    rs_ws_ids: Vec<crate::store::rs::RsWorkingSetId>,
+    rs_plan: rs::RsPlan,
+    cells: BoundCells,
+    accesses: Vec<(bool, bool)>,
+    fwd_rep: u32,
+    instance_id: u64,
+    scheduler: crate::scheduler::worker::SchedulerHandle,
+    frame: Option<crate::scheduler::FrameStamp>,
+    timing_enabled: bool,
+    /// `SubmitTotal` phase snapshot; closed after scheduler admission.
+    submit_cpu: Option<std::time::Instant>,
+    /// `Grant` phase snapshot; closed when the grant-funded prepares land.
+    grant_cpu: Option<std::time::Instant>,
+}
+
+impl PreparedSubmission {
+    /// Phase-A demand for both resources, holding nothing — re-priced on
+    /// every acquisition, because a peer lane can grow either figure while
+    /// the requester awaits a grant.
+    fn demand(&self) -> Result<crate::planner::Demand, String> {
+        let kv_demand = host_kv_demand(
+            &self.stores,
+            &self.ws,
+            self.writable_pages.clone(),
+            self.kv_declaration_realized,
+        )?;
+        let kv_demand = u32::try_from(kv_demand)
+            .map_err(|_| "pipeline: KV demand exceeds the planner ABI".to_string())?;
+        let rs_demand = rs_slot_demand(&self.stores, &self.rs_ws_ids, &self.rs_plan)?;
+        Ok(crate::planner::Demand {
+            kv_pages: kv_demand,
+            rs_slots: rs_demand,
+        })
+    }
+}
+
 /// The body behind one non-no-op slot of `forward.submit(on, slots)`.
 pub async fn submit_pass_stamped<C: FireContext>(
     ctx: &mut C,
@@ -1123,6 +1180,51 @@ pub async fn submit_pass_stamped<C: FireContext>(
             );
             return out;
         }
+        let mut prepared = match prepare_submission(ctx, this, fwd, frame).await? {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(Err(error)),
+        };
+        // Phase A: pure demand for both resources, holding nothing. Phase
+        // B: acquire the one grant (KV pages + RS slots — a fire never
+        // half-succeeds); the acquire awaits are the only awaits in this
+        // build, and the requester waits at the safe point with no pins, no
+        // lease, no open transaction. Phase C: prepare from the grant; if
+        // the demand drifted while waiting (a peer lane touched the same
+        // working set), recompute both demands and re-acquire, bounded.
+        let mut attempts = 0;
+        loop {
+            let demand = match prepared.demand() {
+                Ok(demand) => demand,
+                Err(error) => return Ok(Err(error)),
+            };
+            let grant = match acquire_grant(ctx, prepared.quorum_pipeline_id, demand).await {
+                Ok(grant) => grant,
+                Err(error) => return Ok(Err(error)),
+            };
+            match complete_submission(ctx, &mut prepared, grant).await? {
+                Ok(CompletionOutcome::Submitted) => return Ok(Ok(())),
+                Ok(CompletionOutcome::Fenced) => {}
+                Ok(CompletionOutcome::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
+                    attempts += 1;
+                }
+                Ok(CompletionOutcome::Stale) => return Ok(Err(stale_demand_error())),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    }
+}
+
+/// The pre-acquire half of one host-path fire: preamble drain, geometry
+/// lowering, declaration checks, scope claim, and the RS plan — everything
+/// that neither holds nor needs an allocation grant. The demand itself is
+/// [`PreparedSubmission::demand`], re-priced per acquisition.
+async fn prepare_submission<C: FireContext>(
+    ctx: &mut C,
+    this: Resource<Pipeline>,
+    fwd: Resource<ForwardPass>,
+    frame: Option<crate::scheduler::FrameStamp>,
+) -> Anyhow<Result<PreparedSubmission, String>> {
+    {
         // Contention-probe marker: when the guest's WIT call reached the
         // host (vs `hp-acquire` below — the delta is the build preamble,
         // including the settlement drain).
@@ -1350,173 +1452,195 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         suppress_defaulted_readout_for_fold(&mut req, readout_defaulted, &rs_plan);
         crate::planner::trace_mark!("build", pid, "hp-acquire");
-        let mut attempts = 0;
         crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Declare, phase_cpu);
-        phase_cpu = crate::scheduler::phase_start();
-        let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
-            let kv_demand = match host_kv_demand(
-                &stores,
-                &ws,
-                writable_pages.clone(),
-                kv_declaration_realized,
-            ) {
-                Ok(demand) => demand,
-                Err(error) => return Ok(Err(error)),
-            };
-            let Ok(kv_demand) = u32::try_from(kv_demand) else {
-                return Ok(Err(
-                    "pipeline: KV demand exceeds the planner ABI".to_string()
-                ));
-            };
-            let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids, &rs_plan) {
-                Ok(demand) => demand,
-                Err(error) => return Ok(Err(error)),
-            };
-            let demand = crate::planner::Demand {
-                kv_pages: kv_demand,
-                rs_slots: rs_demand,
-            };
-            let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand).await {
-                Ok(grant) => grant,
-                Err(error) => return Ok(Err(error)),
-            };
-            // The lease is the suspend seal: acquired AFTER any park (a
-            // parked ask must hold no lease, or the planner could never
-            // quiesce it) and BEFORE the prepare (so an eviction either
-            // sees this fire's lease and waits it out, or fenced first and
-            // this fire backs off to wait out the eviction).
-            let ws_guard = match ws.fire_lease() {
-                Ok(lease) => lease,
-                Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
-                    drop(grant); // the pages fund the eviction's head
-                    if let Err(error) = settle_and_wait_resident(ctx).await {
-                        return Ok(Err(error));
-                    }
-                    continue;
-                }
-                Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
-            };
-            let (copies, kvtxn) = match prepare_host_kv_reserved(
-                &stores,
-                &ws,
-                writable_pages.clone(),
-                kv_declaration_realized,
-                &mut grant,
-            ) {
-                Ok(prepared) => prepared,
-                Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
-                    attempts += 1;
-                    continue; // the grant drops here; its pages serve the queue
-                }
-                Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
-                Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
-            };
-            let kvtxn = KvTxnGuard::new(model, driver, kvtxn);
-            // Recurrent-state rows are lowered independently, in resolved
-            // request order. Their CoW copies ride the scheduler's typed
-            // pre-launch state copy so a copy failure rejects this fire
-            // before model execution.
-            match prepare_bound_rs(
-                ctx,
-                &stores,
-                model,
-                driver,
-                &rs_reps,
-                &req.qo_indptr,
-                &pipeline_scope,
-                &rs_plan,
-                &mut grant,
-            )? {
-                Ok(prepared) => break (ws_guard, copies, kvtxn, prepared),
-                Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
-                    attempts += 1;
-                    // kvtxn's guard aborts the prepared KV write on drop.
-                    continue;
-                }
-                Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
-                Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
-            }
-        };
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Grant, phase_cpu);
-        phase_cpu = crate::scheduler::phase_start();
-        rs_prepared.apply_to(&mut req);
-        let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
-        let rstxns = RsTxnsGuard::new(model, driver, rs_prepared.txn);
-        let (translation_version, translation) = match ws.translation() {
-            Ok(translation) => translation,
-            Err(error) => {
-                let reason = format!("pipeline: KV translation: {error}");
-                record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
-                return Ok(Err(reason));
-            }
-        };
-        req.kv_translation_version = translation_version;
-        req.kv_translation = translation.as_ref().to_vec();
-        let last_page_len = req.kv_last_page_lens.last().copied().unwrap_or(0);
-        let completion = ctx
-            .resources()
-            .get_mut(&fwd)?
-            .bound_instance
-            .reserve_completion();
-
-        // Preparation is complete in guest order; the scheduler sees only
-        // launch-ready work.
-        let ticket_reservation = TicketReservation::new(&cells, &accesses);
-        ticket_reservation.apply_to(&mut req);
-        let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
-            &scheduler,
+        let grant_cpu = crate::scheduler::phase_start();
+        Ok(Ok(PreparedSubmission {
             req,
-            instance_id,
+            ws,
+            stores,
+            writable_pages,
+            kv_declaration_realized,
+            model,
+            driver,
             pid,
             quorum_pipeline_id,
-            last_page_len,
-            completion.clone(),
-            copy_src,
-            copy_dst,
-            rs_copy_src,
-            rs_copy_dst,
+            pipeline_scope,
+            pipeline_failure,
+            pipe_fires,
+            rs_reps,
+            rs_ws_ids,
+            rs_plan,
+            cells,
+            accesses,
+            fwd_rep,
+            instance_id,
+            scheduler,
             frame,
             timing_enabled,
-        )
-        .err()
-        .map(|error| format!("{error:#}"));
-        if let Some(error) = submit_error {
-            // The KV/RS transaction guards roll everything back on return.
-            let reason = format!("pipeline: submit failed: {error}");
-            record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+            submit_cpu,
+            grant_cpu,
+        }))
+    }
+}
+
+/// One completion attempt against one grant. Neither retry variant consumed
+/// anything from the stores: `Stale` means the demand drifted while the
+/// requester awaited its grant (re-price and re-acquire, bounded by
+/// [`STALE_DEMAND_ATTEMPTS`]); `Fenced` means the working set was fenced for
+/// this process's eviction, already waited out here — re-acquire without
+/// spending a stale attempt.
+enum CompletionOutcome {
+    Submitted,
+    Stale,
+    Fenced,
+}
+
+/// The post-acquire half of one host-path fire: lease the working set, fund
+/// the KV/RS prepares from the grant, finish the launch plan, hand it to the
+/// scheduler, and enqueue the [`PendingFire`]. `prepared` is borrowed
+/// mutably so a retry outcome hands it back intact; the launch plan moves
+/// out only past the last retry point.
+async fn complete_submission<C: FireContext>(
+    ctx: &mut C,
+    prepared: &mut PreparedSubmission,
+    mut grant: crate::planner::AllocationGrant,
+) -> Anyhow<Result<CompletionOutcome, String>> {
+    let fwd: Resource<ForwardPass> = Resource::new_borrow(prepared.fwd_rep);
+    // The lease is the suspend seal: acquired AFTER any park (a parked ask
+    // must hold no lease, or the planner could never quiesce it) and BEFORE
+    // the prepare (so an eviction either sees this fire's lease and waits
+    // it out, or fenced first and this fire backs off to wait out the
+    // eviction).
+    let ws_guard = match prepared.ws.fire_lease() {
+        Ok(lease) => lease,
+        Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
+            drop(grant); // the pages fund the eviction's head
+            if let Err(error) = settle_and_wait_resident(ctx).await {
+                return Ok(Err(error));
+            }
+            return Ok(Ok(CompletionOutcome::Fenced));
+        }
+        Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
+    };
+    let ((copy_src, copy_dst), kvtxn) = match prepare_host_kv_reserved(
+        &prepared.stores,
+        &prepared.ws,
+        prepared.writable_pages.clone(),
+        prepared.kv_declaration_realized,
+        &mut grant,
+    ) {
+        Ok(kv_prepared) => kv_prepared,
+        // Nothing was consumed; the grant drops on return and its pages
+        // serve the queue.
+        Err(ReservedError::Stale) => return Ok(Ok(CompletionOutcome::Stale)),
+        Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
+    };
+    let kvtxn = KvTxnGuard::new(prepared.model, prepared.driver, kvtxn);
+    // Recurrent-state rows are lowered independently, in resolved
+    // request order. Their CoW copies ride the scheduler's typed
+    // pre-launch state copy so a copy failure rejects this fire
+    // before model execution.
+    let rs_prepared = match prepare_bound_rs(
+        ctx,
+        &prepared.stores,
+        prepared.model,
+        prepared.driver,
+        &prepared.rs_reps,
+        &prepared.req.qo_indptr,
+        &prepared.pipeline_scope,
+        &prepared.rs_plan,
+        &mut grant,
+    )? {
+        Ok(rs_prepared) => rs_prepared,
+        // kvtxn's guard aborts the prepared KV write on drop.
+        Err(ReservedError::Stale) => return Ok(Ok(CompletionOutcome::Stale)),
+        Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
+    };
+    // The prepares drained exactly what they consumed; the remainder goes
+    // back to the planner BEFORE the build, not after the submit.
+    drop(grant);
+    crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Grant, prepared.grant_cpu);
+    let phase_cpu = crate::scheduler::phase_start();
+    // Past the last retry point: the launch plan leaves the prepared half.
+    let mut req = std::mem::take(&mut prepared.req);
+    rs_prepared.apply_to(&mut req);
+    let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
+    let rstxns = RsTxnsGuard::new(prepared.model, prepared.driver, rs_prepared.txn);
+    let (translation_version, translation) = match prepared.ws.translation() {
+        Ok(translation) => translation,
+        Err(error) => {
+            let reason = format!("pipeline: KV translation: {error}");
+            record_submit_failure(ctx, &fwd, &prepared.pipeline_failure, &reason);
             return Ok(Err(reason));
         }
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Launch, phase_cpu);
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::SubmitTotal, submit_cpu);
-        ctx.commit_fire_timing(timing_enabled);
-        ticket_reservation.commit();
+    };
+    req.kv_translation_version = translation_version;
+    req.kv_translation = translation.as_ref().to_vec();
+    let last_page_len = req.kv_last_page_lens.last().copied().unwrap_or(0);
+    let completion = ctx
+        .resources()
+        .get_mut(&fwd)?
+        .bound_instance
+        .reserve_completion();
 
-        {
-            let p = ctx.resources().get_mut(&fwd)?;
-            let p = p.bound_mut().map_err(anyhow::Error::msg)?;
-            p.kv_declaration_realized = true;
-            let (shadow, bound, shadow_cells) =
-                (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
-            shadow.advance(bound, shadow_cells);
-        }
-
-        pipe_fires
-            .lock()
-            .unwrap()
-            .push_back(PendingOp::Fire(PendingFire {
-                completion,
-                kv: FireKv::Host(kvtxn.into_inner()),
-                rstxn: rstxns.into_inner(),
-                ws_guard,
-                model,
-                driver,
-                fwd_rep,
-                instance_id,
-                cells,
-                failure: pipeline_failure,
-            }));
-        Ok(Ok(()))
+    // Preparation is complete in guest order; the scheduler sees only
+    // launch-ready work.
+    let ticket_reservation = TicketReservation::new(&prepared.cells, &prepared.accesses);
+    ticket_reservation.apply_to(&mut req);
+    let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
+        &prepared.scheduler,
+        req,
+        prepared.instance_id,
+        prepared.pid,
+        prepared.quorum_pipeline_id,
+        last_page_len,
+        completion.clone(),
+        copy_src,
+        copy_dst,
+        rs_copy_src,
+        rs_copy_dst,
+        prepared.frame,
+        prepared.timing_enabled,
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
+    if let Some(error) = submit_error {
+        // The KV/RS transaction guards roll everything back on return.
+        let reason = format!("pipeline: submit failed: {error}");
+        record_submit_failure(ctx, &fwd, &prepared.pipeline_failure, &reason);
+        return Ok(Err(reason));
     }
+    crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Launch, phase_cpu);
+    crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::SubmitTotal, prepared.submit_cpu);
+    ctx.commit_fire_timing(prepared.timing_enabled);
+    ticket_reservation.commit();
+
+    {
+        let p = ctx.resources().get_mut(&fwd)?;
+        let p = p.bound_mut().map_err(anyhow::Error::msg)?;
+        p.kv_declaration_realized = true;
+        let (shadow, bound, shadow_cells) =
+            (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
+        shadow.advance(bound, shadow_cells);
+    }
+
+    prepared
+        .pipe_fires
+        .lock()
+        .unwrap()
+        .push_back(PendingOp::Fire(PendingFire {
+            completion,
+            kv: FireKv::Host(kvtxn.into_inner()),
+            rstxn: rstxns.into_inner(),
+            ws_guard,
+            model: prepared.model,
+            driver: prepared.driver,
+            fwd_rep: prepared.fwd_rep,
+            instance_id: prepared.instance_id,
+            cells: prepared.cells.clone(),
+            failure: prepared.pipeline_failure.clone(),
+        }));
+    Ok(Ok(CompletionOutcome::Submitted))
 }
 
 /// The body behind the interface-level `forward.submit(on, slots)` —
