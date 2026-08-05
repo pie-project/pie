@@ -151,6 +151,22 @@ fn rejoin_defer() -> u8 {
     })
 }
 
+/// `PIE_GATE_DUMP_MS=<ms>`: while the device is executing and the gate is
+/// held, dump the IDENTITY and state of every lane denying the seal, at
+/// most once per interval (0/absent = off). The counters can only say how
+/// many and how they classify; this says WHO, which is what the chain-
+/// collapse investigation (analysis.md 10.22-10.23) ran out of.
+fn gate_dump_interval() -> Option<Duration> {
+    static CONFIGURED: OnceLock<Option<Duration>> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_GATE_DUMP_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
 /// The frame identity one fire carries from `forward.submit`: which lane
 /// (pipeline scope), which frame of that lane, which wave slot, and how many
 /// fires the whole frame holds (so arrival completeness is decidable).
@@ -209,6 +225,16 @@ struct PendingFrame {
 impl PendingFrame {
     fn is_complete(&self) -> bool {
         self.park || self.fires.len() >= self.expected as usize
+    }
+
+    /// Diagnostics only (`PIE_GATE_DUMP_MS`): how much of this frame has
+    /// arrived, and how much it is waiting for.
+    fn arrived_slots(&self) -> usize {
+        self.fires.len()
+    }
+
+    fn expected_slots(&self) -> u32 {
+        self.expected
     }
 }
 
@@ -490,6 +516,8 @@ pub(super) struct FramePolicy {
     /// the policy's life (and overridable in tests without touching the
     /// process environment).
     rejoin_defer: u8,
+    /// Next instant a blocked-gate dump may be emitted (`PIE_GATE_DUMP_MS`).
+    gate_dump_at: Option<Instant>,
     /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
     stats: Option<Arc<SchedulerStats>>,
 }
@@ -565,6 +593,7 @@ impl FramePolicy {
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
             rejoin_defer: rejoin_defer(),
+            gate_dump_at: None,
             stats,
         }
     }
@@ -1630,6 +1659,17 @@ impl FramePolicy {
             // rejoining lane is waited for exactly as today.
             let defer_enabled = self.rejoin_defer > 0;
             let defer_rejoins = defer_enabled && executing;
+            // WHO is denying the seal (see `gate_dump_interval`). Rate-limited
+            // and off by default, so the scan below pays one bool.
+            let dump_due = executing
+                && gate_dump_interval().is_some_and(|every| {
+                    self.gate_dump_at.is_none_or(|at| now >= at)
+                        && {
+                            self.gate_dump_at = Some(now + every);
+                            true
+                        }
+                });
+            let mut dump: Vec<serde_json::Value> = Vec::new();
             for (lane_id, lane) in self.lanes.iter_mut() {
                 let owes = self.in_flight_lanes.contains(lane_id)
                     || lane
@@ -1714,6 +1754,23 @@ impl FramePolicy {
                 if blocking {
                     missing += 1;
                     blocking_pin = true;
+                    if dump_due && dump.len() < 16 {
+                        let front = lane.frames.front();
+                        dump.push(serde_json::json!({
+                            "lane": lane_id.to_string()[..8],
+                            "owner": lane.owner.map(|o| o.to_string()[..8].to_string()),
+                            "frames": lane.frames.len(),
+                            "front_arrived": front.map(PendingFrame::arrived_slots),
+                            "front_expect": front.map(PendingFrame::expected_slots),
+                            "owes": owes,
+                            "parked": lane.parked,
+                            "leashed": lane.leashed,
+                            "rejoining": lane.rejoining,
+                            "fired_this_boundary": lane.fired_this_boundary,
+                            "blocking_us": lane.clock_from
+                                .map(|from| now.saturating_duration_since(from).as_micros() as u64),
+                        }));
+                    }
                     // Reason census, INDEPENDENT of `owes`: the classification
                     // below is priority-ordered with `owes` first, and during
                     // execution every member of the in-flight frame is owed,
@@ -1802,6 +1859,21 @@ impl FramePolicy {
             // deadline breaches on any scenario. It bought +6% epoch density
             // on `churn_extreme` alone, which never reached throughput — not
             // worth a 20ms timer and an admission earmark to guess at.
+            if !dump.is_empty() {
+                crate::scheduler::fire_timing_write(&serde_json::json!({
+                    "schema": 1,
+                    "source": "scheduler",
+                    "event": "gate_block_dump",
+                    "at_us": crate::scheduler::fire_timing_now_us(),
+                    "missing": missing,
+                    "awaited": self.lanes.values().filter(|lane| lane.awaited).count(),
+                    "lanes": self.lanes.len(),
+                    "in_flight_lanes": self.in_flight_lanes.len(),
+                    "pending_binds": self.pending_binds.values().sum::<usize>(),
+                    "joins_in_flight": self.joins_in_flight.len(),
+                    "blockers": dump,
+                }));
+            }
             if missing > 0 {
                 let mut stalled = false;
                 if executing {
