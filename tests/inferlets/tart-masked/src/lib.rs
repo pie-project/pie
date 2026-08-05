@@ -128,6 +128,11 @@ async fn main(input: Input) -> Result<String> {
     let token_out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("token_out");
+    // Shadow-plan anchor: a take-less (publish-only) epilogue classifies
+    // as Unknown in the host shadow planner and stalls host-route
+    // submits; a loop-carried counter gives the stage the standard
+    // Fold shape. (Filed as an upstream shadow-classifier gap.)
+    let step_counter = Channel::from([0u32]).named("step_counter");
 
     let decode = ForwardPass::new();
     if let Some(k) = input.max_layers {
@@ -149,7 +154,9 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     decode.epilogue(move || {
+        let step = step_counter.take();
         token_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        step_counter.put(&step + 1u32);
     });
 
     let budget = input.max_tokens.saturating_sub(generated.len());
@@ -175,6 +182,11 @@ async fn main(input: Input) -> Result<String> {
             mask.put((0..pool_len).map(|key| key <= pos).collect::<Vec<bool>>());
         }
         page_indptr.put([0u32, (pos + 1).div_ceil(PAGE_T)]);
+        // Host-route fires POP every host-writer channel per fire (the
+        // host shadow's only record) — even read-only ones must be
+        // re-staged, unlike the device route's latest-value posture.
+        pages.put(pool_ids.clone());
+        decode_indptr.put([0u32, 1]);
         filled += 1;
     }
     pipeline.close();
