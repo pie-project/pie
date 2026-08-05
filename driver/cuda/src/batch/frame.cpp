@@ -2914,6 +2914,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         std::uint32_t hook_free_prefix_rows = 0;
         bool wants_attn_score = false;
         bool wants_page_mask = false;
+        std::uint32_t planned_layers = 0xffffffffu;
     } stage_hook_context{
         engine.dispatch,
         s.staged.get(),
@@ -2924,6 +2925,11 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
         engine.dispatch->launch_wants_attn_score(s.dispatch_view),
         engine.dispatch->launch_wants_page_mask(s.dispatch_view),
+        // Depth-split launches (full-depth rows present) walk the full
+        // model; only a uniformly truncated launch shortens the ledger.
+        s.dispatch_view.planned_full_depth_rows > 0
+            ? 0xffffffffu
+            : s.dispatch_view.planned_max_layers,
     };
     const model::StageHooks stage_hooks{
         .context = &stage_hook_context,
@@ -2973,6 +2979,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                     .wants_attn_score = context.wants_attn_score,
                     .wants_page_mask = context.wants_page_mask,
                     .stream = stream,
+                    .planned_layers = context.planned_layers,
                 });
         },
         .verify_replay_capture = [](void* opaque) {

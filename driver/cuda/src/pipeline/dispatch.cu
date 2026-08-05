@@ -5732,7 +5732,9 @@ std::uint64_t Dispatch::prepare_attention_phases(
     if (in.observation == nullptr || !in.observation->usable()) {
         return veto("no usable observation");
     }
-    const std::uint32_t layers = impl_->model_layers;
+    const std::uint32_t layers = in.planned_layers == 0xffffffffu
+        ? impl_->model_layers
+        : std::min(impl_->model_layers, in.planned_layers);
     if (layers == 0 || !impl_->attention_hook_coverage) {
         return veto("no attention hook coverage");
     }
@@ -6542,6 +6544,15 @@ bool Dispatch::finish(
         throw std::runtime_error(
             "PTIR row-valid offsets do not match launched programs");
     }
+    // A depth-truncated launch (region-table uniform k) legitimately runs
+    // its attention phases at only the planned layers. A DEPTH-SPLIT
+    // launch (full-depth rows present, truncated suffix) still walks the
+    // full model — the split narrows rows, not the layer walk.
+    const std::uint32_t expected_layers =
+        view.planned_max_layers == 0xffffffffu ||
+                view.planned_full_depth_rows > 0
+            ? impl_->model_layers
+            : std::min(impl_->model_layers, view.planned_max_layers);
     for (std::uint8_t phase :
          {std::uint8_t{PTIR_STAGE_ON_ATTN_PROJ},
           std::uint8_t{PTIR_STAGE_ON_ATTN}}) {
@@ -6551,7 +6562,7 @@ bool Dispatch::finish(
                 return !(*lane->phase_plans)[phase].empty();
             });
         if (declared &&
-            state.phase_invocations[phase] != impl_->model_layers) {
+            state.phase_invocations[phase] != expected_layers) {
             throw std::runtime_error(
                 "PTIR attention phase did not execute at every model layer");
         }

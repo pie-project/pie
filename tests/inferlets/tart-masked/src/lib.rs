@@ -36,6 +36,43 @@ struct Input {
     /// output must differ from the maskless run.
     #[serde(default)]
     blind: Option<u32>,
+    /// WIRE-ROUTE LoRA: attach a Q-site adapter (rank 8, 0.6B geometry)
+    /// through `Pass::adapter` at this amplitude. Wire fires then carry
+    /// the LORA region signature — the axis rides the same co-batchable
+    /// class as the mask.
+    #[serde(default)]
+    adapter_scale: Option<f32>,
+    /// WIRE-ROUTE hook: attach an `on_attn` score-fold tap to the decode
+    /// pass, so wire fires carry the HOOK region signature.
+    #[serde(default)]
+    hook: bool,
+}
+
+/// Q-site LoRA channels at the 0.6B geometry (lora-probe's pattern seed,
+/// alpha folded into B).
+const LORA_RANK: u32 = 8;
+const LORA_LAYERS: u32 = 28;
+const LORA_D_IN: u32 = 1024;
+const LORA_D_OUT: u32 = 2048;
+
+fn lora_pattern(i: u32, salt: u32, amp: f32) -> f32 {
+    let h = (i ^ salt).wrapping_mul(0x9e37_79b9) >> 8;
+    ((h % 10_000) as f32 / 10_000.0 - 0.5) * 2.0 * amp
+}
+
+fn make_lora_channels(scale: f32) -> (Channel, Channel) {
+    let a_len = (LORA_LAYERS * LORA_RANK * LORA_D_IN) as usize;
+    let b_len = (LORA_LAYERS * LORA_D_OUT * LORA_RANK) as usize;
+    let a_host: Vec<f32> = (0..a_len as u32)
+        .map(|i| lora_pattern(i, 0x0a0a_a0a0, 0.05))
+        .collect();
+    let b_host: Vec<f32> = (0..b_len as u32)
+        .map(|i| lora_pattern(i, 0x0c0c_c0c0, 0.5) * scale)
+        .collect();
+    (
+        Channel::from_shaped([LORA_LAYERS, LORA_RANK, LORA_D_IN], a_host).named("lora_a"),
+        Channel::from_shaped([LORA_LAYERS, LORA_D_OUT, LORA_RANK], b_host).named("lora_b"),
+    )
 }
 
 fn default_prompt_b() -> String {
@@ -100,6 +137,11 @@ async fn main(input: Input) -> Result<String> {
     if let Some(k) = input.max_layers {
         prefill.set_max_layers(k)?;
     }
+    if let Some(scale) = input.adapter_scale {
+        let (a, b) = make_lora_channels(scale);
+        use inferlet::ptir::adapter::{mm, Site};
+        prefill.adapter(Site::Q, |x, y| y + mm(&b, mm(&a, x)))?;
+    }
     prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
     prefill.attention(
         &ws,
@@ -162,6 +204,22 @@ async fn main(input: Input) -> Result<String> {
     let decode = ForwardPass::new();
     if let Some(k) = input.max_layers {
         decode.set_max_layers(k)?;
+    }
+    if let Some(scale) = input.adapter_scale {
+        let (a, b) = make_lora_channels(scale);
+        use inferlet::ptir::adapter::{mm, Site};
+        decode.adapter(Site::Q, |x, y| y + mm(&b, mm(&a, x)))?;
+    }
+    if input.hook {
+        // A per-layer score-fold tap: enough to make the fire a genuine
+        // hook program (Stage::OnAttn) without changing the numerics.
+        let score_acc =
+            Channel::from(vec![0.0f32; pool_len as usize]).named("score_acc");
+        decode.on_attn(move || {
+            let prev = score_acc.take();
+            let scores = intrinsics::attn_score(pool_len);
+            score_acc.put(&(&prev + &scores));
+        });
     }
     decode.embed(&token_in, &decode_indptr)?;
     decode.attention(

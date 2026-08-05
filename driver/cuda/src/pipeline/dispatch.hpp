@@ -255,6 +255,12 @@ class Dispatch {
         bool wants_attn_score = false;
         bool wants_page_mask = false;
         cudaStream_t stream = nullptr;
+        /// The launch's PLANNED depth (region-table uniform k):
+        /// 0xffffffff = full model depth. A truncated forward invokes its
+        /// hooks only at the layers it runs, so the prepared per-layer
+        /// invocation ledger must be sized at the planned depth or the
+        /// coverage check refuses a correct truncated fire.
+        std::uint32_t planned_layers = 0xffffffffu;
     };
     std::uint64_t prepare_attention_phases(
         StagedLaunch& launch,
