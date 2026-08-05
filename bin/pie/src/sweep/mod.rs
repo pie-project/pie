@@ -66,6 +66,10 @@ pub struct Round {
     pub throughput_rel_sigma: f64,
     /// Median of the per-repeat p95s.
     pub lane_p95_us: u128,
+    /// Spread of the per-repeat p95s, as a fraction of the median. Carried for
+    /// the same reason as the throughput spread: it is what decides whether a
+    /// latency difference is real.
+    pub lane_p95_rel_sigma: f64,
     /// Lanes that returned nothing, summed over repeats. Non-zero means this
     /// is not a measurement, and the caller must not rank it against one that
     /// is.
@@ -81,22 +85,71 @@ impl Round {
         self.failed_lanes == 0
     }
 
-    /// Is this candidate faster than `other` by more than the two of them can
-    /// explain by noise?
+    /// Is this candidate better than `other`, on `metric`, by more than the two
+    /// of them can explain by noise?
     ///
     /// The same rule the driver's own sweep uses after `fe8d85040`: combine the
     /// two candidates' spreads in quadrature and require the gap to clear it.
     /// Anything closer than that is a coin flip that will land the other way on
     /// the next run, and reporting it as a win is how a sweep produces
     /// confident garbage.
-    pub fn beats(&self, other: &Round) -> bool {
+    ///
+    /// `metric` is not cosmetic. Ranking a `--for latency` sweep on throughput
+    /// was the state of this code before: the command asked for one thing and
+    /// ordered its answers by another.
+    pub fn beats(&self, other: &Round, metric: Metric) -> bool {
         if !self.is_measurement() || !other.is_measurement() {
             return false;
         }
-        let gap = (self.throughput_tok_s - other.throughput_tok_s)
-            / other.throughput_tok_s.max(f64::EPSILON);
-        let noise = (self.throughput_rel_sigma.powi(2) + other.throughput_rel_sigma.powi(2)).sqrt();
+        let (mine, theirs) = (metric.value(self), metric.value(other));
+        let gap = if metric.higher_is_better() {
+            (mine - theirs) / theirs.max(f64::EPSILON)
+        } else {
+            (theirs - mine) / theirs.max(f64::EPSILON)
+        };
+        let noise = (metric.sigma(self).powi(2) + metric.sigma(other).powi(2)).sqrt();
         gap > noise
+    }
+}
+
+/// What a sweep ranks its candidates by.
+///
+/// One per objective, because the objective already names a serving shape and
+/// the quantity that shape is judged on follows from it. There is no ranking
+/// that serves both: latency and throughput pull opposite ways, which is why
+/// `memory_profile` has two names in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    /// Aggregate tokens per second over the fleet. Higher wins.
+    Throughput,
+    /// 95th-percentile lane latency. Lower wins.
+    LaneP95,
+}
+
+impl Metric {
+    pub fn value(self, round: &Round) -> f64 {
+        match self {
+            Self::Throughput => round.throughput_tok_s,
+            Self::LaneP95 => round.lane_p95_us as f64,
+        }
+    }
+
+    pub fn sigma(self, round: &Round) -> f64 {
+        match self {
+            Self::Throughput => round.throughput_rel_sigma,
+            Self::LaneP95 => round.lane_p95_rel_sigma,
+        }
+    }
+
+    pub fn higher_is_better(self) -> bool {
+        matches!(self, Self::Throughput)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Throughput => "throughput",
+            Self::LaneP95 => "p95 lane latency",
+        }
     }
 }
 
@@ -199,12 +252,13 @@ pub async fn measure(
     }
 
     let (throughput_tok_s, throughput_rel_sigma) = median_and_rel_sigma(&throughputs);
-    let (lane_p95, _) = median_and_rel_sigma(&p95s);
+    let (lane_p95, lane_p95_rel_sigma) = median_and_rel_sigma(&p95s);
     Ok(Round {
         knobs,
         throughput_tok_s,
         throughput_rel_sigma,
         lane_p95_us: lane_p95 as u128,
+        lane_p95_rel_sigma,
         failed_lanes,
         repeats,
     })
@@ -257,12 +311,13 @@ pub async fn sweep_all(
         .enumerate()
         .map(|(index, knobs)| {
             let (throughput_tok_s, throughput_rel_sigma) = median_and_rel_sigma(&throughputs[index]);
-            let (lane_p95, _) = median_and_rel_sigma(&p95s[index]);
+            let (lane_p95, lane_p95_rel_sigma) = median_and_rel_sigma(&p95s[index]);
             Round {
                 knobs: *knobs,
                 throughput_tok_s,
                 throughput_rel_sigma,
                 lane_p95_us: lane_p95 as u128,
+                lane_p95_rel_sigma,
                 failed_lanes: failed[index],
                 repeats,
             }
@@ -366,7 +421,8 @@ mod tests {
             knobs,
             throughput_tok_s: tok_s,
             throughput_rel_sigma: rel_sigma,
-            lane_p95_us: 0,
+            lane_p95_us: 1_000,
+            lane_p95_rel_sigma: rel_sigma,
             failed_lanes: failed,
             repeats: 3,
         }
@@ -381,12 +437,12 @@ mod tests {
         // other way on the next run.
         let a = round(BASE, 1296.0, 0.06, 0);
         let b = round(BASE, 1265.0, 0.06, 0);
-        assert!(!a.beats(&b), "2.4% gap under 8.5% combined noise");
+        assert!(!a.beats(&b, Metric::Throughput), "2.4% gap under 8.5% combined noise");
 
         // A 3.4x collapse is not ambiguous, and the rule must not be so
         // conservative that it misses one.
         let slow = round(BASE, 375.0, 0.06, 0);
-        assert!(b.beats(&slow), "k=1 collapse must register");
+        assert!(b.beats(&slow, Metric::Throughput), "k=1 collapse must register");
     }
 
     #[test]
@@ -395,7 +451,7 @@ mod tests {
         // the spread comes down.
         let a = round(BASE, 1296.0, 0.005, 0);
         let b = round(BASE, 1265.0, 0.005, 0);
-        assert!(a.beats(&b));
+        assert!(a.beats(&b, Metric::Throughput));
     }
 
     #[test]
@@ -404,8 +460,8 @@ mod tests {
         // can post the best number. It must not be allowed to rank at all.
         let broken = round(BASE, 4000.0, 0.001, 2);
         let good = round(BASE, 1265.0, 0.01, 0);
-        assert!(!broken.beats(&good));
-        assert!(!good.beats(&broken));
+        assert!(!broken.beats(&good, Metric::Throughput));
+        assert!(!good.beats(&broken, Metric::Throughput));
     }
 
     #[test]

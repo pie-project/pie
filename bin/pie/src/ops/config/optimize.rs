@@ -21,10 +21,7 @@ use super::typed_by_schema;
 use crate::sweep::{self, Knobs};
 use crate::ui::{Align, Mark, Palette, Row, Stream, Table};
 
-/// Lanes per fleet. Enough to co-batch — a single lane never exercises the
-/// frame knobs, because there is nothing for it to overlap with — and enough
-/// that a fleet lasts long enough to time. See [`DEFAULT_TOKENS`].
-const DEFAULT_FLEET: usize = 16;
+
 /// Fleets per candidate. Three is the smallest count that gives a median an
 /// outlier cannot move and a spread that means anything.
 const DEFAULT_REPEATS: usize = 3;
@@ -58,28 +55,78 @@ impl Objective {
             Self::Throughput => "throughput",
         }
     }
+
+    /// What this objective ranks by.
+    ///
+    /// Before this existed, `--for latency` measured and ranked THROUGHPUT: the
+    /// command asked for one thing and ordered its answers by another. The
+    /// objective already names a serving shape, and the quantity that shape is
+    /// judged on follows from it.
+    pub fn metric(self) -> sweep::Metric {
+        match self {
+            Self::Latency => sweep::Metric::LaneP95,
+            Self::Throughput => sweep::Metric::Throughput,
+        }
+    }
+
+    /// The load this objective is measured under.
+    ///
+    /// Also derived rather than defaulted, because an arbitrary load measures an
+    /// arbitrary thing. The first version of this command shipped 8 lanes of 48
+    /// tokens picked by nothing, and that load turned out to be dominated by
+    /// process startup rather than by batching — k=1 measured 4x slower there
+    /// and identical at a longer fleet.
+    ///
+    /// `latency` is a low-concurrency regime by definition, so its fleet is
+    /// small. That costs sample count: four lanes over five passes is twenty
+    /// lane latencies, and a p95 over twenty samples is the second-worst of
+    /// them. `--repeats` is the lever if that is too coarse; there is no
+    /// arrangement that makes a low-concurrency measurement dense.
+    pub fn workload(self) -> Workload {
+        match self {
+            Self::Latency => Workload {
+                fleet: 4,
+                tokens: 256,
+                repeats: 5,
+            },
+            Self::Throughput => Workload {
+                fleet: 64,
+                tokens: 256,
+                repeats: 3,
+            },
+        }
+    }
+}
+
+/// The shape of the synthetic load one objective is measured under.
+#[derive(Debug, Clone, Copy)]
+pub struct Workload {
+    pub fleet: usize,
+    pub tokens: usize,
+    pub repeats: usize,
 }
 
 pub struct Args {
     pub objective: Option<Objective>,
     pub program: String,
-    pub fleet: usize,
-    pub repeats: usize,
-    pub tokens: usize,
+    /// Overrides for the objective's own workload. Absent means "use the shape
+    /// the objective implies", which is the answer for almost everyone.
+    pub fleet: Option<usize>,
+    pub repeats: Option<usize>,
+    pub tokens: Option<usize>,
     pub budget: Option<usize>,
     pub write: bool,
 }
 
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            objective: None,
-            program: String::new(),
-            fleet: DEFAULT_FLEET,
-            repeats: DEFAULT_REPEATS,
-            tokens: DEFAULT_TOKENS,
-            budget: None,
-            write: false,
+impl Args {
+    /// The load actually run: the objective's shape, with any explicit override
+    /// applied over it.
+    pub fn workload(&self, objective: Objective) -> Workload {
+        let base = objective.workload();
+        Workload {
+            fleet: self.fleet.unwrap_or(base.fleet),
+            tokens: self.tokens.unwrap_or(base.tokens),
+            repeats: self.repeats.unwrap_or(base.repeats),
         }
     }
 }
@@ -132,25 +179,39 @@ pub fn plan(baseline: Knobs, budget: Option<usize>) -> (Vec<Knobs>, usize) {
 /// A candidate only wins if it clears both spreads in quadrature
 /// (`Round::beats`). Everything closer is a coin flip, and a sweep that reports
 /// coin flips as findings is worse than no sweep.
-pub fn winner<'a>(rounds: &'a [sweep::Round], baseline: &Knobs) -> Option<&'a sweep::Round> {
+pub fn winner<'a>(
+    rounds: &'a [sweep::Round],
+    baseline: &Knobs,
+    metric: sweep::Metric,
+) -> Option<&'a sweep::Round> {
     let base = rounds.iter().find(|r| r.knobs == *baseline)?;
     rounds
         .iter()
-        .filter(|r| r.knobs != *baseline && r.beats(base))
+        .filter(|r| r.knobs != *baseline && r.beats(base, metric))
         .max_by(|a, b| {
-            a.throughput_tok_s
-                .partial_cmp(&b.throughput_tok_s)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let (a, b) = (metric.value(a), metric.value(b));
+            let ordering = a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+            if metric.higher_is_better() {
+                ordering
+            } else {
+                ordering.reverse()
+            }
         })
 }
 
 /// Print what was measured, whether anything won, and what was not looked at.
-pub fn report(rounds: &[sweep::Round], baseline: &Knobs, skipped: usize, wrote: bool) {
+pub fn report(
+    rounds: &[sweep::Round],
+    baseline: &Knobs,
+    metric: sweep::Metric,
+    skipped: usize,
+    wrote: bool,
+) {
     let palette = Palette::for_stream(Stream::Stdout);
-    let best = winner(rounds, baseline);
+    let best = winner(rounds, baseline, metric);
     let base = rounds.iter().find(|r| r.knobs == *baseline);
 
-    println!("Measured {} candidate(s):", rounds.len());
+    println!("Measured {} candidate(s), ranked by {}:", rounds.len(), metric.label());
     let mut table = Table::new(
         [
             Align::Right,
@@ -174,12 +235,29 @@ pub fn report(rounds: &[sweep::Round], baseline: &Knobs, skipped: usize, wrote: 
                 format!("k={}", round.knobs.frame_size),
                 format!("submit={}", round.knobs.submit_depth),
                 format!("dispatch={}", round.knobs.dispatch_depth),
-                format!("{:.0} tok/s", round.throughput_tok_s),
-                format!("+/-{:.1}%", round.throughput_rel_sigma * 100.0),
-                if round.knobs == *baseline {
-                    format!("p95 {:.0} ms  (current)", round.lane_p95_us as f64 / 1_000.0)
-                } else {
-                    format!("p95 {:.0} ms", round.lane_p95_us as f64 / 1_000.0)
+                // The RANKED quantity, with the spread that decided the
+                // ranking. Printing the throughput spread beside a p95 ordering
+                // was the same mismatch this command had between `--for` and
+                // its metric.
+                match metric {
+                    sweep::Metric::Throughput => format!("{:.0} tok/s", round.throughput_tok_s),
+                    sweep::Metric::LaneP95 => {
+                        format!("p95 {:.0} ms", round.lane_p95_us as f64 / 1_000.0)
+                    }
+                },
+                format!("+/-{:.1}%", metric.sigma(round) * 100.0),
+                {
+                    let other = match metric {
+                        sweep::Metric::Throughput => {
+                            format!("p95 {:.0} ms", round.lane_p95_us as f64 / 1_000.0)
+                        }
+                        sweep::Metric::LaneP95 => format!("{:.0} tok/s", round.throughput_tok_s),
+                    };
+                    if round.knobs == *baseline {
+                        format!("{other}  (current)")
+                    } else {
+                        other
+                    }
                 },
             ],
         ));
@@ -189,11 +267,18 @@ pub fn report(rounds: &[sweep::Round], baseline: &Knobs, skipped: usize, wrote: 
 
     match (best, base) {
         (Some(best), Some(base)) => {
-            let gain =
-                (best.throughput_tok_s - base.throughput_tok_s) / base.throughput_tok_s * 100.0;
+            let (mine, theirs) = (metric.value(best), metric.value(base));
+            let gain = if metric.higher_is_better() {
+                (mine - theirs) / theirs * 100.0
+            } else {
+                (theirs - mine) / theirs * 100.0
+            };
             println!(
-                "  {} beats the current config by {gain:.1}% ({:.0} -> {:.0} tok/s).",
-                best.knobs, base.throughput_tok_s, best.throughput_tok_s
+                "  {} beats the current config by {gain:.1}% on {} ({:.0} -> {:.0}).",
+                best.knobs,
+                metric.label(),
+                theirs,
+                mine
             );
             if wrote {
                 println!("  Written to the config.");
@@ -202,8 +287,9 @@ pub fn report(rounds: &[sweep::Round], baseline: &Knobs, skipped: usize, wrote: 
             }
         }
         _ => println!(
-            "  Nothing measured faster than the current config by more than the \
-             measurement noise. Nothing to change."
+            "  Nothing measured better than the current config on {} by more than \
+             the measurement noise. Nothing to change.",
+            metric.label()
         ),
     }
 
@@ -283,18 +369,26 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
         dispatch_depth: worker.model.scheduler.frame_dispatch_depth as usize,
     };
     let (plan, skipped) = plan(baseline, args.budget);
+    let workload = args.workload(objective);
+    let metric = objective.metric();
 
     println!(
-        "Optimizing for {} on this machine: {} candidate(s), {} fleet(s) of {} lanes each.",
+        "Optimizing for {} on this machine: {} candidate(s), ranked by {}.",
         objective.as_profile(),
         plan.len(),
-        args.repeats,
-        args.fleet
+        metric.label()
+    );
+    println!(
+        "  Load: {} lanes x {} tokens, {} pass(es) -- the shape `{}` implies.",
+        workload.fleet,
+        workload.tokens,
+        workload.repeats,
+        objective.as_profile()
     );
     println!("  This holds the whole device. Do not run it against a machine that is serving.");
     println!();
 
-    let inputs = lane_inputs(args.fleet, args.tokens);
+    let inputs = lane_inputs(workload.fleet, workload.tokens);
     // The CLI's `#[tokio::main]` owns the one runtime (see main.rs's "Model A"
     // note), so this borrows it rather than building a second one -- nesting
     // runtimes panics outright.
@@ -323,7 +417,7 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
             &args.program,
             &inputs,
             &plan,
-            args.repeats,
+            workload.repeats,
             |pass, total| println!("  pass {pass}/{total} over {} candidates", plan.len()),
         )
         .await?;
@@ -333,7 +427,7 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
     println!();
 
     let mut wrote = false;
-    if let Some(best) = winner(&rounds, &baseline)
+    if let Some(best) = winner(&rounds, &baseline, metric)
         && args.write
     {
         let content = apply(&content, best.knobs)?;
@@ -341,7 +435,7 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
         wrote = true;
     }
 
-    report(&rounds, &baseline, skipped, wrote);
+    report(&rounds, &baseline, metric, skipped, wrote);
     Ok(())
 }
 
@@ -361,6 +455,7 @@ mod tests {
             throughput_tok_s: tok_s,
             throughput_rel_sigma: sigma,
             lane_p95_us: 1_000,
+            lane_p95_rel_sigma: sigma,
             failed_lanes: 0,
             repeats: 3,
         }
@@ -420,11 +515,14 @@ mod tests {
         };
         // 2.5% apart, 8.5% combined noise: not a result.
         let rounds = vec![round(BASE, 1200.0, 0.06), round(fast, 1230.0, 0.06)];
-        assert!(winner(&rounds, &BASE).is_none());
+        assert!(winner(&rounds, &BASE, sweep::Metric::Throughput).is_none());
 
         // Same gap, quiet measurements: a result.
         let rounds = vec![round(BASE, 1200.0, 0.005), round(fast, 1230.0, 0.005)];
-        assert_eq!(winner(&rounds, &BASE).map(|r| r.knobs), Some(fast));
+        assert_eq!(
+            winner(&rounds, &BASE, sweep::Metric::Throughput).map(|r| r.knobs),
+            Some(fast)
+        );
     }
 
     #[test]
@@ -471,6 +569,75 @@ mod tests {
     }
 
     #[test]
+    fn latency_ranks_by_latency_and_throughput_by_throughput() {
+        // The bug this replaces: `--for latency` measured and ranked
+        // THROUGHPUT, so the command asked for one thing and ordered its
+        // answers by another.
+        assert_eq!(Objective::Latency.metric(), sweep::Metric::LaneP95);
+        assert_eq!(Objective::Throughput.metric(), sweep::Metric::Throughput);
+        assert!(!sweep::Metric::LaneP95.higher_is_better());
+        assert!(sweep::Metric::Throughput.higher_is_better());
+    }
+
+    #[test]
+    fn a_lower_p95_wins_a_latency_sweep() {
+        // Direction matters as much as the quantity: ranked as if higher were
+        // better, a latency sweep would pick the slowest candidate.
+        let quicker = Knobs { frame_size: 1, ..BASE };
+        let mut base = round(BASE, 1000.0, 0.01);
+        base.lane_p95_us = 400_000;
+        base.lane_p95_rel_sigma = 0.01;
+        let mut challenger = round(quicker, 500.0, 0.01);
+        challenger.lane_p95_us = 200_000;
+        challenger.lane_p95_rel_sigma = 0.01;
+
+        // Half the latency, and half the throughput -- so the two objectives
+        // must disagree about it, which is the whole reason there are two.
+        assert_eq!(
+            winner(&[base, challenger], &BASE, sweep::Metric::LaneP95).map(|r| r.knobs),
+            Some(quicker)
+        );
+        let mut base = round(BASE, 1000.0, 0.01);
+        base.lane_p95_us = 400_000;
+        base.lane_p95_rel_sigma = 0.01;
+        let mut challenger = round(quicker, 500.0, 0.01);
+        challenger.lane_p95_us = 200_000;
+        challenger.lane_p95_rel_sigma = 0.01;
+        assert!(winner(&[base, challenger], &BASE, sweep::Metric::Throughput).is_none());
+    }
+
+    #[test]
+    fn the_workload_follows_the_objective_unless_overridden() {
+        // An arbitrary load measures an arbitrary thing: the first version of
+        // this command shipped 8 lanes of 48 tokens picked by nothing, and that
+        // load was dominated by process startup rather than by batching.
+        let latency = Objective::Latency.workload();
+        let throughput = Objective::Throughput.workload();
+        assert!(
+            latency.fleet < throughput.fleet,
+            "latency is the low-concurrency regime by definition"
+        );
+        assert!(
+            latency.repeats > throughput.repeats,
+            "a small fleet yields few lane samples, so it needs more passes"
+        );
+
+        let args = Args {
+            objective: None,
+            program: String::new(),
+            fleet: Some(7),
+            repeats: None,
+            tokens: None,
+            budget: None,
+            write: false,
+        };
+        let resolved = args.workload(Objective::Latency);
+        assert_eq!(resolved.fleet, 7, "an explicit flag wins");
+        assert_eq!(resolved.tokens, latency.tokens, "the rest stays derived");
+        assert_eq!(resolved.repeats, latency.repeats);
+    }
+
+    #[test]
     fn without_a_baseline_round_nothing_wins() {
         // Ranking against an absent baseline would make the fastest candidate
         // look like an improvement over nothing.
@@ -479,6 +646,6 @@ mod tests {
             ..BASE
         };
         let rounds = vec![round(other, 9_000.0, 0.001)];
-        assert!(winner(&rounds, &BASE).is_none());
+        assert!(winner(&rounds, &BASE, sweep::Metric::Throughput).is_none());
     }
 }

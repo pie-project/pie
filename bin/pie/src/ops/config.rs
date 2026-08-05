@@ -82,20 +82,23 @@ pub enum ConfigCmd {
         #[arg(long)]
         program: String,
 
-        /// Lanes per fleet.
-        #[arg(long, default_value_t = 16)]
-        fleet: usize,
+        /// Lanes per fleet. Defaults to the shape `--for` implies: 4 for
+        /// latency, 64 for throughput.
+        #[arg(long)]
+        fleet: Option<usize>,
 
-        /// Fleets per candidate. Below 3 the spread means little, and the
-        /// spread is what decides whether a difference is real.
-        #[arg(long, default_value_t = 3)]
-        repeats: usize,
+        /// Fleets per candidate. Defaults to the shape `--for` implies. Below
+        /// 3 the spread means little, and the spread is what decides whether a
+        /// difference is real.
+        #[arg(long)]
+        repeats: Option<usize>,
 
-        /// Tokens each lane decodes. Shorter fleets are measurably noisier,
-        /// and the noise decides what counts as a win — at 48 tokens the sweep
-        /// reported a 20% improvement that a longer fleet showed was nothing.
-        #[arg(long, default_value_t = 256)]
-        tokens: usize,
+        /// Tokens each lane decodes. Defaults to 256. Shorter fleets are
+        /// measurably noisier, and the noise decides what counts as a win — at
+        /// 48 tokens the sweep reported a 20% improvement that a longer fleet
+        /// showed was nothing.
+        #[arg(long)]
+        tokens: Option<usize>,
 
         /// Stop after this many candidates. Counts candidates, not minutes: an
         /// operator cannot predict how many fleets fit in a wall-clock budget.
