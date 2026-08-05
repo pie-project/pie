@@ -2753,10 +2753,25 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             const std::size_t nreg = ind.size() - 1;
             bool ok = true;
             bool seen_trunc = false;
+            bool seen_hook = false;
+            std::size_t trunc_regions = 0;
             for (std::size_t r = 0; r < nreg && ok; ++r) {
+                if (rsig[r] & PIE_REGION_SIG_TRUNCATED) ++trunc_regions;
+                if (rsig[r] & PIE_REGION_SIG_HOOK) seen_hook = true;
                 if (rsig[r] &
-                    (PIE_REGION_SIG_HOOK | PIE_REGION_SIG_MASK |
-                     PIE_REGION_SIG_MULTI_TOKEN)) {
+                    (PIE_REGION_SIG_MASK | PIE_REGION_SIG_MULTI_TOKEN)) {
+                    ok = false;
+                } else if ((rsig[r] & PIE_REGION_SIG_HOOK) &&
+                           ((rsig[r] & PIE_REGION_SIG_TRUNCATED) ||
+                            seen_trunc)) {
+                    // ④ tier 1 (hook-aware banding, Act-2 order): a
+                    // FULL-DEPTH hook region sits in the plain prefix —
+                    // the walk's permanent live rows — so run_layer's
+                    // existing per-layer invocations cover exactly its
+                    // planned depth. A TRUNCATED hook region (or one the
+                    // seriation somehow sorted after a band) would go
+                    // dormant mid-walk while the fire-wide hook context
+                    // keeps firing — tier 2, undeclared.
                     ok = false;
                 } else if (rsig[r] & PIE_REGION_SIG_TRUNCATED) {
                     if (rsig[r] & PIE_REGION_SIG_LORA) { ok = false; break; }
@@ -2773,6 +2788,20 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 s.depth_band_k.size() > 3) {
                 s.depth_band_k.clear();
                 s.depth_band_rows.clear();
+            }
+            // Tier-1 contract backstop: a hooked fire with two or more
+            // distinct truncations has exactly one correct server — the
+            // banded walk. The engine's admission gate (worker.rs, hook x
+            // depth) only groups such fires in band-servable shapes, so an
+            // unarmed arrival here is an admission bug; the fallback paths
+            // would demote a lane's k silently, so refuse loudly instead.
+            if (seen_hook && trunc_regions >= 2 &&
+                s.depth_band_k.empty()) {
+                throw std::runtime_error(
+                    "hooked multi-depth fire reached the driver without "
+                    "armed bands (" + std::to_string(trunc_regions) +
+                    " truncated regions) — the admission gate should have "
+                    "split it");
             }
             if (std::getenv("PIE_REGION_TRACE") != nullptr) {
                 std::fprintf(stderr,

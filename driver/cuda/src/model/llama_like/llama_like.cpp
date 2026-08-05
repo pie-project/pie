@@ -2778,9 +2778,20 @@ void llama_like_forward_paged(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
+    // ④ tier 1 (Act-2 order): hook fires band. The frame gate arms bands
+    // only when every hooked region is FULL-DEPTH in the plain prefix —
+    // inside [0, band_rows[j]) at every banded layer — so the per-layer
+    // hook invocations inside run_layer cover exactly the hook rows'
+    // planned depth, and the score capture rides each band's own plan.
     const bool bands_runnable =
         plan_state.depth_band_count >= 2 && is_pure_decode &&
-        !has_custom_mask && hooks == nullptr &&
+        !has_custom_mask &&
+        // A page-mask-writing hook substitutes the fire's page table at
+        // full R on the paged decode path; the banded layers run attention
+        // at live<R rows, and the compaction and the fire then disagree on
+        // request count (caught by the soak's h2o lane). Observation-only
+        // hooks band; Track-B hooks keep the pre-band servers.
+        (hooks == nullptr || !hooks->wants_page_mask) &&
         (use_decode_path || use_prefill_decode_path ||
          fwd_cfg.force_prefill_path) &&
         layer_bound == cfg.num_hidden_layers;

@@ -349,106 +349,67 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
     // sort_by_key is stable, so equal keys keep `arrival` order even
     // without the explicit third component; it is in the key anyway so the
     // contract survives callers passing members out of arrival order.
-    // GRAY SERIATION (the review's generalization #3, staged): the
-    // Gray-code rank over the axis bit-vector orders members so that
-    // ADJACENT combinations differ in one axis — each axis's window
-    // fragments into the fewest runs when members carry arbitrary axis
-    // subsets (lex: mask splits into 2 runs at k=2 axes; Gray: 1 run
-    // each — the PoC's radix-36 vs Gray-18 table). TODAY the admitted
-    // combination set nests (both-window-axes lanes are refused or
-    // k-uniform), so Gray and the standing lexicographic key produce
-    // THE SAME block structure — asserted below, so the moment a
-    // relaxation admits a combination where they diverge, this fires
-    // and the window consumers get generalized WITH the reorder
-    // rather than silently after it.
-    fn gray_rank(bits: u32) -> u32 {
-        // Inverse of n -> n ^ (n >> 1): prefix-XOR decode.
-        let mut rank = bits;
-        let mut shift = 1;
-        while shift < 32 {
-            rank ^= rank >> shift;
-            shift <<= 1;
-        }
-        rank
-    }
-    let axis_bits = |m: &MemberFacts| -> u32 {
-        // Bit order = the standing key's significance (mask > hook >
-        // truncated); multi_token and lora stay outside (not window
-        // axes).
-        (u32::from(m.custom_mask) << 2)
-            | (u32::from(m.hook_program) << 1)
-            | u32::from(m.truncated)
-    };
     member_order.sort_by_key(|&index| {
         let member = &members[index];
         (
-            // AC-4 order [plain | truncated | hooked | masked]: the mask
-            // window stays the outermost SUFFIX (its machinery is
-            // end-anchored), hooked lanes sit before it (the unfused
-            // QKV tail is the GENERAL path — masked rows riding it is
-            // correctness-neutral), the truncated middle before that.
+            // ACT 2 step (i) — order [full(plain|hooked) | truncated
+            // deepest-first | masked]: the mask window stays the outermost
+            // SUFFIX (its machinery is end-anchored); DEPTH becomes the
+            // ordered operand ABOVE the hook bit, so every full-depth row
+            // (plain, lora, hooked) precedes every truncated one — the
+            // banded walk's live-prefix invariant now holds fire-wide, not
+            // by accident of lane class. Hooks move EARLY among the
+            // full-depth rows: the peel is position-parametric
+            // (hook_free_prefix_rows re-stamps below) and the fused-QKV
+            // fast_rows shrinkage this costs was priced NIL (playbook,
+            // 2026-08-05: hook delta 0.58ms/step hooks-early vs 1.06
+            // hooks-late, controls subtracted). The old
+            // [plain|trunc|hook|mask] contract lives on only in the
+            // stash server, whose family-2 prefix-marker rule already
+            // tolerates hook blocks at or before t_start.
             member.device_resolved_geometry,
             member.custom_mask,
-            member.hook_program,
             member.truncated,
             // ④: deepest-first inside the truncated block (banded
             // depth's prefix invariant); constant for everyone else.
             std::cmp::Reverse(member.max_layers.unwrap_or(u32::MAX)),
+            member.hook_program,
             !member.multi_token,
             member.arrival,
         )
     });
 
-    // The Act-2 cutover sentinel (north-star-dsl.md "the cutover
-    // trigger"): the first admitted combination whose Gray order
-    // diverges from the lexicographic order is the signal to land the
-    // Gray reorder + (start, len) consumers + gather together. It must
-    // run IN PRODUCTION — a debug-only sentinel can never fire where
-    // the combinations actually arrive — so it is gated on the one
-    // cheap precondition that makes divergence possible at all: at
-    // least two distinct axis-bit patterns in the group. Homogeneous
-    // groups (nearly every step) skip both the sort and the compare.
+    // ACT 2 step (i): the cutover sentinel PROMOTED. Detection served its
+    // purpose (the event fired; the reorder above is its consequence) — the
+    // production check is now the guarantee itself: every window axis's
+    // members must form ONE contiguous run in the final order, because the
+    // window consumers (mask split, hook peel, depth bands/stash) each take
+    // one (start, len). A fragmented axis is the signal that an admitted
+    // combination needs the gather fallback — the trio's last leg — so it
+    // logs loudly (latched) instead of silently fragmenting a window.
     {
-        let mut seen_bits: u32 = 0;
-        let mut patterns = 0u32;
-        for member in members {
-            let bit = 1u32 << (axis_bits(member) & 31);
-            if seen_bits & bit == 0 {
-                seen_bits |= bit;
-                patterns += 1;
-            }
-        }
-        if patterns > 1 {
-            let mut gray_order: Vec<usize> = (0..members.len()).collect();
-            gray_order.sort_by_key(|&i| {
-                (
-                    members[i].device_resolved_geometry,
-                    gray_rank(axis_bits(&members[i])),
-                    std::cmp::Reverse(members[i].max_layers.unwrap_or(u32::MAX)),
-                    !members[i].multi_token,
-                    members[i].arrival,
-                )
-            });
-            if member_order != gray_order {
-                // NOT an assert: a hooked+truncated lane coexisting with a
-                // plain hooked one already ranks differently under Gray
-                // (011 before 010). The sentinel's job is DETECTION — the
-                // fire still runs on the lexicographic order the window
-                // consumers contract for; this line is the signal to bring
-                // the Gray reorder and the (start, len) consumer
-                // generalization in together. Latched once per process:
-                // the design needs the EVENT, not a per-step stream (a
-                // masked-full + masked-truncated wave diverges on every
-                // step it recurs).
-                static FIRED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!(
-                        "[seriation] gray/lex divergence: lex={member_order:?} \
-                         gray={gray_order:?} — a combination outside the \
-                         nesting set is live"
-                    );
+        let contiguous = |bit: fn(&MemberFacts) -> bool| -> bool {
+            let mut runs = 0;
+            let mut inside = false;
+            for &index in &member_order {
+                let hit = bit(&members[index]);
+                if hit && !inside {
+                    runs += 1;
                 }
+                inside = hit;
+            }
+            runs <= 1
+        };
+        let mask_ok = contiguous(|m| m.custom_mask);
+        let hook_ok = contiguous(|m| m.hook_program);
+        let trunc_ok = contiguous(|m| m.truncated);
+        if !(mask_ok && hook_ok && trunc_ok) {
+            static FIRED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[seriation] window axis fragmented under the Act-2 order                      (mask_ok={mask_ok} hook_ok={hook_ok} trunc_ok={trunc_ok},                      order={member_order:?}) — this combination wants the                      gather fallback"
+                );
             }
         }
     }
@@ -590,6 +551,45 @@ mod tests {
             plan.member_order,
             vec![3, 1, 2, 0],
             "full depth first, then bands deepest-first"
+        );
+    }
+
+    /// ACT 2 step (i): depth outranks the hook bit — a full-depth hooked
+    /// member sorts INTO the full prefix, before every truncated member,
+    /// so the banded walk's live prefix contains the hook rows at every
+    /// layer (tier-1 hook banding's ordering precondition). Within the
+    /// full prefix, hook members still sit after the plain ones (the
+    /// fused-QKV prefix), and the mask suffix is untouched.
+    #[test]
+    fn full_depth_hook_sorts_before_truncated_members() {
+        let band = |k: u32, arrival: usize| {
+            let mut m = member(false, false, false, arrival);
+            m.truncated = true;
+            m.max_layers = Some(k);
+            m
+        };
+        let members = [
+            band(8, 0),
+            member(true, false, false, 1),  // hooked, full depth
+            band(12, 2),
+            member(false, false, false, 3), // plain, full depth
+        ];
+        let plan = plan_fire_with_model(&members, &[]);
+        assert_eq!(
+            plan.member_order,
+            vec![3, 1, 2, 0],
+            "[plain-full, hook-full, k12, k8]"
+        );
+        let masked = [
+            band(8, 0),
+            member(true, false, false, 1),
+            masked_member(2),
+        ];
+        let plan = plan_fire_with_model(&masked, &[]);
+        assert_eq!(
+            plan.member_order,
+            vec![1, 0, 2],
+            "[hook-full, k8, masked] — mask stays the outermost suffix"
         );
     }
 

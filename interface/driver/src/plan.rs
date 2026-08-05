@@ -77,6 +77,13 @@ pub struct LaunchPlan {
     /// (`set-max-layers`). Engine-internal — it crosses the driver ABI as
     /// the region table's per-region k, never as a scalar word.
     pub max_layers: Option<u32>,
+    /// The program's hook stages write the `attn_page_mask` sink (Track B
+    /// page substitution). Engine-internal, same precedent as
+    /// `max_layers`: the admission gate reads it — a page-mask hook needs
+    /// the full-R paged decode path, so it cannot ride the banded walk
+    /// and its group stays depth-homogeneous.
+    #[serde(default)]
+    pub hook_page_mask: bool,
     /// The program binds an `AttnMask` descriptor port to a CHANNEL, so the
     /// driver resolves a dense per-cell mask pre-forward. Such a fire must be
     /// submitted SOLO: a multi-program batch cannot merge one program's dense

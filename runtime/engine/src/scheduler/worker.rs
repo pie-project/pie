@@ -455,14 +455,23 @@ pub(crate) struct LaunchGrouping {
     has_device_geometry: bool,
     has_hook_program: bool,
     has_multi_token: bool,
-    /// First FINITE truncation (`set-max-layers`) seen in the group, and
-    /// whether a SECOND distinct one joined. Only consulted when a hook
-    /// member is (or would be) present: the dsplit union that serves a
-    /// hook-carrying mixed-depth fire has ONE depth boundary — [k | full] —
-    /// and bands decline hooks, so two distinct finite k's would demote the
-    /// deeper lane to the stamp's k. Hookless multi-k groups band fine.
-    finite_k: Option<u32>,
-    finite_k_multi: bool,
+    /// The DISTINCT finite truncations (`set-max-layers`) seen in the
+    /// group — the driver's banded walk serves at most three, so three
+    /// slots suffice; `finite_k_overflow` records a fourth. Consulted when
+    /// a hook member is (or would be) present: under the Act-2 order a
+    /// FULL-DEPTH hook member lives in the banded walk's permanent live
+    /// prefix and bands serve any mix the band cap admits, but a TRUNCATED
+    /// hook member (tier 2, unimplemented) still pins the group to its own
+    /// k, and with banding disarmed the one-boundary dsplit union is the
+    /// only server — those groups stay depth-homogeneous.
+    finite_ks: [Option<u32>; 3],
+    finite_k_overflow: bool,
+    /// A hook member's own FINITE truncation, if any hook member has one.
+    hook_finite_k: Option<u32>,
+    /// A hook member writes the `attn_page_mask` sink — its substitution
+    /// needs the full-R paged decode path, so the group cannot band and
+    /// stays depth-homogeneous (the dsplit union's [k | full] only).
+    has_page_mask_hook: bool,
 }
 
 /// One token per row — the paged-decode-path shape, independent of
@@ -578,18 +587,51 @@ impl LaunchGrouping {
         {
             return false;
         }
-        // Hook x depth: a group that carries (or would carry) a hook member
-        // must hold at most ONE distinct finite truncation. The serving
-        // machinery for hooked mixed-depth fires is the dsplit union —
-        // [k | full], one boundary — because banding declines hooks; a
-        // second distinct k would execute at the stamp's k (silent
-        // demotion, observed live: hook@8 + k12 lanes ran the k12 rows at
-        // 8). Refused here, the odd-k lane forms its own group and runs
-        // exact.
+        // Hook x depth (Act 2 step (i) admission): a FULL-DEPTH hook
+        // member rides the banded walk's permanent live prefix (the Act-2
+        // order puts every full-depth row before every truncated one), so
+        // its group may hold as many distinct finite truncations as the
+        // driver's band cap (three). A TRUNCATED hook member (tier 2,
+        // unimplemented) pins the group to its own k, and with banding
+        // disarmed the only multi-depth server is the one-boundary dsplit
+        // union — those groups stay depth-homogeneous. Refused lanes form
+        // their own groups and run exact.
         if self.count != 0 && (self.has_hook_program || request.hook_program) {
-            let clashes = match (request.request.max_layers, self.finite_k) {
-                (Some(a), Some(b)) => a != b || self.finite_k_multi,
-                _ => self.finite_k_multi,
+            static BANDS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let bands_on = *BANDS_ON.get_or_init(|| {
+                std::env::var("PIE_DEPTH_BANDS")
+                    .map(|v| !v.starts_with('0'))
+                    .unwrap_or(true)
+            });
+            let joining_hook_k = if request.hook_program {
+                request.request.max_layers
+            } else {
+                None
+            };
+            let distinct_after = {
+                let k = request.request.max_layers;
+                let known = k.is_none()
+                    || self.finite_ks.iter().any(|slot| *slot == k);
+                self.finite_ks.iter().filter(|slot| slot.is_some()).count()
+                    + usize::from(!known)
+            };
+            let page_mask_hook = self.has_page_mask_hook
+                || (request.hook_program && request.request.hook_page_mask);
+            let hook_k = self.hook_finite_k.or(joining_hook_k);
+            let clashes = if page_mask_hook {
+                // Track-B hooks keep the pre-band servers: at most one
+                // distinct finite truncation beside them.
+                self.finite_k_overflow || distinct_after > 1
+            } else if let Some(hk) = hook_k {
+                // A truncated hook member: every finite k must equal hk.
+                self.finite_k_overflow
+                    || request.request.max_layers.is_some_and(|k| k != hk)
+                    || self.finite_ks.iter().flatten().any(|&k| k != hk)
+            } else if bands_on {
+                // Full-depth hooks band with up to the driver's band cap.
+                self.finite_k_overflow || distinct_after > 3
+            } else {
+                self.finite_k_overflow || distinct_after > 1
             };
             if clashes {
                 return false;
@@ -625,11 +667,19 @@ impl LaunchGrouping {
         self.has_hook_program |= request.hook_program;
         self.has_multi_token |= !one_token_rows(&request.request);
         if let Some(k) = request.request.max_layers {
-            match self.finite_k {
-                None => self.finite_k = Some(k),
-                Some(existing) if existing != k => self.finite_k_multi = true,
-                _ => {}
+            if !self.finite_ks.iter().any(|slot| *slot == Some(k)) {
+                if let Some(slot) =
+                    self.finite_ks.iter_mut().find(|slot| slot.is_none())
+                {
+                    *slot = Some(k);
+                } else {
+                    self.finite_k_overflow = true;
+                }
             }
+        }
+        if request.hook_program {
+            self.hook_finite_k = self.hook_finite_k.or(request.request.max_layers);
+            self.has_page_mask_hook |= request.request.hook_page_mask;
         }
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)

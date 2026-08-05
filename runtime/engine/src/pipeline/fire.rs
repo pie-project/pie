@@ -44,6 +44,17 @@ fn container_has_attention_stages(
 /// Whether the pass carries a `lora` sink — the region table's LORA
 /// signature (an adapter fire batches, but its region must say so, so the
 /// driver's plans see the axis).
+fn container_writes_page_mask(container: &pie_ir::container::TraceContainer) -> bool {
+    container.stages.iter().flat_map(|s| s.ops.iter()).any(|op| {
+        matches!(
+            op,
+            pie_ir::op::Op::SinkCall { name, .. }
+                if container.names.get(*name as usize).map(String::as_str)
+                    == Some("attn_page_mask")
+        )
+    })
+}
+
 fn container_has_lora_sink(container: &pie_ir::container::TraceContainer) -> bool {
     container.stages.iter().flat_map(|s| s.ops.iter()).any(|op| {
         matches!(
@@ -1491,6 +1502,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let (hook_program, lora_program) = {
             let p = ctx.resources().get(&fwd)?;
             let container = &p.instance.program.bound.container;
+            req.hook_page_mask = container_writes_page_mask(container);
             (
                 container_has_attention_stages(container),
                 container_has_lora_sink(container),
@@ -2799,6 +2811,7 @@ async fn fire_device_geometry<C: FireContext>(
         let (hook_program, lora_program) = {
             let p = ctx.resources().get(&fwd)?;
             let container = &p.instance.program.bound.container;
+            req.hook_page_mask = container_writes_page_mask(container);
             (
                 container_has_attention_stages(container),
                 container_has_lora_sink(container),
