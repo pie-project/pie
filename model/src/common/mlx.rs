@@ -104,6 +104,26 @@ pub fn already_lowered(raw_name: &str) -> bool {
     !index.is_empty() && index.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Which requantization this lowering can serve, and the refusal for the rest.
+///
+/// `None` and `Int4` are the only two answers these kernels have: they read
+/// MLX affine, and `Encode` is implemented for `MlxAffineU4` on both the host
+/// and the driver. Anything else is CUDA's vocabulary, and it is refused
+/// rather than ignored — authoring an unquantized contract for `--quant int8`
+/// would hand back an artifact whose name and bytes disagree. That was the
+/// state this field was in: plumbed through three layers to authors that never
+/// looked at it.
+pub fn int4_requested(b: &Builder<'_>, schema: &str) -> Result<bool, Error> {
+    match b.runtime_quant() {
+        RuntimeQuant::None => Ok(false),
+        RuntimeQuant::Int4 => Ok(true),
+        other => fail(format!(
+            "Metal {schema}: runtime_quant={other:?} has no encoder here; these \
+             kernels read MLX affine, so `int4` is the only request they can serve"
+        )),
+    }
+}
+
 /// Declare a tensor where it lies, casting the widths no Metal kernel reads.
 pub fn push_direct(b: &mut Builder<'_>, raw: &RawTensor, output: String) {
     if is_raw(&raw.encoding, DType::F16) || is_raw(&raw.encoding, DType::F32) {
@@ -478,6 +498,14 @@ pub type RenameRule<'r> = &'r dyn Fn(&Builder<'_>, &str) -> Result<Option<String
 /// the same `Encode` op, so what runs at load without a request and offline
 /// under `pie model build --quant int4` is one transform, not two. Rank is
 /// what separates these from the norms, which must stay values.
+///
+/// F16 and F32 are cast to BF16 first rather than encoded where they lie. The
+/// two executors would not agree otherwise: the host reads the operand's
+/// declared dtype, while the driver's `encode_mlx_affine_u4` is handed a byte
+/// width and reads every 2-byte element as BF16 — so an F16 weight would be
+/// quantized correctly offline and from misread bits at load. `Cast` is in
+/// both tile-map masks and is what `push_direct` already does with these two
+/// widths, so the chain costs nothing and removes the disagreement.
 pub fn author_mlx_file(
     b: &mut Builder<'_>,
     schema: &str,
@@ -485,16 +513,7 @@ pub fn author_mlx_file(
 ) -> Result<(), Error> {
     let quant_bits = i64::from(b.facts().mlx_quant_bits);
     let quant_group = i64::from(b.facts().mlx_quant_group_size);
-    let encode_floats = match b.runtime_quant() {
-        RuntimeQuant::None => false,
-        RuntimeQuant::Int4 => true,
-        other => {
-            return fail(format!(
-                "Metal {schema}: runtime_quant={other:?} has no encoder here; these \
-                 kernels read MLX affine, so `int4` is the only request they can serve"
-            ));
-        }
-    };
+    let encode_floats = int4_requested(b, schema)?;
     let mut declared = 0usize;
     for raw in b.tensors().to_vec() {
         let Some(output) = rename(b, &raw.name)? else {
@@ -512,14 +531,30 @@ pub fn author_mlx_file(
                 ));
             };
             push_mlx_affine_declared(b, raw, scales, biases, quant_bits, quant_group, output)?;
-        } else if encode_floats
-            && raw.name.ends_with(".weight")
-            && raw.shape.len() == 2
-            && (is_raw(&raw.encoding, DType::BF16)
-                || is_raw(&raw.encoding, DType::F16)
-                || is_raw(&raw.encoding, DType::F32))
-        {
-            push_encoded_affine(b, Expr::src(&raw.name), raw.shape[0], raw.shape[1], output)?;
+        } else if encode_floats && raw.name.ends_with(".weight") && raw.shape.len() == 2 {
+            let value = if is_raw(&raw.encoding, DType::BF16) {
+                Expr::src(&raw.name)
+            } else if is_raw(&raw.encoding, DType::F16) || is_raw(&raw.encoding, DType::F32) {
+                // Two tile maps, not one expression: `Cast` needs a kernel, so
+                // a cast feeding an encode has to leave a buffer behind for the
+                // encode to read rather than nest inside it.
+                let widened = format!("{output}.bf16");
+                let bf16 = Encoding::Raw(DType::BF16);
+                if let Some(declared) = b.define(
+                    widened.clone(),
+                    Expr::src(&raw.name).cast(bf16.clone()),
+                    bf16,
+                    Some(raw.shape.clone()),
+                ) {
+                    b.mark_internal(declared);
+                }
+                Expr::out(&widened)
+            } else {
+                push_direct(b, raw, output);
+                declared += 1;
+                continue;
+            };
+            push_encoded_affine(b, value, raw.shape[0], raw.shape[1], output)?;
         } else {
             push_direct(b, raw, output);
         }

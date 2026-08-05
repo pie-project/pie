@@ -942,20 +942,126 @@ fn llama_mlx_metal_int4() {
 #[test]
 fn metal_refuses_a_requantization_it_cannot_encode() {
     for quant in [RuntimeQuant::Int8, RuntimeQuant::Mxfp4, RuntimeQuant::Fp8] {
-        let err = author(
-            &facts("llama3", 1),
-            &llama_bf16_checkpoint(),
-            &metal_target(),
-            &Policy {
-                runtime_quant: quant,
-                ..mlx_policy()
-            },
-        )
-        .expect_err(&format!("runtime_quant={quant:?} should be refused"));
-        let text = err.to_string();
-        assert!(text.contains("no encoder here"), "{quant:?}: {text}");
-        assert!(text.contains("int4"), "{quant:?} refusal names the alternative: {text}");
+        // gpt-oss is in the list because its lowering encodes whatever the
+        // request says -- so the refusal is the only thing the request can do
+        // there, and an author that ignored it would be the odd one out.
+        for (family, checkpoint) in [
+            ("llama3", llama_bf16_checkpoint()),
+            ("gpt_oss", gptoss_mlx_checkpoint()),
+        ] {
+            let err = author(
+                &facts(family, 1),
+                &checkpoint,
+                &metal_target(),
+                &Policy {
+                    runtime_quant: quant,
+                    ..mlx_policy()
+                },
+            )
+            .expect_err(&format!("{family} runtime_quant={quant:?} should be refused"));
+            let text = err.to_string();
+            assert!(text.contains("no encoder here"), "{family} {quant:?}: {text}");
+            assert!(
+                text.contains("int4"),
+                "{family} {quant:?} refusal names the alternative: {text}"
+            );
+        }
     }
+}
+
+/// The same decoder again, in F16 — the width many older releases ship.
+///
+/// Not a cosmetic variant: the driver's `encode_mlx_affine_u4` is handed a byte
+/// width, not a dtype, so it reads every 2-byte element as BF16. Encoding an
+/// F16 weight where it lies would quantize correct values offline and misread
+/// bits at load, which is the one thing this feature must not do. The contract
+/// casts first, and the golden is where that stays true.
+fn llama_f16_checkpoint() -> CheckpointMetadata {
+    let (hidden, intermediate, vocab) = (64, 128, 128);
+    let mut ck = Checkpoint::new();
+    ck.push("model.embed_tokens.weight", &[vocab, hidden], f16enc());
+    let p = "model.layers.0.";
+    ck.push(&format!("{p}input_layernorm.weight"), &[hidden], f16enc());
+    for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+        ck.push(
+            &format!("{p}self_attn.{proj}.weight"),
+            &[hidden, hidden],
+            f16enc(),
+        );
+    }
+    ck.push(
+        &format!("{p}mlp.down_proj.weight"),
+        &[hidden, intermediate],
+        f16enc(),
+    );
+    ck.push("model.norm.weight", &[hidden], f16enc());
+    ck.finish("llama_f16")
+}
+
+#[test]
+fn llama_mlx_metal_int4_from_f16() {
+    check(
+        "llama_mlx_metal_int4_from_f16",
+        &llama_f16_checkpoint(),
+        &facts("llama3", 1),
+        &metal_target(),
+        &Policy {
+            runtime_quant: RuntimeQuant::Int4,
+            ..mlx_policy()
+        },
+    );
+}
+
+/// An already-quantized checkpoint is not quantized again.
+///
+/// The U32-triplet arm is checked before the encode arm, and the order is the
+/// whole guarantee: reversed, `--quant int4` over an MLX checkpoint would try
+/// to encode packed codes as if they were values. Nothing in a type would
+/// catch that, so the property is asserted — no widening tensor appears, and
+/// every projection is still the affine the checkpoint shipped.
+///
+/// This is what makes `optimize --quant int4` idempotent: run twice, the second
+/// artifact is the same size as the first and gates identically.
+#[test]
+fn an_mlx_checkpoint_is_not_requantized_by_int4() {
+    let mut facts = facts("llama3", 1);
+    facts.mlx_quant_bits = 4;
+    facts.mlx_quant_group_size = 64;
+    let contract = author(
+        &facts,
+        &llama_mlx_checkpoint(),
+        &metal_target(),
+        &Policy {
+            runtime_quant: RuntimeQuant::Int4,
+            ..mlx_policy()
+        },
+    )
+    .expect("authoring an MLX checkpoint with int4 succeeds")
+    .expect("llama has an author");
+
+    assert!(
+        !contract.tensors.iter().any(|t| t.name.ends_with(".bf16")),
+        "an already-quantized checkpoint grew a widening tensor: {:?}",
+        contract
+            .tensors
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let projections = contract.tensors.iter().filter(|t| {
+        t.name.ends_with(".weight") && (t.name.contains("self_attn.") || t.name.contains("mlp."))
+    });
+    let mut seen = 0;
+    for tensor in projections {
+        seen += 1;
+        assert!(
+            matches!(&tensor.encoding, Encoding::Quant(spec) if spec.bits_per_element == 4),
+            "{} lost the affine the checkpoint shipped: {:?}",
+            tensor.name,
+            tensor.encoding
+        );
+    }
+    assert!(seen >= 7, "fixture should carry every projection, saw {seen}");
 }
 
 fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {

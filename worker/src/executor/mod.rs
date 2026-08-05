@@ -4519,16 +4519,21 @@ mod tests {
         // says the same thing without the guess: never released is still a
         // failure, it just takes the timeout to prove it.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last = None;
         let released = loop {
-            if let Ok(ExecutorResponse::Embeddings(_)) = rpc(&client, request()).await {
-                break true;
+            match rpc(&client, request()).await {
+                Ok(ExecutorResponse::Embeddings(_)) => break true,
+                other => last = Some(format!("{other:?}")),
             }
             if std::time::Instant::now() >= deadline {
                 break false;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         };
-        assert!(released, "cancelled encodes never released their admission");
+        assert!(
+            released,
+            "cancelled encodes never released their admission; last answer was {last:?}"
+        );
         server.shutdown().await;
     }
 }

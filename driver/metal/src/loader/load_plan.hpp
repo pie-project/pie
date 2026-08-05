@@ -78,11 +78,17 @@ inline pie_loader::DeviceTarget metal_device_target() {
 /// crosses as a fact: it is the key the author registry dispatches on, and an
 /// unknown one comes back as a diagnostic naming it rather than a plan.
 ///
-/// What the request does NOT carry mirrors what the Metal authors never read:
-/// no runtime quantization, no MXFP4 MoE lowering choice, no component split,
-/// no expert streaming, and none of the CUDA per-family environment knobs —
-/// zeros and defaults, stated here rather than defaulted there, so equal
-/// requests author equal contracts.
+/// What the request does NOT carry is a policy this driver has no operator
+/// knob for: no MXFP4 MoE lowering choice, no component split, no expert
+/// streaming, and none of the CUDA per-family environment knobs — zeros and
+/// defaults, stated here rather than defaulted there, so equal requests author
+/// equal contracts.
+///
+/// `runtime_quant` is zero for a reason of its own. The MLX authors DO read it
+/// now (`RuntimeQuant::Int4` encodes a float weight to affine-U4), but this
+/// driver binds what the checkpoint holds: a requantization is a decision about
+/// an artifact, made once by `pie model optimize --quant int4` and written
+/// down, not one to re-run over every weight on each boot.
 inline LoadPlan compile_load_plan(
     std::string_view snapshot_dir,
     const pie_loader::DeviceTarget& target,
