@@ -161,6 +161,13 @@ inline bool moe_should_batch(int n_pairs, int n_experts) {
 /// thirty-two and would rather be many and small than few and large. Which is
 /// why what follows is a table of measurements and not a curve.
 ///
+/// The other shape of the same idea was tried too and is not here either:
+/// swapping the routed grid's axes so that row tiles run in x, which makes
+/// consecutive threadgroups consecutive tiles of the SAME expert reading the
+/// SAME weight slice where before they were `out_vec/bn` apart and shared
+/// nothing. Correct -- the answers do not move -- and 558.6 -> 557.5 tok/s. So
+/// the reuse is real on paper and the machine does not pay for it either way.
+///
 /// So 32 almost always, 64 once a run fills one, and 16 only where a run is too
 /// short to fill even a 32 -- which `moe_should_batch` already keeps to a sliver,
 /// since it admits nothing below eight rows an expert. The thresholds sit in the
