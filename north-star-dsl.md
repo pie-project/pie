@@ -2867,3 +2867,33 @@ TWO ATTRIBUTION RESULTS worth the whole day:
    "boot-window register-death" flakiness were CROSS-AGENT KILLS, not
    engine bugs. Standing ops rule: run our engine as `pie-tart`
    (copy the binary; -x match misses it).
+
+## THE STAGED TRIO LANDS (2026-08-05, tart branch)
+
+The cutover trigger fired for real — hook-full + multi-k + lora-full
+waves wanted banding and the nesting's order forbade it — and the
+staged machinery answered in sequence:
+
+- ACT 2 STEP (i) (cfee541b9): depth became the ordered operand above
+  the hook bit — [full(plain|hooked) | truncated deepest-first |
+  masked] per geometry class. The sentinel is now the guarantee
+  itself (one contiguous run per window axis, loud when a combination
+  wants gather). Hooks-early's feared fused-QKV regression measured
+  NIL before the cut.
+- TIER 1 (same commit): full-depth observation hooks band.
+- ACT 3 OPENING (d669e3721): derive_depth_bands = the ONE band
+  decision (frame gate + planned-words suppression share it); m=1
+  banding subsumed the dsplit form for [full | k] fires; the
+  page-mask distinction crossed the table as a region_sig bit.
+- TIER 2 (972a9149e): truncated observation hooks band, gated at
+  their own k by one table-derived word (hook_region_k) enforced
+  centrally in invoke_stage_hook and mirrored by both hook ledgers.
+  Admission learned the class-order invariant ([wire | devgeo]
+  blocks × descending-k).
+
+Every admitted hook x depth combination now has a correct server.
+The remaining staged legs — (start,len) windows for the mask-order
+servers, gather, stash deletion — stay demand-gated: no admitted
+combination needs them. plan.md's five "done" criteria: all met
+within this repo's scope (criterion 3 — different-rank adapters in
+one fire — verified live for the first time, 66f4a79d7).
