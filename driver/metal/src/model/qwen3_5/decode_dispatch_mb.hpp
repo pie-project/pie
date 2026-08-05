@@ -180,6 +180,15 @@ inline constexpr int kQmmBnCrossoverTg = 160;
 /// is why the rule no longer reaches for it. The threshold sits in the only gap
 /// the sweep leaves: 144 threadgroups still wants 16, 192 already wants 32.
 ///
+/// Checked against the machine and not just the probe, because the MIXTURE's
+/// tile rule was built the same way and the probe misled it three times over.
+/// Forcing each width through a real llama-3.2-1B prefill agrees with the
+/// table: at 448 rows BN=16/32/64 give 2565.8 / 2663.7 / 2578.3 tok/s and at
+/// 1024 rows 2270.8 / 2349.8 / 2297.0, so the rule's 32 is the machine's 32.
+/// The dense side's probe holds where the mixture's did not, and the reason is
+/// the mixture's alone: its threadgroups read thirty-two experts' weights
+/// where the probe reads one.
+///
 /// BN partitions output columns only, so this is bit-exact whichever way it
 /// goes; it decides how many times a weight tile is dequantized, not what the
 /// sum is.
