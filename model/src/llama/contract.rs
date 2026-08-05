@@ -162,6 +162,12 @@ fn llama_mlx_name(raw_name: &str, tied: bool) -> Result<Option<String>, Error> {
         }));
     }
 
+    // Its own output is a valid input: see `mlx::already_lowered`. After the
+    // `lm_head.` arm above, because that one is not an identity when tied.
+    if mlx::already_lowered(raw_name) {
+        return Ok(Some(raw_name.to_string()));
+    }
+
     // Some releases nest the decoder one level deeper. Accept either.
     let rest = raw_name
         .strip_prefix("model.language_model.")

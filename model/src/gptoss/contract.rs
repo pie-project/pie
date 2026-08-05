@@ -423,6 +423,11 @@ fn gptoss_mlx_name(raw_name: &str) -> Result<Option<String>, Error> {
     if raw_name.starts_with("lm_head.") {
         return Ok(Some(raw_name.to_string()));
     }
+    // Its own output is a valid input: see `mlx::already_lowered`. After the
+    // `lm_head.` arm above, which this family answers with an identity anyway.
+    if mlx::already_lowered(raw_name) {
+        return Ok(Some(raw_name.to_string()));
+    }
     let Some(rest) = raw_name.strip_prefix("model.") else {
         return fail(format!(
             "Metal GptOss schema has no declared mapping or skip for '{raw_name}'"

@@ -16,12 +16,14 @@ pub fn default_config_content() -> String {
     let driver_block = match driver_ffi::default_flavor() {
         #[cfg(feature = "driver-cuda")]
         Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
+        #[cfg(feature = "driver-metal")]
+        Some(Flavor::Metal) => METAL_DRIVER_BLOCK,
         Some(Flavor::Dummy) => DUMMY_DRIVER_BLOCK,
         // Fallback for exhaustiveness: `default_flavor` always returns `Some`
         // (dummy is linked unconditionally), and `pie-worker` may compile
         // `Flavor::Cuda`/`Metal` while this crate's matching `driver-*` arm is
         // cfg'd off (workspace feature-unification can desync the two) — those
-        // land here → the dummy block. Unreachable at runtime.
+        // land here → the dummy block.
         _ => DUMMY_DRIVER_BLOCK,
     };
     format!("{HEADER}{driver_block}{TAIL}")
@@ -103,6 +105,24 @@ gpu_mem_utilization = 0.90
 # random_seed     = 42
 "#;
 
+#[cfg(feature = "driver-metal")]
+const METAL_DRIVER_BLOCK: &str = r#"
+[driver]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named driver accepts. A key it does not know is a parse error
+# naming the driver that rejected it.
+type = "metal"
+device = ["metal:0"]
+activation_dtype = "bfloat16"
+kv_page_size = 32
+total_pages = 1024
+# max_forward_tokens      = 10240
+# max_forward_requests    = 512
+# cpu_pages               = 0      # 0 disables KV swapping to host memory
+# kv_cache_dtype          = "auto"
+# stream_routed_experts   = false  # page MoE experts from the checkpoint
+"#;
+
 const DUMMY_DRIVER_BLOCK: &str = r#"
 [driver]
 # Which keys are valid here depends on `type`: the common ones below, plus
@@ -125,6 +145,28 @@ mod tests {
         // not parse is the worst possible first impression.
         let content = default_config_content();
         pie_worker::Config::parse(&content).expect("generated config must parse");
+    }
+
+    #[test]
+    fn it_names_the_driver_this_binary_actually_has() {
+        // The whole promise of picking a block per flavor is that `pie config
+        // init` produces a file that runs. A missing match arm does not fail to
+        // compile -- it falls into the catch-all and writes the dummy driver,
+        // which parses perfectly and then generates random tokens. That is
+        // exactly what happened to Metal, so the invariant is checked rather
+        // than assumed: the template's `type` is the flavor this binary has.
+        let expected = match driver_ffi::default_flavor() {
+            #[cfg(feature = "driver-cuda")]
+            Some(Flavor::Cuda) => "cuda_native",
+            #[cfg(feature = "driver-metal")]
+            Some(Flavor::Metal) => "metal",
+            _ => "dummy",
+        };
+        let content = default_config_content();
+        assert!(
+            content.contains(&format!("type = \"{expected}\"")),
+            "template does not select the compiled flavor {expected:?}"
+        );
     }
 
     #[test]

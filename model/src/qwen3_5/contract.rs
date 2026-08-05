@@ -375,6 +375,11 @@ fn qwen3_5_mlx_name(raw_name: &str, tied: bool) -> Result<Option<String>, Error>
             }));
         }
     }
+    // Its own output is a valid input: see `mlx::already_lowered`. After the
+    // head arm above, because that one is not an identity when tied.
+    if mlx::already_lowered(raw_name) {
+        return Ok(Some(raw_name.to_string()));
+    }
     let Some(decoder) = mlx::decoder_member(raw_name) else {
         return mlx::fail(format!(
             "Metal Qwen3.5 schema has no declared mapping or skip for '{raw_name}'"
