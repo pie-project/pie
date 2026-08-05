@@ -1366,6 +1366,7 @@ impl ResidencyPlanner {
             // only — a demand that reserves off the free lists trivially
             // fits, and reading totals is a store-lock hold the per-fire
             // hot path must not pay (§16).
+            let limbo_started_us = crate::scheduler::fire_timing_now_us();
             let (_, kv_total) = self.port.device_stats();
             if demand.kv_pages > kv_total {
                 return Err(PlannerError::Impossible {
@@ -1438,6 +1439,15 @@ impl ResidencyPlanner {
                     // quorum so frames seal without it; rejoin is implicit
                     // on the lane's next accepted fire.
                     crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
+                    {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let acc = &crate::scheduler::GUEST_PHASES;
+                        let limbo = crate::scheduler::fire_timing_now_us()
+                            .saturating_sub(limbo_started_us)
+                            * 1_000;
+                        acc.limbo_ns.fetch_add(limbo, Relaxed);
+                        acc.limbo_max_ns.fetch_max(limbo, Relaxed);
+                    }
                     let mut registration = WaitRegistration {
                         planner: self,
                         key,
@@ -1666,7 +1676,10 @@ impl ResidencyPlanner {
                         // fund readmission. `fleet_stalled` keeps the
                         // liveness backstop: when nothing can complete, a
                         // restore proceeds regardless.
-                        if inner.completion_credit == 0 && !inner.fleet_stalled() {
+                        if rotation_damping_enabled()
+                            && inner.completion_credit == 0
+                            && !inner.fleet_stalled()
+                        {
                             return Step::Done;
                         }
                         inner.completion_credit = inner.completion_credit.saturating_sub(1);
@@ -3325,6 +3338,19 @@ fn fast_small_bypass_enabled() -> bool {
     static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CONFIGURED.get_or_init(|| {
         std::env::var("PIE_ALLOC_FAST_SMALL").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+/// Probe-only: `PIE_ROTATION_DAMPING=0` disables the completion-credit gate
+/// on covered restores (rotation damping, commit fa7f3adf5). Default ON —
+/// the damping is a shipped win at heavy oversubscription; the toggle
+/// exists to measure its sign at mild oversubscription (8192-page D cell),
+/// where parked boundary asks wait ~a full completion interval for supply
+/// an eviction-funded restore could have covered sooner.
+fn rotation_damping_enabled() -> bool {
+    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        !std::env::var("PIE_ROTATION_DAMPING").is_ok_and(|value| value == "0")
     })
 }
 

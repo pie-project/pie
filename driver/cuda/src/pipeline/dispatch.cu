@@ -781,6 +781,116 @@ __global__ void compose_fixed_decode(
 // blocks every submit in cudaEventSynchronize once the pipe is full).
 using pie_cuda_driver::kUploadStagingDepth;
 
+// Per-step staging for the pipeline kernels' parameter arrays (pull-validate
+// tickets/lanes, commit-bump, publish scatter, settle). Each helper used to
+// carry its own cudaMallocAsync + PAGEABLE cudaMemcpyAsync + cudaFreeAsync;
+// the pageable copies each stage through a driver bounce buffer, and the
+// compute queue stalled 5-12 us at every one — ~15 stalls, 120-186 us of
+// device idle per step at c256. One slot per wave, appended into from the
+// lane thread, flushed as at most one PINNED H2D per launch site.
+//
+// Single-threaded by construction: claim/stage/flush/release all run on the
+// driver lane (the same serialization StagedLaunch already relies on).
+// A slot is reusable once its wave's settle kernel retired; the ring is
+// event-guarded and sized past the scheduler's in-flight depth so the
+// claim's cudaEventSynchronize never blocks in steady state.
+class PipelineParamArena {
+  public:
+    static constexpr std::size_t kSlots = 8;
+    static constexpr std::size_t kSlotBytes = 1u << 20;  // 1 MiB
+    static constexpr std::size_t kAlign = 128;
+
+    PipelineParamArena() {
+        for (Slot& slot : slots_) {
+            CUDA_CHECK(cudaHostAlloc(
+                reinterpret_cast<void**>(&slot.host),
+                kSlotBytes,
+                cudaHostAllocDefault));
+            CUDA_CHECK(cudaMalloc(
+                reinterpret_cast<void**>(&slot.device), kSlotBytes));
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &slot.reuse_ready, cudaEventDisableTiming));
+        }
+    }
+    ~PipelineParamArena() noexcept {
+        for (Slot& slot : slots_) {
+            if (slot.host != nullptr) cudaFreeHost(slot.host);
+            if (slot.device != nullptr) cudaFree(slot.device);
+            if (slot.reuse_ready != nullptr) {
+                cudaEventDestroy(slot.reuse_ready);
+            }
+        }
+    }
+    PipelineParamArena(const PipelineParamArena&) = delete;
+    PipelineParamArena& operator=(const PipelineParamArena&) = delete;
+
+    // Claim the next ring slot for one wave. Returns the slot index.
+    int claim() {
+        const int index = static_cast<int>(next_ % kSlots);
+        next_ += 1;
+        Slot& slot = slots_[index];
+        if (slot.pending) {
+            CUDA_CHECK(cudaEventSynchronize(slot.reuse_ready));
+            slot.pending = false;
+        }
+        slot.used = 0;
+        slot.flushed = 0;
+        return index;
+    }
+
+    // Copy `bytes` of host params into the slot; returns the DEVICE address
+    // they will live at after the next flush. Returns nullptr when the slot
+    // cannot hold them (caller falls back to the legacy per-launch path).
+    void* stage(int index, const void* host_src, std::size_t bytes) {
+        Slot& slot = slots_[static_cast<std::size_t>(index)];
+        const std::size_t at = (slot.used + kAlign - 1) & ~(kAlign - 1);
+        if (bytes == 0 || at + bytes > kSlotBytes) return nullptr;
+        std::memcpy(slot.host + at, host_src, bytes);
+        slot.used = at + bytes;
+        return slot.device + at;
+    }
+
+    // Enqueue ONE pinned H2D for everything staged since the last flush.
+    // Must precede the launches that consume it, on their stream.
+    void flush(int index, cudaStream_t stream) {
+        Slot& slot = slots_[static_cast<std::size_t>(index)];
+        if (slot.used == slot.flushed) return;
+        const std::size_t from = slot.flushed & ~(kAlign - 1);
+        CUDA_CHECK(cudaMemcpyAsync(
+            slot.device + from,
+            slot.host + from,
+            slot.used - from,
+            cudaMemcpyHostToDevice,
+            stream));
+        slot.flushed = slot.used;
+    }
+
+    // The wave's last consumer is enqueued: guard reuse behind it.
+    void release_after(int index, cudaStream_t stream) {
+        Slot& slot = slots_[static_cast<std::size_t>(index)];
+        CUDA_CHECK(cudaEventRecord(slot.reuse_ready, stream));
+        slot.pending = true;
+    }
+
+    // Abort/teardown path: the caller has fully synchronized the stream,
+    // so the slot is idle regardless of what was enqueued.
+    void release_synced(int index) {
+        slots_[static_cast<std::size_t>(index)].pending = false;
+    }
+
+  private:
+    struct Slot {
+        std::uint8_t* host = nullptr;
+        std::uint8_t* device = nullptr;
+        cudaEvent_t reuse_ready = nullptr;
+        std::size_t used = 0;
+        std::size_t flushed = 0;
+        bool pending = false;
+    };
+    std::array<Slot, kSlots> slots_{};
+    std::uint64_t next_ = 0;
+};
+
 class FixedDecodeUploadArena {
   public:
     FixedDecodeUploadArena() {
@@ -1320,6 +1430,7 @@ struct Dispatch::Impl {
     DescriptorReadbackArena descriptor_readback;
     FixedDecodeUploadArena fixed_decode_upload;
     DecodeEnvelopeUploadArena decode_envelope_upload;
+    PipelineParamArena pipeline_params;
     std::vector<cudaEvent_t> available_publish_events;
     // W6: per-wave launch events (source_ready, phase_done, signature_*)
     // are acquired here and returned at StagedLaunch teardown — event
@@ -1505,6 +1616,13 @@ struct StagedLaunch::State {
     std::size_t decode_envelope_lane_count = 0;
     std::uint32_t decode_envelope_template_pages = 0;
     std::uint32_t* device_layer = nullptr;
+    // Ring slot in `Impl::pipeline_params` holding this wave's pipeline
+    // kernel parameters (tickets, commit/settle/publish tables). −1 when
+    // the wave fell back to the legacy per-launch upload path.
+    int param_slot = -1;
+    bool param_slot_released = false;
+    // `device_tickets` points into the param slot (do NOT cudaFree it).
+    bool tickets_in_arena = false;
     cudaEvent_t source_ready = nullptr;
     cudaEvent_t phase_done[2] = {nullptr, nullptr};
     cudaEvent_t signature_ready = nullptr;
@@ -1531,12 +1649,24 @@ StagedLaunch::~StagedLaunch() {
     // stream-ordered frees and pool returns instead of the old plain
     // cudaFree (potentially device-synchronizing) + event destroys.
     if (state_->device_tickets != nullptr) {
-        if (state_->stream != nullptr) {
+        if (state_->tickets_in_arena) {
+            // Arena-backed: memory belongs to the param slot below.
+        } else if (state_->stream != nullptr) {
             cudaFreeAsync(state_->device_tickets, state_->stream);
         } else {
             cudaFree(state_->device_tickets);
         }
         state_->device_tickets = nullptr;
+    }
+    if (state_->param_slot >= 0 && !state_->param_slot_released &&
+        state_->owner != nullptr) {
+        // Failure/abort path only (settlement records the reuse event on
+        // the happy path). Drain the stream so the slot is provably idle.
+        if (state_->stream != nullptr) {
+            cudaStreamSynchronize(state_->stream);
+        }
+        state_->owner->pipeline_params.release_synced(state_->param_slot);
+        state_->param_slot_released = true;
     }
     if (state_->device_layer != nullptr) {
         if (state_->stream != nullptr) {
@@ -1997,7 +2127,9 @@ HostPublishTransport select_host_publish_transport(
 void enqueue_host_publish_copies(
     NotifyContext& context,
     cudaStream_t stream,
-    HostPublishTransport transport) {
+    HostPublishTransport transport,
+    PipelineParamArena* param_arena = nullptr,
+    int param_slot = -1) {
     if (context.copy_destinations.empty()) return;
     if (transport == HostPublishTransport::Scatter) {
         context.publish_copies.clear();
@@ -2011,8 +2143,24 @@ void enqueue_host_publish_copies(
                     static_cast<std::uint32_t>(context.copy_sizes[index]),
             });
         }
-        launch_scatter_host_publish_copies(
-            context.publish_copies.values(), stream);
+        const auto copies = context.publish_copies.values();
+        const HostPublishCopy* device =
+            param_arena == nullptr || param_slot < 0
+                ? nullptr
+                : static_cast<const HostPublishCopy*>(
+                      param_arena->stage(
+                          param_slot,
+                          copies.data(),
+                          copies.size() * sizeof(HostPublishCopy)));
+        if (device != nullptr) {
+            param_arena->flush(param_slot, stream);
+            launch_scatter_host_publish_copies_prestaged(
+                device,
+                static_cast<std::uint32_t>(copies.size()),
+                stream);
+        } else {
+            launch_scatter_host_publish_copies(copies, stream);
+        }
         return;
     }
 #if CUDART_VERSION >= 12080
@@ -4765,10 +4913,50 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
                 stream, lane->bound->publish_done, 0));
         }
     }
-    state.device_tickets = launch_pull_validate_host_channels_batch(
-        state.ticket_staging,
-        state.pull_staging,
-        stream);
+    state.param_slot = impl_->pipeline_params.claim();
+    {
+        auto& arena = impl_->pipeline_params;
+        DeviceHostChannelTicket* device_tickets = nullptr;
+        PullValidateHostChannelLane* device_lanes = nullptr;
+        bool staged = state.pull_staging.empty();
+        if (!staged) {
+            device_tickets = static_cast<DeviceHostChannelTicket*>(
+                state.ticket_staging.empty()
+                    ? nullptr
+                    : arena.stage(
+                          state.param_slot,
+                          state.ticket_staging.data(),
+                          state.ticket_staging.size() *
+                              sizeof(DeviceHostChannelTicket)));
+            device_lanes = static_cast<PullValidateHostChannelLane*>(
+                arena.stage(
+                    state.param_slot,
+                    state.pull_staging.data(),
+                    state.pull_staging.size() *
+                        sizeof(PullValidateHostChannelLane)));
+            staged = device_lanes != nullptr &&
+                (state.ticket_staging.empty() || device_tickets != nullptr);
+        }
+        if (staged) {
+            arena.flush(state.param_slot, stream);
+            if (!state.pull_staging.empty()) {
+                launch_pull_validate_host_channels_batch_prestaged(
+                    device_tickets,
+                    device_lanes,
+                    static_cast<std::uint32_t>(state.pull_staging.size()),
+                    stream);
+            }
+            state.device_tickets = device_tickets;
+            state.tickets_in_arena = device_tickets != nullptr;
+        } else {
+            // Oversized wave: legacy per-launch upload path.
+            state.device_tickets = launch_pull_validate_host_channels_batch(
+                state.ticket_staging,
+                state.pull_staging,
+                stream);
+            state.tickets_in_arena = false;
+        }
+    }
     for (const auto& lane : state.lanes) {
         if (lane->snapshot != nullptr) lane->snapshot->ever_validated = true;
     }
@@ -5152,7 +5340,25 @@ bool Dispatch::finish(
             .commit = lane.snapshot->device,
         });
     }
-    launch_commit_bump_batch(notify->commit_lanes.values(), stream);
+    {
+        const auto commit_lanes = notify->commit_lanes.values();
+        const CommitBumpLane* device = commit_lanes.empty() || state.param_slot < 0
+            ? nullptr
+            : static_cast<const CommitBumpLane*>(
+                  impl_->pipeline_params.stage(
+                      state.param_slot,
+                      commit_lanes.data(),
+                      commit_lanes.size() * sizeof(CommitBumpLane)));
+        if (device != nullptr) {
+            impl_->pipeline_params.flush(state.param_slot, stream);
+            launch_commit_bump_batch_prestaged(
+                device,
+                static_cast<std::uint32_t>(commit_lanes.size()),
+                stream);
+        } else {
+            launch_commit_bump_batch(commit_lanes, stream);
+        }
+    }
     notify->settlement_lanes.reserve(program_count);
     for (auto& lane_ptr : state.lanes) {
         StagedLane& lane = *lane_ptr;
@@ -5275,16 +5481,48 @@ bool Dispatch::finish(
             0));
     }
     enqueue_host_publish_copies(
-        *notify, settlement_stream, publish_transport);
-    launch_settle_host_channels_batch(
-        notify->settlement_lanes.values(), settlement_stream);
+        *notify, settlement_stream, publish_transport,
+        state.param_slot >= 0 ? &impl_->pipeline_params : nullptr,
+        state.param_slot);
+    {
+        const auto settle_lanes = notify->settlement_lanes.values();
+        const HostChannelSettlementLane* device =
+            settle_lanes.empty() || state.param_slot < 0
+                ? nullptr
+                : static_cast<const HostChannelSettlementLane*>(
+                      impl_->pipeline_params.stage(
+                          state.param_slot,
+                          settle_lanes.data(),
+                          settle_lanes.size() *
+                              sizeof(HostChannelSettlementLane)));
+        if (device != nullptr) {
+            impl_->pipeline_params.flush(state.param_slot, settlement_stream);
+            launch_settle_host_channels_batch_prestaged(
+                device,
+                static_cast<std::uint32_t>(settle_lanes.size()),
+                settlement_stream);
+        } else {
+            launch_settle_host_channels_batch(
+                settle_lanes, settlement_stream);
+        }
+    }
     if (state.device_tickets != nullptr) {
-        CUDA_CHECK(cudaFreeAsync(
-            state.device_tickets, settlement_stream));
+        if (!state.tickets_in_arena) {
+            CUDA_CHECK(cudaFreeAsync(
+                state.device_tickets, settlement_stream));
+        }
         state.device_tickets = nullptr;
         for (auto& lane : state.lanes) {
             lane->device_tickets = nullptr;
         }
+    }
+    // The settle kernel is the wave's LAST consumer of the param slot
+    // (tickets included — their stream-ordered free above made the same
+    // lifetime claim); reuse is safe behind it.
+    if (state.param_slot >= 0 && !state.param_slot_released) {
+        impl_->pipeline_params.release_after(
+            state.param_slot, settlement_stream);
+        state.param_slot_released = true;
     }
     if (batch_copies) {
         CUDA_CHECK(cudaEventRecord(

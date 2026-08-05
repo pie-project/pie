@@ -323,16 +323,30 @@ async fn acquire_grant<C: FireContext>(
         return Err("pipeline: KV residency planner is not installed".to_string());
     };
     let pid = ctx.process_id();
-    loop {
+    let acq_started_us = crate::scheduler::fire_timing_now_us();
+    let outcome = loop {
         match planner
             .acquire(pid, pipeline_id, demand)
             .await
-            .map_err(|error| format!("pipeline: KV capacity: {error}"))?
+            .map_err(|error| format!("pipeline: KV capacity: {error}"))
         {
-            crate::planner::Acquired::Granted(grant) => return Ok(grant),
-            crate::planner::Acquired::Yield => settle_and_wait_resident(ctx).await?,
+            Ok(crate::planner::Acquired::Granted(grant)) => break Ok(grant),
+            Ok(crate::planner::Acquired::Yield) => {
+                if let Err(error) = settle_and_wait_resident(ctx).await {
+                    break Err(error);
+                }
+            }
+            Err(error) => break Err(error),
         }
+    };
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let acc = &crate::scheduler::GUEST_PHASES;
+        let acq = crate::scheduler::fire_timing_now_us().saturating_sub(acq_started_us) * 1_000;
+        acc.acq_ns.fetch_add(acq, Relaxed);
+        acc.acq_max_ns.fetch_max(acq, Relaxed);
     }
+    outcome
 }
 
 /// Back off for THIS process's eviction: settle its pipeline tails (the

@@ -439,6 +439,18 @@ pub(crate) struct GuestPhaseAcc {
     pub park_max_ns: AtomicU64,
     /// Head-harmless free-list bypass grants (`PIE_ALLOC_FAST_SMALL=1`).
     pub fast_small_n: AtomicU64,
+    /// Whole `acquire_grant` span on the submit path (park wait included) —
+    /// splits `fsub` into acquire vs build/post so a slow wave can say
+    /// whether the seal waited on the planner or on frame assembly.
+    pub acq_ns: AtomicU64,
+    pub acq_max_ns: AtomicU64,
+    /// Ask-to-park limbo: planner slow-path entry to the wait-set leave
+    /// being posted. The gate cannot seal past a lane in this span — it has
+    /// neither submitted nor parked — so this is the bound on how long a
+    /// boundary-crossing lane can hold the wave for purely host-side
+    /// reasons (store-lock reads, planner lock, queue insert).
+    pub limbo_ns: AtomicU64,
+    pub limbo_max_ns: AtomicU64,
 }
 
 /// Per-lane run-ahead probe: at every seal, how deep each awaited lane's
@@ -589,6 +601,10 @@ pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
     park_ns: AtomicU64::new(0),
     park_max_ns: AtomicU64::new(0),
     fast_small_n: AtomicU64::new(0),
+    acq_ns: AtomicU64::new(0),
+    acq_max_ns: AtomicU64::new(0),
+    limbo_ns: AtomicU64::new(0),
+    limbo_max_ns: AtomicU64::new(0),
 };
 
 pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {
