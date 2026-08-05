@@ -19,13 +19,41 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct RmsParams {
-  float eps;
-  uint axis_size;   // feature dim (hidden), e.g. 1024
-  uint w_stride;    // weight stride along axis (1 for contiguous)
-  uint plus_one;    // 1 => effective gain is (1.0f + weight) [Gemma/qwen3.5]
-  float gain;       // constant multiplier on the weight; 1.0 unless stated
-};
+#include "rms_params.h"
+#include "rms_reduce.h"
+
+template <typename T, int N_READS>
+METAL_FUNC void rms_row_body(
+    const device T* x, const device T* w, device T* out,
+    constant RmsParams& p, size_t row_base,
+    threadgroup float* inv_rms, threadgroup float* partials,
+    uint lid, uint simd_lane, uint simd_group) {
+  const uint axis_size = p.axis_size;
+  const uint w_stride = p.w_stride;
+
+  x += row_base + lid * N_READS;
+  w += w_stride * lid * N_READS;
+  const float inv = rms_inv_from_lane_sum(
+      rms_lane_square_sum<T, N_READS>(x, axis_size, lid),
+      axis_size, p.eps, inv_rms, partials, simd_lane, simd_group);
+
+  out += row_base + lid * N_READS;
+  if (lid * N_READS + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
+      out[i] = wv * static_cast<T>(x[i] * inv);
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      if ((lid * N_READS + i) < axis_size) {
+        T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                      : float(w[w_stride * i])));
+        out[i] = wv * static_cast<T>(x[i] * inv);
+      }
+    }
+  }
+}
 
 template <typename T, int N_READS>
 [[kernel]] void rms_single_row(
@@ -35,64 +63,12 @@ template <typename T, int N_READS>
     constant RmsParams& p      [[buffer(3)]],
     uint gid                   [[threadgroup_position_in_grid]],
     uint lid                   [[thread_position_in_threadgroup]],
-    uint simd_lane_id          [[thread_index_in_simdgroup]],
-    uint simd_group_id         [[simdgroup_index_in_threadgroup]]) {
-  constexpr int SIMD_SIZE = 32;
-  const uint axis_size = p.axis_size;
-  const uint w_stride = p.w_stride;
-
-  threadgroup float local_inv_mean[1];
-  threadgroup float local_sums[SIMD_SIZE];
-
-  float acc = 0;
-  x += gid * size_t(axis_size) + lid * N_READS;
-  w += w_stride * lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      float xi = x[i];
-      acc += xi * xi;
-    }
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      if ((lid * N_READS + i) < axis_size) {
-        float xi = x[i];
-        acc += xi * xi;
-      }
-    }
-  }
-  acc = simd_sum(acc);
-  if (simd_group_id == 0) {
-    local_sums[simd_lane_id] = 0;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_lane_id == 0) {
-    local_sums[simd_group_id] = acc;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group_id == 0) {
-    acc = simd_sum(local_sums[simd_lane_id]);
-    if (simd_lane_id == 0) {
-      local_inv_mean[0] = precise::rsqrt(acc / axis_size + p.eps);
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  out += gid * size_t(axis_size) + lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
-                                    : float(w[w_stride * i])));
-      out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
-    }
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      if ((lid * N_READS + i) < axis_size) {
-        T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
-                                    : float(w[w_stride * i])));
-        out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
-      }
-    }
-  }
+    uint simd_lane             [[thread_index_in_simdgroup]],
+    uint simd_group            [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  rms_row_body<T, N_READS>(
+      x, w, out, p, size_t(gid) * p.axis_size,
+      inv_rms, partials, lid, simd_lane, simd_group);
 }
 
 // Prefill variant: the prompt's scratch rows are a uniform `row_pitch` elements
@@ -108,65 +84,12 @@ template <typename T, int N_READS>
     constant int& row_pitch    [[buffer(4)]],
     uint gid                   [[threadgroup_position_in_grid]],
     uint lid                   [[thread_position_in_threadgroup]],
-    uint simd_lane_id          [[thread_index_in_simdgroup]],
-    uint simd_group_id         [[simdgroup_index_in_threadgroup]]) {
-  constexpr int SIMD_SIZE = 32;
-  const uint axis_size = p.axis_size;
-  const uint w_stride = p.w_stride;
-  const size_t row_base = size_t(gid) * size_t(row_pitch);
-
-  threadgroup float local_inv_mean[1];
-  threadgroup float local_sums[SIMD_SIZE];
-
-  float acc = 0;
-  x += row_base + lid * N_READS;
-  w += w_stride * lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      float xi = x[i];
-      acc += xi * xi;
-    }
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      if ((lid * N_READS + i) < axis_size) {
-        float xi = x[i];
-        acc += xi * xi;
-      }
-    }
-  }
-  acc = simd_sum(acc);
-  if (simd_group_id == 0) {
-    local_sums[simd_lane_id] = 0;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_lane_id == 0) {
-    local_sums[simd_group_id] = acc;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group_id == 0) {
-    acc = simd_sum(local_sums[simd_lane_id]);
-    if (simd_lane_id == 0) {
-      local_inv_mean[0] = precise::rsqrt(acc / axis_size + p.eps);
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  out += row_base + lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
-                                    : float(w[w_stride * i])));
-      out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
-    }
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      if ((lid * N_READS + i) < axis_size) {
-        T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
-                                    : float(w[w_stride * i])));
-        out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
-      }
-    }
-  }
+    uint simd_lane             [[thread_index_in_simdgroup]],
+    uint simd_group            [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  rms_row_body<T, N_READS>(
+      x, w, out, p, size_t(gid) * size_t(row_pitch),
+      inv_rms, partials, lid, simd_lane, simd_group);
 }
 
 #define instantiate_rms_strided_row(name, itype, n_reads)              \
@@ -225,39 +148,13 @@ METAL_FUNC void rms_residual_impl(
   const uint axis_size = p.axis_size;
   const uint w_stride = p.w_stride;
 
-  float acc = 0;
   const size_t row = size_t(gid) * size_t(axis_size);
   x += row + lid * N_READS;
   w += w_stride * lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      float xi = x[i];
-      acc += xi * xi;
-    }
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      if ((lid * N_READS + i) < axis_size) {
-        float xi = x[i];
-        acc += xi * xi;
-      }
-    }
-  }
-  acc = simd_sum(acc);
-  if (simd_group_id == 0) {
-    local_sums[simd_lane_id] = 0;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_lane_id == 0) {
-    local_sums[simd_group_id] = acc;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group_id == 0) {
-    acc = simd_sum(local_sums[simd_lane_id]);
-    if (simd_lane_id == 0) {
-      local_inv_mean[0] = precise::rsqrt(acc / axis_size + p.eps);
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rms_inv_from_lane_sum(
+      rms_lane_square_sum<T, N_READS>(x, axis_size, lid),
+      axis_size, p.eps, local_inv_mean, local_sums,
+      simd_lane_id, simd_group_id);
 
   const float scale = SCALED ? float(s[0]) : 1.0f;
   r += row + lid * N_READS;
@@ -266,7 +163,7 @@ METAL_FUNC void rms_residual_impl(
     if (lid * N_READS + N_READS <= axis_size || (lid * N_READS + i) < axis_size) {
       const float wv = p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
                                          : float(w[w_stride * i]));
-      const float normed = wv * (float(x[i]) * local_inv_mean[0]);
+      const float normed = wv * (float(x[i]) * inv);
       out[i] = static_cast<T>((normed + float(r[i])) * scale);
     }
   }

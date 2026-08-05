@@ -349,10 +349,10 @@ int main() {
 
             // ── Two sequences, resident at once ──
             //
-            // gpt-oss has no M>1 path -- its MoE picks experts per ROW -- so a
-            // two-member fire is two passes rather than one wider one. Paging
-            // is what makes those passes safe to interleave: before it, the KV
-            // was one ring and the second sequence overwrote the first.
+            // gpt-oss now sorts the two members' routed rows into one wider
+            // expert-major pass. Paging is what makes their KV histories safe:
+            // before it, the cache was one ring and the second sequence
+            // overwrote the first.
             //
             // B's prompt is a PREFIX of A's, so a leak between them would give
             // one answer twice. A must still answer 40510 ("Tokyo") beside a

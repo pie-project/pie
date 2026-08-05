@@ -235,10 +235,7 @@ inline void launch_mla_naive_paged_raw(
     // block walks the same keys, so a bigger group means the latent KV is read
     // from L1 instead of L2/HBM — but the grid is (tokens x head-groups), so
     // shrinking it too far starves the SMs. Two waves is the target.
-    static const int kForcedGroup = [] {
-        const char* e = std::getenv("PIE_MLA_HEAD_GROUP");
-        return (e != nullptr && e[0] != '\0') ? std::atoi(e) : 0;
-    }();
+    constexpr int kForcedGroup = 0;
     const int kMlaWaveTarget = 296;
     int G = kMlaNaiveWarps;
     if (kForcedGroup > 0) {
@@ -693,10 +690,9 @@ inline std::size_t smem_bytes() {
 
 inline bool mla_mma_supported(int kv_lora_rank, int qk_rope_head_dim, int num_heads) {
     static const int forced = [] {
-        const char* e = std::getenv("PIE_MLA_KERNEL");
-        if (e == nullptr || e[0] == '\0') return 0;
-        if (std::strcmp(e, "scalar") == 0) return -1;
-        if (std::strcmp(e, "mma") == 0) return 1;
+        return 0;
+        if (false) return -1;
+        if (false) return 1;
         return 0;
     }();
     if (forced < 0) return false;

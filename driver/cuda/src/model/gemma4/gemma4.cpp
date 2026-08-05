@@ -41,26 +41,6 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-bool gemma4_forward_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_GEMMA4_FORWARD_PROFILE");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
-std::uint64_t gemma4_forward_profile_limit() {
-    static const std::uint64_t limit = []() -> std::uint64_t {
-        const char* v = std::getenv("PIE_GEMMA4_FORWARD_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return 64ull;
-        char* end = nullptr;
-        const unsigned long long parsed = std::strtoull(v, &end, 10);
-        if (end == v) return 64ull;
-        return static_cast<std::uint64_t>(parsed);
-    }();
-    return limit;
-}
 
 struct Gemma4ForwardProfile {
     bool enabled = false;
@@ -115,19 +95,7 @@ struct Gemma4ForwardProfile {
         return idx;
     }
 
-    void begin(cudaStream_t stream) {
-        static std::atomic<std::uint64_t> counter{0};
-        if (!gemma4_forward_profile_enabled()) return;
-        const std::uint64_t current =
-            counter.fetch_add(1, std::memory_order_relaxed);
-        const std::uint64_t limit = gemma4_forward_profile_limit();
-        if (limit != 0 && current >= limit) return;
-        enabled = true;
-        seq = current;
-        CUDA_CHECK(cudaEventCreate(&total_start));
-        CUDA_CHECK(cudaEventCreate(&total_stop));
-        CUDA_CHECK(cudaEventRecord(total_start, stream));
-    }
+    void begin(cudaStream_t) {}
 
     void end(cudaStream_t stream) {
         if (!enabled || ended) return;
@@ -236,52 +204,14 @@ float read_bf16_scalar_once(const DeviceTensor& t) {
 // other binders.
 constexpr const char* kPrefix = "model.language_model.";
 
-bool gemma4_row_decode_verify_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
-int gemma4_row_decode_qmax() {
-    static const int qmax = [] {
-        const char* v = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE_QMAX");
-        // Gemma4 native MTP uses three draft tokens in vLLM, so the
-        // verifier's common block is the sampled token plus three drafts.
-        // Keep that q_len=4 case on the decode-style verifier by default;
-        // the full causal verifier is substantially slower and follows a
-        // different multi-token numerical path anyway.
-        if (v == nullptr || v[0] == '\0') return 4;
-        return std::max(1, std::atoi(v));
-    }();
-    return qmax;
-}
-
-std::size_t gemma4_row_decode_max_page_refs() {
-    static const std::size_t cap = [] {
-        const char* v = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE_MAX_PAGE_REFS");
-        if (v == nullptr || v[0] == '\0') return static_cast<std::size_t>(1 << 20);
-        const long long parsed = std::atoll(v);
-        return parsed > 0 ? static_cast<std::size_t>(parsed) : static_cast<std::size_t>(0);
-    }();
-    return cap;
-}
-
-bool gemma4_dense_gate_up_batched_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_GEMMA4_DENSE_GATE_UP_BATCHED");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+// Gemma4 native MTP uses three draft tokens in vLLM, so the verifier's
+// common block is the sampled token plus three drafts. Keep that q_len=4 case
+// on the decode-style verifier; the full causal verifier is substantially
+// slower and follows a different multi-token numerical path anyway.
+constexpr int kGemma4RowDecodeQmax = 4;
+constexpr std::size_t kGemma4RowDecodeMaxPageRefs = std::size_t{1} << 20;
 
 bool gemma4_dense_gate_up_fused_enabled(const HfConfig& cfg) {
-    const char* v = std::getenv("PIE_GEMMA4_DENSE_GATE_UP_FUSED");
-    if (v != nullptr && v[0] != '\0') return v[0] != '0';
-
     return !cfg.gemma4_enable_moe &&
            cfg.hidden_size == 2560 &&
            cfg.intermediate_size == 10240 &&
@@ -292,36 +222,7 @@ bool gemma4_dense_gate_up_fused_enabled(const HfConfig& cfg) {
 }
 
 bool gemma4_dense_gate_up_fused_for_row_decode(const HfConfig& cfg) {
-    const char* v = std::getenv("PIE_GEMMA4_DENSE_GATE_UP_FUSED");
-    if (v != nullptr && v[0] != '\0') return v[0] != '0';
     return gemma4_dense_gate_up_fused_enabled(cfg);
-}
-
-bool gemma4_dense_qkv_fused_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_GEMMA4_DENSE_QKV_FUSED");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool gemma4_plan_debug_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_GEMMA4_PLAN_DEBUG");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
-int gemma4_plan_debug_limit() {
-    static const int limit = [] {
-        const char* v = std::getenv("PIE_GEMMA4_PLAN_DEBUG_LIMIT");
-        if (v == nullptr || v[0] == '\0') return 32;
-        return std::max(0, std::atoi(v));
-    }();
-    return limit;
 }
 
 bool prepare_row_decode_kv_table(
@@ -334,10 +235,7 @@ bool prepare_row_decode_kv_table(
     int R,
     int page_size)
 {
-    const bool debug = [] {
-        const char* dbg = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE_DEBUG");
-        return dbg != nullptr && dbg[0] != '\0' && dbg[0] != '0';
-    }();
+    constexpr bool debug = false;
     const auto fail = [&](const char* reason, int r = -1,
                           std::uint32_t q_len = 0,
                           std::uint32_t value0 = 0,
@@ -359,8 +257,7 @@ bool prepare_row_decode_kv_table(
         }
         return false;
     };
-    if (!gemma4_row_decode_verify_enabled() ||
-        qo_indptr_h == nullptr ||
+    if (qo_indptr_h == nullptr ||
         kv_page_indices_h == nullptr ||
         kv_page_indptr_h == nullptr ||
         kv_last_page_lens_h == nullptr ||
@@ -368,9 +265,8 @@ bool prepare_row_decode_kv_table(
         return fail("disabled-or-bad-input");
     }
 
-    const int qmax = gemma4_row_decode_qmax();
-    const std::size_t max_page_refs = gemma4_row_decode_max_page_refs();
-    if (max_page_refs == 0) return fail("zero-page-ref-cap");
+    const int qmax = kGemma4RowDecodeQmax;
+    const std::size_t max_page_refs = kGemma4RowDecodeMaxPageRefs;
     bool saw_multi = false;
     moe_ws.h_row_decode_kv_page_indices.clear();
     moe_ws.h_row_decode_kv_page_indptr.clear();
@@ -477,18 +373,6 @@ bool prepare_row_decode_kv_table(
         std::span<const std::uint32_t>(moe_ws.h_row_decode_kv_page_indptr));
     moe_ws.row_decode_kv_last_page_lens.copy_from_host(
         std::span<const std::uint32_t>(moe_ws.h_row_decode_kv_last_page_lens));
-    if (const char* dbg = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE_DEBUG");
-        dbg != nullptr && dbg[0] != '\0' && dbg[0] != '0') {
-        static std::atomic<int> count{0};
-        const int idx = count.fetch_add(1, std::memory_order_relaxed);
-        if (idx < 8) {
-            std::cerr << "[pie-driver-cuda] gemma4 row-decode verify"
-                      << " rows=" << N
-                      << " page_refs="
-                      << moe_ws.h_row_decode_kv_page_indices.size()
-                      << " qmax=" << qmax << "\n";
-        }
-    }
     return true;
 }
 
@@ -572,12 +456,7 @@ void prepare_gemma4_decode_plans(
     int R,
     bool is_pure_decode)
 {
-    static std::atomic<int> debug_count{0};
-    const bool debug = gemma4_plan_debug_enabled();
-    const int debug_idx = debug
-        ? debug_count.fetch_add(1, std::memory_order_relaxed)
-        : -1;
-    const bool log_debug = debug && debug_idx < gemma4_plan_debug_limit();
+    constexpr bool log_debug = false;
     moe_ws.decode_plans_prepared = false;
     moe_ws.row_decode_prepared = false;
     moe_ws.row_decode_prepared_tokens = 0;
@@ -710,7 +589,7 @@ void Gemma4MoeMlpWorkspace::allocate_row_decode(int max_tokens)
     // these at workspace lifetime so growing speculative verification prefixes
     // cannot invalidate a captured graph.
     const std::size_t N = static_cast<std::size_t>(max_tokens);
-    const std::size_t row_page_refs = gemma4_row_decode_max_page_refs();
+    const std::size_t row_page_refs = kGemma4RowDecodeMaxPageRefs;
     if (row_page_refs == 0) return;
     if (row_decode_kv_page_indices.size() < row_page_refs) {
         row_decode_kv_page_indices =
@@ -763,7 +642,7 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     Gemma4Weights w;
     const bool fuse_dense_gate_up = gemma4_dense_gate_up_fused_enabled(cfg);
     const bool fuse_dense_qkv =
-        !cfg.gemma4_enable_moe && gemma4_dense_qkv_fused_enabled();
+        !cfg.gemma4_enable_moe;
     const std::string p = kPrefix;
     w.embed           = &must(engine, p + "embed_tokens.weight");
     // PLE (Per-Layer Embeddings) machinery is optional — Gemma-4 E2B /
@@ -1601,24 +1480,15 @@ void gemma4_forward_paged(
     // for small batches than maintaining two cached plans.
 
     // ── 3. Layer loop ────────────────────────────────────────────────────
-    int debug_max_layers = L;
-    if (const char* lim = getenv("PIE_GEMMA4_MAX_LAYERS")) {
-        debug_max_layers = std::min(L, std::atoi(lim));
-    }
+    const int debug_max_layers = L;
     if (profile.enabled) {
         profile.layers = debug_max_layers;
     }
     bool attn_norm_precomputed = false;
     for (int l = 0; l < debug_max_layers; ++l) {
         const auto& layer = w.layers[l];
-        // Which layer the L0_* intra-layer dumps come from. Still layer 0 by
-        // default; `PIE_GEMMA4_DUMP_LAYER` retargets it, which is how a fault
-        // that only appears in gemma-4's full-attention layers can be seen.
-        static const int dump_layer = [] {
-            const char* v = std::getenv("PIE_GEMMA4_DUMP_LAYER");
-            return (v == nullptr || v[0] == '\0') ? 0 : std::atoi(v);
-        }();
-        const bool dump_this = (l == dump_layer);
+        // The L0_* intra-layer dumps come from layer 0.
+        const bool dump_this = (l == 0);
         // Pair the sync with the dump so a release run (no dump dir
         // env var) skips both — the standalone syncs that used to
         // precede each dump_l0 call were the dominant per-step
@@ -1688,12 +1558,10 @@ void gemma4_forward_paged(
         const float prf = w.per_layer_partial_rotary_factor[l];
         const int rotary_dim = static_cast<int>(prf * d);
         const bool partial = (prf < 1.0f) && (rotary_dim > 0);
-        const bool qk_norm_enabled = getenv("PIE_NO_QK_NORM") == nullptr;
         bool qkv_post_fused = false;
 
         const bool use_fused_qkv =
             !layer.is_shared &&
-            gemma4_dense_qkv_fused_enabled() &&
             layer.qkv_proj_fused != nullptr &&
             !ws.qkv_fused.empty();
         if (use_fused_qkv) {
@@ -1702,7 +1570,7 @@ void gemma4_forward_paged(
                 ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
             const bool can_fuse_packed_qkv_post =
                 hooks == nullptr &&
-                qk_norm_enabled && !partial && !dbg_dumps_enabled() &&
+                !partial && !dbg_dumps_enabled() &&
                 kv_view.is_native_bf16() &&
                 (use_row_decode_path || use_decode_path);
             if (can_fuse_packed_qkv_post) {
@@ -1761,7 +1629,7 @@ void gemma4_forward_paged(
                     static_cast<std::size_t>(N) * num_q_heads_local * d);
         }
 
-        const bool can_fuse_qk_norm_rope = qk_norm_enabled && !partial;
+        const bool can_fuse_qk_norm_rope = !partial;
         if (qkv_post_fused) {
             // Packed QKV post-processing already produced Q and wrote K/V.
         } else if (can_fuse_qk_norm_rope) {
@@ -1782,7 +1650,7 @@ void gemma4_forward_paged(
                 w.per_layer_rope_theta[l], eps, stream);
         } else {
             // Per-head Q/K RMSNorm (Gemma-4 always has it).
-            if (qk_norm_enabled) {
+            {
                 kernels::launch_rmsnorm_bf16(
                     ws.q.data(), layer.q_norm->data(), ws.q.data(),
                     N * num_q_heads_local, d, eps, stream);
@@ -1999,29 +1867,6 @@ void gemma4_forward_paged(
                 ws.gate_up_fused.data(), N, 2 * I, H);
             kernels::launch_chunked_geglu_tanh_bf16(
                 ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-        } else if (gemma4_dense_gate_up_batched_enabled() &&
-            moe_ws.a_gu_ptrs.size() >= 2 &&
-            moe_ws.b_gu_ptrs.size() >= 2 &&
-            moe_ws.c_gu_ptrs.size() >= 2) {
-            kernels::launch_build_dual_bf16_gemm_ptrs(
-                ws.norm_x.data(),
-                layer.gate_proj->data(),
-                layer.up_proj->data(),
-                ws.gate.data(),
-                ws.up.data(),
-                reinterpret_cast<const void**>(moe_ws.a_gu_ptrs.data()),
-                reinterpret_cast<const void**>(moe_ws.b_gu_ptrs.data()),
-                reinterpret_cast<void**>(moe_ws.c_gu_ptrs.data()),
-                stream);
-            ops::gemm_batched_act_x_wt_bf16(
-                cublas.handle(),
-                reinterpret_cast<const void* const*>(moe_ws.a_gu_ptrs.data()),
-                reinterpret_cast<const void* const*>(moe_ws.b_gu_ptrs.data()),
-                reinterpret_cast<void* const*>(moe_ws.c_gu_ptrs.data()),
-                N, I, H, /*batch_count=*/2);
-            kernels::launch_geglu_tanh_bf16(
-                ws.gate.data(), ws.up.data(), ws.gate.data(),
-                N * I, stream);
         } else {
             if (use_row_decode_path) {
                 ops::gemm_act_x_wt_bf16_cublas(cublas.handle(),
@@ -2114,9 +1959,9 @@ void gemma4_forward_paged(
         // → `ple_dim == 0`), which doesn't ship the per-layer triple at
         // all.
         const bool ple_active =
-            ple_dim > 0 && getenv("PIE_NO_PLE") == nullptr;
+            ple_dim > 0;
         const bool layer_scalar_active =
-            layer.layer_scalar && getenv("PIE_NO_LAYER_SCALAR") == nullptr &&
+            layer.layer_scalar &&
             std::abs(layer.layer_scalar_value - 1.f) > 1e-6f;
         const float layer_scalar =
             layer_scalar_active ? layer.layer_scalar_value : 1.f;

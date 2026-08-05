@@ -103,8 +103,7 @@ public:
         bind_sources(how);
         init_persistent_arena(plan, how);
         copy_engine_.set_stats(&stats);
-        const bool trace_executor =
-            loader_config::env_present("PIE_CUDA_TRACE_STORAGE_EXECUTOR");
+        constexpr bool trace_executor = false;
         if (trace_executor) {
             std::cerr << "[pie-driver-cuda] storage executor begin schedule="
                       << plan.schedule.len << " instrs=" << plan.instrs.len
@@ -261,9 +260,6 @@ private:
             persistent_arena_base_ = how.persistent_arena;
             persistent_arena_bytes_ = how.persistent_arena_bytes;
             external_arena_ = true;
-            return;
-        }
-        if (loader_config::env_truthy("PIE_CUDA_DISABLE_WEIGHT_ARENA")) {
             return;
         }
         if (plan.memory.persistent_bytes == 0) {

@@ -74,19 +74,7 @@ RunnerState& state() {
     return states[device];
 }
 
-bool log_enabled() {
-    return env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_MOE_LOG"));
-}
-
-bool use_first_tactic_selection() {
-    const char* v = std::getenv("PIE_NEMOTRON_FLASHINFER_MOE_SELECT");
-    return v != nullptr && std::strcmp(v, "first") == 0;
-}
-
-bool use_raw_tactic_selection() {
-    const char* v = std::getenv("PIE_NEMOTRON_FLASHINFER_MOE_SELECT");
-    return v != nullptr && std::strcmp(v, "raw") == 0;
-}
+constexpr bool log_enabled() { return false; }
 
 std::optional<ce::CutlassGemmConfig> select_first_profile(
     const std::vector<ce::CutlassGemmConfig>& configs,
@@ -175,27 +163,6 @@ const char* fusion_name(ce::CutlassGemmConfig::EpilogueFusionType fusion) {
     return "unknown";
 }
 
-int env_index(const char* name) {
-    const char* v = std::getenv(name);
-    if (v == nullptr || v[0] == '\0') return 0;
-    return std::max(0, std::atoi(v));
-}
-
-std::optional<ce::CutlassGemmConfig::EpilogueFusionType> requested_gemm2_fusion() {
-    const char* v = std::getenv("PIE_NEMOTRON_FLASHINFER_MOE_GEMM2");
-    if (v == nullptr || v[0] == '\0' || std::strcmp(v, "auto") == 0) {
-        return std::nullopt;
-    }
-    if (std::strcmp(v, "none") == 0) {
-        return ce::CutlassGemmConfig::EpilogueFusionType::NONE;
-    }
-    if (std::strcmp(v, "finalize") == 0) {
-        return ce::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
-    }
-    throw std::runtime_error(
-        "PIE_NEMOTRON_FLASHINFER_MOE_GEMM2 must be auto, none, or finalize");
-}
-
 // The tile/cluster enums encode their shape as base-1000 digits, so they are
 // unreadable as raw integers. `Undefined`(0) and `ChooseWithHeuristic`(1) are
 // not shapes and are reported as-is.
@@ -254,65 +221,43 @@ Runner& get_runner() {
             TacticPair defaults{};
             std::optional<ce::CutlassGemmConfig> best_gemm1;
             std::optional<ce::CutlassGemmConfig> best_gemm2;
-            if (use_raw_tactic_selection()) {
-                best_gemm1 = select_raw_profile(
-                    gemm1,
-                    env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM1_INDEX"),
-                    "GEMM1", &defaults.gemm1);
-                best_gemm2 = select_raw_profile(
-                    gemm2,
-                    env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM2_INDEX"),
-                    "GEMM2", &defaults.gemm2);
-            } else if (use_first_tactic_selection()) {
-                best_gemm1 = select_first_profile(gemm1, "GEMM1", &defaults.gemm1);
-                best_gemm2 = select_first_profile(gemm2, "GEMM2", &defaults.gemm2);
-            } else {
-                // Default: first tactic the runner reports as occupancy-viable,
-                // with the plain (NONE) epilogue on GEMM2.
-                //
-                // The alternative, FINALIZE, folds the topk-weighted reduction
-                // and the unpermute into the GEMM epilogue, and in isolation it
-                // is faster: 147.0 us against 174.6 us at GLM's shapes (M=128,
-                // H=6144, I=2048, E=8, topk=8). It is not the default anyway,
-                // because of how it performs that reduction. Each expert's
-                // contribution to a token is committed with
-                // `red.global.add.noftz.bf16x2` -- a hardware reduction-add
-                // straight to global memory, in bf16 (see
-                // cutlass_extensions/arch/copy_red_global.hpp). So the topk sum
-                //
-                //   * accumulates in bf16, rounding after each of the topk
-                //     terms, where the unfused path accumulates in fp32, and
-                //   * adds them in whatever order the CTAs finish in, which is
-                //     not the same order twice.
-                //
-                // The second point makes the whole engine irreproducible: the
-                // same prompt decodes to different tokens on different runs
-                // whenever two logits land within the resulting ~1 ulp. That
-                // was worth paying for a 16% cut of GEMM2 if it showed up end
-                // to end -- it does not. Median of 5 runs on glm5.2-mini, 256
-                // output tokens: 3518.8 vs 3515.8 tok/s at c=8 and 36824.6 vs
-                // 36931.3 at c=128, i.e. a tie at both ends, because GEMM2 is a
-                // small enough slice of the step that 27 us/layer disappears
-                // into it. Determinism and an fp32 reduction for nothing.
-                //
-                // `PIE_NEMOTRON_FLASHINFER_MOE_GEMM2=finalize` opts back in.
-                best_gemm1 = first_supported(
-                    *runner, gemm1, std::nullopt,
-                    env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM1_INDEX"),
-                    "GEMM1", &defaults.gemm1);
-                const auto gemm2_fusion = requested_gemm2_fusion();
-                const int gemm2_index =
-                    env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM2_INDEX");
+            // Default: first tactic the runner reports as occupancy-viable,
+            // with the plain (NONE) epilogue on GEMM2.
+            //
+            // The alternative, FINALIZE, folds the topk-weighted reduction
+            // and the unpermute into the GEMM epilogue, and in isolation it
+            // is faster: 147.0 us against 174.6 us at GLM's shapes (M=128,
+            // H=6144, I=2048, E=8, topk=8). It is not the default anyway,
+            // because of how it performs that reduction. Each expert's
+            // contribution to a token is committed with
+            // `red.global.add.noftz.bf16x2` -- a hardware reduction-add
+            // straight to global memory, in bf16 (see
+            // cutlass_extensions/arch/copy_red_global.hpp). So the topk sum
+            //
+            //   * accumulates in bf16, rounding after each of the topk
+            //     terms, where the unfused path accumulates in fp32, and
+            //   * adds them in whatever order the CTAs finish in, which is
+            //     not the same order twice.
+            //
+            // The second point makes the whole engine irreproducible: the
+            // same prompt decodes to different tokens on different runs
+            // whenever two logits land within the resulting ~1 ulp. That
+            // was worth paying for a 16% cut of GEMM2 if it showed up end
+            // to end -- it does not. Median of 5 runs on glm5.2-mini, 256
+            // output tokens: 3518.8 vs 3515.8 tok/s at c=8 and 36824.6 vs
+            // 36931.3 at c=128, i.e. a tie at both ends, because GEMM2 is a
+            // small enough slice of the step that 27 us/layer disappears
+            // into it. Determinism and an fp32 reduction for nothing.
+            //
+            best_gemm1 = first_supported(
+                *runner, gemm1, std::nullopt, 0, "GEMM1", &defaults.gemm1);
+            best_gemm2 = first_supported(
+                *runner, gemm2,
+                ce::CutlassGemmConfig::EpilogueFusionType::NONE,
+                0, "GEMM2", &defaults.gemm2);
+            if (!best_gemm2) {
                 best_gemm2 = first_supported(
-                    *runner, gemm2,
-                    gemm2_fusion.value_or(
-                        ce::CutlassGemmConfig::EpilogueFusionType::NONE),
-                    gemm2_index, "GEMM2", &defaults.gemm2);
-                if (!best_gemm2 && !gemm2_fusion) {
-                    best_gemm2 = first_supported(
-                        *runner, gemm2, std::nullopt, gemm2_index, "GEMM2",
-                        &defaults.gemm2);
-                }
+                    *runner, gemm2, std::nullopt, 0, "GEMM2", &defaults.gemm2);
             }
             if (!best_gemm1 || !best_gemm2) {
                 throw std::runtime_error(
@@ -417,15 +362,6 @@ void run_moe(Runner& runner, const MoeProblem& p, const MoeBuffers& b,
         b.unpermuted_row_to_permuted_row,
         parallelism_config(p.tp_size, p.tp_rank), false, false, lora_params,
         false, false, false, min_latency_params, false, stream);
-}
-
-bool autotune_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("PIE_MOE_AUTOTUNE");
-        if (v == nullptr || v[0] == '\0') return true;
-        return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N');
-    }();
-    return on;
 }
 
 // A candidate must be at least this much faster than the incumbent to
@@ -705,7 +641,6 @@ TuningCache& tactic_cache(const RunnerState& s) {
 // problem, then installs it on the runner.
 void install_tactics(RunnerState& s, Runner& runner, const MoeProblem& p,
                      const MoeBuffers& b, std::size_t workspace_bytes) {
-    if (!autotune_enabled()) return;
     const std::uint64_t key = tactic_key(p);
     std::lock_guard<std::mutex> lock(s.tune_mutex);
     TuningCache& disk = tactic_cache(s);
@@ -727,48 +662,13 @@ void install_tactics(RunnerState& s, Runner& runner, const MoeProblem& p,
 
 }  // namespace
 
-bool flashinfer_cutlass_moe_enabled() {
-    // Two consumers, each with its own switch: nemotron_h (Relu2) and the
-    // qwen3_5 MoE decode (Swiglu). Either one turns the runner on.
-    static const bool enabled = [] {
-        if (env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_MOE"))) return true;
-        const char* q = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
-        return q == nullptr || q[0] == '\0' || q[0] != '0';
-    }();
-    return enabled;
-}
+bool flashinfer_cutlass_moe_enabled() { return true; }
 
-int flashinfer_cutlass_moe_max_rows() {
-    static const int rows = [] {
-        constexpr int kDefault = 1024;
-        const char* v = std::getenv("PIE_MOE_FUSED_MAX_ROWS");
-        if (v == nullptr || v[0] == '\0') return kDefault;
-        const long parsed = std::strtol(v, nullptr, 10);
-        if (parsed <= 0) return kDefault;
-        return static_cast<int>(std::min<long>(parsed, 1 << 20));
-    }();
-    return rows;
-}
+int flashinfer_cutlass_moe_max_rows() { return 1024; }
 
-int flashinfer_cutlass_moe_min_rows() {
-    static const int rows = [] {
-        const char* v = std::getenv("PIE_MOE_FUSED_MIN_ROWS");
-        if (v == nullptr || v[0] == '\0') return 0;
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<int>(parsed) : 0;
-    }();
-    return rows;
-}
+int flashinfer_cutlass_moe_min_rows() { return 0; }
 
-int moe_gemv_max_tokens(int fallback) {
-    static const long override_value = [] {
-        const char* v = std::getenv("PIE_MOE_GEMV_MAX_TOKENS");
-        if (v == nullptr || v[0] == '\0') return -1L;
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed >= 0 ? parsed : -1L;
-    }();
-    return override_value >= 0 ? static_cast<int>(override_value) : fallback;
-}
+int moe_gemv_max_tokens(int fallback) { return fallback; }
 
 std::size_t flashinfer_cutlass_moe_workspace_bytes(
     MoeActivation activation,

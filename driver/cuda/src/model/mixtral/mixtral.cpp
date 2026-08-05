@@ -264,11 +264,7 @@ void mixtral_forward_paged(
         !w.layers[0].expert_gate_up_packed_ptrs.empty() &&
         H % 32 == 0 && I % 32 == 0;
     if (mxfp4_decode_gemv_available && w.mxfp4_decode_max_routes == 0) {
-        int cap = 32 * num_experts;
-        if (const char* ov = std::getenv("PIE_MXFP4_DECODE_ROUTES")) {
-            cap = std::atoi(ov);
-        }
-        w.mxfp4_decode_max_routes = std::max(0, cap);
+        w.mxfp4_decode_max_routes = 32 * num_experts;
     }
     const bool use_mxfp4_decode_gemv =
         mxfp4_decode_gemv_available &&

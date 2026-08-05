@@ -51,9 +51,7 @@ template <typename T>
 [[kernel]] void attn_gate(
     device T* attn         [[buffer(0)]],  // [n_q*head_dim] in-place
     const device T* gate   [[buffer(1)]],  // [n_q*head_dim]
-    const constant int& width [[buffer(2)]],
     uint tid [[thread_position_in_grid]]) {
-  (void)width;
   attn[tid] = attn[tid] * sigmoid_mlx(gate[tid]);
 }
 
@@ -66,7 +64,7 @@ template <typename T>
 #define instantiate_attn_gate(name, itype)                        \
   template [[host_name("attn_gate_" #name)]]                      \
   [[kernel]] void attn_gate<itype>(                               \
-      device itype*, const device itype*, const constant int&, uint);
+      device itype*, const device itype*, uint);
 
 instantiate_q_gate_split(bfloat16, bfloat)
 

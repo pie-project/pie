@@ -23,42 +23,42 @@ impl std::fmt::Debug for Decoder {
 
 impl pie::inferlet::chat::Host for ProcessCtx {
     async fn system(&mut self, message: String) -> Result<Vec<u32>> {
-        Ok(pie_model::model().instruct().system(&message))
+        Ok(crate::model::model().instruct().system(&message))
     }
 
     async fn user(&mut self, message: String) -> Result<Vec<u32>> {
-        Ok(pie_model::model().instruct().user(&message))
+        Ok(crate::model::model().instruct().user(&message))
     }
 
     async fn first_user(&mut self, message: String) -> Result<Vec<u32>> {
-        Ok(pie_model::model().instruct().first_user(&message))
+        Ok(crate::model::model().instruct().first_user(&message))
     }
 
     async fn system_user(&mut self, system: String, user: String) -> Result<Vec<u32>> {
-        Ok(pie_model::model().instruct().system_user(&system, &user))
+        Ok(crate::model::model().instruct().system_user(&system, &user))
     }
 
     async fn assistant(&mut self, message: String) -> Result<Vec<u32>> {
-        Ok(pie_model::model().instruct().assistant(&message))
+        Ok(crate::model::model().instruct().assistant(&message))
     }
 
     async fn cue(&mut self) -> Result<Vec<u32>> {
-        Ok(pie_model::model().instruct().cue())
+        Ok(crate::model::model().instruct().cue())
     }
 
     async fn seal(&mut self) -> Result<Vec<u32>> {
-        Ok(pie_model::model().instruct().seal())
+        Ok(crate::model::model().instruct().seal())
     }
 
     async fn stop_tokens(&mut self) -> Result<Vec<u32>> {
-        Ok(pie_model::model().instruct().seal())
+        Ok(crate::model::model().instruct().seal())
     }
 
 }
 
 impl pie::inferlet::chat::HostDecoder for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<Decoder>> {
-        let inner = pie_model::model().instruct().chat_decoder();
+        let inner = crate::model::model().instruct().chat_decoder();
         let decoder = Decoder { inner };
         Ok(self.ctx().table.push(decoder)?)
     }

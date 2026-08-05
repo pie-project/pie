@@ -1,31 +1,42 @@
-# The HF config normalizer as a golden oracle
+# The HF config normalizer as a golden oracle *(oracle retired 2026-08-04)*
 
 `pie.model/1` moves HuggingFace `config.json` normalization from serve time to
-import time, and from C++ to Rust. `driver/cuda/src/model/config.cpp` is what
-that Rust has to agree with: ~850 lines, 25 `model_type` conditionals, 134
-output fields, and — as its own comment admits — a pile of rules that exist
+import time, and from C++ to Rust. `driver/cuda/src/model/config.cpp` was what
+that Rust had to agree with: 855 lines, 25 `model_type` conditionals, 219
+output fields, and — as its own comment admitted — a pile of rules that existed
 only because "until we add per-arch metadata, derive it here."
 
 Two implementations of the same normalization, in two languages, that must
 agree by coincidence is exactly the skew the artifact exists to kill. So the
-port is checked against the original **field for field on real configs**,
-rather than against someone's reading of the source.
+port was checked against the original **field for field on real configs**,
+rather than against someone's reading of the source — and then the original
+was deleted.
 
-## Why this can exist at all
+## What is left, now that the oracle is gone
 
-`config.cpp` includes only nlohmann/json, `hf_config_json.hpp` and
-`kernels_manifest.hpp`, and the last is deliberately CUDA-free ("so plain .cpp
-translation units can include it"). So the normalizer builds with a host
-compiler in about a second, with no toolkit, no CMake and no GPU:
+`config.cpp` is deleted, so nothing here can run `parse_hf_config` any more.
+**`golden/` is the oracle now**: 56 files, checked in, recording exactly what
+that function produced for every corpus input. Two things still read them and
+both still pass —
+
+* `check_descriptor.sh`, the round trip below;
+* `model/config/tests/differential.rs`, which re-normalizes the same
+  inputs in Rust and compares.
+
+Neither needs the C++ normalizer to exist, which is what made deleting it
+safe. To run the original again, check out a commit before the harvest.
+
+What builds today is the *read* side — `descriptor.cpp`, generated from
+`model/config.hpp`, which is still the schema both languages derive from:
 
 ```
-./build.sh                      # -> ./dump_hf_config
-./dump_hf_config some/config.json
+./build.sh --descriptor         # -> ./dump_from_descriptor
+./dump_from_descriptor some/pie.model.json
 ```
 
-`dump_hf_config` prints every `HfConfig` field as JSON, or `{"error": ...}` and
-exit 1 when the parser refuses — a refusal is part of the behavior being
-compared, not a crash.
+It prints every `HfConfig` field as JSON, or `{"error": ...}` and exit 1 when
+the reader refuses — a refusal is part of the behavior being compared, not a
+crash. `./build.sh` without `--descriptor` refuses and says why.
 
 ## The pieces
 
@@ -73,19 +84,21 @@ sliding pattern, gemma3's `sliding_window_pattern`, `glm_moe_dsa`'s
 scaling kinds plus the YaRN mscale derivation, and each defaulting rule in
 isolation. None of those had a fixture anywhere in the repo before.
 
-## The round trip: what says `parse_hf_config` can be deleted
+## The round trip: what said `parse_hf_config` could be deleted
 
 `check_descriptor.sh` runs both halves of the replacement against the thing being
 replaced:
 
 ```
-config.json --[C++ parse_hf_config]--------------------------> golden
+config.json --[C++ parse_hf_config]--------------------------> golden (recorded)
 config.json --[Rust normalize]--> pie.model/1 --[C++ read]---> must equal it
 ```
 
-55 matched, 0 differed. The reader (`src/model/descriptor.cpp`) is generated from the
-same header as the oracle, so a field can only go missing from both at once — and
-`generate.py` refuses to run when a declaration goes uncaptured.
+56 matched, 0 differed — before the deletion against a live oracle, and after it
+against the recording, which is the same comparison because the top line was
+never re-run per invocation. The reader (`src/model/descriptor.cpp`) is generated
+from the same header the oracle was, so a field can only go missing from both at
+once — and `generate.py` refuses to run when a declaration goes uncaptured.
 
 The check has been shown to fail for the right reasons: making the reader take
 `num_key_value_heads` from `num_attention_heads` reports exactly that field on exactly

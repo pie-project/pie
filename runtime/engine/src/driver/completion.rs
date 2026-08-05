@@ -661,14 +661,7 @@ impl WorkItemCompletionState {
         // finalize" (found via the Rainer eviction drain, but reachable by
         // any await that straddles the driver-notify → worker-retire gap).
         let outcome = WakerTable::global().wake(self.slot);
-        if crate::scheduler::fire_timing_enabled() {
-            use std::sync::atomic::Ordering::Relaxed;
-            let acc = &crate::scheduler::GUEST_PHASES;
-            match outcome {
-                pie_waker::WakeOutcome::Woken => acc.wake_woken.fetch_add(1, Relaxed),
-                _ => acc.wake_empty.fetch_add(1, Relaxed),
-            };
-        }
+        let _ = outcome;
     }
 
     fn resolve_failure(&self, message: impl Into<String>) {

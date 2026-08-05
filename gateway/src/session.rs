@@ -376,7 +376,7 @@ impl Sessions {
             session,
             tenant: ident.tenant,
             affinity_key,
-            current: Mutex::new(Some(req_id)),
+            current: Mutex::new(vec![req_id]),
         };
         Ok((handle, rx))
     }
@@ -488,7 +488,13 @@ pub struct SessionHandle {
     /// The session's §7 affinity key, reused for every turn (a multi-turn session
     /// sticks to its warm-KV worker; `None` for a one-shot).
     affinity_key: Option<u64>,
-    current: Mutex<Option<ReqId>>,
+    /// EVERY turn this session has opened and not yet cancelled. A WS client
+    /// may run several turns at once (one per launched process), so a single
+    /// slot here silently forgot all but the newest — `cancel`/`close` then
+    /// left the older turns running on the worker with nobody to stream them.
+    /// Ids of turns that finished on their own stay until the session ends;
+    /// `abort_turn` is a no-op for them, which is what makes that safe.
+    current: Mutex<Vec<ReqId>>,
 }
 
 impl SessionHandle {
@@ -500,19 +506,19 @@ impl SessionHandle {
             .inner
             .run_turn(self.session, &self.tenant, next, self.affinity_key)
             .await?;
-        *self.current.lock().unwrap() = Some(req_id);
+        self.current.lock().unwrap().push(req_id);
         Ok(rx)
     }
 
-    /// Cancel the current in-flight turn (immediate abort on the worker; the
-    /// turn's `TokenRx` aborts). The session stays open — a WS client may submit
-    /// another [`turn`](SessionHandle::turn).
+    /// Cancel EVERY in-flight turn on this session (immediate abort on the
+    /// worker; each turn's `TokenRx` aborts). The session stays open — a WS
+    /// client may submit another [`turn`](SessionHandle::turn).
     pub async fn cancel(&self) {
-        let req_id = self.current.lock().unwrap().take();
-        if let Some(req_id) = req_id
-            && let Some(worker) = self.inner.abort_turn(req_id)
-        {
-            self.inner.router.cancel(worker, req_id).await;
+        let req_ids = std::mem::take(&mut *self.current.lock().unwrap());
+        for req_id in req_ids {
+            if let Some(worker) = self.inner.abort_turn(req_id) {
+                self.inner.router.cancel(worker, req_id).await;
+            }
         }
     }
 
@@ -531,12 +537,12 @@ impl SessionHandle {
 impl Drop for SessionHandle {
     fn drop(&mut self) {
         self.inner.live.fetch_sub(1, Ordering::Relaxed);
-        let req_id = self.current.lock().unwrap().take();
-        if let Some(req_id) = req_id
-            && let Some(worker) = self.inner.abort_turn(req_id)
-        {
-            let router = self.inner.router.clone();
-            tokio::spawn(async move { router.cancel(worker, req_id).await });
+        let req_ids = std::mem::take(&mut *self.current.lock().unwrap());
+        for req_id in req_ids {
+            if let Some(worker) = self.inner.abort_turn(req_id) {
+                let router = self.inner.router.clone();
+                tokio::spawn(async move { router.cancel(worker, req_id).await });
+            }
         }
     }
 }

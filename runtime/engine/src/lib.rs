@@ -3,6 +3,13 @@
 pub mod bootstrap;
 pub mod driver;
 pub mod inferlet;
+/// The served model: the global cache the runtime binds once at bootstrap.
+///
+/// Moved here from `pie-model`, which defines itself as backend-blind family
+/// knowledge — and a process-global `OnceLock` holding whatever this engine
+/// booted is neither a family fact nor knowledge. `pie_model::ModelMetadata`
+/// stayed behind: what an artifact carries is a fact about models.
+pub mod model;
 pub(crate) mod pipeline;
 pub mod offload {
     pub use crate::pipeline::offload::{

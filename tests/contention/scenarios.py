@@ -37,9 +37,9 @@ for 8192-16384 pages against device pools of 12-256, which took the server to
 32.3 GB RSS and pushed the host into reclaim -- ``/proc/pressure/memory``
 ``full avg10`` hit 66% during a run against 0.11% idle. The engine convoys
 badly on that: a thread that stalls in the allocator while holding the global
-KV store mutex freezes every lane behind it, and the KV lock trace
-(``PIE_KV_LOCK_TRACE=1``) caught single ``create_working_set`` calls holding it
-for 1.07s, 1.55s and 5.74s. Downstream that reads as 9-18 lanes falling silent
+KV store mutex freezes every lane behind it, and a KV lock trace (since
+removed, along with the ``PIE_KV_LOCK_TRACE`` switch that armed it) caught
+single ``create_working_set`` calls holding it for 1.07s, 1.55s and 5.74s. Downstream that reads as 9-18 lanes falling silent
 at once, ``[frame-stall]``, and ``submit deadline exceeded`` -- i.e. it looks
 exactly like an engine scheduling bug. Every scenario that was flaky used
 16384; none that used <= 512 ever was.
@@ -271,14 +271,16 @@ SCENARIOS: list[Scenario] = [
         contract=Contract(max_wall_s=300, min_completed=4096, max_failed=0),
         repeat=4,
     ),
-    # ---- restore path: retries exhausted -----------------------------------
+    # ---- restore path: heavy restore traffic, every one must land ----------
+    # Named for the `PIE_KV_RESTORE_RETRIES=1` it used to set, which never
+    # bought it anything: with `max_failed=0` it asserts that no restore fails
+    # under a deep swap pool, so it never reached an exhausted retry.
     Scenario(
-        name="restore1",
-        target="restore retry exhaustion",
+        name="restore",
+        target="restore under a deep swap pool",
         args=["--total-pages", "96", "--swap-pool-size", "512",
               "--num-requests", "256", "--concurrency", "128",
               "--max-tokens", "128"],
-        env={"PIE_KV_RESTORE_RETRIES": "1"},
         contract=Contract(max_wall_s=180, min_completed=256, max_failed=0),
     ),
     # ---- pool holds ~one resident: every admission needs a full eviction ---

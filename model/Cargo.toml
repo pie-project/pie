@@ -1,0 +1,71 @@
+[package]
+name = "pie-model"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Model metadata, instruct chat templates, and multimodal (image/audio) host-side decode for Pie."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_model"
+path = "src/lib.rs"
+
+[features]
+# One feature per aspect, because the aspects pull different worlds: `chat`
+# needs the tokenizer (and the model service around it), `contract` needs the
+# loader's algebra, `forward` will need the DSL. A consumer links only the
+# aspect it reads — the ABI crate builds with `contract` alone, so a driver
+# link never carries the tokenizer or the image decoders.
+default = ["chat"]
+chat = ["dep:pie-tokenizer", "dep:anyhow", "dep:serde_json", "dep:image", "pie-model-common/chat", "pie-model-deepseek-r1/chat", "pie-model-gemma-2/chat", "pie-model-gemma-3/chat", "pie-model-gemma-4/chat", "pie-model-gpt-oss/chat", "pie-model-kimi-k2/chat", "pie-model-llama-2/chat", "pie-model-llama-3/chat", "pie-model-mistral-3/chat", "pie-model-olmo-2/chat", "pie-model-olmo-3/chat", "pie-model-phi-3/chat", "pie-model-qwen-2/chat", "pie-model-qwen-3/chat"]
+# `pie-model-config` comes with the contract aspect because `ModelFacts` is
+# read out of a `pie.model/1` descriptor, and that crate owns the descriptor's
+# schema. It is a serde-only leaf — no loader, no runtime — so this does not
+# widen a driver link.
+contract = ["dep:pie-loader", "dep:pie-model-config", "dep:serde_json", "pie-model-common/contract", "pie-model-csm/contract", "pie-model-deepseek-v4/contract", "pie-model-gemma-4/contract", "pie-model-glm-5/contract", "pie-model-gpt-oss/contract", "pie-model-kimi-k2/contract", "pie-model-kimi-k3/contract", "pie-model-llama-3/contract", "pie-model-nemotron-h/contract", "pie-model-phi-3/contract", "pie-model-qwen-3-5/contract"]
+
+[dependencies]
+pie-tokenizer = { path = "../runtime/tokenizer", optional = true }
+pie-model-config = { path = "config", optional = true }
+pie-model-common = { path = "common", default-features = false }
+# The generations. `pie-model` is where the two registries live, so it is
+# the one crate that names them all; a consumer that wants one aspect gets
+# that aspect of every generation and nothing of the other.
+pie-model-csm = { path = "csm", default-features = false }
+pie-model-deepseek-r1 = { path = "deepseek_r1", default-features = false }
+pie-model-deepseek-v4 = { path = "deepseek_v4", default-features = false }
+pie-model-gemma-2 = { path = "gemma_2", default-features = false }
+pie-model-gemma-3 = { path = "gemma_3", default-features = false }
+pie-model-gemma-4 = { path = "gemma_4", default-features = false }
+pie-model-glm-5 = { path = "glm_5", default-features = false }
+pie-model-gpt-oss = { path = "gpt_oss", default-features = false }
+pie-model-kimi-k2 = { path = "kimi_k2", default-features = false }
+pie-model-kimi-k3 = { path = "kimi_k3", default-features = false }
+pie-model-llama-2 = { path = "llama_2", default-features = false }
+pie-model-llama-3 = { path = "llama_3", default-features = false }
+pie-model-mistral-3 = { path = "mistral_3", default-features = false }
+pie-model-nemotron-h = { path = "nemotron_h", default-features = false }
+pie-model-olmo-2 = { path = "olmo_2", default-features = false }
+pie-model-olmo-3 = { path = "olmo_3", default-features = false }
+pie-model-phi-3 = { path = "phi_3", default-features = false }
+pie-model-qwen-2 = { path = "qwen_2", default-features = false }
+pie-model-qwen-3 = { path = "qwen_3", default-features = false }
+pie-model-qwen-3-5 = { path = "qwen_3_5", default-features = false }
+# `default-features = false` drops the loader's testkit half — the authoring
+# side needs the algebra, never the host executor.
+pie-loader = { path = "../loader", default-features = false, optional = true }
+anyhow = { version = "1.0", optional = true }
+serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
+# Host-side media decode for the model-agnostic multimodal API.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"], optional = true }
+
+[dev-dependencies]
+# The tests state facts and policy directly, which is shared vocabulary.
+pie-model-common = { path = "common", features = ["contract"] }
+# The contract tests compile and verify what the authors declare, which is
+# the loader's whole job; the marshalled-view verifier they finish with lives
+# in the ABI crate, the same pipeline a driver boot runs.
+pie-loader = { path = "../loader", default-features = false }
+pie-loader-capi = { path = "../loader/capi", default-features = false }
+serde_json = { version = "1.0", features = ["preserve_order"] }

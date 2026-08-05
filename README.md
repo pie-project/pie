@@ -48,7 +48,15 @@ Then configure and run:
 
 ```bash
 pie config init
-pie run text-completion -- --prompt "The capital of France is"
+pie model import Qwen/Qwen3-0.6B
+pie serve
+```
+
+`pie serve` boots the engine and holds the terminal. From another shell, submit an
+inferlet to it with the Python client (`pip install pie-client`):
+
+```bash
+pie-client submit text-completion -- --prompt "The capital of France is"
 ```
 
 ## Project Layout

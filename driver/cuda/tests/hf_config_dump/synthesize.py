@@ -189,6 +189,20 @@ ENTRIES = {
                          "low_freq_factor": 1.0, "high_freq_factor": 4.0,
                          "original_max_position_embeddings": 512},
     ),
+    # Linear: no separate schedule, just positions divided by `factor`. The
+    # KIND stays `None` (the plain geometric series) but the factor must
+    # survive normalization, or an imported artifact silently differs from the
+    # same checkpoint read as a raw config.json past the original context.
+    "synthetic--rope-linear": cfg(
+        "llama", "LlamaForCausalLM",
+        rope_scaling={"rope_type": "linear", "factor": 4.0},
+    ),
+    # A bare `default` with no factor is the opposite case: it declares no
+    # scaling at all, and must NOT set has_rope_scaling. Qwen3.5 ships this.
+    "synthetic--rope-default-no-factor": cfg(
+        "llama", "LlamaForCausalLM",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    ),
 
     # -- Defaulting rules, each isolated ------------------------------------
     # No num_key_value_heads (<- num_attention_heads) and no head_dim

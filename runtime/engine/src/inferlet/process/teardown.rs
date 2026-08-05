@@ -79,13 +79,7 @@ pub(crate) fn defer_resource_teardown(
         // remain possible.
         return;
     };
-    let timing = crate::scheduler::fire_timing_enabled();
     let task = async move {
-        let task_started_us = if timing {
-            crate::scheduler::fire_timing_now_us()
-        } else {
-            0
-        };
         if capped_execution {
             // Reference fence, awaited on purpose: after this resolves,
             // every driver's scheduler has purged the pid's queued work and
@@ -103,20 +97,10 @@ pub(crate) fn defer_resource_teardown(
                 crate::scheduler::worker::notify_pipeline_close(pipeline_id).await;
             }
         }
-        let terminate_acked_us = if timing {
-            crate::scheduler::fire_timing_now_us()
-        } else {
-            0
-        };
         for fires in snapshot.pipelines {
             // Teardown policy: log and keep draining — the table drops next.
             let _ = crate::pipeline::fire::finalize_all(&mut context, &fires, true).await;
         }
-        let finalized_us = if timing {
-            crate::scheduler::fire_timing_now_us()
-        } else {
-            0
-        };
         // Take over the guest channels' close notifications before the
         // table drops, so a departing process posts one batched close per
         // driver instead of one mailbox item per channel (a teardown herd
@@ -126,28 +110,9 @@ pub(crate) fn defer_resource_teardown(
         // then keeps the driver's instance-before-channel close order.
         let channel_close_batches =
             crate::pipeline::channel::detach_channel_close_notifications(&mut context.resources);
-        let detached_us = if timing {
-            crate::scheduler::fire_timing_now_us()
-        } else {
-            0
-        };
-        let channels = channel_close_batches
-            .iter()
-            .map(|(_, ids)| ids.len())
-            .sum::<usize>();
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         drop(context);
-        let dropped_us = if timing {
-            crate::scheduler::fire_timing_now_us()
-        } else {
-            0
-        };
         remove_scratch(scratch_dir.as_deref());
-        let scratch_removed_us = if timing {
-            crate::scheduler::fire_timing_now_us()
-        } else {
-            0
-        };
         for (driver_id, ids) in channel_close_batches {
             if let Err(error) = crate::scheduler::close_channels(driver_id, ids) {
                 // Same failure mode as the per-endpoint closer (the
@@ -162,33 +127,6 @@ pub(crate) fn defer_resource_teardown(
         // posted its close controls): the tombstone that deduped its
         // Terminate leaves can now retire.
         crate::scheduler::worker::notify_process_quiesced(process_id);
-        if timing {
-            let quiesced_us = crate::scheduler::fire_timing_now_us();
-            crate::scheduler::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "runtime",
-                "event": "process_teardown",
-                "process_id": process_id,
-                "task_started_us": task_started_us,
-                "terminate_ack_us": terminate_acked_us - task_started_us,
-                "finalize_us": finalized_us - terminate_acked_us,
-                "detach_us": detached_us - finalized_us,
-                // The wasmtime `ResourceTable` drop: previously invisible,
-                // because the record was written before it.
-                "table_drop_us": dropped_us - detached_us,
-                "scratch_rm_us": scratch_removed_us - dropped_us,
-                "close_post_us": quiesced_us - scratch_removed_us,
-                "channels": channels,
-                "released_us": quiesced_us,
-            }));
-        }
     };
-    if timing {
-        runtime.spawn(crate::scheduler::CpuMetered::new(
-            crate::scheduler::CpuClass::Teardown,
-            task,
-        ));
-    } else {
-        runtime.spawn(task);
-    }
+    runtime.spawn(task);
 }

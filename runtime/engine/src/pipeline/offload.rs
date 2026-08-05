@@ -500,6 +500,27 @@ impl EncodeBlobServer {
                 while !thread_shutdown.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // The listener is non-blocking so the accept loop
+                            // can poll its shutdown flag, and on macOS/BSD an
+                            // accepted socket *inherits* that flag -- Linux
+                            // does not, which is why this only ever showed up
+                            // on one platform. `serve_encode_blob` is blocking
+                            // code: without this its 8 MiB `write_all` returns
+                            // `WouldBlock` partway through a body the client
+                            // was promised by `content-length`, and the client
+                            // sees a truncated response.
+                            //
+                            // Checked rather than ignored, unlike the timeouts
+                            // below: those only sharpen a failure this one
+                            // prevents, and serving a truncated body looks to
+                            // the client like corruption rather than a refusal.
+                            if stream.set_nonblocking(false).is_err() {
+                                tracing::warn!(
+                                    "encode blob connection could not be made blocking; \
+                                     dropping it rather than truncating its body"
+                                );
+                                continue;
+                            }
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                             let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
                             if connections.try_send(stream).is_err() {

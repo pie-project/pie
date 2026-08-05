@@ -22,6 +22,9 @@
 #ifndef PIE_METAL_TOOL_KERNELS_DIR
 #define PIE_METAL_TOOL_KERNELS_DIR "."
 #endif
+#ifndef PIE_METAL_TOOL_LOCAL_KERNELS_DIR
+#define PIE_METAL_TOOL_LOCAL_KERNELS_DIR "."
+#endif
 
 using namespace pie::metal;
 
@@ -73,7 +76,9 @@ int main(int argc, char** argv) {
 
     // compile the demo kernel at runtime
     std::string err;
-    Pso pso = ctx->compile_pso_from_file(kernels_dir + "/gemv_demo.metal", "gemv_demo", &err);
+    Pso pso = ctx->compile_pso_from_file(
+        std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + "/gemv_demo.metal",
+        "gemv_demo", &err);
     if (!pso.valid()) { printf("FAIL: pso compile: %s\n", err.c_str()); return 1; }
     printf("runtime MSL compile OK (gemv_demo)\n");
 

@@ -1,0 +1,818 @@
+{
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "language_model.backbone.layers.0.mixer.in_proj.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.in_proj.weight"
+                            },
+                            "axis": 0,
+                            "start": 0,
+                            "len": 32
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            4,
+                            512
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    16,
+                    64
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.in_proj.weight"
+                            },
+                            "axis": 0,
+                            "start": 32,
+                            "len": 32
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            4,
+                            512
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    16,
+                    64
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.in_proj.weight"
+                            },
+                            "axis": 0,
+                            "start": 64,
+                            "len": 16
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            2,
+                            512
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    8,
+                    64
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.in_proj.weight"
+                            },
+                            "axis": 0,
+                            "start": 80,
+                            "len": 16
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            2,
+                            512
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    8,
+                    64
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "language_model.backbone.layers.0.mixer.in_proj.weight"
+                    },
+                    "axis": 0,
+                    "start": 96,
+                    "len": 4
+                  }
+                },
+                "axis": 0
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        50,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.conv1d.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.conv1d.weight"
+                            },
+                            "axis": 0,
+                            "start": 0,
+                            "len": 32
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            4,
+                            32
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    16,
+                    1,
+                    4
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.conv1d.weight"
+                            },
+                            "axis": 0,
+                            "start": 32,
+                            "len": 16
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            2,
+                            32
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    8,
+                    1,
+                    4
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.conv1d.weight"
+                            },
+                            "axis": 0,
+                            "start": 48,
+                            "len": 16
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            2,
+                            32
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    8,
+                    1,
+                    4
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        32,
+        1,
+        4
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.conv1d.bias",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.conv1d.bias"
+                            },
+                            "axis": 0,
+                            "start": 0,
+                            "len": 32
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            4,
+                            8
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    16
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.conv1d.bias"
+                            },
+                            "axis": 0,
+                            "start": 32,
+                            "len": 16
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            2,
+                            8
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    8
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Shard": {
+                    "src": {
+                      "Transmute": {
+                        "src": {
+                          "Slice": {
+                            "src": {
+                              "Src": "language_model.backbone.layers.0.mixer.conv1d.bias"
+                            },
+                            "axis": 0,
+                            "start": 48,
+                            "len": 16
+                          }
+                        },
+                        "to": {
+                          "shape": [
+                            2,
+                            8
+                          ],
+                          "encoding": {
+                            "Raw": "BF16"
+                          }
+                        }
+                      }
+                    },
+                    "axis": 0
+                  }
+                },
+                "to": {
+                  "shape": [
+                    8
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        32
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.A_log",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "language_model.backbone.layers.0.mixer.A_log"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        2
+      ],
+      "encoding": {
+        "Raw": "F32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.D",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "language_model.backbone.layers.0.mixer.D"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        2
+      ],
+      "encoding": {
+        "Raw": "F32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.dt_bias",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "language_model.backbone.layers.0.mixer.dt_bias"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        2
+      ],
+      "encoding": {
+        "Raw": "F32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.norm.weight",
+      "expr": {
+        "Transmute": {
+          "src": {
+            "Shard": {
+              "src": {
+                "Transmute": {
+                  "src": {
+                    "Src": "language_model.backbone.layers.0.mixer.norm.weight"
+                  },
+                  "to": {
+                    "shape": [
+                      4,
+                      8
+                    ],
+                    "encoding": {
+                      "Raw": "BF16"
+                    }
+                  }
+                }
+              },
+              "axis": 0
+            }
+          },
+          "to": {
+            "shape": [
+              16
+            ],
+            "encoding": {
+              "Raw": "BF16"
+            }
+          }
+        }
+      },
+      "shape": [
+        16
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.out_proj.weight",
+      "expr": {
+        "Transmute": {
+          "src": {
+            "Shard": {
+              "src": {
+                "Transmute": {
+                  "src": {
+                    "Src": "language_model.backbone.layers.0.mixer.out_proj.weight"
+                  },
+                  "to": {
+                    "shape": [
+                      64,
+                      4,
+                      8
+                    ],
+                    "encoding": {
+                      "Raw": "BF16"
+                    }
+                  }
+                }
+              },
+              "axis": 1
+            }
+          },
+          "to": {
+            "shape": [
+              64,
+              -1
+            ],
+            "encoding": {
+              "Raw": "BF16"
+            }
+          }
+        }
+      },
+      "shape": [
+        64,
+        16
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.1.mixer.experts.up_proj.packed.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Shard": {
+                "src": {
+                  "Src": "language_model.backbone.layers.1.mixer.experts.0.up_proj.weight"
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Src": "language_model.backbone.layers.1.mixer.experts.1.up_proj.weight"
+                },
+                "axis": 0
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        32,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.1.mixer.experts.down_proj.packed.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Concat": {
+              "axis": 0,
+              "parts": [
+                {
+                  "Src": "language_model.backbone.layers.1.mixer.experts.0.down_proj.weight"
+                },
+                {
+                  "Src": "language_model.backbone.layers.1.mixer.experts.1.down_proj.weight"
+                }
+              ]
+            }
+          },
+          "axis": 1
+        }
+      },
+      "shape": [
+        128,
+        16
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.1.mixer.experts.0.up_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "language_model.backbone.layers.1.mixer.experts.up_proj.packed.weight"
+          },
+          "axis": 0,
+          "start": 0,
+          "len": 16
+        }
+      },
+      "shape": [
+        16,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.1.mixer.experts.1.up_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "language_model.backbone.layers.1.mixer.experts.up_proj.packed.weight"
+          },
+          "axis": 0,
+          "start": 16,
+          "len": 16
+        }
+      },
+      "shape": [
+        16,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.1.mixer.experts.0.down_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "language_model.backbone.layers.1.mixer.experts.down_proj.packed.weight"
+          },
+          "axis": 0,
+          "start": 0,
+          "len": 64
+        }
+      },
+      "shape": [
+        64,
+        16
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.layers.1.mixer.experts.1.down_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "language_model.backbone.layers.1.mixer.experts.down_proj.packed.weight"
+          },
+          "axis": 0,
+          "start": 64,
+          "len": 64
+        }
+      },
+      "shape": [
+        64,
+        16
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.embed_tokens.weight",
+      "expr": {
+        "Src": "language_model.backbone.embed_tokens.weight"
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "language_model.backbone.norm_f.weight",
+      "expr": {
+        "Src": "language_model.backbone.norm_f.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    }
+  ],
+  "groups": []
+}

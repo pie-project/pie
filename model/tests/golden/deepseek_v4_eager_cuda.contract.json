@@ -1,0 +1,441 @@
+{
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "layers.0.ffn.experts.gate_up.scale",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Concat": {
+                "axis": 1,
+                "parts": [
+                  {
+                    "Transmute": {
+                      "src": {
+                        "Src": "layers.0.ffn.experts.0.w1.scale"
+                      },
+                      "to": {
+                        "shape": [
+                          1,
+                          32,
+                          2
+                        ],
+                        "encoding": {
+                          "Raw": "E8M0"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "Transmute": {
+                      "src": {
+                        "Src": "layers.0.ffn.experts.0.w3.scale"
+                      },
+                      "to": {
+                        "shape": [
+                          1,
+                          32,
+                          2
+                        ],
+                        "encoding": {
+                          "Raw": "E8M0"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "Concat": {
+                "axis": 1,
+                "parts": [
+                  {
+                    "Transmute": {
+                      "src": {
+                        "Src": "layers.0.ffn.experts.1.w1.scale"
+                      },
+                      "to": {
+                        "shape": [
+                          1,
+                          32,
+                          2
+                        ],
+                        "encoding": {
+                          "Raw": "E8M0"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "Transmute": {
+                      "src": {
+                        "Src": "layers.0.ffn.experts.1.w3.scale"
+                      },
+                      "to": {
+                        "shape": [
+                          1,
+                          32,
+                          2
+                        ],
+                        "encoding": {
+                          "Raw": "E8M0"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        2,
+        64,
+        2
+      ],
+      "encoding": {
+        "Raw": "E8M0"
+      },
+      "scales": null,
+      "visibility": "Internal"
+    },
+    {
+      "name": "layers.0.ffn.experts.down.scale",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Transmute": {
+                "src": {
+                  "Src": "layers.0.ffn.experts.0.w2.scale"
+                },
+                "to": {
+                  "shape": [
+                    1,
+                    64,
+                    1
+                  ],
+                  "encoding": {
+                    "Raw": "E8M0"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Src": "layers.0.ffn.experts.1.w2.scale"
+                },
+                "to": {
+                  "shape": [
+                    1,
+                    64,
+                    1
+                  ],
+                  "encoding": {
+                    "Raw": "E8M0"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        2,
+        64,
+        1
+      ],
+      "encoding": {
+        "Raw": "E8M0"
+      },
+      "scales": null,
+      "visibility": "Internal"
+    },
+    {
+      "name": "layers.0.ffn.experts.gate_up.weight",
+      "expr": {
+        "Scale": {
+          "src": {
+            "Concat": {
+              "axis": 0,
+              "parts": [
+                {
+                  "Concat": {
+                    "axis": 1,
+                    "parts": [
+                      {
+                        "Transmute": {
+                          "src": {
+                            "Src": "layers.0.ffn.experts.0.w1.weight"
+                          },
+                          "to": {
+                            "shape": [
+                              1,
+                              32,
+                              64
+                            ],
+                            "encoding": {
+                              "Quant": {
+                                "scheme": "Mxfp4E2M1E8M0",
+                                "logical_dtype": "BF16",
+                                "bits_per_element": 4,
+                                "group_size": 32,
+                                "channel_axis": 2
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "Transmute": {
+                          "src": {
+                            "Src": "layers.0.ffn.experts.0.w3.weight"
+                          },
+                          "to": {
+                            "shape": [
+                              1,
+                              32,
+                              64
+                            ],
+                            "encoding": {
+                              "Quant": {
+                                "scheme": "Mxfp4E2M1E8M0",
+                                "logical_dtype": "BF16",
+                                "bits_per_element": 4,
+                                "group_size": 32,
+                                "channel_axis": 2
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "Concat": {
+                    "axis": 1,
+                    "parts": [
+                      {
+                        "Transmute": {
+                          "src": {
+                            "Src": "layers.0.ffn.experts.1.w1.weight"
+                          },
+                          "to": {
+                            "shape": [
+                              1,
+                              32,
+                              64
+                            ],
+                            "encoding": {
+                              "Quant": {
+                                "scheme": "Mxfp4E2M1E8M0",
+                                "logical_dtype": "BF16",
+                                "bits_per_element": 4,
+                                "group_size": 32,
+                                "channel_axis": 2
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "Transmute": {
+                          "src": {
+                            "Src": "layers.0.ffn.experts.1.w3.weight"
+                          },
+                          "to": {
+                            "shape": [
+                              1,
+                              32,
+                              64
+                            ],
+                            "encoding": {
+                              "Quant": {
+                                "scheme": "Mxfp4E2M1E8M0",
+                                "logical_dtype": "BF16",
+                                "bits_per_element": 4,
+                                "group_size": 32,
+                                "channel_axis": 2
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "factor": {
+            "PerBlock": {
+              "by": {
+                "Out": "layers.0.ffn.experts.gate_up.scale"
+              }
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.ffn.experts.down.weight",
+      "expr": {
+        "Scale": {
+          "src": {
+            "Concat": {
+              "axis": 0,
+              "parts": [
+                {
+                  "Transmute": {
+                    "src": {
+                      "Src": "layers.0.ffn.experts.0.w2.weight"
+                    },
+                    "to": {
+                      "shape": [
+                        1,
+                        64,
+                        32
+                      ],
+                      "encoding": {
+                        "Quant": {
+                          "scheme": "Mxfp4E2M1E8M0",
+                          "logical_dtype": "BF16",
+                          "bits_per_element": 4,
+                          "group_size": 32,
+                          "channel_axis": 2
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "Transmute": {
+                    "src": {
+                      "Src": "layers.0.ffn.experts.1.w2.weight"
+                    },
+                    "to": {
+                      "shape": [
+                        1,
+                        64,
+                        32
+                      ],
+                      "encoding": {
+                        "Quant": {
+                          "scheme": "Mxfp4E2M1E8M0",
+                          "logical_dtype": "BF16",
+                          "bits_per_element": 4,
+                          "group_size": 32,
+                          "channel_axis": 2
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "factor": {
+            "PerBlock": {
+              "by": {
+                "Out": "layers.0.ffn.experts.down.scale"
+              }
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        64,
+        32
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.attn.wq.scale",
+      "expr": {
+        "Src": "layers.0.attn.wq.scale"
+      },
+      "shape": [
+        2,
+        2
+      ],
+      "encoding": {
+        "Raw": "U8"
+      },
+      "scales": {
+        "of": "layers.0.attn.wq.weight",
+        "granularity": "PerGroup",
+        "group_size": 32,
+        "channel_axis": 0,
+        "form": "F32Factors"
+      },
+      "visibility": "Public"
+    },
+    {
+      "name": "embed_tokens.weight",
+      "expr": {
+        "Src": "embed_tokens.weight"
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.attn.wq.weight",
+      "expr": {
+        "Src": "layers.0.attn.wq.weight"
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "F8E4M3"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "norm.weight",
+      "expr": {
+        "Src": "norm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    }
+  ],
+  "groups": []
+}

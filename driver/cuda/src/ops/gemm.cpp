@@ -102,16 +102,7 @@ void check(cublasStatus_t s, const char* expr) {
     }
 }
 
-std::size_t cublaslt_bf16_workspace_bytes() {
-    static const std::size_t bytes = [] {
-        const char* v = std::getenv("PIE_CUBLASLT_BF16_WORKSPACE_MIB");
-        if (v == nullptr || v[0] == '\0') return 64ull * 1024ull * 1024ull;
-        const unsigned long long mib = std::strtoull(v, nullptr, 10);
-        if (mib == 0ull) return 64ull * 1024ull * 1024ull;
-        return static_cast<std::size_t>(mib) * 1024ull * 1024ull;
-    }();
-    return bytes;
-}
+std::size_t cublaslt_bf16_workspace_bytes() { return 64ull * 1024ull * 1024ull; }
 
 // Lazily-created singleton keyed by the CALLING THREAD'S CURRENT DEVICE.
 //
@@ -211,15 +202,6 @@ struct Bf16LtPlanCache {
     }
 };
 
-bool use_bf16_gemv() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_BF16_GEMV");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
 // The handle's stream, or `false` if cuBLAS will not say. Never guess:
 // falling back to the null stream would run the GEMV outside the
 // caller's ordering and race whatever produced its input.
@@ -227,35 +209,7 @@ bool cublas_stream(cublasHandle_t handle, cudaStream_t& stream) {
     return cublasGetStream(handle, &stream) == CUBLAS_STATUS_SUCCESS;
 }
 
-bool use_cublaslt_bf16() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUBLASLT_BF16");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool sync_after_grouped_bf16() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUBLAS_GROUPED_BF16_SYNC");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-int cublaslt_bf16_forced_algo_index() {
-    static const int index = [] {
-        const char* v = std::getenv("PIE_CUBLASLT_BF16_ALGO_INDEX");
-        if (v == nullptr || v[0] == '\0') return -1;
-        return std::max(0, std::atoi(v));
-    }();
-    return index;
-}
-
 int cublaslt_bf16_algo_index_for_shape(int N, int K) {
-    const int forced = cublaslt_bf16_forced_algo_index();
-    if (forced >= 0) return forced;
     // Qwen3-0.6B's lm_head shape (K=1024, very wide N) consistently
     // prefers the third returned Lt heuristic. Larger hidden sizes regress
     // on that choice, so keep the old default for them.
@@ -279,12 +233,6 @@ int cublaslt_bf16_algo_index_for_shape(int N, int K) {
 }
 
 int cublaslt_bf16_min_n(int K) {
-    static const int min_n = [] {
-        const char* v = std::getenv("PIE_CUBLASLT_BF16_MIN_N");
-        if (v == nullptr || v[0] == '\0') return -1;
-        return std::max(0, std::atoi(v));
-    }();
-    if (min_n >= 0) return min_n;
     // Small hidden-size models (H=1024) only benefited from cuBLASLt on the
     // very wide lm_head; routing their 2k/6k projection GEMMs through Lt was
     // consistently slower. H=2048 keeps the previous threshold because the
@@ -299,32 +247,9 @@ int cublaslt_bf16_min_n(int K) {
     return K < 2048 ? 12288 : (K == 2048 ? 6144 : 12288);
 }
 
-int cublaslt_bf16_min_k() {
-    static const int min_k = [] {
-        const char* v = std::getenv("PIE_CUBLASLT_BF16_MIN_K");
-        if (v == nullptr || v[0] == '\0') return 1024;
-        return std::max(0, std::atoi(v));
-    }();
-    return min_k;
-}
-
-int cublaslt_bf16_min_m() {
-    static const int min_m = [] {
-        const char* v = std::getenv("PIE_CUBLASLT_BF16_MIN_M");
-        if (v == nullptr || v[0] == '\0') return 2;
-        return std::max(0, std::atoi(v));
-    }();
-    return min_m;
-}
-
-int cublaslt_bf16_max_n() {
-    static const int max_n = [] {
-        const char* v = std::getenv("PIE_CUBLASLT_BF16_MAX_N");
-        if (v == nullptr || v[0] == '\0') return 0;
-        return std::max(0, std::atoi(v));
-    }();
-    return max_n;
-}
+constexpr int kCublasLtBf16MinK = 1024;
+constexpr int kCublasLtBf16MinM = 2;
+constexpr int kCublasLtBf16MaxN = 0;
 
 // `workspace` defaults to the context's shared scratch. It is overridable
 // because the autotuner runs matmuls on a stream of its own, concurrently with
@@ -376,15 +301,6 @@ bool run_bf16_lt_plan(
     cublasGetStream(cublas_handle, &stream);
     return run_bf16_lt_algo(ctx, plan, &algo, stream, act, W, y, beta,
                             workspace, workspace_bytes);
-}
-
-bool use_cublas_grouped_batched_bf16() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUBLAS_GROUPED_BATCHED_BF16");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
 }
 
 // Creates the descriptors for a shape and asks cuBLASLt which algorithms it
@@ -508,136 +424,8 @@ bool gemm_bf16_lt_impl(
 
 }  // namespace
 
-void maybe_bench_lm_head_algos(
-    cublasHandle_t cublas_handle,
-    const void* act, const void* W, void* y,
-    int M, int N, int K)
-{
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_BENCH_LM_HEAD_ALGOS");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    if (!enabled) return;
-    static bool done = false;
-    if (done) return;
-    done = true;
-
-    auto& ctx = Bf16LtCtx::instance();
-    ctx.ensure();
-
-    cublasLtMatmulDesc_t op_desc = nullptr;
-    cublasLtMatrixLayout_t a_desc = nullptr;
-    cublasLtMatrixLayout_t b_desc = nullptr;
-    cublasLtMatrixLayout_t c_desc = nullptr;
-    cublasLtMatmulPreference_t pref = nullptr;
-
-    cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F_FAST_16BF, CUDA_R_32F);
-    cublasOperation_t transa = CUBLAS_OP_T;
-    cublasOperation_t transb = CUBLAS_OP_N;
-    cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA,
-        &transa, sizeof(transa));
-    cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB,
-        &transb, sizeof(transb));
-    cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16BF, K, N, K);
-    cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16BF, K, M, K);
-    cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16BF, N, M, N);
-    cublasLtMatmulPreferenceCreate(&pref);
-    cublasLtMatmulPreferenceSetAttribute(
-        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &ctx.workspace_bytes, sizeof(ctx.workspace_bytes));
-
-    cublasLtMatmulHeuristicResult_t heuristics[8]{};
-    int returned = 0;
-    cublasLtMatmulAlgoGetHeuristic(
-        ctx.handle, op_desc, a_desc, b_desc, c_desc, c_desc,
-        pref, 8, heuristics, &returned);
-
-    cudaStream_t stream = nullptr;
-    cublasGetStream(cublas_handle, &stream);
-    const float alpha = 1.f;
-    const float beta = 0.f;
-    constexpr int warmup = 3;
-    constexpr int iters = 10;
-
-    std::cerr << "[pie-bench-lm-head-algos] M=" << M << " N=" << N
-              << " K=" << K << " returned=" << returned << "\n";
-
-    {
-        for (int w = 0; w < warmup; ++w) {
-            cublasGemmEx(cublas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
-                W, CUDA_R_16BF, K, act, CUDA_R_16BF, K, &beta,
-                y, CUDA_R_16BF, N,
-                CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        cudaEvent_t start, stop;
-        CUDA_CHECK(cudaEventCreate(&start));
-        CUDA_CHECK(cudaEventCreate(&stop));
-        CUDA_CHECK(cudaEventRecord(start, stream));
-        for (int i = 0; i < iters; ++i) {
-            cublasGemmEx(cublas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
-                W, CUDA_R_16BF, K, act, CUDA_R_16BF, K, &beta,
-                y, CUDA_R_16BF, N,
-                CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        }
-        CUDA_CHECK(cudaEventRecord(stop, stream));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-        std::cerr << "[pie-bench-lm-head-algos]   GEMMEx: "
-                  << (ms / iters) << " ms\n";
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
-    }
-
-    for (int i = 0; i < returned; ++i) {
-        bool ok = false;
-        for (int w = 0; w < warmup; ++w) {
-            auto st = cublasLtMatmul(
-                ctx.handle, op_desc, &alpha,
-                W, a_desc, act, b_desc, &beta,
-                y, c_desc, y, c_desc,
-                &heuristics[i].algo,
-                ctx.workspace, ctx.workspace_bytes, stream);
-            if (st != CUBLAS_STATUS_SUCCESS) break;
-            ok = true;
-        }
-        if (!ok) {
-            std::cerr << "[pie-bench-lm-head-algos]   Lt[" << i
-                      << "]: FAILED\n";
-            continue;
-        }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        cudaEvent_t start, stop;
-        CUDA_CHECK(cudaEventCreate(&start));
-        CUDA_CHECK(cudaEventCreate(&stop));
-        CUDA_CHECK(cudaEventRecord(start, stream));
-        for (int it = 0; it < iters; ++it) {
-            cublasLtMatmul(
-                ctx.handle, op_desc, &alpha,
-                W, a_desc, act, b_desc, &beta,
-                y, c_desc, y, c_desc,
-                &heuristics[i].algo,
-                ctx.workspace, ctx.workspace_bytes, stream);
-        }
-        CUDA_CHECK(cudaEventRecord(stop, stream));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-        std::cerr << "[pie-bench-lm-head-algos]   Lt[" << i << "]: "
-                  << (ms / iters) << " ms\n";
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
-    }
-
-    if (pref) cublasLtMatmulPreferenceDestroy(pref);
-    if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
-    if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
-    if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
-    if (op_desc) cublasLtMatmulDescDestroy(op_desc);
-}
+void maybe_bench_lm_head_algos(cublasHandle_t, const void*, const void*, void*,
+                              int, int, int) {}
 
 CublasHandle::CublasHandle(cudaStream_t stream) {
     check(cublasCreate(&h_), "cublasCreate");
@@ -712,15 +500,6 @@ namespace {
 // cuBLASLt's heuristic offers. They are ordered so that the incumbent choice
 // comes first, and ties are broken towards the front of the list, so a shape
 // where nothing measurably wins keeps doing what it did before.
-
-bool gemm_autotune_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("PIE_GEMM_AUTOTUNE");
-        if (v == nullptr || v[0] == '\0') return true;
-        return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N');
-    }();
-    return on;
-}
 
 // A candidate must beat the incumbent by this much to displace it; anything
 // closer is treated as a tie. Below this the difference is timing noise, and
@@ -918,11 +697,11 @@ std::vector<DenseTactic> dense_candidates(const Bf16LtPlan* plan, int M, int N,
     std::vector<DenseTactic> out;
     // Ordered by what the shape would have used without tuning, because ties
     // resolve to the first entry.
-    if (M == 1 && beta == 0.f && use_bf16_gemv()) {
+    if (M == 1 && beta == 0.f) {
         out.push_back({static_cast<int>(GemmKind::Gemv), 0});
     }
     out.push_back({static_cast<int>(GemmKind::GemmEx), 0});
-    if (plan != nullptr && use_cublaslt_bf16()) {
+    if (plan != nullptr) {
         const int preferred = cublaslt_bf16_algo_index_for_shape(N, K);
         const int count = static_cast<int>(plan->heuristics.size());
         if (preferred < count) {
@@ -979,14 +758,6 @@ std::uint64_t dense_key(int M, int N, int K, float beta) {
     return h;
 }
 
-bool gemm_tune_log() {
-    static const bool on = [] {
-        const char* v = std::getenv("PIE_GEMM_AUTOTUNE_LOG");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return on;
-}
-
 DenseTactic tune_dense(cublasHandle_t caller, const Bf16LtPlan* plan,
                        const void* W, int M, int N, int K, float beta) {
     const std::vector<DenseTactic> candidates =
@@ -995,12 +766,6 @@ DenseTactic tune_dense(cublasHandle_t caller, const Bf16LtPlan* plan,
 
     DenseTuneArena arena;
     if (!arena.init(caller, M, N, K)) {
-        if (gemm_tune_log()) {
-            std::fprintf(stderr,
-                         "[pie-driver-cuda] dense GEMM autotune skipped for "
-                         "M=%d N=%d K=%d (arena setup failed)\n",
-                         M, N, K);
-        }
         return best;
     }
 
@@ -1023,15 +788,6 @@ DenseTactic tune_dense(cublasHandle_t caller, const Bf16LtPlan* plan,
         best = candidates[i];
         chosen_ms = ms;
         break;
-    }
-    if (gemm_tune_log()) {
-        static const char* kNames[] = {"gemmex", "lt", "gemv"};
-        std::fprintf(stderr,
-                     "[pie-driver-cuda] dense GEMM autotune M=%d N=%d K=%d: "
-                     "%.1f us over %d candidates -> %s[%d]\n",
-                     M, N, K, chosen_ms * 1e3f,
-                     static_cast<int>(timings.size()), kNames[best.kind],
-                     best.algo);
     }
     return best;
 }
@@ -1056,7 +812,7 @@ bool dense_tactic_for(cublasHandle_t caller, const void* W, int M, int N,
     // Built for every shape, tuned or not: it is the source of the cuBLASLt
     // candidates, and the tactic we cache names one of them by index.
     std::shared_ptr<Bf16LtPlan> plan =
-        use_cublaslt_bf16() ? lt_plan_for(ctx, M, N, K) : nullptr;
+        lt_plan_for(ctx, M, N, K);
     *out_plan = plan.get();
 
     auto& tuner = DenseGemmTuner::instance();
@@ -1095,14 +851,6 @@ bool dense_tactic_for(cublasHandle_t caller, const void* W, int M, int N,
 // does *not* call `dense_tactic_for`: that bumps the `seen` counter and can
 // trigger a tune, and asking "would you have picked the GEMV?" must not
 // change the answer to "what will you pick?".
-bool gemv_fused_bias_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_GEMV_FUSED_BIAS");
-        return v == nullptr || !(v[0] == '0' && v[1] == '\0');
-    }();
-    return enabled;
-}
-
 bool dense_tactic_already_gemv(int M, int N, int K, float beta) {
     auto& tuner = DenseGemmTuner::instance();
     std::lock_guard<std::mutex> lock(tuner.mu);
@@ -1146,7 +894,7 @@ void gemm_bf16_impl(
     // measurement, not a rule -- so take it, once per shape, and remember it.
     // Everything after this point is the fallback for shapes the tuner
     // declined (too large to allocate a probe output for) or could not run.
-    if (gemm_autotune_enabled()) {
+    {
         cudaStream_t caller_stream = nullptr;
         cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
         const Bf16LtPlan* plan = nullptr;
@@ -1174,17 +922,16 @@ void gemm_bf16_impl(
     // worth filling and reaches roughly half of HBM bandwidth on these;
     // a warp-per-row GEMV nearly doubles it (see `launch_gemv_bf16`).
     cudaStream_t gemv_stream = nullptr;
-    if (M == 1 && beta == 0.f && use_bf16_gemv() &&
+    if (M == 1 && beta == 0.f &&
         cublas_stream(handle, gemv_stream) &&
         kernels::launch_gemv_bf16(W, act, nullptr, y, N, K, gemv_stream)) {
         if (path_trace) std::fprintf(stderr, "[gemm-path]   -> gemv\n");
         return;
     }
-    const int lt_max_n = cublaslt_bf16_max_n();
-    if (use_cublaslt_bf16() &&
-        M >= cublaslt_bf16_min_m() &&
+    const int lt_max_n = kCublasLtBf16MaxN;
+    if (M >= kCublasLtBf16MinM &&
         N >= cublaslt_bf16_min_n(K) &&
-        K >= cublaslt_bf16_min_k() &&
+        K >= kCublasLtBf16MinK &&
         (lt_max_n == 0 || N <= lt_max_n) &&
         gemm_bf16_lt_impl(handle, act, W, y, M, N, K, beta)) {
         if (path_trace) std::fprintf(stderr, "[gemm-path]   -> lt-ladder\n");
@@ -1377,7 +1124,6 @@ void gemm_batched_bf16_impl(
     auto& grouped_support = per_device_singleton<GroupedBatchedSupport>();
     const int grouped_known = grouped_support.lookup(grouped_key);
     const bool try_grouped =
-        use_cublas_grouped_batched_bf16() &&
         (grouped_known == 1 ||
          (grouped_known < 0 && !stream_is_capturing(handle)));
     if (try_grouped) {
@@ -1510,11 +1256,6 @@ void gemm_grouped_bf16_impl(
             "): cublasGemmGroupedBatchedEx[bf16] groups=" +
             std::to_string(group_count) + " N=" + std::to_string(N) +
             " K=" + std::to_string(K));
-    }
-    if (sync_after_grouped_bf16()) {
-        cudaStream_t stream = nullptr;
-        check(cublasGetStream(handle, &stream), "cublasGetStream");
-        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 }
 
@@ -1970,15 +1711,7 @@ class DequantWeightCache {
     // Public only so `per_device_singleton` can build one per device; the
     // instance is still reached exclusively through `instance()`.
     DequantWeightCache() {
-        const char* v = std::getenv("PIE_FP8_DEQUANT_CACHE_GB");
-        if (v != nullptr && v[0] != '\0') {
-            const double gb = std::atof(v);
-            budget_ = gb > 0.0
-                ? static_cast<std::size_t>(gb * 1024.0 * 1024.0 * 1024.0)
-                : 0;
-            return;
-        }
-        // Self-tuning default. The singleton is built on the first FP8 GEMM,
+        // Self-tuning. The singleton is built on the first FP8 GEMM,
         // i.e. after the KV arena is sized, so "free" here is real headroom.
         // A quarter of it is enough for every block-FP8 weight in the models
         // we serve without competing with activations or graph memory.
@@ -2125,27 +1858,8 @@ bool gemm_fp8_blockwise_w8a8_impl(
     cudaStream_t stream,
     int group_size)
 {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_FP8_BLOCK_GEMM");
-        return v == nullptr || (v[0] != '0');
-    }();
-    static const bool dbg = [] {
-        const char* v = std::getenv("PIE_FP8_BLOCK_DEBUG");
-        return v != nullptr && v[0] != '0';
-    }();
     auto& ctx = LtCtx::instance();
-    auto reject = [&](const char* why) {
-        if (dbg) {
-            static int n = 0;
-            if (n++ < 24) {
-                std::fprintf(stderr,
-                    "[fp8-block] reject %s M=%d N=%d K=%d gs=%d\n",
-                    why, M, N, K, group_size);
-            }
-        }
-        return false;
-    };
-    if (!enabled) return reject("disabled");
+    auto reject = [](const char*) { return false; };
     if (!ctx.fp8_block_supported) return reject("latched-off");
     if (group_size != 128) return reject("group_size");
     // Block scales assume a whole number of 128-wide groups along K; the
@@ -2193,13 +1907,6 @@ bool gemm_fp8_blockwise_w8a8_impl(
         ctx.fp8_block_supported = false;
         return reject("no-algo");
     }
-    if (dbg) {
-        static int n = 0;
-        if (n++ < 8) {
-            std::fprintf(stderr, "[fp8-block] accept M=%d N=%d K=%d\n", M, N, K);
-        }
-    }
-
     const float alpha = 1.f;
     LT_CHECK(cublasLtMatmul(
         ctx.handle, desc.d, &alpha,
@@ -2509,42 +2216,7 @@ void gemm_act_x_w(
         }
         validate_quant_weight_view("gemm_act_x_w[MXFP4]", w, N, K);
 
-        // Decide path: Marlin needs pre-repacked weights. Runtime FP4 quant
-        // emits raw nibble-packed weights, so default to a dequant→bf16 GEMM
-        // fallback (correct but ~2× the memory pass of native). The env var
-        // PIE_MXFP4_GEMM=marlin opts into the native path when weights are
-        // known to be Marlin-repacked (e.g., V4 / GPT-OSS prepacked ckpts).
-        static const bool use_marlin = [] {
-            const char* v = std::getenv("PIE_MXFP4_GEMM");
-            return (v != nullptr && std::string(v) == "marlin");
-        }();
-
-        if (use_marlin) {
-#ifdef PIE_CUDA_HAS_MARLIN
-            const std::size_t mn_bytes =
-                static_cast<std::size_t>(M) * static_cast<std::size_t>(N) * 2;
-            void* dst = (beta == 0.f) ? y : marlin_residual_scratch_(mn_bytes);
-            marlin::launch_mxfp4_gemm_w4a16_bf16(
-                act, w.data, w.scale_data, dst,
-                marlin_fp32_reduce_scratch_(), marlin_workspace_(),
-                M, N, K, stream);
-            if (beta != 0.f) {
-                kernels::launch_residual_add_bf16(
-                    y, dst,
-                    static_cast<std::size_t>(M) * static_cast<std::size_t>(N),
-                    stream);
-            }
-            return;
-#else
-            throw std::runtime_error(
-                "gemm_act_x_w[MXFP4]: PIE_MXFP4_GEMM=marlin was requested, but "
-                "the vendored marlin kernels are not built (configure with "
-                "-DPIE_CUDA_BUILD_MARLIN=ON). Unset PIE_MXFP4_GEMM to use the "
-                "dequant fallback.");
-#endif
-        }
-
-        // Fallback: dequant MXFP4 → bf16 in a scratch buffer, then bf16 GEMM.
+        // Dequant MXFP4 → bf16 in a scratch buffer, then bf16 GEMM.
         // Reuse the LtCtx dequant scratch (auto-grows monotonically). Cost is
         // one extra weight read + write per call, acceptable for prefill /
         // small-batch decode.
@@ -2648,8 +2320,7 @@ void gemm_act_x_wt_bias_bf16(
     // peeking at what it has already decided: a shape is seen for the first
     // time *during graph capture*, and a peek would miss then and bake the
     // unfused pair into the graph forever.
-    if (bias != nullptr && M == 1 && gemv_fused_bias_enabled() &&
-        gemm_autotune_enabled()) {
+    if (bias != nullptr && M == 1) {
         cudaStream_t s = nullptr;
         cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
         const Bf16LtPlan* plan = nullptr;

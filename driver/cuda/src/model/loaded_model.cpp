@@ -14,7 +14,7 @@
 #include "cuda_check.hpp"
 #include "distributed.hpp"
 #include "ops/gemm.hpp"
-#include "loader/load_plan_bridge.hpp"
+#include "loader/rust_author.hpp"
 #include "loader/load_plan_executor.hpp"
 #include "model/descriptor.hpp"
 #include "model/registry.hpp"
@@ -147,10 +147,30 @@ LoadedModel LoadedModel::load(
     };
 
     const std::filesystem::path snapshot{boot_cfg.model.snapshot_dir};
-    if (!boot_cfg.model.descriptor.empty()) {
-        // The artifact carried its model config already normalized, so there
-        // is nothing to derive here. See model/descriptor.hpp.
-        log_stage("read model descriptor begin");
+    // The model config arrives already normalized, whatever the worker was
+    // pointed at: an artifact carries a `pie.model/1` descriptor, and a plain
+    // HF snapshot is normalized into one by `worker/src/weights.rs` before any
+    // driver is created. See model/descriptor.hpp.
+    //
+    // There used to be an `else` here — `parse_hf_config`, 855 lines and 25
+    // `model_type` conditionals, reading `config.json` a second time in a
+    // second language. It is gone, so this is an error rather than a fallback:
+    // a driver with no descriptor cannot answer what the model is made of, and
+    // guessing is what produced two answers that had to agree by coincidence.
+    if (boot_cfg.model.descriptor.empty()) {
+        throw std::runtime_error(
+            "engine: model.descriptor is empty. Every boot is handed a "
+            "pie.model/1 descriptor beside its startup TOML; a hand-written "
+            "config must point `[model] descriptor` at one "
+            "(`pie model import` writes an artifact that carries it, and "
+            "`cargo run -p pie-model-config --bin descriptor config.json` "
+            "compiles one from a snapshot).");
+    }
+    log_stage("read model descriptor begin");
+    // Kept for the whole load: the compile request borrows this document
+    // rather than a struct distilled from it, so it has to outlive
+    // `prepare_load_plan_rust_author` below.
+    const std::string descriptor_json = [&] {
         std::ifstream in(boot_cfg.model.descriptor);
         if (!in) {
             throw std::runtime_error("cannot open model descriptor: " +
@@ -158,16 +178,10 @@ LoadedModel LoadedModel::load(
         }
         std::ostringstream buffer;
         buffer << in.rdbuf();
-        e.hf_ = parse_pie_model_descriptor(buffer.str());
-        log_stage("read model descriptor done");
-    } else {
-        // A snapshot that predates the artifact format. The whole of
-        // `parse_hf_config` exists for this branch, and it goes when the
-        // descriptor has been proven on real hardware.
-        log_stage("parse hf config begin");
-        e.hf_ = parse_hf_config(snapshot / "config.json");
-        log_stage("parse hf config done");
-    }
+        return buffer.str();
+    }();
+    e.hf_ = parse_pie_model_descriptor(descriptor_json);
+    log_stage("read model descriptor done");
 
     // Bind to the requested CUDA device before we allocate anything.
     int dev_id = 0;
@@ -221,14 +235,13 @@ LoadedModel LoadedModel::load(
         throw std::runtime_error("engine: failed to read checkpoint: " + open_error);
     }
 
-    // What this driver will bind, stated before anything is loaded. The row is
-    // the same one `Context` will later call `bind` on, so the contract and the
-    // binder cannot be about different models; the loader type-checks the
-    // contract against what the files contain and lowers it, but does not
-    // decide *what* to build, which is why a family it has never heard of loads
-    // exactly as well as one it has (§12 row 12).
+    // The row is the same one `Context` will later call `bind` on; whether
+    // the model is supported is answered here, before anything is loaded.
+    // What to *build* is authored on the loader's side from the request
+    // below, which is why a family this driver has never heard of fails
+    // here by name rather than deep in a load.
     const model::ArchEntry* arch = model::find_arch_entry(e.hf_.model_type);
-    if (arch == nullptr || !arch->author_contract) {
+    if (arch == nullptr) {
         throw std::runtime_error("engine: unsupported model_type '" + e.hf_.model_type +
                                  "'; no row in the arch table declares what it binds");
     }
@@ -240,27 +253,24 @@ LoadedModel LoadedModel::load(
         .head_dim = static_cast<std::uint32_t>(std::max(0, e.hf_.head_dim)),
         .mamba_groups = static_cast<std::uint32_t>(std::max(0, e.hf_.mamba_n_groups)),
     };
-    pie_loader::ModelContract contract;
+    // One author, on the far side of the request boundary: facts and policy
+    // in, plan out, the contract never crossing the ABI
+    // (`plan/model-in-rust.md` §2). The C++ author this replaced was proven
+    // byte-equal by the §8-3 differential — 17 synthetic cases, ten real
+    // checkpoints, and a dual boot on this hardware — before it was
+    // deleted.
     model::Mxfp4MoePolicy mxfp4_moe_policy = model::Mxfp4MoePolicy::RoutedDecode;
-    {
-        model::ContractBuilder builder(
-            checkpoint, facts, device_target,
-            model::resolve_runtime_quant(runtime_quant, fp8_native),
-            mxfp4_moe, component, boot_cfg.model.stream_routed_experts,
-            contract);
-        arch->author_contract(builder);
-        builder.finish();
-        mxfp4_moe_policy = builder.mxfp4_moe();
-    }
+    LoadPlanResult planned_load = prepare_load_plan_rust_author(
+        checkpoint, descriptor_json, device_target,
+        model::resolve_runtime_quant(runtime_quant, fp8_native),
+        mxfp4_moe, component, boot_cfg.model.stream_routed_experts,
+        &mxfp4_moe_policy);
 
-    // The policy is the *author's* answer, not the plan's -- and it is read
-    // back off the builder rather than recomputed, so there is one answer
-    // rather than two that have to be kept agreeing. An expert weight is MXFP4
-    // in the plan because a contract node says so, and this is the decision
-    // that node was written from.
+    // The policy is the *author's* answer, not the plan's — a family may
+    // override the device rule — and it comes back through the entry's
+    // out-parameter, so there is one answer rather than two that have to be
+    // kept agreeing.
     e.mxfp4_moe_policy_ = mxfp4_moe_policy;
-
-    LoadPlanResult planned_load = prepare_load_plan(checkpoint, contract, device_target);
     log_stage("compile LoadPlan done");
 
     log_stage("open checkpoint source begin");
@@ -297,9 +307,8 @@ LoadedModel LoadedModel::load(
     // inventory (an undeclared family demands nothing at all).
     WeightStoreBuilder(e.weights_).reserve(planned_load.planned_tensor_count);
     const auto load_view = planned_load.plan.view();
-    if (const char* dump_path =
-            std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
-        dump_path && dump_path[0] != '\0') {
+    if constexpr (false) {
+        const char* dump_path = nullptr;
         std::ofstream out(dump_path);
         if (!out) {
             throw std::runtime_error(
@@ -353,8 +362,7 @@ LoadedModel LoadedModel::load(
             std::move(planned_load.quant_attachments));
         log_stage("materialize LoadPlan begin");
         LoadExecutionStats load_memory_stats;
-        const bool sample_load_memory =
-            verbose || std::getenv("PIE_CUDA_PROFILE_LOAD_MEMORY") != nullptr;
+        const bool sample_load_memory = verbose;
         LoadMemorySampler load_memory_sampler{.stats = &load_memory_stats};
         if (sample_load_memory) {
             LoadMemorySampler::sample(&load_memory_sampler);
@@ -447,8 +455,7 @@ LoadedModel LoadedModel::load(
                   << " MiB across "
                   << materialized.cuda_memory_samples << " samples\n";
     }
-    if (const char* profile = std::getenv("PIE_LOAD_EXECUTOR_PROFILE");
-        profile != nullptr && profile[0] != '\0' && profile[0] != '0') {
+    if constexpr (false) {
         const auto to_mib = [](std::uint64_t bytes) {
             return bytes / (1024ull * 1024ull);
         };

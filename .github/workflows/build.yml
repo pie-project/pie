@@ -192,9 +192,13 @@ jobs:
           # Defined in workspace Cargo.toml. Smaller + faster than
           # plain `release` (no LTO at all by default), without fat
           # LTO's many-hour link cost. Distribution profile.
+          # `pie-bin` is the crate with the `[[bin]] name = "pie"`; `pie-worker`
+          # is a library. Building the worker here produced no binary at all,
+          # so the Package step below could only ever tar a file that did not
+          # exist.
           cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \
-            -p pie-worker \
+            -p pie-bin \
             --features ${{ matrix.target.features }}
 
       - name: Package

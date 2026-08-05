@@ -1,0 +1,15 @@
+{
+  "architectures": [
+    "LlamaForCausalLM"
+  ],
+  "hidden_size": 128,
+  "max_position_embeddings": 2048,
+  "model_type": "llama",
+  "num_attention_heads": 8,
+  "num_hidden_layers": 4,
+  "rope_scaling": {
+    "factor": 4.0,
+    "rope_type": "linear"
+  },
+  "vocab_size": 1000
+}

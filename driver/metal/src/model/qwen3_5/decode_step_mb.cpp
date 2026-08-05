@@ -531,18 +531,53 @@ void encode_prefill_dags_mb(StepEncoder& se,
         if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead &&
             d0.kind != Kernel::LmHeadUntied) {
             const int out = qmv_out_size(d0.kind, *geometry);
+            if (out == 16 && !d0.fuse_residual && mb_psos.qmv_wide_strided.valid()) {
+                constexpr int vecs = 4;
+                constexpr int lanes = 8;
+                se.set_pso(mb_psos.qmv_wide_strided);
+                se.set_argtable(d0.kind, d0.ordinal);
+                se.dispatch(
+                    Grid{32u * std::uint32_t((int(n) + vecs - 1) / vecs),
+                         2u * std::uint32_t(
+                             (out + (64 / lanes) - 1) / (64 / lanes)), 1},
+                    Threadgroup{32, 2, 1});
+                se.barrier();
+                continue;
+            }
+            // N=16 GDN projections deliberately stay matvecs. A BN16 strided
+            // GEMM replaced 768 dispatches with six, but end-to-end prefill fell
+            // from 1408 to 1396 tok/s. The wide matvec above is the intermediate
+            // primitive: five vectors reuse each decoded weight chunk without
+            // paying a matrix tile's setup.
             if (out != 0 && out % 32 == 0) {
                 const bool wide = qmm_strided_bm(strided_rows) > kQmmBM &&
                                   mb_psos.qmm_t_strided_wide.valid();
-                const Pso& gemm =
-                    wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
-                                             : mb_psos.qmm_t_strided_wide)
-                         : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
-                                             : mb_psos.qmm_t_strided);
+                const bool fp16 = mb_psos.qmm_t_strided_cast.valid() &&
+                                  mb_psos.qmm_t_strided_fp16_precast.valid();
+                const Pso& gemm = fp16
+                    ? (wide ? (d0.fuse_residual
+                                   ? mb_psos.qmm_t_strided_fp16_precast_wide_residual
+                                   : mb_psos.qmm_t_strided_fp16_precast_wide)
+                            : (d0.fuse_residual
+                                   ? mb_psos.qmm_t_strided_fp16_precast_residual
+                                   : mb_psos.qmm_t_strided_fp16_precast))
+                    : (wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
+                                                : mb_psos.qmm_t_strided_wide)
+                            : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
+                                                : mb_psos.qmm_t_strided));
                 if (gemm.valid()) {
                     Grid grid;
                     Threadgroup tg;
                     qmm_t_strided_dispatch(out, strided_rows, grid, tg);
+                    if (fp16) {
+                        se.set_pso(mb_psos.qmm_t_strided_cast);
+                        se.set_argtable(d0.kind, d0.ordinal);
+                        se.dispatch(
+                            Grid{std::uint32_t(qmv_kn(d0.kind, *geometry).K),
+                                 std::uint32_t(strided_rows), 1},
+                            Threadgroup{256, 1, 1});
+                        se.barrier();
+                    }
                     se.set_pso(gemm);
                     se.set_argtable(d0.kind, d0.ordinal);
                     se.dispatch(grid, tg);

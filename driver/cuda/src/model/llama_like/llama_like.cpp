@@ -147,14 +147,7 @@ inline const void* bf16_row(const void* base, int row, int width)
            static_cast<std::ptrdiff_t>(row) * width;
 }
 
-bool decode_full_attention_variant_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_DECODE_FULL_ATTENTION");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+bool decode_full_attention_variant_enabled() { return true; }
 
 // PIE_LORA_GROUPED: same-shape lora lanes share one grouped-GEMM launch
 // per correction GEMM instead of per-lane pairs. Default ON.

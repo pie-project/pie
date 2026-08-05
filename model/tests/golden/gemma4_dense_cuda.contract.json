@@ -1,0 +1,277 @@
+{
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "model.language_model.layers.0.router.scale",
+      "expr": {
+        "Scale": {
+          "src": {
+            "Src": "model.language_model.layers.0.router.scale"
+          },
+          "factor": {
+            "Uniform": 1040187392
+          }
+        }
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.self_attn.qkv_proj.fused.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Src": "model.language_model.layers.0.self_attn.q_proj.weight"
+            },
+            {
+              "Src": "model.language_model.layers.0.self_attn.k_proj.weight"
+            },
+            {
+              "Src": "model.language_model.layers.0.self_attn.v_proj.weight"
+            }
+          ]
+        }
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.self_attn.q_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.language_model.layers.0.self_attn.qkv_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 0,
+          "len": 64
+        }
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.self_attn.k_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.language_model.layers.0.self_attn.qkv_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 64,
+          "len": 32
+        }
+      },
+      "shape": [
+        32,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.self_attn.v_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.language_model.layers.0.self_attn.qkv_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 96,
+          "len": 32
+        }
+      },
+      "shape": [
+        32,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.gate_up_proj.fused.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Src": "model.language_model.layers.0.mlp.gate_proj.weight"
+            },
+            {
+              "Src": "model.language_model.layers.0.mlp.up_proj.weight"
+            }
+          ]
+        }
+      },
+      "shape": [
+        192,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.gate_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.language_model.layers.0.mlp.gate_up_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 0,
+          "len": 96
+        }
+      },
+      "shape": [
+        96,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.up_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.language_model.layers.0.mlp.gate_up_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 96,
+          "len": 96
+        }
+      },
+      "shape": [
+        96,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "expr": {
+        "Src": "model.embed_tokens.weight"
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.input_layernorm.weight",
+      "expr": {
+        "Src": "model.language_model.layers.0.input_layernorm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.self_attn.o_proj.weight",
+      "expr": {
+        "Src": "model.language_model.layers.0.self_attn.o_proj.weight"
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.post_attention_layernorm.weight",
+      "expr": {
+        "Src": "model.language_model.layers.0.post_attention_layernorm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.down_proj.weight",
+      "expr": {
+        "Src": "model.language_model.layers.0.mlp.down_proj.weight"
+      },
+      "shape": [
+        64,
+        96
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.norm.weight",
+      "expr": {
+        "Src": "model.norm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    }
+  ],
+  "groups": []
+}

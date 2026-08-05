@@ -3,7 +3,7 @@
 //! until every awaited lane's next FRAME is fully submitted, then seal the
 //! dense epoch and dispatch its k waves in slot order.
 //!
-//! Every deployment routes here, including `PIE_FRAME_SIZE=1`:
+//! Every deployment routes here, including k = 1:
 //! a 1-slot frame IS a wave, so k = 1 reproduces the per-wave wait-all
 //! barrier (each tracked fire arrives as its own single-fire frame; a seal
 //! boundary is a wave boundary). The former per-wave `WaitAllPolicy`
@@ -63,40 +63,43 @@
 //! `on_fire_dropped` (rejected while queued).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::stats::SchedulerStats;
 use crate::scheduler::ProcessId;
 
-/// Default run-ahead depth: one batch computing plus one prefetched.
-/// The N9 depth dose-response superseded the older depth-3 default:
-/// depth 2 reduced missing/deferred enough to win steady throughput in
-/// all three paired production-shape runs while retaining pre-enqueue.
-/// `PIE_SCHED_MAX_IN_FLIGHT` may reduce this; depth above three is
-/// intentionally capped because the CUDA driver sizes its pinned staging
-/// pools from this value (`kSchedulerMaxInFlight` in
-/// driver/cuda/src/runahead.hpp — staging depth must EXCEED run-ahead,
-/// so raising this without raising that re-serializes every submit).
-const DEFAULT_MAX_IN_FLIGHT: usize = 2;
-const MAX_IN_FLIGHT: usize = 3;
+/// Default dispatch depth (`[model.scheduler] frame_dispatch_depth`): one
+/// batch computing plus one prefetched. The N9 depth dose-response superseded
+/// the older depth-3 default: depth 2 reduced missing/deferred enough to win
+/// steady throughput in all three paired production-shape runs while retaining
+/// pre-enqueue.
+///
+/// Dispatch-time preparation is the allocation-credit gate: physical pool
+/// allocation is atomic, and an exhausted request remains a retrying
+/// preparation rather than overcommitting. Depth therefore costs committed
+/// pages, which is half of why deeper is not simply better.
+///
+/// The joint bound against the driver's staging pool
+/// (`frame_dispatch_depth * frame_size < kUploadStagingDepth`) is enforced by
+/// `SchedulerConfig::validate()`, where both factors are visible at once.
+const DEFAULT_DISPATCH_DEPTH: usize = 2;
 
-/// Reads the requested run-ahead depth once. Dispatch-time preparation is the
-/// allocation-credit gate: physical pool allocation is atomic, and an
-/// exhausted request remains a retrying preparation rather than overcommitting.
-fn parse_max_in_flight(value: Option<&str>) -> usize {
-    value
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_IN_FLIGHT)
-        .clamp(1, MAX_IN_FLIGHT)
+pub(super) fn configured_dispatch_depth() -> usize {
+    match DISPATCH_DEPTH.load(Ordering::Relaxed) {
+        0 => DEFAULT_DISPATCH_DEPTH,
+        depth => depth,
+    }
 }
 
-pub(super) fn configured_max_in_flight() -> usize {
-    static CONFIGURED: OnceLock<usize> = OnceLock::new();
-    *CONFIGURED.get_or_init(|| {
-        parse_max_in_flight(std::env::var("PIE_SCHED_MAX_IN_FLIGHT").ok().as_deref())
-    })
+/// Install the configured dispatch depth at bootstrap.
+pub(crate) fn set_dispatch_depth(depth: usize) {
+    DISPATCH_DEPTH.store(depth, Ordering::Relaxed);
 }
+
+/// `0` = never installed; see `crate::scheduler::reconfigure`.
+static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 /// The frame identity one fire carries from `forward.submit`: which lane
 /// (pipeline scope), which frame of that lane, which wave slot, and how many
@@ -438,7 +441,7 @@ impl FramePolicy {
         }
     }
 
-    /// Whether this deployment runs 1-slot frames (`PIE_FRAME_SIZE=1`):
+    /// Whether this deployment runs 1-slot frames (k = 1):
     /// a frame is a wave, and the worker synthesizes a per-fire stamp at
     /// admission instead of the guest submitting frames.
     pub fn single_slot(&self) -> bool {
@@ -454,17 +457,6 @@ impl FramePolicy {
         tokens: usize,
         rows: usize,
     ) {
-        if Self::stamp_trace() {
-            use std::sync::atomic::{AtomicU64, Ordering as O};
-            static N: AtomicU64 = AtomicU64::new(0);
-            let n = N.fetch_add(1, O::Relaxed) + 1;
-            if n % 256 == 0 {
-                eprintln!(
-                    "[stamp] n={n} k={} slot={} fires={} seq={}",
-                    self.k, stamp.slot, stamp.fires, stamp.seq
-                );
-            }
-        }
         self.record_arrival(
             stamp,
             owner,
@@ -481,17 +473,6 @@ impl FramePolicy {
     /// toward its frame's arrival completeness so the frame can seal (its
     /// surviving fires execute; the guest observed the rejection).
     pub fn on_fire_rejected_at_admission(&mut self, stamp: FrameStamp, owner: Option<ProcessId>) {
-        if Self::stamp_trace() {
-            use std::sync::atomic::{AtomicU64, Ordering as O};
-            static N: AtomicU64 = AtomicU64::new(0);
-            let n = N.fetch_add(1, O::Relaxed) + 1;
-            if n % 256 == 0 {
-                eprintln!(
-                    "[stamp] n={n} k={} slot={} fires={} seq={}",
-                    self.k, stamp.slot, stamp.fires, stamp.seq
-                );
-            }
-        }
         self.record_arrival(
             stamp,
             owner,
@@ -707,11 +688,6 @@ impl FramePolicy {
                 self.staged.insert(pid);
             }
         }
-    }
-
-    fn stamp_trace() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("PIE_FRAME_SHAPE").is_some())
     }
 
     /// Bootstrap: seed the slot balance with the execution pool's initial
@@ -1038,7 +1014,7 @@ impl FramePolicy {
     /// partition's content at an instant when no fire had executed, so a
     /// prefill-heavy boundary could only ever produce prefill-only launches
     /// (CONTENTION_FOLLOWUP §20.49). The worker posts at most
-    /// `configured_max_in_flight()` frames, so partitions beyond that were
+    /// `configured_dispatch_depth()` frames, so partitions beyond that were
     /// dispatched long after their content froze.
     ///
     /// Called only once the wait-all gate holds for a CLOSED boundary (no
@@ -1400,7 +1376,6 @@ impl FramePolicy {
             // on `churn_extreme` alone, which never reached throughput — not
             // worth a 20ms timer and an admission earmark to guess at.
             if missing > 0 {
-                let mut stalled = false;
                 if executing {
                     // An epoch is executing: its retirements re-decide and
                     // the gather continues in the background.
@@ -1411,31 +1386,12 @@ impl FramePolicy {
                     .get_or_insert(now + Duration::from_micros(STRICT_WATCHDOG_US));
                 if now >= *deadline {
                     *deadline = now + Duration::from_micros(STRICT_WATCHDOG_US);
-                    crate::scheduler::fire_timing_write(&serde_json::json!({
-                        "schema": 1,
-                        "source": "scheduler",
-                        "event": "frame_wait_watchdog",
-                        "at_us": crate::scheduler::fire_timing_now_us(),
-                        "missing_count": missing,
-                        "pending_binds": self.pending_binds.values().sum::<usize>(),
-                        "pending_slots": self.pending_slots,
-                        "departing": self.departing.len(),
-                        "joins_in_flight": self.joins_in_flight.len(),
-                        "staged": self.staged.len(),
-                        "slotted": self.slotted.len(),
-                        "awaited_lanes":
-                            self.lanes.values().filter(|lane| lane.awaited).count(),
-                    }));
-                    stalled = true;
                 }
                 let plan = FramePlan::Hold(
                     deadline
                         .saturating_duration_since(now)
                         .min(Duration::from_micros(GATHER_POLL_US)),
                 );
-                if stalled && crate::planner::trace_enabled() {
-                    println!("[frame-stall] {}", self.debug_summary());
-                }
                 return plan;
             }
             self.strict_watchdog_deadline = None;
@@ -1546,12 +1502,11 @@ mod tests {
     }
 
     #[test]
-    fn max_in_flight_configuration_is_truthful_and_safely_capped() {
-        assert_eq!(parse_max_in_flight(None), DEFAULT_MAX_IN_FLIGHT);
-        assert_eq!(parse_max_in_flight(Some("0")), 1);
-        assert_eq!(parse_max_in_flight(Some("4")), MAX_IN_FLIGHT);
-        assert_eq!(parse_max_in_flight(Some("invalid")), DEFAULT_MAX_IN_FLIGHT);
-        assert!(configured_max_in_flight() >= 1);
+    fn dispatch_depth_defaults_when_bootstrap_installs_nothing() {
+        // Nothing in this binary installs a depth, so the accessor must still
+        // hand back a usable one: a driver harness that never boots the worker
+        // config path still dispatches.
+        assert_eq!(configured_dispatch_depth(), DEFAULT_DISPATCH_DEPTH);
     }
 
     /// Density at k = 1 comes from the wait-all gate, not from a timer: two

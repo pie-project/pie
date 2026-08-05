@@ -65,8 +65,8 @@ fn pie_driver_abi_include_dir() -> PathBuf {
 /// this on their include path.
 fn pie_loader_include_dir() -> PathBuf {
     let dir = std::env::var("DEP_PIE_LOADER_INCLUDE").expect(
-        "pie-loader's build.rs did not emit cargo:include — \
-                 check that `links = \"pie_loader\"` is set in loader/Cargo.toml",
+        "pie-loader-capi's build.rs did not emit cargo:include — \
+                 check that `links = \"pie_loader\"` is set in loader/capi/Cargo.toml",
     );
     PathBuf::from(dir)
 }

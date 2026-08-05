@@ -109,16 +109,8 @@ public:
         if (slot_bytes_ < kSmallSlot) {
             copy_engine_.prefer_small_transfers();
         }
-        // A knob because prefetching is only visibly worth anything against a
-        // cold page cache, and telling whether it helped means running the
-        // same thing without it.
-        prefetch_enabled_ =
-            !loader_config::env_present("PIE_CUDA_STREAM_NO_PREFETCH");
-        // Read once, not per access: `verify_fill` is called on every hit as
-        // well as every miss, and a `getenv` there is a scan of the
-        // environment inside the forward pass.
-        verify_fills_ =
-            loader_config::env_truthy("PIE_CUDA_STREAM_VERIFY");
+        prefetch_enabled_ = true;
+        verify_fills_ = false;
         CUDA_CHECK(cudaEventCreateWithFlags(&transform_done_,
                                             cudaEventDisableTiming));
         allocate_slab();
@@ -149,10 +141,7 @@ public:
     }
 
     ~GroupStreamCache() {
-        // Also on a bare env var, not only under the boot config's verbose:
-        // measuring paging is a thing one does to an otherwise ordinary run,
-        // and the rest of verbose is a wall of load-time noise.
-        if (verbose_ || loader_config::env_truthy("PIE_CUDA_STREAM_STATS")) {
+        if (verbose_) {
             report(std::cerr);
         }
         free_slab();
@@ -849,7 +838,7 @@ private:
         // The scratch fills are not misses the operator asked for, and counting
         // them would report a page-in rate that no token paid for.
         stats_ = Stats{};
-        if (verbose_ || loader_config::env_truthy("PIE_CUDA_STREAM_STATS")) {
+        if (verbose_) {
             std::cerr << "[pie-driver-cuda] group stream cache: warmed "
                       << host_of_.size() << " host tier slots in "
                       << std::chrono::duration_cast<std::chrono::milliseconds>(

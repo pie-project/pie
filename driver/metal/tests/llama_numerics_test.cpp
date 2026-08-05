@@ -848,15 +848,17 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     MultiBatchPsos mb;
     std::string err;
     if (!build_llama_psos(ctx, kernels_dir, g, ll, &err) ||
-        !load_decode_psos(ctx, kernels_dir, base, g.quant, /*with_argmax=*/false, &err)) {
+        !load_decode_psos(ctx, kernels_dir, base, g.quant, &err)) {
         expect(false, std::string(who) + ": pipelines compiled (" + err + ")");
         return;
     }
     if (paged && !load_multibatch_psos(
-                     ctx, kernels_dir, mb, g.quant, /*with_d512=*/false, &err,
-                     /*routed=*/g.is_moe(),
-                     /*fp16_precast=*/!g.is_moe() &&
-                         g.quant.bits == 4 && g.quant.group == 64)) {
+                     ctx, kernels_dir, mb, g.quant, &err,
+                     pie::metal::MultiBatchPsoFeatures{
+                         .routed = g.is_moe(),
+                         .splitk = true,
+                         .fp16_precast = !g.is_moe() &&
+                             g.quant.bits == 4 && g.quant.group == 64})) {
         expect(false, std::string(who) + ": multi-batch pipelines compiled (" + err + ")");
         return;
     }

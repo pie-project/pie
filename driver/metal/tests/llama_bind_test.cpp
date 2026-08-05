@@ -141,14 +141,14 @@ int declared_slots(Kind k, bool paged = false) {
         // q, k, v, out, n, gqa, scale, and the four strides.
         case Kind::Sdpa:
             return 11;
-        // gate, up, out, width.
+        // gate, up, out.
         case Kind::SiluMul:
         case Kind::ExpertSiluMul:
-            return 4;
-        // x, residual, out, width.
+            return 3;
+        // x, residual, out.
         case Kind::AttnResidual:
         case Kind::FfnResidual:
-            return 4;
+            return 3;
         // logits, ids, weights, params.
         case Kind::RouterTopK:
             return 4;

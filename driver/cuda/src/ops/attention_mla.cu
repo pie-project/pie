@@ -59,10 +59,6 @@ namespace {
 
 bool mla_use_naive_backend() {
     static const int choice = [] {
-        if (const char* e = std::getenv("PIE_MLA_BACKEND")) {
-            if (std::strcmp(e, "naive") == 0) return 1;
-            if (std::strcmp(e, "fa2") == 0) return 0;
-        }
         int dev = 0;
         cudaGetDevice(&dev);
         int major = 0;

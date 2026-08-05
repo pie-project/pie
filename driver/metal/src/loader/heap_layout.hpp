@@ -99,6 +99,9 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
     // widest intermediate projection output.
     int widest = g.intermediate;                 // MLP gate/up out
     widest = widest > g.gdn_conv_dim ? widest : g.gdn_conv_dim;   // GDN in-proj out
+    const int gdn_prep_elems =
+        2 * (2 * g.gdn_v_heads + g.gdn_v_heads * g.gdn_v_dim);
+    widest = widest > gdn_prep_elems ? widest : gdn_prep_elems;
     widest = widest > g.n_q_heads * g.head_dim ? widest : g.n_q_heads * g.head_dim; // q
     // The sealed M=1 allocation stays byte-identical.  Paged fires store
     // token-major [max_tokens,width] activations in the same colored buffers.

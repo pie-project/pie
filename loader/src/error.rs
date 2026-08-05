@@ -94,22 +94,6 @@ impl From<ztensor::Error> for Error {
     }
 }
 
-#[cfg(test)]
-mod ztensor_conversion {
-    use super::*;
-
-    /// The two zTensor outcomes a caller must be able to tell apart across the
-    /// C ABI, where only the code survives.
-    #[test]
-    fn unsupported_survives_as_unsupported() {
-        let unfamiliar = ztensor::Error::Unsupported("layout \"x.future/1\"".into());
-        assert_eq!(Error::from(unfamiliar).code(), 4);
-
-        let broken = ztensor::Error::NotFound("tensor \"w\"".into());
-        assert_eq!(Error::from(broken).code(), 3);
-    }
-}
-
 /// Every fallible step in the loader answers with this.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -146,5 +130,21 @@ impl<T> OrOverflow<T> for Option<T> {
 impl<T> OrOverflow<T> for std::result::Result<T, std::num::TryFromIntError> {
     fn or_overflow(self, message: impl Into<String>) -> Result<T> {
         self.map_err(|_| Error::Overflow(message.into()))
+    }
+}
+
+#[cfg(test)]
+mod ztensor_conversion {
+    use super::*;
+
+    /// The two zTensor outcomes a caller must be able to tell apart across the
+    /// C ABI, where only the code survives.
+    #[test]
+    fn unsupported_survives_as_unsupported() {
+        let unfamiliar = ztensor::Error::Unsupported("layout \"x.future/1\"".into());
+        assert_eq!(Error::from(unfamiliar).code(), 4);
+
+        let broken = ztensor::Error::NotFound("tensor \"w\"".into());
+        assert_eq!(Error::from(broken).code(), 3);
     }
 }

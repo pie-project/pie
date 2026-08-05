@@ -358,12 +358,8 @@ void dsv4_forward_paged(
     // takes host wall-clock around each stage with no sync, giving the
     // *submit* cost — the two answer different questions, and DSV4 decode
     // is submit-bound, so both are needed.
-    static const int prof_mode = [] {
-        const char* v = std::getenv("PIE_DSV4_PROFILE");
-        return (v == nullptr || v[0] == '\0') ? 0 : std::atoi(v);
-    }();
-    const bool prof_on = prof_mode == 1;
-    const bool prof_host = prof_mode == 2;
+    constexpr bool prof_on = false;
+    constexpr bool prof_host = false;
     static std::vector<std::pair<std::string, double>> prof_acc;
     static int prof_steps = 0;
     static std::chrono::steady_clock::time_point ph_a;
@@ -422,11 +418,7 @@ void dsv4_forward_paged(
     // D2H of `positions`, no host compaction, no blocking H2D — which is what
     // makes the layer capturable into a CUDA graph. Everything else keeps the
     // host path, where compaction is worth the sync because N can be large.
-    static const bool dev_boundary = [] {
-        const char* v = std::getenv("PIE_DSV4_DEV_BOUNDARY");
-        return v == nullptr || v[0] != '0';
-    }();
-    const bool decode_only = dev_boundary && (N == num_requests) && N > 0;
+    const bool decode_only = (N == num_requests) && N > 0;
 
     auto comp_boundaries = [&](int ratio) -> const CompBoundaries& {
         for (auto& kv : comp_boundary_cache) {
@@ -551,11 +543,7 @@ void dsv4_forward_paged(
     // CUDA-graph capture region. The naive fallback kernel this replaces
     // walked the KV scalar-wise (one `load_kv_scalar` call per element per
     // query head) and cost ~65% of the whole step.
-    static const bool swa_force_naive = [] {
-        const char* v = std::getenv("PIE_DSV4_NAIVE_SWA");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    const bool swa_use_flashinfer = !swa_force_naive && ws.swa_plan_valid;
+    const bool swa_use_flashinfer = ws.swa_plan_valid;
     prof_end("swa_plan");
     prof_beg();
     // TP all-reduce helper (safe: no-op when tp_comm is null)

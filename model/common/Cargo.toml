@@ -1,0 +1,33 @@
+[package]
+name = "pie-model-common"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "What every model generation shares: the contract-authoring DSL, the chat vocabulary, and nothing about any one model."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_model_common"
+path = "src/lib.rs"
+
+[features]
+# The same two aspects the generation crates carry, for the same reason: a
+# consumer links only what it reads. The loader's C ABI builds with `contract`
+# alone, so a driver link never sees the tokenizer or the image decoders.
+default = []
+chat = ["dep:pie-tokenizer", "dep:anyhow", "dep:serde_json", "dep:image"]
+contract = ["dep:pie-loader", "dep:pie-model-config", "dep:serde_json"]
+
+[dependencies]
+pie-tokenizer = { path = "../../runtime/tokenizer", optional = true }
+# The descriptor's schema: `ModelFacts` is a projection of a `pie.model/1`
+# document, and this crate owns that document's shape.
+pie-model-config = { path = "../config", optional = true }
+# `default-features = false` drops the loader's testkit half — the authoring
+# side needs the algebra, never the host executor.
+pie-loader = { path = "../../loader", default-features = false, optional = true }
+anyhow = { version = "1.0", optional = true }
+serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
+# Host-side media decode for the model-agnostic multimodal API.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"], optional = true }

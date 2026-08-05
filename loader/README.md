@@ -3,28 +3,34 @@
 Typed weight-loading compiler: checkpoints to verified device-memory layouts.
 
 ```text
-model contract  ──compile──▶  load plan  ──C ABI──▶  driver executes
-(what a driver     (the bytes to move,     (pie_loader.h,
- declares it        where, in what          generated)
- needs)             order)
+model request  ──author──▶  model contract  ──compile──▶  load plan  ──C ABI──▶  driver executes
+(facts + policy,   (what the model         (the bytes to move,       (pie_loader.h,
+ ~20 scalars)       needs, as expressions   where, in what            generated)
+                    over the checkpoint)    order)
 ```
 
-`plan = compile(source_facts, contract, target)`. None of the three inputs is a
-model's name — the driver declares what it needs as a contract over the
-checkpoint's byte space, the loader reads the checkpoint's own metadata, and the
-target carries the numbers a device measured.
+`plan = compile(source_facts, author(facts, source, policy), target)`. The
+contract is internal IR: it is authored from the driver's request
+(`pie_model::contract`, `plan/model-in-rust.md`), compiled, and dropped in one
+call, never crossing the ABI. The compiler itself stays family-blind — none of
+its inputs is a model's name; the request's `model_type` is spent selecting the
+author, the loader reads the checkpoint's own metadata, and the target carries
+the numbers a device measured.
 
 ## Build and check
 
 ```sh
-cargo test -p pie-loader                     # 247 tests, no GPU needed
+cargo test -p pie-loader -p pie-loader-capi  # the compiler and its C ABI, no GPU needed
 cargo clippy -p pie-loader --all-targets
-cargo run -p pie-loader-cbindgen             # regenerate include/pie_loader.h
+cargo run -p pie-loader-cbindgen             # regenerate capi/include/pie_loader.h
 UPDATE_GOLDEN=1 cargo test -p pie-loader --test golden_plans
 ```
 
-The generated header is committed. Regenerating it must leave it byte-identical
-unless the ABI changed on purpose; `driver/{cuda,metal}` compile against it.
+Two crates: `pie-loader` is the compiler and knows nothing of C;
+`pie-loader-capi` (`capi/`) is the repr(C) marshalling, the extern entry
+points, the `pie-loader` CLI, and the committed header. Regenerating the
+header must leave it byte-identical unless the ABI changed on purpose;
+`driver/{cuda,metal}` compile against it.
 
 ## The tool
 
@@ -66,7 +72,7 @@ contract), and quantized *output* encodings outside {MXFP4, FP8, INT8}
 Four optional positional arguments follow, in order: `BACKEND` (`cuda`|`metal`|
 `host`), `FUSION` (`fused`|`unfused`), `TP` (`RANK/SIZE`), and a JSON
 `StorageTarget`. `CONTRACT` is a JSON `ModelContract` — see
-`tests/golden/contracts/`. `PIE_LOAD_PLANNER_DEBUG=1` prints per-pass timings.
+`tests/golden/contracts/`.
 
 ## Design documents
 

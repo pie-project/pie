@@ -35,7 +35,7 @@
 
 #include "loader/heap_bind_metal.hpp"
 #include "batch/forward.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/llama/encode.hpp"
 #include "model/llama/geometry.hpp"
 #include "model_facts.hpp"

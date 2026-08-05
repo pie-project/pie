@@ -207,6 +207,10 @@ impl WorkerHandle {
             WorkerKind::Decode(engine) => engine.shutdown().await,
             WorkerKind::Executor(executor) => executor.shutdown().await,
         }
+        // The startup TOMLs under `$PIE_HOME/standalone/<pid>` are read once at
+        // driver creation and never again, so they are dead the moment the
+        // drivers are down. The boot sweep covers the unclean exits.
+        crate::embedded_driver::remove_launch_state();
     }
 }
 
@@ -258,8 +262,9 @@ pub async fn run_with<C: ControlLink>(
     cfg: config::Config,
     control: C,
     gateways: Vec<String>,
+    client_edge: Option<String>,
 ) -> Result<WorkerHandle> {
-    let engine = start_engine_embedded(cfg, control, gateways).await?;
+    let engine = start_engine_embedded(cfg, control, gateways, client_edge).await?;
     Ok(WorkerHandle {
         inner: WorkerKind::Decode(engine),
     })
@@ -305,19 +310,24 @@ impl StartupBanner {
         ];
         let label_width = 12;
         let header = "─ Pie Engine ";
+        // Character counts, not `str::len()`. `header` opens with `─` (U+2500,
+        // three bytes), so its byte length is 15 against 13 columns -- the top
+        // border came out two dashes short of every other line. Rust's format
+        // width counts characters, so byte lengths cannot be mixed with it.
+        let header_cols = header.chars().count();
         let content_width = rows
             .iter()
-            .map(|(_, value)| label_width + 1 + value.len())
+            .map(|(_, value)| label_width + 1 + value.chars().count())
             .max()
             .unwrap_or(0)
-            .max(header.len() - 2);
+            .max(header_cols - 2);
         let inner_width = content_width + 2;
         let mut out = String::new();
 
         out.push_str(&format!(
             "╭{}{}╮\n",
             header,
-            "─".repeat(inner_width - header.len())
+            "─".repeat(inner_width - header_cols)
         ));
         for (label, value) in rows {
             let content = format!("{label:<label_width$} {value}");
@@ -353,9 +363,10 @@ struct LoadedModelDrivers {
     encode_identity: pie_driver_abi::ModelIdentity,
     kv_handle: Option<pie_driver_abi::KvHandle>,
     drivers: ModelDrivers,
-    /// The artifact's compiled metadata, read once while resolving the model.
-    /// `None` for a legacy snapshot.
-    artifact: Option<pie_model::ArtifactMetadata>,
+    /// The model's compiled metadata, read once while resolving it. Present
+    /// for either input form: an artifact carries the descriptor, a snapshot's
+    /// `config.json` is normalized into one.
+    metadata: pie_model::ModelMetadata,
 }
 
 struct LoadedPartnerMetadata {
@@ -491,7 +502,37 @@ fn load_model_drivers(
     user_cfg: &config::Config,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<LoadedModelDrivers> {
-    let mut artifact: Option<pie_model::ArtifactMetadata> = None;
+    // Process housekeeping, once per boot and before anything writes under
+    // `$PIE_HOME/standalone/<pid>`: reclaim the directories left by launches
+    // that did not exit cleanly.
+    crate::embedded_driver::sweep_stale_launch_state();
+
+    // Every driver-side disk cache derives from this. Resolved here because
+    // `$PIE_HOME` is the worker layer's to know; the driver has never been
+    // told it, which is the only reason those caches used to sit under XDG.
+    crate::embedded_driver::set_cache_dir(
+        crate::state::driver_cache_dir()
+            .to_string_lossy()
+            .into_owned(),
+    );
+
+    // Resolve the weight-artifact directory here, before any driver startup
+    // TOML is written. `$PIE_HOME` is this layer's to know: the driver has
+    // never been told it, which is why the old env-var form fell back to XDG.
+    let weight_cache_dir = if user_cfg.model.weight_cache_dir.is_empty() {
+        // Under `cache/`, not `models/`. `models/` is the artifact store now,
+        // and these are the opposite kind of thing: device bytes for one
+        // driver, one TP layout and one ABI version, rebuilt by a single cold
+        // load. Sharing a directory left `.weights` files sitting in a store
+        // that scans for `.zt` and silently ignored them, while `pie cache`
+        // reported their size under the store's name.
+        crate::state::weight_cache_dir().to_string_lossy().into_owned()
+    } else {
+        user_cfg.model.weight_cache_dir.clone()
+    };
+    crate::embedded_driver::set_weight_cache_dir(weight_cache_dir);
+
+    let mut metadata: Option<pie_model::ModelMetadata> = None;
     let (driver_groups, snapshot_dir) = {
         let m = &user_cfg.model;
         let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;
@@ -521,14 +562,22 @@ fn load_model_drivers(
         let ResolvedFlavor::Embedded(flavor) = resolved;
         let mut embedded_base_opts = preflight::build_embedded_options(m, flavor)?;
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
+        apply_embedded_calibration(
+            &mut embedded_base_opts,
+            user_cfg.server.calibrate_planner,
+        );
         let resolved_model = weights::resolve(&m.model)
             .with_context(|| format!("resolving the model for {:?}", m.name))?;
-        // Opened once, here. The drivers get the compiled model config beside
-        // their startup TOML; the runtime gets the whole of it. Neither
-        // re-opens the artifact, and neither re-decides what it is.
-        artifact = resolved_model
+        // Lifted once, here, in one open. The drivers get the compiled model
+        // config beside their startup TOML; the runtime gets the whole of it.
+        // Nobody downstream re-opens the artifact or re-decides what it is —
+        // and for a snapshot, nobody re-parses `config.json`, which is what
+        // this one call replaced on both sides.
+        let lifted = resolved_model
             .metadata()
-            .with_context(|| format!("reading the artifact for {:?}", m.name))?;
+            .with_context(|| format!("reading the model metadata for {:?}", m.name))?;
+        let descriptor = lifted.descriptor.clone();
+        metadata = Some(lifted);
         let snapshot_dir = resolved_model.path().to_path_buf();
         let mut group_drivers: Vec<GroupDriver> = Vec::with_capacity(topology.len());
         for (group_idx, group) in topology.iter().enumerate() {
@@ -539,7 +588,7 @@ fn load_model_drivers(
                 flavor,
                 &embedded_base_opts,
                 &snapshot_dir,
-                artifact.as_ref().map(|a| a.descriptor.as_slice()),
+                &descriptor,
                 tp_degree,
                 component,
             )?);
@@ -567,7 +616,9 @@ fn load_model_drivers(
         *blake3::hash(user_cfg.model.model.as_bytes()).as_bytes()
     };
     Ok(LoadedModelDrivers {
-        artifact,
+        // Set in the block above, which is the only path that reaches here:
+        // a model that could not be resolved never got as far as a driver.
+        metadata: metadata.expect("the model was resolved before its drivers were created"),
         model: user_cfg.model.name.clone(),
         full_identity: model_identity(
             user_cfg,
@@ -602,10 +653,10 @@ async fn boot_engine(
         encode_identity,
         kv_handle,
         drivers,
-        artifact,
+        metadata,
     } = load_model_drivers(user_cfg, pie_driver_abi::ModelComponent::Full)?;
 
-    let boot_cfg = translate::build(user_cfg, drivers, artifact)
+    let boot_cfg = translate::build(user_cfg, drivers, metadata)
         .context("translating to bootstrap::Config")?;
 
     let boot = pie_engine::bootstrap::bootstrap(boot_cfg)
@@ -737,6 +788,7 @@ pub async fn start_engine_embedded<C: ControlLink>(
     user_cfg: config::Config,
     control: C,
     gateways: Vec<String>,
+    client_edge: Option<String>,
 ) -> Result<EngineHandle> {
     let (model, caps, partner_metadata, runtime) = boot_engine(&user_cfg).await?;
     let partner_bootstrap = build_partner_bootstrap(&user_cfg, partner_metadata, runtime.model_idx);
@@ -753,7 +805,13 @@ pub async fn start_engine_embedded<C: ControlLink>(
         partner_bootstrap,
     )
     .await?;
-    let url = edge_server.url();
+    // `edge_server.url()` reports the address the worker DIALED -- the
+    // gateway's worker-facing listener. In standalone that is an ephemeral port
+    // that speaks the worker protocol, so advertising it told the user to point
+    // their client at a socket no client can use, and at a different (random)
+    // port on every boot. The composition root knows the real client edge, so it
+    // passes it; the dial-in listing is only right when nobody knows better.
+    let url = client_edge.unwrap_or_else(|| edge_server.url());
     log_serving(&user_cfg, &url);
     Ok(EngineHandle {
         url,
@@ -800,7 +858,7 @@ fn build_partner_bootstrap(
         transfer: user_cfg.offload.transfer,
         model_idx,
         page_size: metadata.page_size,
-        request_timeout_secs: user_cfg.model.scheduler.request_timeout_secs,
+        request_timeout_secs: user_cfg.model.scheduler.request_timeout.as_secs(),
         max_outstanding: user_cfg.offload.max_outstanding_per_partner,
     })
 }
@@ -951,7 +1009,7 @@ fn create_driver_group(
     flavor: Flavor,
     base_opts: &DriverOptions,
     snapshot_dir: &Path,
-    descriptor: Option<&[u8]>,
+    descriptor: &[u8],
     tp_degree: usize,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<GroupDriver> {
@@ -1014,6 +1072,23 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
         }
         other => other.clone(),
     }
+}
+
+/// Carry a calibration request from the in-memory config onto the driver
+/// options, the same way `verbose` travels.
+///
+/// CUDA only, because it is the only driver with a memory planner to calibrate.
+/// A request against any other driver is silently nothing rather than an error:
+/// the caller asked for a measurement this backend does not have, and refusing
+/// the boot over it would be worse than doing the ordinary thing.
+fn apply_embedded_calibration(options: &mut DriverOptions, calibrate: bool) {
+    #[cfg(feature = "driver-cuda")]
+    if let DriverOptions::CudaNative(opts) = options {
+        opts.calibrate_planner = calibrate;
+    }
+
+    #[cfg(not(feature = "driver-cuda"))]
+    let _ = (options, calibrate);
 }
 
 fn apply_embedded_verbose(options: &mut DriverOptions, verbose: bool) {
@@ -1089,6 +1164,39 @@ mod tests {
         assert!(rendered.contains("Device"));
         assert!(rendered.contains("✓ Server ready at ws://127.0.0.1:8080"));
         assert!(!rendered.contains("internal token"));
+    }
+
+    /// The box lines up.
+    ///
+    /// It did not: `content_width` and the top border's dash count were taken
+    /// from `str::len()` (bytes) while `format!`'s width pads by characters,
+    /// and `"─ Pie Engine "` opens with a three-byte `─`. The top border came
+    /// out two columns short of the rows beneath it. A short model name hides
+    /// it (the header is not the widest line), so the case that matters is a
+    /// long one.
+    #[test]
+    fn startup_banner_box_is_aligned() {
+        for model in [
+            "default (Qwen/Qwen3-0.6B)",
+            "default (mlx-community/Qwen3.5-0.8B-4bit)",
+            "d",
+        ] {
+            let banner = StartupBanner {
+                model: model.to_string(),
+                driver: "metal".to_string(),
+                device: "metal:0".to_string(),
+            };
+            let rendered = banner.render("ws://127.0.0.1:8080");
+            let widths: Vec<usize> = rendered
+                .lines()
+                .take_while(|l| !l.is_empty())
+                .map(|l| l.chars().count())
+                .collect();
+            assert!(
+                widths.windows(2).all(|w| w[0] == w[1]),
+                "unaligned for {model:?}: {widths:?}\n{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -1169,11 +1277,9 @@ mod tests {
             name = "test"
             model = "local"
 
-            [model.driver]
+            [driver]
             type = "dummy"
             device = ["cpu"]
-
-            [model.driver.options]
             vocab_size = 32
             arch_name = "dummy"
             "#,

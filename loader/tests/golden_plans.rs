@@ -26,18 +26,16 @@ use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::contract::ModelContract;
-use pie_loader::ffi::contract::read_contract;
-use pie_loader::ffi::view::verify_marshalled;
 use pie_loader::plan::compile as compile_load_plan;
 use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
     compiler_version,
 };
-use pie_loader::testkit::contract_writer::write_contract;
 use pie_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
 use pie_loader::verify::ContractView;
+use pie_loader_capi::view::verify_marshalled;
 
 // ── the checkpoints ─────────────────────────────────────────────────
 
@@ -389,9 +387,9 @@ fn contract_fixture(name: &str) -> ModelContract {
     let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
         panic!(
             "{name}: cannot read {}: {err}\n\
-             A new golden needs a contract next to it. Author one the way a \
-             driver does — `driver/*/src/model/*/*_contract.hpp` \
-             can dump the real thing under PIE_TEST_CONTRACT_DUMP — or write the \
+             A new golden needs a contract next to it. Author one the way \
+             production does — a `pie_model::contract` author can be dumped \
+             as JSON from `model/tests/family_contracts.rs` — or write the \
              expression out by hand.",
             path.display()
         )
@@ -449,7 +447,6 @@ fn check_stats_render(name: &str, plan: &LoadPlan) {
 /// verify before it is allowed to become golden is what stops that.
 fn check(name: &str, metadata: &CheckpointMetadata, target: StorageTarget) {
     let contract = contract_fixture(name);
-    check_contract_survives_the_ffi(name, &contract);
     let plan = compile_load_plan(metadata, &contract, target)
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
 
@@ -502,32 +499,6 @@ fn check(name: &str, metadata: &CheckpointMetadata, target: StorageTarget) {
     );
 }
 
-/// Round-trip the contract through the POD form the C++ builder emits.
-///
-/// This is the safety net for moving authorship out of `arch/` and into the
-/// drivers. The migration's claim is that a family's contract can be written by
-/// hand in C++ and produce the identical plan; that claim is only checkable if
-/// the FFI representation is known to be lossless for every construct the real
-/// families use. Asserting it here, on every golden, means each family covers
-/// its own constructs — the MXFP4 repacks, the fused QKV `Concat`, the `Out`
-/// aliases into a bank, the strided GPTQ slices — instead of on a synthetic
-/// expression that happens to use the ones someone thought of.
-///
-/// Equality is on the whole `ModelContract`, not on the plan it compiles to. A
-/// weaker check would pass for a lossy encoding whose loss happened not to
-/// change this particular plan.
-fn check_contract_survives_the_ffi(name: &str, contract: &ModelContract) {
-    let owned = write_contract(contract);
-    let read = unsafe { read_contract(&owned.view()) }
-        .unwrap_or_else(|err| panic!("{name}: the contract does not read back: {err}"));
-    assert_eq!(
-        &read,
-        contract,
-        "{name}: the contract changed crossing the FFI ({} nodes)",
-        owned.node_count()
-    );
-}
-
 /// Execute the plan, when this backend's plan is one the host executor can run.
 ///
 /// A plan can be self-consistent, honour its contract, and match its golden
@@ -542,9 +513,8 @@ fn replay(name: &str, plan: &LoadPlan, metadata: &CheckpointMetadata) {
         return;
     }
     let snapshot = PathBuf::from(&metadata.files[0].path);
-    let storage =
-        pie_loader::testkit::host_executor::execute_plan(plan, snapshot.parent().unwrap())
-            .unwrap_or_else(|err| panic!("{name}: the plan does not execute: {err}"));
+    let storage = pie_loader::executor::host::execute_plan(plan, snapshot.parent().unwrap())
+        .unwrap_or_else(|err| panic!("{name}: the plan does not execute: {err}"));
     for tensor in &plan.tensors {
         let materialized = storage
             .tensors

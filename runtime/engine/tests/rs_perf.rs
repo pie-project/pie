@@ -21,7 +21,7 @@
 //!   PIE_BENCH_DELAY_MS  simulated device latency (default 4)
 //!   PIE_BENCH_LANES     concurrent processes (default 1)
 //!   PIE_BENCH_DENSE     extra dense (no-RS) `generate` lanes (default 0)
-//!   PIE_FRAME_SIZE      k (default 1)
+//!   PIE_BENCH_FRAME_SIZE  k (default 2, the config default)
 //!
 //! It prints one `BENCH ...` line of `key=value` pairs on stdout.
 //!
@@ -44,7 +44,7 @@
 //! rejected outright): k=1 103.8 -> k=2 92.9 -> k=3 87.7 ms, i.e. -15.5%.
 //!
 //! The run-ahead depth lever was DEAD for recurrent workloads before: the old
-//! engine measures flat across `PIE_SCHED_MAX_IN_FLIGHT` 1/2/3 (195-224 ms at
+//! engine measures flat across dispatch depth 1/2/3 (195-224 ms at
 //! 8 lanes) because the barrier pinned every RS lane to depth 1. It is live
 //! now (155/255/263 ms), which also means RS workloads inherit the wait-all
 //! scheduler's known depth behaviour: in a FULLY BATCHED, zero-headroom fleet
@@ -52,8 +52,9 @@
 //! That is pre-existing and RS-independent — the unmodified engine on a
 //! PURE-ATTENTION model measures the same 610 -> 1034 ms going from depth 1 to
 //! 2, and at matched depth 1 the two engines are identical (601-624 vs
-//! 578-613 ms). `PIE_SCHED_MAX_IN_FLIGHT` is the deployment lever; its default
-//! of 2 was tuned on real hardware, where run-ahead has headroom to exploit.
+//! 578-613 ms). `[model.scheduler] frame_dispatch_depth` is the deployment
+//! lever; its default of 2 was tuned on real hardware, where run-ahead has
+//! headroom to exploit.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -166,6 +167,9 @@ fn bench() -> &'static Bench {
         } else {
             env
         };
+        // A harness parameter that selects an arm, not engine config: k
+        // reaches the engine through `[model.scheduler] frame_size` below.
+        let env = env.with_frame_size(env_usize("PIE_BENCH_FRAME_SIZE", 2) as u32);
         let config = env.config();
         rt.block_on(async {
             pie_engine::bootstrap::bootstrap(config).await.unwrap();

@@ -46,6 +46,28 @@ impl Origin {
     }
 }
 
+/// Resolve which config file a CLI command should read or write, by the same
+/// order the engine uses: `--config`, then `$PIE_CONFIG`, then the
+/// `$PIE_HOME` default.
+///
+/// Public because `pie config` needs the same answer the engine gets. It used
+/// to resolve its own path from `$PIE_HOME` alone, so `pie --config other.toml
+/// config show` printed the default file -- the flag was accepted, initialised
+/// and ignored. Three other commands had their own copies with the same defect;
+/// this is deliberately the only implementation, so a fifth cannot appear
+/// quietly.
+pub fn cli_config_path(global: &GlobalArgs) -> (PathBuf, Origin) {
+    if let Some(flag) = global.config.as_deref() {
+        return (PathBuf::from(flag), Origin::Flag);
+    }
+    if let Ok(env) = std::env::var("PIE_CONFIG")
+        && !env.trim().is_empty()
+    {
+        return (PathBuf::from(env), Origin::Env);
+    }
+    (paths::pie_home_file("config.toml"), Origin::Default)
+}
+
 /// Resolve *which* config file this role would read, without touching the disk.
 pub(crate) fn resolve_path(spec: &BootSpec, global: &GlobalArgs) -> (PathBuf, Origin) {
     if let Some(flag) = global.config.as_deref() {

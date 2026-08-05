@@ -533,7 +533,15 @@ struct HfConfig {
     int qwen3_vl_vision_end_token_id = -1;
 };
 
-// Parse `<snapshot_dir>/config.json`. Throws on missing required fields.
-HfConfig parse_hf_config(const std::filesystem::path& path);
+// `parse_hf_config` used to be declared here, and `config.cpp` was its 855-line
+// implementation. Both are gone: `config.json` is normalized once, in Rust, at
+// import (or by the worker for a plain snapshot), and what a driver reads is
+// the `pie.model/1` descriptor — see `model/descriptor.hpp`.
+//
+// This header stays because the struct above is the *schema*, not the parser.
+// Three things generate from it: `descriptor.cpp` (the reader),
+// `model/config/src/schema.rs` (the Rust normalizer's output type), and
+// the golden dumper in `tests/hf_config_dump/`. Adding a field here is still
+// how a new fact reaches the driver; deriving it from raw HF JSON is not.
 
 }  // namespace pie_cuda_driver

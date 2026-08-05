@@ -42,12 +42,13 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser = argparse.ArgumentParser(description=description)
     parser.addoption = parser.add_argument  # convenience alias
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
-    parser.add_argument("--device", default="cuda:0", help="Device(s), comma-separated")
+    parser.add_argument("--device", default=None,
+                        help="Device(s), comma-separated. Default: 'metal:0' for --driver metal, else 'cuda:0'")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per inferlet (seconds)")
     parser.add_argument("--verbose", action="store_true", help="Show stdout on failure")
     driver_group = parser.add_mutually_exclusive_group()
-    driver_group.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "tensorrt_llm", "dummy", "cuda_native"],
-                              help="Inference driver: 'dev', 'vllm', 'sglang', 'tensorrt_llm', 'dummy', or 'cuda_native'")
+    driver_group.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "tensorrt_llm", "dummy", "cuda_native", "metal"],
+                              help="Inference driver: 'dev', 'vllm', 'sglang', 'tensorrt_llm', 'dummy', 'cuda_native', or 'metal'")
     driver_group.add_argument("--dummy", action="store_true",
                               help="Alias for --driver dummy")
     parser.add_argument("--vllm-attention-backend", default=None,
@@ -186,7 +187,10 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         DriverConfig,
     )
 
-    device = [d.strip() for d in args.device.split(",")] if "," in args.device else args.device
+    raw_device = args.device
+    if raw_device is None:
+        raw_device = "metal:0" if args.driver == "metal" else "cuda:0"
+    device = [d.strip() for d in raw_device.split(",")] if "," in raw_device else raw_device
     if isinstance(device, str):
         device = [device]
 

@@ -1,0 +1,93 @@
+{
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "backbone.embed_tokens.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "backbone.embed_tokens.weight"
+          },
+          "to": {
+            "Raw": "BF16"
+          }
+        }
+      },
+      "shape": [
+        64,
+        32
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "backbone.layers.0.mlp.w1.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "backbone.layers.0.mlp.w1.weight"
+          },
+          "to": {
+            "Raw": "BF16"
+          }
+        }
+      },
+      "shape": [
+        48,
+        32
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "backbone.norm.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "backbone.norm.weight"
+          },
+          "to": {
+            "Raw": "BF16"
+          }
+        }
+      },
+      "shape": [
+        32
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "depth_decoder.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "depth_decoder.weight"
+          },
+          "to": {
+            "Raw": "BF16"
+          }
+        }
+      },
+      "shape": [
+        32,
+        32
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    }
+  ],
+  "groups": []
+}

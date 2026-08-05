@@ -24,17 +24,10 @@ NemotronHModel::NemotronHModel(
     fwd_cfg_.tp_size = tp_size;
     fwd_cfg_.tp_comm = tp_comm;
 
-    // CUDA graphs are opt-in for Nemotron-H: the Mamba/MoE paths trade
-    // graph stability for first-fire capture overhead today, and the
-    // current graph replay was measured slower on this model in nsys.
-    // PIE_NEMOTRON_ENABLE_CUDA_GRAPHS=1 brings it back when the kernel
-    // story stabilizes.
-    const char* graphs_env = std::getenv("PIE_NEMOTRON_ENABLE_CUDA_GRAPHS");
-    caps_.graph_safe =
-        kv_cache_.format().is_native_bf16() &&
-        graphs_env != nullptr &&
-        graphs_env[0] != '\0' &&
-        graphs_env[0] != '0';
+    // CUDA graphs are off for Nemotron-H: the Mamba/MoE paths trade graph
+    // stability for first-fire capture overhead today, and the current graph
+    // replay was measured slower on this model in nsys.
+    caps_.graph_safe = false;
     caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
 }

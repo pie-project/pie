@@ -53,75 +53,9 @@ inline bool uses_gemma_rmsnorm(const HfConfig& cfg) {
     return cfg.model_type != "qwen3_moe";
 }
 
-bool qwen35_moe_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
 
-std::uint64_t qwen35_moe_profile_print_limit() {
-    static const std::uint64_t limit = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{8};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return limit;
-}
 
-bool qwen35_moe_profile_all_ranks() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_PROFILE_ALL_RANKS");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool mtp_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_MTP_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-std::uint64_t mtp_profile_print_limit() {
-    static const std::uint64_t limit = [] {
-        const char* v = std::getenv("PIE_MTP_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{8};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return limit;
-}
-
-int qwen35_gdn_cached_prefill_max_tokens() {
-    static const int max_tokens = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 0;
-        return std::max(0, std::atoi(v));
-    }();
-    return max_tokens;
-}
-
-int qwen35_gdn_warp_tiled_max_tokens() {
-    static const int max_tokens = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_MAX_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 64;
-        return std::max(0, std::atoi(v));
-    }();
-    return max_tokens;
-}
-
-bool moe_path_log_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_MOE_PATH_LOG");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr int kQwen35GdnWarpTiledMaxTokens = 64;
 
 // Every block is one entry of a batched GEMM and reads a whole expert
 // weight, and a block belongs to exactly one expert — so the row count
@@ -160,14 +94,6 @@ bool moe_path_log_enabled() {
 // and would want the shared expert folded in as well.
 // Skips the padding blocks that the static batch-count bound forces on the
 // cuBLAS path. On by default; set to 0 to fall back to cuBLAS.
-bool moe_grouped_gemm_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_GROUPED_GEMM");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
 
 // flashinfer's CUTLASS grouped MoE. It takes unpermuted rows plus the topk
 // indices/scales and does permute -> GEMM1 -> swiglu -> GEMM2 -> scaled
@@ -180,14 +106,6 @@ bool moe_grouped_gemm_enabled() {
 // MoE workspace is sized for this rather than for a prefill's token count.
 constexpr int kFusedMoeMaxRows = 512;
 
-bool moe_flashinfer_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
 
 // True when the routed gate/up weights were stored in flashinfer's
 // [linear|gate] order at bind time. Both MoE paths must agree.
@@ -195,14 +113,6 @@ bool moe_gate_up_swapped() {
     return model::qwen35_moe_gate_up_swapped();
 }
 
-bool shared_fold_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_FOLD_SHARED");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
 
 // Two forces pull opposite ways. A bigger block means fewer batch entries,
 // and the routed GEMM's cost scales with entry count (established by the
@@ -221,31 +131,13 @@ bool shared_fold_enabled() {
 //     11.15 -> 10.64 ms, down 8.70 -> 7.88).
 // 32 and above is worse at both.
 int qwen35_moe_aligned_decode_block_size(int inter_local, int hidden) {
-    const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK");
-    if (v != nullptr && v[0] != '\0') {
-        char* end = nullptr;
-        long parsed_long = std::strtol(v, &end, 10);
-        if (end != v) {
-            int parsed = static_cast<int>(parsed_long);
-            if (parsed <= 1) return 0;
-            if (parsed > 64) parsed = 64;
-            return parsed;
-        }
-    }
     if (inter_local <= 0 || hidden <= 0) return 8;
     const std::size_t gate_up_bytes = static_cast<std::size_t>(2) *
         inter_local * hidden * sizeof(std::uint16_t);
     return gate_up_bytes <= (std::size_t{3} << 20) ? 16 : 8;
 }
 
-int qwen35_moe_aligned_decode_min_routes() {
-    static const int min_routes = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_MIN_ROUTES");
-        if (v == nullptr || v[0] == '\0') return 64;
-        return std::clamp(std::atoi(v), 0, 4096);
-    }();
-    return min_routes;
-}
+constexpr int kQwen35MoeAlignedDecodeMinRoutes = 64;
 
 // Row count above which a NON-pure-decode step leaves the device-side
 // MoE dispatch for the host-driven one. The host path resolves routing on
@@ -266,57 +158,10 @@ int qwen35_moe_aligned_decode_min_routes() {
 // per expert. A real bulk prefill (8192 tokens) still takes the host
 // path. Measured, 128 requests x 256 tokens: 64 gave 918-986 tok/s,
 // everything from 128 up gave 994-1116 (within run-to-run spread).
-int qwen35_moe_decode_fast_max_tokens() {
-    static const int max_tokens = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_DECODE_FAST_N");
-        if (v == nullptr || v[0] == '\0') return 1024;
-        return std::max(0, std::atoi(v));
-    }();
-    return max_tokens;
-}
+constexpr int kQwen35MoeDecodeFastMaxTokens = 1024;
 
 // The routed decode GEMMs are M=1 streaming reads. A dedicated GEMV beats
 // `cublasGemmBatchedEx` on them; see `moe_decode_gemv_bf16_kernel`.
-bool qwen35_moe_gemv_decode_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_GEMV_DECODE");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool qwen35_moe_wmma_decode_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_WMMA_DECODE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-enum class MtpMoeMode {
-    Full,
-    SharedOnly,
-    Skip,
-};
-
-MtpMoeMode mtp_moe_mode() {
-    static const MtpMoeMode mode = [] {
-        const char* v = std::getenv("PIE_MTP_MOE_MODE");
-        if (v == nullptr || v[0] == '\0') return MtpMoeMode::Full;
-        std::string s(v);
-        std::transform(s.begin(), s.end(), s.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (s == "shared" || s == "shared_only" || s == "shared-only") {
-            return MtpMoeMode::SharedOnly;
-        }
-        if (s == "skip" || s == "none" || s == "off") {
-            return MtpMoeMode::Skip;
-        }
-        return MtpMoeMode::Full;
-    }();
-    return mode;
-}
 
 // Timing means synchronizing on an event, which CUDA forbids while the stream
 // is capturing a graph, and which under TP stalls one rank inside a collective
@@ -405,8 +250,8 @@ struct Qwen35MoeForwardProfile {
     }
 
     void begin(int n, int r, bool decode, int rank, cudaStream_t stream) {
-        enabled = qwen35_moe_profile_enabled();
-        if (!enabled) return;
+        enabled = false;
+        return;
         ensure_events();
         tp_rank = rank;
         N = n;
@@ -486,63 +331,7 @@ void profile_cuda_detail_stage(
     profile_cuda_stage(profile, dst, stream, std::forward<F>(fn));
 }
 
-void maybe_print_profile(const Qwen35MoeForwardProfile& p) {
-    if (!p.enabled) return;
-    if (p.tp_rank != 0 && !qwen35_moe_profile_all_ranks()) return;
-    static std::uint64_t seq = 0;
-    ++seq;
-    const std::uint64_t limit = qwen35_moe_profile_print_limit();
-    if (limit == 0 || seq > limit) return;
-
-    const double named =
-        p.embed_ms + p.norm_ms + p.linear_attn_ms + p.full_attn_ms +
-        p.moe_router_ms + p.moe_routed_ms + p.moe_shared_ms +
-        p.moe_allreduce_ms + p.residual_ms + p.lm_head_ms;
-    const double other = p.forward_ms > named ? p.forward_ms - named : 0.0;
-    // One buffered line, one write. TP ranks profile concurrently, and a
-    // chain of `std::cerr <<` interleaves their fields mid-number, which
-    // silently corrupts anything parsing the output.
-    std::ostringstream os;
-    os
-        << "[pie-qwen35-moe-profile] seq=" << seq
-        << " rank=" << p.tp_rank
-        << " N=" << p.N
-        << " R=" << p.R
-        << " decode=" << (p.pure_decode ? 1 : 0)
-        << " layers_linear=" << p.linear_layers
-        << " layers_full=" << p.full_layers
-        << " layers_moe=" << p.moe_layers
-        << " total_ms=" << p.forward_ms
-        << " embed_ms=" << p.embed_ms
-        << " norm_ms=" << p.norm_ms
-        << " linear_attn_ms=" << p.linear_attn_ms
-        << " linear_proj_ms=" << p.linear_proj_ms
-        << " linear_conv_ms=" << p.linear_conv_ms
-        << " linear_prep_ms=" << p.linear_prep_ms
-        << " linear_recur_ms=" << p.linear_recur_ms
-        << " linear_post_ms=" << p.linear_post_ms
-        << " full_attn_ms=" << p.full_attn_ms
-        << " moe_router_ms=" << p.moe_router_ms
-        << " moe_routed_ms=" << p.moe_routed_ms
-        << " moe_route_setup_ms=" << p.moe_route_setup_ms
-        << " moe_align_ms=" << p.moe_align_ms
-        << " moe_gather_ms=" << p.moe_gather_ms
-        << " moe_ptrs_ms=" << p.moe_ptrs_ms
-        << " moe_gate_up_ms=" << p.moe_gate_up_ms
-        << " moe_act_ms=" << p.moe_act_ms
-        << " moe_down_ms=" << p.moe_down_ms
-        << " moe_reduce_ms=" << p.moe_reduce_ms
-        << " moe_shared_ms=" << p.moe_shared_ms
-        << " moe_shared_gate_up_ms=" << p.moe_shared_gate_up_ms
-        << " moe_shared_down_ms=" << p.moe_shared_down_ms
-        << " moe_shared_gate_ms=" << p.moe_shared_gate_ms
-        << " moe_allreduce_ms=" << p.moe_allreduce_ms
-        << " residual_ms=" << p.residual_ms
-        << " lm_head_ms=" << p.lm_head_ms
-        << " other_ms=" << other
-        << "\n";
-    std::cerr << os.str() << std::flush;
-}
+void maybe_print_profile(const Qwen35MoeForwardProfile&) {}
 
 struct MtpProfile {
     bool enabled = false;
@@ -573,8 +362,8 @@ struct MtpProfile {
     }
 
     void begin(int n, cudaStream_t stream) {
-        enabled = mtp_profile_enabled();
-        if (!enabled) return;
+        enabled = false;
+        return;
         ensure_events();
         N = n;
         input_fc_ms = attn_ms = moe_ms = lm_head_ms = total_ms = 0.0;
@@ -611,25 +400,7 @@ void profile_mtp_stage(
     dst += static_cast<double>(ms);
 }
 
-void maybe_print_mtp_profile(const MtpProfile& p) {
-    if (!p.enabled) return;
-    static std::uint64_t seq = 0;
-    ++seq;
-    const std::uint64_t limit = mtp_profile_print_limit();
-    if (limit == 0 || seq > limit) return;
-    const double named = p.input_fc_ms + p.attn_ms + p.moe_ms + p.lm_head_ms;
-    const double other = p.total_ms > named ? p.total_ms - named : 0.0;
-    std::cerr
-        << "[pie-mtp-profile] seq=" << seq
-        << " N=" << p.N
-        << " total_ms=" << p.total_ms
-        << " input_fc_ms=" << p.input_fc_ms
-        << " attn_ms=" << p.attn_ms
-        << " moe_ms=" << p.moe_ms
-        << " lm_head_ms=" << p.lm_head_ms
-        << " other_ms=" << other
-        << "\n";
-}
+void maybe_print_mtp_profile(const MtpProfile&) {}
 
 inline void rmsnorm_bf16_dispatch(
     const HfConfig& cfg,
@@ -730,7 +501,7 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
         ws.aligned_out =
             DeviceBuffer<std::uint16_t>::alloc(ws.aligned_rows_capacity * H);
     }
-    if (moe_flashinfer_enabled() && ops::flashinfer_cutlass_moe_enabled()) {
+    if (ops::flashinfer_cutlass_moe_enabled()) {
         // Sized for decode, not for the prefill high-water mark: the fused
         // path only runs on the decode fast path, and its workspace scales
         // with rows * top_k. At tp=1 the whole 68 GB model sits on one
@@ -952,46 +723,23 @@ void linear_attn_body(
                 const auto* x =
                     static_cast<const std::uint16_t*>(ws.norm_x.data()) +
                     static_cast<std::size_t>(src0) * H;
-                if (Lw.la_in_proj_qkvz != nullptr) {
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_qkvz->data(),
-                        la.mixed_qkvz.data(), rows, conv_dim + V_dim, H);
-                    kernels::launch_split_bf16_rows(
-                        la.mixed_qkvz.data(),
-                        la.mixed_qkv.data() +
-                            static_cast<std::size_t>(dst0) * conv_dim,
-                        la.z.data() + static_cast<std::size_t>(src0) * V_dim,
-                        rows, conv_dim, V_dim, stream);
-                } else {
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_qkv->data(),
-                        la.mixed_qkv.data() +
-                            static_cast<std::size_t>(dst0) * conv_dim,
-                        rows, conv_dim, H);
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_z->data(),
-                        la.z.data() + static_cast<std::size_t>(src0) * V_dim,
-                        rows, V_dim, H);
-                }
-                if (Lw.la_in_proj_ba != nullptr) {
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_ba->data(),
-                        la.ba.data(), rows, 2 * V_h, H);
-                    kernels::launch_split_qwen_gdn_ba_bf16(
-                        la.ba.data(),
-                        la.b.data() + static_cast<std::size_t>(dst0) * V_h,
-                        la.a.data() + static_cast<std::size_t>(dst0) * V_h,
-                        rows, V_h, stream);
-                } else {
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_a->data(),
-                        la.a.data() + static_cast<std::size_t>(dst0) * V_h,
-                        rows, V_h, H);
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_b->data(),
-                        la.b.data() + static_cast<std::size_t>(dst0) * V_h,
-                        rows, V_h, H);
-                }
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    x, Lw.la_in_proj_qkv->data(),
+                    la.mixed_qkv.data() +
+                        static_cast<std::size_t>(dst0) * conv_dim,
+                    rows, conv_dim, H);
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    x, Lw.la_in_proj_z->data(),
+                    la.z.data() + static_cast<std::size_t>(src0) * V_dim,
+                    rows, V_dim, H);
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    x, Lw.la_in_proj_a->data(),
+                    la.a.data() + static_cast<std::size_t>(dst0) * V_h,
+                    rows, V_h, H);
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    x, Lw.la_in_proj_b->data(),
+                    la.b.data() + static_cast<std::size_t>(dst0) * V_h,
+                    rows, V_h, H);
             };
             if (!has_buffer_read) {
                 in_proj_rows(0, 0, N);
@@ -1195,7 +943,7 @@ void linear_attn_body(
         !linear_decode &&
         slot_ids_d != nullptr &&
         qo_indptr_d != nullptr &&
-        N <= qwen35_gdn_warp_tiled_max_tokens() &&
+        N <= kQwen35GdnWarpTiledMaxTokens &&
         K_d <= 256 &&
         commit_len == nullptr;
     // Same reasoning as the dense forward: V_h == K_h is the repeat=1 case,
@@ -1384,67 +1132,6 @@ void linear_attn_body(
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
                                 stream, write_state, rs_write_state_mask);
-                        }
-                    } else if (
-                        commit_len == nullptr &&
-                        N <= qwen35_gdn_cached_prefill_max_tokens()) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        }
-                    } else {
-                        if (state_bf16) {
-                            // K_h==V_h identity: the MoE path still materialises
-                            // the expanded q/k (no use_batched_fla_gqa here), so
-                            // the GQA-aware kernel sees h_k==h and is unchanged.
-                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, V_h, K_d, V_d, stream, write_state,
-                                commit_len);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, V_h, K_d, V_d, stream, write_state,
-                                commit_len);
                         }
                     }
                 } else {
@@ -1735,25 +1422,7 @@ bool moe_block(
     const bool use_decode_fast_path =
         !streamed && !qwen35_moe_force_general_path() &&
         (is_pure_decode ||
-         (N > 0 && N <= qwen35_moe_decode_fast_max_tokens()));
-    if (moe_path_log_enabled()) {
-        // One line per distinct (N, pure_decode, path) triple, so a whole
-        // run reports which shapes took which path without 40 lines per
-        // step drowning the log.
-        static std::mutex seen_mutex;
-        static std::set<std::tuple<int, bool, bool>> seen;
-        const auto key = std::make_tuple(N, is_pure_decode, use_decode_fast_path);
-        bool fresh = false;
-        {
-            std::lock_guard<std::mutex> lock(seen_mutex);
-            fresh = seen.insert(key).second;
-        }
-        if (fresh) {
-            std::fprintf(
-                stderr, "[pie-moe-path] N=%d pure_decode=%d fast_path=%d\n",
-                N, is_pure_decode ? 1 : 0, use_decode_fast_path ? 1 : 0);
-        }
-    }
+         (N > 0 && N <= kQwen35MoeDecodeFastMaxTokens));
     const bool add_to_residual = (T == 1) && use_decode_fast_path;
     void* moe_out = add_to_residual ? ws.y.data() : ws.norm_y.data();
 
@@ -1848,7 +1517,7 @@ bool moe_block(
                 const int block = moe_ws.aligned_block_size;
                 const bool use_aligned_decode =
                     block > 1 &&
-                    routes >= qwen35_moe_aligned_decode_min_routes() &&
+                    routes >= kQwen35MoeAlignedDecodeMinRoutes &&
                     !moe_ws.aligned_expert_in.empty();
                 if (use_aligned_decode) {
                     const int active_expert_cap = std::min(E, routes);
@@ -1862,17 +1531,10 @@ bool moe_block(
                     // covers with only ~4 thread blocks (N=512 on 108 SMs)
                     // with ceil(N/block) more blocks of an already-saturated
                     // one.
-                    const bool fold_shared = shared_fold_enabled() &&
-                        Is > 0 && Is == Im &&
-                        Lw.shared_gate_up_proj != nullptr &&
-                        Lw.shared_down_proj != nullptr &&
-                        !Lw.shared_down_proj_quant.has_value();
-                    const int shared_blocks =
-                        fold_shared ? (N + block - 1) / block : 0;
-                    const int max_blocks = routed_blocks + shared_blocks;
+                    constexpr bool fold_shared = false;
+                    const int max_blocks = routed_blocks;
                     const int aligned_rows = max_blocks * block;
-                    const int shared_row_begin =
-                        fold_shared ? routed_blocks * block : -1;
+                    constexpr int shared_row_begin = -1;
                     moe_shared_folded = fold_shared;
                     if (static_cast<std::size_t>(aligned_rows) >
                         moe_ws.aligned_rows_capacity) {
@@ -1939,7 +1601,7 @@ bool moe_block(
                     // one and loses on the long-K one, so they do not share
                     // an answer.
                     const bool grouped_ok =
-                        moe_grouped_gemm_enabled() && !fold_shared;
+                        !fold_shared;
                     const bool grouped_gu = grouped_ok &&
                         kernels::moe_grouped_gemm_bf16_supported(
                             block, 2 * Im, H);
@@ -2023,7 +1685,7 @@ bool moe_block(
                                     N, K, H, stream);
                             }
                         });
-                } else if (qwen35_moe_gemv_decode_enabled() &&
+                } else if (
                            (H % 8) == 0 && (Im % 8) == 0) {
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_gate_up_ms : nullptr,
@@ -2069,133 +1731,6 @@ bool moe_block(
                                 kernels::launch_token_batched_weighted_sum_bf16(
                                     moe_out, moe_ws.expert_out.data(),
                                     moe_ws.topk_weights.data(),
-                                    N, K, H, stream);
-                            }
-                        });
-                } else if (qwen35_moe_wmma_decode_enabled() &&
-                           (H % 16) == 0 && (Im % 16) == 0) {
-                    profile_cuda_detail_stage(
-                        profile, profile ? &profile->moe_gate_up_ms : nullptr,
-                        stream, [&] {
-                            kernels::launch_moe_gate_up_decode_wmma_bf16(
-                                moe_ws.topk_idx.data(),
-                                ws.norm_x.data(),
-                                Lw.moe_gate_up_proj->data(),
-                                moe_ws.expert_gate_up.data(),
-                                N, K, H, Im, stream);
-                        });
-
-                    profile_cuda_detail_stage(
-                        profile, profile ? &profile->moe_act_ms : nullptr,
-                        stream, [&] {
-                            kernels::launch_chunked_swiglu_bf16(
-                                moe_ws.expert_gate_up.data(),
-                                moe_ws.expert_act.data(),
-                                routes, Im, stream,
-                                /*gate_second=*/moe_gate_up_swapped());
-                        });
-
-                    profile_cuda_detail_stage(
-                        profile, profile ? &profile->moe_down_ms : nullptr,
-                        stream, [&] {
-                            kernels::launch_moe_down_decode_wmma_bf16(
-                                moe_ws.topk_idx.data(),
-                                moe_ws.expert_act.data(),
-                                Lw.moe_down_proj->data(),
-                                moe_ws.expert_out.data(),
-                                N, K, H, Im, stream);
-                        });
-
-                    profile_cuda_detail_stage(
-                        profile, profile ? &profile->moe_reduce_ms : nullptr,
-                        stream, [&] {
-                            if (add_to_residual) {
-                                kernels::launch_token_batched_weighted_sum_add_bf16(
-                                    moe_out, moe_ws.expert_out.data(),
-                                    moe_ws.topk_weights.data(),
-                                    N, K, H, stream);
-                            } else {
-                                kernels::launch_token_batched_weighted_sum_bf16(
-                                    moe_out, moe_ws.expert_out.data(),
-                                    moe_ws.topk_weights.data(),
-                                    N, K, H, stream);
-                            }
-                        });
-                } else {
-                    profile_cuda_detail_stage(
-                        profile, profile ? &profile->moe_route_setup_ms : nullptr,
-                        stream, [&] {
-                            kernels::launch_build_moe_ptrs_decode_batched_bf16(
-                                moe_ws.topk_idx.data(),
-                                moe_ws.topk_weights.data(),
-                                Lw.moe_gate_up_proj->data(),
-                                Lw.moe_down_proj->data(),
-                                ws.norm_x.data(),
-                                moe_ws.expert_gate_up.data(),
-                                moe_ws.expert_act.data(),
-                                moe_ws.expert_out.data(),
-                                reinterpret_cast<const void**>(moe_ws.a_gu_ptrs.data()),
-                                reinterpret_cast<const void**>(moe_ws.b_gu_ptrs.data()),
-                                reinterpret_cast<void**>(moe_ws.c_gu_ptrs.data()),
-                                reinterpret_cast<const void**>(moe_ws.a_dn_ptrs.data()),
-                                reinterpret_cast<const void**>(moe_ws.b_dn_ptrs.data()),
-                                reinterpret_cast<void**>(moe_ws.c_dn_ptrs.data()),
-                                moe_ws.batch_weights.data(),
-                                N, K, H, Im, stream);
-                        });
-
-                    // gate_up batched GEMM: M=1, N=2*Im, K=H, batch=N*top_k.
-                    profile_cuda_detail_stage(
-                        profile, profile ? &profile->moe_gate_up_ms : nullptr,
-                        stream, [&] {
-                            ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
-                                reinterpret_cast<const void* const*>(
-                                    moe_ws.b_gu_ptrs.data()),
-                                reinterpret_cast<const void* const*>(
-                                    moe_ws.a_gu_ptrs.data()),
-                                reinterpret_cast<void* const*>(moe_ws.c_gu_ptrs.data()),
-                                /*M=*/1, /*N=*/2 * Im, /*K=*/H,
-                                /*batch_count=*/routes);
-                        });
-
-                    // SwiGLU on [N*top_k, 2*Im] -> [N*top_k, Im].
-                    profile_cuda_detail_stage(
-                        profile, profile ? &profile->moe_act_ms : nullptr,
-                        stream, [&] {
-                            kernels::launch_chunked_swiglu_bf16(
-                                moe_ws.expert_gate_up.data(),
-                                moe_ws.expert_act.data(),
-                                routes, Im, stream,
-                                /*gate_second=*/moe_gate_up_swapped());
-                        });
-
-                    // down_proj batched GEMM: M=1, N=H, K=Im, batch=N*top_k.
-                    profile_cuda_detail_stage(
-                        profile, profile ? &profile->moe_down_ms : nullptr,
-                        stream, [&] {
-                            ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
-                                reinterpret_cast<const void* const*>(
-                                    moe_ws.b_dn_ptrs.data()),
-                                reinterpret_cast<const void* const*>(
-                                    moe_ws.a_dn_ptrs.data()),
-                                reinterpret_cast<void* const*>(moe_ws.c_dn_ptrs.data()),
-                                /*M=*/1, /*N=*/H, /*K=*/Im,
-                                /*batch_count=*/routes);
-                        });
-
-                    // Sum each token's K routed outputs into norm_y.
-                    profile_cuda_detail_stage(
-                        profile, profile ? &profile->moe_reduce_ms : nullptr,
-                        stream, [&] {
-                            if (add_to_residual) {
-                                kernels::launch_token_batched_weighted_sum_add_bf16(
-                                    moe_out, moe_ws.expert_out.data(),
-                                    moe_ws.batch_weights.data(),
-                                    N, K, H, stream);
-                            } else {
-                                kernels::launch_token_batched_weighted_sum_bf16(
-                                    moe_out, moe_ws.expert_out.data(),
-                                    moe_ws.batch_weights.data(),
                                     N, K, H, stream);
                             }
                         });
@@ -2374,7 +1909,7 @@ bool moe_block(
                                 scalar_gate,
                                 N, H, 2 * Is + 1, stream);
                         } else if (Lw.shared_gate != nullptr &&
-                                   N <= qwen35_moe_decode_fast_max_tokens() &&
+                                   N <= kQwen35MoeDecodeFastMaxTokens &&
                                    !Lw.shared_gate_quant.has_value()) {
                             kernels::launch_sigmoid_dot_scalar_gate_add_bf16(
                                 ws.norm_x.data(),
@@ -2873,81 +2408,6 @@ void mtp_full_attn_no_cache_moe(
     }
 }
 
-bool mtp_shared_expert_only_moe(
-    const Qwen3_5MoeLayerWeights& Lw,
-    const HfConfig& cfg,
-    const Qwen3_5ForwardCfg& fwd_cfg,
-    Workspace& ws,
-    Qwen3_5MoeMlpWorkspace& moe_ws,
-    int N,
-    ops::CublasHandle& cublas,
-    cudaStream_t stream)
-{
-    const int T = std::max(1, fwd_cfg.tp_size);
-    const int H = cfg.hidden_size;
-    const int Is = cfg.shared_expert_intermediate_size / T;
-    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
-    if (Is <= 0 || Lw.shared_gate_proj == nullptr) return false;
-
-    const bool fused_shared_scalar_gate =
-        Lw.shared_gate_up_gate_proj != nullptr;
-    if (fused_shared_scalar_gate) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), ops::WeightView(*Lw.shared_gate_up_gate_proj),
-            moe_ws.shared_gate_up.data(), N, 2 * Is + 1, H);
-        kernels::launch_chunked_swiglu_strided_bf16(
-            moe_ws.shared_gate_up.data(), moe_ws.shared_act.data(),
-            N, Is, 2 * Is + 1, stream);
-    } else if (Lw.shared_gate_up_proj != nullptr) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), ops::WeightView(*Lw.shared_gate_up_proj),
-            moe_ws.shared_gate_up.data(), N, 2 * Is, H);
-        kernels::launch_chunked_swiglu_bf16(
-            moe_ws.shared_gate_up.data(), moe_ws.shared_act.data(),
-            N, Is, stream);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(),
-            make_weight_view(Lw.shared_gate_proj, Lw.shared_gate_proj_quant),
-            moe_ws.shared_gate.data(), N, Is, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(),
-            make_weight_view(Lw.shared_up_proj, Lw.shared_up_proj_quant),
-            moe_ws.shared_up.data(), N, Is, H);
-        kernels::launch_swiglu_bf16(
-            moe_ws.shared_gate.data(), moe_ws.shared_up.data(),
-            moe_ws.shared_act.data(), N * Is, stream);
-    }
-    ops::gemm_act_x_w(cublas.handle(),
-        moe_ws.shared_act.data(),
-        make_weight_view(Lw.shared_down_proj, Lw.shared_down_proj_quant),
-        moe_ws.shared_out.data(), N, H, Is);
-    if (fused_shared_scalar_gate) {
-        const auto* scalar_gate =
-            moe_ws.shared_gate_up.data() + static_cast<std::size_t>(2 * Is);
-        kernels::launch_sigmoid_scalar_gate_strided_inplace_bf16(
-            moe_ws.shared_out.data(), scalar_gate, N, H, 2 * Is + 1, stream);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(),
-            make_weight_view(Lw.shared_gate, Lw.shared_gate_quant),
-            moe_ws.shared_gate_logit.data(), N, 1, H);
-        kernels::launch_sigmoid_scalar_gate_inplace_bf16(
-            moe_ws.shared_out.data(), moe_ws.shared_gate_logit.data(),
-            N, H, stream);
-    }
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        ws.norm_y.data(), moe_ws.shared_out.data(),
-        static_cast<std::size_t>(N) * H * sizeof(std::uint16_t),
-        cudaMemcpyDeviceToDevice, stream));
-    if (T > 1) {
-        tp->all_reduce_bf16(
-            ws.norm_y.data(), static_cast<std::size_t>(N) * H,
-            ncclSum, stream);
-    }
-    return true;
-}
 
 }  // namespace
 
@@ -3107,18 +2567,10 @@ void qwen3_5_moe_mtp_forward(
     rmsnorm_bf16_dispatch(cfg,
         ws.y.data(), Lw.mlp_norm_pre->data(), ws.norm_x.data(),
         num_tokens, H, eps, stream);
-    const MtpMoeMode mode = mtp_moe_mode();
-    bool add_moe_residual = false;
-    if (mode == MtpMoeMode::Full) {
-        const bool moe_added_to_residual = moe_block(
-            Lw, cfg, fwd_cfg, ws, moe_ws, num_tokens,
-            /*is_pure_decode=*/true, cublas, stream, /*profile=*/nullptr);
-        add_moe_residual = !moe_added_to_residual;
-    } else if (mode == MtpMoeMode::SharedOnly) {
-        add_moe_residual = mtp_shared_expert_only_moe(
-            Lw, cfg, fwd_cfg, ws, moe_ws, num_tokens, cublas, stream);
-    }
-    if (add_moe_residual) {
+    const bool moe_added_to_residual = moe_block(
+        Lw, cfg, fwd_cfg, ws, moe_ws, num_tokens,
+        /*is_pure_decode=*/true, cublas, stream, /*profile=*/nullptr);
+    if (!moe_added_to_residual) {
         kernels::launch_residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(num_tokens) * H, stream);
@@ -3159,18 +2611,7 @@ std::size_t qwen3_5_moe_workspace_bytes(const HfConfig& cfg,
     auto u16 = [](std::size_t elems) { return elems * 2; };
     auto i32 = [](std::size_t elems) { return elems * 4; };
     auto fp32 = [](std::size_t elems) { return elems * 4; };
-    auto aligned_decode_block = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK");
-        if (v == nullptr || v[0] == '\0') return 16;
-        char* end = nullptr;
-        long parsed_long = std::strtol(v, &end, 10);
-        if (end == v) return 16;
-        int parsed = static_cast<int>(parsed_long);
-        if (parsed <= 1) return 0;
-        if (parsed < 4) parsed = 4;
-        if (parsed > 64) parsed = 64;
-        return parsed;
-    };
+    auto aligned_decode_block = [] { return 16; };
     std::size_t bytes = 0;
     bytes += u16(n * cfg.num_experts);
     bytes += i32(n * cfg.num_experts_per_tok);

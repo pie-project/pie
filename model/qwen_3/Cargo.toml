@@ -1,0 +1,21 @@
+[package]
+name = "pie-model-qwen-3"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Qwen3 — and `QwenInstruct`, the ChatML template Qwen2, Qwen3.5, GLM-5 and Nemotron-H bind."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[features]
+# One feature per aspect, matching `pie-model-common`. A generation is linked
+# for the aspect a consumer reads and no other: the loader's C ABI takes
+# `contract` alone, so a driver link never carries a chat template.
+default = []
+chat = ["pie-model-common/chat", "dep:pie-tokenizer", "dep:serde_json", "dep:anyhow"]
+
+[dependencies]
+pie-model-common = { path = "../common", default-features = false }
+pie-tokenizer = { path = "../../runtime/tokenizer", optional = true }
+serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
+anyhow = { version = "1.0", optional = true }

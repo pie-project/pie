@@ -89,7 +89,7 @@ fn encode_delim(s: &str) -> Vec<u32> {
     if s.is_empty() {
         Vec::new()
     } else {
-        pie_model::model().tokenize(s)
+        crate::model::model().tokenize(s)
     }
 }
 
@@ -115,7 +115,7 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
     /// Decode + resize + patchify an encoded still image per the bound model.
     async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Image>, String>> {
         let (processor, prefix, suffix) = {
-            let m = pie_model::model();
+            let m = crate::model::model();
             let arch = m.arch_name();
             let varch = match VisionArch::from_arch_name(arch) {
                 Some(a) => a,
@@ -181,7 +181,7 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
         max_frames: u32,
     ) -> Result<Result<Resource<Video>, String>> {
         let (processor, prefix, suffix) = {
-            let m = pie_model::model();
+            let m = crate::model::model();
             let arch = m.arch_name();
             let varch = match VisionArch::from_arch_name(arch) {
                 Some(a) => a,
@@ -268,7 +268,7 @@ impl pie::inferlet::media::HostAudio for ProcessCtx {
     /// model. Non-audio models return a clean error.
     async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Audio>, String>> {
         let (prefix, suffix) = {
-            let m = pie_model::model();
+            let m = crate::model::model();
             let arch = m.arch_name();
             if !multimodal::audio_arch_supported(arch) {
                 return Ok(Err(format!(

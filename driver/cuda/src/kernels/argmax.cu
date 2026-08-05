@@ -13,15 +13,6 @@ constexpr int BLOCK = 256;
 constexpr int MAX_MASKED_TOP_K = 64;
 constexpr int MASKED_TILE_TOKENS = 8;
 
-bool argmax_vec2_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_ARGMAX_VEC2");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
 __device__ __forceinline__ std::uint64_t pack_argmax_pair(float value, int token) {
     const std::uint32_t value_bits = __float_as_uint(value);
     return (static_cast<std::uint64_t>(value_bits) << 32) |
@@ -573,7 +564,7 @@ __global__ void argmax_finalize_bf16_kernel(
 // boundary and the load faults. Production vocabs are even, which is why this
 // never fired, but the guard costs nothing.
 bool argmax_vec2_usable(const void* logits, int vocab) {
-    return argmax_vec2_enabled() && (vocab % 2) == 0 &&
+    return (vocab % 2) == 0 &&
            (reinterpret_cast<std::uintptr_t>(logits) % 4) == 0;
 }
 
@@ -755,12 +746,8 @@ void launch_lm_head_gemv_argmax_int8(
 
     int num_sms = 0;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
-    static const int blocks_per_sm = [] {
-        const char* v = std::getenv("PIE_GEMV_BLOCKS_PER_SM");
-        if (v == nullptr || v[0] == '\0') return 2;
-        return std::max(1, std::min(8, std::atoi(v)));
-    }();
-    const int max_blocks_x = num_sms * blocks_per_sm;
+    constexpr int kBlocksPerSm = 2;
+    const int max_blocks_x = num_sms * kBlocksPerSm;
     const int min_blocks_x =
         (vocab + GEMV_WARPS - 1) / GEMV_WARPS;
     const int num_blocks_x = std::min(max_blocks_x, min_blocks_x);

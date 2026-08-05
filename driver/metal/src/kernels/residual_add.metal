@@ -14,15 +14,13 @@ template <typename T>
     const device T* x        [[buffer(0)]],   // [hidden]
     const device T* residual [[buffer(1)]],   // [hidden]
     device T* out            [[buffer(2)]],   // [hidden] (may alias x)
-    const constant int& width [[buffer(3)]],
     uint tid [[thread_position_in_grid]]) {
-  (void)width;  // flat token-major rows are exactly the dispatched extent
   out[tid] = T(float(x[tid]) + float(residual[tid]));
 }
 
 #define instantiate_residual_add(name, itype)                     \
   template [[host_name("residual_add_" #name)]]                   \
   [[kernel]] void residual_add<itype>(                            \
-      const device itype*, const device itype*, device itype*, const constant int&, uint);
+      const device itype*, const device itype*, device itype*, uint);
 
 instantiate_residual_add(bfloat16, bfloat)

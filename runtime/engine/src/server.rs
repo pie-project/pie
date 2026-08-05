@@ -81,6 +81,14 @@ pub fn open_session() -> Result<ClientId> {
     let state = get_state()?;
     let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
 
+    // One outbox per session, shared by all of the session's turns. Scoped
+    // that way on purpose: a session's lifetime is one websocket connection
+    // (`gateway/src/ingress/ws.rs`), so its turns all egress through a single
+    // socket and share that socket's fate. A per-turn split would give no
+    // isolation -- for this queue to fill, the socket must already be stalled,
+    // which stalls every turn regardless -- and would require routing outbound
+    // messages by `corr_id`/`process_id` here, where a "turn" is not a concept
+    // this layer has. The worker's `link::gateway` owns that mapping.
     let (out_tx, out_rx) = mpsc::channel(1000);
     SESSION_OUTBOX.insert(id, Arc::new(TokioMutex::new(out_rx)));
 

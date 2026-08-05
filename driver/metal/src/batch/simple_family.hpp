@@ -38,7 +38,7 @@
 #include "mtl4_context.hpp"
 #include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "forward.hpp"
 
 namespace pie::metal::batch {

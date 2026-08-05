@@ -10,6 +10,7 @@
 
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg}
 #include "mtl4_context.hpp"
+#include "../../kernels/gdn_params.h"
 #include "../shared_kernels.hpp"
 
 namespace pie::metal {
@@ -18,17 +19,27 @@ namespace {
 
 // ── Kernel param structs, replicated EXACTLY from the .metal sources ──
 using shared_kernels::ExpertCombineParams;
+using shared_kernels::GatedRmsParams;
 using shared_kernels::MoeRouteParams;
 using shared_kernels::RmsParams;
 using shared_kernels::RouterParams;
-struct GatedRmsParams {  // gated_rms.metal:20  (buffer 4)
-    float eps;
-    uint32_t vd;         // value-head dim (reduction axis)
-};
-struct GdnCoreParams {   // gdn_core.metal:39  (buffer 11)
-    int32_t Dk, Dv, Hk, Hv, conv_dim, Kc, q_off, k_off, v_off;
-    float   eps, inv_sqrt_dk;
-};
+static_assert(sizeof(GdnCoreParams) == 44);
+
+GdnCoreParams gdn_core_params(const DecodeGeometry& g) {
+    return {
+        g.gdn_k_dim,
+        g.gdn_v_dim,
+        g.gdn_k_heads,
+        g.gdn_v_heads,
+        g.gdn_conv_dim,
+        g.gdn_conv_k,
+        0,
+        g.gdn_k_heads * g.gdn_k_dim,
+        2 * g.gdn_k_heads * g.gdn_k_dim,
+        g.eps,
+        1.0f / std::sqrt(float(g.gdn_k_dim)),
+    };
+}
 
 // Bind a POD constant value into a fresh resident slot at (ordinal, bind_index).
 template <class V>
@@ -131,14 +142,6 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         const int ord = d.ordinal;
         switch (d.kind) {
             case Kernel::LlExpertSiluMul:
-                // The routed stack's gate and up are `moe_intermediate` wide
-                // and there is one row per sorted (token, slot) pair, padding
-                // included -- the padding rows are real rows of the buffers
-                // this reads. This is the one SwiGLU whose extent moves with
-                // the batch; the shared expert's does not, which is why only
-                // this one is here.
-                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
-                                sorted * g.moe_intermediate, &count);
                 break;
 
             case Kernel::LlMoeSort:
@@ -225,40 +228,30 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kernel::FfnRms:
             case Kernel::FinalRms:
                 bind_const<RmsParams>(ctx, ord, (uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, (uint32_t)g.hidden, 1u, 0u}, &count);
+                                      RmsParams{g.eps, (uint32_t)g.hidden, 1u, 0u, 1.0f},
+                                      &count);
                 break;
             case Kernel::QNorm:
             case Kernel::KNorm:
                 bind_const<RmsParams>(ctx, ord, (uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, (uint32_t)g.head_dim, 1u, 0u}, &count);
+                                      RmsParams{g.eps, (uint32_t)g.head_dim, 1u, 0u, 1.0f},
+                                      &count);
                 break;
 
             case Kernel::GdnPrep: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       /*q_off*/0, /*k_off*/g.gdn_k_heads * g.gdn_k_dim,
-                                       /*v_off*/2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnPrep::Params, gp, &count);
                 break;
             }
 
             case Kernel::GdnPrepSlotted: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       0, g.gdn_k_heads * g.gdn_k_dim,
-                                       2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnPrep::Params, gp, &count);
                 break;
             }
 
             case Kernel::GdnCore: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       /*q_off*/0, /*k_off*/g.gdn_k_heads * g.gdn_k_dim,
-                                       /*v_off*/2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 const uint8_t pbuf = gdn_prep ? (uint8_t)bind::GdnCoreRecurrent::Params
                                               : (uint8_t)bind::GdnCore::Params;
                 bind_const<GdnCoreParams>(ctx, ord, pbuf, gp, &count);
@@ -266,11 +259,7 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             }
 
             case Kernel::GdnCoreSlotted: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       0, g.gdn_k_heads * g.gdn_k_dim,
-                                       2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnCoreRecurrent::Params,
                                           gp, &count);
                 break;
@@ -335,16 +324,8 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<int>(ctx, ord, (uint8_t)bind::SdpaPaged::Window, 0, &count);
                 break;
 
-            case Kernel::AttnGate:
-                bind_const<int>(ctx, ord, (uint8_t)bind::AttnGate::Width,
-                                g.n_q_heads * g.head_dim, &count);
-                break;
             case Kernel::SiluMul:
-                // Dense, the FFN's own SwiGLU; routed, the SHARED expert's --
-                // one row per token either way, so the width does not move
-                // with the batch and this stays out of `bind_token_consts`.
-                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
-                                g.is_moe() ? g.shared_intermediate : g.intermediate, &count);
+            case Kernel::AttnGate:
                 break;
             case Kernel::LlExpertSiluMul:
             case Kernel::LlMoeSort:
@@ -376,15 +357,8 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                      (uint32_t)g.hidden, &count);
                 break;
 
-            // Both residual adds. `LayerOut` is the fused one and `Residual`
-            // the standalone; they are the same kernel and take the same
-            // width. Do not let anything be inserted between these two labels:
-            // `bind::Residual::Width` and `bind::GoRouterTopK::Params` are
-            // both index 3, so a kind that falls into the wrong arm here is
-            // bound to a plausible slot with the wrong TYPE in it.
             case Kernel::Residual:
             case Kernel::LayerOut:
-                bind_const<int>(ctx, ord, (uint8_t)bind::Residual::Width, g.hidden, &count);
                 break;
 
             // No const params: Argmax.

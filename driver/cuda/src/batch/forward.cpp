@@ -212,22 +212,10 @@ class CudaStreamOwner {
         bool active_ = true;
 };
 
-bool step_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_STEP_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool step_profile_enabled() { return false; }
 
-std::uint64_t step_profile_limit() {
-    static const std::uint64_t limit = [] {
-        const char* v = std::getenv("PIE_STEP_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{32};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return limit;
+constexpr std::uint64_t step_profile_limit() {
+    return std::uint64_t{32};
 }
 
 std::vector<int> forward_graph_request_lattice(int max_requests) {
@@ -579,11 +567,6 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             "force_prefill attention bakes capture-shape launch config); "
             "buckets capture on first use with real geometry");
     }
-    const char* disable_upfront = std::getenv("PIE_CUDA_DISABLE_UPFRONT_GRAPHS");
-    if (disable_upfront != nullptr && disable_upfront[0] != '\0' &&
-        disable_upfront[0] != '0') {
-        return skip_upfront_capture("PIE_CUDA_DISABLE_UPFRONT_GRAPHS is set");
-    }
     const int max_requests =
         std::min(engine.max_forward_requests, engine.max_workspace_tokens);
     if (max_requests <= 0) return 0;
@@ -816,16 +799,7 @@ bool forward_graph_replay_eligible(
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
          engine.inputs.custom_mask_indptr.data() != nullptr);
-    // A kill switch for the decode graphs alone. `PIE_CUDA_PREFILL_DECODE_
-    // NOGRAPHS` reshapes the whole plan, so it cannot answer "is this bug in
-    // the graph or in the kernels the graph records?" -- the question every
-    // hang inside a replay asks first.
-    static const bool graphs_disabled = [] {
-        const char* v = std::getenv("PIE_CUDA_DISABLE_DECODE_GRAPHS");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return !graphs_disabled &&
-        engine.graph_cache != nullptr &&
+    return engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
         is_pure_decode &&
         mask_pointers_stable &&

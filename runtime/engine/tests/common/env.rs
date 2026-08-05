@@ -13,12 +13,16 @@ use pie_engine::driver::{DriverBackend, SchedulerLimits};
 use super::mock_device::{Behavior, MockBackend, launch_observer};
 
 /// The mock model's logits/output vocab. MUST match what the engine model
-/// reports (`Model::vocab_size()`, which reads `vocab_size` from the
-/// fixture `config.json` beside the tokenizer, falling back to the
-/// tokenizer vocab): a guest declares its `logits` intrinsic as
-/// `[rows, output-vocab-size]` and the dummy driver validates that decl
+/// reports (`Model::vocab_size()`): a guest declares its `logits` intrinsic
+/// as `[rows, output-vocab-size]` and the dummy driver validates that decl
 /// against ITS capability vocab — a mismatch rejects every logits-using
 /// PTIR program at bind.
+///
+/// Read from the fixture `config.json` here, and written into the fixture
+/// descriptor below, so the two sides of that equality come from one number.
+/// The engine itself no longer reads a `config.json`: it takes `vocab_size`
+/// from the `pie.model/1` descriptor the worker hands it, which for a real
+/// boot is normalized from exactly this file.
 fn fixture_vocab_size() -> u32 {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/fixtures");
     let cfg =
@@ -90,6 +94,13 @@ pub struct MockEnv {
     /// completion from its own worker thread after this delay, so concurrent
     /// launches overlap exactly as far as the engine lets them run ahead.
     callback_delay_ms: u64,
+    /// Waves per frame (k) and the run-ahead window, installed through
+    /// `[model.scheduler]` exactly as a deployment would. A binary needing a
+    /// non-default k must still be its own test binary: the engine reads both
+    /// once into a `OnceLock`.
+    frame_size: u32,
+    frame_submit_depth: u32,
+    frame_dispatch_depth: u32,
     /// Dummy-driver operation log (shared across every device driver): op
     /// names plus `launch-shape tokens=N programs=P per=[..]` entries (batch
     /// totals plus per-program token spans) for geometry
@@ -104,6 +115,24 @@ impl MockEnv {
     pub fn with_recurrent_state(mut self, slots: usize, slot_bytes: u64) -> Self {
         self.rs_slots = slots;
         self.rs_slot_bytes = slot_bytes;
+        self
+    }
+
+    /// Pin the engine's dispatch depth. Must be called before
+    /// [`MockEnv::config`], with the same one-binary caveat as
+    /// [`MockEnv::with_frame_size`].
+    #[allow(dead_code)]
+    pub fn with_dispatch_depth(mut self, depth: u32) -> Self {
+        self.frame_dispatch_depth = depth;
+        self
+    }
+
+    /// Pin the frame size (k) this engine runs at. Must be called before
+    /// [`MockEnv::config`], and only from a test binary that touches the
+    /// scheduler nowhere else — k is installed into a `OnceLock` at bootstrap.
+    #[allow(dead_code)]
+    pub fn with_frame_size(mut self, frame_size: u32) -> Self {
+        self.frame_size = frame_size;
         self
     }
 
@@ -177,13 +206,27 @@ impl MockEnv {
                 arch_name: String::new(),
                 kv_page_size: 16,
                 tokenizer_path,
-                // A fixture snapshot, not an artifact.
-                artifact: None,
+                // A fixture snapshot: the tokenizer is a file on disk, and the
+                // descriptor is what the worker would have normalized from the
+                // fixture's `config.json`. Only the two fields `register`
+                // reads are stated -- the rest of the schema is the
+                // normalizer's business, and this harness never runs it.
+                metadata: pie_model::ModelMetadata {
+                    tokenizer: None,
+                    descriptor: format!(
+                        r#"{{"version":"pie.model/1","vocab_size":{},"num_hidden_layers":2}}"#,
+                        fixture_vocab_size(),
+                    )
+                    .into_bytes(),
+                },
                 drivers,
                 scheduler: SchedulerConfig {
                     request_timeout_secs: 30,
                     submit_deadline_us: 50_000,
                     silence_timeout_secs: 30,
+                    frame_size: self.frame_size,
+                    frame_submit_depth: self.frame_submit_depth,
+                    frame_dispatch_depth: self.frame_dispatch_depth,
                 },
             },
             runtime: RuntimeConfig {
@@ -228,6 +271,9 @@ pub fn create_mock_env(
         rs_slots: 0,
         rs_slot_bytes: 0,
         callback_delay_ms: 0,
+        frame_size: 2,
+        frame_submit_depth: 3,
+        frame_dispatch_depth: 2,
         operation_log,
     }
 }

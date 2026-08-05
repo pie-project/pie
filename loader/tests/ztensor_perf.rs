@@ -125,8 +125,8 @@ fn reading_a_zt_artifact_is_not_slower_than_safetensors() {
         let payload = vec![0u8; 64];
         for i in 0..TENSORS {
             w.add(
-                &format!("blk.{i:05}.attn.weight"),
-                &[16],
+                format!("blk.{i:05}.attn.weight"),
+                [16],
                 ztensor::DType::F32,
                 &payload,
             )

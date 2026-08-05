@@ -33,11 +33,7 @@ Gemma4Model::Gemma4Model(
         has_audio_ = true;
     }
     caps_.supports_media_encode = has_vision_ || has_audio_;
-    // CUDA graphs default ON for Gemma4 unless intrusive-profile env is set.
-    const char* profile_env = std::getenv("PIE_GEMMA4_FORWARD_PROFILE");
-    const bool profile_enabled =
-        profile_env != nullptr && profile_env[0] != '\0' && profile_env[0] != '0';
-    caps_.graph_safe = kv_cache_.format().is_native_bf16() && !profile_enabled;
+    caps_.graph_safe = kv_cache_.format().is_native_bf16();
     caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
     caps_.supports_small_prefill_graph =

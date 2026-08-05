@@ -565,14 +565,40 @@ class Context::Impl {
         // `load.runtime_quant` and `load.mxfp4_moe` are deliberately not read:
         // this driver binds what the checkpoint holds. They were plumbed through
         // three layers to an author that never looked at them.
-        // An artifact carries its model config already normalized; a snapshot
-        // does not, and `read_model_facts` derives it as before.
-        if (auto from_descriptor =
-                read_model_facts_from_descriptor(cfg_.model.descriptor)) {
-            facts_ = std::move(*from_descriptor);
-        } else {
-            facts_ = read_model_facts(cfg_.model.hf_path);
+        // The model config arrives already normalized, whichever form the
+        // worker was pointed at: an artifact carries a `pie.model/1`
+        // descriptor, and a plain HF snapshot is normalized into one by
+        // `worker/src/weights.rs` before any driver is created.
+        //
+        // The `else` here used to be `read_model_facts(hf_path)` — this
+        // driver's own `config.json` parser, a third normalization of one
+        // document beside CUDA's and Rust's. Production no longer has a
+        // fallback to reach for, so an unreadable descriptor is refused
+        // rather than worked around; `model/config`'s
+        // `one_normalizer` test is what keeps a new caller from reappearing.
+        //
+        // Read once, here, and kept: `facts_` is this driver's projection of
+        // the document and the compile request carries the document itself.
+        descriptor_json_.clear();
+        if (!cfg_.model.descriptor.empty()) {
+            std::ifstream in(cfg_.model.descriptor);
+            if (in) {
+                std::ostringstream buffer;
+                buffer << in.rdbuf();
+                descriptor_json_ = buffer.str();
+            }
         }
+        auto from_descriptor = read_model_facts_from_descriptor(descriptor_json_);
+        if (!from_descriptor) {
+            std::cerr << "[pie-driver-metal] load_model: no readable pie.model/1 "
+                         "descriptor at "
+                      << (cfg_.model.descriptor.empty()
+                              ? std::string{"<unset>"}
+                              : cfg_.model.descriptor)
+                      << "; every boot is handed one beside its startup TOML\n";
+            return PIE_STATUS_UNSUPPORTED;
+        }
+        facts_ = std::move(*from_descriptor);
         std::string error;
         if (!ensure_executor(error)) {
             std::cerr << "[pie-driver-metal] load_model: " << error << "\n";
@@ -2145,6 +2171,7 @@ class Context::Impl {
         setup_cfg.max_forward_tokens = simple_family_max_forward_tokens(cfg_, facts_);
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
+        setup_cfg.descriptor_json = descriptor_json_;
         setup_cfg.stream_routed_experts = cfg_.model.stream_routed_experts;
         setup_cfg.expert_slab_bytes = cfg_.model.expert_slab_bytes;
         fill_family_geometry(setup_cfg, facts_);
@@ -2397,6 +2424,12 @@ class Context::Impl {
 
     Config cfg_{};
     ModelFacts facts_{};
+    /// The `pie.model/1` document read at `load_model`, kept whole.
+    ///
+    /// `facts_` is what this driver reads out of it; the compile request
+    /// carries the document itself, so the loader's authors are not limited to
+    /// the fields this driver happened to want.
+    std::string descriptor_json_;
     std::string caps_json_;
     std::string device_facts_json_;
     bool load_attempted_ = false;

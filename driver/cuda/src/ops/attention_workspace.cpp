@@ -13,13 +13,7 @@
 namespace pie_cuda_driver {
 
 namespace {
-bool plan_profile_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("PIE_STEP_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return on;
-}
+constexpr bool plan_profile_enabled() { return false; }
 }  // namespace
 
 void AttentionWorkspace::ensure_plan_slot(PlanStaging& slot) {
@@ -157,10 +151,6 @@ bool flashinfer_decode_supports_gqa(int gqa) {
     return attn_decode_gqa_instantiated(gqa);
 }
 
-bool xqa_decode_enabled_by_env() {
-    const char* v = std::getenv("PIE_CUDA_XQA_DECODE");
-    if (v == nullptr || v[0] == '\0') return true;
-    return v[0] != '0';
-}
+bool xqa_decode_enabled_by_env() { return true; }
 
 }  // namespace pie_cuda_driver

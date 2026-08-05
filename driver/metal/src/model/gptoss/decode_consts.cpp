@@ -21,6 +21,7 @@
 #include <stdexcept>
 
 #include "../../batch/decode_abi.hpp"
+#include "encode.hpp"
 #include "kernels.hpp"
 #include "../shared_kernels.hpp"
 
@@ -88,9 +89,8 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
                                 d.kind == Kind::ExpertDown;
             if (routed) {
-                // Only `down` reads a per-expert input.
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::GoQmv::XSlotStride,
-                                         d.kind == Kind::ExpertDown ? kn.K : 0, &count);
+                                         0, &count);
             }
             // The token row's pitch in `x`, and how many expert slots a row
             // selects. Bound for EVERY matvec, routed or not: at M=1 the row is
@@ -98,9 +98,9 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             // path is a stride out of uninitialized memory.
             bind_const<std::int32_t>(
                 ctx, ord, (std::uint8_t)bind::GoQmv::XRowStride,
-                d.kind == Kind::ExpertDown ? std::int32_t(K) * kn.K : kn.K, &count);
+                kn.K, &count);
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::GoQmv::SlotsPerRow,
-                                     routed ? std::int32_t(K) : 1, &count);
+                                     1, &count);
             continue;
         }
 
@@ -109,7 +109,9 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kind::FfnNorm:
             case Kind::FinalRms:
                 bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, std::uint32_t(g.hidden), 1u, 0u}, &count);
+                                      RmsParams{
+                                          g.eps, std::uint32_t(g.hidden), 1u, 0u, 1.0f},
+                                      &count);
                 break;
 
             case Kind::RopeQ:
@@ -193,10 +195,31 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                          RouterParams{std::uint32_t(g.n_experts), K}, &count);
                 break;
 
+            case Kind::ExpertSort:
+            case Kind::ExpertGather: {
+                const int sorted = gptoss_moe_sorted_rows(g, int(R));
+                const shared_kernels::MoeRouteParams p{
+                    R * K,
+                    std::uint32_t(g.n_experts),
+                    K,
+                    std::uint32_t(gptoss_moe_tile_rows(g, int(R))),
+                    std::uint32_t(sorted),
+                    std::uint32_t(g.hidden)};
+                const std::uint8_t idx = d.kind == Kind::ExpertSort
+                    ? (std::uint8_t)bind::MoeRouteSort::Params
+                    : (std::uint8_t)bind::MoeRouteRows::Params;
+                bind_const<shared_kernels::MoeRouteParams>(
+                    ctx, ord, idx, p, &count);
+                break;
+            }
+
             case Kind::ExpertSwiGlu:
                 bind_const<SwiGluParams>(
                     ctx, ord, (std::uint8_t)bind::GoSwiGlu::Params,
-                    SwiGluParams{R * K * std::uint32_t(g.intermediate), g.swiglu_limit,
+                    SwiGluParams{
+                                 std::uint32_t(gptoss_moe_sorted_rows(g, int(R))) *
+                                     std::uint32_t(g.intermediate),
+                                 g.swiglu_limit,
                                  g.swiglu_alpha},
                     &count);
                 break;
@@ -212,8 +235,6 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 
             case Kind::AttnResidual:
             case Kind::FfnResidual:
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Residual::Width,
-                                         std::int32_t(R) * g.hidden, &count);
                 break;
 
             case Kind::EmbedGather:

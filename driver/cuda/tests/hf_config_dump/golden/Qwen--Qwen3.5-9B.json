@@ -236,7 +236,7 @@
   "tie_word_embeddings": false,
   "topk_group": 1,
   "torch_dtype": "bfloat16",
-  "use_qk_norm": false,
+  "use_qk_norm": true,
   "v_head_dim": 0,
   "vocab_size": 248320,
   "vocab_size_per_layer_input": 0

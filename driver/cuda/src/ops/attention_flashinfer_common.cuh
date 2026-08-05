@@ -222,22 +222,9 @@ inline bool current_device_supports_pdl() {
     return current_device_major() >= 9;
 }
 
-inline bool force_split_kv_small_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_FLASHINFER_FORCE_SPLIT_KV_SMALL");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool force_split_kv_small_enabled() { return false; }
 
-inline bool static_nonsplit_decode_plan_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_STATIC_DECODE_PLAN");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool static_nonsplit_decode_plan_enabled() { return true; }
 
 inline std::size_t align_up_bytes(std::size_t n, std::size_t alignment) {
     return (n + alignment - 1) / alignment * alignment;
@@ -602,7 +589,7 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
     // per-request KV bound + plan work-distribution the kernel actually reads —
     // the wrong field (kv_len, request_indices, o_indptr, padded_batch_size, or
     // batch_size) is the fix site. Env-gated, D2H copies (heavy) — off by default.
-    if (std::getenv("PIE_DECODE_PARAM_DUMP") != nullptr) {
+    if constexpr (false) {
         const int R = static_cast<int>(cache.num_requests);
         std::vector<IdType> h_indptr(R + 1), h_lastlen(R), h_reqidx(R), h_oindptr(R + 1);
         cudaStreamSynchronize(stream);

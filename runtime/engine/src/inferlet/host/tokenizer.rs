@@ -1,13 +1,13 @@
 //! pie:inferlet/tokenizer - Tokenizer global functions.
 //!
 //! Split from `model` (§2.2): the engine serves exactly one model, so these are
-//! free functions over the single global [`pie_model::Model`] rather than
+//! free functions over the single global [`crate::model::Model`] rather than
 //! resource methods.
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
-use pie_model as model;
+use crate::model;
 
 /// `pie_model` still hands token tables back as two parallel vectors; the WIT
 /// surface names the pairing instead.

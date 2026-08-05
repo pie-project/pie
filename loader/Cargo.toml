@@ -7,35 +7,26 @@ description = "Typed weight-loading compiler: checkpoints to verified device-mem
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
-# `links = "pie_loader"` lets downstream crates (e.g. `pie-worker`'s build.rs)
-# discover the generated C++ header directory via the `DEP_PIE_LOADER_INCLUDE`
-# env var, which is how the native drivers get `pie_loader.h` on their include
-# path (build script ↔ build script handoff).
-links = "pie_loader"
-
 [lib]
 name = "pie_loader"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# The loader as a tool: compile, inspect, check and replay a plan without a
-# GPU, a runtime, or a driver.
-[[bin]]
-name = "pie-loader"
-path = "src/main.rs"
-required-features = ["testkit"]
+# The C ABI — repr(C) marshalling, extern entry points, the committed
+# `pie_loader.h`, and the `pie-loader` CLI — lives in `capi/`
+# (`pie-loader-capi`). This crate is the compiler alone and knows nothing of
+# C; the split makes that a dependency arrow instead of a module convention.
 
 [features]
 default = ["testkit"]
 
 # The parts of this crate that exist to *check* the loader rather than to be
-# the loader: the differential oracle, the contract fixture builder, and the
-# CPU plan executor the `pie-loader` tool replays with. None is reachable from
-# `ffi/`, so a driver linking this crate has no use for ~1.4k lines of them.
+# the loader: the differential oracle and the CPU plan executor the
+# `pie-loader` tool replays with.
 #
-# On by default so `cargo build`, `cargo test` and the tool all work unasked.
-# `worker/Cargo.toml` turns it off, which is also the check: if `ffi/` ever
-# grows a path into the oracle, the worker stops compiling.
+# On by default so `cargo build` and `cargo test` work unasked.
+# `worker/Cargo.toml` turns it off, which is also the check: if the load path
+# ever grows a route into the oracle, the worker stops compiling.
 testkit = []
 
 [dependencies]
@@ -57,3 +48,8 @@ thiserror = "2.0"
 
 [dev-dependencies]
 ztensor = { workspace = true }
+# A dev-only cycle, which cargo permits: the golden and verifier tests check
+# the *marshalled* view of a plan, and the marshalling lives in the ABI crate
+# above this one. The lib itself must never depend on it — that is the whole
+# point of the split.
+pie-loader-capi = { path = "capi", default-features = false }

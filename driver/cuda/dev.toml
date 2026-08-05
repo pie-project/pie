@@ -9,4 +9,4 @@ dtype = "bfloat16"
 # weights load.
 [batching]
 gpu_mem_utilization = 0.90
-memory_profile = "balanced"
+memory_profile = "auto"

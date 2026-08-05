@@ -16,14 +16,7 @@ namespace pie_cuda_driver::model {
 // Off by default for the same reason Kimi-K2's is: the fused runner is a real
 // GPU-time win but resonates with the scheduler at some concurrencies. Enable
 // with `PIE_KIMI_K3_MOE_FLASHINFER=1`.
-bool kimi_k3_moe_gate_up_swapped() {
-    static const bool swapped = [] {
-        const char* v = std::getenv("PIE_KIMI_K3_MOE_FLASHINFER");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return swapped;
-}
+bool kimi_k3_moe_gate_up_swapped() { return false; }
 
 namespace {
 

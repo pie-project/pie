@@ -39,14 +39,6 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
         self.id()
     }
 
-    fn fire_timing_requested(&self) -> bool {
-        ProcessCtx::fire_timing_requested(self)
-    }
-
-    fn commit_fire_timing(&mut self, enabled: bool) {
-        ProcessCtx::commit_fire_timing(self, enabled);
-    }
-
     async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
         crate::inferlet::process::gate::drain_pending_fires(self).await
     }

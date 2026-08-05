@@ -55,7 +55,7 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir,
                          "affine_qmv_tail" + g.ffn_quant.kernel_suffix(), &out.qmv_tail_alt});
     }
     if (g.is_moe()) {
-        extra.push_back({"gptoss.metal", "router_topk_scaled_bfloat16", &out.router_topk});
+        extra.push_back({"moe_route.metal", "router_topk_scaled_bfloat16", &out.router_topk});
         extra.push_back({"quantized_qmv.metal", "affine_qmv_routed" + q, &out.qmv_routed});
         extra.push_back({"moe_route.metal", "moe_route_sort", &out.moe_sort});
         extra.push_back({"moe_route.metal", "moe_route_gather", &out.moe_gather});

@@ -24,7 +24,7 @@
 #include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
 #include "pie_loader/checkpoint_source.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/gptoss/bind.hpp"
 #include "model/gptoss/decode_consts.hpp"
 #include "model/gptoss/decode_step.hpp"
@@ -252,8 +252,8 @@ int main(int argc, char** argv) {
 
     pie_loader::LoadPlan plan;
     try {
-        plan = compile_load_plan(ckpt, metal_device_target(), "gpt_oss",
-                                 pie::metal::model::ContractFacts{});
+        plan = compile_load_plan(ckpt, metal_device_target(),
+                                 descriptor_for_testing("gpt_oss"));
     } catch (const std::exception& e) {
         std::printf("  FAIL  compile_load_plan: %s\n", e.what());
         return 1;
@@ -313,8 +313,8 @@ int main(int argc, char** argv) {
     if (!build_gptoss_psos(*ctx, kernels_dir, g, psos, &err) ||
         // gpt-oss's shared table is affine b4/g64; its mxfp4 entrypoints are
         // named directly in `gptoss/kernels.cpp`.
-        !load_decode_psos(*ctx, kernels_dir, base, pie::metal::AffineFormat{4, 64},
-                          /*with_argmax=*/false, &err)) {
+        !load_decode_psos(*ctx, kernels_dir, base,
+                          pie::metal::AffineFormat{4, 64}, &err)) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }

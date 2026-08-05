@@ -19,11 +19,47 @@ members = [
     "runtime/tokenizer",
     # Constrained-decoding grammar engine (EBNF/regex/json-schema/matcher/bitmask).
     "runtime/grammar",
-    # Model metadata + instruct chat templates + multimodal host-decode.
-    "runtime/model",
+    # The two registries: `model_type` -> load-contract author, `arch_name` ->
+    # chat template. The implementations live in the per-generation crates
+    # below; this crate names them and holds host-side multimodal decode, the
+    # one aspect not yet split per generation.
+    "model",
     # HF `config.json` normalization -> the `pie.model/1` descriptor. A leaf:
     # serde only, no driver and no runtime, so `pie model convert` can run it.
-    "runtime/model-config",
+    #
+    # Under `model/` because that is what it is: "what is this model made of",
+    # answered once at import. It sat under `runtime/` while the runtime was
+    # its only caller; `pie-model` reads the descriptor directly now
+    # (`ModelFacts::from_descriptor`), and a crate a model-knowledge crate
+    # depends on is not runtime machinery.
+    # Shared by every generation crate: the authoring DSL and the chat
+    # vocabulary, and no knowledge of any one model.
+    "model/common",
+    "model/config",
+    # One crate per model generation. A generation is a crate rather than a
+    # module because the forward aspect (PTIR per generation) lands into these,
+    # and because a crate boundary is the only thing Rust has that stops one
+    # generation reaching into another.
+    "model/csm",
+    "model/deepseek_r1",
+    "model/deepseek_v4",
+    "model/gemma_2",
+    "model/gemma_3",
+    "model/gemma_4",
+    "model/glm_5",
+    "model/gpt_oss",
+    "model/kimi_k2",
+    "model/kimi_k3",
+    "model/llama_2",
+    "model/llama_3",
+    "model/mistral_3",
+    "model/nemotron_h",
+    "model/olmo_2",
+    "model/olmo_3",
+    "model/phi_3",
+    "model/qwen_2",
+    "model/qwen_3",
+    "model/qwen_3_5",
     # Shared process skeleton (paths, config sourcing, tracing/metrics, signals,
     # CLI skeleton). Depends on no role lib. Lives under `bin/` because it also
     # ships the `pie-env` command; the bins import its lib as `startup`.
@@ -58,8 +94,12 @@ members = [
     "driver/dummy",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime (see loader/architecture.md).
+    # `loader` is the compiler alone; `loader/capi` is its C ABI — the repr(C)
+    # marshalling, the extern entry points, the committed pie_loader.h and the
+    # `pie-loader` CLI — which is what the drivers actually link.
     "loader",
-    "loader/cbindgen",
+    "loader/capi",
+    "loader/capi/cbindgen",
     # Forward-pass declarations: a tracing eDSL whose static control flow runs
     # at model-load time; the traced form is what a driver executes and what
     # the fire planner will classify divergence over. Shaped like `loader/`
@@ -74,6 +114,11 @@ members = [
     "bin/gateway",
     "bin/worker",
     "bin/pie",
+    # The engine's on-device end-to-end suite. No code of its own; it exists so
+    # that `cargo test -p pie-bin` means the CLI's own tests rather than
+    # "compile thirty GPU test binaries". Almost everything in it is `#[ignore]`d
+    # and asks for a real device.
+    "tests/gpu",
 ]
 exclude = [
     "tests/inferlets",

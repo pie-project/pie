@@ -48,14 +48,5 @@ fn main() {
     let compiler_hash = hash_sources(&manifest_dir.join("src"));
     println!("cargo:rustc-env=PIE_LOADER_COMPILER_HASH={compiler_hash}");
 
-    // Hand the committed, cbindgen-generated header directory to downstream
-    // build scripts. `driver/{cuda,metal}` compile against it.
-    let include = manifest_dir.join("include");
-    println!(
-        "cargo:rerun-if-changed={}",
-        include.join("pie_loader.h").display()
-    );
-    println!("cargo:include={}", include.display());
-
     println!("cargo:rerun-if-changed=src");
 }

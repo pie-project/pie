@@ -73,13 +73,7 @@ void check_launch(const char* where, int layer) {
 /// enabled run reorders nothing and a disabled one is a load and a branch.
 class PhaseProfiler {
   public:
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_K3_PHASE_PROFILE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
+    static constexpr bool enabled() { return false; }
 
     // Decode fires are captured into a graph, and a capturing stream may not
     // be synchronised -- `report` would turn a profiling run into a failed

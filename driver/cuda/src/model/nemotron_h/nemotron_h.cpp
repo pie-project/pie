@@ -1,6 +1,6 @@
 #include "model/nemotron_h/nemotron_h.hpp"
 
-#include "model/nemotron_h/nemotron_h_contract.hpp"
+#include "model/nemotron_h/nemotron_h.hpp"
 
 #include <algorithm>
 #include <cstdlib>

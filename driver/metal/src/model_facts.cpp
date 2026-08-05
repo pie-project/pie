@@ -10,7 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 
 namespace pie::metal {
 
@@ -163,7 +163,8 @@ ModelFacts read_model_facts(const std::string& hf_path) {
         // only when `model_type` names one of them, on the same principle as
         // the two above: a config that never mentions this family cannot
         // accidentally select it.
-        if (pie::metal::model::llama::is_supported_model_type(facts.model_type)) {
+        if (pie::metal::model::model_family_of(facts.model_type) ==
+            pie::metal::model::ModelFamily::Llama) {
             const auto gi = [](const nlohmann::json& obj, const char* key, int& out) {
                 if (obj.contains(key) && obj[key].is_number_integer()) {
                     out = obj[key].get<int>();
@@ -218,15 +219,25 @@ ModelFacts read_model_facts(const std::string& hf_path) {
                 facts.ll_tied_embeddings = j["tie_word_embeddings"].get<bool>();
             }
             // Qwen3 RMS-normalises q and k per head; llama, mistral and qwen2
-            // do not. The config has no key for it -- it is implied by the
-            // architecture -- so the `model_type` says it.
-            facts.ll_qk_norm =
-                facts.model_type == "qwen3" || facts.model_type == "qwen3_moe";
+            // do not. Usually implied by the architecture, so the `model_type`
+            // says it -- but an explicit `use_qk_norm` wins where a config
+            // states one. `normalize.rs::infer_qk_norm` and the CUDA driver's
+            // `infer_qk_norm` both give the explicit flag priority, and so does
+            // the descriptor branch below; this path was the only one of the
+            // four ignoring it, so a checkpoint carrying `"use_qk_norm": true`
+            // ran q/k-normed from an artifact and un-normed from raw
+            // `config.json` -- the fluent-but-wrong-tokens failure.
+            facts.ll_qk_norm = (j.contains("use_qk_norm") &&
+                                j["use_qk_norm"].is_boolean() &&
+                                j["use_qk_norm"].get<bool>()) ||
+                               facts.model_type == "qwen3" ||
+                               facts.model_type == "qwen3_moe";
         }
 
         // ── Qwen3.5 / Qwen3-Next: the GDN hybrid ──
         // Read only when `model_type` names it, like every block around it.
-        if (pie::metal::model::qwen3_5::is_supported_model_type(facts.model_type)) {
+        if (pie::metal::model::model_family_of(facts.model_type) ==
+            pie::metal::model::ModelFamily::Qwen35) {
             const auto gi = [](const nlohmann::json& obj, const char* key, int& out) {
                 if (obj.contains(key) && obj[key].is_number_integer()) {
                     out = obj[key].get<int>();
@@ -494,14 +505,15 @@ void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts&
 // `HfConfig` field names, `gemma4_*`, because the schema is generated from
 // that struct.
 std::optional<ModelFacts> read_model_facts_from_descriptor(
-    const std::string& descriptor_path) {
-    if (descriptor_path.empty()) return std::nullopt;
-    std::ifstream f(descriptor_path);
-    if (!f) return std::nullopt;
+    std::string_view descriptor_json) {
+    if (descriptor_json.empty()) return std::nullopt;
 
+    // Text in, not a path: the caller reads the file, because it keeps the
+    // document anyway — the compile request carries it whole, and opening it
+    // twice would be two chances to read two different things.
     nlohmann::json j;
     try {
-        f >> j;
+        j = nlohmann::json::parse(descriptor_json);
     } catch (const std::exception&) {
         return std::nullopt;
     }
@@ -529,6 +541,27 @@ std::optional<ModelFacts> read_model_facts_from_descriptor(
     u32_of("max_position_embeddings", facts.max_model_len);
     f32_of("rope_theta", facts.rope_theta);
     f32_of("partial_rotary_factor", facts.partial_rotary_factor);
+    // The affine width and group, which the `config.json` path reads off the
+    // root `quantization` block. Leaving them zero here is not a smaller set of
+    // facts, it is a *wrong* one: every geometry defaults to `{4, 64}` and only
+    // overrides when these are non-zero, so an 8-bit checkpoint served as an
+    // artifact would be decoded by 4-bit kernels. The descriptor spells them
+    // `quant_bits` / `quant_group_size` because the schema is generated from
+    // `HfConfig`, which normalizes both quantization dialects into one pair.
+    i32_of("quant_bits", facts.quant_bits);
+    i32_of("quant_group_size", facts.quant_group_size);
+
+    // The declared quantization width. `read_model_facts` took these from
+    // `mlx_lm`'s bare `quantization` block, and the descriptor now carries
+    // them under the `quant_*` names the schema uses -- the normalizer reads
+    // that spelling as well as `quantization_config`.
+    //
+    // Not optional detail: zero here means "undeclared", and both the load
+    // contract (`push_mlx_affine_declared`) and the forward geometry
+    // (`batch/forward.cpp`) answer undeclared with 4 bits. An 8-bit
+    // checkpoint read as 4-bit is not a refusal, it is wrong numbers.
+    i32_of("quant_bits", facts.quant_bits);
+    i32_of("quant_group_size", facts.quant_group_size);
 
     // `arch_name` is `architectures[0]` verbatim in the descriptor; this driver
     // keys on the lowercased stem, so apply the same reduction it applies to
@@ -573,6 +606,129 @@ std::optional<ModelFacts> read_model_facts_from_descriptor(
         f32_of("rope_beta_fast", facts.go_rope_beta_fast);
         f32_of("rope_beta_slow", facts.go_rope_beta_slow);
         i32_of("rope_original_max_position", facts.go_rope_original_max_position);
+    }
+
+    // ── The llama-shaped families ──
+    // The mirror of the `config.json` block above: read only when `model_type`
+    // names one of them, so a config that never mentions this family cannot
+    // accidentally select it. Without this branch every llama-shaped artifact
+    // reached the geometry with `ll_num_hidden_layers == 0` and was refused as
+    // "config carried no decoder shape" -- the descriptor path claimed to carry
+    // a normalized config and then carried no decoder for this family at all.
+    if (pie::metal::model::model_family_of(facts.model_type) ==
+        pie::metal::model::ModelFamily::Llama) {
+        i32_of("num_hidden_layers", facts.ll_num_hidden_layers);
+        i32_of("hidden_size", facts.ll_hidden_size);
+        i32_of("vocab_size", facts.ll_vocab_size);
+        i32_of("num_attention_heads", facts.ll_num_attention_heads);
+        i32_of("num_key_value_heads", facts.ll_num_key_value_heads);
+        i32_of("head_dim", facts.ll_head_dim);
+        i32_of("intermediate_size", facts.ll_intermediate_size);
+        // The descriptor folds `num_local_experts` / `num_experts` /
+        // `n_routed_experts` into one field at import, as it does for gpt-oss.
+        i32_of("num_experts", facts.ll_num_experts);
+        i32_of("num_experts_per_tok", facts.ll_num_experts_per_tok);
+        i32_of("moe_intermediate_size", facts.ll_moe_intermediate_size);
+        f32_of("rms_norm_eps", facts.ll_rms_norm_eps);
+        f32_of("rope_theta", facts.ll_rope_theta);
+        facts.ll_norm_topk_prob = j.value("norm_topk_prob", facts.ll_norm_topk_prob);
+        facts.ll_tied_embeddings =
+            j.value("tie_word_embeddings", facts.ll_tied_embeddings);
+        // `use_qk_norm` is explicit in the descriptor, but import only infers it
+        // for `qwen3` -- not for `qwen3_moe`, which normalizes q and k just the
+        // same. OR in the `model_type` the `config.json` path keys on so the two
+        // paths cannot disagree about a checkpoint's numerics.
+        facts.ll_qk_norm = j.value("use_qk_norm", false) ||
+                           facts.model_type == "qwen3" ||
+                           facts.model_type == "qwen3_moe";
+        // Import resolves `rope_scaling` into a kind plus already-defaulted
+        // knobs; the driver keys on HF's spelling, so translate back. `none`
+        // stays empty, which is the "plain geometric series" the geometry runs
+        // for an absent scaling. `original_yarn` becomes `yarn` so the refusal
+        // names the schedule the config actually asked for.
+        const std::string kind = j.value("rope_scaling_kind", std::string{});
+        if (kind == "llama3") {
+            facts.ll_rope_scaling_kind = "llama3";
+        } else if (kind == "original_yarn") {
+            facts.ll_rope_scaling_kind = "yarn";
+        }
+        // `rope_factor` is read whatever the kind. A linear scaling normalizes
+        // to kind `none` plus a factor -- it IS the plain geometric series,
+        // just with positions divided -- so gating this read on a non-empty
+        // kind would drop the factor and silently disagree with the
+        // `config.json` path above, which reads it unconditionally.
+        f32_of("rope_factor", facts.ll_rope_scale);
+        if (!facts.ll_rope_scaling_kind.empty()) {
+            f32_of("rope_low_freq_factor", facts.ll_rope_low_freq_factor);
+            f32_of("rope_high_freq_factor", facts.ll_rope_high_freq_factor);
+            i32_of("rope_original_max_position",
+                   facts.ll_rope_original_max_position);
+        }
+    }
+
+    // ── Qwen3.5 / Qwen3-Next: the GDN hybrid ──
+    // The mirror of the `config.json` block above, and the reason a Qwen3.5
+    // checkpoint imported through `pie model import` could not boot on Metal:
+    // the descriptor path had no branch for this family at all, so the geometry
+    // saw `q35_num_hidden_layers == 0` and refused the model as carrying no
+    // decoder shape -- from a descriptor that carried the whole decoder.
+    if (pie::metal::model::model_family_of(facts.model_type) ==
+        pie::metal::model::ModelFamily::Qwen35) {
+        i32_of("num_hidden_layers", facts.q35_num_hidden_layers);
+        i32_of("hidden_size", facts.q35_hidden_size);
+        i32_of("vocab_size", facts.q35_vocab_size);
+        i32_of("num_attention_heads", facts.q35_num_attention_heads);
+        i32_of("num_key_value_heads", facts.q35_num_key_value_heads);
+        i32_of("head_dim", facts.q35_head_dim);
+        i32_of("intermediate_size", facts.q35_intermediate_size);
+        i32_of("linear_num_key_heads", facts.q35_linear_key_heads);
+        i32_of("linear_num_value_heads", facts.q35_linear_value_heads);
+        i32_of("linear_key_head_dim", facts.q35_linear_key_head_dim);
+        i32_of("linear_value_head_dim", facts.q35_linear_value_head_dim);
+        i32_of("linear_conv_kernel_dim", facts.q35_linear_conv_kernel);
+        // The descriptor folds `num_local_experts` / `num_experts` /
+        // `n_routed_experts` into one field at import, as it does for the
+        // families above.
+        i32_of("num_experts", facts.q35_num_experts);
+        i32_of("num_experts_per_tok", facts.q35_num_experts_per_tok);
+        i32_of("moe_intermediate_size", facts.q35_moe_intermediate_size);
+        i32_of("shared_expert_intermediate_size",
+               facts.q35_shared_expert_intermediate);
+        f32_of("rms_norm_eps", facts.q35_rms_norm_eps);
+        facts.q35_norm_topk_prob =
+            j.value("norm_topk_prob", facts.q35_norm_topk_prob);
+        // The multimodal `text_config` split the `config.json` path has to
+        // reconcile does not exist here: import already resolved the text
+        // decoder's own statement into one top-level field.
+        facts.q35_tied_embeddings =
+            j.value("tie_word_embeddings", facts.q35_tied_embeddings);
+        // `full_attention_interval` is not a descriptor field -- import
+        // expands the schedule into `layer_types`, one entry per layer. Reduce
+        // it the same way the `config.json` path reduces a list-spelled
+        // pattern, including the -1 for an irregular stack: rounding that to a
+        // regular interval would put full attention on layers that are linear.
+        if (j.contains("layer_types") && j["layer_types"].is_array()) {
+            std::vector<int> full;
+            int idx = 0;
+            for (const auto& lt : j["layer_types"]) {
+                if (lt.is_string() && lt.get<std::string>() == "full_attention") {
+                    full.push_back(idx);
+                }
+                ++idx;
+            }
+            if (!full.empty()) {
+                const int interval = full[0] + 1;
+                bool regular = true;
+                for (std::size_t k = 0; k < full.size(); ++k) {
+                    regular = regular && full[k] == int(k + 1) * interval - 1;
+                }
+                facts.q35_full_attn_interval = regular ? interval : -1;
+            }
+        }
+        // `decoder_sparse_step` and `mlp_only_layers` have no descriptor
+        // spelling; their defaults stand. Both describe which layers are dense
+        // in a routed stack, so they are inert for the dense releases and are
+        // the known gap for a MoE one imported through the descriptor.
     }
 
     if (facts.model_type == "gemma4" || facts.model_type == "gemma4_text") {

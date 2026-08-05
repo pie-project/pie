@@ -578,17 +578,7 @@ bool qwen3_5_forward_declared(
             const bool linear =
                 layer.kind == Qwen3_5LayerWeights::Kind::LinearAttn;
             // ── GDN in-projections (read norm_x, the pre-attn norm) ──
-            if (nm.field == "in_proj_qkvz") {
-                ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
-                    *require(layer.la_in_proj_qkvz, name),
-                    la.mixed_qkvz.data(), N, conv_dim + V_dim, H);
-            } else if (nm.field == "in_proj_ba") {
-                ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
-                    *require(layer.la_in_proj_ba, name),
-                    la.ba.data(), N, 2 * V_h, H);
-            } else if (nm.field == "in_proj_qkv") {
+            if (nm.field == "in_proj_qkv") {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
                     *require(layer.la_in_proj_qkv, name),

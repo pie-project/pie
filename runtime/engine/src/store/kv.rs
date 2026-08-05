@@ -1129,28 +1129,9 @@ impl KvStore {
         );
         if self.table.node_page_last_slot_hash(entry.node, entry.local) != Some(*key) {
             self.cas.remove(key);
-            if crate::scheduler::fire_timing_enabled() {
-                crate::scheduler::fire_timing_write(&serde_json::json!({
-                    "schema": 1,
-                    "source": "runtime",
-                    "event": "cas_prune",
-                    "node": format!("{:?}", entry.node),
-                    "local": entry.local,
-                }));
-            }
-
             return None;
         }
         let pinned = self.table.page_location_pinned(location);
-        if crate::scheduler::fire_timing_enabled() && (!resident || pinned) {
-            crate::scheduler::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "runtime",
-                "event": "cas_blocked",
-                "resident": resident,
-                "pinned": pinned,
-            }));
-        }
         (resident && !pinned).then_some((entry.node, entry.local))
     }
 

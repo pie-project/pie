@@ -62,7 +62,6 @@
 #include "model/kimi_k3/kimi_k3_forward.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/loaded_model.hpp"
-#include "model/nemotron_h/nemotron_h_contract.hpp"
 #include "model/nemotron_h/nemotron_h.hpp"
 #include "model/nemotron_h/nemotron_h_forward.hpp"
 #include "model/qwen3_5/qwen3_5_config.hpp"
@@ -830,8 +829,6 @@ void Context::Impl::report_load_failure(const std::string& what) {
               << ": " << what << "\n";
     pie_cuda_driver::tp_report_rank_failure(
         tp_cpu_gate_key_, tp_rank_, "model load failed: " + what);
-    const char* keep = std::getenv("PIE_TP_NO_FAIL_STOP");
-    if (keep != nullptr && keep[0] != '0' && keep[0] != '\0') return;
     if (tp_size_ <= 1) return;
     std::cerr << "[pie-driver-cuda] a TP rank failed to load; the driver "
                  "cannot serve — exiting\n";
@@ -1077,10 +1074,7 @@ int Context::Impl::load_model(
     // mode and the upfront lattice still runs, because turning those off
     // changes what the two TP ranks each decide to do and wedges the group.
     // Costs throughput; it is for measurement, not for serving.
-    const bool graph_replay_enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_NOGRAPHS");
-        return !(v != nullptr && v[0] != '\0' && v[0] != '0');
-    }();
+    constexpr bool graph_replay_enabled = true;
     const auto runtime_quant_scratch_base =
         runtime_quant_scratch_spec(engine, /*max_tokens=*/0);
 
@@ -1530,12 +1524,8 @@ int Context::Impl::load_model(
         CUDA_CHECK(cudaGetDeviceProperties(&serving_prop, device_ordinal_));
         const bool prefill_decode_supported_head_dim =
             attn_head_dim_instantiated(hf.head_dim_kernel);
-        const bool force_prefill_decode_plan = [] {
-            const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_PLAN");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
         fwd_cfg.use_prefill_decode_plan =
-            (serving_prop.major >= 9 || force_prefill_decode_plan) &&
+            serving_prop.major >= 9 &&
             gqa_in_decode_set && !fwd_cfg.force_prefill_path &&
             prefill_decode_supported_head_dim &&
             fwd_cfg.sliding_window < 0 &&
@@ -1875,8 +1865,6 @@ int Context::Impl::load_model(
         workspace_allocator_->ensure_all();
         tp_startup_cpu_barrier(cfg);
 
-        const char* disabled =
-            std::getenv("PIE_CUDA_DISABLE_CUSTOM_ALL_REDUCE");
         const std::vector<void*> workspace_bases =
             workspace_allocator_->arena_bases();
         struct CustomArVote {
@@ -1885,16 +1873,15 @@ int Context::Impl::load_model(
         };
         const CustomArVote local{
             static_cast<std::uint8_t>(
-                (disabled == nullptr || std::strcmp(disabled, "1") != 0) &&
-                        // The custom all-reduce reads its peers' arenas through
-                        // direct peer mappings, so it needs the same working
-                        // peer path NCCL's P2P transport does. Where that path
-                        // is broken it does not fail loudly -- it reduces
-                        // whatever the mapping yields (zeros) or wedges. Refuse
-                        // it on measured evidence rather than on topology
-                        // claims; NCCL's host-staged fallback still works.
-                        pie_cuda_driver::p2p_transport_usable() &&
-                        !tp_group_devices_.empty() && !workspace_bases.empty()
+                // The custom all-reduce reads its peers' arenas through
+                // direct peer mappings, so it needs the same working peer
+                // path NCCL's P2P transport does. Where that path is broken
+                // it does not fail loudly -- it reduces whatever the mapping
+                // yields (zeros) or wedges. Refuse it on measured evidence
+                // rather than on topology claims; NCCL's host-staged
+                // fallback still works.
+                (pie_cuda_driver::p2p_transport_usable() &&
+                 !tp_group_devices_.empty() && !workspace_bases.empty())
                     ? 1
                     : 0),
             static_cast<std::uint32_t>(workspace_bases.size())};
@@ -2315,60 +2302,12 @@ int Context::Impl::validate_finalized_launch(
 namespace {
 
 struct StepProfile {
-    enum Phase { kPrepare = 0, kEnqueue, kSettle, kPhaseCount };
-    std::array<std::uint64_t, kPhaseCount> ns{};
-    std::array<std::uint64_t, kPhaseCount> hits{};
-
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
-    static StepProfile& instance() {
-        static StepProfile p;
-        return p;
-    }
-    ~StepProfile() {
-        if (!enabled()) return;
-        static const char* names[kPhaseCount] = {"prepare", "enqueue", "settle"};
-        for (int i = 0; i < kPhaseCount; ++i) {
-            if (hits[i] == 0) continue;
-            std::cerr << "[step-profile] " << names[i]
-                      << " calls=" << hits[i]
-                      << " total_ms=" << (static_cast<double>(ns[i]) / 1e6)
-                      << " avg_us=" << (static_cast<double>(ns[i]) / 1e3 / hits[i])
-                      << "\n";
-        }
-    }
+    enum Phase { kPrepare = 0, kEnqueue, kSettle };
 };
 
 class StepPhaseTimer {
   public:
-    explicit StepPhaseTimer(StepProfile::Phase phase)
-        : phase_(phase), on_(StepProfile::enabled()) {
-        if (on_) {
-            static const char* names[StepProfile::kPhaseCount] = {
-                "prepare", "enqueue", "settle"};
-            nvtxRangePushA(names[phase]);
-            start_ = std::chrono::steady_clock::now();
-        }
-    }
-    ~StepPhaseTimer() {
-        if (!on_) return;
-        nvtxRangePop();
-        auto& p = StepProfile::instance();
-        p.ns[phase_] += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start_).count());
-        ++p.hits[phase_];
-    }
-
-  private:
-    StepProfile::Phase phase_;
-    bool on_;
-    std::chrono::steady_clock::time_point start_;
+    explicit StepPhaseTimer(StepProfile::Phase) {}
 };
 
 }  // namespace
@@ -2462,27 +2401,6 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
         return PIE_STATUS_IMPOSSIBLE;
     }
     executor_->required_kv_pages = kv_required;
-    const char* assert_proportional =
-        std::getenv("PIE_CUDA_ASSERT_KV_COMMIT_PROPORTIONAL");
-    if (assert_proportional != nullptr && assert_proportional[0] != '\0' &&
-        assert_proportional[0] != '0' && kv_required > 0) {
-        const std::size_t committed = kv_allocator_->committed_bytes();
-        const std::size_t capacity = kv_allocator_->allocated_bytes();
-        kv_proportional_peak_required_pages_ = std::max(
-            kv_proportional_peak_required_pages_,
-            static_cast<std::size_t>(kv_required));
-        kv_proportional_planned_pages_ =
-            static_cast<std::size_t>(kv_cache_->num_pages());
-        kv_proportional_peak_committed_bytes_ = std::max(
-            kv_proportional_peak_committed_bytes_, committed);
-        kv_proportional_capacity_bytes_ = capacity;
-        if (kv_required * 2 < kv_cache_->num_pages() &&
-            committed * 2 >= capacity) {
-            std::cerr << "[pie-driver-cuda] short-context KV commit is not "
-                         "demand-proportional\n";
-            return PIE_STATUS_DRIVER_ERROR;
-        }
-    }
     // Stream work is SUCCESS-only for admitted frames (P4): any exception
     // past this point is a driver fault. Latch FAILED on the affected
     // steps' fires (every step for a prepare fault — nothing was enqueued;
@@ -2536,17 +2454,14 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
         // channel to tell the runtime "this driver is finished", and the
         // failure has now been surfaced to this frame's clients, so stop the
         // process rather than idle in a state no caller can distinguish from a
-        // hang. `PIE_TP_NO_FAIL_STOP=1` keeps it alive for debugging.
+        // hang.
         if (pie_cuda_driver::detail::g_tp_rank_failed.load(
                 std::memory_order_acquire)) {
-            const char* keep = std::getenv("PIE_TP_NO_FAIL_STOP");
-            if (keep == nullptr || keep[0] == '0' || keep[0] == '\0') {
-                std::cerr << "[pie-driver-cuda] TP group lost a rank; the "
-                             "driver cannot serve again — exiting\n";
-                std::cerr.flush();
-                std::fflush(nullptr);
-                std::_Exit(70);
-            }
+            std::cerr << "[pie-driver-cuda] TP group lost a rank; the "
+                         "driver cannot serve again — exiting\n";
+            std::cerr.flush();
+            std::fflush(nullptr);
+            std::_Exit(70);
         }
         return PIE_STATUS_OK;
     };

@@ -159,10 +159,9 @@ Resolve resolve_shared_layer_field(const LW& lw, std::string_view f) {
     if (f == "in_proj_z") return linear ? ok(lw.la_in_proj_z) : Resolve::No;
     if (f == "in_proj_a") return linear ? ok(lw.la_in_proj_a) : Resolve::No;
     if (f == "in_proj_b") return linear ? ok(lw.la_in_proj_b) : Resolve::No;
-    if (f == "in_proj_qkvz") {
-        return linear ? ok(lw.la_in_proj_qkvz) : Resolve::No;
-    }
-    if (f == "in_proj_ba") return linear ? ok(lw.la_in_proj_ba) : Resolve::No;
+    // Merge 2026-08-05: the fused GDN in-projection bank is gone upstream
+    // (36c333382); a trace naming it is a stale plan, refused here.
+    if (f == "in_proj_qkvz" || f == "in_proj_ba") return Resolve::No;
     if (f == "conv") return linear ? ok(lw.la_conv1d_w) : Resolve::No;
     if (f == "a_log") return linear ? ok(lw.la_A_log_fp32) : Resolve::No;
     if (f == "dt_bias") return linear ? ok(lw.la_dt_bias) : Resolve::No;
@@ -428,18 +427,15 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
         const auto& lw = w.layers[l];
         using Kind = typename std::decay_t<decltype(lw)>::Kind;
         if (lw.kind == Kind::LinearAttn) {
-            const bool f = lw.la_in_proj_qkvz != nullptr;
-            if (f && lw.la_in_proj_ba == nullptr) {
-                return refuse("gdn fused in_proj binding incomplete");
-            }
-            if (!f && (lw.la_in_proj_qkv == nullptr ||
-                       lw.la_in_proj_z == nullptr ||
-                       lw.la_in_proj_a == nullptr ||
-                       lw.la_in_proj_b == nullptr)) {
-                return refuse("gdn unfused in_proj binding incomplete");
-            }
-            if (saw_linear && f != fused_gdn) {
-                return refuse("mixed fused/unfused gdn in_proj binding");
+            // Merge 2026-08-05: upstream deleted the fused GDN input
+            // projections and the switch that armed them (36c333382) —
+            // the split bank is the only form the loader populates.
+            const bool f = false;
+            if (lw.la_in_proj_qkv == nullptr ||
+                lw.la_in_proj_z == nullptr ||
+                lw.la_in_proj_a == nullptr ||
+                lw.la_in_proj_b == nullptr) {
+                return refuse("gdn in_proj binding incomplete");
             }
             fused_gdn = f;
             saw_linear = true;

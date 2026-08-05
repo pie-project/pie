@@ -1,0 +1,307 @@
+{
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "model.layers.0.mlp.shared_expert.gate_up_proj.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Src": "model.layers.0.mlp.shared_expert.gate_proj.weight"
+            },
+            {
+              "Src": "model.layers.0.mlp.shared_expert.up_proj.weight"
+            }
+          ]
+        }
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.gate_up_proj",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Transmute": {
+                "src": {
+                  "Concat": {
+                    "axis": 0,
+                    "parts": [
+                      {
+                        "Src": "model.layers.0.mlp.experts.0.up_proj.weight"
+                      },
+                      {
+                        "Src": "model.layers.0.mlp.experts.0.gate_proj.weight"
+                      }
+                    ]
+                  }
+                },
+                "to": {
+                  "shape": [
+                    1,
+                    64,
+                    64
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Concat": {
+                    "axis": 0,
+                    "parts": [
+                      {
+                        "Src": "model.layers.0.mlp.experts.1.up_proj.weight"
+                      },
+                      {
+                        "Src": "model.layers.0.mlp.experts.1.gate_proj.weight"
+                      }
+                    ]
+                  }
+                },
+                "to": {
+                  "shape": [
+                    1,
+                    64,
+                    64
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.down_proj",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Transmute": {
+                "src": {
+                  "Src": "model.layers.0.mlp.experts.0.down_proj.weight"
+                },
+                "to": {
+                  "shape": [
+                    1,
+                    64,
+                    32
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Src": "model.layers.0.mlp.experts.1.down_proj.weight"
+                },
+                "to": {
+                  "shape": [
+                    1,
+                    64,
+                    32
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        2,
+        64,
+        32
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "expr": {
+        "Src": "model.embed_tokens.weight"
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.input_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.0.input_layernorm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.self_attn.q_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.self_attn.q_proj.weight"
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.self_attn.k_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.self_attn.k_proj.weight"
+      },
+      "shape": [
+        32,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.self_attn.v_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.self_attn.v_proj.weight"
+      },
+      "shape": [
+        32,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.self_attn.o_proj.weight"
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.gate.weight",
+      "expr": {
+        "Src": "model.layers.0.mlp.gate.weight"
+      },
+      "shape": [
+        2,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.shared_expert.gate_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.mlp.shared_expert.gate_proj.weight"
+      },
+      "shape": [
+        32,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.shared_expert.up_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.mlp.shared_expert.up_proj.weight"
+      },
+      "shape": [
+        32,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.norm.weight",
+      "expr": {
+        "Src": "model.norm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    }
+  ],
+  "groups": []
+}

@@ -11,7 +11,7 @@ through the chat decoder while the next token remains device-carried into the
 following pass.
 
 Other inferlets use it as a reference for output-equivalence checks. It is also
-covered by `bin/pie/tests/cuda_chat_completion_e2e.rs`, which asserts on output
+covered by `tests/gpu/tests/cuda_chat_completion_e2e.rs`, which asserts on output
 content — the continuation of "The capital of France is" must contain "Paris" —
 not just liveness. That ignored e2e was the test that exposed a silent decode
 KV-corruption bug affecting six inferlets; see

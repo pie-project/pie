@@ -27,10 +27,14 @@ pub struct ModelDrivers {
     pub groups: Vec<GroupDriver>,
 }
 
+/// The one place config units become the engine's plain numbers. `Duration`
+/// and `ByteSize` carry their unit through the config layer; `pie_engine`'s
+/// bootstrap structs still take `_secs`/`_us`/`_mb` scalars, so the conversion
+/// happens here and only here.
 pub fn build(
     user: &config::Config,
     drivers: ModelDrivers,
-    artifact: Option<pie_model::ArtifactMetadata>,
+    metadata: pie_model::ModelMetadata,
 ) -> Result<pie_engine::bootstrap::Config> {
     if drivers.groups.is_empty() {
         anyhow::bail!(
@@ -44,7 +48,7 @@ pub fn build(
     let cache_dir = pie_home.join("programs");
     let log_dir = Some(pie_home.join("logs"));
 
-    let model = build_model(&user.model, drivers, artifact)?;
+    let model = build_model(&user.model, drivers, metadata)?;
 
     Ok(pie_engine::bootstrap::Config {
         host: user.server.host.clone(),
@@ -61,14 +65,14 @@ pub fn build(
         runtime: pie_engine::bootstrap::RuntimeConfig {
             worker_threads: user.runtime.worker_threads,
             wasm_max_instances: user.runtime.wasm_max_instances,
-            wasm_max_memory_mb: user.runtime.wasm_max_memory_mb,
-            wasm_warm_memory_mb: user.runtime.wasm_warm_memory_mb,
+            wasm_max_memory_mb: user.runtime.wasm_max_memory.as_mib() as usize,
+            wasm_warm_memory_mb: user.runtime.wasm_warm_memory.as_mib() as usize,
             wasm_warm_slots: user.runtime.wasm_warm_slots,
             allow_fs: user.runtime.allow_fs,
             fs_scratch_dir: user.runtime.fs_scratch_dir.clone(),
             allow_network: user.runtime.allow_network,
             network_allowed_hosts: user.runtime.network_allowed_hosts.clone(),
-            max_upload_mb: user.runtime.max_upload_mb,
+            max_upload_mb: user.runtime.max_upload.as_mib() as usize,
             py_runtime_dir: pie_home.join("py-runtime"),
         },
         model,
@@ -83,7 +87,7 @@ pub fn build(
 fn build_model(
     m: &config::ModelConfig,
     drivers: ModelDrivers,
-    artifact: Option<pie_model::ArtifactMetadata>,
+    metadata: pie_model::ModelMetadata,
 ) -> Result<pie_engine::bootstrap::ModelConfig> {
     // Arch + kv_page_size + tokenizer come from group 0; all groups
     // serve the same model so they agree. Per-group caps can differ in
@@ -91,8 +95,9 @@ fn build_model(
     let group0_caps = drivers.groups[0].caps.clone();
     let snapshot_dir = PathBuf::from(&group0_caps.snapshot_dir);
     // The metadata was lifted once when the model was resolved; this only
-    // decides which of the two shapes the runtime is being handed.
-    let tokenizer_path = if artifact.is_some() {
+    // decides which of the two shapes the runtime is being handed. Only the
+    // tokenizer half varies -- the descriptor is there either way.
+    let tokenizer_path = if metadata.tokenizer.is_some() {
         snapshot_dir.clone()
     } else {
         let tokenizer_json = snapshot_dir.join("tokenizer.json");
@@ -141,12 +146,15 @@ fn build_model(
         arch_name: group0_caps.arch_name,
         kv_page_size: group0_caps.kv_page_size as usize,
         tokenizer_path,
-        artifact,
+        metadata,
         drivers,
         scheduler: pie_engine::bootstrap::SchedulerConfig {
-            request_timeout_secs: m.scheduler.request_timeout_secs,
-            submit_deadline_us: m.scheduler.submit_deadline_us,
-            silence_timeout_secs: m.scheduler.silence_timeout_secs,
+            request_timeout_secs: m.scheduler.request_timeout.as_secs(),
+            submit_deadline_us: m.scheduler.submit_deadline.as_micros(),
+            silence_timeout_secs: m.scheduler.silence_timeout.as_secs(),
+            frame_size: m.scheduler.frame_size,
+            frame_submit_depth: m.scheduler.frame_submit_depth,
+            frame_dispatch_depth: m.scheduler.frame_dispatch_depth,
         },
     })
 }
@@ -154,6 +162,19 @@ fn build_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The smallest `pie.model/1` a boot is valid with.
+    ///
+    /// `build` only carries the metadata through; the two fields the runtime
+    /// reads out of it (`vocab_size`, `num_hidden_layers`) are exercised where
+    /// they are read, in `pie_model::register`.
+    fn fixture_metadata() -> pie_model::ModelMetadata {
+        pie_model::ModelMetadata {
+            tokenizer: None,
+            descriptor: br#"{"version":"pie.model/1","vocab_size":32,"num_hidden_layers":2}"#
+                .to_vec(),
+        }
+    }
 
     fn fixture_caps() -> DriverCapabilities {
         DriverCapabilities {
@@ -253,7 +274,7 @@ arch_name = "qwen3"
             ModelDrivers {
                 groups: vec![fixture_group(caps)],
             },
-            None,
+            fixture_metadata(),
         )
         .unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
@@ -300,7 +321,7 @@ arch_name = "qwen3"
             ModelDrivers {
                 groups: vec![fixture_group(fixture_caps()), fixture_group(g1)],
             },
-            None,
+            fixture_metadata(),
         )
         .unwrap();
         let m = &cfg.model;
@@ -322,7 +343,7 @@ device = ["cpu"]
 "#,
         )
         .unwrap();
-        let err = build(&user, ModelDrivers { groups: vec![] }, None)
+        let err = build(&user, ModelDrivers { groups: vec![] }, fixture_metadata())
             .err()
             .unwrap()
             .to_string();

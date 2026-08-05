@@ -26,7 +26,6 @@
 #include "batch/forward.hpp"
 #include "model/llama/decode_step.hpp"
 #include "model/llama/kernels.hpp"
-#include "model/llama/llama_contract.hpp"
 #include "model/llama/bind.hpp"
 #include "model/llama/decode_consts.hpp"
 #include "model/llama/encode.hpp"
@@ -575,48 +574,10 @@ void check_pool_counts_the_slots() {
 // run and get quietly wrong -- not crash, not produce garbage, just return
 // plausible tokens from the wrong arithmetic. That is the failure mode a
 // refusal exists to prevent, so it is worth pinning that each one still fires.
-/// Every tensor a routed checkpoint ships is either RENAMED onto something a
-/// dispatch reads, or refused by name.
-///
-/// The third possibility is the dangerous one and it was open: the mapper's
-/// last line returns `layers.N.<member>` for anything it did not recognise, so
-/// an unrecognised tensor was DECLARED under its own name, loaded into the
-/// heap, and then read by nobody. The bind test cannot see it -- that test
-/// asks whether every slot a dispatch needs got filled, which is the other
-/// direction entirely.
-///
-/// `qwen2_moe` puts a SHARED expert beside the routed ones: a dense SwiGLU
-/// every token runs unconditionally, plus a sigmoid gate on its contribution.
-/// This driver implements no such thing. Passed through silently, its weights
-/// were loaded and dropped and the model ran the routed mixture alone -- which
-/// produces fluent text that is not the checkpoint's, the failure mode this
-/// schema refuses per-expert tensors to avoid. So it is refused here too,
-/// until the block exists.
-void check_shared_experts_are_refused_rather_than_dropped() {
-    namespace cd = pie::metal::model::llama::contract_detail;
-    const auto maps = [&](const char* raw) {
-        try {
-            (void)cd::runtime_name(raw, cd::HeadTying{});
-            return true;
-        } catch (const std::exception&) {
-            return false;
-        }
-    };
-    // The stacked routed bank, in both spellings, still maps.
-    expect(maps("model.layers.3.mlp.experts.gate_proj.weight"),
-           "the fused routed bank maps");
-    expect(maps("model.layers.3.mlp.switch_mlp.gate_proj.weight"),
-           "mlx_lm's spelling of the same bank maps");
-    expect(!maps("model.layers.3.mlp.experts.0.gate_proj.weight"),
-           "an unstacked per-expert bank is refused");
-    // And the shared expert, which nothing here computes.
-    expect(!maps("model.layers.3.mlp.shared_expert.gate_proj.weight"),
-           "a shared expert's weights are refused, not silently dropped");
-    expect(!maps("model.layers.3.mlp.shared_expert.down_proj.weight"),
-           "including its down projection");
-    expect(!maps("model.layers.3.mlp.shared_expert_gate.weight"),
-           "and the sigmoid gate that scales it");
-}
+// (The shared-expert/per-expert refusal that lived here is pinned in Rust
+// now — `model/common/src/mlx.rs::routed_banks_map_and_unservable_experts_are_refused` —
+// beside the `routed_expert_member` rule it checks, which is where the name
+// normalisation went when the C++ author died.)
 
 /// Llama 3.1's rope schedule, on Llama-3.2-1B's own numbers.
 ///
@@ -793,7 +754,7 @@ void check_refusals() {
 /// is a residency decision and a model that copies everything still answers.
 ///
 /// Stated against the names the CONTRACT publishes, not against invented ones:
-/// `llama_contract.hpp` normalises both `mlp.switch_mlp.` and the fused HF form
+/// the author (`model/common/src/mlx.rs`) normalises both `mlp.switch_mlp.` and the fused HF form
 /// onto `mlp.experts.`, and `heap_bind.cpp` hands this predicate the finalized
 /// runtime name.
 void check_streaming_covers_both_ffn_shapes() {
@@ -938,7 +899,6 @@ int main() {
     expect_eq(static_cast<long long>(build_llama_dag(llama3, false).size()), n(llama3) - 1,
               "with_argmax=false drops exactly one dispatch");
 
-    check_shared_experts_are_refused_rather_than_dropped();
     check_refusals();
     check_streaming_covers_both_ffn_shapes();
     check_the_tiled_attention_is_told_its_row_count();

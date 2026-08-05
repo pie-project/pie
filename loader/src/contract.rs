@@ -1,9 +1,13 @@
-//! The model contract: a declaration of what the driver needs, as expressions
+//! The model contract: a declaration of what the model needs, as expressions
 //! over the checkpoint's byte space.
 //!
-//! See `loader/spec.md` for the design rationale. In short: the driver declares
-//! every tensor it wants and where its bytes come from; the loader decides how
-//! to move them. Neither side needs to know the model family.
+//! See `loader/spec.md` for the design rationale. In short: the contract
+//! declares every tensor the driver will bind and where its bytes come from;
+//! the compiler decides how to move them, and no part of it needs to know the
+//! model family. The declarer is `pie_model::contract` — an author turns a
+//! driver's facts-and-policy request into one of these on this side of the
+//! ABI (`plan/model-in-rust.md` §2), so the contract is internal IR now, not
+//! an input a caller hands over.
 //!
 //! This module owns the *declaration* — the grammar, the builders, and the
 //! types a contract is written in. Everything that computes over one lives in a

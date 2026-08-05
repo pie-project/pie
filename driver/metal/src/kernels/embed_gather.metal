@@ -26,6 +26,22 @@ inline uint dequant_code(const device uint32_t* row, int k) {
   return (row[k / per_word] >> ((k % per_word) * bits)) & mask;
 }
 
+template <typename T, int group_size, int bits, bool SCALED>
+METAL_FUNC void embed_gather_body(
+    const device uint32_t* w, const device T* scales, const device T* biases,
+    device T* out, int hidden, int row, int k, size_t out_at,
+    float embed_scale) {
+  if (k >= hidden) return;
+  const int packs_per_row = hidden / (32 / bits);
+  const int groups_per_row = hidden / group_size;
+  const int g = k / group_size;
+  const uint code = dequant_code<bits>(w + row * packs_per_row, k);
+  const float s = float(scales[row * groups_per_row + g]);
+  const float b = float(biases[row * groups_per_row + g]);
+  const float value = s * float(code) + b;
+  out[out_at] = static_cast<T>(SCALED ? value * embed_scale : value);
+}
+
 template <typename T, int group_size, int bits>
 [[kernel]] void embed_gather_4bit(
     const device uint32_t* w   [[buffer(0)]],  // [vocab, hidden/8] packed
@@ -35,17 +51,8 @@ template <typename T, int group_size, int bits>
     device T* out              [[buffer(4)]],  // [hidden]
     const constant int& hidden [[buffer(5)]],
     uint k [[thread_position_in_grid]]) {
-  if ((int)k >= hidden) return;
-  const int row = id[0];
-  const int packs_per_row = hidden / (32 / bits);
-  const int groups_per_row = hidden / group_size;
-
-  const int g = (int)k / group_size;
-  const uint nibble = dequant_code<bits>(w + row * packs_per_row, (int)k);
-
-  const float s = static_cast<float>(scales[row * groups_per_row + g]);
-  const float b = static_cast<float>(biases[row * groups_per_row + g]);
-  out[k] = static_cast<T>(s * static_cast<float>(nibble) + b);
+  embed_gather_body<T, group_size, bits, false>(
+      w, scales, biases, out, hidden, id[0], int(k), size_t(k), 1.0f);
 }
 
 #define instantiate_embed(name, itype, gs, b)                        \
@@ -77,15 +84,8 @@ template <typename T, int group_size, int bits>
     const constant int& hidden [[buffer(5)]],
     const constant float& embed_scale [[buffer(6)]],
     uint k [[thread_position_in_grid]]) {
-  if ((int)k >= hidden) return;
-  const int row = id[0];
-  const int packs_per_row = hidden / (32 / bits);
-  const int groups_per_row = hidden / group_size;
-  const int g = (int)k / group_size;
-  const uint nibble = dequant_code<bits>(w + row * packs_per_row, (int)k);
-  const float s = static_cast<float>(scales[row * groups_per_row + g]);
-  const float b = static_cast<float>(biases[row * groups_per_row + g]);
-  out[k] = static_cast<T>((s * static_cast<float>(nibble) + b) * embed_scale);
+  embed_gather_body<T, group_size, bits, true>(
+      w, scales, biases, out, hidden, id[0], int(k), size_t(k), embed_scale);
 }
 
 #define instantiate_embed_scaled(name, itype, gs, b)                            \
@@ -117,15 +117,9 @@ template <typename T, int group_size, int bits>
     uint2 gid [[thread_position_in_grid]]) {
   const int k = int(gid.x);
   const int m = int(gid.y);
-  if (k >= hidden) return;
-  const int row = id[m];
-  const int packs_per_row = hidden / (32 / bits);
-  const int groups_per_row = hidden / group_size;
-  const int g = k / group_size;
-  const uint nibble = dequant_code<bits>(w + row * packs_per_row, k);
-  const float s = static_cast<float>(scales[row * groups_per_row + g]);
-  const float b = static_cast<float>(biases[row * groups_per_row + g]);
-  out[m * hidden + k] = static_cast<T>(s * static_cast<float>(nibble) + b);
+  embed_gather_body<T, group_size, bits, false>(
+      w, scales, biases, out, hidden, id[m], k,
+      size_t(m) * size_t(hidden) + size_t(k), 1.0f);
 }
 
 #define instantiate_embed_mb(name, itype, gs, b)                            \
@@ -154,15 +148,9 @@ template <typename T, int group_size, int bits>
     uint2 gid [[thread_position_in_grid]]) {
   const int k = int(gid.x);
   const int m = int(gid.y);
-  if (k >= hidden) return;
-  const int row = id[m];
-  const int packs_per_row = hidden / (32 / bits);
-  const int groups_per_row = hidden / group_size;
-  const int g = k / group_size;
-  const uint nibble = dequant_code<bits>(w + row * packs_per_row, k);
-  const float s = static_cast<float>(scales[row * groups_per_row + g]);
-  const float b = static_cast<float>(biases[row * groups_per_row + g]);
-  out[m * hidden + k] = static_cast<T>((s * static_cast<float>(nibble) + b) * embed_scale);
+  embed_gather_body<T, group_size, bits, true>(
+      w, scales, biases, out, hidden, id[m], k,
+      size_t(m) * size_t(hidden) + size_t(k), embed_scale);
 }
 
 #define instantiate_embed_scaled_mb(name, itype, gs, b)                            \

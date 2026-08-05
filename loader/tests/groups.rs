@@ -333,8 +333,8 @@ fn on_disk(mut meta: CheckpointMetadata, tag: &str) -> (CheckpointMetadata, std:
 /// group is verified -- not just the index the template was compiled at.
 #[test]
 fn a_marshalled_group_survives_the_abi_and_every_instance_is_checked() {
-    use pie_loader::ffi::arena;
-    use pie_loader::ffi::view::verify_marshalled;
+    use pie_loader_capi::arena;
+    use pie_loader_capi::view::verify_marshalled;
 
     let (meta, dir) = on_disk(named_checkpoint(), "abi");
     let plan = compile(
@@ -371,7 +371,7 @@ fn a_marshalled_group_survives_the_abi_and_every_instance_is_checked() {
 /// template -- index 0 -- is perfectly in bounds.
 #[test]
 fn an_instance_that_reads_past_its_file_is_rejected() {
-    use pie_loader::ffi::view::verify_marshalled;
+    use pie_loader_capi::view::verify_marshalled;
 
     let (meta, dir) = on_disk(named_checkpoint(), "past-end");
     let mut plan = compile(

@@ -54,8 +54,6 @@ pub async fn instantiate(
     program_name: &ProgramName,
     output: OutputMode,
 ) -> Result<(Store<ProcessCtx>, Instance)> {
-    let timing_started =
-        crate::scheduler::fire_timing_enabled().then(crate::scheduler::fire_timing_now_us);
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Instantiate {
         process_id,
@@ -64,22 +62,7 @@ pub async fn instantiate(
         output,
         response: tx,
     })?;
-    let result = rx.await?;
-    if let Some(started_us) = timing_started {
-        let finished_us = crate::scheduler::fire_timing_now_us();
-        crate::scheduler::fire_timing_write(&serde_json::json!({
-            "schema": 1,
-            "source": "runtime",
-            "event": "process_instantiated",
-            "process_id": process_id,
-            "program": program_name.to_string(),
-            "success": result.is_ok(),
-            "instantiate_started_us": started_us,
-            "instantiate_finished_us": finished_us,
-            "instantiate_us": finished_us.saturating_sub(started_us),
-        }));
-    }
-    result
+    rx.await?
 }
 
 pub(crate) fn invalidate(program_name: &ProgramName) {
@@ -236,18 +219,10 @@ impl Linker {
         program_name: &ProgramName,
         output: OutputMode,
     ) -> Result<(Store<ProcessCtx>, Instance)> {
-        // Diagnostic sub-stamps (iteration 76 provenance): split the span
-        // into program-service round-trips vs ctx/store vs link+instantiate.
-        let timing = crate::scheduler::fire_timing_enabled();
-        let mut stamps = [0u64; 4];
-        let stamp_t0 = timing.then(crate::scheduler::fire_timing_now_us);
         // 1. Get the main component (with snapshot status + python-runtime decl)
         let main = program::get_wasm_component(program_name)
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
-        if timing {
-            stamps[0] = crate::scheduler::fire_timing_now_us();
-        }
 
         // 2. Resolve dependencies and reconcile the python-runtime requirement
         //    across the main program and its direct dependencies. Also tracks
@@ -255,9 +230,6 @@ impl Linker {
         //    determines which shared-module variant we use for instantiation.
         let (dependency_components, python_runtime, any_snapshotted) =
             Self::resolve_dependencies_and_runtime(program_name, &main).await?;
-        if timing {
-            stamps[1] = crate::scheduler::fire_timing_now_us();
-        }
         let generation = main.generation;
         let component = main.component;
         let cacheable_instance_pre = dependency_components.is_empty();
@@ -284,9 +256,6 @@ impl Linker {
         )
         .await?;
         let mut store = Store::new(&engine, process_ctx);
-        if timing {
-            stamps[2] = crate::scheduler::fire_timing_now_us();
-        }
 
         // 5. Reuse the immutable linker configuration. Construction is lazy
         // and single-flight per Plain/PythonFull/PythonStripped variant.
@@ -304,11 +273,9 @@ impl Linker {
         };
 
         // 7. Instantiate the main component
-        let mut pre_hit = false;
         let instance = if cacheable_instance_pre {
-            let (cell, cache_hit) =
+            let (cell, _cache_hit) =
                 Self::instance_pre_cell(&instance_pre_cache, program_name, generation);
-            pre_hit = cache_hit;
             let pre = cell
                 .get_or_try_init(|| async {
                     base_linker
@@ -326,21 +293,6 @@ impl Linker {
                 .await
                 .map_err(|e| anyhow!("Instantiation error: {e}"))?
         };
-        if let Some(t0) = stamp_t0 {
-            stamps[3] = crate::scheduler::fire_timing_now_us();
-            crate::scheduler::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "runtime",
-                "event": "instantiate_breakdown",
-                "process_id": process_id,
-                "pre_hit": pre_hit,
-                "get_component_us": stamps[0].saturating_sub(t0),
-                "resolve_deps_us": stamps[1].saturating_sub(stamps[0]),
-                "ctx_store_us": stamps[2].saturating_sub(stamps[1]),
-                "instantiate_us": stamps[3].saturating_sub(stamps[2]),
-            }));
-        }
-
         Ok((store, instance))
     }
 
@@ -433,8 +385,6 @@ impl ServiceHandler for Linker {
                 let base_cache = Arc::clone(&self.base_linker_cache);
                 let pre_cache = Arc::clone(&self.instance_pre_cache);
                 tokio::task::spawn(async move {
-                    let link_started_us = crate::scheduler::fire_timing_enabled()
-                        .then(crate::scheduler::fire_timing_now_us);
                     let result = Linker::instantiate(
                         engine,
                         policy,
@@ -446,22 +396,6 @@ impl ServiceHandler for Linker {
                         output,
                     )
                     .await;
-                    if let Some(started_us) = link_started_us {
-                        // Splits the public wrapper's `instantiate_us`
-                        // (queue + link) into its link-work part — the W3
-                        // gate reads this to prove the residual is work,
-                        // not actor queue wait.
-                        crate::scheduler::fire_timing_write(&serde_json::json!({
-                            "schema": 1,
-                            "source": "runtime",
-                            "event": "process_link_work",
-                            "process_id": process_id.to_string(),
-                            "success": result.is_ok(),
-                            "link_started_us": started_us,
-                            "link_us": crate::scheduler::fire_timing_now_us()
-                                .saturating_sub(started_us),
-                        }));
-                    }
                     let _ = response.send(result);
                 });
             }

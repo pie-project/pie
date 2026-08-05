@@ -302,7 +302,15 @@ jobs:
 
       - name: cargo test (pie-worker, dummy)
         run: |
-          cargo test -p pie-worker --bin pie \
+          cargo test -p pie-worker \
+            --no-default-features --features driver-dummy
+
+      # The `pie` command lives in `bin/pie` (`pie-bin`); `pie-worker` is a
+      # library with no `[[bin]]`. Building the worker alone never produced a
+      # runnable CLI, so nothing here covered the composition root.
+      - name: cargo build (pie binary, dummy)
+        run: |
+          cargo build -p pie-bin \
             --no-default-features --features driver-dummy
 
   # macOS Metal driver build. Verifies driver/metal's cmake + link
@@ -335,6 +343,13 @@ jobs:
 
       - name: cargo build (driver-metal)
         run: cargo build -p pie-worker --no-default-features --features driver-metal
+
+      # Build the actual CLI too. Every macOS boot blocker found in the Metal
+      # smoke test (B1/B2/B3) was reachable only by running `pie`, and no job
+      # built it — the worker library compiling proves the driver links, not
+      # that the platform has a working binary.
+      - name: cargo build (pie binary, driver-metal)
+        run: cargo build -p pie-bin --no-default-features --features driver-metal
 
       # `src/batch/forward.cpp` compiles a LoadPlan, so every Metal target that
       # links the archive into an executable needs `pie-loader` as a staticlib

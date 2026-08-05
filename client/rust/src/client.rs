@@ -247,9 +247,42 @@ impl Client {
     }
 
     /// Close the connection and clean up background tasks.
+    ///
+    /// **The order below is the whole function.** The writer task ends when the
+    /// last sender for its channel drops, so awaiting it while anything still
+    /// holds one waits forever. Three things hold one, and each has to go
+    /// first:
+    ///
+    ///   * `self.inner`, which owns the sender.
+    ///   * The reader task, which holds its own `Arc` clone -- and which runs
+    ///     until the *server* closes the socket. Awaiting the writer before
+    ///     stopping the reader is therefore a deadlock against a peer that is
+    ///     waiting for us, not a slow path.
+    ///   * Any live [`Process`], which also clones the `Arc`. That one is the
+    ///     caller's to drop, and is a real precondition rather than something
+    ///     to defend against here: a `Process` can still send, and closing the
+    ///     connection under an in-flight signal would be worse than waiting.
+    ///
+    /// Nothing called `close` until `pie run` did, which is how a deadlock this
+    /// total went unnoticed -- the first version of that command printed its
+    /// completion and then hung with the model still resident on the device.
     pub async fn close(self) -> Result<()> {
-        self.writer_handle.await?;
-        self.reader_handle.abort();
+        let Client {
+            inner,
+            reader_handle,
+            writer_handle,
+        } = self;
+        // Explicit and ordered, not incidental. A later edit that reorders
+        // these hangs rather than fails, which is the hardest kind of breakage
+        // to attribute.
+        reader_handle.abort();
+        // Awaited, not just aborted: `abort` only asks, and the task's `Arc`
+        // lives until it actually stops. Joining it is what makes the drop
+        // below the last one. The result is the cancellation, so it is
+        // discarded rather than reported.
+        let _ = reader_handle.await;
+        drop(inner);
+        writer_handle.await?;
         Ok(())
     }
 

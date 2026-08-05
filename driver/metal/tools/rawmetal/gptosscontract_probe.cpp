@@ -13,7 +13,8 @@ int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "";
     try {
         auto plan = pie::metal::compile_load_plan(
-            dir, pie::metal::metal_device_target(), "gpt_oss", pie::metal::model::ContractFacts{});
+            dir, pie::metal::metal_device_target(),
+            pie::metal::descriptor_for_testing("gpt_oss"));
         std::printf("OK: load plan compiled and verified\n");
     } catch (const std::exception& e) {
         std::printf("FAIL: %s\n", e.what());

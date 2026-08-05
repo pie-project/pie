@@ -14,6 +14,7 @@
 #include "decode_abi.hpp"
 #include "harness.hpp"
 #include "mtl4_context.hpp"
+#include "model/shared_kernels.hpp"
 
 #ifndef PIE_METAL_TOOL_KERNELS_DIR
 #define PIE_METAL_TOOL_KERNELS_DIR "."
@@ -81,14 +82,11 @@ int main(int argc, char** argv) {
         SlotHandle x   = ctx->heap_alloc(H * TSZ);
         SlotHandle w   = ctx->heap_alloc(H * TSZ);
         SlotHandle out = ctx->heap_alloc(H * TSZ);
-        SlotHandle pp  = ctx->heap_alloc(sizeof(float) + 2 * sizeof(uint32_t));
+        SlotHandle pp  = ctx->heap_alloc(sizeof(shared_kernels::RmsParams));
         memset(x.contents(), 0, H * TSZ);
         memset(w.contents(), 0, H * TSZ);
-        // RmsParams { float eps; uint axis_size; uint w_stride; }
-        auto* f = static_cast<float*>(pp.contents());
-        f[0] = 1e-6f;
-        auto* u = reinterpret_cast<uint32_t*>(static_cast<char*>(pp.contents()) + sizeof(float));
-        u[0] = H; u[1] = 1;
+        *static_cast<shared_kernels::RmsParams*>(pp.contents()) =
+            shared_kernels::RmsParams{1e-6f, H, 1u, 0u, 1.0f};
         ctx->arg_bind(Kernel::Rms, 0, 0, x);
         ctx->arg_bind(Kernel::Rms, 0, 1, w);
         ctx->arg_bind(Kernel::Rms, 0, 2, out);

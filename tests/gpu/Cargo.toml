@@ -1,0 +1,48 @@
+[package]
+name = "pie-gpu-tests"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The engine's on-device end-to-end suite: boots the real standalone through the real client edge and asserts what the driver produced."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+# Nothing depends on this crate and it has no code of its own. It exists to own
+# `tests/`.
+publish = false
+
+# No library, no binary — only integration tests. The empty lib target is what
+# lets a crate be nothing but a `tests/` directory.
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[features]
+# Forwarded to the composition root, which is what selects the driver. Building
+# this crate without one of these gets the dummy fallback, which is what the
+# handful of no-GPU diagnostics here run against.
+default = []
+driver-cuda = ["pie-bin/driver-cuda"]
+driver-metal = ["pie-bin/driver-metal"]
+driver-dummy = ["pie-bin/driver-dummy"]
+
+[dev-dependencies]
+# The composition root. These tests boot the same `run_standalone` a `pie
+# serve` does — that is the point of them.
+pie-bin = { path = "../../bin/pie" }
+# The client edge. Load goes over the websocket a deployment is reached by,
+# because an in-process shortcut would prove something nobody runs.
+pie-client = { path = "../../client/rust" }
+# The runtime lib — read `inference::get_stats()` in-process to observe the
+# scheduler's fire probes (the thrust-2 bubble/quorum gate) after a decode.
+pie-engine = { path = "../../runtime/engine" }
+
+anyhow = "1.0"
+tokio = { version = "1.53", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3"
+# `cuda_boot_smoke` scrapes `/metrics` off a booted engine over HTTP.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

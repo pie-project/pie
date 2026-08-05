@@ -412,13 +412,12 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
 
         if (!gemma4::build_gemma4_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/false, err,
-                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false)) {
+        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, err)) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/true, err,
-                                  /*routed=*/false)) {
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, g_.quant, err,
+                MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
             return false;
         }
         // A checkpoint may quantize the dense FFN and the router at a DIFFERENT
@@ -428,13 +427,12 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         // `gemma4_uses_alt_quant` picks between them per dispatch. One table for
         // both would run a 4-bit kernel over 8-bit bytes: fast, and wrong.
         if (g_.has_alt_quant()) {
-            if (!load_decode_psos(ctx, kernels_dir, base_alt_, g_.ffn_quant,
-                                  /*with_argmax=*/false, err, /*fuse_residual=*/false,
-                                  /*gdn_prep=*/false, /*routed=*/false, /*untied=*/false)) {
+            if (!load_decode_psos(ctx, kernels_dir, base_alt_, g_.ffn_quant, err)) {
                 return false;
             }
-            if (!load_multibatch_psos(ctx, kernels_dir, mb_alt_, g_.ffn_quant,
-                                      /*with_d512=*/true, err, /*routed=*/false)) {
+            if (!load_multibatch_psos(
+                    ctx, kernels_dir, mb_alt_, g_.ffn_quant, err,
+                    MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
                 return false;
             }
         }
@@ -677,9 +675,30 @@ bool go_tap_for(const gptoss::Dispatch& d, const GptOssGeometry& g, GoTap& out) 
 void dump_go_taps(const std::vector<gptoss::Dispatch>& dag, const GptOssGeometry& g,
                   const gptoss::ScratchColoring& col, const std::vector<SlotHandle>& pool,
                   const SlotHandle& logits, int rows, int head_rows) {
+    std::vector<const std::int32_t*> perm_of(std::size_t(g.n_layers), nullptr);
+    for (std::size_t di = 0; di < dag.size() && di < col.per_dispatch.size(); ++di) {
+        const gptoss::Dispatch& d = dag[di];
+        if (d.kind != gptoss::Kind::ExpertSort || d.layer < 0) continue;
+        for (const auto& sb : col.per_dispatch[di]) {
+            if (sb.bind_index != (std::uint8_t)bind::MoeRouteSort::Perm) continue;
+            if (sb.color < 0 || std::size_t(sb.color) >= pool.size()) continue;
+            perm_of[std::size_t(d.layer)] =
+                static_cast<const std::int32_t*>(pool[std::size_t(sb.color)].contents());
+        }
+    }
     dump_taps_from(
         dag, col, pool, logits, rows, head_rows,
-        [&](const gptoss::Dispatch& d, Tap& t) { return go_tap_for(d, g, t); },
+        [&](const gptoss::Dispatch& d, Tap& t) {
+            if (!go_tap_for(d, g, t)) return false;
+            if (gptoss::is_expert_sorted(d.kind) && d.layer >= 0 &&
+                std::size_t(d.layer) < perm_of.size() &&
+                perm_of[std::size_t(d.layer)] != nullptr) {
+                t.perm = perm_of[std::size_t(d.layer)];
+                t.perm_rows = gptoss::gptoss_moe_sorted_rows(g, rows);
+                t.slots = g.experts_per_token;
+            }
+            return true;
+        },
         [](const gptoss::Dispatch& d) { return gptoss::is_tail(d.kind); });
 }
 
@@ -700,6 +719,10 @@ int go_kind_width(gptoss::Kind k, const GptOssGeometry& g) {
         case K::RouterGemv:               return std::max(g.hidden, g.n_experts);
         // The ids are 4-byte ints, so they count double against a bf16 slot.
         case K::RouterTopK:               return std::max(g.n_experts, 2 * g.experts_per_token);
+        case K::ExpertSort:               return 2 * g.experts_per_token;
+        case K::ExpertGather:             return g.hidden;
+        // The exact sorted-row extent is applied in `go_pool_elems`; these are
+        // the per-row widths used for the M=1 floor.
         case K::ExpertGate: case K::ExpertUp: return std::max(g.hidden, stack);
         case K::ExpertSwiGlu:             return stack;
         case K::ExpertDown:               return std::max(stack, down);
@@ -733,8 +756,37 @@ std::vector<std::size_t> go_pool_elems(const std::vector<gptoss::Dispatch>& dag,
         // The tail's tensors have one row per SAMPLED row; the body's have one
         // per token.
         const bool tail = gptoss::is_tail(kind);
-        const std::size_t need = std::size_t(tail ? head_rows : rows) *
-                                 std::size_t(go_kind_width(kind, g));
+        const std::size_t sorted =
+            std::size_t(gptoss::gptoss_moe_sorted_rows(g, rows));
+        std::size_t need = std::size_t(tail ? head_rows : rows) *
+                           std::size_t(go_kind_width(kind, g));
+        switch (kind) {
+            case K::ExpertSort:
+                need = 2 * std::max(sorted,
+                                    std::size_t(rows * g.experts_per_token));
+                break;
+            case K::ExpertGather:
+                need = sorted * std::size_t(g.hidden);
+                break;
+            case K::ExpertGate:
+            case K::ExpertUp:
+                need = sorted *
+                       std::size_t(std::max(g.hidden, g.intermediate));
+                break;
+            case K::ExpertSwiGlu:
+                need = sorted * std::size_t(g.intermediate);
+                break;
+            case K::ExpertDown:
+                need = sorted *
+                       std::size_t(std::max(g.intermediate, g.hidden));
+                break;
+            case K::ExpertCombine:
+                need = std::max(sorted * std::size_t(g.hidden),
+                                std::size_t(rows) * std::size_t(g.hidden));
+                break;
+            default:
+                break;
+        }
         for (const auto& sb : col.per_dispatch[di]) {
             if (sb.color < 0 || sb.color >= col.colors_used) continue;
             elems[std::size_t(sb.color)] = std::max(elems[std::size_t(sb.color)], need);
@@ -793,11 +845,8 @@ class GptOssEngine final : public SimpleFamilyEngine {
             return false;
         }
 
-        // Paged KV. gpt-oss has no M>1 path -- its MoE picks experts per ROW,
-        // so a batched routed matmul is a different kernel rather than a wider
-        // launch -- but paging is orthogonal to that: what it buys is SEVERAL
-        // SEQUENCES, each attending its own page list, instead of one ring that
-        // the second sequence clobbers.
+        // Paged KV. The sorted MoE is a true M>1 path: rows are grouped by
+        // expert, then the native MXFP4 routed GEMM serves each run.
         g_.paged_kv_enabled = true;
         g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : 32;
         const int ps = g_.kv_page_size;
@@ -871,9 +920,11 @@ class GptOssEngine final : public SimpleFamilyEngine {
         // This used to be the parameter's default, which meant the driver was
         // making the same choice without saying so.
         const AffineFormat kGptOssBase{/*bits=*/4, /*group=*/64};
-        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, /*with_argmax=*/false, err))
+        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, err))
             return false;
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, kGptOssBase, /*with_d512=*/false, err))
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, kGptOssBase, err,
+                MultiBatchPsoFeatures{.bias = true}))
             return false;
 
         gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
@@ -932,10 +983,9 @@ class GptOssEngine final : public SimpleFamilyEngine {
     }
 
     bool paged() const override { return true; }
-    /// A fire of R rows is R PASSES, not one wider one: gpt-oss has no M>1
-    /// path, because its MoE picks experts per row. So the row budget costs
-    /// time rather than memory, and what paging buys is that those passes may
-    /// belong to different sequences.
+    /// A fire of R rows is one wider pass. The routed bank sorts its
+    /// (row, expert) pairs before the GEMM, while paging keeps each request's
+    /// KV history independent.
     int max_rows() const override { return max_rows_; }
     int max_sampled_rows() const override { return max_sampled_; }
     int page_size() const override { return g_.kv_page_size; }
@@ -1164,6 +1214,9 @@ class LlamaEngine final : public SimpleFamilyEngine {
     bool init(RawMetalContext& ctx, const std::string& kernels_dir, const SetupConfig& cfg,
               const pie_loader::LoadPlan& load_plan, int max_ctx, std::string* err) {
         if (!llama_geometry(cfg, g_, max_ctx, err)) return false;
+        // The contract already decided this, and a config can disagree with the
+        // tensors it ships in either direction; see `plan_ties_embeddings`.
+        g_.tied_embeddings = plan_ties_embeddings(load_plan);
         max_ctx_ = max_ctx;
         g_.paged_kv_enabled = true;
         g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : 32;
@@ -1281,15 +1334,17 @@ class LlamaEngine final : public SimpleFamilyEngine {
         ap->vocab = std::uint32_t(g_.vocab);
 
         if (!llama::build_llama_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/true, err,
-                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false)) {
+        if (!load_decode_psos(
+                ctx, kernels_dir, base_, g_.quant, err,
+                DecodePsoFeatures{.argmax = true})) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/false, err,
-                                  /*routed=*/false,
-                                  /*fp16_precast=*/!g_.is_moe() &&
-                                      g_.quant.bits == 4 && g_.quant.group == 64)) {
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, g_.quant, err,
+                MultiBatchPsoFeatures{
+                    .splitk = true,
+                    .fp16_precast = !g_.is_moe() &&
+                        g_.quant.bits == 4 && g_.quant.group == 64})) {
             return false;
         }
 

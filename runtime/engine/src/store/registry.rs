@@ -19,119 +19,11 @@
 //!         kv.settle(..)                       // sync
 //! ```
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
-use std::time::Instant;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use super::kv::KvStore;
 use super::rs::RsStore;
-
-const KV_LOCK_TRACE_CAPACITY: usize = 1_048_576;
-const KV_LOCK_TRACE_DEFAULT_THRESHOLD_US: u64 = 250;
-
-#[derive(Clone, Copy)]
-struct KvLockTraceRecord {
-    t_acquire_us: u64,
-    wait_ns: u64,
-    hold_ns: u64,
-    tag: &'static str,
-    /// Exact call site. The `tag` groups sites by subsystem, but a convoy is
-    /// always ONE line -- typically one that allocates while holding the
-    /// lock -- so the group alone is not enough to act on.
-    caller: &'static std::panic::Location<'static>,
-}
-
-struct KvLockTrace {
-    records: crossbeam_queue::ArrayQueue<KvLockTraceRecord>,
-    dropped: AtomicU64,
-    dumped: AtomicBool,
-    threshold_ns: u64,
-    output: PathBuf,
-}
-
-impl KvLockTrace {
-    fn new() -> Self {
-        let threshold_us = std::env::var("PIE_KV_LOCK_TRACE_THRESHOLD_US")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(KV_LOCK_TRACE_DEFAULT_THRESHOLD_US);
-        let output = std::env::var_os("PIE_KV_LOCK_TRACE_FILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(format!("/tmp/pie-kv-lock-trace-{}.csv", std::process::id()))
-            });
-        Self {
-            records: crossbeam_queue::ArrayQueue::new(KV_LOCK_TRACE_CAPACITY),
-            dropped: AtomicU64::new(0),
-            dumped: AtomicBool::new(false),
-            threshold_ns: threshold_us.saturating_mul(1_000),
-            output,
-        }
-    }
-
-    fn record(&self, record: KvLockTraceRecord) {
-        if record.wait_ns <= self.threshold_ns && record.hold_ns <= self.threshold_ns {
-            return;
-        }
-        if self.records.push(record).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn dump(&self) -> anyhow::Result<()> {
-        if self.dumped.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        if let Some(parent) = self.output.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut records = Vec::with_capacity(self.records.len());
-        while let Some(record) = self.records.pop() {
-            records.push(record);
-        }
-        records.sort_unstable_by_key(|record| record.t_acquire_us);
-        let mut output = BufWriter::new(File::create(&self.output)?);
-        writeln!(output, "t_acquire_us,wait_ns,hold_ns,tag,caller")?;
-        for record in records {
-            writeln!(
-                output,
-                "{},{},{},{},{}:{}",
-                record.t_acquire_us,
-                record.wait_ns,
-                record.hold_ns,
-                record.tag,
-                record.caller.file(),
-                record.caller.line()
-            )?;
-        }
-        output.flush()?;
-        let metadata = serde_json::json!({
-            "schema": 1,
-            "capacity": KV_LOCK_TRACE_CAPACITY,
-            "threshold_ns": self.threshold_ns,
-            "dropped": self.dropped.load(Ordering::Acquire),
-            "output": self.output,
-        });
-        let metadata_path = PathBuf::from(format!("{}.meta.json", self.output.display()));
-        serde_json::to_writer_pretty(File::create(metadata_path)?, &metadata)?;
-        Ok(())
-    }
-}
-
-fn kv_lock_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PIE_KV_LOCK_TRACE").is_ok_and(|value| !value.is_empty() && value != "0")
-    })
-}
-
-fn kv_lock_trace() -> &'static KvLockTrace {
-    static TRACE: LazyLock<KvLockTrace> = LazyLock::new(KvLockTrace::new);
-    &TRACE
-}
 
 /// parking_lot mutexes do not poison: a panic unwinding mid-mutation would
 /// leave a half-updated `KvStore` silently live (std's poisoning made the
@@ -157,7 +49,6 @@ impl Drop for KvTaintOnPanic {
 }
 
 #[inline(always)]
-#[track_caller]
 pub fn with_kv_lock<T>(
     store: &parking_lot::Mutex<KvStore>,
     tag: &'static str,
@@ -168,39 +59,11 @@ pub fn with_kv_lock<T>(
         "KV store tainted by an earlier panic mid-mutation ({tag})"
     );
     let taint = KvTaintOnPanic;
-    let caller = std::panic::Location::caller();
-    if !kv_lock_trace_enabled() {
-        let mut guard = store.lock();
-        let result = operation(&mut guard);
-        drop(guard);
-        drop(taint);
-        return result;
-    }
-
-    let wait_started = Instant::now();
     let mut guard = store.lock();
-    let wait_ns = u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let t_acquire_us = crate::scheduler::fire_timing_now_us();
-    let hold_started = Instant::now();
     let result = operation(&mut guard);
-    let hold_ns = u64::try_from(hold_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     drop(guard);
-    kv_lock_trace().record(KvLockTraceRecord {
-        t_acquire_us,
-        wait_ns,
-        hold_ns,
-        tag,
-        caller,
-    });
+    drop(taint);
     result
-}
-
-pub fn dump_kv_lock_trace() -> anyhow::Result<()> {
-    if kv_lock_trace_enabled() {
-        kv_lock_trace().dump()
-    } else {
-        Ok(())
-    }
 }
 
 /// The typed stores for one (model, driver).

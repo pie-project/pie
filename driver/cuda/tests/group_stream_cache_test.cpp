@@ -32,7 +32,6 @@
 
 #include "pie_loader.h"
 #include "pie_loader/checkpoint_source.hpp"
-#include "pie_loader/model_contract.hpp"
 #include "pie_loader/plan.hpp"
 #include "pie_loader/request.hpp"
 #include "pie_loader/source_checkpoint.hpp"
@@ -41,8 +40,8 @@
 #include "loader/group_stream_cache.hpp"
 #include "loader/load_plan.hpp"
 #include "loader/load_plan_executor.hpp"
-#include "model/contract.hpp"
-#include "model/deepseek_v4/deepseek_v4_contract.hpp"
+#include "loader/rust_author.hpp"
+#include "model/facts.hpp"
 #include "model/weight_store.hpp"
 
 namespace {
@@ -153,25 +152,30 @@ std::vector<Entry> dsv4_entries() {
 pie_loader::LoadPlan compile_dsv4(
     const pie_loader::Checkpoint& checkpoint,
     const pie_loader::DeviceTarget& target,
-    bool streamed,
-    pie_loader::ModelContract& contract)
+    bool streamed)
 {
+    // The boot's own path: the C++ author this test used to drive was
+    // harvested (`plan/model-in-rust.md` §8-5), so it states the same facts
+    // through the same request entry the driver boots through. The claim
+    // under test is unchanged -- stacked and streamed are two answers to one
+    // request, differing only in `stream_routed_experts`.
     namespace model = pie_cuda_driver::model;
-    const model::ModelFacts facts{
-        .model_type = "deepseek_v4",
-        .quant_method = "",
-        .num_hidden_layers = static_cast<std::uint32_t>(kLayers),
-        .num_experts = static_cast<std::uint32_t>(kExperts),
-        .head_dim = 0,
-        .mamba_groups = 0,
-    };
-    model::ContractBuilder builder(
-        checkpoint, facts, target, "", model::Mxfp4MoeRequest::Auto,
-        model::Component::Full, streamed, contract);
-    model::author_deepseek_v4_contract(builder);
-    builder.finish();
-    return pie_loader::LoadPlan::compile(
-        pie_loader::build_contract_request(checkpoint, target, contract.view()));
+    // The facts this test states, in the form the request carries them: a
+    // `pie.model/1` document. It used to build a `ModelFacts` struct, which
+    // stopped crossing the ABI — `ModelFacts::from_descriptor` projects these
+    // names on the far side, so writing them here is writing the same fields
+    // one layer out.
+    const std::string descriptor = std::string(R"({"version":"pie.model/1",)") +
+                                   R"("model_type":"deepseek_v4",)" +
+                                   R"("quant_method":"",)" +
+                                   R"("num_hidden_layers":)" +
+                                   std::to_string(kLayers) + R"(,)" +
+                                   R"("num_experts":)" +
+                                   std::to_string(kExperts) + R"(})";
+    return pie_cuda_driver::prepare_load_plan_rust_author(
+               checkpoint, descriptor, target, "", model::Mxfp4MoeRequest::Auto,
+               model::Component::Full, streamed, nullptr)
+        .plan;
 }
 
 std::vector<std::uint8_t> read_back(const pie_cuda_driver::DeviceTensor& t) {
@@ -201,9 +205,8 @@ void test_a_paged_expert_equals_the_stacked_one() {
     const auto target = cuda_device_target();
 
     // The oracle: the resident path, materialized.
-    pie_loader::ModelContract stacked_contract;
     const pie_loader::LoadPlan stacked =
-        compile_dsv4(checkpoint, target, /*streamed=*/false, stacked_contract);
+        compile_dsv4(checkpoint, target, /*streamed=*/false);
     WeightStore resident;
     {
         pie_loader::CheckpointSource loader(stacked.view());
@@ -218,9 +221,8 @@ void test_a_paged_expert_equals_the_stacked_one() {
         return;
     }
 
-    pie_loader::ModelContract streamed_contract;
     const pie_loader::LoadPlan streamed =
-        compile_dsv4(checkpoint, target, /*streamed=*/true, streamed_contract);
+        compile_dsv4(checkpoint, target, /*streamed=*/true);
     const auto groups = streamed.view().groups;
     check(groups.len == static_cast<std::size_t>(kLayers),
           "one group per layer");
@@ -308,9 +310,8 @@ void test_a_slab_that_fits_stops_missing() {
     if (!checkpoint) return;
 
     const auto target = cuda_device_target();
-    pie_loader::ModelContract contract;
     const pie_loader::LoadPlan plan =
-        compile_dsv4(checkpoint, target, /*streamed=*/true, contract);
+        compile_dsv4(checkpoint, target, /*streamed=*/true);
     const auto groups = plan.view().groups;
     if (groups.len == 0) return;
 
@@ -367,9 +368,8 @@ void test_a_slot_store_owns_nothing() {
     if (!checkpoint) return;
 
     const auto target = cuda_device_target();
-    pie_loader::ModelContract contract;
     const pie_loader::LoadPlan plan =
-        compile_dsv4(checkpoint, target, /*streamed=*/true, contract);
+        compile_dsv4(checkpoint, target, /*streamed=*/true);
     const auto groups = plan.view().groups;
     if (groups.len == 0) return;
 

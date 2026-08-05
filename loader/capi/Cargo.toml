@@ -1,0 +1,56 @@
+[package]
+name = "pie-loader-capi"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The loader's C ABI: repr(C) marshalling, extern entry points, and the committed pie_loader.h."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# `links` lets downstream build scripts (`worker/build.rs`) discover the
+# generated C++ header directory via `DEP_PIE_LOADER_INCLUDE`, which is how
+# the native drivers get `pie_loader.h` on their include path. The key kept
+# its name when the ABI moved out of `pie-loader`, so nothing downstream had
+# to learn a new one.
+links = "pie_loader"
+
+[lib]
+name = "pie_loader_capi"
+path = "src/lib.rs"
+
+# The loader as a tool: compile, inspect, check and replay a plan without a
+# GPU, a runtime, or a driver. It lives beside the ABI because its `verify`
+# checks the *marshalled* view — the tool exists to exercise exactly the
+# surface this crate owns.
+[[bin]]
+name = "pie-loader"
+path = "src/main.rs"
+required-features = ["tool"]
+
+[features]
+default = ["tool"]
+# The CLI, as a feature. It costs nothing extra to link — the host executor
+# it replays through was promoted to `pie_loader::executor::host`, on by
+# default — so the feature only gates the [[bin]] out of a driver build.
+tool = []
+
+[dependencies]
+# `default-features = false` keeps the compiler's testkit (the reference
+# oracle) out of a driver link.
+pie-loader = { path = "..", default-features = false }
+# The contract authors: `pie_loader_compile_model` resolves model_type
+# through pie_model::contract. `contract` alone, so the driver link never
+# carries the chat aspect's tokenizer or image decoders.
+pie-model = { path = "../../model", default-features = false, features = ["contract"] }
+# The authoring vocabulary the request is read into. Depended on directly
+# rather than through `pie-model`'s re-export: this crate reads `ModelFacts`
+# and `Policy`, which are shared vocabulary, not any one generation.
+pie-model-common = { path = "../../model/common", default-features = false, features = ["contract"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+# The tests build their snapshot fixtures through the loader's testkit.
+pie-loader = { path = "..", features = ["testkit"] }
+# The CLI's convert test reads the artifact it wrote back through ztensor.
+half = "2"
+ztensor = { workspace = true }

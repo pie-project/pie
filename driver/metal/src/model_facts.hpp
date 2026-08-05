@@ -184,13 +184,30 @@ struct ModelFacts {
 /// Parse `<hf_path>/config.json`. A missing or unparseable file yields the
 /// defaults, which every caller then refuses on: there is no configuration
 /// worth guessing at.
+///
+/// **Test-only.** No driver code calls this any more — the boot reads a
+/// `pie.model/1` descriptor, and normalization happens once, in Rust, before
+/// the driver exists. What keeps that true is not this comment:
+/// `model/config/tests/one_normalizer.rs` fails the build if a caller
+/// appears under `driver/metal/src/`.
+///
+/// It survives here rather than in `tests/` because two Metal test binaries
+/// (`qwen3_5_geometry_test`, `llama_bench`) link the driver lib and build
+/// their fixtures from a snapshot directory. Relocating it into the test tree
+/// is the remaining tidy-up and needs a macOS build to verify.
 ModelFacts read_model_facts(const std::string& hf_path);
 
-/// The same facts, read out of a `pie.model/1` descriptor instead of derived
-/// from `config.json`. `nullopt` when there is no descriptor to read, and the
-/// caller falls back to [`read_model_facts`].
+/// The facts, read out of the `pie.model/1` descriptor every boot is handed.
+///
+/// Takes the document, not a path to it: the caller has already read the file
+/// because the compile request carries the bytes, and opening it a second time
+/// here would be a second chance to read something else.
+///
+/// `nullopt` means the document is empty, unparseable, or of a version this
+/// build does not read. That is a refusal at the call site, not a signal to
+/// derive the facts another way: there is no other way left.
 std::optional<ModelFacts> read_model_facts_from_descriptor(
-    const std::string& descriptor_path);
+    std::string_view descriptor_json);
 
 /// Fill the family-specific half of a `SetupConfig` from those facts.
 void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts& facts);

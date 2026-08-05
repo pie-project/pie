@@ -1,0 +1,654 @@
+{
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "model.layers.0.mlp.experts.gate_up.scale",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Concat": {
+                "axis": 1,
+                "parts": [
+                  {
+                    "Transmute": {
+                      "src": {
+                        "Src": "language_model.model.layers.0.mlp.experts.0.gate_proj.weight_scale"
+                      },
+                      "to": {
+                        "shape": [
+                          1,
+                          32,
+                          2
+                        ],
+                        "encoding": {
+                          "Raw": "BF16"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "Transmute": {
+                      "src": {
+                        "Src": "language_model.model.layers.0.mlp.experts.0.up_proj.weight_scale"
+                      },
+                      "to": {
+                        "shape": [
+                          1,
+                          32,
+                          2
+                        ],
+                        "encoding": {
+                          "Raw": "BF16"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "Concat": {
+                "axis": 1,
+                "parts": [
+                  {
+                    "Transmute": {
+                      "src": {
+                        "Src": "language_model.model.layers.0.mlp.experts.1.gate_proj.weight_scale"
+                      },
+                      "to": {
+                        "shape": [
+                          1,
+                          32,
+                          2
+                        ],
+                        "encoding": {
+                          "Raw": "BF16"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "Transmute": {
+                      "src": {
+                        "Src": "language_model.model.layers.0.mlp.experts.1.up_proj.weight_scale"
+                      },
+                      "to": {
+                        "shape": [
+                          1,
+                          32,
+                          2
+                        ],
+                        "encoding": {
+                          "Raw": "BF16"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        2,
+        64,
+        2
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Internal"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.down.scale",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Transmute": {
+                "src": {
+                  "Src": "language_model.model.layers.0.mlp.experts.0.down_proj.weight_scale"
+                },
+                "to": {
+                  "shape": [
+                    1,
+                    64,
+                    1
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            },
+            {
+              "Transmute": {
+                "src": {
+                  "Src": "language_model.model.layers.0.mlp.experts.1.down_proj.weight_scale"
+                },
+                "to": {
+                  "shape": [
+                    1,
+                    64,
+                    1
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        2,
+        64,
+        1
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Internal"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.gate_up.weight",
+      "expr": {
+        "Scale": {
+          "src": {
+            "Concat": {
+              "axis": 0,
+              "parts": [
+                {
+                  "Concat": {
+                    "axis": 1,
+                    "parts": [
+                      {
+                        "Transmute": {
+                          "src": {
+                            "Src": "language_model.model.layers.0.mlp.experts.0.gate_proj.weight_packed"
+                          },
+                          "to": {
+                            "shape": [
+                              1,
+                              32,
+                              64
+                            ],
+                            "encoding": {
+                              "Quant": {
+                                "scheme": "Int4B8",
+                                "logical_dtype": "BF16",
+                                "bits_per_element": 4,
+                                "group_size": 32,
+                                "channel_axis": 2
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "Transmute": {
+                          "src": {
+                            "Src": "language_model.model.layers.0.mlp.experts.0.up_proj.weight_packed"
+                          },
+                          "to": {
+                            "shape": [
+                              1,
+                              32,
+                              64
+                            ],
+                            "encoding": {
+                              "Quant": {
+                                "scheme": "Int4B8",
+                                "logical_dtype": "BF16",
+                                "bits_per_element": 4,
+                                "group_size": 32,
+                                "channel_axis": 2
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "Concat": {
+                    "axis": 1,
+                    "parts": [
+                      {
+                        "Transmute": {
+                          "src": {
+                            "Src": "language_model.model.layers.0.mlp.experts.1.gate_proj.weight_packed"
+                          },
+                          "to": {
+                            "shape": [
+                              1,
+                              32,
+                              64
+                            ],
+                            "encoding": {
+                              "Quant": {
+                                "scheme": "Int4B8",
+                                "logical_dtype": "BF16",
+                                "bits_per_element": 4,
+                                "group_size": 32,
+                                "channel_axis": 2
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "Transmute": {
+                          "src": {
+                            "Src": "language_model.model.layers.0.mlp.experts.1.up_proj.weight_packed"
+                          },
+                          "to": {
+                            "shape": [
+                              1,
+                              32,
+                              64
+                            ],
+                            "encoding": {
+                              "Quant": {
+                                "scheme": "Int4B8",
+                                "logical_dtype": "BF16",
+                                "bits_per_element": 4,
+                                "group_size": 32,
+                                "channel_axis": 2
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "factor": {
+            "PerBlock": {
+              "by": {
+                "Out": "model.layers.0.mlp.experts.gate_up.scale"
+              }
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.down.weight",
+      "expr": {
+        "Scale": {
+          "src": {
+            "Concat": {
+              "axis": 0,
+              "parts": [
+                {
+                  "Transmute": {
+                    "src": {
+                      "Src": "language_model.model.layers.0.mlp.experts.0.down_proj.weight_packed"
+                    },
+                    "to": {
+                      "shape": [
+                        1,
+                        64,
+                        32
+                      ],
+                      "encoding": {
+                        "Quant": {
+                          "scheme": "Int4B8",
+                          "logical_dtype": "BF16",
+                          "bits_per_element": 4,
+                          "group_size": 32,
+                          "channel_axis": 2
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "Transmute": {
+                    "src": {
+                      "Src": "language_model.model.layers.0.mlp.experts.1.down_proj.weight_packed"
+                    },
+                    "to": {
+                      "shape": [
+                        1,
+                        64,
+                        32
+                      ],
+                      "encoding": {
+                        "Quant": {
+                          "scheme": "Int4B8",
+                          "logical_dtype": "BF16",
+                          "bits_per_element": 4,
+                          "group_size": 32,
+                          "channel_axis": 2
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "factor": {
+            "PerBlock": {
+              "by": {
+                "Out": "model.layers.0.mlp.experts.down.scale"
+              }
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        64,
+        32
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.self_attn.q_kv_a_proj.fused.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Src": "language_model.model.layers.0.self_attn.q_a_proj.weight"
+            },
+            {
+              "Src": "language_model.model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+            }
+          ]
+        }
+      },
+      "shape": [
+        80,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.self_attn.q_a_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.layers.0.self_attn.q_kv_a_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 0,
+          "len": 32
+        }
+      },
+      "shape": [
+        32,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.layers.0.self_attn.q_kv_a_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 32,
+          "len": 48
+        }
+      },
+      "shape": [
+        48,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "expr": {
+        "Src": "language_model.model.embed_tokens.weight"
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.0.gate_proj.weight_packed",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.0.gate_proj.weight_packed"
+      },
+      "shape": [
+        32,
+        8
+      ],
+      "encoding": {
+        "Raw": "I32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.0.gate_proj.weight_scale",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.0.gate_proj.weight_scale"
+      },
+      "shape": [
+        32,
+        2
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.0.up_proj.weight_packed",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.0.up_proj.weight_packed"
+      },
+      "shape": [
+        32,
+        8
+      ],
+      "encoding": {
+        "Raw": "I32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.0.up_proj.weight_scale",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.0.up_proj.weight_scale"
+      },
+      "shape": [
+        32,
+        2
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.0.down_proj.weight_packed",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.0.down_proj.weight_packed"
+      },
+      "shape": [
+        64,
+        4
+      ],
+      "encoding": {
+        "Raw": "I32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.0.down_proj.weight_scale",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.0.down_proj.weight_scale"
+      },
+      "shape": [
+        64,
+        1
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.1.gate_proj.weight_packed",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.1.gate_proj.weight_packed"
+      },
+      "shape": [
+        32,
+        8
+      ],
+      "encoding": {
+        "Raw": "I32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.1.gate_proj.weight_scale",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.1.gate_proj.weight_scale"
+      },
+      "shape": [
+        32,
+        2
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.1.up_proj.weight_packed",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.1.up_proj.weight_packed"
+      },
+      "shape": [
+        32,
+        8
+      ],
+      "encoding": {
+        "Raw": "I32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.1.up_proj.weight_scale",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.1.up_proj.weight_scale"
+      },
+      "shape": [
+        32,
+        2
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.1.down_proj.weight_packed",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.1.down_proj.weight_packed"
+      },
+      "shape": [
+        64,
+        4
+      ],
+      "encoding": {
+        "Raw": "I32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.mlp.experts.1.down_proj.weight_scale",
+      "expr": {
+        "Src": "language_model.model.layers.0.mlp.experts.1.down_proj.weight_scale"
+      },
+      "shape": [
+        64,
+        1
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.norm.weight",
+      "expr": {
+        "Src": "language_model.model.norm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    }
+  ],
+  "groups": []
+}

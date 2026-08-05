@@ -292,20 +292,10 @@ nlohmann::json dump(const HfConfig& v) {
 
 }  // namespace
 
-#ifndef PIE_DUMP_NO_MAIN
-int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << "usage: dump_hf_config <config.json>\n";
-        return 2;
-    }
-    try {
-        std::cout << dump(pie_cuda_driver::parse_hf_config(argv[1])).dump(2) << "\n";
-    } catch (const std::exception& err) {
-        // A refusal is part of the behavior being compared, so it leaves on
-        // stdout in a shape the harness can read rather than as a crash.
-        std::cout << nlohmann::json{{"error", err.what()}}.dump(2) << "\n";
-        return 1;
-    }
-    return 0;
-}
-#endif
+// This file used to carry a `main` that dumped `parse_hf_config(argv[1])`, and
+// that was the oracle: the C++ normalizer behind a JSON emitter, so the Rust
+// port could be diffed against it. The port won and `config.cpp` was deleted,
+// so the entry point is gone with the function it called. What is left is the
+// emitter, which `dump_from_descriptor.cpp` includes to print an `HfConfig`
+// the descriptor reader produced -- the same emitter, so the same output shape
+// the `golden/` files were recorded in.

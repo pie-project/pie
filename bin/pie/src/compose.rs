@@ -1,6 +1,6 @@
 //! P5a compose — the real in-proc standalone: an embedded controller actor, a
 //! gateway, and a worker co-resident over loopback. golf's overlay of delta's
-//! stub contract (`Mode`, `StandaloneHandle`, `run_standalone`).
+//! stub contract (`StandaloneHandle`, `run_standalone`).
 //!
 //! Topology is the same M3 dial-in as a real cluster, just collapsed into one
 //! process: the controller actor is embedded and a single cloneable `Handle`
@@ -17,16 +17,6 @@ use pie_ids::{GatewayId, NodeId, WorkerId};
 use pie_worker::ControlLink;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-
-/// Standalone run mode. `Local` and `Serve` boot the *same* in-proc cluster;
-/// they differ only in client-facing exposure (loopback vs the configured bind).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// `pie local` — loopback-only, developer one-shot/local use.
-    Local,
-    /// `pie serve` — bind the configured client address; persistent.
-    Serve,
-}
 
 /// In-proc adapter over the embedded controller `Handle`, implementing BOTH the
 /// worker [`ControlLink`] and the gateway [`pie_gateway::GatewayControl`] seams
@@ -101,19 +91,33 @@ pub async fn run_standalone(
     controller: pie_controller::Config,
     mut gateway: pie_gateway::Config,
     worker: pie_worker::Config,
-    mode: Mode,
 ) -> Result<StandaloneHandle> {
     // Embed the controller actor; one cloneable Handle drives both planes.
     let handle = pie_controller::embed(controller);
     let control = EmbeddedControl(handle.clone());
 
     // The in-proc gateway binds its worker-facing socket on an ephemeral
-    // loopback port so the embedded worker can dial in; `Local` also forces the
-    // client edge to loopback (`Serve` keeps the configured bind).
+    // loopback port so the embedded worker can dial in.
     gateway.worker_listen = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-    if mode == Mode::Local {
-        gateway.listen.set_ip(Ipv4Addr::LOCALHOST.into());
-    }
+
+    // The client edge binds `[worker.server] host:port` -- the only address in
+    // the standalone file that looks like it decides this.
+    //
+    // It did not. `[gateway] listen` decided it, that section is empty in every
+    // generated config, and its default is 0.0.0.0:8080 -- so a file saying
+    // `host = "127.0.0.1"` was serving on every interface. `pie local` used to
+    // paper over it by forcing loopback; deleting `pie local` removed the paper
+    // rather than the hole.
+    //
+    // Overwritten rather than defaulted-from, because two spellings for one
+    // bind address is what produced this: whichever loses is a line in a config
+    // file that means nothing.
+    let host: std::net::IpAddr = worker
+        .server
+        .host
+        .parse()
+        .with_context(|| format!("[server] host {:?} is not an IP address", worker.server.host))?;
+    gateway.listen = SocketAddr::new(host, worker.server.port);
     let gw = pie_gateway::bind(gateway, control.clone())
         .await
         .context("bind in-proc gateway")?;
@@ -122,9 +126,16 @@ pub async fn run_standalone(
 
     // Boot the embedded worker against the injected control link, dialing INTO
     // the in-proc gateway (M3 inversion — the same path a remote worker takes).
-    let worker = pie_worker::run_with(worker, control, vec![format!("tcp://{worker_addr}")])
-        .await
-        .context("boot embedded worker")?;
+    let worker = pie_worker::run_with(
+        worker,
+        control,
+        vec![format!("tcp://{worker_addr}")],
+        // The client edge, taken from the bound socket rather than the config:
+        // `port = 0` means the OS chose, and the config still says 0.
+        Some(format!("ws://{listen_addr}")),
+    )
+    .await
+    .context("boot embedded worker")?;
 
     // Serve the gateway client edge (its worker-facing accept loop is already up).
     let gateway = tokio::spawn(async move {

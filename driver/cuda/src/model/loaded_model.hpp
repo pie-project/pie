@@ -14,7 +14,7 @@
 #include "loader/group_stream_cache.hpp"
 #include "loader/load_plan.hpp"
 #include "model/config.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "pie_loader/checkpoint_source.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"

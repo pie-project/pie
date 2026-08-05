@@ -17,14 +17,7 @@ namespace pie_cuda_driver::model {
 // ~10 ms wave plateau at c=160 -- but until the scheduler stops resonating,
 // making the GPU faster here costs throughput. Enable with
 // `PIE_KIMI_MOE_FLASHINFER=1`.
-bool kimi_moe_gate_up_swapped() {
-    static const bool swapped = [] {
-        const char* v = std::getenv("PIE_KIMI_MOE_FLASHINFER");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return swapped;
-}
+bool kimi_moe_gate_up_swapped() { return false; }
 
 
 namespace {

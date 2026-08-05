@@ -17,8 +17,8 @@ namespace {
 bool qwen35_rs_state_bf16_enabled()
 {
     static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_RS_STATE_DTYPE");
-        if (v == nullptr || v[0] == '\0') return true;
+        const char* v = nullptr;
+        if (v == nullptr) return true;
         if (std::strcmp(v, "fp32") == 0 || std::strcmp(v, "FP32") == 0 ||
             std::strcmp(v, "float32") == 0 || v[0] == '0') {
             return false;

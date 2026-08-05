@@ -5,8 +5,10 @@
 namespace pie_cuda_driver {
 
 // The engine scheduler's maximum run-ahead depth in FRAMES
-// (`configured_max_in_flight` in runtime/engine/src/scheduler/frame.rs).
-// Venus: one frame carries up to `PIE_FRAME_SIZE` steps, and every step is
+// (`configured_dispatch_depth` in runtime/engine/src/scheduler/frame.rs,
+// from `[model.scheduler] frame_dispatch_depth`).
+// Venus: one frame carries up to `[model.scheduler] frame_size` steps, and
+// every step is
 // one upload+launch on the stream, so the driver's staging pools must size
 // to STEPS in flight = frames × k. The constants below are the ONE source
 // the pinned staging pools size themselves from; a pool with its own

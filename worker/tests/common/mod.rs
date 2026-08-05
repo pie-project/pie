@@ -76,29 +76,25 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
     // attention plan and its reduction order. Two runs meant to differ only in
     // residency would then differ in numerics too, which is not a comparison.
     let kv = std::env::var("PIE_CUDA_TEST_KV_PAGES")
-        .map(|v| format!("total_pages = {v}\n"))
+        .map(|v| format!("max_total_pages = {v}\n"))
         .unwrap_or_default();
     format!(
         "[server]\n\
          host = \"127.0.0.1\"\n\
          port = 0\n\
          \n\
-         [runtime]\n\
+         [sandbox]\n\
          allow_fs = true\n\
          fs_scratch_dir = \"{scratch}\"\n\
          \n\
-         [auth]\n\
-         enabled = false\n\
          \n\
          [model]\n\
          name = \"default\"\n\
          model = \"{snapshot_path}\"\n\
          \n\
-         [model.driver]\n\
+         [driver]\n\
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
-         \n\
-         [model.driver.options]\n\
          gpu_mem_utilization = 0.90\n\
          memory_profile = \"latency\"\n\
          {kv}{streaming}",

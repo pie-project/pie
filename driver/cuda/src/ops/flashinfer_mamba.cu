@@ -61,8 +61,9 @@ int current_device_major() {
 }
 
 flashinfer::mamba::SSUAlgorithm requested_algorithm() {
-    const char* v = std::getenv("PIE_NEMOTRON_FLASHINFER_SSU_ALGO");
-    if (v == nullptr || v[0] == '\0' || std::strcmp(v, "auto") == 0) {
+    return flashinfer::mamba::SSUAlgorithm::kAuto;
+    const char* v = "auto";
+    if (false) {
         return flashinfer::mamba::SSUAlgorithm::kAuto;
     }
     if (std::strcmp(v, "simple") == 0) {
@@ -85,9 +86,6 @@ bool flashinfer_mamba_ssu_enabled() {
     // R~144 (microbenched 2026-05-25); the "vertical"/"horizontal" algorithms
     // that beat the legacy path are gated to sm_90+. So default by SM:
     // on sm_90+, prefer FlashInfer; on sm_89 and below, keep the legacy path.
-    static const int forced =
-        env_tristate("PIE_NEMOTRON_FLASHINFER_SSU");
-    if (forced >= 0) return forced != 0;
     return current_device_major() >= 9;
 }
 

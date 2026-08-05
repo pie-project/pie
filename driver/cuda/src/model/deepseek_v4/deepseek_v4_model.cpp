@@ -35,8 +35,7 @@ DsV4Model::DsV4Model(
     // FlashInfer plan is built in `prepare()`. The prefill path still syncs,
     // but graphs are only captured for pure-decode shapes.
     {
-        const char* v = std::getenv("PIE_DSV4_GRAPH");
-        bool on = !(v != nullptr && v[0] == '0');
+        bool on = true;
         // Paging experts is host work in the middle of the forward -- a routing
         // table read back off the device, a slot chosen, a plan run -- and none
         // of it is capturable.
