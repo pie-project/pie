@@ -1665,6 +1665,18 @@ StagedLaunch::~StagedLaunch() {
         if (state_->stream != nullptr) {
             cudaStreamSynchronize(state_->stream);
         }
+        // The slot has TWO possible consumer streams. With the batched
+        // host-publish transport the settle kernel, the publish copies and
+        // their `flush` all run on `output_copy_stream`, not on
+        // `state_->stream` (see `finish`: `settlement_stream` switches when
+        // `batch_copies`). If we get here between that launch and `finish`'s
+        // `release_after`, syncing only `state_->stream` leaves the slot
+        // marked idle while the settle kernel is still reading it — the next
+        // wave's `claim()` then hands it out and `stage()`/`flush` overwrite
+        // live device memory. Silent corruption, not a crash, so drain both.
+        if (state_->owner->output_copy_stream != nullptr) {
+            cudaStreamSynchronize(state_->owner->output_copy_stream);
+        }
         state_->owner->pipeline_params.release_synced(state_->param_slot);
         state_->param_slot_released = true;
     }
@@ -5652,7 +5664,18 @@ void Dispatch::abort(
         state.owner->publications_recorded = true;
     }
     if (state.device_tickets != nullptr) {
-        cudaFreeAsync(state.device_tickets, stream);
+        // Arena-backed tickets point INTO the param slot (see
+        // `State::tickets_in_arena`): freeing that interior pointer returns
+        // `cudaErrorInvalidValue`, and because this path is `noexcept` the
+        // status is discarded and the sticky last-error is then reported by
+        // whatever `cudaGetLastError()` runs next — typically a prestaged
+        // launcher in a LATER wave, as a bogus launch failure. The slot is
+        // released through `pipeline_params` below (destructor path), not
+        // here. Reached on the ordinary ticket-miss retry, so this must
+        // mirror `~StagedLaunch` exactly.
+        if (!state.tickets_in_arena) {
+            cudaFreeAsync(state.device_tickets, stream);
+        }
         state.device_tickets = nullptr;
         for (auto& lane : state.lanes) {
             lane->device_tickets = nullptr;
