@@ -27,7 +27,7 @@ use pie_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, 
 use pie_loader::verify::ContractView;
 
 use pie_model::common::facts::ModelFacts;
-use pie_model::common::policy::{Mxfp4MoeRequest, Naming, Policy, Projections};
+use pie_model::common::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
 use pie_model::contract::author;
 
 // ── fixture machinery ───────────────────────────────────────────────
@@ -885,6 +885,77 @@ fn llama_mlx_metal() {
         &metal_target(),
         &mlx_policy(),
     );
+}
+
+/// The same decoder as [`llama_mlx_checkpoint`], unquantized — what a stock
+/// BF16 release ships, and what Metal cannot bind as it stands: its matvecs
+/// read MLX affine, and even the embedding gather wants scales.
+fn llama_bf16_checkpoint() -> CheckpointMetadata {
+    let (hidden, intermediate, vocab) = (64, 128, 128);
+    let mut ck = Checkpoint::new();
+    ck.push("model.embed_tokens.weight", &[vocab, hidden], bf16());
+    let p = "model.layers.0.";
+    ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
+    for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+        ck.push(&format!("{p}self_attn.{proj}.weight"), &[hidden, hidden], bf16());
+    }
+    ck.push(
+        &format!("{p}post_attention_layernorm.weight"),
+        &[hidden],
+        bf16(),
+    );
+    ck.push(&format!("{p}mlp.gate_proj.weight"), &[intermediate, hidden], bf16());
+    ck.push(&format!("{p}mlp.up_proj.weight"), &[intermediate, hidden], bf16());
+    ck.push(&format!("{p}mlp.down_proj.weight"), &[hidden, intermediate], bf16());
+    ck.push("model.norm.weight", &[hidden], bf16());
+    ck.finish("llama_bf16")
+}
+
+/// Offline quantization: the request that turns the BF16 release above into
+/// something these kernels read.
+///
+/// Every rank-2 `.weight` becomes an affine-U4 `Encode` and the rank-1 norms
+/// stay values — the same arm gpt-oss applies unconditionally to the BF16 half
+/// of its published checkpoint, and the same `Encode` a serve boot would run.
+/// `pie model optimize --backend metal --quant int4` is this contract with the
+/// transform executed on the host instead of at load.
+#[test]
+fn llama_mlx_metal_int4() {
+    check(
+        "llama_mlx_metal_int4",
+        &llama_bf16_checkpoint(),
+        &facts("llama3", 1),
+        &metal_target(),
+        &Policy {
+            runtime_quant: RuntimeQuant::Int4,
+            ..mlx_policy()
+        },
+    );
+}
+
+/// A requantization this lowering has no encoder for is refused, not ignored.
+///
+/// The three CUDA schemes are the ones that used to be plumbed through to an
+/// author that never read the field: silently authoring an unquantized
+/// contract for `--quant int8` would hand back an artifact whose name says one
+/// thing and whose bytes say another.
+#[test]
+fn metal_refuses_a_requantization_it_cannot_encode() {
+    for quant in [RuntimeQuant::Int8, RuntimeQuant::Mxfp4, RuntimeQuant::Fp8] {
+        let err = author(
+            &facts("llama3", 1),
+            &llama_bf16_checkpoint(),
+            &metal_target(),
+            &Policy {
+                runtime_quant: quant,
+                ..mlx_policy()
+            },
+        )
+        .expect_err(&format!("runtime_quant={quant:?} should be refused"));
+        let text = err.to_string();
+        assert!(text.contains("no encoder here"), "{quant:?}: {text}");
+        assert!(text.contains("int4"), "{quant:?} refusal names the alternative: {text}");
+    }
 }
 
 fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {

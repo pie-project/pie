@@ -2487,26 +2487,9 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         // the config, before any of this is built.
 
         // Whether the head is its own tensor is decided ONCE, by the contract,
-        // and read back here rather than decided a second time. The contract's
-        // rule is that a shipped `lm_head` beats whatever the config says --
-        // and the config can say nothing at all: Qwen3.5-35B-A3B is a
-        // multimodal wrapper that spells `tie_word_embeddings` at the TOP
-        // level, outside the `text_config` this family parses, so the facts
-        // defaulted to tied. The contract staged `embed_tokens` and `lm_head`;
-        // the DAG asked for `shared_embedding`; the load stopped on "unstaged
-        // weight shared_embedding.weight" -- two opinions about one fact. The
-        // plan's own tensor list is the only opinion that can be wrong in a
-        // way the binding survives, so it is the one the DAG follows.
-        const auto plan_view = load_plan.view();
-        bool plan_ties = false;
-        for (std::size_t i = 0; i < plan_view.tensors.len; ++i) {
-            if (pie_loader::bytes_to_string(plan_view.tensors.ptr[i].name) ==
-                "shared_embedding.weight") {
-                plan_ties = true;
-                break;
-            }
-        }
-        geom.tied_embeddings = plan_ties;
+        // and read back here rather than decided a second time -- see
+        // `plan_ties_embeddings`.
+        geom.tied_embeddings = plan_ties_embeddings(load_plan);
     }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes

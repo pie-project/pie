@@ -759,7 +759,7 @@ struct PieLoaderModelRequest {
   /// `Naming` wire value: 0 HF, 1 MLX.
   uint32_t naming;
   /// `RuntimeQuant` wire value, already resolved against the device:
-  /// 0 none, 1 fp8, 2 int8, 3 mxfp4.
+  /// 0 none, 1 fp8, 2 int8, 3 mxfp4, 4 int4 (MLX affine, Metal's).
   uint32_t runtime_quant;
   /// `Mxfp4MoeRequest` wire value: 0 auto, 1 routed, 2 native, 3 bf16.
   uint32_t moe_request;

@@ -68,6 +68,12 @@ pub enum RuntimeQuant {
     Fp8,
     Int8,
     Mxfp4,
+    /// MLX affine, 4 bits over groups of 64 — the format every Metal matvec
+    /// reads, and the only one its loader can encode into.
+    ///
+    /// Last, because the wire values are positional: the C ABI sends this as
+    /// an integer and inserting a variant in the middle renumbers the rest.
+    Int4,
 }
 
 impl RuntimeQuant {
@@ -80,6 +86,7 @@ impl RuntimeQuant {
             "fp8" => Ok(Self::Fp8),
             "int8" => Ok(Self::Int8),
             "mxfp4" => Ok(Self::Mxfp4),
+            "int4" => Ok(Self::Int4),
             other => Err(format!("unknown runtime quantization {other:?}")),
         }
     }
