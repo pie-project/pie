@@ -3,37 +3,30 @@
   "answers": [
     {
       "question_id": "q01-sound",
-      "headline": "documents generated under the mask that validate: engrain 292/521 valid (56.0%); xgrammar 531/684 valid (77.6%)",
+      "headline": "documents generated under the mask that validate: engrain 2115/2115 valid (100.0%); xgrammar 2398/2551 valid (94.0%)",
       "detail": {
         "schemas": {
-          "engrain": 60,
-          "xgrammar": 60
+          "engrain": 200,
+          "xgrammar": 200
         },
         "walks_per_schema": 20,
         "per_engine": {
           "engrain": {
-            "walks": 1200,
-            "valid": 292,
-            "invalid": 229,
-            "unfinished": 679
+            "walks": 4000,
+            "valid": 2115,
+            "invalid": 0,
+            "unfinished": 1885
           },
           "xgrammar": {
-            "walks": 1200,
-            "valid": 531,
+            "walks": 4000,
+            "valid": 2398,
             "invalid": 153,
-            "unfinished": 516
+            "unfinished": 1449
           }
         },
         "causes": {
           "xgrammar": {
-            "schema uses unlowered const": 18,
-            "relaxed anyOf/oneOf: required sets intersected": 2,
-            "unexplained": 113,
-            "schema uses unlowered dependencies": 20
-          },
-          "engrain": {
-            "unexplained": 212,
-            "schema uses unlowered dependencies": 17
+            "unexplained": 153
           }
         },
         "note": "Every document was produced by choosing only bytes the mask admitted, so an invalid one is a byte the mask should have refused. Both engines walk the same schemas over the same 256-byte vocabulary."
@@ -42,12 +35,12 @@
     },
     {
       "question_id": "q02-superset",
-      "headline": "over-acceptance by precision level: Shadowed 56.0% valid of 521",
+      "headline": "over-acceptance by precision level: Shadowed 100.0% valid of 2115",
       "detail": {
         "per_level": {
           "Shadowed": {
-            "valid": 292,
-            "invalid": 229
+            "valid": 2115,
+            "invalid": 0
           }
         }
       },
@@ -55,13 +48,13 @@
     },
     {
       "question_id": "q03-vs-xgr-mask",
-      "headline": "118/4787 steps mask-identical to XGrammar (2.5%)",
+      "headline": "1541/8049 steps mask-identical to XGrammar (19.1%)",
       "detail": {
-        "schemas": 60,
-        "steps": 4787,
-        "identical": 118,
-        "extra_tokens_we_allow": 137104296,
-        "extra_tokens_xgrammar_allows": 1961952,
+        "schemas": 200,
+        "steps": 8049,
+        "identical": 1541,
+        "extra_tokens_we_allow": 7184905,
+        "extra_tokens_xgrammar_allows": 23226719,
         "examples": [
           {
             "schema": "Github_easy",
@@ -71,116 +64,116 @@
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n",
-            "tokens_only_we_allow": 54,
-            "tokens_only_xgrammar_allows": 0
-          },
-          {
-            "schema": "Github_easy",
-            "prefix": "{\n ",
-            "tokens_only_we_allow": 54,
-            "tokens_only_xgrammar_allows": 0
-          },
-          {
-            "schema": "Github_easy",
-            "prefix": "{\n  ",
+            "prefix": "{\"",
             "tokens_only_we_allow": 1,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n   ",
+            "prefix": "{\"x",
             "tokens_only_we_allow": 2,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    ",
+            "prefix": "{\"x1",
             "tokens_only_we_allow": 4,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"",
+            "prefix": "{\"x1\"",
             "tokens_only_we_allow": 54,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x",
+            "prefix": "{\"x1\":",
             "tokens_only_we_allow": 54,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1",
+            "prefix": "{\"x1\": ",
             "tokens_only_we_allow": 57,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1\"",
+            "prefix": "{\"x1\": 1",
             "tokens_only_we_allow": 54,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1\":",
-            "tokens_only_we_allow": 54,
-            "tokens_only_xgrammar_allows": 0
-          },
-          {
-            "schema": "Github_easy",
-            "prefix": "{\n    \"x1\": ",
+            "prefix": "{\"x1\": 1,",
             "tokens_only_we_allow": 1,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1\": 1",
+            "prefix": "{\"x1\": 1, ",
             "tokens_only_we_allow": 1,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1\": 1,",
+            "prefix": "{\"x1\": 1, \"",
             "tokens_only_we_allow": 4,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1\": 1,\n",
+            "prefix": "{\"x1\": 1, \"x",
             "tokens_only_we_allow": 54,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1\": 1,\n ",
+            "prefix": "{\"x1\": 1, \"x2",
             "tokens_only_we_allow": 54,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1\": 1,\n  ",
-            "tokens_only_we_allow": 79,
+            "prefix": "{\"x1\": 1, \"x2\"",
+            "tokens_only_we_allow": 57,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1\": 1,\n   ",
+            "prefix": "{\"x1\": 1, \"x2\":",
             "tokens_only_we_allow": 54,
             "tokens_only_xgrammar_allows": 0
           },
           {
             "schema": "Github_easy",
-            "prefix": "{\n    \"x1\": 1,\n    ",
-            "tokens_only_we_allow": 54,
-            "tokens_only_xgrammar_allows": 0
-          },
-          {
-            "schema": "Github_easy",
-            "prefix": "{\n    \"x1\": 1,\n    \"x",
+            "prefix": "{\"x1\": 1, \"x2\": 2",
             "tokens_only_we_allow": 4,
+            "tokens_only_xgrammar_allows": 0
+          },
+          {
+            "schema": "Github_easy",
+            "prefix": "{\"x1\": 1, \"x2\": 2,",
+            "tokens_only_we_allow": 63,
+            "tokens_only_xgrammar_allows": 0
+          },
+          {
+            "schema": "Github_easy",
+            "prefix": "{\"x1\": 1, \"x2\": 2, ",
+            "tokens_only_we_allow": 66,
+            "tokens_only_xgrammar_allows": 0
+          },
+          {
+            "schema": "Github_easy",
+            "prefix": "{\"x1\": 1, \"x2\": 2, \"",
+            "tokens_only_we_allow": 69,
+            "tokens_only_xgrammar_allows": 1
+          },
+          {
+            "schema": "Github_easy",
+            "prefix": "{\"x1\": 1, \"x2\": 2, \"x",
+            "tokens_only_we_allow": 54,
             "tokens_only_xgrammar_allows": 0
           }
         ],
@@ -193,425 +186,425 @@
   "seed": 20260726,
   "invalid_examples": [
     {
-      "schema": 1,
+      "schema": 5,
       "engine": "xgrammar",
-      "cause": "schema uses unlowered const",
-      "reason": "{} is valid under each of {'$ref': '#/definitions/second'}, {'$ref': '#/definitions/first'}",
-      "text": "{ \"subject\"\t\n \n \n:\t   { }\n\t\t}"
-    },
-    {
-      "schema": 1,
-      "engine": "xgrammar",
-      "cause": "schema uses unlowered const",
-      "reason": "{} is valid under each of {'$ref': '#/definitions/second'}, {'$ref': '#/definitions/first'}",
-      "text": "{\"subject\"  \n   :\n\t\n\t{} }"
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 4 column 3 (char 20)",
+      "text": "{ \n\n\t\"buyerId\" :\t\n \"\u0006F$\u985d\u001fn\f]\u0163\u0125'\uf264S'\t[X1\u0018\u0007\u01e1\u3887;\u007f~\",\t\t\"buyerPurchaseOrderNumber\"   \t:\t \t\t\"\u000f}\u0017X\u0000\u898a\u06a4LVs\u001eS5\u071d\u0004\u0015\",\t\"objectType\"\t \t\n :\t\n\"orderStatusRequest\",\"orderId\"\t\n:\t \t \t\"7\u001b\u07b3\u34d0\u04e3\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u06beeH)a\u0452K\ud74b2T\u02a8\u001dn\u024fw\tR\u01a1\udb9a\udf0aR\u0590\ufffd\ufffd\ufffd"
     },
     {
       "schema": 5,
       "engine": "xgrammar",
-      "cause": "relaxed anyOf/oneOf: required sets intersected",
-      "reason": "{} is not valid under any of the given schemas",
-      "text": "{\t\t \t\"requirement\"\n\t:{ \t\t}\n\t  ,\"project-template\":{\n}\n\n\t}"
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 5 column 10 (char 30)",
+      "text": "{\t \"buyerId\"\t\n  \t\n:\n\n\t\t  \t\t\t\"k\u0019\u0002NX\u0547\u0131\u0005V\ufffd\ufffd\ufffdTH|\ud8ec\udf4f\uc68b\u0011\u001f\ube7b.\u4c292c\u000e>\u0354\"  ,  \"buyerPurchaseOrderNumber\"\t   \n:\"F2\u0006E\u0006<\ufffd\ufffd\ufffd\ufffdK=An~vq\u0012\u0671\",\t \"objectType\":\n\n\"orderStatusRequest\" ,\n\"orderId\"\n:\t\t\"\u001b\u02c8\u0011UsW?\u07e7\u0012\u0013\u0431O4c\u0f3bU<\ufffd\ufffd\ufffd\ufffd[\ud90c\udcabU\u00183j\u0015X\u007f"
     },
     {
       "schema": 5,
       "engine": "xgrammar",
-      "cause": "relaxed anyOf/oneOf: required sets intersected",
-      "reason": "{} is not valid under any of the given schemas",
-      "text": "{\"requirement\"\t \t:null\n,\n \t \t\"project-template\":\t{\n\"acquisitions\"\t\n:  [43,false ,890,3E8392\t\t\n, \t{ \n\n\t},true]\t\t\n\t\t}}"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
       "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{\n\n\n }\r"
+      "reason": "not JSON: Invalid control character at: line 5 column 5 (char 25)",
+      "text": "{\t\t\"buyerId\"\n :\n\t \n \n \t\t\"\u0012X1\u007fn\u055ewS8j\u0613*?\u01b9\ua62a?jVQ\u0459\u00f5\u000f8\fX\"\t ,\t  \"buyerPurchaseOrderNumber\"\n\t :\t\"?V\u0224\u001cJ\u027c\u0005\u07ea\u00d8e\u07c4\u2c46e\u001c\ufffd\ufffd\ufffd\ufffdd\"\t, \t  \"objectType\"\n\n\t\t\n\t\t  :\"orderStatusRequest\"\n\t\n,\n\n\"orderId\"\n\n:\"8\u0019\u0011\u0002c\u02211\u0015JY\u046ba\u0587\", \t\"seller"
     },
     {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{  }\n"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{\n } \r\t\r\t"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{\"\u074dz\u0489\u013c \u01484qco)\u01efsAw\udbf1\udfc3D}xEiXSQpS\u0194\u0097\"\t  \t\n\r \t \n\t\n\r \t\t \n\t    \n:[\"G\u0507\u3a0f\u0793\u0af6\u8e5d\"]}\r\t"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{\r\r} "
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{ } \t"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{\r}\r\n\n\t\t\t\r \n\t"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{\r\" \uda15\ude65\u00aa$dL^0\u6eccd+gSq)L\u00b8'\uf542w\ub20dF\u00c5\u037d\"\n:4\r\r \t,\t\t\r\t\t\r\"gl6\u06e9\uf389\u07c9qUH!i\u0311U\u0533~Nh\u047d}\u0636%\u0376vZ\"\n\r\r:{}  ,\n\t\"hJ\"\n \t\t  \r\r\r:false\n}\t"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{ \"o\uece4r<bZ\u0242\udb28\udd0aun!\u06b4\ud993\ude1c\u6213\u02f7\u43ac\u0515eY|\uea73*-\ud36e\uba7b\u7791\u02e7w8\u05ec\u8ed9wxL9}jVY\u022en<\u83e5re\u7fe6.\u0589\ub499i\u02cfksp\u03c9A=\u0209&2HT0jdbUy2J()4}b6\u24b1\u00dd\udbd5\udefb3\u03e3H\uf561g\u05d0kzDb,\u0443egH#\u026dS~\u011a&qE\u91f0r]\u025e\u04ceWo\u5dcf\ud06b\u0b19<\u00eai\u06503$U\u0090x\ud34eU(1N1r\ud8b4\udf01X@\u07b2\u03e3TT\"\t\r\t\t\n\n\n:5251E482056  }\t\t\n\t \t\t"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{  } \n"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{ \n\n  }\r \r\n\n\n\r "
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{\r}"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{\r\r\"\u01053P\u0336\u0141'\u02e5f!{wr-\u8d20\ud8ed\udd80\u03ba%ld\u045bT\u66c7b0\u079ev_[|DYb\u024f^\u06a1(M8kM\u09b6\udaf7\udc1f\u0520+\ud5ecT\u02ef\ud8b9\ude9c\u05a1\u5c90\u048c0\u03a2\u0271T\u03f9\u98a3R!aWp\ub567F\ud2c4\u04f4M[u\u03cd2p\u01ec`BRREs\u00cd NeyX_p\udba1\udca4\u04c1\udbda\udfec\u02fb}\u05e5\ucb30r~\u07bbL;\u05cc\u0655C\udbe6\uddd4\u0706n\u02e1\\n`\u02f7c\ua1edA(\u0d8c\uad3aI\u0197\u049b\u07c5\u81858_K\uc9baN\u0570(U}zZt\u050a\u0217[i\u01c5t\u9e76\u0535-*e=-pf}\u0670?\u0407|\u074f~'6\u01650w\u015a_>R\u0667o\u06b4\u0402T\u0678AX'\u01ed\u032ei\u07abZU\u073c\u0101`,PBy\udbee\ude3dh9q\u0565$u?EL"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{ \t\t}\t\r\n\n"
-    },
-    {
-      "schema": 6,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'objectType' is a required property",
-      "text": "{\t}\n\n\r\n\n\r\t\n\r \r"
-    },
-    {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 1 column 24 (char 23)",
-      "text": "{\"buyerId\"\t :   \t\t   \"&\u0007\u03a3\u0004\u1829i\u001cD\ufffd\ufffdM\u0006\u07fa'\ufffd\ufffd\ufffd\ufffd\u0560\u0019\u0005t\u0006+\u01ea~\u065e6I\" \n, \"buyerPurchaseOrderNumber\" : \t\"\ud81a\udd1cE`zQ\u01f4\ufffd\ufffd$_R'\u001c\ufffd\ufffd\ufffd\u02e83\u0013\"\n\t\t   \t\n ,\"objectType\" \t\t\t \t \t    \n: \n\t\"orderStatusRequest\"\t, \n\"orderId\" :\n\t \t \n\"\u0003/\f\u000b4\u04bb+\ud96f\uddff>\u00ac,%"
+      "reason": "not JSON: Invalid control character at: line 5 column 3 (char 23)",
+      "text": "{ \"buyerId\"\t \t:\n\t\n \n\n\"s\u0015\u04ecN\u01e9G\u06aa\u0609j\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd5\u001b\u02a1|\ufffd\ufffd\u0000^\u068b\u044b!\u0018s</\"\n\n\t \n\t\n,\n \t \"buyerPurchaseOrderNumber\"\t\n\t\t\n\n\t\n:\t\n\"&ht&\u0004:*\u021d\u001d9F\ufffd\ufffd\ufffd\ufffd\u2111\ue754\u7229\u5340\"\t  , \"objectType\":\"orderStatusRequest\"\t,\n\t\t\t\n\"orderId\"\n  :\n\t\t \"R\u000f\u02d6\u000f\u000ekSI\ufffd\ufffd\ufffd\f"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 18 (char 20)",
-      "text": "{ \n\t\"buyerId\":\"3M.\u0684y\u001c\u05c5Z\ud956\udc39\u001cx\u0010<\u07dd>\ud974\udc04\u007f9\u0005\u0001\u0005[\u0006Ph\"\n \n\t\n\n,\n \n\n\"buyerPurchaseOrderNumber\"  \n\t \t\t\t\n :\n\t \n\"o\uf028VJe\u0252\ua428^\ufffd\ufffdB8h\u0518\u05fb\u03f8A\"\t\t  \n,\n\t\n\"objectType\" \t  :\n\"orderStatusRequest\", \"orderId\"\t  \t\t\n\n \t\n:\"a\u507d=\ufffd\ufffd!\t\ud9a0\udd49h\u0669\u06ddqH\u0389Pr\u01ab\ub1a0"
+      "reason": "not JSON: Invalid control character at: line 6 column 10 (char 36)",
+      "text": "{ \"buyerId\" \t\t\n\t\n\t \n\t\t\t:\n \n \"\u13cd6o\ueedd+r\udbc3\ude9f\u0012WG`\u4a5fY\u0016\u0363\ufffd\ufffd\u0014y\u0007@\u03189\u000b\u000e\u0343\"\t\n,\n\t\"buyerPurchaseOrderNumber\"\n:\t\t  \"\u165aJ\u01b8y\u001bUx\u0015!\udb61\udf97\u071e\u0007,i\u0004\u000b\", \n\t\t \"objectType\":\n\t\t  \"orderStatusRequest\"\t  ,\"orderId\" \t\n\n\n \t\n\n\t\n \n:\n \n\t\"V\u045d-S\u0000\u007f\u05f6:#\u0286,h\u0019"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 6 column 8 (char 27)",
-      "text": "{\n\n\t \"buyerId\":\n \n\t\n  \"CNu\u0404\u0007\ud89d\udd51\u0015TQ\t'#\u001e\u0126{\u001a0\u001b!\u0010\u01890\u0010w\u0001\", \t\t \"buyerPurchaseOrderNumber\" : \t \"+@\u0007R\u04fcidi\uf8fe\u0016\u016d\u0013y5W\u077b\"\t \t\t\t\t\t,\n   \n  \t\"objectType\"\t\n\t \t: \t\"orderStatusRequest\"\n \n,\t \n\"orderId\":\t \t\"\u001c]s\u0015\u6c7c\u0000f\u0013\u0016\uca21Q\thbU#\ucaf0@\u0007&"
+      "reason": "not JSON: Invalid control character at: line 8 column 3 (char 32)",
+      "text": "{\t \n\n\t  \n\t\t\n\t\"buyerId\"\t\t\t\n :\n\n\"g\u0003o7\ua487\ufffd\ufffd\ufffd\ufffd5\uda51\udd53/*\u000b\u3101\ufffd\ufffd\ufffd\ufffdA\", \t\n\n\n \"buyerPurchaseOrderNumber\" \n\t\t:\"{u\u8827a\u010eZ\ufffd\ufffd\ufffd\ufffd\u077c\u007fm&P2G^\u000e\"\n\t\n \t ,\n\"objectType\"\n:\n\n\"orderStatusRequest\"\n \t \n\n\n\t\t \t\n,\t\n\"orderId\"\n:\n\"\u001cG\u0001\ufffd\ufffd\ufffdJ\u9d7b\u036eQ\u000fRYf2:&"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 1 column 18 (char 17)",
-      "text": "{\"buyerId\":\"V\u44c2.\udb60\udd3cS\u0017nb\u0360YUL?\ufffd\ufffd\ufffd\ufffd\u0012\ufffd\ufffd\ufffdSQF\u06d1P\ub90e]\u034ce\"\t\n\t\n\t\t,\n \t\t\t\n\n\n \t \n\"buyerPurchaseOrderNumber\": \t\t  \n\t\"\u0010V\uca0c\u007fH\udb58\udd4a\ua3ae\ufffd\ufffdI\",\t\n\n\"objectType\"\n :\n\n\"orderStatusRequest\"\n \n \t ,\t\n \n \t \"orderId\"\n:\t \n\t \t\n   \"\u0017\u01d7\f\u04e3\u0007\u8f6c\u0339\u001bX\u0673,D:%\u0017"
+      "reason": "not JSON: Invalid control character at: line 9 column 4 (char 35)",
+      "text": "{\n \t\n\n\t\t\n\t\n \t\"buyerId\"\n \t : \t\t\n\n\"2Q\u0016!\u05d0\ubb19\u04c0\uf307{\u001cw.RDU\u0497\u0007\u05d7j\u014aV`I\u53ce/\"\t,\n \"buyerPurchaseOrderNumber\" :\n\"\ua5e4i\u0005\u6177f\t4\uab3buH3\u000e-\u040dZ\u0770\"\n\n \n   \n,\"objectType\"  \n:\n\"orderStatusRequest\"\t\t\t\n\t \t\n, \n\"orderId\"\t:\"\u5a31\u3d8dO\ub2270}\u0122\u055e\u016e\u064dc\ufffd\ufffd\ufffd\ufffdm\uda12\udc4a@\u073a\u0600\ub5ce"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 6 (char 18)",
-      "text": "{\t \"buyerId\"\n:\"\u0691\u02cbA\u0004.w\b\u001b\u0329RDM\u0217\ud914\udf40ZV}\u3d0dt\u0011\u0167\u448e\u0019\u0006\u001b\"  \t    \t  \n \t \t\n\n\n  ,\t\n\"buyerPurchaseOrderNumber\"\n\n\t:\t \t \n \t\n\"t\u10d5\u0202Y\u0308\u001c(d\u000bn~\u00028\u03e8\u0014W\"\t\t\t \t\t   \t, \t\t\"objectType\" \n :\"orderStatusRequest\"\n,\t\t\"orderId\"\n\t\t:\"\u0627\u03f3JT\u001eD<j\u0005\udb28\udd0aW\ufffd"
+      "reason": "not JSON: Invalid control character at: line 5 column 8 (char 27)",
+      "text": "{  \"buyerId\" \n\t :\n\n\n\t\t \"7\ud8c4\ude61H\u001b\u0676\u0005,\u0003=;\u0018\ufffd\ufffd\ufffd\ufffd\u3f1a\u34b5\tGr\u0015\u00bb=\u0000~\u026c\u36e6D\"\t\n\n\n \n\n\n\t\n\n \t\t ,\t\t \t\"buyerPurchaseOrderNumber\" :\n \"Y~\u0005\u3991\u768cz<X\u52a6\u0de7\u061cl\u46a5\u0012\u01f1\ud983\udc16\"\n\n\t\t\t\n\n\t\n,\"objectType\":\t\"orderStatusRequest\"\t \n \n \t\n,  \t\t  \"orderId\":\n\t\n\"R!g\u001dI\u0641"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 3 column 4 (char 19)",
-      "text": "{\n\t\"buyerId\"\t: \n\">t\u001e9Q\u01b7!\u20ab\ufffd\ufffd5\u001edVK\u9ed0\u0015\u00047c#\u06ac\u039a\u001e7\b\"\n\t \t\t\n\n,\"buyerPurchaseOrderNumber\"\n:\t \n \t\n \"]M \u01c0\u0016EGru\ufffd\ufffd\ufffd\ufffd\u0013\u01f8\u0097#ym\" ,  \n\n\n\"objectType\" :\t\t\n\"orderStatusRequest\"\t  ,\n\n\n\t \t\"orderId\":\t\n\"E\b/\u001aM\ub5bf\u001a\u05f6\u050dd\u06dfu\u0120\u916f[6lb\u045a;w\ufffd\ufffd\ufffd\ufffd"
+      "reason": "not JSON: Invalid control character at: line 1 column 20 (char 19)",
+      "text": "{\t  \"buyerId\"\t:\t\";\u99ad\u0005\u001b\ufffd\ufffd\ufffd\u0004un\u06ed<\u03f6\ufefb'\u000efU\u063dXeNew)I\t\",\t\n\t \n\n \t\t\n\"buyerPurchaseOrderNumber\"\t\n  \n:\"U\u8ec00Q\ua44b\uda3c\udde7\u04ec\u0011ob\u0787\u01bf\u0632\u000f(D\",\t\"objectType\"\t :\n \n  \"orderStatusRequest\"\t,\"orderId\"\n\t\t \t:\n\n  \n\t\t\t\t \"E\u01ef-W\u00198_\u000bG\u000f#y\ue343&;\u0011\u2e34{2&q\b;^"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 5 column 23 (char 43)",
-      "text": "{ \n\t\"buyerId\"\n:\t\t\t\t\n\n \"0vd\u07447`]\ufffd\ufffd\ufffd\ufffd\u12b3\ub5dd\ud953\udc85V\u02b9ou\ubd46\u2162\u001f\u000fRH`\ud8af\udc0fq\u0010\",\t \t\t\"buyerPurchaseOrderNumber\" : \n\n\"|e\u0002B\u000e2$\u076c\u056eR\uef64\u001b\u6a39M\u0582W\"\n\n   \t , \t \"objectType\":\"orderStatusRequest\"\t\t ,\t \"orderId\" \t \t: \".Ruu\u000f*\u0005\ufffd\ufffd\ufffd\ufffdSZ\u0419,oj?2\u01c0K)w\u0018\u6800\ud90f\udd9f)\u0006"
+      "reason": "not JSON: Invalid control character at: line 5 column 3 (char 22)",
+      "text": "{\t  \"buyerId\"\n:\t\n\n \n\"\ud855\uddf8\u0013%\u1befn[\u0019Z\u59ca<X\u047c\u05f3E\u01e2\u001e8^\u04a7/U\u05c2\ubae4Mg\" \t\n \n\n\n, \"buyerPurchaseOrderNumber\"\n\n:\"\u001f\u0017Zu{\u0221Q\u0000~\u0018\ucfb4\u0179)\fN.\"\t\t  \t\t\t, \"objectType\"\n\n:  \t\n\n\"orderStatusRequest\",\"orderId\":  \t  \t\"\u04d8[\u078b2R\u001e\u023fc<\u0003\u8ddf\u8f850F\u0016\u051bD0~\u0394\u0005Ke\uf4a4\u01fdQ\u0011y\u028bx"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 7 column 10 (char 38)",
-      "text": "{\t \n\t \n\n\t\t \"buyerId\":\t \n\t \n \n\",e\uad6f\u9304_\u672bYz\u001fN$\u02b7}U\ue8f8\u06a8J;\udb13\udd57w\u0012\u0003\ufffd\ufffd\u0012\uf549\"\t,  \t \n\"buyerPurchaseOrderNumber\"\t: \n \t\n\n\t\t\n\"\ufcf5F\ufffd\ufffd\ufffd\udb90\ude72\u03bdM;\u8dcf\ub4ed\u04f1Y\u09c2\tG\u136dZ\"  ,\n\t\t\n\n\"objectType\"\n\n  \n\n\n \t\t\t\t\n :\t\"orderStatusRequest\"\t, \n\t \n\n\n\"orderId\"\n\n\t: "
+      "reason": "not JSON: Invalid control character at: line 5 column 6 (char 23)",
+      "text": "{\n  \"buyerId\"\n\t:\n\n\t  \"T\bC\u02dc\ud82a\udd00\b]9K\u0007\ud91e\udd01c\ufffd\ufffd\ufffd\ufffd\u0462\u073e\u26f2H\u0019n\ufffd\ufffd\uf349\ubf1d\u6206\u048f\u0000\" ,\n\n\n \"buyerPurchaseOrderNumber\"\n\t \t \t:\n\n\"\u035ak\u0611\u026e\u03ca\u01eb\u0005k4\u0202\u0015\u03e7\u0014Q$W\", \t  \"objectType\"\t\t:\n\t\"orderStatusRequest\",\n\t \"orderId\" \n\n\t:\"\u001d{\u038a\u000e+\u000e\u0005vnt6F\u0013#\u02bd>\u1fb8FcP|\ufffd\ufffdsr\u0018\t\u0012"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 9 column 8 (char 34)",
-      "text": "{ \n\n\n\t\n\t\n\"buyerId\"  :\n\t\n  \n\"\ufffd\ufffd\ufffd\ufffds\ud961\ude85\u0002+1OX_\u001a\u070b=\ud281\ufffd\ufffd\ufffd\ufffd\u0085\uc2a7\u01a0JIX\uc28cTg!\u07a5\",\"buyerPurchaseOrderNumber\" \t\n: \t\n\t\n\n\n\n \n\n\"\u03ab\u2c19\uf6b7q\u02be^\ue83f#\ud99e\udd05\u000fu\ufffd\ufffd\ufffd\u0137p&\ud90a\ude03\"   \n,\"objectType\"  \t\t\t\n\n\n\t: \n \t\n \n\n \n \t\t\t \"orderStatusRequest\"\n\t,   \"orderId\":"
+      "reason": "not JSON: Invalid control character at: line 9 column 10 (char 103)",
+      "text": "{  \t\n\"buyerId\" \n\n\n\n  :\t\"\u0520j-O#m\ufcae\u01d2h\ua0faV\ufffd\ufffd\ufffd\u0368b25\ua305\u05d0Z\u2252\u059eQ3FH\",\n  \"buyerPurchaseOrderNumber\"\n\t\t \t \t:\t\t \n\"5\u033c\u030bv+\u0391&U\u0005\u0399\ucb1c\u001c%\u77e8\ub835\u39aa\"\t  \n\n,\n\n\n\n \t\n \"objectType\":\n \"orderStatusRequest\"\t \t  \n,\t\"orderId\"\t\t\n\n :\"\u2d1dO\u855ar#\u286a\u001f.agx\u001b\u031b\u0671\u0005"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 2 (char 18)",
-      "text": "{ \"buyerId\":\t\t\t\t\n\"\u0017V:\u0004\u021b\u0265\ufffd\ufffd\u7b35\u02d5\uea08pJ\u001b\u1ec3\u039dJDe\u62a4U\u0013.\u001e\u007f\uf478\"\t,\n\"buyerPurchaseOrderNumber\"  \n :\n\t\t\t\n\t\n\n\n  \t\t   \t\n  \t\n\"\u708e?NqPX\u001b\u02d4\u0012\u0012\u00d6\u0393\u051d\ufffd\ufffd\ufffd\ufffd\u0019\u04e2\" ,\"objectType\" :\n\"orderStatusRequest\",  \t\"orderId\"\t :\"?o**1,Z\u0002CR\u0679w\u0199&v~\u0345fduv\u3aa3(\u69b5"
+      "reason": "not JSON: Invalid control character at: line 8 column 8 (char 32)",
+      "text": "{\t\t \t\"buyerId\"\n\n\n\n\t\t\t \n\n\n\t :\t \"\u66bb\u0017\u0007Q\u017e2\u01aeE\u031f\u8f5e&}\u072e\u0012 \u01b1\ue17dm\ud923\udc78\"\t\t\t \t\t, \n\n  \n \t\"buyerPurchaseOrderNumber\"\t\t\t   \n\n\t\n\t\t\n \t\n\t:\n\n   \n\n\"\u84ed\u0641#?N\u05f4\u025f\u01bd--3\u054e\ufffd\ufffd\ufffd\ufffd~\u001c{\"\n\n\n,\"objectType\":\"orderStatusRequest\" ,\t \"orderId\"\n\n\t \t\n:\t\n\"Xm"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 4 column 2 (char 24)",
-      "text": "{\t\t\"buyerId\" \t:\n \t \t \n\n\"\u0003o\fwbZ\u0005c7\ufffd\ufffd\u0141\u0018b<H&\u001c\u1aac \u3930\u0001\u0371\u001d 4\"\n\n, \t\"buyerPurchaseOrderNumber\"  \t\t:\t\n\n\t\t  \t  \t\"\fK\u0004\u00f2h\u0012\tzO\u06b1\u2df2`>\u0005nT\" \t\n,\"objectType\"\t\n\n:\"orderStatusRequest\"\n\t\n\n \t\n ,\"orderId\" :  \t \t\t\t\n\t\t\n\n\".X/\u0002\u02ad6\u2ab4\ufffd\ufffd\ufffd\u01bf"
+      "reason": "not JSON: Invalid control character at: line 5 column 14 (char 34)",
+      "text": "{ \"buyerId\" \t\n \t\n\n :\n\t \"R\u016b0yT\ufffd\ufffd\ufffd\ufffd\u03e7\u0001|e]\u0390L\u05e0\u3172)\b3PS+J\u0677\u026b\u0004\"\n,\t\t\t\t\n \n\n\"buyerPurchaseOrderNumber\" :\"S\u0003_\u00e8\u0018iDQ=\u0014]\u01e2\u0018\u0086\u0666W\"  \t,\t \"objectType\"\n:\t\t\n \n\"orderStatusRequest\",\n \n\t\"orderId\"\t \t  \n\t:\n\n \"\u0012HLG\u010f\u03ec\u03cd\ud8fe\udc9eP1\ufffd\ufffd\ufffdM\u02b0a/?=\u0fdd"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 3 column 2 (char 18)",
-      "text": "{\"buyerId\"\t :\n  \n\"\b@\u05fc\u001aD\u0005C\ufffd\ufffd[`W\u0136\u03d5\u0004\u001dOo\udab9\udfc9/P\u0018\u078b\ufffd\ufffd\ufffd\ufffd\f\u4c60\" ,\n\n\"buyerPurchaseOrderNumber\":\"\u0006\u0004\u001f\u06ca\u0165f\udaf0\uded3#P(\u000eR\u01c64h\u001d\" , \t\t\t \t\"objectType\"\t\t  \t\n \n \t :\"orderStatusRequest\",\n\n\n\"orderId\"\t\t\n: \n\t\t\t\n\n\t    \t\n\n\t\"<\u00fcZ<O\ufffd\ufffd\ufffd\ufffd\u1578O\u0015\u0007p\ufd28\u48d8s"
+      "reason": "not JSON: Invalid control character at: line 3 column 6 (char 17)",
+      "text": "{\n\"buyerId\"\n:\"\u03ea\u2f13T\u0014X\ufffd\ufffd\ufffdRj\uf870\ufffd\ufffdc\u0017~EC\u9f9cs\u0012\ufffd\ufffd\ufffd\ufffd4Z&^'\u0296\"    ,\"buyerPurchaseOrderNumber\"\t\n:\"$\u060b\u404aL\u0011\u28a4\u67ee(\u0015!q\u0659\u0252\u07c5>\u0017\",\t  \t\t \"objectType\"\t\t\n:  \"orderStatusRequest\" \n\n\n\n  \t,\n\n\n\n \n \"orderId\"\t :\n\"\u021aU:\u567b+x\u03c8H\u00141\u7063qx\u0012\u26cb\u05ba-\ufffd\ufffdO\u03ee\u0003\u00158v\ud897\udd4b\u02a1"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 3 column 7 (char 25)",
-      "text": "{ \t\"buyerId\":  \t\n\t\n \".arg\u000bl\u5a05>#\ufffd\ufffd\ufffd\ufffd}_\u001aW\u00cc\u0198+\uc570\u001dK\u07ac\u026c^_\u0011\"\n,\t  \n\"buyerPurchaseOrderNumber\":\t\"P\u02212\u2943TYk\u0011FH\u0737\u0017\u020aabN\"\t \t  ,\"objectType\" \t :\"orderStatusRequest\",\n\n\n\t\t\n\"orderId\"\n\t :\n\"N+W{4=\u042b\u0016\u06aaA\u00daL&\ud85d\udeae\u01f7\u63de\u0015t\u001d\u0714\uce1e\u86760r8\u0013r\u0187\u0120u\u0265K\u00166"
+      "reason": "not JSON: Invalid control character at: line 1 column 20 (char 19)",
+      "text": "{\"buyerId\":\"u\ufffd\ufffd\ufffd\ufffdM$\u0019\by!\u04feSI\ufffd\ufffdk&\ufffd\ufffd^\u0335\u000f&\u000e}_\u0013\u03e1\u0015\",\t\"buyerPurchaseOrderNumber\"\n:\t\t\n\t\n\n \t \",\u9a33KV\ufffd\ufffd\ufffd\ufffdXApiq\u016cl\u6de4L\ufffd\ufffd\ufffdn\", \t\"objectType\"\n:\n\t \n\n\"orderStatusRequest\"\n,  \n\n \"orderId\"\n\n \t\n:\n\"G\u016e\u001a\u001e^6pY\u0007eO\u069b\uf335\u05c46D]\u0017\u0012;aUN\u0003\tZ\b\u000b-"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 3 column 3 (char 21)",
-      "text": "{ \n\"buyerId\"\t  : \t\n \"\u001c\u046b.A\u001c^S\bn\uda2b\udf2b\u009c\ud075Gk\u0003&\u001dV~2]\ufffd\ufffd\u01e9x\ud8f1\udfbe\"\n\n\n \t\t,\"buyerPurchaseOrderNumber\":\"\u001e\u001e\u01f3\u001e\u0015Lb\u0010RL*Fz\ub51aJY\",\"objectType\"  :\n\t\"orderStatusRequest\"  ,\t\"orderId\"\n:\n \t\t\n\"\u00cd\ufffd\ufffd\u06db?\u0000rN\u0018D\u0644w]\u0361^\u000e\u0745\ud9a9\udd88[\u4e31|J\ub7ecBI\u05fa\ufffd\ufffd\u38fe\u683a\u007fX_Q\u0001\t0`\udb6c\udda3\u0013\u02af"
+      "reason": "not JSON: Invalid control character at: line 6 column 6 (char 28)",
+      "text": "{\"buyerId\" \n\t\n\t   \t\n\n:\n  \t\"\u0485\u0018Q{\u7775s\u06a0 fO:z9\u0002\u0329\ud04f\u0302Bv\u4de7y4$Y\u001c\"\t\t\t \t\n\n \n\n\n , \"buyerPurchaseOrderNumber\"\t\t \t:\n\"\ufffd\ufffdw\u001e7\ufffd\ufffd\ufffds6\u0014\u001807f\u0003\u00d0=K\" \t \n,\t\t \"objectType\"   \n\n:\t\t\t\n  \n\n\n\n  \t \"orderStatusRequest\"\t\t\n\n   \t\n\t\t, \n\t\n\n\n\n\n"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 5 column 3 (char 19)",
-      "text": "{\n\n \"buyerId\"\n:\t\n\"\u7388\u0007\uda40\udc4fu\u8e61Y\u9ce3/t\ud967\udf9a\u0007\u0112i\u001e\u99c9#|\ufffd\ufffd\ufffd\ufffdKhI\u000bN\u007fq\", \t \t\n\"buyerPurchaseOrderNumber\":   \t\t\n\t\n\"\u6cb2\ufffd\ufffd\ufffd\ufffdd8\u0273NT\u0782\u00b0r?y\u078ff\ue2f35\"\t,\n\n\n  \n\t \n\n\t\t\n\t\n \t \t\"objectType\" \t:\t\"orderStatusRequest\" \t\t\t,\"orderId\"\n\n\t : \t \"\u0001SU\u025e\u2a25\u05e9p\u001d\ufffd\ufffd\ufffd"
+      "reason": "not JSON: Invalid control character at: line 3 column 5 (char 20)",
+      "text": "{\"buyerId\"\t \n:\t\n  \"\uad73\u0002[\u007f\u00eeK,L<\u000b\u2d9d-z\u0167[l}YF\u0006\u000f0\u0249\u000bq\",\n\"buyerPurchaseOrderNumber\"\t: \"\u00f5q,46\ufffd\ufffd\u4337\u074a\u0196ng'}\u0003\u0097+\"\n,\n \"objectType\"\n:\t\n\t \n \n\"orderStatusRequest\"\n \n  \n \n\t\n\n \t\t,\n\t\"orderId\"  \t \n\t\t\n\n\n\t:\n\"m\u0648h(\ufffd\ufffddy\u074f*P\u001e\u00f9=4\u0436\u057c9-D"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 4 column 9 (char 23)",
-      "text": "{ \"buyerId\":\n\n\n\"8DVne~=\u0015sm\u03c6\u0305I_\u07e8\u02a1\ufffd\ufffd\ufffdM\u0493L\u0000\u03cf4\u0005h\",\"buyerPurchaseOrderNumber\"\t\t\n:  \t  \"@\ufffd\ufffd\ufffd5:\u04eb\b>\uabb8\u075fE_\u0566\u0267\u0019P\u0014\"\n ,\"objectType\"\t\t:\"orderStatusRequest\",\"orderId\":\"JI\u007f\u06a7\ufffd\ufffd\ufffd\u6edb\u0007>!\u04b0\u4004ys)\u0012\u0010\ud840\udf83\u0014\u0011S\u0643\" \n, \t\"sellerId\" \n\t\t  \t\n\n\t\t"
+      "reason": "not JSON: Invalid control character at: line 9 column 25 (char 52)",
+      "text": "{\n\"buyerId\"\t\t\t\t\n: \t  \n \n\n\n\n\n \t\t\"\ufffd\ufffd\ufffd_\u01fd\u06f8\u0236\u0402b[\u05a8\ufffd\ufffd\ufffdy\ud8c7\uddcd\ud918\udf94\ufffd\ufffd\ufffd\u001eN\u0325vF\ud2cbU\u0421E\ufffd\ufffd\ufffd\u001b\", \t \"buyerPurchaseOrderNumber\"\n:\n \"\u9b34p?}\ud34c\u0003JU\u07f5PV\u000e\u000e\ud8c0\udc67=\u0011\"  \t\n,\t\"objectType\"\n: \"orderStatusRequest\"\t , \n\t\t\t  \n\t\"orderId\"\n\n  \n  \t:  \t  \"Q\u042d\u021b\u0700t"
     },
     {
-      "schema": 6,
+      "schema": 5,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 3 column 32 (char 44)",
-      "text": "{\"buyerId\":\n\n\t\t\t\"_5uY\u03844xSe\u0676\u0180\u0325\u2440?fY\u06e2\ufffd\ufffd\ufffd\ufffd!$)9W{\u001a\",\n\"buyerPurchaseOrderNumber\"  \t\t:\t\t \"_g\u000eK\u0112hg\u0018La#jF\u06cdG\u0126\"\n\t \t,\n\n\n\t\n\n \n\t\t\"objectType\"\t\n\n\t:\"orderStatusRequest\", \n\n\n\t\t\t \"orderId\"\n\t\n \t\t\t\t :\"\u1078\u0012b\ube24\u0757\u0005\u0014\u0007T\u0003A\udaa3\ude1a\ufffd\ufffd\ufffd\ufffd\u000e.@"
+      "reason": "not JSON: Invalid control character at: line 7 column 7 (char 29)",
+      "text": "{\t\t\t\n \"buyerId\"\t \n\n:\n\n\n\t\t\t \"\u6bfb\u0005^QA\ufffd\ufffd\ufffdb\u05c6oI\u0003\u8971W\u5bf3?\u066f\u02fb\ua60a\u0720\ufffd\ufffd\ufffd\ufffdC\u03b2\u06417u\"\n\t \n\n,\n \t\"buyerPurchaseOrderNumber\"\n\t   \t \n :\t\n\n\"mP\u001d?\u7119\u07520{\u075f\u0004\u03bdn\u07a2\u0019\u001f\ufffd\ufffd\ufffd\" ,\n\t\n\n\n\"objectType\"\t\t\t: \t\n\"orderStatusRequest\",\"orderId\": \t\"\u0015-1\u0011@>\u6323m\ufffd\ufffd\ufffd\ufffd\b"
     },
     {
-      "schema": 6,
+      "schema": 11,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 3 column 4 (char 18)",
-      "text": "{\"buyerId\" : \n\n\"\u03a6G\bT\uf1d2\u0017W\ub4c3\ufffd\ufffd\"\t   ,\t\t \"buyerPurchaseOrderNumber\":\t\"N\ud79ep /\u0004\u0585\u0019\u000e\u0019\u0003\uffdb\u007feYX\"\n\n, \t  \"objectType\"\t\t \n\t:\"orderStatusRequest\" \n \n \n,\t  \n\"orderId\":\"p\u02b29- `\ud929\udf251\u0649\u007fh?}No\u0018\u0015\uef22Z\ufffd\ufffd\ufffd\ufffd\u0119)fAE\u0016\u0012\u0013\u0013OR\u04beP,\ua884\ufffd\ufffd\ufffd\ufffd\u061c\u1c28\u59730pE\u007f\u0003S\""
+      "reason": "not JSON: Invalid control character at: line 2 column 9 (char 21)",
+      "text": "[\t{  \"name\" \n:\t \"\u04c6\ue8956H\u0017\ufffd\ufffd\ufffd\ufffd\u0011\uc4e9gg\u042a\u032e\u07cb?\u034fJ\u03ee\u0017<\u0015\u001b\u0583\b\udab7\ude1e\u029f}\u0123\u073c73\u000e\u0014\u0548\u0695\u001a\u0128\u0547\u0372\u9b80\u0331\f\u001c,\udaa6\udc38\" \n\n\t\t\n, \n\n\t\"version\"\n  :\n\t\n\"\u0796\u0006\u7b53hX\ufffd\ufffd\ufffd\ufffd0\ufffd\ufffd\ufffd\ufffdu\u077b]\u000f{M\ufc6b]F&\u0375\u030e|Ok\u001cyJ=\u06c25\tH\ud7e1cx\u03ea\u0711W\"\t\n,\"release\" :\t\"\u07b2\u41fe\u037e\ufffd\ufffd\ufffd\ufffd8\u0011)\u000e\u0011DDI\t3P\u0011\u04c2[\u00d1\u619az\ufbc9\fq\u0010\ucf50\" \n\n} \n]"
     },
     {
-      "schema": 6,
+      "schema": 12,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 10 column 4 (char 35)",
-      "text": "{\n\n \"buyerId\"\t\t\n\t\n\t\t  \n\t\n :\t\t\n\n\n\"\u1692]\u0002\u115fh\ufffd\ufffd\ufffd\ufffdh\ubcecM\u0002O)\u07fb\u1b76H\u07b3gU1<,F\ufffd\ufffd\ufffd\ufffdUk\"\n,\"buyerPurchaseOrderNumber\" \t:\"x\ufffd\ufffdE&W*\u0532\u0019E,\udb9c\udfc1\u0213\u0010A\u0010.\"  \t\t ,\"objectType\"\n\t: \n \n\n \n\t\n\n \t \"orderStatusRequest\",\n\"orderId\" \n \n \n\t:\"\u2862\uad76\u4c1fiM'\u06d2\u001b^W\u000f"
+      "reason": "not JSON: Invalid control character at: line 3 column 11 (char 20)",
+      "text": "{ \"name\"\n\n: \"$\uab4a0\ud638T{|\u0005@z\",\n\n\t\"jsonSchema\":{\"items\" \t\t\n\n\n\n\n\t :\n[\n] ,\t\"properties\":false \t\t}}"
     },
     {
-      "schema": 6,
+      "schema": 12,
       "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 1 column 14 (char 13)",
-      "text": "{\"buyerId\":\"&\u001e\u4774R[_\u0013'\u0543\u052f\ufffd\ufffd\ufffd\ufffdH\u007f\u001b\u0762%xMU\u001eZ\u0000\u000f\ufc109\" \n ,\n\n\n\t   \t\"buyerPurchaseOrderNumber\"\t\t\n:\"R@b\u04fd\u02af2w\u00cab\ud812\udc9d|\u001dAY{\u294d\"  \t\t\t ,  \t\"objectType\"  \n  \t \n\t:\n\"orderStatusRequest\",\"orderId\"\n\t\n\n :\t\"X5KB>{`H\u1ee1\u0678i\u0001+\u0018W\u0752\u000bE\u0764\ufffd\ufffd&\u61cb\u0014S\u0160\u1194w"
+      "reason": "not JSON: Invalid control character at: line 5 column 9 (char 24)",
+      "text": "{\n\t\n \n\"name\"\t \t\n :\"\u05dd\u0265X\u4271Z\u0006b\u0356V\u04ec\"\t\t\n\n\t\t, \n\"jsonSchema\"\n\t\t:\t{\t  }\n, \n\t\t\t\"uiSchema\"  :{}\n\t\t \t\t\t }"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'event' is a required property",
-      "text": "{\t\t\"goals\":\t\t\r\n{\t\n}\r}"
+      "reason": "not JSON: Invalid control character at: line 4 column 11 (char 27)",
+      "text": "{\n\"name\" \t \t\t\n\t:\n\t \"%_\u019c\u05f0\u0343mn\u001e\u0001Q\"\n\n , \"jsonSchema\":\t\n\n{\"items\"\t\n  \t\t\t \t:false,\n\t\"properties\"\n :\n7}, \n\n  \n\"uiSchema\"\t:\n{\t \n\n\n\n\t \n\t } \n\t\n\n\n\n}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'event' is a required property",
-      "text": "{\n\n \"goals\" \t\t \n : \r \n{\"value\" :-9877e+27, \n \n\r\t\"value\"\t:276E414\n}\t,\t\r \n\r \"goals\":\r\t\r\t\n\r{\"event\":\r \r \r\"rewardCreated\"\r,\n\r\n\"event\"\r\t:\r\r\"rewardRedeemed\"\t\t  }\r, \n\r\n\t\n\n\n\"goals\" : \t\r \t \t\r\t\t\r\t \r\n{}\n\t}\n "
+      "reason": "not JSON: Invalid control character at: line 2 column 13 (char 14)",
+      "text": "{\n\t\"name\"\t:\t\t\"\u0013[\u0017\ufffd\ufffd\ufffd\ufffd\u001a\u001d\u079c$z\u0001\",\n \n \"jsonSchema\"\n \n  \t \t \n \n\t\t\n\t:{}  ,\t\t\"uiSchema\"\n\t\t\t\n\n : \n\t{ \n\n\n\t\n}   }"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'goals' is a required property",
-      "text": "{\t}\r\t\r"
+      "reason": "not JSON: Invalid control character at: line 2 column 2 (char 14)",
+      "text": "{\"name\":\t \t \n\"\u001fn\u00c6?8>\u04e1;\u056f2\"\n\n\n,\"jsonSchema\"\t:{\"type\"\n\t: \"integer\",\"items\"\n :37393\n,\"properties\" \n\n:8\t}\t \t, \"uiSchema\"  \t  :\t\t{ \"\u0686/C\ufffd\ufffd*>\u0125:\\r\uf119)zh\u060ce\" :9E5\t\n\t}}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'goals' is a required property",
-      "text": "{\r\n}\r\r "
+      "reason": "'\u05ef\u0143;\u8eb4\ufffd\ufffdS-\u00ff\u00c9>' is too long",
+      "text": "{\"name\"\t \t\t \n\n\n\t:\n \"\u05ef\u0143;\u8eb4\ufffd\ufffdS-\u00ff\u00c9>\"\t,\"jsonSchema\"\n \n:{}\n\t}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'event' is a required property",
-      "text": "{\"goals\"\r \t:\t\t\n{},\"goals\":\r\r{}\r,\n\"goals\"\n:\r\r{\t\t\r\r\"value\":879\t },\r\t\r\t\"goals\" \r:\t\n{\r\n}\r\t}"
+      "reason": "not JSON: Invalid control character at: line 2 column 3 (char 15)",
+      "text": "{ \t\t\"name\"\t:\n\"\u028d\u0000\u00024Pt9\u016c\ud213l\"\n\n\n\t\t \t  ,\t \n \t\t\t\"jsonSchema\":{\"items\":false} \t}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'goals' is a required property",
-      "text": "{\t\r}  \n \r"
+      "reason": "not JSON: Invalid control character at: line 1 column 16 (char 15)",
+      "text": "{\"name\"\t \t\t:\t\"\uaa36\u001cp\u6762s\u0007Zs\u8104m\"\t ,\t \t\"jsonSchema\"\t:{ \t \t}\t\n}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'goals' is a required property",
-      "text": "{\t}\n\r"
+      "reason": "not JSON: Invalid control character at: line 3 column 3 (char 19)",
+      "text": "{\"name\"\n  :\t\t \t \n\"\u02a8\u0002_OIb\u0003\u0350\u0016r\"\t \t\n\n\t\n \n,\"jsonSchema\"\t \t\n\n\t\t\t:{\"type\"\n :\"object\"}}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'value' is a required property",
-      "text": "{ \"goals\"\r:{\n\t\r \n\"event\"\t\t:\r\"rewardCreated\" ,\r\r\"value\":557,\n \n\n\"value\"\r\t:828.23\r, \n\t\r\"event\":\"rewardCreated\"\r\t},\t\r\r\n\n\t \"goals\"  \r:\t\n{\n\"event\" \r:\r\"rewardCreated\"\n}} \t\t\r\r  \t\r\r\n"
+      "reason": "not JSON: Invalid control character at: line 3 column 20 (char 22)",
+      "text": "{\n\n \"name\" \t\t:\"`\u0236-@1w_\u0019d\u000f\"\t\t,\"jsonSchema\" \t \n \t\n\t \t:\t  \n{\"properties\"\n:3 \t }}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'goals' is a required property",
-      "text": "{  \r}"
+      "reason": "not JSON: Invalid control character at: line 6 column 5 (char 20)",
+      "text": "{\n\t\n\"name\"\t\n:\n\t\n\t\t\t\"\u0013\u001a{\u0011\u0148\u03f5\u1f11\u05de\u0010K\",\n\t\n\"jsonSchema\"\n  : \n{\"type\"\n:\"array\" ,\n \t\"items\"\t\t\t\n \t\n\n:11e72\n}\t }"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'event' is a required property",
-      "text": "{\r\"goals\"\n\t \t \n\t\n :\n\r\t\t\t\n \t\r {\r \t\t  \"value\"\r\r\n:3\n\t\t,\n\n\t\t\n\t\r \"value\"\r  \n\t\n :-8\t \t\n \t}\t,\"goals\" \r:{\t\n \"value\"\n\r\n\n  \n\t\n\n:-21\n \n}\n\t}\t"
+      "reason": "not JSON: Invalid control character at: line 4 column 11 (char 27)",
+      "text": "{ \n  \"name\" \t\n\t:\n \">\u9a1dX\u05afyuV\u0279\u0017\b\"\t\n\n\n\n\n\t \t\n\t ,\"jsonSchema\"\n:\n{}\n }"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'value' is a required property",
-      "text": "{ \"goals\"\t:\r\r\n\n\t\n\n\t \r\t\r\n     {\r\r\r \r\n\t\r\"event\"\r\t\t \n\n \r\r \t\n\n\n  \n\n\r\t \t\n\r: \t \r\n\n\r\r\n\"rewardRedeemed\"\r\r\r,\r \n\"value\"\t\r\n\r:85 \n\n\r}\n ,\t\n\n\n\n\r\t\r\"goals\" \r:{\"event\" \t\t\r\t\t\r\t\r\r\t  :\n\"rewardCreated\"\n} }\n\n"
+      "reason": "not JSON: Invalid control character at: line 2 column 6 (char 16)",
+      "text": "{ \"name\"  \n\t:\t\t\"\u0000QE#\u2c7f\u784f\uab94y\u000ex\"\t\t\n,\n\n\n  \"jsonSchema\":{   \"type\"\n:\"string\"  \t}  \t ,\n\n\"uiSchema\"\n:\t{   \n}  \n  \n}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'value' is a required property",
-      "text": "{\"goals\"\t   \n:{},\t\n\r\"goals\"\t \t\r\n:\r{\t\t\r\r \t\"event\"\r\n\n \n:\r \t  \r\n\r\n\n \"rewardRedeemed\"}\t \t\t\n\t} \t\n"
+      "reason": "not JSON: Invalid control character at: line 4 column 7 (char 21)",
+      "text": "{\"name\"  \t\t\n:\n\n\t\"nP\uc74cE\u0013t7wF\ucfd4\"\t \n,\"jsonSchema\"\n :\n\t{\"properties\":false}, \t \t\"uiSchema\":\n \t{\t\t\"<\ua249\u0f18#\u02c9\u0767pMSaN\u07e1ZE\u01a6kpy\u9be2\u4c42\u07b1\u00df\u2edd\u02c7j\u5c09\udbb9\uddd3.\uaa26r\ufffd\ufffd\ufffd\ufffd^\\/\uda06\udc21&+\u0425\u5a25\u058a\ufffd\ufffd\ufffd\ufffd\u50f4k^b-8H\u018cX%5\u4727\u0736N\u01dd&\u05a0\u0152\u007foDez\udbbf\udd74W\u00df+eZ\ufc31,\u2f0c\u912d\u031c z9GI\uc170;\udbec\udf5b\u05f2eG<m\ud6f6\u0144\u008fs\u061bvg\ufffd\ufffdO\u9dbao3X"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'goals' is a required property",
-      "text": "{ }\t\n\r"
+      "reason": "not JSON: Invalid control character at: line 9 column 4 (char 26)",
+      "text": "{\n\"name\"\n\t:\n\n\n  \n  \n  \n\"\udafe\udc6a_\u000f<vI\ud367Rb\u32ad\"\t ,\"jsonSchema\"\n\n:{ \n\t}, \t \t \t \"uiSchema\": { \n} }"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'goals' is a required property",
-      "text": "{}\t\r"
+      "reason": "not JSON: Invalid control character at: line 2 column 8 (char 16)",
+      "text": "{\"name\":\n\t\"LIh\u34ad}\u0013_?J\u0014\",\n\"jsonSchema\"\n:{\t\n} ,\t\t\"uiSchema\": \t{} \n}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'goals' is a required property",
-      "text": "{\t\r } \r\t\r\n\n \t\n\t\t\r\r   \r\n\t \t  "
+      "reason": "not JSON: Invalid control character at: line 5 column 11 (char 29)",
+      "text": "{\n \n  \t\n\"name\"  \t \n\t\t: \"\u0242j*.\u0663\u0018\u0010\u0437u\u05a2\" \n,\n\n\n \"jsonSchema\"\t:\n  {\"items\"\n\t\n\t\n:false\n,\n\n \t\n\n\t \t\"properties\"\n \n\t:5500.25\t\t}}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'event' is a required property",
-      "text": "{\n\n\"goals\" \t\r\r\n \r :\r{\t \"value\"  \r: \n9\n\r\n}\n\n\r\t,\n\r\t \"goals\":\t\n{}\r}\t"
+      "reason": "not JSON: Invalid control character at: line 2 column 13 (char 22)",
+      "text": "{\"name\"\t \n\t\t : \"\u0183z\u0770GKZ\u0019\fn\u0007\"\n\t\n,\t \t\"jsonSchema\"\t \t \n\t\t :\t\n {\t \"properties\"\n:248E-36\n\n\t \n\n \n}}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 12,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'goals' is a required property",
-      "text": "{\n\r}\t"
+      "reason": "not JSON: Invalid control character at: line 5 column 11 (char 27)",
+      "text": "{\"name\" \t \t\n \t\n\n\n: \t \"X9(\u0765d\u0007)\ufffd\ufffd\ufffd\ufffd\u1b020\"\n \t\t\t,\"jsonSchema\"\n : \n\t\n \t\t\t\t \t { \n\n\"properties\"\t:4886e39099990\n  }, \"uiSchema\" :{\t\t\t}\n \t\t }"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 13,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'value' is a required property",
-      "text": "{\"goals\"\r \t \r:\r\r\r\r\n{\n}\t \n \t\n\t\t\r, \n \r\n\r\n\n \n\r\t \t\n\r\n\t\r\n\"goals\":{\r\t}\n\t\r\n\n ,\n\t\t\n\t \r \r\r \n\n\"goals\"\t\t\t\r \r\n\t \r\n\n : \n \n\n{\r\n\t\n\t \"value\":49.0008}\t \t,\"goals\"\n\r \r:  \t\n{\"value\" \t\r \n\n\r\n\t \n\n\n\n\r\n :7234 }\r\r,\"goals\"\n\r \r\t"
+      "reason": "not JSON: Invalid control character at: line 4 column 6 (char 15)",
+      "text": "{\n\n\"name\"\n:\"\udbcf\udf67KH\u0011\u0001\u03e5Lr\u07f6\uda15\udf60O\u0002yU\u0007\f\u0010T\u042c\u01de\" ,\n\"modified\"\t\t\n\n :536,\n\"sortOrder\" :7 \n}"
     },
     {
-      "schema": 8,
-      "engine": "engrain",
+      "schema": 13,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'event' is a required property",
-      "text": "{\"goals\" \t\n:\t  \r\r{}\r\r\n\n \n\t\t  \r  \r\r ,\r\r \r\t\r\"goals\"\t\r  \r : \r\r{\r}}\n\r\r\r\n\r\r "
+      "reason": "not JSON: Invalid control character at: line 6 column 31 (char 46)",
+      "text": "{\"id\"\n:6\n ,\t\n\n\t\n\t\"name\"\t  :\"|\u056f\u00b3f\ub5ee\u07b2,0\u0448 G\u0448\u069e\uff71s<\u0377-\u0013\ufffd\ufffd\"\t \n}"
     },
     {
-      "schema": 10,
-      "engine": "engrain",
+      "schema": 13,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'token_type' is a required property",
-      "text": "{\t  \r\r\t \n\n}\t\r\r \t\n\r  \t\r   "
+      "reason": "not JSON: Invalid control character at: line 2 column 12 (char 14)",
+      "text": "{\t\n\"name\": \"$o\u0014\ufffd\ufffd\ufffd\ufffdc>\u06dc\t\u062c?\u12e4\u009f4\u0006\u2758nV+\ud8df\uddf5\u000b\" }"
     },
     {
-      "schema": 10,
-      "engine": "engrain",
+      "schema": 13,
+      "engine": "xgrammar",
       "cause": "unexplained",
-      "reason": "'access_token' is a required property",
-      "text": "{\"expires_in\":\t0.377788\r\t\t\n\t\n\r,\n\r\"token_type\"\t\r\n\n:\"bearer\" }\n\r\n \t\r\n\t "
+      "reason": "not JSON: Invalid control character at: line 6 column 6 (char 51)",
+      "text": "{ \"id\"\t:900539  , \t \n\n \t\t\t\n\t  \"name\"\t  \n :   \n\t\"\ufffd\ufffdJ\u0018q3\"\t\t\n\t\t\t\n\n,\"sortOrder\"\n \t\n\n \t \t:0 }"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 7 column 4 (char 38)",
+      "text": "{\"id\"\n\t \t\n\t\n:85\t,\"name\" \t \n \n\t:\t \t\n\t \"\u0010\u06f4q\u01fc\u000f\u0017\u051c>\u01b2\ud82e\udc7a\u7cd8\uc2e2\u0018x\ud997\udcdf\u02e8\u6f1c\u0151\ua207c\"\t ,  \"sortOrder\":53 \n}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 2 column 12 (char 24)",
+      "text": "{\"id\":\t\t 5 ,\n  \"name\"\t:\"\u00103\u07d6t\u00cb;Z\u07e64x4,\u001f\u0c5f\u000e\ufffd\ufffd]\u03a4bs\" \t \t, \"modified\":50}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 6 column 18 (char 63)",
+      "text": "{\t  \n \t \t\t \n\t    \"id\" :68305015\t \t,\t \t\n\n  \t \t\n\"name\":\"\u64750\u0203_$\u0573$Q7\u0017G@y\ufffd\ufffd\uf75e@3<]\u001a\"}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 3 column 24 (char 35)",
+      "text": "{ \"id\":3\t \n\n\t ,\t \t\"name\":\t \"8\ufffd\ufffd\ufffd\u5974 ?\b\u057aeD\ud64d\u0436p\u07f4Q,4xaFD\"\n , \t\n \"modified\"\t\n\t\t\n:5}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 9 column 17 (char 39)",
+      "text": "{\t\t\n\n\n \n\"name\"\t\n  \n :\n\n \"\u012ar)\ufffd\ufffd\ufffd\u030e\u0541IWm\u0428\u0418g\u0002\u042f\u60e4\u0464&\u01cbO;\"\t,\"modified\" \n\t \t \n \n\n   :3,\t\"sortOrder\"\n \t\n\t\n\n:0\t}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 9 column 2 (char 49)",
+      "text": "{\t \n \n \t\t\n\"id\"  \t \n \n  \t\t  \t:3\t\t\n\t \t,\"name\"\t:\n\t\n\"\u000et\u01abr\u0012\u4399\u001bO$\f7*\ufffd\ufffd\ufffd\u001e*7\u01dbp\ucc5f\u051e\",\"created\":0,\"sortOrder\"\n \n :3}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 4 column 6 (char 23)",
+      "text": "{ \t\t\n\"name\"\n: \t \t\n \"oc?\u0012\u03fe\u007f\ufffd\ufffdo\u0002\ufffd\ufffd\ufffd\ufffd\u0495]*h\ufffd\ufffd\ufffd\ufffd%RU\ufffd\ufffd6\",\t\"created\":4 \t,\n \t\n\t\n\t\n\n\t\n\"sortOrder\"\n\t\t  \t\t \t \t \n \n   \n:2599874707\t}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 5 column 16 (char 28)",
+      "text": "{ \t\n\n\n\"name\"\n\t:\"/mi/;)5uU\ud98e\ude92\u6f019\u0007?\u0208\u001c\u001bQ)*\",  \"modified\"\n\t \n :\n8\t\n \n, \n\t\"sortOrder\":1 }"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 1 column 11 (char 10)",
+      "text": "{\t\"name\":\"\u000e\u03f5\ufffd\ufffdP9sHo`S\u0494b?\u050d#\u0740a0YB\"\t \n\t,\n   \"modified\"\t\n\n\t\n\t\n\n\n\n\t \n :2,\"sortOrder\"  \t  :15135580469545817}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 8 column 14 (char 32)",
+      "text": "{\n\n\n\t  \n\t\"id\"\n\n:\t2\n,\t\"name\"\t\t :\"\u000e$\u0017\u0007\u0186\u2154\u0005#\u06adNW'J@CFn\ub355m`\"}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 13 column 3 (char 49)",
+      "text": "{\t\t\n  \"id\"\t \t\t:\n\n9\t\t\t\t\n\n\t,\t \n  \"name\":\n\t\n\n\t\n\t\n\n\t\"\u0013\u0007\u05a0 ,;\u0582U\ufffd\ufffd\ufffd\ufffd\fq?\u02b8\u0391o\ufffd\ufffd\ufffd\ufffdC\u02bf%\u0732\" \t }"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 2 column 9 (char 38)",
+      "text": "{\t\t\t\t\"id\"  \t:55039,\"name\" :\t\t\n\"fk}_DZy\u0017ac\u0015Zx\",\n \t\n\"sortOrder\"\n\n:99}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 3 column 22 (char 41)",
+      "text": "{\t\t \t \t\t \t\t\"id\" :8\n\n\t\t\t,\"name\": \"}C1\u02d0VV\u0154\u0300\u0019\u04fc*$x\u0016x\uadb1\u8898\u0016Wg\"\n    \t\t, \t\t\"created\": 3685}"
+    },
+    {
+      "schema": 13,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 7 column 12 (char 45)",
+      "text": "{\n\n \"id\":\t5697611778,\"name\"\t\n:\n\t\n\n\t\"\u030d6\u02d4$\ufffd\ufffdg&b\u0010g\u214d)\u0438y\u0c38)\u0001sSf\", \"sortOrder\"\n:82\n \n }"
+    },
+    {
+      "schema": 23,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "'4p55v#91Nw#fnvMl8hCqtjU8sXHYeHWSgobJkTidyDePitVA#5i@2cXYdjVIig[W8Qt#OhkxqCKxwm0?NwvLs#[WrJ]3ShboBQ[[kvA9a-J6pXGSrWc*JOTb0zvpZG8[zEpE3ifjvYM",
+      "text": "{\n\"message.sub-id\" \t:\n\"9B8A78BA-D6CC-2D1f-Efad-fD87cdf2b723\"  \n\t\t\t\t\t,\"message.topic\"\n \t \t\n \t:\t\n\n\"/tqnflnlcsspcjiostwxv\"  \n  ,\t\n \"message.since\" \n\n\n\n:0\t   \n,\t\"message.snapshot\":\ttrue ,\t \"message.filter"
+    },
+    {
+      "schema": 23,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "'yG9Y]jEzU.DkVYfCTSt@E]qhqk-CzvF80pNFZRKIDmggey.mjCcZS9w_oPPQX-*6OIqnUAl]Q]Y_Lal.TBj.M5mvyGt5B9T1C95WPpxM?viS?pN7K9z*OdD2Q2HXLH-DCyZ#XpBI2?3",
+      "text": "{\t\"message.sub-id\" \n:\t\"eA948fF1-f384-e1d5-BFfc-16dc2F083aDc\" \n\t\n  \n\t\t\t,\n \t \"message.topic\":\"/-kzltfslgsghnler\"\n,\n\t\"message.since\"\n:56e4040 \t\n\t\n,\t\n \"message.snapshot\"\t\t\t:\n\n false\t \n\t \n, \n\n\"message.filt"
     }
   ],
-  "invalid_total": 382
+  "invalid_total": 153
 }
