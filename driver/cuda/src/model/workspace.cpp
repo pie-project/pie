@@ -40,7 +40,7 @@ Workspace Workspace::allocate_full(
     ws.norm_y        = DeviceTensor::allocate(DType::BF16, {N, H});
     // One [N, H] value's worth, which is what the converted island asks
     // for; every further island widens this and nothing else.
-    ws.declared_values = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.declared_values = DeviceTensor::allocate(DType::BF16, {N, H + I});
     ws.gate          = DeviceTensor::allocate(DType::BF16, {N, I});
     ws.up            = DeviceTensor::allocate(DType::BF16, {N, I});
     ws.logits        = DeviceTensor::allocate(

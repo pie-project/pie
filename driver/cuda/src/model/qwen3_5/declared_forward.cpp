@@ -869,7 +869,8 @@ bool qwen3_5_forward_declared(
             break;
         }
         case PieForwardOpKind::Swiglu: {
-            declared::arm_swiglu(ws, gate_up_used_fused, N, I, stream);
+            declared::arm_swiglu(ws, gate_up_used_fused, ws.gate.data(), N, I,
+                                 stream);
             break;
         }
 case PieForwardOpKind::Launch: {

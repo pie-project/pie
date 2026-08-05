@@ -30,18 +30,20 @@ namespace pie_cuda_driver::model::declared {
 // packed matmul either way (see the binder's `gate_up`).
 //
 // Both executors held this arm character-for-character identical.
+// `dst` is the traced value's slot once the caller has moved this island
+// onto the arena; a caller that has not keeps passing its convention.
 inline void arm_swiglu(Workspace& ws,
                        bool gate_up_used_fused,
+                       void* dst,
                        int n,
                        int intermediate,
                        cudaStream_t stream) {
     if (gate_up_used_fused) {
         kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), n, intermediate, stream);
+            ws.gate_up_fused.data(), dst, n, intermediate, stream);
     } else {
         kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            n * intermediate, stream);
+            ws.gate.data(), ws.up.data(), dst, n * intermediate, stream);
     }
 }
 

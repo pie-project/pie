@@ -1008,17 +1008,21 @@ void llama_like_forward_declared(
                         ws.up.data(), N, I, H);
                 }
             } else if (nm.field == "down") {
+                // The island's consumer.
+                const void* const down_in =
+                    values.slot(plan.inputs(op)[0],
+                                plan.value(plan.inputs(op)[0]));
                 if (post_norm) {
                     // Post-norm: down_proj → norm_x scratch (beta 0), then
                     // Rmsnorm(mlp_norm) + ResidualAdd — as o_proj above.
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.gate.data(),
+                        down_in,
                         make_weight_view(&wb.require(name),
                                          layer.down_proj_quant),
                         ws.norm_x.data(), N, H, I, beta);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.gate.data(),
+                        down_in,
                         make_weight_view(&wb.require(name),
                                          layer.down_proj_quant),
                         ws.y.data(), N, H, I, beta);
@@ -1932,7 +1936,13 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::Swiglu: {
-            declared::arm_swiglu(ws, gate_up_used_fused, N, I, stream);
+            // ISLAND (value arena): the activated MLP hidden is a traced
+            // VALUE; `ws.gate` was this family's convention for it.
+            declared::arm_swiglu(
+                ws, gate_up_used_fused,
+                values.slot(plan.outputs(op)[0],
+                            plan.value(plan.outputs(op)[0])),
+                N, I, stream);
             break;
         }
         case PieForwardOpKind::ResidualAdd: {
