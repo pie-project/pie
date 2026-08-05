@@ -23,6 +23,25 @@
 //!   routed-decode lowering materializes fine.
 //! * **Streamed expert groups.** A group is a paging decision; materializing
 //!   one eagerly would build exactly the residency it exists to avoid.
+//! * **Serving on Metal.** The policy here is `Policy::default()`, which is
+//!   `Projections::Fused` and `Naming::Hf` — CUDA's shape. Metal authors with
+//!   `InPlace` and `Mlx` (`driver/metal/src/loader/load_plan.hpp`), so what
+//!   this writes is not what that bind path reads.
+//!
+//!   Adding a `--backend metal` that flips the pair is not the fix, and was
+//!   tried: it materializes correctly and then cannot be booted, because a
+//!   serve boot always re-authors from *checkpoint* names and the MLX schemas
+//!   are not idempotent over their own output — authoring Llama-3.2-1B that
+//!   way and re-authoring the result fails with "Metal llama schema has no
+//!   declared mapping or skip for 'final_norm.weight'". Making that work is a
+//!   change to the family schemas, not to this command.
+//!
+//!   Meanwhile the boot cost it would save on Metal is small and `pie model
+//!   import` already saves it: on Llama-3.2-1B a Metal plan over the raw
+//!   snapshot is 1084 instructions with 259 `Cast` tile maps, over the
+//!   imported `.zt` it is 844 with none, and over what this command writes
+//!   today it is 1116 with the 259 back. Measured with
+//!   `driver/metal/tools/rawmetal/plan_cost_probe.cpp`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
