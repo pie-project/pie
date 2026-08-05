@@ -126,11 +126,18 @@ def main() -> None:
                     help="llama.cpp splits this across its parallel slots, so it "
                          "has to cover the widest prompt times the concurrency.")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--extra", default="",
+                    help="Space-separated flags forwarded to all three harnesses "
+                         "verbatim -- `common.py` owns the workload shapes "
+                         "(--mixed-phase, --shared-prefix-words, --arrival-rate, "
+                         "--output-spread), so they are passed rather than "
+                         "reimplemented.")
     args = ap.parse_args()
 
     prompt = ["--prompt", " ".join(["the quick brown fox jumps over the lazy dog"] *
                                    max(1, args.prompt_words // 9))] if args.prompt_words else []
     common = ["--model", args.mlx_model, "--no-ignore-eos", "--warmup", str(args.warmup)]
+    common += args.extra.split() if args.extra else []
     gguf_size = os.path.getsize(args.gguf) / (1 << 30)
 
     rows = []
