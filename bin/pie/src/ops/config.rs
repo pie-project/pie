@@ -738,11 +738,22 @@ fn unset(global: &startup::GlobalArgs, key: String) -> Result<Answer> {
     if !remove_nested(&mut root, &key)? {
         return Ok(Answer::noop(format!("{key} was already unset")));
     }
+    // Validated on a plain re-serialization, but *written* from a `toml_edit`
+    // document so the file keeps its comments -- the same split `set` makes,
+    // and for the same reason. `set` got this treatment and `unset`, four
+    // lines below it in the same file, kept writing `toml::to_string`: a
+    // config with the annotated default template in it came back bare, and
+    // the command that erased thirty-seven comments was the one that reported
+    // removing a single key.
     let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
     // A removal can be invalid too -- a required key has no derived form.
     crate::derive::derive_standalone(&serialized)
         .with_context(|| format!("unsetting {key}"))?;
-    std::fs::write(&cfg_path, serialized).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
+    remove_nested_doc(&mut doc, &key)?;
+    std::fs::write(&cfg_path, doc.to_string()).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
     Ok(Answer::did(format!("unset {key}")))
 }
 
@@ -756,6 +767,30 @@ fn get_nested<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
 }
 
 /// Remove a dot-path. Returns whether anything was there.
+/// [`remove_nested`] against the annotated document, so the write keeps the
+/// comments the plain `toml::Value` round-trip throws away.
+///
+/// The raw key, not the normalized one -- `unset` reaches this only after
+/// `schema_field` has accepted the key as the schema spells it, so the two
+/// removals act on the same path and the document that gets written matches
+/// the one that was validated.
+///
+/// An emptied table keeps its header and its comments. That is the point: the
+/// header is where the operator's note about the section lives, and unsetting
+/// the last key in it is not a request to delete the note.
+fn remove_nested_doc(doc: &mut toml_edit::DocumentMut, key: &str) -> Result<bool> {
+    let parts: Vec<&str> = key.split('.').collect();
+    let (last, parents) = parts.split_last().ok_or_else(|| anyhow!("empty key"))?;
+    let mut cursor = doc.as_table_mut();
+    for part in parents {
+        let Some(next) = cursor.get_mut(*part).and_then(|item| item.as_table_mut()) else {
+            return Ok(false);
+        };
+        cursor = next;
+    }
+    Ok(cursor.remove(last).is_some())
+}
+
 fn remove_nested(root: &mut toml::Value, key: &str) -> Result<bool> {
     let parts: Vec<&str> = key.split('.').collect();
     let (last, parents) = parts.split_last().ok_or_else(|| anyhow!("empty key"))?;
@@ -1287,5 +1322,76 @@ arch_name = "qwen3"
         assert!(written.contains("# trailing note"), "got: {written}");
         assert!(written.contains("port = 9090"), "got: {written}");
         assert!(!written.contains("port = 8080"), "got: {written}");
+    }
+
+    /// And so does unsetting one.
+    ///
+    /// `set` was given a `toml_edit` write and `unset`, four lines below it,
+    /// was not -- so the fix for "one `config set` erased the entire
+    /// explanation" left `config unset` erasing it. Measured on the real
+    /// template: thirty-seven comments before, zero after.
+    #[test]
+    fn unsetting_a_value_keeps_the_comments_around_it() {
+        let annotated = r#"# pie configuration
+# Delete a line to get the default back.
+
+[server]
+# The port the engine listens on.
+port = 8080
+
+[model]
+name = "default"
+model = "Qwen/Qwen3-0.6B"
+
+[driver]
+type = "dummy"          # trailing note
+device = ["cpu"]
+"#;
+        let mut doc: toml_edit::DocumentMut = annotated.parse().unwrap();
+        assert!(remove_nested_doc(&mut doc, "server.port").unwrap());
+        let written = doc.to_string();
+
+        assert!(!written.contains("port = 8080"), "got: {written}");
+        // Everything that is not about the removed key survives -- the file
+        // header, and a trailing note on a key in another section. This is the
+        // bug: all thirty-seven of these went at once.
+        assert!(written.contains("# pie configuration"), "got: {written}");
+        assert!(written.contains("# trailing note"), "got: {written}");
+        // The emptied section keeps its header: unsetting the last key in it
+        // is not a request to delete the section's own note.
+        assert!(written.contains("[server]"), "got: {written}");
+        // But the removed key's OWN comment goes with it, because it describes
+        // a setting that is no longer there and would otherwise be left
+        // hanging over nothing. The template `config init` writes has no
+        // comments in this position -- it documents keys with a trailing note
+        // on the same line, or by commenting the key out entirely -- so this
+        // costs nothing there and is the coherent answer where it does apply.
+        assert!(
+            !written.contains("# The port the engine listens on."),
+            "got: {written}"
+        );
+
+        // A key that is not there is not an error, and changes nothing --
+        // that is what `unset` reports as "was already unset".
+        let mut doc: toml_edit::DocumentMut = annotated.parse().unwrap();
+        assert!(!remove_nested_doc(&mut doc, "server.port.deeper").unwrap());
+        assert!(!remove_nested_doc(&mut doc, "nowhere.at.all").unwrap());
+        assert_eq!(doc.to_string(), annotated);
+    }
+
+    /// The two removals have to agree, because one decides whether the write
+    /// happens and the other performs it.
+    #[test]
+    fn both_removals_take_the_same_path() {
+        let annotated = "[server]\nport = 8080\nhost = \"127.0.0.1\"\n";
+        for key in ["server.port", "server.host", "server.missing", "nope.nope"] {
+            let mut value: toml::Value = toml::from_str(annotated).unwrap();
+            let mut doc: toml_edit::DocumentMut = annotated.parse().unwrap();
+            assert_eq!(
+                remove_nested(&mut value, key).unwrap(),
+                remove_nested_doc(&mut doc, key).unwrap(),
+                "{key} was removed from one representation and not the other"
+            );
+        }
     }
 }
