@@ -1,0 +1,69 @@
+{
+  "schemas": 64,
+  "rows": [
+    {
+      "batch": 8,
+      "distinct": 1,
+      "engrain_us": 608.6539942771196,
+      "xgrammar_serial_us": 346.16305492818356,
+      "xgrammar_threaded_us": 346.16305492818356,
+      "forward_us": 28573.473007418215
+    },
+    {
+      "batch": 8,
+      "distinct": 8,
+      "engrain_us": 605.8691069483757,
+      "xgrammar_serial_us": 220.97351029515266,
+      "xgrammar_threaded_us": 220.97351029515266,
+      "forward_us": 28573.473007418215
+    },
+    {
+      "batch": 32,
+      "distinct": 1,
+      "engrain_us": 684.7069598734379,
+      "xgrammar_serial_us": 1376.8025673925877,
+      "xgrammar_threaded_us": 925.5269542336464,
+      "forward_us": 30298.074148595333
+    },
+    {
+      "batch": 32,
+      "distinct": 32,
+      "engrain_us": 826.0898757725954,
+      "xgrammar_serial_us": 925.6720077246428,
+      "xgrammar_threaded_us": 730.8621425181627,
+      "forward_us": 30298.074148595333
+    },
+    {
+      "batch": 128,
+      "distinct": 1,
+      "engrain_us": 859.3231905251741,
+      "xgrammar_serial_us": 6186.048267409205,
+      "xgrammar_threaded_us": 2097.8045649826527,
+      "forward_us": 29109.267401508987
+    },
+    {
+      "batch": 128,
+      "distinct": 64,
+      "engrain_us": 1236.7898598313332,
+      "xgrammar_serial_us": 7836.015895009041,
+      "xgrammar_threaded_us": 3147.681476548314,
+      "forward_us": 29109.267401508987
+    },
+    {
+      "batch": 512,
+      "distinct": 1,
+      "engrain_us": 1431.6453598439693,
+      "xgrammar_serial_us": 24229.86109741032,
+      "xgrammar_threaded_us": 7862.626574933529,
+      "forward_us": 29327.766387723386
+    },
+    {
+      "batch": 512,
+      "distinct": 64,
+      "engrain_us": 1988.8670649379492,
+      "xgrammar_serial_us": 31229.967018589377,
+      "xgrammar_threaded_us": 8495.06608210504,
+      "forward_us": 29327.766387723386
+    }
+  ]
+}

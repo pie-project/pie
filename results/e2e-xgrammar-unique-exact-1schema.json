@@ -1,0 +1,31 @@
+{
+  "backend": "xgrammar",
+  "model": "Qwen/Qwen3-0.6B",
+  "unique": true,
+  "schemas": 1,
+  "rows": [
+    {
+      "batch": 512,
+      "distinct_schemas": 1,
+      "seconds": {
+        "min": 3.3132714605890214,
+        "p25": 3.3431321368552744,
+        "p50": 3.400472329230979,
+        "p75": 3.472758030053228,
+        "max": 3.5037286346778274
+      },
+      "tokens_per_second": {
+        "min": 12683.345268286232,
+        "p25": 12800.515034138158,
+        "p50": 13081.661797509769,
+        "p75": 13160.358218413103,
+        "max": 13385.561831421932
+      },
+      "tokens_generated_p50": 44513.0,
+      "longest_request_p50": 96.0,
+      "hit_the_cap_p50": 429.0,
+      "valid_last_run": 84,
+      "requests": 512
+    }
+  ]
+}

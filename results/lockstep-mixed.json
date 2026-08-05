@@ -1,0 +1,61 @@
+{
+  "schemas": 64,
+  "rows": [
+    {
+      "batch": 512,
+      "distinct": 1,
+      "engrain_us": 1386.7311645299196,
+      "xgrammar_serial_us": 23776.50560811162,
+      "xgrammar_threaded_us": 7677.898975089192,
+      "forward_us": null
+    },
+    {
+      "batch": 512,
+      "distinct": 2,
+      "engrain_us": 1404.7406148165464,
+      "xgrammar_serial_us": 13206.986710429192,
+      "xgrammar_threaded_us": 8052.146527916193,
+      "forward_us": null
+    },
+    {
+      "batch": 512,
+      "distinct": 4,
+      "engrain_us": 1419.602893292904,
+      "xgrammar_serial_us": 17487.98880726099,
+      "xgrammar_threaded_us": 8156.923111528158,
+      "forward_us": null
+    },
+    {
+      "batch": 512,
+      "distinct": 8,
+      "engrain_us": 1470.01794539392,
+      "xgrammar_serial_us": 12830.911204218864,
+      "xgrammar_threaded_us": 8569.458732381463,
+      "forward_us": null
+    },
+    {
+      "batch": 512,
+      "distinct": 16,
+      "engrain_us": 1528.4500550478697,
+      "xgrammar_serial_us": 12997.333891689777,
+      "xgrammar_threaded_us": 8700.167061761022,
+      "forward_us": null
+    },
+    {
+      "batch": 512,
+      "distinct": 32,
+      "engrain_us": 1598.3916819095612,
+      "xgrammar_serial_us": 14468.595152720809,
+      "xgrammar_threaded_us": 8301.25855281949,
+      "forward_us": null
+    },
+    {
+      "batch": 512,
+      "distinct": 64,
+      "engrain_us": 1950.9750418365002,
+      "xgrammar_serial_us": 31608.239049091935,
+      "xgrammar_threaded_us": 8613.272104412317,
+      "forward_us": null
+    }
+  ]
+}
