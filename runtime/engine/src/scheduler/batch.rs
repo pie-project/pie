@@ -7,6 +7,7 @@ use pie_driver_abi::PieTerminalCell;
 use super::stats::SchedulerStats;
 use super::wire;
 use super::worker::PendingRequest;
+use super::fire_plan;
 use crate::driver::{FrameSubmission, LaunchPlan, SchedulerLimits, StepSubmission};
 
 /// One step's assembled wire request: the per-batch merge of its member
@@ -217,6 +218,49 @@ pub(crate) fn build_batch_request(
     })
 }
 
+
+/// tart rung ③ (re-ported onto the 0.3 scheduler): the region table —
+/// the seriation's output stated ONCE; the driver derives every planned
+/// split from it (region_plans.hpp). Maximal runs of members sharing an
+/// axis signature (PIE_REGION_SIG_*) and a depth operand k; boundaries
+/// in WIRE rows through the attribution CSR. Declined (empty) when the
+/// attribution is absent or any member owns zero wire rows.
+fn planned_region_table(
+    ordered: &[Box<PendingRequest>],
+    row_indptr: &[u32],
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    if row_indptr.len() != ordered.len() + 1
+        || row_indptr.windows(2).any(|w| w[1] <= w[0])
+    {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let mut indptr: Vec<u32> = vec![row_indptr[0]];
+    let mut sigs: Vec<u32> = Vec::new();
+    let mut ks: Vec<u32> = Vec::new();
+    for (member, req) in ordered.iter().enumerate() {
+        let sig = u32::from(
+            req.request
+                .qo_indptr
+                .windows(2)
+                .any(|w| w[1] - w[0] > 1),
+        ) * pie_driver_abi::PIE_REGION_SIG_MULTI_TOKEN
+            | u32::from(req.hook_program) * pie_driver_abi::PIE_REGION_SIG_HOOK
+            | u32::from(req.request.has_user_mask)
+                * pie_driver_abi::PIE_REGION_SIG_MASK
+            | u32::from(req.lora_program) * pie_driver_abi::PIE_REGION_SIG_LORA;
+        let k = pie_driver_abi::PIE_MAX_LAYERS_FULL;
+        let end = row_indptr[member + 1];
+        if sigs.last() == Some(&sig) && ks.last() == Some(&k) {
+            *indptr.last_mut().expect("indptr starts nonempty") = end;
+        } else {
+            sigs.push(sig);
+            ks.push(k);
+            indptr.push(end);
+        }
+    }
+    (indptr, sigs, ks)
+}
+
 /// Assemble one sealed frame's submission (ABI v14) from its waves' picked
 /// requests, in slot order. Returns the submission plus the flattened
 /// requests in POST order (step order, member order within a step) — the
@@ -286,7 +330,40 @@ pub(crate) fn build_frame_submission(
         // contiguous program suffix. Stable sort keeps arrival order
         // within each class.
         let mut group = group;
-        group.sort_by_key(|req| req.request.device_resolved_geometry);
+        // tart (0.3 re-port step 1): the fire planner's seriation — the
+        // key's PRIMARY term is device_resolved_geometry, so the
+        // envelope-suffix invariant this sort used to provide is
+        // preserved, and the mask/hook/depth windows the driver's
+        // planned splits need become contiguous. Stable, arrival-order
+        // within equal keys, exactly the pre-merge behavior.
+        let facts: Vec<fire_plan::MemberFacts> = group
+            .iter()
+            .enumerate()
+            .map(|(arrival, req)| fire_plan::MemberFacts {
+                hook_program: req.hook_program,
+                lora: req.lora_program,
+                custom_mask: req.request.has_user_mask,
+                // Depth facts await the set-max-layers 0.3 re-port
+                // (step 2): no truncation is expressible yet.
+                truncated: false,
+                max_layers: None,
+                multi_token: req
+                    .request
+                    .qo_indptr
+                    .windows(2)
+                    .any(|w| w[1] - w[0] > 1),
+                device_resolved_geometry: req.request.device_resolved_geometry,
+                arrival,
+            })
+            .collect();
+        let plan = fire_plan::plan_fire_with_model(&facts, &[]);
+        let mut slots: Vec<Option<Box<PendingRequest>>> =
+            group.into_iter().map(Some).collect();
+        let group: Vec<Box<PendingRequest>> = plan
+            .member_order
+            .iter()
+            .map(|&index| slots[index].take().expect("member_order is a permutation"))
+            .collect();
         let wire_count = group
             .iter()
             .take_while(|req| !req.request.device_resolved_geometry)
@@ -330,6 +407,8 @@ pub(crate) fn build_frame_submission(
             );
         }
         required_kv_pages = required_kv_pages.max(build.plan.required_kv_pages);
+        let (region_row_indptr, region_sig, region_k) =
+            planned_region_table(&group, &build.program_row_indptr);
         steps.push(StepSubmission {
             plan: build.plan,
             roster_rows,
@@ -341,6 +420,9 @@ pub(crate) fn build_frame_submission(
             channel_expected_head: build.channel_expected_head,
             channel_expected_tail: build.channel_expected_tail,
             channel_ticket_indptr: build.channel_ticket_indptr,
+            region_row_indptr,
+            region_sig,
+            region_k,
         });
         flattened.extend(group);
     }
@@ -371,6 +453,8 @@ mod tests {
 
     fn pending(request: LaunchPlan, instance_id: u64, prebuilt: bool) -> Box<PendingRequest> {
         Box::new(PendingRequest {
+            hook_program: false,
+            lora_program: false,
             logical_fire_id: 1,
             last_page_len: 1,
             request,

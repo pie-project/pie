@@ -28,6 +28,19 @@
 //! `inferlet/` in the layering while the fire engine still owns every bit of
 //! the algorithm — see [`FireContext`]'s doc for the design rationale.
 
+
+/// tart (0.3 re-port step 1): whether the bound container carries
+/// attention-stage programs — the fire planner's hook divergence fact.
+fn container_has_attention_stages(
+    container: &pie_ir::container::TraceContainer,
+) -> bool {
+    use pie_ir::registry::Stage;
+    container
+        .stages
+        .iter()
+        .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
+}
+
 pub mod context;
 pub mod geometry;
 pub mod kv;
@@ -1451,6 +1464,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // launch-ready work.
         let ticket_reservation = TicketReservation::new(&cells, &accesses);
         ticket_reservation.apply_to(&mut req);
+        
+        let hook_program = {
+            let p = ctx.resources().get(&fwd)?;
+            container_has_attention_stages(&p.instance.program.bound.container)
+        };
         let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
             &scheduler,
             req,
@@ -1465,7 +1483,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             rs_copy_dst,
             frame,
             timing_enabled,
-        )
+        hook_program)
         .err()
         .map(|error| format!("{error:#}"));
         if let Some(error) = submit_error {
@@ -2749,7 +2767,12 @@ async fn fire_device_geometry<C: FireContext>(
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let last_page_len = if pages.is_empty() { 0 } else { page_size };
-    let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
+    
+        let hook_program = {
+            let p = ctx.resources().get(&fwd)?;
+            container_has_attention_stages(&p.instance.program.bound.container)
+        };
+        let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
         req,
         instance_id,
@@ -2763,7 +2786,7 @@ async fn fire_device_geometry<C: FireContext>(
         rs_copy_dst,
         frame,
         timing_enabled,
-    )
+        hook_program)
     .err()
     .map(|error| format!("{error:#}"));
     if let Some(error) = submit_error {

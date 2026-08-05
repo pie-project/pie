@@ -13,6 +13,9 @@ crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
+# tart: the declared-forward toolchain — the fire planner's site table
+# maps driver-reported model sites onto its vocabulary.
+pie-forward = { path = "../../forward" }
 pie-driver-abi = { path = "../../interface/driver" }
 pie-driver-dummy = { path = "../../driver/dummy" }
 pie-ir = { path = "../../compiler/ir" }

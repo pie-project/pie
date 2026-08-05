@@ -23,6 +23,12 @@
 //! that owns a given `driver_id`. `driver/` (L0) never imports this module.
 
 pub(crate) mod batch;
+// tart (V2): the fire planner — seriation (deepest-first bands, the
+// gray sentinel) and the per-site lowerings. Orphaned by the dev merge
+// (upstream's assembly does not call it yet); re-declared so the module
+// and its pinned tests stay live while the 0.3 regraft lands
+// (playbook: "0.3 re-port step 1").
+pub(crate) mod fire_plan;
 pub(crate) mod dispatch;
 pub(crate) mod frame;
 pub(crate) mod probe;
@@ -1166,6 +1172,7 @@ pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
         rs_copy_dst,
         None,
         fire_timing_request_enabled(Some(pipeline_id)),
+        /*hook_program=*/false,
     )
 }
 
@@ -1184,6 +1191,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     rs_copy_dst: Vec<u32>,
     frame: Option<FrameStamp>,
     timing_enabled: bool,
+    hook_program: bool,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
         src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
@@ -1205,6 +1213,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
         frame,
         timing_enabled,
+        hook_program,
     )
 }
 

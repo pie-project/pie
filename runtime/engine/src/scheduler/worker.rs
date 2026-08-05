@@ -270,6 +270,14 @@ pub(crate) struct PendingRequest {
     /// `None` = an untracked/prebuilt rider — dispatched outside the
     /// sealed-wave order, never awaited.
     pub(crate) frame: Option<FrameStamp>,
+    /// tart (0.3 re-port step 1): whether this fire's program carries
+    /// attention-stage hooks (OnAttnProj/OnAttn). Stamped at the pipeline
+    /// submit from the bound container; fire planning sorts hook rows
+    /// last so the driver's hook-free fast prefix is maximal.
+    pub(crate) hook_program: bool,
+    /// The pass-wide adapter sink (dormant on 0.3 until the adapter
+    /// re-port; the region table's LORA bit reads it).
+    pub(crate) lora_program: bool,
     pub(super) timing: Option<FireTimingState>,
 }
 
@@ -329,6 +337,7 @@ impl PendingRequest {
         prelaunch_state_copy: Option<StateCopyPlan>,
         frame: Option<FrameStamp>,
         timing_enabled: bool,
+        hook_program: bool,
     ) -> Self {
         let logical_fire_id = NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -343,6 +352,8 @@ impl PendingRequest {
             prelaunch_copy,
             prelaunch_state_copy,
             frame,
+            hook_program,
+            lora_program: false,
             timing: timing_enabled.then(FireTimingState::new),
         }
     }
@@ -2212,6 +2223,7 @@ impl SchedulerHandle {
                 prelaunch_state_copy,
                 None,
                 timing_enabled,
+                /*hook_program=*/false,
             ),
         })
     }
@@ -2238,7 +2250,7 @@ impl SchedulerHandle {
                 prelaunch_state_copy,
                 None,
                 super::fire_timing_full(),
-            ),
+                /*hook_program=*/false),
         })
     }
 
@@ -2255,6 +2267,7 @@ impl SchedulerHandle {
         prelaunch_state_copy: Option<StateCopyPlan>,
         frame: Option<FrameStamp>,
         timing_enabled: bool,
+        hook_program: bool,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -2269,7 +2282,7 @@ impl SchedulerHandle {
                 prelaunch_state_copy,
                 frame,
                 timing_enabled,
-            ),
+                /*hook_program=*/false),
         })
     }
 
@@ -6001,7 +6014,7 @@ mod tests {
             None,
             None,
             false,
-        );
+                /*hook_program=*/false);
         let mut pending: PendingQueue =
             VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
         completion.request_cancel();
@@ -6057,7 +6070,7 @@ mod tests {
             Some(state_copy),
             None,
             false,
-        );
+                /*hook_program=*/false);
         let mut pending = PendingQueue::default();
         BatchScheduler::queue_attempt(&mut pending, request);
 
@@ -6092,7 +6105,7 @@ mod tests {
             None,
             None,
             false,
-        );
+                /*hook_program=*/false);
         assert!(request.preserves_inner_rows());
         assert!(request.requires_solo_submission());
     }
@@ -7210,7 +7223,7 @@ mod tests {
                 None,
                 None,
                 false,
-            )?;
+                /*hook_program=*/false)?;
             if pipeline_id == pipeline_b {
                 timeout(Duration::from_secs(5), completion).await??;
             }
@@ -7232,7 +7245,7 @@ mod tests {
             None,
             None,
             false,
-        )?;
+                /*hook_program=*/false)?;
         notify_pipeline_close(pipeline_a).await;
         timeout(Duration::from_secs(5), sibling).await??;
 
@@ -7389,7 +7402,7 @@ mod tests {
             None,
             None,
             false,
-        ))
+                /*hook_program=*/false))
     }
 
     #[test]
@@ -7613,7 +7626,7 @@ mod tests {
             None,
             Some(stamp),
             false,
-        );
+                /*hook_program=*/false);
         let fire_id = request.logical_fire_id;
         // Row budget 1: the single-fire wave is structurally full and seals
         // with no cold hold.
@@ -7699,7 +7712,7 @@ mod tests {
             None,
             Some(stamp),
             false,
-        );
+                /*hook_program=*/false);
         let fire_id = request.logical_fire_id;
         // fires=2 with one arrival: the frame is still gathering, so the
         // front launch is immovable.
@@ -8020,7 +8033,7 @@ mod tests {
                     fires: 1,
                 }),
                 false,
-            )
+                /*hook_program=*/false)
         };
         let request_a = stamped(lane_a, 7);
         let request_b = stamped(lane_b, 8);
@@ -8098,7 +8111,7 @@ mod tests {
                 None,
                 frame,
                 false,
-            )
+                /*hook_program=*/false)
         };
         let stamped = make(Some(FrameStamp {
             lane,
@@ -8175,7 +8188,7 @@ mod tests {
                 None,
                 Some(stamp),
                 false,
-            );
+                /*hook_program=*/false);
             let fire_id = request.logical_fire_id;
             let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
             frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);

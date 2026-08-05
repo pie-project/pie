@@ -3109,6 +3109,11 @@ fn single_step_frame(
             channel_expected_head,
             channel_expected_tail,
             channel_ticket_indptr,
+            // tart: no region table on the harness/legacy path — the
+            // driver derives alone (legacy discipline).
+            region_row_indptr: Vec::new(),
+            region_sig: Vec::new(),
+            region_k: Vec::new(),
         }],
     }
 }
