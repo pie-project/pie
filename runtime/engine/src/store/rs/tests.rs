@@ -243,55 +243,59 @@ fn three_deep_run_ahead_resets_once_and_allocates_once() {
 }
 
 #[test]
-fn retirement_waits_for_the_fire_that_named_the_slot() {
+fn retirement_waits_for_every_in_flight_write() {
     let mut s = store();
     let parent = store_with_state(&mut s);
     let shared = s.folded_slot(parent).unwrap().unwrap();
     let child = s.fork(parent).unwrap();
 
-    // This fire COPIES FROM the shared slot, so the device will read it.
     let cow = s.prepare_write(child, true, None).unwrap();
     assert_eq!(cow.state().unwrap().copy_from, Some(shared));
     let cow = s.publish_prepared(cow).unwrap();
     let free_after_publish = s.available_slots();
 
-    // The shared slot loses its last owner while that copy is still in
-    // flight. Handing it out now would alias a source the device is reading.
+    // A second write is still in flight when the shared slot loses its last
+    // owner, so the displaced slot must NOT be handed back out.
+    let held = s.prepare_write(child, true, None).unwrap();
+    let held = s.publish_prepared(held).unwrap();
     s.release_working_set(parent, s.current_epoch());
+    s.settle(cow);
     assert_eq!(
         s.available_slots(),
         free_after_publish,
-        "a slot a live fire still names must not be handed back out"
+        "retirement waits for the write whose epoch the free is tagged with"
     );
 
-    s.settle(cow);
+    s.settle(held);
     assert!(
         s.available_slots() > free_after_publish,
-        "it returns once the fire that named it completes"
+        "the displaced slot returns once nothing is in flight"
     );
 }
 
 #[test]
-fn an_unrelated_long_fire_does_not_pin_a_slot_it_never_named() {
-    // The reason frees carry a per-slot tag rather than the newest sequence
-    // issued: one slow fire on ANOTHER working set used to hold up every slot
-    // freed while it ran, which is what starved the RS pool under load.
+fn a_completed_free_retires_while_a_newer_write_is_outstanding() {
     let mut s = store();
     let doomed = store_with_state(&mut s);
-    let busy = s.create_working_set(geom());
+    let other = s.create_working_set(geom());
 
-    // A long-running fire on a working set that has nothing to do with
-    // `doomed`, still outstanding.
-    let long = s.prepare_write(busy, true, None).unwrap();
-    let long = s.publish_prepared(long).unwrap();
-
-    let before = s.available_slots();
+    // Nothing is outstanding, so this free is tagged with an epoch that has
+    // already completed on the device.
     s.release_working_set(doomed, s.current_epoch());
+
+    // Now a NEWER write goes in flight. Its sequence is above the free's tag,
+    // so it was prepared after the slot became unreachable and cannot be
+    // touching it. Retirement must not wait for it.
+    let held = s.prepare_write(other, true, None).unwrap();
+    let held = s.publish_prepared(held).unwrap();
+    let under_load = s.available_slots();
+
+    s.retire_idle();
     assert!(
-        s.available_slots() > before,
-        "a slot the outstanding fire never named retires without waiting"
+        s.available_slots() > under_load,
+        "a free whose epoch has completed retires even under sustained load"
     );
-    s.settle(long);
+    s.settle(held);
 }
 
 #[test]
