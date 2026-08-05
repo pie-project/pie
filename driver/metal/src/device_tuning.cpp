@@ -26,9 +26,12 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
     switch (info.apple_family) {
         case 9:
             // M3/M4 generation. Measured on an M4 Pro (20 cores) with
-            // gemma-4-E4B, same binary via PIE_METAL_QMM_MIN_BATCH,
-            // alternating order, quiet host: 12 -> 169.07 tok/s,
-            // 8 -> 176.14. Applied by FAMILY and not by core count -- the
+            // gemma-4-E4B at concurrency 8 -- the batch where the two
+            // settings actually diverge -- same binary via
+            // PIE_METAL_QMM_MIN_BATCH, arms alternated, quiet host:
+            // 138.90 tok/s at 12 against 144.04 at 8, +3.7%. See
+            // `device_tuning.hpp` for the individual runs. Applied by FAMILY
+            // and not by core count -- the
             // crossover is set by per-core matrix throughput, which the
             // family names and the core count does not.
             t.qmm_min_batch = 8;

@@ -39,10 +39,15 @@ struct DeviceTuning {
     /// M1 Max: 12. Measured -- pie's per-step cost beats mlx-lm's at every
     /// batch up to 8 with the GEMV and only loses above it.
     ///
-    /// M4 Pro (Apple9, 20 cores): 8. Measured on gemma-4-E4B, same binary,
-    /// alternating order: 12 -> 169.07 tok/s, 8 -> 176.14. The M4's wider
-    /// per-core matrix throughput moves the crossover down; the GEMV's
-    /// advantage at small N is a memory-bound one and does not.
+    /// M4 Pro (Apple9, 20 cores): 8. Measured on gemma-4-E4B at the batch
+    /// that discriminates -- concurrency 8, where 12 takes the GEMV and 8
+    /// takes the GEMM -- same binary via the env override, arms alternated,
+    /// quiet host: 12 -> 140.88, 136.92 tok/s; 8 -> 144.44, 143.63. Means
+    /// 138.90 vs 144.04, +3.7%. (At concurrency 16 both settings take the
+    /// same path and measure the same, which is the check that the difference
+    /// above is the crossover and not the weather.) The M4's wider per-core
+    /// matrix throughput moves the crossover down; the GEMV's advantage at
+    /// small N is a memory-bound one and does not.
     int qmm_min_batch = 12;
 };
 
