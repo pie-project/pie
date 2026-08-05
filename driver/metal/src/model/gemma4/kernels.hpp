@@ -102,7 +102,7 @@ struct Gemma4Psos {
     Pso router_topk{};
     Pso qmv_routed{};
     /// The batched form's three column tiles.
-    Pso qmm_routed[3]{};
+    Pso qmm_routed[2][3]{};  // [tile width][bn]
     Pso moe_sort{};
     Pso moe_gather{};
     Pso moe_combine{};
@@ -113,7 +113,9 @@ struct Gemma4Psos {
     bool moe_valid() const {
         return router_topk.valid() && qmv_routed.valid() && moe_sort.valid() &&
                moe_gather.valid() && moe_combine.valid() && residual_add.valid() &&
-               qmm_routed[0].valid() && qmm_routed[1].valid() && qmm_routed[2].valid();
+               qmm_routed[0][0].valid() && qmm_routed[0][1].valid() &&
+               qmm_routed[0][2].valid() && qmm_routed[1][0].valid() &&
+               qmm_routed[1][1].valid() && qmm_routed[1][2].valid();
     }
 
     bool valid() const {

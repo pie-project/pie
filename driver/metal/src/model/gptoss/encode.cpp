@@ -330,7 +330,8 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
     const int m = d.kind == Kind::LmHead ? S : N;
     if (const int bn = gptoss_moe_qmm_bn(d.kind, g, N); bn > 0) {
         const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
-        if (go.qmm_routed_bias[slot].valid()) return go.qmm_routed_bias[slot];
+        const int bm = shared_kernels::moe_bm_slot(gptoss_moe_tile_rows(g, N));
+        if (go.qmm_routed_bias[bm][slot].valid()) return go.qmm_routed_bias[bm][slot];
     }
     if (const int bn = gptoss_qmm_bn(d.kind, g, m); bn > 0) {
         const int wide = qmm_bm_slot(qmm_bm(m));
@@ -356,7 +357,7 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
         const int m = d.kind == Kind::LmHead ? S : N;
         if (const int bn = gptoss_moe_qmm_bn(d.kind, g, N); bn > 0) {
             qmm_t_dispatch(kn.N, gptoss_moe_sorted_rows(g, N), bn,
-                           shared_kernels::kMoeTileRows, grid, tg);
+                           gptoss_moe_tile_rows(g, N), grid, tg);
             return;
         }
         // A dense projection becomes a matmul once the batch fills a tile: the

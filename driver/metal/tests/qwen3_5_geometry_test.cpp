@@ -618,7 +618,8 @@ void check_the_batched_mixture_becomes_a_matmul() {
         expect(d.qmm_bn > 0, "at width the mixture becomes matmuls");
         // And the tile must be what the sort padded to. A block spanning two
         // experts reads one expert's weights for the other's rows.
-        expect(d.qmm_bm == pie::metal::shared_kernels::kMoeTileRows,
+        expect(d.qmm_bm == pie::metal::shared_kernels::moe_tile_rows(
+                               wide * moe.experts_per_token, moe.n_experts),
                "a routed tile is the tile the sort padded every run to");
         // Split-K would sum partial products across a K the routing already
         // split by expert, so it must stay off.

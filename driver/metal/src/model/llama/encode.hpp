@@ -73,7 +73,8 @@ int llama_qmm_pool_rows(int max_rows);
 int llama_moe_pairs(const LlamaGeometry& g, int rows);
 
 /// The rows the sort pads each expert's run to: 1 leaves the routed
-/// projections matvecs, `shared_kernels::kMoeTileRows` makes them matmuls.
+/// projections matvecs, and `shared_kernels::moe_tile_rows`'s answer -- 16 or
+/// 32, by the batch and the expert count -- makes them matmuls.
 ///
 /// One question in one place. The sort kernel, the three projections' launch
 /// shapes, their pipeline choice and the pool sizer all have to give the same

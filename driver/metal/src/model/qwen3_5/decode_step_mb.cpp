@@ -172,8 +172,8 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // answer for them: they run over the sorted rows, which is neither `n`
         // nor `n * k`, because the sort pads every expert's run to a whole
         // tile. Once the batch fills a tile they become matmuls, and the tile
-        // is `kMoeTileRows` -- the same number the sort padded to, spelled from
-        // the constant rather than restated.
+        // is `moe_tile_rows`'s answer -- the same number the sort padded to,
+        // asked of the same function rather than restated.
         case Kernel::LlExpertGate:
         case Kernel::LlExpertUp:
         case Kernel::LlExpertDown: {
@@ -182,9 +182,9 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             if (const int bn = qmm_bn(N, sorted);
                 bn > 0 && shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
                 d.qmm_bn = bn;
-                d.qmm_bm = shared_kernels::kMoeTileRows;
+                d.qmm_bm = shared_kernels::moe_tile_rows(n * g.experts_per_token, g.n_experts);
                 d.qmm_split = 1;
-                qmm_t_dispatch(N, sorted, bn, shared_kernels::kMoeTileRows, d.grid, d.tg);
+                qmm_t_dispatch(N, sorted, bn, d.qmm_bm, d.grid, d.tg);
             } else {
                 // One sorted row per (token, slot) pair and no expert axis: the
                 // pair's expert is `row_expert[p]`, not `tid.z`.
@@ -236,7 +236,8 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::LlExpertDown: {
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
-                if (mb.qmm_routed[slot].valid()) return mb.qmm_routed[slot];
+                const int bm = shared_kernels::moe_bm_slot(d.qmm_bm);
+                if (mb.qmm_routed[bm][slot].valid()) return mb.qmm_routed[bm][slot];
             }
             return base[d.kind];
         }

@@ -237,16 +237,18 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         want(qmm, "cast_qmm_input_bfloat16_to_float16", &out.qmm_cast_bf16_f16);
     }
     if (features.routed) {
-        // `bm` is spelled from `kMoeTileRows` rather than restated: it is the
+        // `bm` is spelled from the shared widths rather than restated: it is the
         // number the sort padded every expert's run to, and a tile that
         // disagreed with the padding would read one expert's weights for
         // another's rows.
-        for (int i = 0; i < 3; ++i) {
-            want(qmm,
-                 "affine_qmm_t_routed" + q + "_bm_" +
-                     std::to_string(shared_kernels::kMoeTileRows) + "_bn_" +
-                     std::to_string(16 << i),
-                 &out.qmm_routed[i]);
+        for (int t = 0; t < 2; ++t) {
+            for (int i = 0; i < 3; ++i) {
+                want(qmm,
+                     "affine_qmm_t_routed" + q + "_bm_" +
+                         std::to_string(shared_kernels::kMoeTileWidths[t]) + "_bn_" +
+                         std::to_string(16 << i),
+                     &out.qmm_routed[t][i]);
+            }
         }
     }
     if (features.splitk) {

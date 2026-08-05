@@ -290,7 +290,9 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             const int bn = llama_moe_qmm_bn(d.kind, g, R);
             if (bn == 0) return ll.qmv_routed;
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
-            return ll.qmm_routed[slot].valid() ? ll.qmm_routed[slot] : ll.qmv_routed;
+            const int bm = shared_kernels::moe_bm_slot(llama_moe_tile_rows(g, R));
+            return ll.qmm_routed[bm][slot].valid() ? ll.qmm_routed[bm][slot]
+                                                   : ll.qmv_routed;
         }
         default:
             break;
@@ -448,7 +450,8 @@ int llama_moe_pairs(const LlamaGeometry& g, int rows) {
 }
 
 /// The tile the sort pads each expert's run to: 1 leaves the projections
-/// matvecs, `kMoeTileRows` makes them matmuls. One question asked in one place,
+/// matvecs, and `moe_tile_rows`'s width makes them matmuls. One question asked
+/// in one place,
 /// because the sort, the launch shapes, the pipeline choice and the pool sizer
 /// all have to give the same answer -- a sort that padded to 16 under a matvec
 /// launched for 8 rows would run the projection over a fraction of its input.
@@ -494,7 +497,7 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
         const KN kn = qmv_kn(d.kind, g);
         const int sorted = llama_moe_sorted_rows(g, R);
         if (const int bn = llama_moe_qmm_bn(d.kind, g, R); bn > 0) {
-            qmm_t_dispatch(kn.N, sorted, bn, shared_kernels::kMoeTileRows, grid, tg);
+            qmm_t_dispatch(kn.N, sorted, bn, llama_moe_tile_rows(g, R), grid, tg);
             return;
         }
         // One sorted row per (token, slot) pair, and the expert axis is gone --

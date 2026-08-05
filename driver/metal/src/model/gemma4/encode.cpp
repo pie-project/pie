@@ -243,7 +243,8 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
     if (is_routed(d.kind)) {
         if (const int bn = gemma4_moe_qmm_bn(d.kind, g, N, d.layer); bn > 0) {
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
-            if (g4.qmm_routed[slot].valid()) return g4.qmm_routed[slot];
+            const int bm = shared_kernels::moe_bm_slot(gemma4_moe_tile_rows(g, N));
+            if (g4.qmm_routed[bm][slot].valid()) return g4.qmm_routed[bm][slot];
         }
         return g4.qmv_routed;
     }
@@ -397,7 +398,7 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         const KN kn = qmv_kn(d.kind, g, L);
         const int sorted = gemma4_moe_sorted_rows(g, N);
         if (const int bn = gemma4_moe_qmm_bn(d.kind, g, N, L); bn > 0) {
-            qmm_t_dispatch(kn.N, sorted, bn, shared_kernels::kMoeTileRows, grid, tg);
+            qmm_t_dispatch(kn.N, sorted, bn, gemma4_moe_tile_rows(g, N), grid, tg);
             return;
         }
         // One sorted row per (token, slot) pair, and the expert axis is gone --

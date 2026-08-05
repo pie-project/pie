@@ -3,6 +3,8 @@
 #include <cmath>
 #include <string>
 
+#include "model/shared_kernels.hpp"
+
 namespace pie::metal::gptoss {
 
 bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
@@ -61,18 +63,27 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         }
     }
     if (g.mxfp4_experts) {
-        for (int i = 0; i < 3; ++i) {
-            const std::string fn =
-                "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_" +
-                std::to_string(16 << i);
-            std::string compile_error;
-            out.qmm_routed_bias[i] = ctx.compile_pso_from_file(
-                dir + "quantized_qmm_t.metal", fn, &compile_error);
-            if (!out.qmm_routed_bias[i].valid()) {
-                if (err != nullptr)
-                    *err = "gpt-oss PSO '" + fn + "' (quantized_qmm_t.metal): " +
-                           compile_error;
-                return false;
+        // `bm` is spelled from the shared tile widths, not restated: it is
+        // the same number the sort padded each expert's run to and the same
+        // number the grid divides the sorted rows by. Hardcoding it here made
+        // this the one place that did not follow the constant -- and a grid
+        // built for one tiling against a pipeline compiled for another is
+        // wrong numbers, not a crash.
+        for (int t = 0; t < 2; ++t) {
+            for (int i = 0; i < 3; ++i) {
+                const std::string fn =
+                    "mxfp4_qmm_t_routed_bias_bfloat16_bm_" +
+                    std::to_string(shared_kernels::kMoeTileWidths[t]) + "_bn_" +
+                    std::to_string(16 << i);
+                std::string compile_error;
+                out.qmm_routed_bias[t][i] = ctx.compile_pso_from_file(
+                    dir + "quantized_qmm_t.metal", fn, &compile_error);
+                if (!out.qmm_routed_bias[t][i].valid()) {
+                    if (err != nullptr)
+                        *err = "gpt-oss PSO '" + fn + "' (quantized_qmm_t.metal): " +
+                               compile_error;
+                    return false;
+                }
             }
         }
     }
