@@ -1080,11 +1080,24 @@ void linear_attn_layer_body(
                                         const std::uint32_t* qo_indptr_d,
                                         bool write_state,
                                         const std::uint8_t* rs_write_state_mask) {
-                    if (use_warp_tiled_recurrent && V_h != K_h) {
+                    // One arm per state dtype, and nothing else to choose.
+                    //
+                    // This was four arms: GQA and non-GQA, each with an fp32
+                    // and a bf16 state. The two kernels behind them differed
+                    // only in how they index q/k -- with `K_h == V_h` the GQA
+                    // kernel's `repeat` is 1, `qk_h` is `h`, and its index
+                    // reduces to the other's exactly -- so the non-GQA pair
+                    // was a second copy of the same arithmetic, and the
+                    // `V_h != K_h` test picked between identical results.
+                    //
+                    // `q_recur_full`/`k_recur_full` already resolve to the
+                    // compact K_h-head buffers when the heads are equal, which
+                    // is what the GQA kernel wants, so one call covers both.
+                    if (use_warp_tiled_recurrent) {
                         if (state_bf16) {
                             kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
+                                q_recur_full,
+                                k_recur_full,
                                 la.v_fp32.data(),
                                 la.g_log.data(),
                                 la.beta.data(),
@@ -1096,8 +1109,8 @@ void linear_attn_layer_body(
                                 stream, write_state, rs_write_state_mask);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
+                                q_recur_full,
+                                k_recur_full,
                                 la.v_fp32.data(),
                                 la.g_log.data(),
                                 la.beta.data(),
@@ -1108,34 +1121,32 @@ void linear_attn_layer_body(
                                 R, K_h, V_h, K_d, V_d,
                                 stream, write_state, rs_write_state_mask);
                         }
-                    } else if (use_warp_tiled_recurrent) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        }
+                    } else {
+                        // KNOWN HOLE, and the only one left in this dispatch.
+                        //
+                        // `chunk_prefill_per_request` cannot stand in here:
+                        // it walks the fire's own `qo_indptr_h`, and a fold
+                        // pass is segmented differently, so it would fold the
+                        // wrong token ranges into the wrong slots. Nor can it
+                        // express the tail pass's `write_state=false` -- the
+                        // per-token chunk path accumulates the state in
+                        // place, so running it would move the boundary the
+                        // head just set.
+                        //
+                        // Throwing here was tried and is wrong: a fold fire
+                        // that the runtime is about to refuse for a *better*
+                        // reason gets refused for this one instead, and
+                        // `two_chunks_need_the_buffer_read_path` exists to
+                        // catch exactly that ("refused BECAUSE of the buffer,
+                        // not incidentally").
+                        //
+                        // So this arm still computes nothing, and four of the
+                        // eight `cuda_gdn_foldcommit` cases still disagree. It
+                        // is unblocked by making the warp-tiled kernel
+                        // available to a state-persisting fire -- i.e. by
+                        // settling the stopgap on `use_warp_tiled_recurrent`
+                        // with a measurement rather than a note -- not by
+                        // adding a third spelling of the recurrence here.
                     }
                     };
                     if (fold_split != nullptr) {
@@ -1152,14 +1163,10 @@ void linear_attn_layer_body(
                         fla_pass(R, slot_ids_d, qo_indptr_d, write_state,
                                  rs_write_state_mask);
                     } else {
-                        // `fla_pass` has an arm for each warp-tiled shape and
-                        // no `else`, so with the kernel gated off it launched
-                        // NOTHING: `core_out` stayed at its zero-initialised
-                        // contents and every GDN layer contributed exactly
-                        // zero to the residual stream. The stopgap that gated
-                        // it says it routes these to "the proven
-                        // non-warp-tiled chunk_gated_delta path" -- this is
-                        // that route, which was never wired.
+                        // The route the state-persist stopgap says it takes
+                        // and never wired: with the warp-tiled kernel gated
+                        // off, a plain slotted prefill goes to the proven
+                        // per-request chunk path.
                         chunk_prefill_per_request();
                     }
                 } else {
