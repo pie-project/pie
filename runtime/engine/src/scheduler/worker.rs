@@ -4796,6 +4796,11 @@ impl BatchScheduler {
             take(&gacc.limbo_ns) / 1_000,
             take(&gacc.limbo_max_ns) / 1_000,
         );
+        let herd_span = {
+            let first = gacc.take_first_us.swap(u64::MAX, Ordering::Relaxed);
+            let last = gacc.take_last_us.swap(0, Ordering::Relaxed);
+            if first == u64::MAX { 0 } else { last.saturating_sub(first) }
+        };
         let (retire_instances, retire_mark, retire_resolve, retire_drop, retire_emit, retire_n) = (
             take(&acc.retire_instances_ns) / 1_000,
             take(&acc.retire_mark_ns) / 1_000,
@@ -4940,6 +4945,7 @@ impl BatchScheduler {
                 ("guest_acq_max_us", guest_acq_max),
                 ("alloc_limbo_us", alloc_limbo),
                 ("alloc_limbo_max_us", alloc_limbo_max),
+                ("guest_take_span_us", herd_span),
                 (
                     "guest_resume_us",
                     if guest_resume_n > 0 {

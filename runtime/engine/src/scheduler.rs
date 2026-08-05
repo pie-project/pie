@@ -451,6 +451,12 @@ pub(crate) struct GuestPhaseAcc {
     /// reasons (store-lock reads, planner lock, queue insert).
     pub limbo_ns: AtomicU64,
     pub limbo_max_ns: AtomicU64,
+    /// Wake-herd WALL span: earliest and latest `take`-return timestamps in
+    /// the window (µs). span ≈ wake_ns sum ⇒ the herd is SERIALIZED (a lock
+    /// on the take path); span ≪ sum ⇒ queue-depth latency (fast-lane
+    /// territory). min is stored as u64::MAX when the window saw no takes.
+    pub take_first_us: AtomicU64,
+    pub take_last_us: AtomicU64,
 }
 
 /// Per-lane run-ahead probe: at every seal, how deep each awaited lane's
@@ -605,6 +611,8 @@ pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
     acq_max_ns: AtomicU64::new(0),
     limbo_ns: AtomicU64::new(0),
     limbo_max_ns: AtomicU64::new(0),
+    take_first_us: AtomicU64::new(u64::MAX),
+    take_last_us: AtomicU64::new(0),
 };
 
 pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {
