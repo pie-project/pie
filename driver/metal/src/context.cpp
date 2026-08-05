@@ -385,7 +385,7 @@ std::string build_caps_json(const Config& cfg,
         rs_cache_slot_bytes =
             static_cast<std::uint32_t>(executor::rs_slot_bytes_for(g));
         rs_cache_slots = executor::rs_slots_for_budget(
-            g, executor::kRsSlotBudgetBytes,
+            g, executor::rs_slot_budget_bytes(),
             std::min(cfg.batching.max_forward_requests,
                      kMetalPagedMaxForwardRequests));
     }

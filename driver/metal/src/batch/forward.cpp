@@ -1276,16 +1276,39 @@ std::uint64_t rs_slot_bytes_for(const DecodeGeometry& g) {
     return gdn_layers * (2 * conv + recur);
 }
 
+std::uint64_t rs_slot_budget_bytes() {
+    const std::uint64_t working_set =
+        static_cast<std::uint64_t>(RawMetalContext::device_working_set_bytes());
+    return std::max<std::uint64_t>(kRsSlotBudgetBytes, working_set / 10);
+}
+
 std::uint32_t rs_slots_for_budget(const DecodeGeometry& g, std::uint64_t budget_bytes,
-                                  std::uint32_t floor_slots) {
+                                  std::uint32_t requested_slots) {
     const std::uint64_t per_slot = rs_slot_bytes_for(g);
     // A geometry with no linear-attention layers has no state to slot; the
     // count is then whatever the caller needs, at no cost.
-    if (per_slot == 0) return std::max<std::uint32_t>(floor_slots, 1);
+    if (per_slot == 0) return std::max<std::uint32_t>(requested_slots, 1);
     const std::uint64_t affordable = budget_bytes / per_slot;
+    // `requested_slots` is a CEILING, not a floor. It used to be applied as
+    // `max(slots, requested)`, which made `budget_bytes` decorative: the
+    // request count is `kPagedMaxForwardRequests`, a constant, so every
+    // checkpoint reserved 64 slots at whatever they cost. Qwen3.6-27B's slots
+    // are 170 MiB, so that is 10.6 GiB of recurrent state -- which put the
+    // model 5.2 GiB over this device and, at the batch sizes that did load,
+    // returned `kIOGPUCommandBufferCallbackErrorOutOfMemory` from the command
+    // queue. That arrived as a command buffer which never ran, so every PTIR
+    // lane's status still held its zero fill, and the runtime read the zeros
+    // back as every lane faulting -- deterministic above concurrency 4, and
+    // naming neither memory nor the batch it came from.
+    //
+    // Reserving fewer slots than the driver ADVERTISES would hang rather than
+    // queue, so the two are kept equal: `context.cpp` derives the advertised
+    // `max_forward_requests` from this same call. Fewer admitted requests
+    // queue; a device that is overrun does not.
     std::uint64_t slots = std::min<std::uint64_t>(affordable, kPhase1bRsSlots);
-    slots = std::max<std::uint64_t>(slots, std::max<std::uint32_t>(floor_slots, 1));
-    return std::uint32_t(slots);
+    slots = std::min<std::uint64_t>(
+        slots, std::max<std::uint32_t>(requested_slots, 1));
+    return std::uint32_t(std::max<std::uint64_t>(slots, 1));
 }
 
 uint64_t MetalExecutor::Impl::rs_slot_bytes() const {
@@ -2510,7 +2533,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // floor is the concurrency the caller asked for: a driver that reserves
     // fewer slots than it accepts requests hangs rather than queues.
     geom.max_slots = int(rs_slots_for_budget(
-        geom, kRsSlotBudgetBytes,
+        geom, rs_slot_budget_bytes(),
         std::min(cfg.max_forward_requests, kPagedMaxForwardRequests)));
     // Bounded, actually allocated/bound multi-batch capacity.  The paged path
     // has no hidden ring fallback: every advertised row/request has an IO,
@@ -3334,6 +3357,12 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         schedule, in, &batch_err, dispatch_callbacks);
     impl_->pending_logits_stage_.clear();
     if (!ran) {
+        // The only account of why a paged batch was refused. Without it the
+        // caller sees a poison epoch, and any PTIR group riding this forward
+        // reports lanes that never dispatched -- neither of which names the
+        // reason. The simple-family path already prints its rejections.
+        std::cerr << "[pie-driver-metal] paged batch forward rejected: "
+                  << batch_err << "\n";
         for (const std::size_t member : accepted_members) {
             errors[member] = batch_err;
         }
