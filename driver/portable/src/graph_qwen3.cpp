@@ -707,9 +707,24 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
                 gate = ggml_relu(ctx, ggml_sub(ctx, gate, cutoff));
             }
 
-            gate = spec.ffn_use_gelu ? ggml_gelu(ctx, gate)
-                                     : ggml_silu(ctx, gate);
-            auto* gated = ggml_mul(ctx, gate, up);
+            // Gated activation as a single GGML_OP_GLU node rather than
+            // ggml_silu/ggml_gelu followed by ggml_mul.
+            //
+            // The two-node form cannot be fused by the Metal backend:
+            // ggml_metal_op_unary() returns 1 unconditionally and never looks
+            // ahead at the next node (unlike ggml_metal_op_norm(), which does
+            // fold RMS_NORM+MUL). So every layer pays an extra kernel dispatch,
+            // an extra MTLBarrierScopeBuffers drain between the two nodes, and
+            // a write plus re-read of the intermediate activation.
+            //
+            // GGML_GLU_OP_SWIGLU/GEGLU are numerically identical to the pair
+            // they replace — GEGLU uses the same tanh approximation as
+            // ggml_gelu — so this is a graph-shape change only.
+            //
+            // No effect on CUDA, which already pattern-matches
+            // {GGML_OP_UNARY, GGML_OP_MUL} and dispatches a fused kernel.
+            auto* gated = spec.ffn_use_gelu ? ggml_geglu_split(ctx, gate, up)
+                                            : ggml_swiglu_split(ctx, gate, up);
             ffn_out = ggml_mul_mat(ctx, L.down_proj, gated);
         }
 
