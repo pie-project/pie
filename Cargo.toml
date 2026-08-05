@@ -102,8 +102,8 @@ rust-version = "1.91"
 #
 # or add a `[patch]` section, which leaves this file alone.
 [workspace.dependencies]
-ztensor = "2.0"
-ztensor-compat = "2.0"
+ztensor = "=2.0.0"
+ztensor-compat = "=2.0.0"
 
 # Shared lint table. Opt in per crate with `[lints] workspace = true`; today
 # only the `compiler/*` crates do, because they are the only ones at zero
