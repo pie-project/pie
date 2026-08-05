@@ -62,6 +62,13 @@ pub struct Pipeline {
     /// Per-lane frame sequence for Vesuvius frame submission (k > 1): each
     /// `forward.submit` frame on this pipeline takes the next number.
     pub(crate) frame_seq: std::sync::atomic::AtomicU64,
+    /// Depth-1 deferred allocation (`PIE_DEFER_ALLOC=1`): the handle of the
+    /// one frame whose grant park was deferred to an engine completion task
+    /// ([`fire::DeferredSubmission`]). Lives here because the pipeline IS the
+    /// ordering domain — the next frame entering this pipeline must await it
+    /// before preparing (its pass mutation feeds that prepare). `None`
+    /// whenever the flag is off or the lane has no deferred frame in flight.
+    pub(crate) deferred: Mutex<Option<fire::DeferredSubmission>>,
 }
 
 impl Pipeline {
@@ -78,6 +85,7 @@ impl Pipeline {
                     .is_none_or(|fires| fires.lock().unwrap().is_empty())
             }),
             frame_seq: std::sync::atomic::AtomicU64::new(0),
+            deferred: Mutex::new(None),
         }
     }
 

@@ -1034,6 +1034,92 @@ impl Drop for WaitRegistration<'_> {
     }
 }
 
+/// What [`ResidencyPlanner::acquire_or_enqueue`] resolved to. `Granted` and
+/// `NotResident` are [`Acquired::Granted`] / [`Acquired::Yield`] one-to-one;
+/// `Ticket` is the parked case handed back instead of awaited, so the caller
+/// (the deferred-allocation fire path, `PIE_DEFER_ALLOC=1`) can collect the
+/// grant from its own task while the guest keeps running.
+pub(crate) enum Enqueued {
+    Granted(AllocationGrant),
+    Ticket(AllocationTicket),
+    /// The asking process is out of the resident set (or in transfer): the
+    /// fire path must settle its own tail and wait out the eviction — same
+    /// contract as [`Acquired::Yield`].
+    NotResident,
+}
+
+/// A parked allocation ask, owned: the queue entry was inserted at its FCFS
+/// position by [`ResidencyPlanner::acquire_or_enqueue`] (the park side
+/// effects — census, `notify_lane_close`, poke — already happened), and
+/// [`AllocationTicket::collect`] runs the exact notified/collect loop
+/// [`ResidencyPlanner::acquire`] would have run inline. Dropping an
+/// uncollected ticket deregisters the ask exactly like [`WaitRegistration`]
+/// (cancellation on process death); a parked outcome's reservation returns
+/// to the pool through the removed entry's drop.
+pub(crate) struct AllocationTicket {
+    planner: Arc<ResidencyPlanner>,
+    key: EntryKey,
+    notify: Arc<Notify>,
+    /// When the ask parked — the `park_ns` accounting moves here with the
+    /// collect loop.
+    park_started_us: u64,
+    collected: bool,
+}
+
+impl AllocationTicket {
+    /// The park-collect half of [`ResidencyPlanner::acquire`]: arm the
+    /// notify, probe the outcome, sleep until served. Returns
+    /// [`Acquired::Yield`] when the owner was chosen for eviction while
+    /// parked (the caller settles the tail and waits out the eviction, as
+    /// the inline path does).
+    pub(crate) async fn collect(mut self) -> Result<Acquired, PlannerError> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.planner.collect_outcome(self.key) {
+                Collect::Ready(outcome) => {
+                    self.collected = true;
+                    ptrace!("collect key={:?} ok={}", self.key, outcome.is_ok());
+                    if matches!(outcome, Err(PlannerError::Cancelled)) {
+                        self.planner
+                            .stats
+                            .cancelled_waits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    // The collection unblocked the next head.
+                    self.planner.poke();
+                    {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let acc = &crate::scheduler::GUEST_PHASES;
+                        let waited = crate::scheduler::fire_timing_now_us()
+                            .saturating_sub(self.park_started_us)
+                            * 1_000;
+                        acc.park_ns.fetch_add(waited, Relaxed);
+                        acc.park_max_ns.fetch_max(waited, Relaxed);
+                    }
+                    return outcome.map(Acquired::Granted);
+                }
+                Collect::Yield => {
+                    self.collected = true;
+                    self.planner.poke();
+                    return Ok(Acquired::Yield);
+                }
+                Collect::Wait => {}
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for AllocationTicket {
+    fn drop(&mut self) {
+        if !self.collected {
+            self.planner.cancel_waiter(self.key);
+        }
+    }
+}
+
 impl ResidencyPlanner {
     pub fn new(port: Arc<dyn PoolPort>, config: PlannerConfig) -> Self {
         Self {
@@ -1488,6 +1574,150 @@ impl ResidencyPlanner {
                         notified.await;
                     }
                 }
+            }
+        }
+    }
+
+    /// [`Self::acquire`]'s decision half, non-blocking (the deferred-
+    /// allocation path, `PIE_DEFER_ALLOC=1`; `acquire` itself is untouched).
+    /// Fast paths, E6 progress notes, `Impossible` sync checks, park census
+    /// probes and the queue insert at the SAME FCFS position (including
+    /// `notify_lane_close`) are reproduced from `acquire` exactly; where
+    /// `acquire` would enter the notified/collect loop this returns the
+    /// owned [`AllocationTicket`] instead, to be awaited via
+    /// [`AllocationTicket::collect`] from the caller's own task.
+    pub(crate) fn acquire_or_enqueue(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        quorum_id: ProcessId,
+        demand: Demand,
+    ) -> Result<Enqueued, PlannerError> {
+        if demand.is_zero() {
+            // E6 progress event — see `acquire`'s zero-demand path.
+            if self.waiters.load(Ordering::Acquire) != 0
+                || self.nonresident.load(Ordering::Acquire) != 0
+            {
+                self.note_progress(pid);
+            }
+            return Ok(Enqueued::Granted(AllocationGrant::empty()));
+        }
+        // Fast path — see `acquire`: uncontended is two free-list pops; the
+        // opt-in head-harmless bypass serves small asks that cannot divert
+        // pages the FCFS head is entitled to.
+        let uncontended = self.waiters.load(Ordering::Acquire) == 0
+            && self.nonresident.load(Ordering::Acquire) == 0;
+        if !uncontended && fast_small_bypass_enabled() && demand.rs_slots == 0 {
+            let (free_now, _) = self.port.device_stats();
+            let head_covered = self.with_inner(|inner| {
+                let head_shortfall = inner
+                    .unmet_head()
+                    .map(|(_, waiter)| waiter.kv_need().saturating_sub(inner.accum.len() as u32))
+                    .unwrap_or(0);
+                free_now >= demand.kv_pages.saturating_add(head_shortfall)
+            });
+            if head_covered && let Some(grant) = self.try_reserve(demand) {
+                use std::sync::atomic::Ordering::Relaxed;
+                crate::scheduler::GUEST_PHASES
+                    .fast_small_n
+                    .fetch_add(1, Relaxed);
+                self.note_progress(pid);
+                return Ok(Enqueued::Granted(grant));
+            }
+        }
+        if !uncontended {
+            // E6 progress: this process is asking to fire again.
+            self.note_progress(pid);
+        }
+        if uncontended && let Some(grant) = self.try_reserve(demand) {
+            return Ok(Enqueued::Granted(grant));
+        }
+        // Exact-arithmetic exhaustion check before parking — slow path only,
+        // as in `acquire`.
+        let limbo_started_us = crate::scheduler::fire_timing_now_us();
+        let (_, kv_total) = self.port.device_stats();
+        if demand.kv_pages > kv_total {
+            return Err(PlannerError::Impossible {
+                need: demand.kv_pages,
+                total: kv_total,
+            });
+        }
+        if demand.rs_slots > 0 {
+            let (_, rs_total) = self.port.rs_stats();
+            if demand.rs_slots > rs_total {
+                return Err(PlannerError::Impossible {
+                    need: demand.rs_slots,
+                    total: rs_total,
+                });
+            }
+        }
+        enum Parked {
+            Entry(EntryKey, Arc<Notify>),
+            NotResident,
+            Gone,
+        }
+        let parked = self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get(&pid) else {
+                return Parked::Gone;
+            };
+            if proc.state != Residency::Resident {
+                return Parked::NotResident;
+            }
+            let key = (proc.seq, inner.next_id);
+            inner.next_id += 1;
+            let notify = Arc::new(Notify::new());
+            inner.queue.insert(
+                key,
+                Waiter {
+                    pid,
+                    kind: WaitKind::Allocation {
+                        demand,
+                        notify: notify.clone(),
+                        outcome: None,
+                        yielded: false,
+                    },
+                },
+            );
+            Parked::Entry(key, notify)
+        });
+        match parked {
+            Parked::Gone => Err(PlannerError::Cancelled),
+            Parked::NotResident => Ok(Enqueued::NotResident),
+            Parked::Entry(key, notify) => {
+                self.stats.parks.fetch_add(1, Ordering::Relaxed);
+                ptrace!("park key={:?} pid={} kv={}", key, pid, demand.kv_pages);
+                let park_started_us = crate::scheduler::fire_timing_now_us();
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let acc = &crate::scheduler::GUEST_PHASES;
+                    acc.park_n.fetch_add(1, Relaxed);
+                    let (free_now, _) = self.port.device_stats();
+                    if free_now as u64 >= u64::from(demand.kv_pages) {
+                        acc.park_free_n.fetch_add(1, Relaxed);
+                    }
+                }
+                // The park empties this lane's seat in the wait-all quorum so
+                // frames seal without it; rejoin is implicit on the lane's
+                // next accepted fire — for a deferred frame, the engine
+                // completion task's own submission.
+                crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let acc = &crate::scheduler::GUEST_PHASES;
+                    let limbo = crate::scheduler::fire_timing_now_us()
+                        .saturating_sub(limbo_started_us)
+                        * 1_000;
+                    acc.limbo_ns.fetch_add(limbo, Relaxed);
+                    acc.limbo_max_ns.fetch_max(limbo, Relaxed);
+                }
+                let ticket = AllocationTicket {
+                    planner: Arc::clone(self),
+                    key,
+                    notify,
+                    park_started_us,
+                    collected: false,
+                };
+                self.poke();
+                Ok(Enqueued::Ticket(ticket))
             }
         }
     }
@@ -4081,6 +4311,95 @@ mod starvation_race_tests {
         );
 
         parked.abort();
+    }
+
+    /// The deferred-allocation contract's cancellation half: dropping an
+    /// uncollected [`AllocationTicket`] must deregister the parked ask,
+    /// exactly like dropping an inline `acquire` future (process-death
+    /// cleanup — a dead process's deferred frame must not hold the FCFS
+    /// head hostage).
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_an_uncollected_ticket_deregisters_the_ask() {
+        let pool = Arc::new(RacePool::new(4));
+        let planner = Arc::new(ResidencyPlanner::new(
+            pool.clone(),
+            PlannerConfig::default(),
+        ));
+
+        // A running holder keeps the wedge predicate false so the parked ask
+        // is not destroyed on arrival by the starvation rung.
+        let holder = ProcessId::new_v4();
+        planner.register(holder);
+        planner.note_admitted(holder);
+
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let demand = Demand {
+            kv_pages: 1, // the pool starts empty, so the ask must park
+            rs_slots: 0,
+        };
+        let ticket = match planner.acquire_or_enqueue(pid, pid, demand) {
+            Ok(Enqueued::Ticket(ticket)) => ticket,
+            Ok(Enqueued::Granted(_)) => panic!("an empty pool cannot grant"),
+            Ok(Enqueued::NotResident) => panic!("the process is resident"),
+            Err(error) => panic!("enqueue failed: {error}"),
+        };
+        assert_eq!(planner.diagnostics().queue.len(), 1, "the ask parked FCFS");
+
+        drop(ticket);
+        assert_eq!(
+            planner.diagnostics().queue.len(),
+            0,
+            "dropping an uncollected ticket must remove the queue entry"
+        );
+    }
+
+    /// The deferred-allocation contract's service half: a ticket collects the
+    /// grant the drain serves — same outcome the inline collect loop would
+    /// have returned, from a task that is not the enqueuer's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ticket_collects_the_grant_the_drain_serves() {
+        let pool = Arc::new(RacePool::new(4));
+        let planner = Arc::new(ResidencyPlanner::new(
+            pool.clone(),
+            PlannerConfig::default(),
+        ));
+
+        let holder = ProcessId::new_v4();
+        planner.register(holder);
+        planner.note_admitted(holder);
+
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let demand = Demand {
+            kv_pages: 2,
+            rs_slots: 0,
+        };
+        let ticket = match planner.acquire_or_enqueue(pid, pid, demand) {
+            Ok(Enqueued::Ticket(ticket)) => ticket,
+            _ => panic!("an empty pool must park the ask"),
+        };
+
+        // Pages come back; the freed poke drains the queue head into a
+        // parked outcome the ticket then collects.
+        pool.refill_after_stall(4, 0);
+        planner.pages_freed();
+
+        let collected = tokio::time::timeout(std::time::Duration::from_secs(5), ticket.collect())
+            .await
+            .expect("collect must resolve once the pool refills");
+        match collected {
+            Ok(Acquired::Granted(grant)) => drop(grant),
+            Ok(Acquired::Yield) => panic!("nothing evicted this process"),
+            Err(error) => panic!("collect failed: {error}"),
+        }
+        assert_eq!(
+            planner.diagnostics().queue.len(),
+            0,
+            "the collected entry left the queue"
+        );
     }
 }
 
