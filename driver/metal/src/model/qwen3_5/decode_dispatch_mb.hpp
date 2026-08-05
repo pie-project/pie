@@ -128,6 +128,50 @@ inline int qmm_bn(int out_vec, int N) {
     return best;
 }
 
+/// The threadgroup count past which this GEMM stops caring about more of them.
+///
+/// The same number the sweep above the `qmm_bn` comment reports: ~380 GFLOP/s
+/// at 16 threadgroups, ~900 at 32, ~1600 at 112, saturating past ~200.
+inline constexpr int kQmmSaturationTg = 200;
+
+/// `qmm_bn` for a family whose GEMM has no split-K behind it.
+///
+/// The rule above is correct *because* the split supplies threadgroups when the
+/// output tiles do not. A family that dispatches no split has no such supply,
+/// and taking the widest tile then starves the machine: at M=128 with BM=64 a
+/// projection to 1024 columns gets `1024/64 * 128/64` = 32 threadgroups, which
+/// the curve prices at a third of what the same work does at 200.
+///
+/// So this restores what the split retired — widest tile that still fills the
+/// machine, narrowest when nothing does. Measured with `roofline_probe` at
+/// M=128, BM=64, in GFLOP/s, with the rule's choice in bold:
+///
+///     N        BN=16    BN=32    BN=64
+///     512     *2187*    1829     1054
+///     1024    *3249*    3115     2234
+///     2048    *3399*    3346     3333
+///     3584     3595    *3904*    3098
+///     6144     3829    *4302*    4012
+///
+/// The rule picks the measured best at every one of them, and BN=64 -- what the
+/// unconditional rule would have chosen for all five -- is optimal at none.
+///
+/// BN partitions output columns only, so this is bit-exact whichever way it
+/// goes; it decides how many times a weight tile is dequantized, not what the
+/// sum is.
+inline int qmm_bn_unsplit(int out_vec, int N) {
+    const int bm = qmm_bm(N);
+    if (N < kQmmMinBatch || N % bm != 0) return 0;
+    const int row_tiles = N / bm;
+    int narrowest = 0, widest_that_fills = 0;
+    for (int bn : {16, 32, 64}) {
+        if (out_vec % bn != 0) continue;
+        if (narrowest == 0) narrowest = bn;
+        if ((out_vec / bn) * row_tiles >= kQmmSaturationTg) widest_that_fills = bn;
+    }
+    return widest_that_fills != 0 ? widest_that_fills : narrowest;
+}
+
 // Split the K dimension when the output tiles alone leave the machine short.
 // MLX picks the split to land near 512 threadgroups (backend/metal/
 // quantized.cpp:880) and sends every transposed non-batched decode down this

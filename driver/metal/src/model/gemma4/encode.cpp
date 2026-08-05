@@ -239,7 +239,10 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
     if (const KN kn = qmv_kn(d.kind, g, d.layer); kn.N != 0) {
         const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
         const int bm = qmm_bm(M);
-        const int bn = qmm_bn(kn.N, M);
+        // `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only
+        // where split-K supplies the threadgroups the wide tile gives up, and
+        // this family dispatches no split (see `launch_shape_mb`).
+        const int bn = qmm_bn_unsplit(kn.N, M);
         const int wide = qmm_bm_slot(bm);
         // No split-K here either; see `launch_shape_mb`.
         const int split = 0;
@@ -388,7 +391,10 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
     if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
         const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
         const int bm = qmm_bm(M);
-        const int bn = qmm_bn(kn.N, M);
+        // Same chooser as `pso_for_mb`, for the same reason -- and it has to be
+        // the same one: the grid and the pipeline disagreeing about BN is a
+        // dispatch that computes the wrong thing rather than one that refuses.
+        const int bn = qmm_bn_unsplit(kn.N, M);
         // NO split-K. The split GEMM accumulates partial sums into a split
         // buffer and needs a reduce pass to fold them; qwen3.5 has both, this
         // family has neither -- so a split dispatch here wrote partials nobody
