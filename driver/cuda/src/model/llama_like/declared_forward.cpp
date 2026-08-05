@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 
+#include "model/declared/weights.hpp"
 #include "batch/supergraph.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/embed.hpp"
@@ -44,37 +45,52 @@ using pie_forward::PieForwardOpKind;
 using pie_forward::PieForwardQkNorm;
 using pie_forward::PieForwardRopeKind;
 
-// A plan weight name split into its layer index and field: "layer.3.qkv" →
-// {3, "qkv"}; prologue/epilogue names ("embed", "final_norm") keep layer -1.
-// The vocabulary is `forward/src/family.rs`'s and nothing else; anything the
-// parse cannot place throws, loudly, because a name the resolver does not
-// know means the trace and this executor have drifted.
-struct ParsedWeightName {
-    int layer = -1;
-    std::string_view field;
-};
+// The name grammar is `model/declared/weights.hpp`'s — it was identical in
+// every family executor, which is the first thing that says these executors
+// wanted to be one.
+using declared::ParsedWeightName;
+using declared::parse_weight_name;
+using declared::throw_unknown_weight;
 
-[[noreturn]] void throw_unknown_weight(std::string_view name) {
-    throw std::runtime_error(
-        "declared forward: unknown weight name '" + std::string(name) +
-        "' (trace vocabulary is forward/src/family.rs's)");
-}
-
-ParsedWeightName parse_weight_name(std::string_view name) {
-    constexpr std::string_view prefix = "layer.";
-    if (name.substr(0, prefix.size()) != prefix) {
-        return ParsedWeightName{-1, name};
-    }
-    const std::size_t dot = name.find('.', prefix.size());
-    if (dot == std::string_view::npos) throw_unknown_weight(name);
-    int layer = -1;
-    const char* first = name.data() + prefix.size();
-    const char* last = name.data() + dot;
-    const auto [ptr, ec] = std::from_chars(first, last, layer);
-    if (ec != std::errc() || ptr != last || layer < 0) {
+// This family's half of `declared::WeightBinder`: a traced name against
+// Qwen3Weights. Every arm goes through it, so no arm names a struct field —
+// which is what lets an arm be shared with a family whose field is spelled
+// differently (qwen3_5's `attn_norm_pre` is this family's `attn_norm`).
+const DeviceTensor* bind_llama_like_weight(
+    const void* ctx, const ParsedWeightName& nm, std::string_view name)
+{
+    const auto& w = *static_cast<const Qwen3Weights*>(ctx);
+    if (nm.layer < 0) {
+        if (nm.field == "embed") return w.embed;
+        if (nm.field == "final_norm") return w.final_norm;
+        if (nm.field == "lm_head") return w.lm_head;
         throw_unknown_weight(name);
     }
-    return ParsedWeightName{layer, name.substr(dot + 1)};
+    if (nm.layer >= static_cast<int>(w.layers.size())) {
+        throw_unknown_weight(name);
+    }
+    const Qwen3LayerWeights& l = w.layers[static_cast<std::size_t>(nm.layer)];
+    // The vocabulary is the TRACE's (`forward/src/dsl.rs`'s `Layer`), which
+    // is why this table is the family's whole contribution: `gate_up` is one
+    // traced name whether or not the checkpoint bound a fused bank, and the
+    // arm asks for the split halves by field when it did not.
+    if (nm.field == "attn_norm") return l.attn_norm;
+    if (nm.field == "mlp_norm") return l.mlp_norm;
+    if (nm.field == "q_norm") return l.q_norm;
+    if (nm.field == "k_norm") return l.k_norm;
+    if (nm.field == "qkv") return l.qkv_proj_fused;
+    if (nm.field == "q_proj") return l.q_proj;
+    if (nm.field == "k_proj") return l.k_proj;
+    if (nm.field == "v_proj") return l.v_proj;
+    if (nm.field == "o_proj") return l.o_proj;
+    if (nm.field == "q_bias") return l.q_bias;
+    if (nm.field == "k_bias") return l.k_bias;
+    if (nm.field == "v_bias") return l.v_bias;
+    if (nm.field == "gate_up") return l.gate_up_proj_fused;
+    if (nm.field == "gate_proj") return l.gate_proj;
+    if (nm.field == "up_proj") return l.up_proj;
+    if (nm.field == "down") return l.down_proj;
+    throw_unknown_weight(name);
 }
 
 const Qwen3LayerWeights& layer_of(
@@ -427,6 +443,9 @@ void llama_like_forward_declared(
     std::uint32_t declared_max_layers,
     std::uint32_t declared_full_depth_rows)
 {
+    // Every weight an arm reads goes through the binder (see its header):
+    // the arms name what the TRACE names, never a struct field.
+    const declared::WeightBinder wb{&bind_llama_like_weight, &w};
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
     // below — the parity gate's third leg proves it — with every choice
@@ -800,7 +819,7 @@ void llama_like_forward_declared(
             const std::string_view name = plan.weight_name(op);
             if (name != "embed") throw_unknown_weight(name);
             kernels::launch_embed_bf16(
-                token_ids, require(w.embed, name)->data(), ws.y.data(),
+                token_ids, wb.require(name).data(), ws.y.data(),
                 N, H, V, stream);
             break;
         }
@@ -820,11 +839,11 @@ void llama_like_forward_declared(
                     // hand-written scratch) is normed into norm_y; the
                     // following ResidualAdd lands it on the stream.
                     kernels::launch_rmsnorm_bf16(
-                        ws.norm_x.data(), require(layer.attn_norm, name)->data(),
+                        ws.norm_x.data(), wb.require(name).data(),
                         ws.norm_y.data(), N, H, eps, stream);
                 } else {
                     kernels::launch_rmsnorm_bf16(
-                        ws.y.data(), require(layer.attn_norm, name)->data(),
+                        ws.y.data(), wb.require(name).data(),
                         ws.norm_x.data(), N, H, eps, stream);
                 }
             } else if (nm.field == "mlp_norm") {
@@ -832,11 +851,11 @@ void llama_like_forward_declared(
                 if (post_norm) {
                     // Post-norm: the down_proj OUTPUT (in norm_x) → norm_y.
                     kernels::launch_rmsnorm_bf16(
-                        ws.norm_x.data(), require(layer.mlp_norm, name)->data(),
+                        ws.norm_x.data(), wb.require(name).data(),
                         ws.norm_y.data(), N, H, eps, stream);
                 } else {
                     kernels::launch_rmsnorm_bf16(
-                        ws.y.data(), require(layer.mlp_norm, name)->data(),
+                        ws.y.data(), wb.require(name).data(),
                         ws.norm_y.data(), N, H, eps, stream);
                 }
             } else if (nm.field == "q_norm") {
@@ -845,19 +864,19 @@ void llama_like_forward_declared(
                 // the hand-written `rmsnorm_qk` global branch, verbatim.
                 const auto& layer = layer_of(w, nm, name);
                 kernels::launch_rmsnorm_bf16(
-                    ws.q.data(), require(layer.q_norm, name)->data(),
+                    ws.q.data(), wb.require(name).data(),
                     ws.q.data(), N, Hq, eps, stream);
             } else if (nm.field == "k_norm") {
                 const auto& layer = layer_of(w, nm, name);
                 kernels::launch_rmsnorm_bf16(
-                    ws.k.data(), require(layer.k_norm, name)->data(),
+                    ws.k.data(), wb.require(name).data(),
                     ws.k.data(), N, Hk, eps, stream);
             } else if (nm.layer < 0 && nm.field == "final_norm") {
                 // Deferred to LmHead: the hand-written epilogue interleaves
                 // the final norm with the logit-row gather (norm is row-wise,
                 // so gather-then-norm equals norm-then-gather), and copying
                 // that block whole is what keeps the two paths bit-identical.
-                require(w.final_norm, name);
+                &wb.require(name);
             } else {
                 throw_unknown_weight(name);
             }
@@ -874,15 +893,15 @@ void llama_like_forward_declared(
             const auto& layer = layer_of(w, nm, name);
             if (nm.field == "q_bias") {
                 kernels::launch_add_bias_bf16(
-                    ws.q.data(), require(layer.q_bias, name)->data(),
+                    ws.q.data(), wb.require(name).data(),
                     N, Hq, stream);
             } else if (nm.field == "k_bias") {
                 kernels::launch_add_bias_bf16(
-                    ws.k.data(), require(layer.k_bias, name)->data(),
+                    ws.k.data(), wb.require(name).data(),
                     N, Hk, stream);
             } else if (nm.field == "v_bias") {
                 kernels::launch_add_bias_bf16(
-                    ws.v.data(), require(layer.v_bias, name)->data(),
+                    ws.v.data(), wb.require(name).data(),
                     N, Hk, stream);
             } else {
                 throw_unknown_weight(name);
@@ -910,24 +929,24 @@ void llama_like_forward_declared(
                 // it here is deleted (rung 2, north-star-dsl.md).
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    ops::WeightView(*require(layer.qkv_proj_fused, name)),
+                    ops::WeightView(wb.require(name)),
                     ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
             } else if (nm.field == "q_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    make_weight_view(require(layer.q_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.q_proj_quant),
                     ws.q.data(), N, Hq, H);
             } else if (nm.field == "k_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    make_weight_view(require(layer.k_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.k_proj_quant),
                     ws.k.data(), N, Hk, H);
             } else if (nm.field == "v_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    make_weight_view(require(layer.v_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.v_proj_quant),
                     ws.v.data(), N, Hk, H);
             } else if (nm.field == "o_proj") {
@@ -938,7 +957,7 @@ void llama_like_forward_declared(
                     // post-norm block, same buffers, same order.
                     ops::gemm_act_x_w(cublas.handle(),
                         ws.attn_out.data(),
-                        make_weight_view(require(layer.o_proj, name),
+                        make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
                         ws.norm_x.data(), N, H, Hq, beta);
                 } else {
@@ -947,7 +966,7 @@ void llama_like_forward_declared(
                     // branch.
                     ops::gemm_act_x_w(cublas.handle(),
                         ws.attn_out.data(),
-                        make_weight_view(require(layer.o_proj, name),
+                        make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
                         ws.y.data(), N, H, Hq, beta);
                 }
@@ -966,13 +985,15 @@ void llama_like_forward_declared(
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
                         mlp_in,
-                        make_weight_view(require(layer.gate_proj, name),
-                                         layer.gate_proj_quant),
+                        make_weight_view(
+                            &wb.require_field(nm.layer, "gate_proj", name),
+                            layer.gate_proj_quant),
                         ws.gate.data(), N, I, H);
                     ops::gemm_act_x_w(cublas.handle(),
                         mlp_in,
-                        make_weight_view(require(layer.up_proj, name),
-                                         layer.up_proj_quant),
+                        make_weight_view(
+                            &wb.require_field(nm.layer, "up_proj", name),
+                            layer.up_proj_quant),
                         ws.up.data(), N, I, H);
                 }
             } else if (nm.field == "down") {
@@ -981,13 +1002,13 @@ void llama_like_forward_declared(
                     // Rmsnorm(mlp_norm) + ResidualAdd — as o_proj above.
                     ops::gemm_act_x_w(cublas.handle(),
                         ws.gate.data(),
-                        make_weight_view(require(layer.down_proj, name),
+                        make_weight_view(&wb.require(name),
                                          layer.down_proj_quant),
                         ws.norm_x.data(), N, H, I, beta);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
                         ws.gate.data(),
-                        make_weight_view(require(layer.down_proj, name),
+                        make_weight_view(&wb.require(name),
                                          layer.down_proj_quant),
                         ws.y.data(), N, H, I, beta);
                 }
@@ -1029,11 +1050,11 @@ void llama_like_forward_declared(
             const auto& layer = layer_of(w, nm, name);
             if (nm.field == "q_norm") {
                 kernels::launch_rmsnorm_bf16(
-                    ws.q.data(), require(layer.q_norm, name)->data(),
+                    ws.q.data(), wb.require(name).data(),
                     ws.q.data(), N * num_q_heads, d, eps, stream);
             } else if (nm.field == "k_norm") {
                 kernels::launch_rmsnorm_bf16(
-                    ws.k.data(), require(layer.k_norm, name)->data(),
+                    ws.k.data(), wb.require(name).data(),
                     ws.k.data(), N * num_kv_heads, d, eps, stream);
             } else {
                 throw_unknown_weight(name);
@@ -1927,8 +1948,8 @@ void llama_like_forward_declared(
             // Tied embeddings trace the lm head as "embed"; either way the
             // binding already aliased `w.lm_head` accordingly.
             const DeviceTensor* lm_head =
-                name == "embed" ? require(w.embed, name)
-                : name == "lm_head" ? require(w.lm_head, name)
+                name == "embed" ? &wb.require(name)
+                : name == "lm_head" ? &wb.require(name)
                 : nullptr;
             if (lm_head == nullptr) throw_unknown_weight(name);
             // The hand-written epilogue, copied whole (T==1, no fused-AR

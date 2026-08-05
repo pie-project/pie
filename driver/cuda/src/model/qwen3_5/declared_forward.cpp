@@ -1,4 +1,5 @@
 #include "model/qwen3_5/declared_forward.hpp"
+#include "model/declared/weights.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -38,32 +39,59 @@ using pie_forward::PieForwardRopeKind;
 // executor's parse (`llama_like/declared_forward.cpp`), same contract: a
 // name the resolver does not know means the trace and this executor have
 // drifted, so it throws rather than half-executing.
-struct ParsedWeightName {
-    int layer = -1;
-    std::string_view field;
-};
+// The name grammar is `model/declared/weights.hpp`'s (it was copied here
+// byte-for-byte; that duplication is what said the executors wanted to be
+// one).
+using declared::ParsedWeightName;
+using declared::parse_weight_name;
+using declared::throw_unknown_weight;
 
-[[noreturn]] void throw_unknown_weight(std::string_view name) {
-    throw std::runtime_error(
-        "declared qwen35 forward: unknown weight name '" + std::string(name) +
-        "' (trace vocabulary is forward/src/family.rs's)");
-}
-
-ParsedWeightName parse_weight_name(std::string_view name) {
-    constexpr std::string_view prefix = "layer.";
-    if (name.substr(0, prefix.size()) != prefix) {
-        return ParsedWeightName{-1, name};
-    }
-    const std::size_t dot = name.find('.', prefix.size());
-    if (dot == std::string_view::npos) throw_unknown_weight(name);
-    int layer = -1;
-    const char* first = name.data() + prefix.size();
-    const char* last = name.data() + dot;
-    const auto [ptr, ec] = std::from_chars(first, last, layer);
-    if (ec != std::errc() || ptr != last || layer < 0) {
+// This family's half of `declared::WeightBinder`. Note `attn_norm` /
+// `mlp_norm`: the SAME traced names llama_like binds, spelled `_pre` in
+// this weights struct — the difference an arm must never see.
+const DeviceTensor* bind_qwen3_5_weight(
+    const void* ctx, const ParsedWeightName& nm, std::string_view name)
+{
+    const auto& w = *static_cast<const Qwen3_5Weights*>(ctx);
+    if (nm.layer < 0) {
+        if (nm.field == "embed") return w.embed;
+        if (nm.field == "final_norm") return w.final_norm;
+        if (nm.field == "lm_head") return w.lm_head;
         throw_unknown_weight(name);
     }
-    return ParsedWeightName{layer, name.substr(dot + 1)};
+    if (nm.layer >= static_cast<int>(w.layers.size())) {
+        throw_unknown_weight(name);
+    }
+    const Qwen3_5LayerWeights& l =
+        w.layers[static_cast<std::size_t>(nm.layer)];
+    // Same TRACE vocabulary as llama_like's binder — note `attn_norm` /
+    // `mlp_norm`, which this weights struct spells `_pre`. That difference
+    // is exactly what an arm must never see.
+    if (nm.field == "attn_norm") return l.attn_norm_pre;
+    if (nm.field == "mlp_norm") return l.mlp_norm_pre;
+    if (nm.field == "gate_up") return l.gate_up_proj_fused;
+    if (nm.field == "gate_proj") return l.gate_proj;
+    if (nm.field == "up_proj") return l.up_proj;
+    if (nm.field == "down") return l.down_proj;
+    // Full-attention layers.
+    if (nm.field == "q_proj") return l.fa_q_proj;
+    if (nm.field == "k_proj") return l.fa_k_proj;
+    if (nm.field == "v_proj") return l.fa_v_proj;
+    if (nm.field == "o_proj") return l.fa_o_proj;
+    if (nm.field == "q_norm") return l.fa_q_norm;
+    if (nm.field == "k_norm") return l.fa_k_norm;
+    if (nm.field == "qgkv") return l.fa_qgkv_proj_fused;
+    // Gated-DeltaNet (linear-attention) layers. `a_log` / `gate_norm` are
+    // pre-converted fp32 arrays, not tensors — the GDN arms read those off
+    // the layer directly; a tensor binder has nothing to say about them.
+    if (nm.field == "in_proj_qkv") return l.la_in_proj_qkv;
+    if (nm.field == "in_proj_z") return l.la_in_proj_z;
+    if (nm.field == "in_proj_a") return l.la_in_proj_a;
+    if (nm.field == "in_proj_b") return l.la_in_proj_b;
+    if (nm.field == "out_proj") return l.la_out_proj;
+    if (nm.field == "dt_bias") return l.la_dt_bias;
+    if (nm.field == "conv") return l.la_conv1d_w;
+    throw_unknown_weight(name);
 }
 
 const Qwen3_5LayerWeights& layer_of(
@@ -216,6 +244,8 @@ bool qwen3_5_forward_declared(
     const std::int32_t* commit_lens,
     const StageHooks* stage_hooks)
 {
+    // Weights reach the arms only through the binder (see its header).
+    const declared::WeightBinder wb{&bind_qwen3_5_weight, &w};
     // Rung 4c-iii: normal decode/prefill fires walk the CLASS trace, in
     // which the declaration stated every kernel; the MTP/verify/legacy
     // service fires keep the semantic walk until 4c-iv brings their
@@ -530,7 +560,7 @@ bool qwen3_5_forward_declared(
             const std::string_view name = plan.weight_name(op);
             if (name != "embed") throw_unknown_weight(name);
             kernels::launch_embed_bf16(
-                token_ids, require(w.embed, name)->data(), ws.y.data(),
+                token_ids, wb.require(name).data(), ws.y.data(),
                 N, H, cfg.vocab_size, stream);
             break;
         }
@@ -547,14 +577,14 @@ bool qwen3_5_forward_declared(
             if (nm.field == "attn_norm") {
                 const auto& layer = layer_of(w, nm, name);
                 kernels::launch_rmsnorm_gemma_bf16(
-                    ws.y.data(), require(layer.attn_norm_pre, name)->data(),
+                    ws.y.data(), wb.require(name).data(),
                     ws.norm_x.data(), N, H, eps, stream);
             } else if (nm.field == "mlp_norm") {
                 // The qwen3_5 MLP reads norm_x (not llama_like's norm_y):
                 // qwen3_5_forward_paged's post-attention norm, verbatim.
                 const auto& layer = layer_of(w, nm, name);
                 kernels::launch_rmsnorm_gemma_bf16(
-                    ws.y.data(), require(layer.mlp_norm_pre, name)->data(),
+                    ws.y.data(), wb.require(name).data(),
                     ws.norm_x.data(), N, H, eps, stream);
             } else if (nm.layer < 0 && nm.field == "final_norm") {
                 // Emitted at its op position: the hand-written epilogue
@@ -563,7 +593,7 @@ bool qwen3_5_forward_declared(
                 // opposite interleave from llama_like's epilogue), so the
                 // LmHead arm below only gathers and multiplies.
                 kernels::launch_rmsnorm_gemma_bf16(
-                    ws.y.data(), require(w.final_norm, name)->data(),
+                    ws.y.data(), wb.require(name).data(),
                     ws.norm_x.data(), N, H, eps, stream);
             } else {
                 throw_unknown_weight(name);
@@ -581,22 +611,22 @@ bool qwen3_5_forward_declared(
             if (nm.field == "in_proj_qkv") {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
-                    *require(layer.la_in_proj_qkv, name),
+                    wb.require(name),
                     la.mixed_qkv.data(), N, conv_dim, H);
             } else if (nm.field == "in_proj_z") {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
-                    *require(layer.la_in_proj_z, name),
+                    wb.require(name),
                     la.z.data(), N, V_dim, H);
             } else if (nm.field == "in_proj_a") {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
-                    *require(layer.la_in_proj_a, name),
+                    wb.require(name),
                     la.a.data(), N, V_h, H);
             } else if (nm.field == "in_proj_b") {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
-                    *require(layer.la_in_proj_b, name),
+                    wb.require(name),
                     la.b.data(), N, V_h, H);
             // ── Full-attention projections ───────────────────────────
             } else if (nm.field == "qgkv") {
@@ -606,25 +636,25 @@ bool qwen3_5_forward_declared(
                 // check), so a missing bank here is drift, not dispatch.
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
-                    ops::WeightView(*require(layer.fa_qgkv_proj_fused, name)),
+                    ops::WeightView(wb.require(name)),
                     ws.gate_up_fused.data(), N, qgkv_dim, H);
             } else if (nm.field == "q_proj") {
                 // 2×-wide gated q → the packed [query | gate] buffer.
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
-                    make_weight_view(require(layer.fa_q_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.fa_q_proj_quant),
                     la.fa_qg_packed.data(), N, 2 * Hq, H);
             } else if (nm.field == "k_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
-                    make_weight_view(require(layer.fa_k_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.fa_k_proj_quant),
                     ws.k.data(), N, Hk, H);
             } else if (nm.field == "v_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
-                    make_weight_view(require(layer.fa_v_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.fa_v_proj_quant),
                     ws.v.data(), N, Hk, H);
             // ── Output projections (residual folded via beta=1) ──────
@@ -632,12 +662,12 @@ bool qwen3_5_forward_declared(
                 if (linear) {
                     ops::gemm_act_x_w(cublas.handle(),
                         la.core_out_bf16.data(),
-                        *require(layer.la_out_proj, name),
+                        wb.require(name),
                         ws.y.data(), N, H, V_dim, beta);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
                         ws.attn_out.data(),
-                        make_weight_view(require(layer.fa_o_proj, name),
+                        make_weight_view(&wb.require(name),
                                          layer.fa_o_proj_quant),
                         ws.y.data(), N, H, Hq, beta);
                 }
@@ -657,19 +687,21 @@ bool qwen3_5_forward_declared(
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
                         ws.norm_x.data(),
-                        make_weight_view(require(layer.gate_proj, name),
-                                         layer.gate_proj_quant),
+                        make_weight_view(
+                            &wb.require_field(nm.layer, "gate_proj", name),
+                            layer.gate_proj_quant),
                         ws.gate.data(), N, I, H);
                     ops::gemm_act_x_w(cublas.handle(),
                         ws.norm_x.data(),
-                        make_weight_view(require(layer.up_proj, name),
-                                         layer.up_proj_quant),
+                        make_weight_view(
+                            &wb.require_field(nm.layer, "up_proj", name),
+                            layer.up_proj_quant),
                         ws.up.data(), N, I, H);
                 }
             } else if (nm.field == "down") {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.gate.data(),
-                    make_weight_view(require(layer.down_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.down_proj_quant),
                     ws.y.data(), N, H, I, beta);
             } else {
@@ -792,11 +824,11 @@ bool qwen3_5_forward_declared(
             const auto& layer = layer_of(w, nm, name);
             if (nm.field == "q_norm") {
                 kernels::launch_rmsnorm_gemma_bf16(
-                    ws.q.data(), require(layer.fa_q_norm, name)->data(),
+                    ws.q.data(), wb.require(name).data(),
                     ws.q.data(), N * num_q_heads, d, eps, stream);
             } else if (nm.field == "k_norm") {
                 kernels::launch_rmsnorm_gemma_bf16(
-                    ws.k.data(), require(layer.fa_k_norm, name)->data(),
+                    ws.k.data(), wb.require(name).data(),
                     ws.k.data(), N * num_kv_heads, d, eps, stream);
             } else {
                 throw_unknown_weight(name);
@@ -1156,8 +1188,8 @@ case PieForwardOpKind::Launch: {
             // Tied embeddings trace the lm head as "embed"; either way the
             // binding already aliased `w.lm_head` accordingly.
             const DeviceTensor* lm_head =
-                name == "embed" ? require(w.embed, name)
-                : name == "lm_head" ? require(w.lm_head, name)
+                name == "embed" ? &wb.require(name)
+                : name == "lm_head" ? &wb.require(name)
                 : nullptr;
             if (lm_head == nullptr) throw_unknown_weight(name);
             // The hand-written epilogue, copied whole: the final norm
