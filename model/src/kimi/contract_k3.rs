@@ -40,8 +40,10 @@ pub fn author_kimi_k3(b: &mut Builder<'_>) -> Result<(), Error> {
     b.shard_axis_fn(kimi_k3_shard_axis);
     b.shard_embed_tokens();
     a_log_bands(b)?;
-    let gate_second = b.knobs().kimi_k3_moe_gate_up_swapped;
-    bf16_expert_stacks(b, gate_second)?;
+    // Checkpoint order, matching `kimi_k3_moe_gate_up_swapped()` on the
+    // forward side. The two have to agree: a load that swaps the halves and
+    // a matmul that does not is silently wrong output.
+    bf16_expert_stacks(b, /*gate_second=*/ false)?;
     // Deliberately *not* `author_dense_contract`: its
     // `dense_fused_projection_joins` would join `self_attn.{q,k,v}_proj`
     // into one QKV weight, which is right for a llama-like layer and wrong

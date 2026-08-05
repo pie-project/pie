@@ -735,14 +735,13 @@ struct PieLoaderModelFactsView {
 /// The per-family switches, wire form. Mirrors [`FamilyKnobs`] field for
 /// field; the caller reads its environment and fills these, so an author
 /// never consults the environment and equal requests author equal contracts.
+///
+/// These two family names are the only ones in the ABI, and each is here
+/// because the *forward* path reads the same environment variable. A switch
+/// only the loader read would move the weights while the matmuls stayed put
+/// — see [`FamilyKnobs`] for the six that went that way.
 struct PieLoaderFamilyKnobs {
-  bool glm5_moe_gate_up_swapped;
-  bool qwen35_fused_gdn_projection;
   bool qwen35_mtp_int8_lm_head;
-  bool qwen35_moe_gate_up_swapped;
-  bool qwen35_fused_shared_scalar_gate;
-  bool kimi_k3_moe_gate_up_swapped;
-  bool kimi_moe_gate_up_swapped;
   bool nemotron_tp_mamba_sharding;
 };
 

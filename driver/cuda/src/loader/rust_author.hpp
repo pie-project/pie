@@ -92,25 +92,30 @@ using pie_loader::PieLoaderModelRequest;
 /// read them from, with the same defaults. Reading them HERE and sending
 /// values keeps the Rust author environment-blind: equal requests author
 /// equal contracts.
+/// The two per-family switches the loader and the forward both read.
+///
+/// There were eight. Six of them selected a *weight layout* — the
+/// `[up | gate]` reorders for flashinfer's grouped GEMM, the fused GDN input
+/// projection, the folded shared scalar gate — and the forward arms that
+/// consumed those layouts have since been deleted or collapsed to a
+/// constant. What survived was an environment variable that still moved the
+/// bytes while the matmuls no longer moved with them, and that failure mode
+/// is silent: not a missing tensor, wrong numbers. Each is a constant in its
+/// family's author now, written beside the C++ constant it must equal.
+///
+/// So the rule this function is held to: a knob belongs here only while
+/// `driver/cuda/src/model/**` reads the same variable.
 inline PieLoaderFamilyKnobs cuda_family_knobs() {
-    const auto on_by_default = [](const char* name) {
-        const char* v = std::getenv(name);
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    };
     const auto off_by_default = [](const char* name) {
         const char* v = std::getenv(name);
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     };
     return PieLoaderFamilyKnobs{
-        .glm5_moe_gate_up_swapped = on_by_default("PIE_GLM5_MOE_FLASHINFER"),
-        .qwen35_fused_gdn_projection = off_by_default("PIE_QWEN35_FUSED_GDN_PROJ"),
+        // Read by `qwen35_mtp_int8_lm_head_enabled()` in qwen3_5_moe.cpp.
         .qwen35_mtp_int8_lm_head = off_by_default("PIE_QWEN35_MTP_INT8_LM_HEAD"),
-        .qwen35_moe_gate_up_swapped = on_by_default("PIE_QWEN35_MOE_FLASHINFER"),
-        .qwen35_fused_shared_scalar_gate =
-            off_by_default("PIE_QWEN35_FUSED_SHARED_SCALAR_GATE"),
-        .kimi_k3_moe_gate_up_swapped = off_by_default("PIE_KIMI_K3_MOE_FLASHINFER"),
-        .kimi_moe_gate_up_swapped = off_by_default("PIE_KIMI_MOE_FLASHINFER"),
+        // Read by `nemotron_h_tp_mamba_sharding_enabled()` in nemotron_h.hpp,
+        // which also applies the `tp_size <= 1` short-circuit the contract
+        // applies for itself.
         .nemotron_tp_mamba_sharding =
             !loader_config::env_truthy("PIE_NEMOTRON_DISABLE_TP_MAMBA_SHARD"),
     };

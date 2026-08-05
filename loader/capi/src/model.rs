@@ -62,16 +62,15 @@ pub struct PieLoaderModelFactsView {
 /// The per-family switches, wire form. Mirrors [`FamilyKnobs`] field for
 /// field; the caller reads its environment and fills these, so an author
 /// never consults the environment and equal requests author equal contracts.
+///
+/// These two family names are the only ones in the ABI, and each is here
+/// because the *forward* path reads the same environment variable. A switch
+/// only the loader read would move the weights while the matmuls stayed put
+/// — see [`FamilyKnobs`] for the six that went that way.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderFamilyKnobs {
-    pub glm5_moe_gate_up_swapped: bool,
-    pub qwen35_fused_gdn_projection: bool,
     pub qwen35_mtp_int8_lm_head: bool,
-    pub qwen35_moe_gate_up_swapped: bool,
-    pub qwen35_fused_shared_scalar_gate: bool,
-    pub kimi_k3_moe_gate_up_swapped: bool,
-    pub kimi_moe_gate_up_swapped: bool,
     pub nemotron_tp_mamba_sharding: bool,
 }
 
@@ -177,13 +176,7 @@ unsafe fn read_model_request(
         .map_err(bad)?,
         stream_routed_experts: req.stream_routed_experts,
         knobs: FamilyKnobs {
-            glm5_moe_gate_up_swapped: req.knobs.glm5_moe_gate_up_swapped,
-            qwen35_fused_gdn_projection: req.knobs.qwen35_fused_gdn_projection,
             qwen35_mtp_int8_lm_head: req.knobs.qwen35_mtp_int8_lm_head,
-            qwen35_moe_gate_up_swapped: req.knobs.qwen35_moe_gate_up_swapped,
-            qwen35_fused_shared_scalar_gate: req.knobs.qwen35_fused_shared_scalar_gate,
-            kimi_k3_moe_gate_up_swapped: req.knobs.kimi_k3_moe_gate_up_swapped,
-            kimi_moe_gate_up_swapped: req.knobs.kimi_moe_gate_up_swapped,
             nemotron_tp_mamba_sharding: req.knobs.nemotron_tp_mamba_sharding,
         },
     };

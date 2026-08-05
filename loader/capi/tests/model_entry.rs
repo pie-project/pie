@@ -110,13 +110,7 @@ fn llama_request(checkpoint: *const PieLoaderCheckpoint) -> PieLoaderModelReques
         component: 0,
         stream_routed_experts: false,
         knobs: PieLoaderFamilyKnobs {
-            glm5_moe_gate_up_swapped: true,
-            qwen35_fused_gdn_projection: false,
             qwen35_mtp_int8_lm_head: false,
-            qwen35_moe_gate_up_swapped: true,
-            qwen35_fused_shared_scalar_gate: false,
-            kimi_k3_moe_gate_up_swapped: false,
-            kimi_moe_gate_up_swapped: false,
             nemotron_tp_mamba_sharding: true,
         },
     }

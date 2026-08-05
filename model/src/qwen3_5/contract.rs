@@ -24,7 +24,6 @@ pub fn author_qwen3_5(b: &mut Builder<'_>) -> Result<(), Error> {
     // declared.
     b.decoder_layer_prefix_any_of(&["model.language_model.layers.", "model.layers."]);
     gdn_kkv_blocked_shards(b)?;
-    gdn_fused_in_proj_joins(b)?;
     gdn_fp32_parameters(b)?;
     // The speculative-decoding head is a full-attention layer with the same
     // projection names, so it wants the same join. Checkpoints without one
@@ -43,16 +42,16 @@ pub fn author_qwen3_5_moe(b: &mut Builder<'_>) -> Result<(), Error> {
     b.allow_bf16_runtime_quant();
     b.decoder_layer_prefix_any_of(&["model.language_model.layers.", "model.layers."]);
     gdn_kkv_blocked_shards(b)?;
-    gdn_fused_in_proj_joins(b)?;
     gdn_fp32_parameters(b)?;
     // The MoE decode runs through flashinfer's CUTLASS grouped GEMM, which
     // reads fc1's output as [linear|gate]; the checkpoint stores [gate|up].
     // Both the pre-fused and the per-expert stacking paths publish in the
-    // order the bound driver expects.
-    let gate_second = b.knobs().qwen35_moe_gate_up_swapped;
-    b.fused_moe_gate_up_tp_slices(gate_second)?;
+    // order the bound driver expects — `qwen35_moe_gate_up_swapped()` on the
+    // forward side is this same constant, and the two have to agree.
+    const GATE_SECOND: bool = true;
+    b.fused_moe_gate_up_tp_slices(GATE_SECOND)?;
     shared_expert_gate_up_joins(b);
-    hf_moe_expert_stacks(b, gate_second, false)?;
+    hf_moe_expert_stacks(b, GATE_SECOND, false)?;
     b.publish_remaining()
 }
 
@@ -104,12 +103,6 @@ fn gdn_kkv_blocked_shards(b: &mut Builder<'_>) -> Result<(), Error> {
         }
         let k_dim = (conv_dim - v_dim) / 2;
         for leaf in ["in_proj_qkv.weight", "conv1d.weight", "conv1d.bias"] {
-            // The fused layout publishes qkv as the first leg of
-            // `in_proj_qkvz` instead; conv1d still wants it under its own
-            // name either way.
-            if b.knobs().qwen35_fused_gdn_projection && leaf == "in_proj_qkv.weight" {
-                continue;
-            }
             let Some(raw) = b.find(&b.source_name(&format!("{la}{leaf}"))) else {
                 continue;
             };
@@ -122,74 +115,6 @@ fn gdn_kkv_blocked_shards(b: &mut Builder<'_>) -> Result<(), Error> {
             b.define(b.output_name(&raw.name), expr, encoding, Some(shape));
             b.consume(id);
         }
-    }
-    Ok(())
-}
-
-/// Join the Gated DeltaNet input projections the forward reads pre-fused.
-///
-/// `qwen3_5_forward` branches on `la_in_proj_qkvz`: when the fused layout is
-/// selected it wants `[2K | V | V]` (qkv then z) and `[H | H]` (b then a) as
-/// single tensors. Stating that here rather than concatenating after the
-/// load is what makes the layout free — the earlier bind-time version had to
-/// hold the sources *and* the join, which on Qwen3.6-35B-A3B meant 1.4 GB of
-/// duplicate weights.
-///
-/// The qkv leg keeps the per-block shard from [`gdn_kkv_blocked_shards`]; z,
-/// b and a shard uniformly on axis 0, so a plain `split` is right for them.
-fn gdn_fused_in_proj_joins(b: &mut Builder<'_>) -> Result<(), Error> {
-    if !b.knobs().qwen35_fused_gdn_projection {
-        return Ok(());
-    }
-    for layer in 0..b.facts().num_hidden_layers {
-        let la = format!("{}{layer}.linear_attn.", b.decoder_layer_prefix_value());
-        let (Some(qkv), Some(z), Some(bb), Some(aa)) = (
-            b.find(&b.source_name(&format!("{la}in_proj_qkv.weight"))),
-            b.find(&b.source_name(&format!("{la}in_proj_z.weight"))),
-            b.find(&b.source_name(&format!("{la}in_proj_b.weight"))),
-            b.find(&b.source_name(&format!("{la}in_proj_a.weight"))),
-        ) else {
-            continue;
-        };
-        if qkv.shape.is_empty() || z.shape.is_empty() || bb.shape.is_empty() || aa.shape.is_empty()
-        {
-            continue;
-        }
-        let v_dim = z.shape[0];
-        let conv_dim = qkv.shape[0];
-        if conv_dim <= v_dim || (conv_dim - v_dim) % 2 != 0 {
-            continue;
-        }
-        let k_dim = (conv_dim - v_dim) / 2;
-
-        let (blocked, mut qkvz_shape) = gdn_kkv_blocked(b, qkv, k_dim, v_dim);
-        let z_local = b.split(Expr::src(&z.name), 0);
-        qkvz_shape[0] += b.local_extent(v_dim);
-        let encoding = qkv.encoding.clone();
-        let (qkv_id, z_id) = (qkv.id, z.id);
-        b.define(
-            b.output_name(&format!("{la}in_proj_qkvz.weight")),
-            Expr::concat(0, vec![blocked, z_local]),
-            encoding,
-            Some(qkvz_shape),
-        );
-        b.consume(qkv_id);
-        b.consume(z_id);
-
-        let b_local = b.split(Expr::src(&bb.name), 0);
-        let a_local = b.split(Expr::src(&aa.name), 0);
-        let mut ba_shape = bb.shape.clone();
-        ba_shape[0] = b.local_extent(bb.shape[0]) + b.local_extent(aa.shape[0]);
-        let encoding = bb.encoding.clone();
-        let (b_id, a_id) = (bb.id, aa.id);
-        b.define(
-            b.output_name(&format!("{la}in_proj_ba.weight")),
-            Expr::concat(0, vec![b_local, a_local]),
-            encoding,
-            Some(ba_shape),
-        );
-        b.consume(b_id);
-        b.consume(a_id);
     }
     Ok(())
 }
@@ -295,39 +220,17 @@ fn shared_expert_gate_up_join(b: &mut Builder<'_>, layer_prefix: &str) {
     let up_local = b.split(Expr::src(&up.name), 0);
     let rows = b.local_extent(gate.shape[0]) + b.local_extent(up.shape[0]);
 
-    let scalar = if b.knobs().qwen35_fused_shared_scalar_gate {
-        b.find(&b.source_name(&format!("{lp}_gate.weight")))
-            .filter(|scalar| {
-                is_raw(&scalar.encoding, DType::BF16)
-                    && scalar.shape.len() == 2
-                    && scalar.shape[1] == gate.shape[1]
-            })
-    } else {
-        None
-    };
-
-    let encoding = gate.encoding.clone();
-    let cols = gate.shape[1];
-    match scalar {
-        Some(scalar) => {
-            let shape = vec![rows + scalar.shape[0], cols];
-            let expr = Expr::concat(0, vec![gate_local, up_local, Expr::src(&scalar.name)]);
-            b.define(
-                b.output_name(&format!("{lp}.gate_up_gate_proj.weight")),
-                expr,
-                encoding,
-                Some(shape),
-            );
-        }
-        None => {
-            b.define(
-                b.output_name(&format!("{lp}.gate_up_proj.weight")),
-                Expr::concat(0, vec![gate_local, up_local]),
-                encoding,
-                Some(vec![rows, cols]),
-            );
-        }
-    }
+    // The scalar gate stays its own tensor. Folding its row into this slab
+    // was `PIE_QWEN35_FUSED_SHARED_SCALAR_GATE`, and the arm that read the
+    // folded `gate_up_gate_proj` is gone from the forward
+    // (`qwen35_fused_shared_scalar_gate_enabled()` is `false`), so a contract
+    // that published it would name a tensor nothing binds.
+    b.define(
+        b.output_name(&format!("{lp}.gate_up_proj.weight")),
+        Expr::concat(0, vec![gate_local, up_local]),
+        gate.encoding.clone(),
+        Some(vec![rows, gate.shape[1]]),
+    );
 }
 
 /// Every module that carries a shared expert: the decoder layers and, when

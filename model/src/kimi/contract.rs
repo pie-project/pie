@@ -94,7 +94,10 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
     // `[up | gate]` is what flashinfer's fused grouped GEMM reads fc1 as,
     // and choosing the order here costs nothing — it is which `concat` leg
     // goes first. Undoing it later would cost a copy of the whole slab.
-    let gate_second = b.knobs().kimi_moe_gate_up_swapped;
+    // Kimi's grouped GEMM does not take that path, so the halves stay in
+    // checkpoint order; `kimi_moe_gate_up_swapped()` on the forward side is
+    // this same constant, and the two have to agree.
+    const GATE_SECOND: bool = false;
 
     for layer in 0..b.facts().num_hidden_layers {
         let mlp = format!("model.layers.{layer}.mlp.");
@@ -216,7 +219,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
             let up_s = factors(b, &parts[3].name, vec![1, inter_full, h / GROUP], 1);
             gate_up.push(Expr::concat(
                 1,
-                if gate_second {
+                if GATE_SECOND {
                     vec![up, gate]
                 } else {
                     vec![gate, up]
@@ -224,7 +227,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
             ));
             gate_up_scales.push(Expr::concat(
                 1,
-                if gate_second {
+                if GATE_SECOND {
                     vec![up_s, gate_s]
                 } else {
                     vec![gate_s, up_s]

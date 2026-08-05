@@ -33,9 +33,10 @@ pub fn author_glm5(b: &mut Builder<'_>) -> Result<(), Error> {
     // flashinfer's CUTLASS grouped GEMM reads fc1 as. Stating it here is the
     // whole point: the alternative is a driver-side block swap over the
     // largest tensor in the model, done after the loader has already placed
-    // it.
-    let gate_second = b.knobs().glm5_moe_gate_up_swapped;
-    hf_moe_expert_stacks(b, gate_second, /*float_only=*/ true)?;
+    // it. `glm5_moe_gate_up_swapped()` on the forward side is this same
+    // constant, and the two have to agree — a load that swaps and a matmul
+    // that does not is silently wrong output, not a load error.
+    hf_moe_expert_stacks(b, /*gate_second=*/ true, /*float_only=*/ true)?;
     author_dense_contract(b)
 }
 
