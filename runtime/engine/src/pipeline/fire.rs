@@ -265,12 +265,34 @@ impl Drop for RsTxnsGuard {
     }
 }
 
+/// `PIE_KV_REALIZE_AHEAD=<pages>`: realize this many KV pages beyond the
+/// fire's writable frontier (clamped to the guest's declared working-set
+/// capacity), so a page-boundary ask is issued ~one page of waves before
+/// the page is needed and a park resolves before it can stall the lane.
+/// Absent, empty, `0`, or unparseable = off (behavior byte-identical to
+/// before the flag existed).
+fn kv_realize_ahead_pages() -> u64 {
+    static CONFIGURED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_KV_REALIZE_AHEAD")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn host_kv_demand_locked(
     store: &mut crate::store::kv::KvStore,
     ws: &KvWorkingSet,
     writable: std::ops::Range<u64>,
     declaration_realized: bool,
 ) -> Result<usize, String> {
+    // Realize-ahead extension (identity when the flag is off). Computed
+    // under the caller's lock hold from store state, so the Phase-A demand,
+    // the prepare-time staleness gate, and the grant-consuming realization
+    // in `prepare_host_kv_reserved` all price the SAME range.
+    let writable = kv::realize_ahead_range(store, ws.id, &writable, kv_realize_ahead_pages())
+        .map_err(|error| error.to_string())?;
     let realization = if declaration_realized {
         0
     } else {
@@ -744,6 +766,13 @@ fn prepare_host_kv_reserved(
         if required > grant.remaining_kv() {
             return Err(ReservedError::Stale);
         }
+        // The demand gate above priced the realize-ahead-extended range;
+        // re-derive the identical extension (same store state, same lock
+        // hold) so realization and backing consume exactly what was priced.
+        let writable = kv::realize_ahead_range(store, ws.id, &writable, kv_realize_ahead_pages())
+            .map_err(|error| {
+                ReservedError::Fatal(format!("pipeline: KV realize-ahead range: {error}"))
+            })?;
         let (copies, txn) = if declaration_realized {
             ((Vec::new(), Vec::new()), None)
         } else {
