@@ -476,6 +476,13 @@ pub(crate) struct LaunchGrouping {
 /// AND a channel-bound `AttnMask`, so the batcher merged them and the first
 /// concurrent step failed the driver's contract, poisoned descriptor
 /// channel 0, and lost all 8 streams.
+/// One token per row — the paged-decode-path shape, independent of
+/// `single_token_mode` (which a masked row clears to pick the mask-aware
+/// attention variant while still carrying exactly one token).
+fn one_token_rows(request: &crate::driver::LaunchPlan) -> bool {
+    request.qo_indptr.windows(2).all(|w| w[1] - w[0] == 1)
+}
+
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
     request.dense_device_mask || (request.has_user_mask && request.masks.is_empty())
 }
@@ -536,15 +543,19 @@ impl LaunchGrouping {
         // Hook-program fires: the driver executes ONE hook program per
         // launch (the sideband arena is singular), and a page-list
         // substitution written from a hook needs the PAGED DECODE path —
-        // which a batch loses the moment it carries a multi-token row
+        // which a batch loses the moment it carries a MULTI-TOKEN row
         // (driver fail: "attn_page_mask was written but this layer does
         // not take the paged decode path"). So a hook fire joins only
-        // all-single-token groups with no other hook member, and a
-        // multi-token fire never joins past a hook member.
+        // one-token-per-row groups with no other hook member, and a
+        // multi-token fire never joins past a hook member. The test is
+        // the qo windows, NOT `single_token_mode`: a masked decode row
+        // clears that flag to pick the mask-aware attention path, but it
+        // is still one token per row and the planned mask split gives its
+        // region its own attention launch.
         if self.count != 0
             && ((request.hook_program
                 && (self.has_hook_program || self.has_multi_token))
-                || (!request.request.single_token_mode && self.has_hook_program))
+                || (!one_token_rows(&request.request) && self.has_hook_program))
         {
             return false;
         }
@@ -576,7 +587,7 @@ impl LaunchGrouping {
         self.has_user_mask |= request.request.has_user_mask;
         self.has_device_geometry |= request.request.device_resolved_geometry;
         self.has_hook_program |= request.hook_program;
-        self.has_multi_token |= !request.request.single_token_mode;
+        self.has_multi_token |= !one_token_rows(&request.request);
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
             || self.count >= limits.max_forward_requests

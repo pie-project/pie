@@ -763,8 +763,23 @@ impl ProcessCtx {
             // descriptors); the runtime only leases physical pages. A real
             // wire class, capability-gated like every device-resolved family
             // — never a driver-side trace sniff (RV-6).
+            // RV-26 extension: a Track B pass whose AttnMask binds a CHANNEL
+            // ships the mask as a descriptor the driver must resolve
+            // per-step; a driver that does not claim the mask port cannot
+            // (CUDA today), and admitting the pass poisons at frame prepare
+            // ("descriptor channel not ready"). Such a pass takes the same
+            // loud Host fallback as a geometry-incapable driver.
+            let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
+                matches!(binding.port, pie_ir::registry::Port::AttnMask)
+                    && matches!(
+                        binding.source,
+                        pie_ir::container::PortSource::Channel(_)
+                    )
+            });
             let devgeo_capable = device_port_mask & pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
-                == pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS;
+                == pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+                && (!needs_mask_port
+                    || device_port_mask & pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK != 0);
             let devgeo = match crate::pipeline::fire::lease::detect_device_geometry(
                 &prog.bound.container,
             ) {

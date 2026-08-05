@@ -412,6 +412,21 @@ pub(crate) fn build_frame_submission(
         required_kv_pages = required_kv_pages.max(build.plan.required_kv_pages);
         let (region_row_indptr, region_sig, region_k) =
             planned_region_table(&group, &build.program_row_indptr);
+        // Engine-side region observability: the driver's [band-gate] trace
+        // skips masked/multi-token frames before printing sigs, so batteries
+        // that need per-step region truth (the AC-5 census) read this line.
+        if std::env::var_os("PIE_WAVE_TRACE").is_some() {
+            let sigs: Vec<String> = region_sig
+                .iter()
+                .zip(&region_k)
+                .map(|(sig, k)| format!("{sig}:{k}"))
+                .collect();
+            eprintln!(
+                "[step-regions] rows={} regions={}",
+                group.len(),
+                sigs.join(",")
+            );
+        }
         steps.push(StepSubmission {
             plan: build.plan,
             roster_rows,
