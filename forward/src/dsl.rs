@@ -297,21 +297,44 @@ pub fn trace_cuda(
     class: FireClass,
     body: impl FnOnce(&mut M),
 ) -> ForwardPlan {
-    let family = format!(
-        "llama_like.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            FireClass::Prefill => "prefill",
-            // The service classes are qwen3_5's; llama_like has no
-            // spec-decode repair pass. The ffi entry rejects them
-            // before tracing; this is the same statement for direct
-            // Rust callers.
-            FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify => {
-                panic!("llama_like has no MTP service classes")
-            }
+    run(format!("llama_like.cuda.{}", class_word(class)), facts, body)
+}
+
+/// Run a LOWERED llama_like declaration for METAL.
+///
+/// The counterpart of [`trace_cuda`], and the reason the backend is a
+/// first-class axis rather than a CUDA assumption: a model text is
+/// written for one backend, so Metal gets its own text stating Metal's
+/// kernels, checked against Metal's table
+/// ([`crate::kernels::KERNELS_METAL`]).
+///
+/// Metal has NO such text yet — it consumes the semantic trace and
+/// re-derives its dispatch selection in C++
+/// (`driver/metal/src/model/llama_like/declared_dag.hpp`), which is the
+/// same "the driver decides" shape the CUDA side is being cured of.
+/// This entry is the seam that text will be written against; until it
+/// is, nothing calls it, and the empty Metal kernel table means the
+/// first thing that does must declare its kernels.
+pub fn trace_metal(
+    facts: &LlamaLikeFacts,
+    class: FireClass,
+    body: impl FnOnce(&mut M),
+) -> ForwardPlan {
+    run(format!("llama_like.metal.{}", class_word(class)), facts, body)
+}
+
+fn class_word(class: FireClass) -> &'static str {
+    match class {
+        FireClass::Decode => "decode",
+        FireClass::Prefill => "prefill",
+        // The service classes are qwen3_5's; llama_like has no
+        // spec-decode repair pass. The ffi entry rejects them
+        // before tracing; this is the same statement for direct
+        // Rust callers.
+        FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify => {
+            panic!("llama_like has no MTP service classes")
         }
-    );
-    run(family, facts, body)
+    }
 }
 
 fn run(family: String, facts: &LlamaLikeFacts, body: impl FnOnce(&mut M)) -> ForwardPlan {

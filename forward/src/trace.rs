@@ -716,7 +716,9 @@ impl ForwardPlan {
         let OpKind::Launch { kernel, .. } = &op.kind else {
             return false;
         };
-        crate::kernels::sig(kernel).is_some_and(|k| k.depth_prefix_plan)
+        crate::kernels::Backend::of_family(&self.family)
+            .and_then(|b| crate::kernels::sig_in(b, kernel))
+            .is_some_and(|k| k.depth_prefix_plan)
     }
 
     /// Ops belonging to layer `l`, in execution order.

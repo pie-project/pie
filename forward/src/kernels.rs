@@ -31,6 +31,39 @@
 
 use crate::trace::{ForwardPlan, OpKind};
 
+/// Which backend's kernels a lowered trace states.
+///
+/// The table is per-BACKEND because a kernel signature is backend-owned
+/// (`.wiki/tart/dsl.md` ②: `driver/cuda/kernels.rs`). A model text is
+/// written for one backend and states that backend's symbols; the
+/// family name says which — `llama_like.cuda.decode` is CUDA's,
+/// `llama_like.metal.decode` would be Metal's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Cuda,
+    Metal,
+}
+
+impl Backend {
+    /// The backend a traced family name names, or `None` for a SEMANTIC
+    /// trace — which states no kernels at all, so no table applies.
+    pub fn of_family(family: &str) -> Option<Backend> {
+        let mut parts = family.split('.').skip(1);
+        match parts.next() {
+            Some("cuda") => Some(Backend::Cuda),
+            Some("metal") => Some(Backend::Metal),
+            _ => None,
+        }
+    }
+
+    pub fn table(self) -> &'static [KernelSig] {
+        match self {
+            Backend::Cuda => KERNELS,
+            Backend::Metal => KERNELS_METAL,
+        }
+    }
+}
+
 /// A capability a seam may ask of the kernel covering its rows. Named
 /// after the seam vocabulary (`.wiki/tart/dsl.md` ①), because that is
 /// what a `lacks` line refuses to serve.
@@ -167,9 +200,29 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(verify_stash_load "qwen35_verify_stash_load"),
 ];
 
-/// The contract for one recorded symbol.
+/// METAL's kernel signatures.
+///
+/// EMPTY, and deliberately so: Metal has no lowered text yet. It
+/// consumes the SEMANTIC trace and re-derives its dispatch selection in
+/// C++ (`driver/metal/src/model/llama_like/declared_dag.hpp`) — the same
+/// "the driver decides" shape the CUDA side is being cured of, from the
+/// other end.
+///
+/// An empty table is not a placeholder that does nothing. Because
+/// [`check_plan`]'s coverage rule refuses any undeclared symbol, a
+/// `llama_like.metal.*` text CANNOT be written without declaring the
+/// kernels it states, which is exactly the discipline the CUDA table
+/// enforces. The first Metal text fills this in.
+pub static KERNELS_METAL: &[KernelSig] = &[];
+
+/// The contract for one recorded symbol, in `backend`'s table.
+pub fn sig_in(backend: Backend, symbol: &str) -> Option<&'static KernelSig> {
+    backend.table().iter().find(|k| k.symbol == symbol)
+}
+
+/// The contract for one CUDA symbol.
 pub fn sig(symbol: &str) -> Option<&'static KernelSig> {
-    KERNELS.iter().find(|k| k.symbol == symbol)
+    sig_in(Backend::Cuda, symbol)
 }
 
 /// LOAD-TIME check of a traced form against the kernel table.
@@ -186,6 +239,7 @@ pub fn sig(symbol: &str) -> Option<&'static KernelSig> {
 /// family it was loading.
 pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
     let mut problems = Vec::new();
+    let backend = Backend::of_family(&plan.family);
     // Ops inside a Peel's two regions, as a countdown over the flat op
     // list (regions are consecutive: prefix then tail, right after the
     // op — `OpKind::Peel`'s doc).
@@ -201,10 +255,17 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
             } => {
                 peeled = peeled.max(*prefix_ops as usize + *tail_ops as usize);
             }
-            OpKind::Launch { kernel, .. } => match sig(kernel) {
+            OpKind::Launch { kernel, .. } => match backend.and_then(|b| sig_in(b, kernel)) {
                 None => problems.push(format!(
-                    "{}: launches `{kernel}`, which no kernel! signature declares",
-                    plan.family
+                    "{}: launches `{kernel}`, which no {} kernel! signature declares",
+                    plan.family,
+                    match backend {
+                        Some(b) => format!("{b:?}").to_lowercase(),
+                        // A semantic trace states no kernels; one that
+                        // does has a family name that does not say
+                        // whose they are.
+                        None => "backend's".to_string(),
+                    }
                 )),
                 Some(k) if k.whole && inside_peel => problems.push(format!(
                     "{}: `{kernel}` is declared `whole` (needs {:?}) but is stated \
@@ -243,7 +304,9 @@ mod tests {
 
     fn plan_of(ops: Vec<Op>) -> ForwardPlan {
         ForwardPlan {
-            family: "test".to_string(),
+            // A family name that says whose kernels these are — the
+            // check resolves the table from it.
+            family: "llama_like.cuda.decode".to_string(),
             values: vec![],
             ops,
             depth_window: false,
@@ -283,6 +346,35 @@ mod tests {
         // The same kernel OUTSIDE a peel is fine — the fire-level
         // statement the model body takes today.
         assert!(check_plan(&plan_of(vec![launch(xqa)])).is_empty());
+    }
+
+    /// A family name says whose kernels a text states.
+    #[test]
+    fn the_backend_is_read_off_the_family() {
+        assert_eq!(Backend::of_family("llama_like.cuda.decode"), Some(Backend::Cuda));
+        assert_eq!(
+            Backend::of_family("qwen3_5_hybrid.cuda.commit_advance"),
+            Some(Backend::Cuda)
+        );
+        assert_eq!(Backend::of_family("llama_like.metal.decode"), Some(Backend::Metal));
+        // Semantic traces state no kernels, so no table applies.
+        assert_eq!(Backend::of_family("llama_like"), None);
+        assert_eq!(Backend::of_family("qwen3_5_moe_mlp_block"), None);
+    }
+
+    /// Metal's table is empty, and that REFUSES rather than permits: a
+    /// `llama_like.metal.*` text cannot state a kernel it has not
+    /// declared. This is the discipline that will fill the table when
+    /// the first Metal text is written.
+    #[test]
+    fn an_empty_backend_table_refuses() {
+        let mut p = plan_of(vec![launch("metal_gemm_bf16")]);
+        p.family = "llama_like.metal.decode".to_string();
+        // (the same symbol under CUDA's table is refused too — this is
+        // about WHICH table, not about permissiveness)
+        let problems = check_plan(&p);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(problems[0].contains("metal"), "{}", problems[0]);
     }
 
     /// The table is exactly the set of symbols `dsl::cuda` can record.
