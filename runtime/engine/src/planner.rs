@@ -975,6 +975,101 @@ impl Inner {
             .map(|(&key, waiter)| (key, waiter))
     }
 
+    /// The pages the burst behind the head still needs beyond the
+    /// accumulation — the size of the ONE free-list pull
+    /// [`Step::ServeAllocationBurst`] makes for the whole pass.
+    ///
+    /// The run is the maximal consecutive stretch of unmet, RS-free
+    /// allocation waiters in FCFS order. Restores are transparent to it:
+    /// a restore younger than the head allocation never outranks it, and an
+    /// older one can only outrank it while [`Inner::fleet_stalled`] holds —
+    /// which the burst's first serve falsifies (a served, uncollected grant
+    /// is exactly what that predicate rules out). An RS-carrying ask ENDS
+    /// the run: funding RS is a port call, and the port must never be
+    /// touched under this lock.
+    fn burst_shortfall(&self) -> u32 {
+        let mut supply = self.accum.len() as u64;
+        let mut extra = 0u64;
+        for waiter in self.queue.values() {
+            if !waiter.is_unmet() {
+                continue;
+            }
+            let WaitKind::Allocation { demand, .. } = &waiter.kind else {
+                continue;
+            };
+            if demand.rs_slots > 0 {
+                break;
+            }
+            let need = u64::from(demand.kv_pages);
+            let covered = need.min(supply);
+            supply -= covered;
+            extra += need - covered;
+        }
+        extra.try_into().unwrap_or(u32::MAX)
+    }
+
+    /// The burst's single lock hold: fund consecutive waiters head-first out
+    /// of the accumulation, parking each outcome in its own entry, and hand
+    /// back the notifies for the caller to fire AFTER the lock is released.
+    ///
+    /// This is [`Step::ServeAllocation`]'s body, run in a loop under one
+    /// hold. Equivalent to re-deriving [`Inner::unmet_head`] per serve — the
+    /// head is derived once here and the walk then follows queue order,
+    /// which is the same sequence, because serving an entry is precisely
+    /// what makes `unmet_head` move on to the next one. Nothing else can
+    /// interleave: the whole pass happens under this hold.
+    ///
+    /// Stops at the first waiter the accumulation cannot cover in full (and
+    /// at the first RS-carrying ask, which the per-step path serves).
+    /// Strict FCFS — no skipping, no bypass.
+    fn serve_burst(&mut self) -> Vec<(EntryKey, u32, Arc<Notify>)> {
+        let mut wake = Vec::new();
+        let Some((head, waiter)) = self.unmet_head() else {
+            return wake;
+        };
+        // The head is re-derived here, after the pull released the lock, and
+        // it must still be an allocation. A restore that took the head in
+        // that window (the fleet went stalled) outranks everything behind
+        // it — serving past it would be the one FCFS inversion this pass
+        // could introduce. Serve nothing and let the drain re-decide.
+        if !matches!(waiter.kind, WaitKind::Allocation { .. }) {
+            return wake;
+        }
+        // Disjoint field borrows: the accumulation is donated from while the
+        // queue entry that receives it is held mutably.
+        let Inner { queue, accum, .. } = self;
+        for (&key, waiter) in queue.range_mut(head..) {
+            if !waiter.is_unmet() {
+                continue;
+            }
+            let WaitKind::Allocation {
+                demand,
+                notify,
+                outcome,
+                ..
+            } = &mut waiter.kind
+            else {
+                continue; // a restore never ends the allocation run
+            };
+            let demand = *demand;
+            if demand.rs_slots > 0 {
+                break;
+            }
+            if (accum.len() as u32) < demand.kv_pages {
+                break;
+            }
+            let kv = accum.donate(demand.kv_pages as usize);
+            debug_assert!(outcome.is_none(), "an unmet waiter carries no outcome");
+            *outcome = Some(Ok(AllocationGrant::new(
+                demand,
+                kv,
+                RsSlotReservation::empty(),
+            )));
+            wake.push((key, demand.kv_pages, notify.clone()));
+        }
+        wake
+    }
+
     /// No completion can ever arrive on its own: no eviction in flight, no
     /// grant served and awaiting collection, and every admitted resident
     /// parked in the queue.
@@ -1018,9 +1113,31 @@ enum Step {
         fund_by_eviction: bool,
     },
     /// The head's KV side is covered; finish an allocation with `rs` slots.
+    /// Only RS-carrying asks take this step — the RS reservation is a port
+    /// call that must happen outside the planner lock, so they keep the
+    /// per-step path. RS-free allocations take [`Step::ServeAllocationBurst`].
     ServeAllocation {
         key: EntryKey,
         demand: Demand,
+    },
+    /// The head is a covered, RS-free allocation: serve the maximal
+    /// consecutive run of fundable RS-free allocation waiters in ONE pass —
+    /// one free-list pull sized `extra` (the run's total ask beyond the
+    /// accumulation), then one planner-lock hold that pops-and-funds the run
+    /// head-first, parking each outcome; the notifies fire after release.
+    ///
+    /// This exists because the sequential drain served a completion's
+    /// unpark burst nearly one waiter at a time: every serve paid three to
+    /// four lock cycles (step decision, absorb, serve re-validation — each
+    /// recomputing the lock-free mirrors over every proc) plus a port pull,
+    /// interleaved against the just-woken collectors contending on the same
+    /// mutex — measured intra-burst serve spacing p50 54µs / p90 321µs,
+    /// ~4.3 ms wall for a ~32-waiter burst, and the wave seal idled the
+    /// device for all of it. FCFS is untouched: the run is re-derived under
+    /// the lock via `unmet_head` exactly as the sequential drain would, and
+    /// it stops at the first waiter it cannot fund — no skipping, no bypass.
+    ServeAllocationBurst {
+        extra: u32,
     },
     /// The head is a restore whose recorded demand is covered; re-validate
     /// its swapped count and board it.
@@ -1973,7 +2090,15 @@ impl ResidencyPlanner {
                     };
                 }
                 match demand {
-                    Some(demand) => Step::ServeAllocation { key, demand },
+                    // An RS-carrying ask keeps the per-step path: its RS
+                    // reservation is a port call, and the port is never
+                    // touched under the planner lock.
+                    Some(demand) if demand.rs_slots > 0 || !batch_grants_enabled() => {
+                        Step::ServeAllocation { key, demand }
+                    }
+                    Some(_) => Step::ServeAllocationBurst {
+                        extra: inner.burst_shortfall(),
+                    },
                     None => {
                         // Rotation damping: a covered restore still waits
                         // for a completion credit — accum surplus (often
@@ -2104,6 +2229,43 @@ impl ResidencyPlanner {
                             continue;
                         }
                     }
+                }
+                Step::ServeAllocationBurst { extra } => {
+                    // ONE free-list pull for the whole burst, outside the
+                    // planner lock like every other port call — and the only
+                    // supply read this pass makes (§16: the store lock is
+                    // never taken inside the planner lock, and never more
+                    // often than the sequential path did per serve).
+                    if extra > 0 {
+                        let pages = self.port.reserve_device_up_to(extra);
+                        if !pages.is_empty() {
+                            let reservation = DevicePageReservation::new(pages, self.port.clone());
+                            self.with_inner(|inner| inner.accum.absorb(reservation));
+                        }
+                        // An empty pull is NOT a shortage to escalate: the
+                        // head is covered by the accumulation already (that
+                        // is why this step was chosen), so the burst still
+                        // serves what it can and the next iteration takes
+                        // the ordinary `Absorb` rung for the rest.
+                    }
+                    let wake = self.with_inner(|inner| inner.serve_burst());
+                    if !wake.is_empty() {
+                        self.stats
+                            .serves
+                            .fetch_add(wake.len() as u64, Ordering::Relaxed);
+                    }
+                    // Outside the lock: the woken collectors take it.
+                    for (key, pages, notify) in wake {
+                        ptrace!("serve key={:?} kv={}", key, pages);
+                        notify.notify_waiters();
+                    }
+                    // CASCADE, as on the per-step path: the served entries no
+                    // longer compete, so keep draining — whatever is left
+                    // (an RS-carrying ask, a restore, a short head) is
+                    // decided by the ordinary rungs on the next iteration.
+                    // A pass that served nothing behaves exactly like a
+                    // `Stale` serve: re-decide.
+                    continue;
                 }
                 Step::ServeRestore { key, pid } => {
                     // Re-validate the ask against the store: the demand is
@@ -3899,6 +4061,21 @@ fn rotation_damping_enabled() -> bool {
     })
 }
 
+/// `PIE_BATCH_GRANTS=0` disables the burst serve pass
+/// ([`Step::ServeAllocationBurst`]) and puts every allocation back on the
+/// one-at-a-time [`Step::ServeAllocation`] path. Default ON.
+///
+/// The burst is a pure latency fix — same waiters, same FCFS order, same
+/// grants, same counters, only the lock cycling and the per-serve free-list
+/// round trip removed — so it does not gate a behaviour choice. The switch
+/// exists because the drain is the fleet's single serialization point and an
+/// integrator hitting anything odd there must be able to A/B it without a
+/// rebuild (the [`rotation_damping_enabled`] idiom).
+fn batch_grants_enabled() -> bool {
+    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| !std::env::var("PIE_BATCH_GRANTS").is_ok_and(|value| value == "0"))
+}
+
 /// `PIE_SUPPLY_RUNWAY=<pages>`: the supply-phase runway target (§10.14).
 /// When nonzero the planner treats the free list itself as a demand: it
 /// starts and sizes eviction rounds so `free` is pulled back toward this
@@ -4176,6 +4353,10 @@ mod starvation_race_tests {
         /// `NoSwapRoom` short-circuit, which is what every starvation-rung
         /// test wants; non-zero lets a test reach the load-control gate.
         host: u32,
+        /// Every `reserve_device_up_to` request, in order — how the drain
+        /// ASKED for its supply, which is what tells one pull for a whole
+        /// burst apart from one pull per waiter.
+        pulls: parking_lot::Mutex<Vec<u32>>,
     }
 
     impl RacePool {
@@ -4185,6 +4366,7 @@ mod starvation_race_tests {
                 total,
                 stall: AtomicU32::new(0),
                 host: 0,
+                pulls: parking_lot::Mutex::new(Vec::new()),
             }
         }
 
@@ -4240,6 +4422,7 @@ mod starvation_race_tests {
             Some(free.split_off(at))
         }
         fn reserve_device_up_to(&self, count: u32) -> Vec<PhysicalKvPageId> {
+            self.pulls.lock().push(count);
             if self
                 .stall
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -4259,6 +4442,138 @@ mod starvation_race_tests {
             Some(Vec::new())
         }
         fn release_rs(&self, _slots: Vec<crate::store::rs::RsSlotId>) {}
+    }
+
+    /// A completion's unpark burst is served in ONE pass: the drain funds
+    /// the whole fundable FCFS prefix under a single lock hold off a single
+    /// free-list pull, and stops exactly where the supply runs out.
+    ///
+    /// The serialization this pins down was the contended decode cell's
+    /// remaining throughput gap: each completion freed ~35 pages and
+    /// un-parked ~32 one-page asks, and the drain served them nearly one at
+    /// a time (p50 54 µs between serves, ~4.3 ms for the burst) because
+    /// every waiter cost its own step decision, its own free-list round
+    /// trip and its own serve re-validation — three planner-lock cycles,
+    /// each recomputing the lock-free mirrors over every process, all while
+    /// the just-woken collectors contended for the same mutex. The wave seal
+    /// waits for the last unparked lane, so the device idled through all of
+    /// it.
+    #[test]
+    fn a_burst_serves_exactly_the_fundable_prefix_in_one_pass() {
+        let pool = Arc::new(RacePool::new(64));
+        let planner = Arc::new(ResidencyPlanner::new(
+            pool.clone() as Arc<dyn PoolPort>,
+            PlannerConfig::default(),
+        ));
+
+        // A running holder keeps the wedge predicate false, so the rungs
+        // below the drain stay out of this while the pool is empty.
+        let holder = ProcessId::new_v4();
+        planner.register(holder);
+        planner.note_admitted(holder);
+
+        // Six one-page asks parked in FCFS order. Parked directly: the point
+        // here is the drain's service order, not the acquire path.
+        let demand = Demand {
+            kv_pages: 1,
+            rs_slots: 0,
+        };
+        let pids: Vec<ProcessId> = (0..6)
+            .map(|_| {
+                let pid = ProcessId::new_v4();
+                planner.register(pid);
+                planner.note_admitted(pid);
+                pid
+            })
+            .collect();
+        let keys: Vec<EntryKey> = planner.with_inner(|inner| {
+            pids.iter()
+                .map(|&pid| {
+                    let key = (inner.procs[&pid].seq, inner.next_id);
+                    inner.next_id += 1;
+                    inner.queue.insert(
+                        key,
+                        Waiter {
+                            pid,
+                            kind: WaitKind::Allocation {
+                                demand,
+                                notify: Arc::new(Notify::new()),
+                                outcome: None,
+                                yielded: false,
+                            },
+                        },
+                    );
+                    key
+                })
+                .collect()
+        });
+
+        // The third ask's owner was picked for eviction while parked: it is
+        // no longer a claimant, and the burst must hand it no pages.
+        planner.with_inner(|inner| {
+            let waiter = inner.queue.get_mut(&keys[2]).expect("parked");
+            let WaitKind::Allocation { yielded, .. } = &mut waiter.kind else {
+                unreachable!()
+            };
+            *yielded = true;
+        });
+
+        // Four pages come back — a completion that covers four of the five
+        // live asks.
+        pool.refill_after_stall(4, 0);
+        pool.pulls.lock().clear();
+        planner.plan();
+
+        let served: Vec<bool> = planner.with_inner(|inner| {
+            keys.iter()
+                .map(|key| match &inner.queue.get(key).expect("still queued").kind {
+                    WaitKind::Allocation { outcome, .. } => outcome.is_some(),
+                    WaitKind::Restore { .. } => unreachable!(),
+                })
+                .collect()
+        });
+        assert_eq!(
+            served,
+            vec![true, true, false, true, true, false],
+            "exactly the fundable FCFS prefix is served, the yielded entry is \
+             passed over rather than funded, and the ask past the supply waits"
+        );
+        assert_eq!(
+            planner.diagnostics().serves_total,
+            4,
+            "one grant per served waiter"
+        );
+        // The served set above is what the two paths AGREE on — the burst is
+        // a pure latency fix. What changes is the shape of the pass: how many
+        // times the drain had to leave the lock and go back to the pool.
+        let pulls = pool.pulls.lock().clone();
+        if batch_grants_enabled() {
+            assert_eq!(
+                pulls,
+                vec![1, 4, 1],
+                "the head is covered by the ordinary absorb rung (1), the REST \
+                 of the run is asked for in a SINGLE pull (4 — the four live \
+                 asks behind the head), and the one ask the supply did not \
+                 reach re-enters the absorb rung (1)"
+            );
+        } else {
+            assert_eq!(
+                pulls,
+                vec![1, 1, 1, 1, 1],
+                "PIE_BATCH_GRANTS=0: one absorb round trip per served waiter, \
+                 which is the serialization the burst removes"
+            );
+        }
+        assert_eq!(
+            planner.diagnostics().device_pages_free,
+            0,
+            "the burst consumed what it pulled"
+        );
+        assert_eq!(
+            planner.diagnostics().accumulation,
+            0,
+            "and stranded nothing in the accumulation"
+        );
     }
 
     /// The starvation rung must not destroy a request while the pool holds
