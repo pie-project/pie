@@ -41,8 +41,9 @@ __device__ Verdict replay_group(
     int32_t sequence) {
     Verdict out{false, 0, depth};
 
-    int32_t use_end = t.reading_offsets[group + 1];
-    for (int32_t use = t.reading_offsets[group]; use < use_end && !out.admitted; ++use) {
+    const int32_t use_at = t.reading_offsets[group];
+    const int32_t use_end = use_at + 1 + t.reading_index[use_at];
+    for (int32_t use = use_at + 1; use < use_end && !out.admitted; ++use) {
         int32_t reading = t.reading_index[use];
         int32_t span = 1;
         for (int32_t path = 0; path < paths && path < span && !out.admitted; ++path) {

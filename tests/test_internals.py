@@ -330,7 +330,7 @@ class Approximations(unittest.TestCase):
         self.assertEqual(self.engine.compile_json_schema(schema).relaxations, [])
 
     def test_a_note_points_at_the_place_and_says_what_to_change(self):
-        """"This schema is relaxed" sends an author looking; a pointer does not."""
+        """ "This schema is relaxed" sends an author looking; a pointer does not."""
         schema = json.dumps(
             {
                 "type": "object",
@@ -912,7 +912,9 @@ class AnUntypedSchemaIsStillAShape(unittest.TestCase):
         pattern's value schema is not enforced - so it has to be said.
         """
         grammar = self.engine.compile_json_schema(
-            json.dumps({"type": "object", "patternProperties": {".*": {"type": "object"}}})
+            json.dumps(
+                {"type": "object", "patternProperties": {".*": {"type": "object"}}}
+            )
         )
         self.assertTrue(
             any(note["keyword"] == "patternProperties" for note in grammar.relaxations)

@@ -1,0 +1,29 @@
+{
+  "schemas": 64,
+  "rows": [
+    {
+      "batch": 1,
+      "distinct": 1,
+      "engrain_us": 503.4834612160921,
+      "xgrammar_serial_us": 56.80089816451073,
+      "xgrammar_threaded_us": 56.80089816451073,
+      "forward_us": null
+    },
+    {
+      "batch": 32,
+      "distinct": 32,
+      "engrain_us": 818.5715414583683,
+      "xgrammar_serial_us": 946.5499315410852,
+      "xgrammar_threaded_us": 759.1350004076958,
+      "forward_us": null
+    },
+    {
+      "batch": 512,
+      "distinct": 64,
+      "engrain_us": 1894.0807785838842,
+      "xgrammar_serial_us": 31135.394936427474,
+      "xgrammar_threaded_us": 8722.815196961164,
+      "forward_us": null
+    }
+  ]
+}

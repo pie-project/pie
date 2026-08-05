@@ -29,6 +29,8 @@ pure function of the grammar and the vocabulary.
 from __future__ import annotations
 
 import bisect
+import hashlib
+import dataclasses
 from dataclasses import dataclass
 
 import numpy as np
@@ -366,8 +368,12 @@ def _replay_group(
     # it, which is the difference between hitting and never hitting on a
     # grammar whose stack grows with the document.
     deepest = depth
+    # The block is length-prefixed: a reading list is shared with every group
+    # that wants the same one, wherever in the pool it is, so it cannot say how
+    # long it is by where the next one starts.
     use = tl.load(reading_offsets_ptr + group)
-    use_end = tl.load(reading_offsets_ptr + group + 1)
+    use_end = use + 1 + tl.load(reading_index_ptr + use)
+    use = use + 1
     while use < use_end:
         reading = tl.load(reading_index_ptr + use)
         # One derivation per path, in the mixed radix each conflicted cell
@@ -1503,7 +1509,8 @@ def _candidate_kernel(
                 at + _B_PENDING_TERMINALS
             )
             use = tl.load(reading_offsets + group)
-            use_end = tl.load(reading_offsets + group + 1)
+            use_end = use + 1 + tl.load(reading_index + use)
+            use = use + 1
             index = 0
             while use < use_end and index < MAX_READINGS:
                 reading = tl.load(reading_index + use)
@@ -2706,6 +2713,37 @@ _ARENA = {
 }
 
 
+def _blocks(raw: bytes, starts, lengths):
+    """Which distinct blocks an offset array points at, by content.
+
+    Returns one digest and one span per distinct block, and which block each
+    slot wants. The *bodies* are not built here: a block that some other
+    grammar already holds is never copied, and building every one of them
+    would be the cost this exists to avoid. Digested straight off the raw
+    buffer for the same reason - a numpy slice and a cast per block doubled a
+    compile, on the path a request waits on.
+    """
+    at = np.asarray(starts, dtype=np.int64)
+    size = np.asarray(lengths, dtype=np.int64)
+    view = memoryview(raw)
+    digests: list[bytes] = []
+    spans: list[tuple[int, int]] = []
+    of_slot = np.zeros(at.size, dtype=np.int64)
+    seen: dict[bytes, int] = {}
+    for slot, (block_at, block_size) in enumerate(zip(at.tolist(), size.tolist())):
+        digest = hashlib.blake2b(
+            view[4 * block_at : 4 * (block_at + block_size)], digest_size=16
+        ).digest()
+        found = seen.get(digest)
+        if found is None:
+            found = len(digests)
+            seen[digest] = found
+            digests.append(digest)
+            spans.append((block_at, block_size))
+        of_slot[slot] = found
+    return digests, spans, of_slot
+
+
 @dataclass
 class ResidentTables:
     """A grammar as the pool wants it: arrays to upload and ceilings to raise.
@@ -2737,6 +2775,11 @@ class ResidentTables:
     # so a caller holding a `ResidentTables` from before this existed still
     # works; 0 means "unknown" and matches anything.
     vocabulary_digest: int = 0
+    # The arrays whose blocks are shared across the pool, as content: for each
+    # store, one digest and one body per distinct block, and which block each
+    # group wants. Digested here because a digest of two megabytes is
+    # milliseconds and admission happens far more often than compilation.
+    shared: dict = dataclasses.field(default_factory=dict)
 
     @property
     def words(self) -> int:
@@ -2747,6 +2790,23 @@ class ResidentTables:
 # concatenating them shifts every following grammar by one. The base is
 # whatever the concatenation actually produced, computed rather than derived.
 _SIGNED = {"action_values", "action_extra"}
+
+# Whether to keep the verdict shortcut resident. Off trades a replay per group
+# for a quarter of the arena.
+_VERDICTS = os.environ.get("ENGRAIN_VERDICTS", "1") != "0"
+
+# Arrays whose blocks are shared across the pool, and the array that names
+# where each block is. A pointer into a shared store is absolute, so the
+# grammar's base for that store is zero.
+_INTERNED = {
+    "set_payload": "group_set_offset",
+    "reading_index": "reading_offsets",
+}
+
+# Stores whose blocks carry their length in front of them. A block placed
+# wherever it fits cannot say how long it is by where the next one starts, and
+# `group_set_length` already says it for the token sets.
+_PREFIXED = {"reading_index"}
 
 
 class ConfigurationsExceeded(ValueError):
@@ -2932,6 +2992,12 @@ class DeviceGrammar:
         self._used = {name: 0 for name in _ARENA}
         self._free = {name: [] for name in _ARENA}
         self._free_ids: list[int] = []
+        # The shared stores: array -> digest -> [offset, words, holders]. Every
+        # grammar in a pool is compiled against the same tokenizer, so a block
+        # two of them hold is the same words twice; here it is the same words
+        # once, and a group points at it from wherever it is wanted.
+        self._interned: dict[str, dict[bytes, list[int]]] = {}
+        self._interned_of: dict[int, dict[str, tuple]] = {}
         self._stamp = 0
         self._used_at: list[int] = []
         self._pinned: list[int] = []
@@ -2984,6 +3050,106 @@ class DeviceGrammar:
             self.revision += 1
         self._used[name] = at + extra
         return at
+
+    def _intern(self, tables) -> dict:
+        """Place this grammar's shared blocks and say where they landed.
+
+        Returns the arrays whose contents depend on the placement - the offset
+        array of each store, since an offset into a shared store is absolute
+        rather than relative to a base - and the digests this grammar now holds
+        a reference to.
+
+        Misses are copied in one run rather than block by block: a grammar has
+        thousands of distinct blocks, and thousands of small copies is the
+        latency rather than the bytes.
+        """
+        out: dict[str, object] = {}
+        held: dict[str, tuple] = {}
+        for store, (digests, spans, of_slot) in tables.shared.items():
+            prefix = 1 if store in _PREFIXED else 0
+            source = tables.runs[store].numpy()
+            table = self._interned.setdefault(store, {})
+            placed = [0] * len(digests)
+            missing = []
+            for block, digest in enumerate(digests):
+                entry = table.get(digest)
+                if entry is None:
+                    missing.append(block)
+                else:
+                    entry[2] += 1
+                    placed[block] = entry[0]
+            if missing:
+                wanted = sum(spans[block][1] + prefix for block in missing)
+                base = self._reserve(store, wanted)
+                staged = np.empty(wanted, dtype=np.int32)
+                cursor = 0
+                for block in missing:
+                    at, size = spans[block]
+                    if prefix:
+                        staged[cursor] = size
+                    staged[cursor + prefix : cursor + prefix + size] = source[
+                        at : at + size
+                    ]
+                    placed[block] = base + cursor
+                    table[digests[block]] = [base + cursor, size + prefix, 1]
+                    cursor += size + prefix
+                getattr(self, store)[base : base + wanted] = torch.from_numpy(
+                    staged
+                ).cuda(non_blocking=False)
+            pointer = _INTERNED[store]
+            rewritten = np.asarray(placed, dtype=np.int64)[of_slot].astype(np.int32)
+            # Kept the same length as the run it replaces. `reading_offsets`
+            # carries a CSR sentinel nothing reads any more, and a run that
+            # changed size would make the room reserved for it a guess.
+            wide = tables.runs[pointer].numel()
+            if rewritten.size < wide:
+                rewritten = np.concatenate(
+                    [rewritten, np.zeros(wide - rewritten.size, dtype=np.int32)]
+                )
+            out[pointer] = torch.from_numpy(rewritten)
+            held[store] = (tuple(digests), of_slot)
+        out["__held"] = held
+        return out
+
+    def _compact_shared(self, store: str, previous: torch.Tensor) -> None:
+        """Rebuild a shared store densely and point every grammar at it again.
+
+        A block in it is named by an absolute offset, so this is the one place
+        a pointer array has to be written twice. Doing it here keeps
+        `dead_fraction` honest: a store that only ever grew would make the
+        number that decides whether to compact blind to the largest arrays in
+        the arena.
+        """
+        table = self._interned.get(store, {})
+        wanted = sum(size for _, size, _ in table.values())
+        self._used[store] = 0
+        self._free[store] = []
+        setattr(
+            self,
+            store,
+            torch.zeros(
+                max(1024, int(wanted * 1.25)), dtype=torch.int32, device="cuda"
+            ),
+        )
+        rebuilt = getattr(self, store)
+        for entry in table.values():
+            at, size, _ = entry
+            to = self._reserve(store, size)
+            rebuilt[to : to + size] = previous[at : at + size]
+            entry[0] = to
+        pointer = _INTERNED[store]
+        for identifier, holds in self._interned_of.items():
+            digests, of_slot = holds[store]
+            placed = np.asarray(
+                [table[digest][0] for digest in digests], dtype=np.int64
+            )
+            at, size = self._extent[identifier][pointer]
+            rewritten = placed[of_slot].astype(np.int32)
+            if rewritten.size < size:
+                rewritten = np.concatenate(
+                    [rewritten, np.zeros(size - rewritten.size, dtype=np.int32)]
+                )
+            getattr(self, pointer)[at : at + size] = torch.from_numpy(rewritten).cuda()
 
     def _return(self, name: str, at: int, size: int) -> None:
         """Give a run back, joined to whatever it now touches.
@@ -3097,6 +3263,17 @@ class DeviceGrammar:
         for name in _ARENA:
             dtype = np.int32 if name in _SIGNED else np.uint32
             run = np.frombuffer(arrays[name], dtype=dtype).astype(np.int32)
+            # The verdict table is a shortcut, not an answer: it says whether a
+            # (lexer state, parser state) pair admits a group without replaying
+            # the group's readings, and the kernel does the replay anyway where
+            # it is absent. It is also a quarter of the arena, being lexer
+            # states times parser states times groups - so a pool with more
+            # schemas than room is offered the trade the table exists to make.
+            if (
+                name in ("verdicts", "verdict_stride", "verdict_offsets")
+                and not _VERDICTS
+            ):
+                run = run[:0]
             runs[name] = torch.from_numpy(run).pin_memory()
 
         def widest(name):
@@ -3105,7 +3282,29 @@ class DeviceGrammar:
 
         lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
         nullable = _nullable_chain(arrays)
+        # Every grammar in a pool is compiled against one tokenizer, so a block
+        # two of them hold is the same words twice. Measured over the corpus,
+        # `reading_index` repeats 5.06x - a group's list of ways to read its
+        # tokens is the same list in state after state - and `set_payload`
+        # 1.56x. Both are stored once here and pointed at from wherever they
+        # are wanted, which costs nothing at all to run.
+        starts = np.frombuffer(arrays["reading_offsets"], dtype=np.uint32)
+        shared = {
+            "set_payload": _blocks(
+                arrays["set_payload"],
+                np.frombuffer(arrays["group_set_offset"], dtype=np.uint32),
+                lengths,
+            ),
+            # Length-prefixed, because a shared block cannot say how long it is
+            # by where the next one starts. One word per *distinct* block is
+            # cheaper than one per group, and it keeps the arena's array count
+            # where it was.
+            "reading_index": _blocks(
+                arrays["reading_index"], starts[:-1], np.diff(starts)
+            ),
+        }
         return ResidentTables(
+            shared=shared,
             runs=runs,
             vocab_size=int(arrays["vocab_size"]),
             mask_words=int(arrays["bitset_words"]),
@@ -3114,7 +3313,7 @@ class DeviceGrammar:
             num_groups=int(
                 np.frombuffer(arrays["group_set_kind"], dtype=np.uint32).size
             ),
-            max_readings=widest("reading_offsets"),
+            max_readings=max(1, int(np.diff(starts).max()) if starts.size > 1 else 1),
             max_reading_terms=widest("reading_term_offsets"),
             nullable_chain=nullable,
             window_bound=_window_bound(arrays, nullable),
@@ -3195,8 +3394,14 @@ class DeviceGrammar:
 
         rows = np.zeros(int(_NBASES.value), dtype=np.int32)
         extent: dict[str, tuple[int, int]] = {}
+        # `set_payload` is shared, so its base is zero and a group's offset is
+        # absolute. Everything else is a per-grammar run at a base.
+        held = self._intern(tables) if tables.shared else None
         for name, slot in _ARENA.items():
-            run = runs[name]
+            if held is not None and name in _INTERNED:
+                rows[int(slot.value)] = 0
+                continue
+            run = held.get(name, runs[name]) if held is not None else runs[name]
             size = run.numel()
             at = self._reserve(name, size)
             getattr(self, name)[at : at + size] = run.cuda(non_blocking=True)
@@ -3249,6 +3454,8 @@ class DeviceGrammar:
                 self.window = wanted
                 self.revision += 1
 
+        if held is not None:
+            self._interned_of[identifier] = held["__held"]
         self.start_parser_states[identifier] = tables.start_parser_state
         self._live[identifier] = True
         self._extent[identifier] = extent
@@ -3282,6 +3489,14 @@ class DeviceGrammar:
         for name, (at, size) in self._extent[identifier].items():
             self._return(name, at, size)
         self._extent[identifier] = {}
+        for store, (digests, _) in self._interned_of.pop(identifier, {}).items():
+            table = self._interned[store]
+            for digest in digests:
+                entry = table[digest]
+                entry[2] -= 1
+                if entry[2] == 0:
+                    self._return(store, entry[0], entry[1])
+                    del table[digest]
         self._free_ids.append(identifier)
         self.count -= 1
         self.tenancy += 1
@@ -3319,7 +3534,14 @@ class DeviceGrammar:
         # admissions do not immediately grow it back. Compaction is the only
         # moment the capacity can come down: everywhere else a live batch may
         # be reading the arrays.
+        # The shared store is renumbered like everything else, but a block in
+        # it is pointed at by absolute offset from every grammar that admits
+        # the same set - so moving one means rewriting those grammars'
+        # `group_set_offset`, which is done below rather than through `rows`.
+        shared = set(_INTERNED) if self._interned else set()
         for name in _ARENA:
+            if name in shared:
+                continue
             wanted = sum(extent[name][1] for extent in extents)
             self._used[name] = 0
             self._free[name] = []
@@ -3333,6 +3555,8 @@ class DeviceGrammar:
         rows = np.zeros((max(len(keep), 1), int(_NBASES.value)), dtype=np.int32)
         for new, extent in enumerate(extents):
             for name, slot in _ARENA.items():
+                if name in shared:
+                    continue
                 at, size = extent[name]
                 to = self._reserve(name, size)
                 getattr(self, name)[to : to + size] = held[name][at : at + size]
@@ -3354,9 +3578,17 @@ class DeviceGrammar:
             {
                 name: (int(rows[new, int(slot.value)]), extents[new][name][1])
                 for name, slot in _ARENA.items()
+                if name not in shared
             }
             for new in range(len(keep))
         ]
+        self._interned_of = {
+            remap[old]: entry
+            for old, entry in self._interned_of.items()
+            if old in remap
+        }
+        for store in shared:
+            self._compact_shared(store, held[store])
         self.revision += 1
         self.tenancy += 1
         return remap

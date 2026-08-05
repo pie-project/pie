@@ -322,8 +322,12 @@ extern "C" __global__ void en_candidate(
         int64_t out_base = (int64_t)row * max_readings;
 
         int32_t index = 0;
-        int32_t use_end = t.reading_offsets[group + 1];
-        for (int32_t use = t.reading_offsets[group];
+        // Length-prefixed: a reading list is shared with every group in the
+        // pool that wants the same one, so it cannot say how long it is by
+        // where the next one starts.
+        const int32_t use_at = t.reading_offsets[group];
+        const int32_t use_end = use_at + 1 + t.reading_index[use_at];
+        for (int32_t use = use_at + 1;
              use < use_end && index < max_readings; ++use) {
             int32_t reading = t.reading_index[use];
             // Every surviving derivation is kept, unlike the mask, which only
@@ -422,7 +426,7 @@ extern "C" __global__ void en_candidate(
         cand_count[row] = index;
         // More derivations than there is room for keeps a prefix of them,
         // which narrows the mask at the next token.
-        if (index >= max_readings && t.reading_offsets[group] + index < use_end) {
+        if (index >= max_readings && use_at + 1 + index < use_end) {
             state->overflow[sequence] = 1;
         }
     }

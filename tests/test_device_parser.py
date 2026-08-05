@@ -903,7 +903,8 @@ class ArenaPaging(unittest.TestCase):
             identifier = pool.admit(grammar)
             held[index] = (identifier, pool.generation(identifier))
         live = [
-            identifier for identifier, generation in held.values()
+            identifier
+            for identifier, generation in held.values()
             if pool.holds(identifier, generation)
         ]
         self.assertTrue(live, "the budget evicted everything")
@@ -1271,9 +1272,7 @@ class StackDeeperThanTheBlock(unittest.TestCase):
         held = batch.configurations(0)
         self.assertEqual(
             sorted((state, tuple(stack)) for state, stack in held),
-            sorted(
-                (state, tuple(stack)) for state, stack in matcher.configurations()
-            ),
+            sorted((state, tuple(stack)) for state, stack in matcher.configurations()),
         )
 
 
@@ -1498,3 +1497,72 @@ class SizedForTheMachine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BlocksAreSharedAcrossThePool(unittest.TestCase):
+    """Every grammar in a pool is compiled against one tokenizer.
+
+    So a block two of them hold is the same words twice. `set_payload` and
+    `reading_index` are content-addressed stores with absolute offsets, and a
+    group's list of ways to read its tokens is the same list in state after
+    state - which is 6.9x on the largest array in a live pool.
+    """
+
+    def setUp(self):
+        _requirements()
+        from engrain._engine import DeviceGrammar
+
+        self.DeviceGrammar = DeviceGrammar
+        self.compiler = support.Compiler(VOCABULARY)
+
+    def test_the_same_grammar_twice_costs_one_copy(self):
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {name: {"type": "string"} for name in "abcdef"},
+                "additionalProperties": False,
+            }
+        )
+        one = self.compiler.compile_json_schema(schema)
+        two = self.compiler.compile_json_schema(schema + " ")
+        pool = self.DeviceGrammar(max_configs=8)
+        pool.admit(one)
+        alone = pool.used_bytes()
+        pool.admit(two)
+        both = pool.used_bytes()
+        # The second grammar's blocks are all held already, so what it adds is
+        # its own tables and none of theirs.
+        self.assertLess(both - alone, alone)
+
+    def test_a_released_grammar_gives_its_blocks_back(self):
+        pool = self.DeviceGrammar(max_configs=8)
+        empty = pool.used_bytes()
+        identifier = pool.admit(
+            self.compiler.compile_json_schema(
+                json.dumps({"type": "array", "items": {"type": "integer"}})
+            )
+        )
+        self.assertGreater(pool.used_bytes(), empty)
+        pool.release(identifier)
+        self.assertEqual(pool.used_bytes(), empty)
+
+    def test_the_mask_is_the_matcher_s_with_blocks_shared(self):
+        """Sharing is a placement, not a meaning. The masks must not move."""
+        schemas = [
+            json.dumps({"type": "object", "properties": {"a": {"type": "integer"}}}),
+            json.dumps({"type": "array", "items": {"type": "string"}}),
+            json.dumps({"type": "object", "properties": {"a": {"type": "string"}}}),
+        ]
+        import torch
+
+        pool = self.DeviceGrammar(max_configs=8)
+        held = [self.compiler.compile_json_schema(source) for source in schemas]
+        ids = [pool.admit(compiled) for compiled in held]
+        batch = pool.new_batch(1)
+        for identifier, compiled in zip(ids, held, strict=True):
+            matcher = compiled.matcher(0)
+            reference = torch.zeros(pool.mask_words, dtype=torch.int32)
+            matcher.fill_bitmask(reference)
+            batch.set_grammars([identifier])
+            batch.set_configurations(0, matcher.configurations())
+            self.assertTrue(torch.equal(batch.fill_mask()[0].cpu(), reference))
