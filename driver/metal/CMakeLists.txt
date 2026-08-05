@@ -218,18 +218,27 @@ endif()
 
 # ---- the loader archive ----------------------------------------------------
 #
-# `src/batch/forward.cpp` compiles a LoadPlan, which means calling into
-# `pie-loader` — an rlib the *worker* links, not something a C++ binary can
-# pull in. `cargo rustc -p pie-loader --lib --crate-type staticlib` emits an
-# archive that does link. Anything that links `pie_driver_metal_lib` into an
-# executable needs it; the archive target itself does not, which is why
-# `worker/build.rs` (it builds only `pie_driver_metal_lib`) never noticed.
+# `src/batch/forward.cpp` compiles a LoadPlan, which means calling into the
+# loader's C ABI — `pie-loader-capi`, an rlib the *worker* links, not something
+# a C++ binary can pull in. `cargo rustc -p pie-loader-capi --lib --crate-type
+# staticlib` emits an archive that does link. Anything that links
+# `pie_driver_metal_lib` into an executable needs it; the archive target itself
+# does not, which is why `worker/build.rs` (it builds only
+# `pie_driver_metal_lib`) never noticed.
+#
+# The name is `pie_loader_capi` and NOT `pie_loader`: the C entry points moved
+# out of the compiler crate when authoring did, so a `-p pie-loader` staticlib
+# still builds and still links and exports none of the eighteen `pie_loader_*`
+# symbols. Searching for the old name found that archive and failed at link
+# with an undefined `_pie_loader_verify_model` instead of skipping.
+#
 # Mirrors driver/cuda: when the archive is absent those targets are skipped
 # rather than failing the build for everyone who has not run that command.
 if(NOT PIE_LOADER_STATICLIB)
   find_library(PIE_LOADER_STATICLIB
-    NAMES pie_loader
+    NAMES pie_loader_capi
     PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../target/release
     NO_DEFAULT_PATH)
 endif()
 
@@ -243,8 +252,8 @@ if(PIE_LOADER_STATICLIB)
     ${PIE_LOADER_STATICLIB})
 else()
   message(STATUS
-    "pie_driver_metal: skipped (no libpie_loader.a; build one with "
-    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+    "pie_driver_metal: skipped (no libpie_loader_capi.a; build one with "
+    "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
 endif()
 
 # The `--features driver-metal` build in worker/build.rs consumes
@@ -316,8 +325,8 @@ function(add_metal_linked_test target source)
   cmake_parse_arguments(ARG "NEEDS_LOADER" "" "" ${ARGN})
   if(ARG_NEEDS_LOADER AND NOT PIE_LOADER_STATICLIB)
     message(STATUS
-      "${target}: skipped (no libpie_loader.a; build one with "
-      "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+      "${target}: skipped (no libpie_loader_capi.a; build one with "
+      "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
     return()
   endif()
   add_executable(${target} ${source})
@@ -443,8 +452,8 @@ if(PIE_LOADER_STATICLIB)
   add_test(NAME paged_batch_validation_test COMMAND paged_batch_validation_test)
 else()
   message(STATUS
-    "paged_batch_validation_test: skipped (no libpie_loader.a; build one with "
-    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+    "paged_batch_validation_test: skipped (no libpie_loader_capi.a; build one with "
+    "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
 endif()
 
 add_metal_linked_test(pipeline_copy_ops_test tests/pipeline_copy_ops_test.cpp

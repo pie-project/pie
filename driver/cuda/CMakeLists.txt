@@ -619,17 +619,24 @@ target_include_directories(pie_driver_cuda_lib
 # ---- the loader archive ----------------------------------------------------
 #
 # Authoring a contract reads the checkpoint's tensor table, which means calling
-# into `pie-loader` — and `pie-loader` is an rlib the *worker* links, not
-# something a C++ binary can pull in. `cargo rustc -p pie-loader --lib
+# into the loader's C ABI — `pie-loader-capi`, an rlib the *worker* links, not
+# something a C++ binary can pull in. `cargo rustc -p pie-loader-capi --lib
 # --crate-type staticlib` emits an archive that does link. Anything reaching
 # `pie_driver_cuda_lib`'s `loaded_model.cpp` needs it. When it is there those
 # targets are built; when it is not they are skipped, because failing the whole
 # build for everyone who has not run that command would be worse than not
 # building a diagnostic tool and two structural tests.
+#
+# The name is `pie_loader_capi` and NOT `pie_loader`: the C entry points moved
+# out of the compiler crate when authoring did, so a `-p pie-loader` staticlib
+# still builds and exports none of the eighteen `pie_loader_*` symbols.
+# Searching for the old name finds that archive and fails at link instead of
+# skipping.
 if(NOT PIE_LOADER_STATICLIB)
   find_library(PIE_LOADER_STATICLIB
-    NAMES pie_loader
+    NAMES pie_loader_capi
     PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../target/release
     NO_DEFAULT_PATH)
 endif()
 
@@ -641,8 +648,8 @@ if(PIE_LOADER_STATICLIB)
     ${PIE_LOADER_STATICLIB} dl pthread)
 else()
   message(STATUS
-    "pie_driver_cuda: skipped (no libpie_loader.a; build one with "
-    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+    "pie_driver_cuda: skipped (no libpie_loader_capi.a; build one with "
+    "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
 endif()
 
 # ---- FlashInfer generated CUTLASS MoE (vendored) ---------------------------
@@ -1105,8 +1112,8 @@ if(PIE_LOADER_STATICLIB)
     LIBS pie_driver_cuda_lib CUDA::cudart ${PIE_LOADER_STATICLIB} dl pthread)
 else()
   message(STATUS
-    "test_weight_store_codec: skipped (no libpie_loader.a; build one with "
-    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+    "test_weight_store_codec: skipped (no libpie_loader_capi.a; build one with "
+    "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
 endif()
 # The non-compact ExtentWrite path. Header-only: it builds its own one-file
 # plan, so it needs the loader's headers but not the staticlib.
@@ -1213,8 +1220,8 @@ if(PIE_LOADER_STATICLIB)
     LIBS pie_driver_cuda_lib ${PIE_LOADER_STATICLIB} dl pthread)
 else()
   message(STATUS
-    "test_entry_validation: skipped (no libpie_loader.a; build one with "
-    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+    "test_entry_validation: skipped (no libpie_loader_capi.a; build one with "
+    "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
 endif()
 pie_add_cuda_target(test_rs_descriptor_validation
   SOURCES tests/rs_descriptor_validation_test.cpp
@@ -1239,6 +1246,6 @@ if(PIE_LOADER_STATICLIB)
     LIBS pie_driver_cuda_lib ${PIE_LOADER_STATICLIB} dl pthread)
 else()
   message(STATUS
-    "test_model_registry: skipped (no libpie_loader.a; build one with "
-    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+    "test_model_registry: skipped (no libpie_loader_capi.a; build one with "
+    "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
 endif()
