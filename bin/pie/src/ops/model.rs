@@ -45,14 +45,24 @@ pub enum ModelCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Precompute a serve boot: author the family contract, run the load
+    /// transforms offline, write the runtime tensors as a `.zt` artifact.
+    ///
+    /// Not to be confused with `pie config optimize`, which measures this
+    /// machine and tunes the batching knobs. This one prepares an artifact;
+    /// that one prepares a config.
+    Optimize(crate::ops::optimize::OptimizeArgs),
 }
 
 pub fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
         ModelCmd::List { json } => list(json),
         ModelCmd::Info { name, json } => info(name, json),
+        // `download` and `convert` were both "make this servable", so they are
+        // one verb now; `import` fetches when the source is remote.
         ModelCmd::Import(args) => crate::ops::convert::run(args),
         ModelCmd::Remove { name, yes } => remove(name, yes),
+        ModelCmd::Optimize(args) => crate::ops::optimize::run(args),
     }
 }
 

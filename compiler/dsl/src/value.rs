@@ -34,9 +34,29 @@ impl Tensor {
 
     /// A trace-known constant value. Accepts a scalar
     /// (`Tensor::constant(-1i32)`) or an array (`Tensor::constant([0u32, 1])`).
-    /// A body constant materializes to `Const` (scalar), `Broadcast` (uniform
-    /// vector), or `Iota`/affine (a sequence) — the closed op set has no general
-    /// vector-const op (small consts fold to immediates).
+    ///
+    /// The op set carries constants as *scalars*: `const` holds one
+    /// [`Literal`] and nothing else. So the tensor constants that lower are
+    /// exactly the ones a scalar plus one op can spell — a uniform tensor
+    /// (`broadcast`), and a `u32` affine ramp `a + b*i` (`iota`, then the
+    /// arithmetic). Anything else — a per-token logit bias, a banned-token
+    /// set, a sampling schedule — is *bulk data*, and bulk data lives in a
+    /// channel:
+    ///
+    /// ```ignore
+    /// let bias = Channel::from(vec![0.0f32, -3.5, 0.0, 12.25]).named("bias");
+    /// // ... in a stage body:
+    /// let logits = logits + bias.read();
+    /// ```
+    ///
+    /// That is not a workaround for a missing op. The op stream is a stream of
+    /// fixed-size records — it is what lets a backend emit a kernel from an op
+    /// tag alone — and a buffer of arbitrary bytes is not a record. A channel
+    /// is this system's name for a buffer the device reads, so a constant
+    /// tensor is a channel that is seeded once and never written again.
+    ///
+    /// Passing anything else here records a trace error naming the shape and
+    /// pointing at the channel.
     pub fn constant(v: impl IntoConst) -> Tensor {
         Tensor {
             inner: TensorInner::Const(v.into_const()),
@@ -58,6 +78,63 @@ impl Tensor {
     pub fn shape(&self) -> Shape {
         self.ty().shape
     }
+
+    /// Ceiling division, the same spelling std gives the host scalars
+    /// (`u32::div_ceil`): `n.div_ceil(page_size)` reads the same whether `n`
+    /// is a prompt length on the host or a device-resolved KV length.
+    ///
+    /// This is the page-count arithmetic every decode epilogue does, and
+    /// spelling it `(n + (page_size - 1)) / page_size` hid a rounding rule
+    /// behind an off-by-one that had to be re-read every time.
+    ///
+    /// A trace-known scalar divisor has its `- 1` folded here, so the emitted
+    /// ops are exactly the ones the hand-written form produced.
+    pub fn div_ceil(&self, rhs: impl AsTensor) -> Tensor {
+        let d = rhs.to_arg();
+        match const_scalar(&d) {
+            Some(v) => {
+                let one_less = Tensor::from_arg(scalar_arg(v - 1.0, d.ty().dtype));
+                (self + one_less) / Tensor::from_arg(d)
+            }
+            None => {
+                let d = Tensor::from_arg(d);
+                (self + &d - 1u32) / &d
+            }
+        }
+    }
+
+    fn from_arg(a: Arg) -> Tensor {
+        match a {
+            Arg::Node { id, ty } => Tensor::node(id, ty),
+            Arg::Const(c) => Tensor {
+                inner: TensorInner::Const(c),
+            },
+        }
+    }
+}
+
+/// The numeric value of a trace-known scalar operand, if it is one.
+fn const_scalar(a: &Arg) -> Option<f64> {
+    let Arg::Const(c) = a else { return None };
+    if !c.shape.is_scalar() {
+        return None;
+    }
+    let b = c.bytes.as_slice();
+    Some(match c.dtype {
+        DType::Bool => (b.first().copied().unwrap_or(0) != 0) as u8 as f64,
+        DType::F32 => f32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
+        DType::I32 => i32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
+        DType::U32 => u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
+    })
+}
+
+/// A scalar constant operand of the given dtype.
+fn scalar_arg(v: f64, dtype: DType) -> Arg {
+    Arg::Const(ConstData {
+        shape: Shape::SCALAR,
+        dtype,
+        bytes: scalar_bytes_of(v, dtype),
+    })
 }
 
 /// A trace-known constant value: a typed scalar/vector immediate.
@@ -293,9 +370,13 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
     }
     let poisoned = poison_id(
         alloc::format!(
-            "general vector constant {vals:?} (dtype {:?}) is not representable in the closed \
-             op set; use iota/broadcast, an arithmetic expression, or feed it through a channel",
-            c.dtype
+            "a {:?} constant of shape {:?} is bulk data, and the op set carries constants as \
+             scalars: `const` holds one literal, so only a uniform tensor (broadcast) and a u32 \
+             affine ramp a+b*i (iota) are reachable from it. Seed a channel with the values and \
+             read it in the body — `Channel::from(values)` — or build the tensor from an \
+             arithmetic expression",
+            c.dtype,
+            c.shape
         ),
         ty,
     );
@@ -522,7 +603,17 @@ pub fn log(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Log, |t| t)
 }
 /// `x` converted elementwise to dtype `to`, shape preserved.
+///
+/// A cast to the dtype `x` already has is the identity, and returns `x`
+/// unchanged rather than emitting an op. Worth doing here rather than asking
+/// authors not to write it: a cast is often applied to a value whose dtype
+/// depends on which branch produced it, and "cast it and let the trace decide"
+/// should not cost a device op when the answer is "nothing to do".
 pub fn cast(x: impl AsTensor, to: DType) -> Tensor {
+    let x = Tensor::from_arg(x.to_arg());
+    if x.dtype() == to {
+        return x;
+    }
     emit_unary(
         &x,
         move |id| Op::Cast {
@@ -753,8 +844,20 @@ pub fn iota(len: u32) -> Tensor {
     let ty = ValueType::new(Shape::vector(len), DType::U32);
     Tensor::node(emit(Op::Iota { len }, &[ty]), ty)
 }
-/// Axis-0 generalized gather: `gather(src[n, rest..], idx[S..]) -> [S.., rest..]`.
-#[track_caller]
+/// The CSR row-offset vector for `rows` runs of equal length `run_len`:
+/// `[0, run_len, 2*run_len, …, rows*run_len]`, one entry more than there are
+/// rows.
+///
+/// This is what a descriptor's `*_indptr` port wants, and the shape every
+/// decode epilogue rebuilds each fire as its page count grows. Spelled out it
+/// was `iota(2) * broadcast(&page_count, [2])` — arithmetic that happens to
+/// evaluate to `[0, page_count]` without ever saying so.
+pub fn indptr(rows: u32, run_len: impl AsTensor) -> Tensor {
+    let n = rows + 1;
+    iota(n) * broadcast(run_len, [n])
+}
+
+/// Axis-0 generalized gather: `gather(src[n, rest..], idx[S..]) -> [S.., rest..]`.#[track_caller]
 pub fn gather(src: impl AsTensor, idx: impl AsTensor) -> Tensor {
     let (is, tys) = src.to_arg().materialize();
     let (ii, tyi) = idx.to_arg().materialize();
@@ -847,11 +950,14 @@ pub fn reduce_argmax(x: impl AsTensor) -> Tensor {
         ValueType::new(reduce_shape(t.shape), DType::I32)
     })
 }
-/// Inclusive prefix sum along the last axis; `F32` only, shape preserved.
+/// Inclusive prefix sum along the last axis; numeric, shape and dtype
+/// preserved. Integer lanes scan in their own dtype and wrap on overflow, so
+/// a `u32` offset scan stays exact past 2^24.
 pub fn cumsum(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumSum, |t| t)
 }
-/// Inclusive prefix product along the last axis; `F32` only, shape preserved.
+/// Inclusive prefix product along the last axis; numeric, shape and dtype
+/// preserved. Integer lanes wrap on overflow.
 pub fn cumprod(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumProd, |t| t)
 }

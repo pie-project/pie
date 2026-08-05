@@ -129,7 +129,10 @@ void bind_llama_dag(RawMetalContext& ctx, const BoundLlama& b, const std::vector
                 bind_slot(ctx, ord, (std::uint8_t)bind::RowGather::Rows, io(IoSlot::SampleRows));
                 break;
             case Kind::Argmax:
-                bind_slot(ctx, ord, 1, io(IoSlot::TokenId));
+                bind_slot(ctx, ord, (std::uint8_t)bind::Argmax::NextToken,
+                          io(IoSlot::NextToken));
+                bind_slot(ctx, ord, (std::uint8_t)bind::Argmax::Params, b.argmax_params);
+                bind_slot(ctx, ord, (std::uint8_t)bind::Argmax::EosFlag, b.eos_flag);
                 break;
             default:
                 break;

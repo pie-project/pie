@@ -52,7 +52,7 @@ fn default_top_p() -> f32 {
 fn sample_token(r: &Tensor, temperature: f32, top_p: f32, vocab: u32) -> Tensor {
     let logits = intrinsics::logits(); // [1, vocab] f32 (read-out row)
     if temperature == 0.0 {
-        return cast(&reduce_argmax(&logits), dtype::i32);
+        return reduce_argmax(&logits);
     }
     let scaled = &logits / temperature.max(1e-4);
     let _ = vocab;
@@ -110,14 +110,13 @@ async fn main(input: Input) -> Result<String> {
         let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
         let w_slot_p = Channel::from(w_slot_pv).named("w_slot_p");
         let w_off_p = Channel::from(w_off_pv).named("w_off_p");
-        let klen_p = Channel::from(vec![n; 1]).named("klen_p");
+        let klen_p = Channel::from([n]).named("klen_p");
         let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
         // The page CSR is the SOURCE OF TRUTH for kv_len on the wire: the driver
         // derives `kv_len = (page_count-1)*PAGE_T + last_page_len`. Declaring the
         // whole pool here would claim a kv length the pass does not have and
         // silently corrupt attention — the count must track `kv_len` exactly.
-        let page_indptr_p =
-            Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]).named("pidx_p");
+        let page_indptr_p = Channel::from([0u32, n.div_ceil(PAGE_T)]).named("pidx_p");
 
         // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
         let mask_pv: Vec<bool> = (0..n)
@@ -176,12 +175,12 @@ async fn main(input: Input) -> Result<String> {
 
     // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
     let slot_n = pool_ids[(n / PAGE_T) as usize];
-    let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-    let pos = Channel::from(vec![n; 1]).named("pos");
-    let fill = Channel::from(vec![n + 1; 1]).named("fill");
-    let klen = Channel::from(vec![n + 1; 1]).named("klen");
-    let w_slot = Channel::from(vec![slot_n; 1]).named("w_slot");
-    let w_off = Channel::from(vec![n % PAGE_T; 1]).named("w_off");
+    let tok_in = Channel::from([g0]).named("tok_in");
+    let pos = Channel::from([n]).named("pos");
+    let fill = Channel::from([n + 1]).named("fill");
+    let klen = Channel::from([n + 1]).named("klen");
+    let w_slot = Channel::from([slot_n]).named("w_slot");
+    let w_off = Channel::from([n % PAGE_T]).named("w_off");
     // No AttnMask port: a decode query attends every key up to `klen`, which
     // this pass already carries on device, so a causal mask would only restate
     // it. Binding one would also cost the whole run-ahead: the mask port is a
@@ -190,8 +189,7 @@ async fn main(input: Input) -> Result<String> {
     // does not advertise — the pass would fall out of the decode-envelope class
     // and lose the only descriptor resolver that works inside one frame.
     let pages = Channel::from(pool_ids.clone()).named("pages");
-    let page_indptr =
-        Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]).named("page_indptr");
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]).named("page_indptr");
     let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
@@ -231,27 +229,19 @@ async fn main(input: Input) -> Result<String> {
         let next_free = &base + 1u32;
         let pages_v = reshape(&pids, [pool_pages]);
         // Page count tracks the new kv length, never the pool size.
-        let page_count = (&klen_v + (PAGE_T - 1)) / PAGE_T;
-        let pidx_v = iota(2) * broadcast(&page_count, [2]);
+        let page_count = klen_v.div_ceil(PAGE_T);
+        let pidx_v = indptr(1, &page_count);
 
         // Device-resolved geometry is loop-carried: the host never drains
-        // these rings, so the graph has to take before it puts or the
-        // readiness check sees a full ring and refuses to commit the pass.
-        tok_in.take();
+        // these rings, so every fire's values are re-put here.
         tok_in.put(&tok);
         out.put(&tok);
-        w_slot.take();
         w_slot.put(&w_slot_v);
-        w_off.take();
         w_off.put(&w_off_v);
-        klen.take();
         klen.put(&klen_v);
-        pos.take();
         pos.put(&base);
         fill.put(&next_free);
-        pages.take();
         pages.put(&pages_v);
-        page_indptr.take();
         page_indptr.put(&pidx_v);
         rng.put(&r_next);
         pool_ids_ch.put(&pids);

@@ -61,7 +61,7 @@ async fn main(_input: String) -> Result<String> {
     let scores = Channel::from(vec![0.0f32; B as usize]).named("scores");
     let toks = Channel::from(vec![BOS; B as usize]).named("toks");
     let pos = Channel::from(vec![0u32; B as usize]).named("pos");
-    let fill = Channel::from(vec![1u32; 1]).named("fill"); // next free flat position
+    let fill = Channel::from([1u32]).named("fill"); // next free flat position
     let klen = Channel::from(vec![1u32; B as usize]).named("klen");
     let w_slot = Channel::from(vec![phys0; B as usize]).named("w_slot"); // physical page id
     let w_off = Channel::from(vec![0u32; B as usize]).named("w_off");
@@ -136,7 +136,6 @@ async fn main(_input: String) -> Result<String> {
 
         // physical KV span after this step's appends (mask restricts attention).
         let filled = &base + B; // [1]
-        klen.take();
         klen.put(broadcast(reshape(&filled, [1]), [B]));
 
         pos.put(pos.take() + 1u32);
@@ -150,11 +149,9 @@ async fn main(_input: String) -> Result<String> {
             broadcast(reshape(&pids, [1, POOL_PAGES]), [B, POOL_PAGES]),
             [B * POOL_PAGES],
         );
-        pages.take();
         pages.put(&pages_ig);
         // Re-emit the constant page_indptr each fire (channel-bound; peeked ports
         // still want a fresh value each pass). [0, POOL_PAGES, 2*POOL_PAGES].
-        page_indptr.take();
         page_indptr.put(&Tensor::constant(
             (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
         ));

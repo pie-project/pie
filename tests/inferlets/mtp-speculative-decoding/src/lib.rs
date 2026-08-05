@@ -171,7 +171,6 @@ async fn main(input: Input) -> Result<String> {
     fwd.epilogue(move || {
         let win = window.take();
         let base = len.take();
-        kv_len.take();
         let stop_prev = stopped.take();
         let neg1_w = broadcast(TOKEN_PAD, [w]);
 
@@ -218,20 +217,18 @@ async fn main(input: Input) -> Result<String> {
         let next_window = select(&stop_next_w, &neg1_w, &win_next);
         let next_live = ne(&next_window, TOKEN_PAD);
         let next_live_u32 = cast(&next_live, dtype::u32);
-        let next_live_f32 = cast(&next_live, dtype::f32);
-        let next_rank = cast(cumsum(&next_live_f32) - &next_live_f32, dtype::u32);
+        let next_rank = cumsum(&next_live_u32) - &next_live_u32;
         let next_positions = broadcast(&next_base, [w]) + &next_rank;
 
         let next_kv_len = &next_positions + &next_live_u32;
-        let page_counts = (&next_kv_len + (PAGE_T - 1)) / PAGE_T;
-        let page_tail = cast(cumsum(cast(&page_counts, dtype::f32)), dtype::u32);
+        let page_counts = next_kv_len.div_ceil(PAGE_T);
+        let page_tail = cumsum(&page_counts);
         let next_page_indptr = scatter_set(broadcast(0u32, [w + 1]), iota(w) + 1u32, &page_tail);
         len.put(&next_base);
         kv_len.put(&next_kv_len);
         positions.put(&next_positions);
         w_slot.put(&next_positions / PAGE_T);
         w_off.put(&next_positions % PAGE_T);
-        page_indptr.take();
         page_indptr.put(&next_page_indptr);
         window.put(&next_window);
     });

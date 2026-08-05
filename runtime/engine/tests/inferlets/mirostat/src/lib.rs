@@ -128,18 +128,9 @@ async fn main(input: String) -> Result<String> {
     let positions_p = Channel::from_iter(0..n).named("positions_p");
     let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
     let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p = Channel::from(
-        (0..n)
-            .map(|position| position / page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot_p");
-    let w_off_p = Channel::from(
-        (0..n)
-            .map(|position| position % page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off_p");
+    let w_slot_p =
+        Channel::from_iter((0..n).map(|position| position / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|position| position % page_size)).named("w_off_p");
     let mu_p = Channel::new([1], dtype::f32).named("mu_p");
     let rng_p = Channel::from([0x9e37_u32, 0]).named("rng_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
@@ -189,7 +180,7 @@ async fn main(input: String) -> Result<String> {
 
     // ── DECODE LOOP (1-wide) ──
     if generated.len() < max_tokens {
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
+        let tok_in = Channel::from([g0]).named("tok_in");
         let mu_ch = Channel::new([1], dtype::f32).named("mu_ch");
         let rng = Channel::from([0x51ed_u32, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32).named("tok_out");
@@ -228,15 +219,14 @@ async fn main(input: String) -> Result<String> {
 
             let r_next = &r + iota(2);
             let next_length = &length + 1u32;
-            let page_count = (&next_length + (page_size - 1)) / page_size;
+            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
             w_slot.put(&length / page_size);
             w_off.put(&length % page_size);
-            page_indptr.take();
-            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             s_out.put(&surprise);
             rng.put(&r_next);

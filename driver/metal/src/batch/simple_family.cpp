@@ -412,13 +412,12 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
 
         if (!gemma4::build_gemma4_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/false, err,
-                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false)) {
+        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, err)) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/true, err,
-                                  /*routed=*/false)) {
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, g_.quant, err,
+                MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
             return false;
         }
         // A checkpoint may quantize the dense FFN and the router at a DIFFERENT
@@ -428,13 +427,12 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         // `gemma4_uses_alt_quant` picks between them per dispatch. One table for
         // both would run a 4-bit kernel over 8-bit bytes: fast, and wrong.
         if (g_.has_alt_quant()) {
-            if (!load_decode_psos(ctx, kernels_dir, base_alt_, g_.ffn_quant,
-                                  /*with_argmax=*/false, err, /*fuse_residual=*/false,
-                                  /*gdn_prep=*/false, /*routed=*/false, /*untied=*/false)) {
+            if (!load_decode_psos(ctx, kernels_dir, base_alt_, g_.ffn_quant, err)) {
                 return false;
             }
-            if (!load_multibatch_psos(ctx, kernels_dir, mb_alt_, g_.ffn_quant,
-                                      /*with_d512=*/true, err, /*routed=*/false)) {
+            if (!load_multibatch_psos(
+                    ctx, kernels_dir, mb_alt_, g_.ffn_quant, err,
+                    MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
                 return false;
             }
         }
@@ -677,9 +675,30 @@ bool go_tap_for(const gptoss::Dispatch& d, const GptOssGeometry& g, GoTap& out) 
 void dump_go_taps(const std::vector<gptoss::Dispatch>& dag, const GptOssGeometry& g,
                   const gptoss::ScratchColoring& col, const std::vector<SlotHandle>& pool,
                   const SlotHandle& logits, int rows, int head_rows) {
+    std::vector<const std::int32_t*> perm_of(std::size_t(g.n_layers), nullptr);
+    for (std::size_t di = 0; di < dag.size() && di < col.per_dispatch.size(); ++di) {
+        const gptoss::Dispatch& d = dag[di];
+        if (d.kind != gptoss::Kind::ExpertSort || d.layer < 0) continue;
+        for (const auto& sb : col.per_dispatch[di]) {
+            if (sb.bind_index != (std::uint8_t)bind::MoeRouteSort::Perm) continue;
+            if (sb.color < 0 || std::size_t(sb.color) >= pool.size()) continue;
+            perm_of[std::size_t(d.layer)] =
+                static_cast<const std::int32_t*>(pool[std::size_t(sb.color)].contents());
+        }
+    }
     dump_taps_from(
         dag, col, pool, logits, rows, head_rows,
-        [&](const gptoss::Dispatch& d, Tap& t) { return go_tap_for(d, g, t); },
+        [&](const gptoss::Dispatch& d, Tap& t) {
+            if (!go_tap_for(d, g, t)) return false;
+            if (gptoss::is_expert_sorted(d.kind) && d.layer >= 0 &&
+                std::size_t(d.layer) < perm_of.size() &&
+                perm_of[std::size_t(d.layer)] != nullptr) {
+                t.perm = perm_of[std::size_t(d.layer)];
+                t.perm_rows = gptoss::gptoss_moe_sorted_rows(g, rows);
+                t.slots = g.experts_per_token;
+            }
+            return true;
+        },
         [](const gptoss::Dispatch& d) { return gptoss::is_tail(d.kind); });
 }
 
@@ -700,6 +719,10 @@ int go_kind_width(gptoss::Kind k, const GptOssGeometry& g) {
         case K::RouterGemv:               return std::max(g.hidden, g.n_experts);
         // The ids are 4-byte ints, so they count double against a bf16 slot.
         case K::RouterTopK:               return std::max(g.n_experts, 2 * g.experts_per_token);
+        case K::ExpertSort:               return 2 * g.experts_per_token;
+        case K::ExpertGather:             return g.hidden;
+        // The exact sorted-row extent is applied in `go_pool_elems`; these are
+        // the per-row widths used for the M=1 floor.
         case K::ExpertGate: case K::ExpertUp: return std::max(g.hidden, stack);
         case K::ExpertSwiGlu:             return stack;
         case K::ExpertDown:               return std::max(stack, down);
@@ -733,8 +756,37 @@ std::vector<std::size_t> go_pool_elems(const std::vector<gptoss::Dispatch>& dag,
         // The tail's tensors have one row per SAMPLED row; the body's have one
         // per token.
         const bool tail = gptoss::is_tail(kind);
-        const std::size_t need = std::size_t(tail ? head_rows : rows) *
-                                 std::size_t(go_kind_width(kind, g));
+        const std::size_t sorted =
+            std::size_t(gptoss::gptoss_moe_sorted_rows(g, rows));
+        std::size_t need = std::size_t(tail ? head_rows : rows) *
+                           std::size_t(go_kind_width(kind, g));
+        switch (kind) {
+            case K::ExpertSort:
+                need = 2 * std::max(sorted,
+                                    std::size_t(rows * g.experts_per_token));
+                break;
+            case K::ExpertGather:
+                need = sorted * std::size_t(g.hidden);
+                break;
+            case K::ExpertGate:
+            case K::ExpertUp:
+                need = sorted *
+                       std::size_t(std::max(g.hidden, g.intermediate));
+                break;
+            case K::ExpertSwiGlu:
+                need = sorted * std::size_t(g.intermediate);
+                break;
+            case K::ExpertDown:
+                need = sorted *
+                       std::size_t(std::max(g.intermediate, g.hidden));
+                break;
+            case K::ExpertCombine:
+                need = std::max(sorted * std::size_t(g.hidden),
+                                std::size_t(rows) * std::size_t(g.hidden));
+                break;
+            default:
+                break;
+        }
         for (const auto& sb : col.per_dispatch[di]) {
             if (sb.color < 0 || sb.color >= col.colors_used) continue;
             elems[std::size_t(sb.color)] = std::max(elems[std::size_t(sb.color)], need);
@@ -793,11 +845,8 @@ class GptOssEngine final : public SimpleFamilyEngine {
             return false;
         }
 
-        // Paged KV. gpt-oss has no M>1 path -- its MoE picks experts per ROW,
-        // so a batched routed matmul is a different kernel rather than a wider
-        // launch -- but paging is orthogonal to that: what it buys is SEVERAL
-        // SEQUENCES, each attending its own page list, instead of one ring that
-        // the second sequence clobbers.
+        // Paged KV. The sorted MoE is a true M>1 path: rows are grouped by
+        // expert, then the native MXFP4 routed GEMM serves each run.
         g_.paged_kv_enabled = true;
         g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : 32;
         const int ps = g_.kv_page_size;
@@ -871,9 +920,11 @@ class GptOssEngine final : public SimpleFamilyEngine {
         // This used to be the parameter's default, which meant the driver was
         // making the same choice without saying so.
         const AffineFormat kGptOssBase{/*bits=*/4, /*group=*/64};
-        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, /*with_argmax=*/false, err))
+        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, err))
             return false;
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, kGptOssBase, /*with_d512=*/false, err))
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, kGptOssBase, err,
+                MultiBatchPsoFeatures{.bias = true}))
             return false;
 
         gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
@@ -932,10 +983,9 @@ class GptOssEngine final : public SimpleFamilyEngine {
     }
 
     bool paged() const override { return true; }
-    /// A fire of R rows is R PASSES, not one wider one: gpt-oss has no M>1
-    /// path, because its MoE picks experts per row. So the row budget costs
-    /// time rather than memory, and what paging buys is that those passes may
-    /// belong to different sequences.
+    /// A fire of R rows is one wider pass. The routed bank sorts its
+    /// (row, expert) pairs before the GEMM, while paging keeps each request's
+    /// KV history independent.
     int max_rows() const override { return max_rows_; }
     int max_sampled_rows() const override { return max_sampled_; }
     int page_size() const override { return g_.kv_page_size; }
@@ -1215,7 +1265,7 @@ class LlamaEngine final : public SimpleFamilyEngine {
             b_.kv[std::size_t(L)] = kv_[std::size_t(L)];
         }
 
-        dag_ = llama::build_llama_dag(g_, /*with_argmax=*/false);
+        dag_ = llama::build_llama_dag(g_, /*with_argmax=*/true);
         plan_ = llama::build_llama_scratch(dag_, g_);
         // Under a tap dump every value needs its own buffer, or a later
         // dispatch overwrites the one being read.
@@ -1241,8 +1291,12 @@ class LlamaEngine final : public SimpleFamilyEngine {
 
         b_.io.resize(kIoSlotCount);
         // The page list is the largest of these and grows with the context.
-        const std::size_t io_bytes =
-            std::max<std::size_t>(4096, std::size_t(g_.total_pages + 8) * 4);
+        const std::size_t io_bytes = std::max({
+            std::size_t(4096),
+            std::size_t(g_.total_pages + 8) * 4,
+            std::size_t(max_rows_ + 1) * 4,
+            std::size_t(max_sampled_ + 1) * 4,
+        });
         for (int i = 0; i < kIoSlotCount; ++i) b_.io[i] = ctx.heap_alloc(io_bytes);
         // The routed matvec declares a bias it does not read; see
         // `BoundLlama::zero_bias`. Wide enough for the widest routed output.
@@ -1266,20 +1320,60 @@ class LlamaEngine final : public SimpleFamilyEngine {
             if (err) *err = "llama logits allocation failed";
             return false;
         }
+        b_.argmax_params = ctx.heap_alloc(sizeof(ArgmaxParams));
+        b_.eos_flag = ctx.heap_alloc(std::size_t(max_sampled_) * sizeof(std::uint32_t));
+        if (!b_.argmax_params.valid() || !b_.eos_flag.valid()) {
+            if (err) *err = "llama argmax allocation failed";
+            return false;
+        }
+        auto* ap = static_cast<ArgmaxParams*>(b_.argmax_params.contents());
+        *ap = {};
+        ap->vocab = std::uint32_t(g_.vocab);
 
         if (!llama::build_llama_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/false, err,
-                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false)) {
+        if (!load_decode_psos(
+                ctx, kernels_dir, base_, g_.quant, err,
+                DecodePsoFeatures{.argmax = true})) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/false, err,
-                                  /*routed=*/false)) {
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, g_.quant, err,
+                MultiBatchPsoFeatures{
+                    .splitk = true,
+                    .fp16_precast = !g_.is_moe() &&
+                        g_.quant.bits == 4 && g_.quant.group == 64})) {
             return false;
         }
 
+        // Split-K partials: the largest shape this model actually splits, with
+        // one slice per member of the Q/K/V concurrency run. lm_head never
+        // splits, so this stays in megabytes rather than hundreds of them.
+        const std::size_t splitk_elems =
+            llama::llama_splitk_partial_elems(g_, max_rows_);
+        if (splitk_elems > 0) {
+            splitk_partial_ = ctx.heap_alloc(sizeof(float) * splitk_elems);
+            if (!splitk_partial_.valid()) {
+                if (err) *err = "llama split-K partial allocation failed";
+                return false;
+            }
+        }
+        if (!g_.is_moe() && g_.quant.bits == 4 && g_.quant.group == 64) {
+            const std::size_t fp16_elems =
+                std::size_t(llama::llama_qmm_pool_rows(max_rows_)) *
+                std::size_t(std::max(g_.hidden, g_.intermediate));
+            fp16_input_ = ctx.heap_alloc(fp16_elems * sizeof(std::uint16_t));
+            if (!fp16_input_.valid()) {
+                if (err) *err = "llama FP16 QMM input allocation failed";
+                return false;
+            }
+        }
         llama::bind_llama_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true);
+        llama::bind_llama_splitk(ctx, dag_, g_, /*rows=*/1, splitk_partial_,
+                                 splitk_keep_, /*requests=*/1);
+        llama::bind_llama_fp16_qmm(ctx, dag_, g_, /*rows=*/1, /*head_rows=*/1,
+                                   /*requests=*/1, fp16_input_, fp16_keep_);
         bound_rows_ = 1;
+        bound_requests_ = 1;
         try {
             llama::bind_llama_dag(ctx, b_, dag_, g_, coloring_, /*ordinal_base=*/0,
                                   /*paged=*/true);
@@ -1287,9 +1381,15 @@ class LlamaEngine final : public SimpleFamilyEngine {
             if (err) *err = std::string("binding llama: ") + e.what();
             return false;
         }
-        // The logits leave the pool: the sampler reads a slot of its own, so
-        // the tail writes there and nothing copies afterwards.
-        ctx.arg_bind_ordinal(dag_.back().ordinal, (std::uint8_t)bind::Qmv::Out, logits_);
+        // The logits leave the pool: both the sampler and the argmax read a
+        // slot of their own, so the head writes there directly.
+        for (const llama::Dispatch& d : dag_) {
+            if (d.kind == llama::Kind::LmHead) {
+                ctx.arg_bind_ordinal(d.ordinal, (std::uint8_t)bind::Qmv::Out, logits_);
+            } else if (d.kind == llama::Kind::Argmax) {
+                ctx.arg_bind_ordinal(d.ordinal, (std::uint8_t)bind::Argmax::Logits, logits_);
+            }
+        }
         if (slab_ && !plan_segments(err)) return false;
         write_u32s(b_.io[int(IoSlot::AttnMaskStride)], {0u});
         if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
@@ -1358,6 +1458,12 @@ class LlamaEngine final : public SimpleFamilyEngine {
         // anything that switches back.
         write_i32(b_.io[int(IoSlot::SeqLen)], std::int32_t(csr.position_ids.back()) + 1);
         const int head_rows = csr.sample_rows.empty() ? rows : int(csr.sample_rows.size());
+        // How many requests these rows came from. `qo_indptr` is one entry per
+        // request plus a terminator, so this is the CSR's own answer rather than
+        // a second opinion. Attention needs it: the row count alone cannot tell a
+        // 32-row prefill from 32 members decoding a token each, and those two want
+        // opposite kernels.
+        const int requests = csr.qo_indptr.size() >= 2 ? int(csr.qo_indptr.size()) - 1 : 1;
         if (csr.sample_rows.empty()) {
             std::vector<std::uint32_t> every;
             every.resize(std::size_t(rows));
@@ -1372,21 +1478,34 @@ class LlamaEngine final : public SimpleFamilyEngine {
         // The constants carry the row count into the elementwise widths and
         // the row-gather's pitch, so they are rebound whenever it changes --
         // and only then, because this is every dispatch's argument table.
-        if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
+        if (bound_rows_ != rows || bound_head_rows_ != head_rows ||
+            bound_requests_ != requests) {
             llama::bind_llama_consts(ctx, dag_, g_, rows, /*paged=*/true);
+            llama::bind_llama_splitk(ctx, dag_, g_, rows, splitk_partial_,
+                                     splitk_keep_, requests);
+            llama::bind_llama_fp16_qmm(ctx, dag_, g_, rows, head_rows, requests,
+                                       fp16_input_, fp16_keep_);
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
+            bound_requests_ = requests;
         }
-        if (paging_.active()) return fire_segmented(ctx, rows, head_rows, pre, post);
+        if (paging_.active()) {
+            return fire_segmented(
+                ctx, rows, head_rows, requests, csr.run_argmax, pre, post);
+        }
         return ctx.run_step([&](StepEncoder& se) {
             if (pre) pre(se);
             llama::encode_llama_step(se, dag_, g_, base_, psos_, /*ordinal_base=*/0, &mb_, rows,
-                                     head_rows);
+                                     head_rows, requests, /*begin=*/0, /*end=*/~std::size_t(0),
+                                     csr.run_argmax);
             if (post) post(se);
         });
     }
 
     SlotHandle logits_slot() const override { return logits_; }
+    SlotHandle greedy_tokens_slot() const override {
+        return b_.io[int(IoSlot::NextToken)];
+    }
 
     void dump_taps(int rows) const override {
         dump_ll_taps(dag_, g_, plan_, coloring_, b_.pool, logits_, rows, bound_head_rows_);
@@ -1441,16 +1560,16 @@ class LlamaEngine final : public SimpleFamilyEngine {
                             g_.experts_per_token, max_rows_, "llama", err);
     }
 
-    StepTiming fire_segmented(RawMetalContext& ctx, int rows, int head_rows,
-                              const EncodeHook& pre, const EncodeHook& post) {
+    StepTiming fire_segmented(RawMetalContext& ctx, int rows, int head_rows, int requests,
+                              bool run_argmax, const EncodeHook& pre, const EncodeHook& post) {
         const std::size_t n = dag_.size();
         return paging_.fire(
             ctx, rows,
-            [this, rows, head_rows, n, &pre, &post](StepEncoder& se, std::size_t begin,
-                                                    std::size_t end) {
+            [this, rows, head_rows, requests, run_argmax, n, &pre, &post](
+                StepEncoder& se, std::size_t begin, std::size_t end) {
                 if (begin == 0 && pre) pre(se);
                 llama::encode_llama_step(se, dag_, g_, base_, psos_, /*ordinal_base=*/0, &mb_,
-                                         rows, head_rows, begin, end);
+                                         rows, head_rows, requests, begin, end, run_argmax);
                 if (end == n && post) post(se);
             });
     }
@@ -1471,7 +1590,16 @@ class LlamaEngine final : public SimpleFamilyEngine {
     int max_sampled_ = 1;
     int bound_rows_ = 0;
     int bound_head_rows_ = 0;
+    int bound_requests_ = 0;
     SlotHandle logits_{};
+    /// The split GEMM's partial [M, N] slices, and the small constant buffers
+    /// the argument tables point at. One partials buffer serves every split
+    /// projection: they are serialized by barriers and each is reduced before
+    /// the next one runs.
+    SlotHandle splitk_partial_{};
+    std::vector<SlotHandle> splitk_keep_{};
+    SlotHandle fp16_input_{};
+    std::vector<SlotHandle> fp16_keep_{};
     /// The routed experts' paging cache, when a budget asked for one.
     std::shared_ptr<ExpertSlab> slab_{};
     ExpertPaging paging_{};
@@ -1672,6 +1800,11 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
             bytes += e * 2;
         }
         bytes += std::size_t(sampled) * std::size_t(g.vocab) * 2;  // the logits slot
+        bytes += sizeof(float) * llama::llama_splitk_partial_elems(pg, rows);
+        if (!g.is_moe() && g.quant.bits == 4 && g.quant.group == 64) {
+            bytes += sizeof(std::uint16_t) * std::size_t(rows) *
+                     std::size_t(std::max(g.hidden, g.intermediate));
+        }
     }
     return bytes;
 }

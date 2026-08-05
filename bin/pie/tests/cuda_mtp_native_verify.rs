@@ -235,7 +235,9 @@ async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
             + name.len()
             + 1;
         let rest = &json[at..];
-        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
         Ok(rest[..end].parse()?)
     };
 

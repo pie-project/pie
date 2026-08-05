@@ -305,20 +305,32 @@ pub(crate) fn eval_op(
         }
 
         Op::CumSum(a) | Op::CumProd(a) => {
-            let t = ty_of(a);
-            let rows = rows_of(t.shape);
-            let x = lanes_f32(v(a));
-            let len = x.len().checked_div(rows).unwrap_or(0);
+            let rows = rows_of(ty_of(a).shape);
             let is_sum = matches!(op, Op::CumSum(_));
-            let mut out = Vec::with_capacity(x.len());
-            for r in 0..rows {
-                let mut acc = if is_sum { 0.0 } else { 1.0 };
-                for &e in &x[r * len..(r + 1) * len] {
-                    acc = if is_sum { acc + e } else { acc * e };
-                    out.push(acc);
+
+            // Scanned in the input's own dtype rather than through f32, which
+            // is the whole reason the op is not F32-only: a u32 offset scan
+            // past 2^24 is not representable in f32 and must not be rounded
+            // on its way through the interpreter either.
+            match v(a) {
+                Value::I32(x) if is_sum => {
+                    One(Value::I32(scan_rows(x, rows, 0, i32::wrapping_add)))
+                }
+                Value::I32(x) => One(Value::I32(scan_rows(x, rows, 1, i32::wrapping_mul))),
+                Value::U32(x) if is_sum => {
+                    One(Value::U32(scan_rows(x, rows, 0, u32::wrapping_add)))
+                }
+                Value::U32(x) => One(Value::U32(scan_rows(x, rows, 1, u32::wrapping_mul))),
+                other => {
+                    let lanes = lanes_f32(other);
+                    let (identity, combine): (f32, fn(f32, f32) -> f32) = if is_sum {
+                        (0.0, |a, b| a + b)
+                    } else {
+                        (1.0, |a, b| a * b)
+                    };
+                    One(Value::F32(scan_rows(&lanes, rows, identity, combine)))
                 }
             }
-            One(Value::F32(out))
         }
 
         Op::SortDesc(a) => {

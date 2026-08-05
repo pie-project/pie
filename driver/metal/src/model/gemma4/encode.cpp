@@ -240,7 +240,7 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
         const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
         const int bm = qmm_bm(M);
         const int bn = qmm_bn(kn.N, M);
-        const int wide = bm == kQmmBMWide ? 1 : 0;
+        const int wide = qmm_bm_slot(bm);
         // No split-K here either; see `launch_shape_mb`.
         const int split = 0;
         if (split > 1 && mb.qmm_t_splitk[wide].valid()) return mb.qmm_t_splitk[wide];

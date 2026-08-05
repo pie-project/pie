@@ -173,9 +173,7 @@ async fn mtp_specdecode_device_ab() -> Result<()> {
 
     let (a_mean, a_commit) = parse_metrics(&a_json);
     let (b_mean, b_commit) = parse_metrics(&b_json);
-    eprintln!(
-        "═══════════════════ MTP spec-decode A/B — 4090 / Qwen3.5-0.8B ═══════════════════"
-    );
+    eprintln!("═══════════════════ MTP spec-decode A/B — 4090 / Qwen3.5-0.8B ═══════════════════");
     eprintln!(
         "  A mtp-specdecode    : mean_accept={a_mean:.2}  committed={a_commit}  decode={a_dt:?}"
     );

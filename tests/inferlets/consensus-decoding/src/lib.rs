@@ -120,15 +120,14 @@ async fn main(input: Input) -> Result<String> {
         let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
         let w_slot_p = Channel::from(w_slot_pv).named("w_slot_p");
         let w_off_p = Channel::from(w_off_pv).named("w_off_p");
-        let klen_p = Channel::from(vec![n; 1]).named("klen_p");
+        let klen_p = Channel::from([n]).named("klen_p");
         let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
         // The page CSR is the wire's source of truth for kv_len: the driver derives
         // `last_page_len = ((kv_len-1) % PAGE_T) + 1` and reads back a span of
         // `(page_count-1)*PAGE_T + last_page_len` cells. A pool-wide constant count
         // inflates that span past the live prefix and attends uninitialized KV, so
         // the count must track `kv_len` exactly.
-        let page_indptr_p =
-            Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]).named("pidx_p");
+        let page_indptr_p = Channel::from([0u32, n.div_ceil(PAGE_T)]).named("pidx_p");
 
         // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
         let mask_pv: Vec<bool> = (0..n)
@@ -209,7 +208,7 @@ async fn main(input: Input) -> Result<String> {
         // prefix plus its own cells only.
         let tok_in = Channel::from(g0s.clone()).named("tok_in"); // [B] device loop-carried
         let pos = Channel::from(vec![n; num_candidates]).named("pos");
-        let fill = Channel::from(vec![n + b; 1]).named("fill"); // next free flat cell
+        let fill = Channel::from([n + b]).named("fill"); // next free flat cell
         let klen = Channel::from(vec![n + b; num_candidates]).named("klen");
         let w_slot_v: Vec<u32> = (0..b)
             .map(|c| pool_ids[((n + c) / PAGE_T) as usize])
@@ -287,7 +286,7 @@ async fn main(input: Input) -> Result<String> {
             let filled = &base + b; // [1] span after the next fire's appends
             let klen_n = broadcast(reshape(&filled, [1]), [b]);
             let pos_n = pos.take() + 1u32;
-            let page_count = (&filled + (PAGE_T - 1)) / PAGE_T;
+            let page_count = filled.div_ceil(PAGE_T);
             let pages_n = gather(
                 &pids,
                 iota(b * pool_pages) % broadcast(&page_count, [b * pool_pages]),
@@ -295,23 +294,16 @@ async fn main(input: Input) -> Result<String> {
             let pidx_n = iota(b + 1) * broadcast(&page_count, [b + 1]);
 
             // Device-resolved geometry is loop-carried: the host never drains
-            // these rings, so the graph has to take before it puts or the
-            // readiness check sees a full ring and refuses to commit the pass.
-            tok_in.take();
+            // these rings, so every fire's values are re-put here.
             tok_in.put(&toks);
             out.put(&toks);
             mask.put(&new_mask);
-            w_slot.take();
             w_slot.put(&w_slot_n);
-            w_off.take();
             w_off.put(&w_off_n);
-            klen.take();
             klen.put(&klen_n);
             pos.put(&pos_n);
             fill.put(&filled);
-            pages.take();
             pages.put(&pages_n);
-            page_indptr.take();
             page_indptr.put(&pidx_n);
             rng.put(&r_next);
             pool_ids_ch.put(&pids);

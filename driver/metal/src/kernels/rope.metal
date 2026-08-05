@@ -19,6 +19,41 @@
 #include <metal_stdlib>
 using namespace metal;
 
+template <typename T, bool SCALE_OUTPUT>
+METAL_FUNC void rope_rotate_pair(
+    device T* x, size_t i1, size_t i2, float theta, float output_scale) {
+  const float costheta = fast::cos(theta);
+  const float sintheta = fast::sin(theta);
+  const float x1 = float(x[i1]);
+  const float x2 = float(x[i2]);
+  const float y1 = x1 * costheta - x2 * sintheta;
+  const float y2 = x1 * sintheta + x2 * costheta;
+  x[i1] = static_cast<T>(SCALE_OUTPUT ? output_scale * y1 : y1);
+  x[i2] = static_cast<T>(SCALE_OUTPUT ? output_scale * y2 : y2);
+}
+
+template <typename T>
+METAL_FUNC void rope_neox_geometric_body(
+    device T* x, int position, float scale, float base, int head_dim,
+    int pair_half, int i, int head, size_t row_base) {
+  const float d = float(i) / float(pair_half);
+  const float inv_freq = exp2(-d * base);
+  const float theta = (scale * float(position)) * inv_freq;
+  const size_t i1 = row_base + size_t(head * head_dim + i);
+  rope_rotate_pair<T, false>(x, i1, i1 + size_t(pair_half), theta, 1.0f);
+}
+
+template <typename T>
+METAL_FUNC void rope_neox_freqs_body(
+    device T* x, int position, float scale, const device float* inv_freq,
+    int head_dim, int pair_half, float output_scale,
+    int i, int head, size_t row_base) {
+  const float theta = (scale * float(position)) * inv_freq[i];
+  const size_t i1 = row_base + size_t(head * head_dim + i);
+  rope_rotate_pair<T, true>(
+      x, i1, i1 + size_t(pair_half), theta, output_scale);
+}
+
 template <typename T>
 [[kernel]] void rope_neox_decode(
     device T* x                       [[buffer(0)]],  // in-place [n_head, head_dim]
@@ -30,21 +65,8 @@ template <typename T>
     uint2 grid [[threads_per_grid]]) {
   const int i = int(pos.x);            // freq index, 0..half-1
   const int h = int(pos.y);            // head index
-  const int half_rd = int(grid.x);        // rope_dims / 2
-
-  float d = static_cast<float>(i) / static_cast<float>(half_rd);
-  float inv_freq = exp2(-d * base);
-  float L = scale * static_cast<float>(position[0]);
-  float theta = L * inv_freq;
-  float costheta = fast::cos(theta);
-  float sintheta = fast::sin(theta);
-
-  const int i1 = h * head_dim + i;
-  const int i2 = i1 + half_rd;
-  float x1 = static_cast<float>(x[i1]);
-  float x2 = static_cast<float>(x[i2]);
-  x[i1] = static_cast<T>(x1 * costheta - x2 * sintheta);
-  x[i2] = static_cast<T>(x1 * sintheta + x2 * costheta);
+  rope_neox_geometric_body<T>(
+      x, position[0], scale, base, head_dim, int(grid.x), i, h, 0);
 }
 
 #define instantiate_rope_neox(name, itype)                       \
@@ -75,21 +97,10 @@ template <typename T>
   const int m = int(pos.z);            // token row
   const int half_rd = int(grid.x);
   const int n_head  = int(grid.y);
-
-  float d = static_cast<float>(i) / static_cast<float>(half_rd);
-  float inv_freq = exp2(-d * base);
-  float L = scale * static_cast<float>(position[m]);
-  float theta = L * inv_freq;
-  float costheta = fast::cos(theta);
-  float sintheta = fast::sin(theta);
-
-  const int base_x = m * (n_head * head_dim);
-  const int i1 = base_x + h * head_dim + i;
-  const int i2 = i1 + half_rd;
-  float x1 = static_cast<float>(x[i1]);
-  float x2 = static_cast<float>(x[i2]);
-  x[i1] = static_cast<T>(x1 * costheta - x2 * sintheta);
-  x[i2] = static_cast<T>(x1 * sintheta + x2 * costheta);
+  const size_t row_base =
+      size_t(m) * size_t(n_head) * size_t(head_dim);
+  rope_neox_geometric_body<T>(
+      x, position[m], scale, base, head_dim, half_rd, i, h, row_base);
 }
 
 #define instantiate_rope_neox_mb(name, itype)                    \
@@ -115,6 +126,10 @@ instantiate_rope_neox_mb(bfloat16, bfloat)
 // Both attention types run this one kernel: on a sliding layer rotary_dims ==
 // head_dim and it reduces exactly to `rope_neox_decode`. The rotated pair count
 // is grid.x, so no extra buffer is needed -- only which value indexes what.
+//
+// Keep this arithmetic inline in both wrappers. Folding it into the generic
+// pair helper changed Gemma-4-26B's recorded batched continuation, despite the
+// same source-level formula; the Metal compiler's contraction/rounding moved.
 template <typename T>
 [[kernel]] void rope_neox_prop_decode(
     device T* x                       [[buffer(0)]],
@@ -125,7 +140,7 @@ template <typename T>
     uint2 pos  [[thread_position_in_grid]]) {
   const int i = int(pos.x);            // rotated pair index, 0..rotary_dims/2-1
   const int h = int(pos.y);
-  const int half_hd = head_dim / 2;    // NEOX pair offset, over the FULL head
+  const int half_hd = head_dim / 2;
 
   float d = 2.0f * static_cast<float>(i) / static_cast<float>(head_dim);
   float inv_freq = exp2(-d * base);
@@ -217,17 +232,9 @@ template <typename T>
   const int i = int(pos.x);
   const int h = int(pos.y);
   const int half_rd = int(grid.x);
-
-  const float theta = scale * static_cast<float>(position[0]) * inv_freq[i];
-  const float costheta = fast::cos(theta);
-  const float sintheta = fast::sin(theta);
-
-  const int i1 = h * head_dim + i;
-  const int i2 = i1 + half_rd;
-  const float x1 = static_cast<float>(x[i1]);
-  const float x2 = static_cast<float>(x[i2]);
-  x[i1] = static_cast<T>(mscale * (x1 * costheta - x2 * sintheta));
-  x[i2] = static_cast<T>(mscale * (x1 * sintheta + x2 * costheta));
+  rope_neox_freqs_body(
+      x, position[0], scale, inv_freq, head_dim, half_rd,
+      mscale, i, h, 0);
 }
 
 // The same rotation over N token rows.
@@ -250,18 +257,9 @@ template <typename T>
   const int h = int(pos.y);
   const int row = int(pos.z);
   const int half_rd = int(grid.x);
-
-  const float theta = scale * static_cast<float>(position[row]) * inv_freq[i];
-  const float costheta = fast::cos(theta);
-  const float sintheta = fast::sin(theta);
-
-  device T* xr = x + size_t(row) * size_t(row_stride);
-  const int i1 = h * head_dim + i;
-  const int i2 = i1 + half_rd;
-  const float x1 = static_cast<float>(xr[i1]);
-  const float x2 = static_cast<float>(xr[i2]);
-  xr[i1] = static_cast<T>(mscale * (x1 * costheta - x2 * sintheta));
-  xr[i2] = static_cast<T>(mscale * (x1 * sintheta + x2 * costheta));
+  rope_neox_freqs_body(
+      x, position[row], scale, inv_freq, head_dim, half_rd,
+      mscale, i, h, size_t(row) * size_t(row_stride));
 }
 
 #define instantiate_rope_freqs(name, itype)                        \

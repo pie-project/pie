@@ -95,7 +95,12 @@ kernel void ptir_pointer_probe(const device ulong* addresses [[buffer(0)]],
         "Metal accepts lane-table GPU-address pointer indirection (" +
             pointer_error + ")");
 
+#ifdef PIE_METAL_TEST_KERNELS_DIR
+    const std::string source =
+        std::string(PIE_METAL_TEST_KERNELS_DIR) + "/ptir_m0.metal";
+#else
     const std::string source = kernels_dir + "/ptir_m0.metal";
+#endif
     std::string error;
     const Pso rng =
         context->compile_ptir_pso_from_file(source, "ptir_m0_rng_vectors", &error);

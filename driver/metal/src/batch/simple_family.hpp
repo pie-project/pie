@@ -38,7 +38,7 @@
 #include "mtl4_context.hpp"
 #include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "forward.hpp"
 
 namespace pie::metal::batch {
@@ -115,6 +115,7 @@ class SimpleFamilyEngine {
         /// and reads one per request, and the LM head is the step's most
         /// expensive dispatch by two orders of magnitude.
         std::vector<std::uint32_t> sample_rows;
+        bool run_argmax = false;
     };
 
     virtual int vocab() const = 0;
@@ -171,6 +172,9 @@ class SimpleFamilyEngine {
     /// dispatch writes here directly, so nothing copies between the model and
     /// the sampler.
     virtual SlotHandle logits_slot() const = 0;
+
+    /// Optional u32 greedy tokens, one per sampled row from the last fire.
+    virtual SlotHandle greedy_tokens_slot() const { return {}; }
 
     /// Dump every tapped activation of the LAST step, under the names
     /// `tests/parity/gemma4_mlx_taps.py` writes.

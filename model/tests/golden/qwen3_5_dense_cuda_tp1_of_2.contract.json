@@ -1,0 +1,622 @@
+{
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "model.layers.0.linear_attn.in_proj_qkv.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "model.layers.0.linear_attn.in_proj_qkv.weight"
+                    },
+                    "axis": 0,
+                    "start": 0,
+                    "len": 32
+                  }
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "model.layers.0.linear_attn.in_proj_qkv.weight"
+                    },
+                    "axis": 0,
+                    "start": 32,
+                    "len": 32
+                  }
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "model.layers.0.linear_attn.in_proj_qkv.weight"
+                    },
+                    "axis": 0,
+                    "start": 64,
+                    "len": 32
+                  }
+                },
+                "axis": 0
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        48,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.linear_attn.conv1d.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "model.layers.0.linear_attn.conv1d.weight"
+                    },
+                    "axis": 0,
+                    "start": 0,
+                    "len": 32
+                  }
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "model.layers.0.linear_attn.conv1d.weight"
+                    },
+                    "axis": 0,
+                    "start": 32,
+                    "len": 32
+                  }
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "model.layers.0.linear_attn.conv1d.weight"
+                    },
+                    "axis": 0,
+                    "start": 64,
+                    "len": 32
+                  }
+                },
+                "axis": 0
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        48,
+        1,
+        4
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.linear_attn.conv1d.bias",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "model.layers.0.linear_attn.conv1d.bias"
+                    },
+                    "axis": 0,
+                    "start": 0,
+                    "len": 32
+                  }
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "model.layers.0.linear_attn.conv1d.bias"
+                    },
+                    "axis": 0,
+                    "start": 32,
+                    "len": 32
+                  }
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Slice": {
+                    "src": {
+                      "Src": "model.layers.0.linear_attn.conv1d.bias"
+                    },
+                    "axis": 0,
+                    "start": 64,
+                    "len": 32
+                  }
+                },
+                "axis": 0
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        48
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.linear_attn.A_log",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Shard": {
+              "src": {
+                "Src": "model.layers.0.linear_attn.A_log"
+              },
+              "axis": 0
+            }
+          },
+          "to": {
+            "Raw": "F32"
+          }
+        }
+      },
+      "shape": [
+        4
+      ],
+      "encoding": {
+        "Raw": "F32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.linear_attn.norm.weight",
+      "expr": {
+        "Src": "model.layers.0.linear_attn.norm.weight"
+      },
+      "shape": [
+        32
+      ],
+      "encoding": {
+        "Raw": "F32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.self_attn.qkv_proj.fused.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Shard": {
+                "src": {
+                  "Src": "model.layers.1.self_attn.q_proj.weight"
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Src": "model.layers.1.self_attn.k_proj.weight"
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Src": "model.layers.1.self_attn.v_proj.weight"
+                },
+                "axis": 0
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.self_attn.q_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.layers.1.self_attn.qkv_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 0,
+          "len": 32
+        }
+      },
+      "shape": [
+        32,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.self_attn.k_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.layers.1.self_attn.qkv_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 32,
+          "len": 16
+        }
+      },
+      "shape": [
+        16,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.self_attn.v_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.layers.1.self_attn.qkv_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 48,
+          "len": 16
+        }
+      },
+      "shape": [
+        16,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.mlp.gate_up_proj.fused.weight",
+      "expr": {
+        "Concat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Shard": {
+                "src": {
+                  "Src": "model.layers.1.mlp.gate_proj.weight"
+                },
+                "axis": 0
+              }
+            },
+            {
+              "Shard": {
+                "src": {
+                  "Src": "model.layers.1.mlp.up_proj.weight"
+                },
+                "axis": 0
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        96,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.mlp.gate_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.layers.1.mlp.gate_up_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 0,
+          "len": 48
+        }
+      },
+      "shape": [
+        48,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.mlp.up_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "model.layers.1.mlp.gate_up_proj.fused.weight"
+          },
+          "axis": 0,
+          "start": 48,
+          "len": 48
+        }
+      },
+      "shape": [
+        48,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "expr": {
+        "Src": "model.embed_tokens.weight"
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.linear_attn.in_proj_z.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.linear_attn.in_proj_z.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        16,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.linear_attn.in_proj_b.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.linear_attn.in_proj_b.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        4,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.linear_attn.in_proj_a.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.linear_attn.in_proj_a.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        4,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.linear_attn.out_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.linear_attn.out_proj.weight"
+          },
+          "axis": 1
+        }
+      },
+      "shape": [
+        64,
+        16
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.linear_attn.dt_bias",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.linear_attn.dt_bias"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        4
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.input_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.1.input_layernorm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.1.self_attn.o_proj.weight"
+          },
+          "axis": 1
+        }
+      },
+      "shape": [
+        64,
+        32
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.post_attention_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.1.post_attention_layernorm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.1.mlp.down_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.1.mlp.down_proj.weight"
+          },
+          "axis": 1
+        }
+      },
+      "shape": [
+        64,
+        48
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.norm.weight",
+      "expr": {
+        "Src": "model.norm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    }
+  ],
+  "groups": []
+}

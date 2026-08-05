@@ -49,6 +49,8 @@ struct BoundLlama {
     /// keeps not reading it. Binding zeros costs one small allocation and makes
     /// the guarantee independent of the kernel's internals.
     SlotHandle zero_bias{};
+    SlotHandle argmax_params{};
+    SlotHandle eos_flag{};
 };
 
 /// Colour the dataflow's live ranges onto pool buffers, honouring the barriers
