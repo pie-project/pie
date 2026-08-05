@@ -423,7 +423,7 @@ class Dispatch {
 
     void set_attention_hook_coverage(
         bool supported,
-        std::uint32_t model_layers = 0);
+        std::vector<std::uint32_t> hook_layer_ids);
 
     void close_instance(std::uint64_t instance_id);
     int close_channel(std::uint64_t channel_id, std::string* err);

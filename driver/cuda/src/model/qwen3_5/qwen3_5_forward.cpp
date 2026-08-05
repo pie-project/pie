@@ -927,12 +927,8 @@ void linear_attn_layer_body(
                 la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
         }
     });
-    invoke_stage_hook(
-        StageHookPoint::OnAttnProj, la.q_pre.data(),
-        static_cast<std::uint32_t>(N),
-        static_cast<std::uint32_t>(K_h * K_d),
-        static_cast<std::uint32_t>(layer_idx), stream,
-        /*query_is_f32=*/true);
+    // forward-hybrid.wit ruling (2026-08-05): the attention taps fire on
+    // ATTENTION layers only — this GDN layer invokes no hook stage.
     const float* q_recur_full =
         (V_h == K_h) ? la.q_pre.data() : la.q_norm.data();
     const float* k_recur_full =
@@ -1160,12 +1156,7 @@ void linear_attn_layer_body(
     // Gated on the compact LINEAR index, like every sibling trace here: on a
     // hybrid stack layer 0 may be an attention layer, and this body would then
     // never run for it.
-    invoke_stage_hook(
-        StageHookPoint::OnAttn, la.q_pre.data(),
-        static_cast<std::uint32_t>(N),
-        static_cast<std::uint32_t>(K_h * K_d),
-        static_cast<std::uint32_t>(layer_idx), stream,
-        /*query_is_f32=*/true);
+    // forward-hybrid.wit ruling: no hook stage on GDN layers (above).
     if (commit_len != nullptr) return;
 
     // ── back to the fire's own token space ────────────────────────

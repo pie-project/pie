@@ -1688,10 +1688,30 @@ int Context::Impl::load_model(
           nemotron_h_attention_layer_count !=
               engine.hf_config().num_hidden_layers)
         ;
+    // forward-hybrid.wit: "the attention taps fire on attention layers
+    // only." On the qwen3.5 hybrids the hook ledger therefore counts the
+    // FULL-ATTENTION layers (layer_types), not the model depth — the
+    // bodies invoke exactly there.
+    std::vector<std::uint32_t> attention_hook_layer_ids;
+    if (family == model::Family::Qwen3_5 ||
+        family == model::Family::Qwen3_5Moe) {
+        const auto& kinds = engine.hf_config().layer_types;
+        for (std::size_t l = 0; l < kinds.size(); ++l) {
+            if (kinds[l] == "full_attention") {
+                attention_hook_layer_ids.push_back(
+                    static_cast<std::uint32_t>(l));
+            }
+        }
+    } else {
+        const int n = std::max(0, engine.hf_config().num_hidden_layers);
+        for (int l = 0; l < n; ++l) {
+            attention_hook_layer_ids.push_back(
+                static_cast<std::uint32_t>(l));
+        }
+    }
     registry_->dispatch().set_attention_hook_coverage(
         complete_attention_hook_coverage,
-        static_cast<std::uint32_t>(
-            std::max(0, engine.hf_config().num_hidden_layers)));
+        std::move(attention_hook_layer_ids));
 
     // The pad page/slot give CUDA-graph padding rows *and* device-composed
     // padding rows a sacrificial KV destination. Both require the model to
