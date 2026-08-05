@@ -45,15 +45,25 @@ async def maybe_server(args: argparse.Namespace):
         if not args.gguf_model:
             raise ValueError("--gguf-model is required with --server-bin")
         url = f"http://127.0.0.1:{args.port}"
+        parallel = args.num_requests if args.mode == "tput" else 1
         cmd = [
             args.server_bin,
             "--model", args.gguf_model,
             "--host", "127.0.0.1",
             "--port", str(args.port),
-            "--ctx-size", str(args.max_model_len),
-            "--parallel", str(args.num_requests if args.mode == "tput" else 1),
+            # llama.cpp splits `--ctx-size` ACROSS the parallel slots, so
+            # passing the per-request context here gave each slot
+            # `max_model_len / parallel` tokens -- 128 at the defaults, which
+            # silently truncated every request in a tput run and made the
+            # engine look like it stopped early. Scale by the slot count so a
+            # slot gets the context the other engines are given.
+            "--ctx-size", str(args.max_model_len * parallel),
+            "--parallel", str(parallel),
             "--n-gpu-layers", "all",
-            "--flash-attn", "off",
+            # On, because the comparison is against engines running their own
+            # optimized attention; turning llama.cpp's off benchmarks a
+            # handicap rather than the engine.
+            "--flash-attn", "on",
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         deadline = time.time() + 120
@@ -158,7 +168,7 @@ async def run(args: argparse.Namespace):
         wall_s=wall,
         config={
             "cache_prompt": False,
-            "flash_attn": "off when spawned by benches",
+            "flash_attn": "on when spawned by benches",
             "temperature": args.temperature,
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
