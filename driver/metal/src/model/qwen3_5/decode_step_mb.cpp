@@ -79,7 +79,11 @@ namespace {
 void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     auto rms = [&](int row, int rows) { rms_mb_dispatch(row, rows, n, d.grid, d.tg); };
     if (const int out = qmv_out_size(d.kind, g); out != 0) {
-        d.qmm_bn = qmm_bn(out, n);
+        // `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only
+        // where split-K supplies the threadgroups the wide tile gives up, and
+        // this family dispatches no split -- see the comment on `qmm_split`
+        // just below, which is the same reason gemma4 and gpt-oss have.
+        d.qmm_bn = qmm_bn_unsplit(out, n);
         d.qmm_bm = qmm_bm(n);
         // NO split-K, for exactly the reason gemma4's `launch_shape_mb` gives:
         // the split GEMM writes `split_k` partial [M, N] slices into a side

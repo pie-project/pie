@@ -189,7 +189,7 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
     // same numbers `launch_shape` uses, because the two answers must agree.
     if (mb != nullptr) {
         const int m = d.kind == Kind::LmHead ? S : R;
-        if (const int bn = llama_qmm_bn(d.kind, g, m, requests); bn > 0) {
+        if (const int bn = llama_qmm_bn_for(d.kind, g, m, requests); bn > 0) {
             const int split = llama_qmm_split(d.kind, g, m, requests);
             const int wide = qmm_bm_slot(llama_dense_qmm_bm(m, requests));
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
@@ -417,6 +417,40 @@ int llama_qmm_split(Kind k, const LlamaGeometry& g, int rows, int requests) {
                        llama_dense_qmm_bm(rows, requests));
 }
 
+/// The column tile a dispatch actually launches.
+///
+/// Two functions because there are two questions and only one of them is
+/// recursive. `llama_qmm_bn` answers "is there a tile at all, and how wide if
+/// the split is behind it", and `llama_qmm_split` needs that answer to decide
+/// whether to split -- so the width cannot depend on the split inside it.
+///
+/// This is the width the encoder and the grid use, and it asks the split
+/// first. `qmm_bn`'s widest-tile rule is correct *because* the split supplies
+/// the threadgroups a wide tile gives up; a dispatch this family does NOT
+/// split has no such supply, and the same rule that was wrong for gemma4 and
+/// gpt-oss is wrong for it. Measured on llama-3.2-1B's own projections at
+/// M=448, BM=64, FP16 GEMM, GFLOP/s:
+///
+///     K     N        BN=16    BN=32    BN=64
+///     2048  2048      5832    *6070*    5660
+///     2048  8192      6115    *6411*    6166
+///     8192  2048      5929    *6180*    5766
+///
+/// At 448 rows this checkpoint splits k_proj and v_proj and nothing else, so
+/// the other five projections per layer -- 73.7% of the prefill's GPU time --
+/// were taking a width that is the best of none of the three.
+///
+/// `LmHead` keeps its own answer: `llama_qmm_bn` pins it to 32 already, and
+/// the vocabulary is wide enough that both rules agree anyway.
+int llama_qmm_bn_for(Kind k, const LlamaGeometry& g, int rows, int requests) {
+    const int bn = llama_qmm_bn(k, g, rows, requests);
+    if (bn <= 0 || k == Kind::LmHead) return bn;
+    if (llama_qmm_split(k, g, rows, requests) > 1) return bn;
+    const KN kn = qmv_kn(k, g);
+    const int unsplit = qmm_bn_unsplit(int(kn.N), llama_qmm_rows(rows, requests));
+    return unsplit > 0 ? unsplit : bn;
+}
+
 std::size_t llama_splitk_partial_elems(const LlamaGeometry& g, int max_rows) {
     const Kind dense[] = {
         Kind::QmvQ, Kind::QmvK, Kind::QmvV, Kind::QmvO,
@@ -510,7 +544,7 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
         // Once the batch fills a tile, a dense projection becomes a matmul.
         // The matvec re-reads the ENTIRE weight for every row, so on a prefill
         // it is the difference between amortizing the weights and not.
-        if (const int bn = llama_qmm_bn(d.kind, g, m, requests); bn > 0) {
+        if (const int bn = llama_qmm_bn_for(d.kind, g, m, requests); bn > 0) {
             // The row block is asked of the BATCH, not of the padded count:
             // padding rounds up, and a rounded-up count can land on a wider
             // rung than the one the grid was built for.

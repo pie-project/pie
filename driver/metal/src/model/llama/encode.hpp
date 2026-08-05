@@ -94,6 +94,11 @@ bool llama_is_dense_proj(Kind k);
 /// The GEMM's column tile for a dense projection, or 0 to keep the matvec.
 int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows, int requests = 1);
 
+/// The column tile a dispatch actually LAUNCHES: `llama_qmm_bn`'s answer where
+/// the split is behind it, and the unsplit rule where it is not. Two functions
+/// because `llama_qmm_split` reads the first one and cannot read this one.
+int llama_qmm_bn_for(Kind k, const LlamaGeometry& g, int rows, int requests = 0);
+
 /// The K partitions a dense projection's GEMM takes, or 1 for no split.
 ///
 /// A decode fleet is the shape that needs this: 32 rows fill exactly one row
