@@ -260,6 +260,16 @@ def build_config(args: argparse.Namespace):
             driver_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "total_pages", 0):
             driver_options["total_pages"] = args.total_pages
+        # `--max-model-len` is the cross-engine context knob (llama.cpp takes
+        # it as `--ctx-size`, vLLM as `max_model_len`), and on every other
+        # engine it means ONE REQUEST's context. The Metal driver's knob is
+        # the whole fleet's ring -- it is one shared linear ring, not a
+        # per-request allocation -- so the fair translation multiplies by the
+        # fleet the client will actually offer. Sending the per-request number
+        # straight through would hand a 16-way run 128 tokens per request and
+        # measure a starved engine against unstarved ones.
+        fleet = max(1, args.concurrency) if args.mode != "latency" else 1
+        driver_options["max_model_len"] = args.max_model_len * fleet
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
