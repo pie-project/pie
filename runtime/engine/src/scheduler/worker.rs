@@ -4732,6 +4732,7 @@ impl BatchScheduler {
         );
         let (ra_blk_noframes, ra_blk_incomplete) =
             (take(&racc.blk_noframes), take(&racc.blk_incomplete));
+        let ra_contrib_skipped = take(&racc.contrib_skipped);
         let (ra_leave_close, ra_leave_hit, ra_leave_removed) = (
             take(&racc.leave_close),
             take(&racc.leave_hit),
@@ -4979,6 +4980,7 @@ impl BatchScheduler {
                 ("ra_blk_partial", ra_blk_partial),
                 ("ra_blk_noframes", ra_blk_noframes),
                 ("ra_blk_incomplete", ra_blk_incomplete),
+                ("ra_contrib_skipped", ra_contrib_skipped),
                 ("ra_exec_evals", ra_exec_evals),
                 ("ra_exec_blk_owed", ra_exec_blk_owed),
                 ("ra_exec_blk_empty", ra_exec_blk_empty),

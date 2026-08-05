@@ -167,6 +167,25 @@ fn gate_dump_interval() -> Option<Duration> {
     })
 }
 
+/// `PIE_GATE_CONTRIBUTED=1`: in the wait-all gate, do not count a lane as
+/// missing when it has ALREADY fired into the frame currently in flight and
+/// has nothing queued behind it. Such a lane's next frame CANNOT exist yet —
+/// its guest is credit-bound on a result the device has not produced — so
+/// waiting for it makes chaining structurally impossible once the fleet is
+/// one frame deep (analysis.md 10.24-10.25). Applied only while a frame is
+/// executing: with the device idle, dense gathering is simply right.
+/// Membership, frame atomicity and FCFS are untouched; the lanes not waited
+/// for land as later partitions of the SAME boundary.
+fn gate_contributed() -> u8 {
+    static CONFIGURED: OnceLock<u8> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_GATE_CONTRIBUTED")
+            .ok()
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// The frame identity one fire carries from `forward.submit`: which lane
 /// (pipeline scope), which frame of that lane, which wave slot, and how many
 /// fires the whole frame holds (so arrival completeness is decidable).
@@ -518,6 +537,12 @@ pub(super) struct FramePolicy {
     rejoin_defer: u8,
     /// Next instant a blocked-gate dump may be emitted (`PIE_GATE_DUMP_MS`).
     gate_dump_at: Option<Instant>,
+    /// [`gate_contributed`], read once so the lever is fixed for the run.
+    /// 1 = every contributed-and-empty lane is skipped; 2 = only those the
+    /// engine still OWES a result (an unretired dispatch), which is the
+    /// arithmetically exact statement of "its next frame cannot exist yet"
+    /// and skips strictly fewer lanes, so the boundary it opens is wider.
+    gate_contributed: u8,
     /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
     stats: Option<Arc<SchedulerStats>>,
 }
@@ -594,6 +619,7 @@ impl FramePolicy {
             silence_timeout: crate::scheduler::configured_silence_timeout(),
             rejoin_defer: rejoin_defer(),
             gate_dump_at: None,
+            gate_contributed: gate_contributed(),
             stats,
         }
     }
@@ -1670,6 +1696,9 @@ impl FramePolicy {
                         }
                 });
             let mut dump: Vec<serde_json::Value> = Vec::new();
+            let contributed_relax = self.gate_contributed > 0 && executing;
+            let contributed_owed_only = self.gate_contributed >= 2;
+            let mut contrib_skipped = 0u64;
             for (lane_id, lane) in self.lanes.iter_mut() {
                 let owes = self.in_flight_lanes.contains(lane_id)
                     || lane
@@ -1679,8 +1708,21 @@ impl FramePolicy {
                 // Leashed: already dropped by the leash below and still
                 // silent — it blocks nobody, but the clock keeps running
                 // because only a submit or a park ends the silence.
-                let blocking =
+                let mut blocking =
                     lane.awaited && !lane.frames.front().is_some_and(PendingFrame::is_complete);
+                // Contributed-lane relaxation (`PIE_GATE_CONTRIBUTED`): this
+                // lane is already inside the frame on the device and has
+                // nothing queued, so its next frame cannot exist until that
+                // frame retires. Waiting for it is waiting for the device.
+                if contributed_relax
+                    && blocking
+                    && lane.fired_this_boundary
+                    && lane.frames.is_empty()
+                    && (!contributed_owed_only || owes)
+                {
+                    blocking = false;
+                    contrib_skipped += 1;
+                }
                 if !blocking && !lane.leashed {
                     lane.clock_from = None;
                     continue;
@@ -1808,6 +1850,7 @@ impl FramePolicy {
                 acc.blk_empty.fetch_add(blk_empty, Ordering::Relaxed);
                 acc.blk_partial.fetch_add(blk_partial, Ordering::Relaxed);
                 acc.blk_noframes.fetch_add(blk_noframes, Ordering::Relaxed);
+                acc.contrib_skipped.fetch_add(contrib_skipped, Ordering::Relaxed);
                 acc.blk_incomplete.fetch_add(blk_incomplete, Ordering::Relaxed);
                 acc.gate_evals.fetch_add(1, Ordering::Relaxed);
                 acc.miss_max.fetch_max(missing as u64, Ordering::Relaxed);

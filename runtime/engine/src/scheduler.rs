@@ -504,6 +504,8 @@ pub(crate) struct RunAheadAcc {
     /// arrived only partially (some of its k slots still missing).
     pub blk_noframes: AtomicU64,
     pub blk_incomplete: AtomicU64,
+    /// Lanes the contributed-lane relaxation did not count as missing.
+    pub contrib_skipped: AtomicU64,
     pub leave_close: AtomicU64,
     pub leave_hit: AtomicU64,
     pub leave_removed: AtomicU64,
@@ -568,6 +570,7 @@ pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
     blk_partial: AtomicU64::new(0),
     blk_noframes: AtomicU64::new(0),
     blk_incomplete: AtomicU64::new(0),
+    contrib_skipped: AtomicU64::new(0),
     leave_close: AtomicU64::new(0),
     leave_hit: AtomicU64::new(0),
     leave_removed: AtomicU64::new(0),
