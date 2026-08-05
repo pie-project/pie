@@ -1400,11 +1400,23 @@ impl TraceBuilder {
     }
 
     pub fn finish(self) -> ForwardPlan {
-        ForwardPlan {
+        let plan = ForwardPlan {
             family: self.family,
             values: self.values,
             ops: self.ops,
             depth_window: self.depth_axis,
-        }
+        };
+        // ② The kernel signatures, checked (`.wiki/tart/dsl.md` ②,
+        // migration step 3). A declaration is traced when the model
+        // LOADS, so this is the load-time check the design asks for:
+        // `whole` and the table's own coverage stop being rules a
+        // reader has to know and become rules a build cannot violate.
+        let problems = crate::kernels::check_plan(&plan);
+        assert!(
+            problems.is_empty(),
+            "kernel! signature violations in this declaration:\n  {}",
+            problems.join("\n  ")
+        );
+        plan
     }
 }
