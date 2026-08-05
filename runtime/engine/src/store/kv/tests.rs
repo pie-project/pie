@@ -143,10 +143,8 @@ fn single_state_runahead_reuses_the_published_mapping() {
         [PreparedTarget::InPlace { .. }]
     ));
     let (follow_seq, follow_intents) = store.publish_prepared(follower, &[pc(21)]).unwrap();
-    store.settle(first_intents, true);
-    store.retire_through(first_seq);
-    store.settle(follow_intents, true);
-    store.retire_through(follow_seq);
+    store.settle(first_seq, first_intents, true);
+    store.settle(follow_seq, follow_intents, true);
     assert_eq!(store.available_pages(), 1);
 }
 
@@ -761,8 +759,7 @@ fn publish_prepared(
     commits: &[PageCommit],
 ) {
     let (seq, intents) = store.publish_prepared(prepared, commits).unwrap();
-    store.settle(intents, true);
-    store.retire_through(seq);
+    store.settle(seq, intents, true);
 }
 
 /// Prepare+commit `n` fresh pages onto `ws`, returning the committed ids.
@@ -1172,20 +1169,75 @@ fn later_settlement_does_not_retire_older_inflight_pages() {
     store.reserve(second_ws, 1).unwrap();
     let first = store.prepare_write(first_ws, &[0]).unwrap();
     let second = store.prepare_write(second_ws, &[0]).unwrap();
-    let (_first_seq, first_intents) = store.publish_prepared(first, &[pc(1)]).unwrap();
-    let (_second_seq, second_intents) = store.publish_prepared(second, &[pc(2)]).unwrap();
+    let (first_seq, first_intents) = store.publish_prepared(first, &[pc(1)]).unwrap();
+    let (second_seq, second_intents) = store.publish_prepared(second, &[pc(2)]).unwrap();
     store
         .discard(first_ws, &[0..1], store.current_epoch())
         .unwrap();
 
-    store.settle(second_intents, true);
+    // Settled OUT OF ORDER, and with a third fire still outstanding, so the
+    // release cannot come from the `in_flight == 0` whole-set self-heal: only
+    // `settle` removing its own sequence can advance the retirement frontier.
+    let third_ws = store.create_working_set();
+    store.reserve(third_ws, 1).unwrap();
+    let third = store.prepare_write(third_ws, &[0]).unwrap();
+    let (third_seq, third_intents) = store.publish_prepared(third, &[pc(3)]).unwrap();
+
+    store.settle(second_seq, second_intents, true);
+    assert_eq!(
+        store.available_pages(),
+        1,
+        "a later fire cannot retire a page still protected by an older fire"
+    );
+    store.settle(first_seq, first_intents, true);
     assert_eq!(
         store.available_pages(),
         2,
-        "a later fire cannot retire a page still protected by an older fire"
+        "the oldest fire settling releases its epoch even with a newer fire \
+         still in flight — the whole point of tracking the set rather than a \
+         count (analysis.md 10.16-10.17)"
     );
-    store.settle(first_intents, true);
+    store.settle(third_seq, third_intents, true);
+    assert_eq!(store.available_pages(), 2);
+}
+
+/// `settle` carries its own sequence so the retirement frontier cannot be
+/// pinned by a caller who forgot a second call. Nothing may stay outstanding
+/// once every published fire has settled, WITHOUT relying on the quiesced
+/// self-heal — the regression this guards is a silent one (freed pages simply
+/// stop reaching the free list until a moment of global quiescence, which
+/// under load never comes).
+#[test]
+fn settling_every_fire_leaves_no_epoch_outstanding() {
+    let mut store = KvStore::new(6, h(42));
+    let mut live = Vec::new();
+    for _ in 0..3 {
+        let ws = store.create_working_set();
+        store.reserve(ws, 1).unwrap();
+        let prepared = store.prepare_write(ws, &[0]).unwrap();
+        let (seq, intents) = store.publish_prepared(prepared, &[pc(7)]).unwrap();
+        live.push((ws, seq, intents));
+    }
     assert_eq!(store.available_pages(), 3);
+    // Discard every mapping, so all three pages are epoch-tagged and can only
+    // come back through retirement.
+    for (ws, _, _) in &live {
+        store.discard(*ws, &[0..1], store.current_epoch()).unwrap();
+    }
+    assert_eq!(store.available_pages(), 3, "still gated by three live fires");
+
+    // Newest first: each settle may only release what nothing older gates.
+    live.reverse();
+    for (index, (_, seq, intents)) in live.into_iter().enumerate() {
+        store.settle(seq, intents, true);
+        let expected = if index == 2 { 6 } else { 3 };
+        assert_eq!(
+            store.available_pages(),
+            expected,
+            "settle #{index} (newest-first) must release exactly the epochs no \
+             older outstanding fire still gates"
+        );
+    }
 }
 
 #[test]
@@ -1194,10 +1246,11 @@ fn store_publish_mismatch_cancels_prepared_write() {
     let ws = store.create_working_set();
     store.reserve(ws, 2).unwrap();
     let prepared = store.prepare_write(ws, &[0, 1]).unwrap();
-    let seq = prepared.seq();
     let err = store.publish_prepared(prepared, &[pc(0)]).unwrap_err();
     assert_eq!(err, KvStoreError::CommitMismatch);
-    store.retire_through(seq);
+    // The mismatch routes through `cancel_prepared`, which releases the write's
+    // own sequence — no separate retirement call is owed for a write that never
+    // published (this used to be a `retire_through(seq)` that did nothing).
     assert_eq!(store.available_pages(), 4);
     assert_eq!(store.mapped_len(ws).unwrap(), 0);
 }
