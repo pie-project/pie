@@ -573,4 +573,25 @@ if(APPLE)
     PIE_MSL_RUNTIME_TEMPLATE="${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/runtime/metal/ptir_m1_runtime.metal"
     PIE_MSL_GROUPED_PREAMBLE="${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/runtime/metal/ptir_m1_grouped.metal"
     PIE_MSL_RNG_PREAMBLE="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/ptir_rng.generated.metal")
+  # The tests that load a real checkpoint each take a multi-gigabyte Metal heap
+  # -- `gemma4_forward_test` asks for 6 GiB and `gemma4_prefill_numerics_test`
+  # for 8 -- so two of them scheduled together can exhaust the device where
+  # either alone fits. `ctest -j` had never scheduled two, because until the
+  # checkpoint lookup learned to find the Hugging Face cache they all skipped
+  # in a hundredth of a second. A shared lock keeps the rest of the suite
+  # parallel and these one at a time.
+  set(PIE_METAL_CHECKPOINT_TESTS
+    gemma4_forward_test
+    gemma4_prefill_numerics_test
+    gptoss_forward_test
+    simple_family_executor_test
+    simple_family_executor_streamed_test
+    llama_bench)
+  # `if(TEST)` rather than an unconditional list: several of these are
+  # registered only when the loader is built.
+  foreach(t IN LISTS PIE_METAL_CHECKPOINT_TESTS)
+    if(TEST ${t})
+      set_tests_properties(${t} PROPERTIES RESOURCE_LOCK metal_gpu_heap)
+    endif()
+  endforeach()
 endif()
