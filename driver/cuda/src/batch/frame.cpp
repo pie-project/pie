@@ -2925,9 +2925,14 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
         engine.dispatch->launch_wants_attn_score(s.dispatch_view),
         engine.dispatch->launch_wants_page_mask(s.dispatch_view),
-        // Depth-split launches (full-depth rows present) walk the full
-        // model; only a uniformly truncated launch shortens the ledger.
-        s.dispatch_view.planned_full_depth_rows > 0
+        // ANY planned depth split — full_depth_rows PLANNED, including
+        // 0 (no full prefix, but a mask/hook TAIL that runs every
+        // layer) — walks the full model; only the uniform stamp
+        // (full_depth_rows UNPLANNED with a planned k) shortens the
+        // ledger. The 0-prefix case burned once: [trunc-k, hook-tail]
+        // planned full_depth_rows=0, the tail's hooks invoked at
+        // layers [k, L), and a k-sized ledger threw at entry k.
+        s.dispatch_view.planned_full_depth_rows != 0xffffffffu
             ? 0xffffffffu
             : s.dispatch_view.planned_max_layers,
     };

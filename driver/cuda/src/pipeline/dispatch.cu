@@ -1634,6 +1634,7 @@ struct StagedLaunch::State {
     // against the exact (phase, layer) order the prepare pass recorded.
     // `prepared_attn[phase - PTIR_STAGE_ON_ATTN_PROJ]`.
     bool hook_graph_prepared = false;
+    std::uint32_t prepared_planned_layers = 0xffffffffu;
     std::array<std::vector<HookPreparedInvocation>, 2> prepared_attn;
     std::array<std::size_t, 2> prepared_cursor{};
     // Host CSR of folded score offsets, uploaded to the arena's score-rows
@@ -6357,6 +6358,7 @@ std::uint64_t Dispatch::prepare_attention_phases(
     // asserted by this pass's construction instead.
     state.phase_invocations[PTIR_STAGE_ON_ATTN_PROJ] = layers;
     state.phase_invocations[PTIR_STAGE_ON_ATTN] = layers;
+    state.prepared_planned_layers = in.planned_layers;
     state.hook_graph_prepared = true;
     return fingerprint == 0 ? 1 : fingerprint;
 }
@@ -6418,7 +6420,9 @@ void Dispatch::execute_attention_phase(
                 std::to_string(static_cast<int>(phase)) + " layer " +
                 std::to_string(layer) + " does not match prepared entry " +
                 std::to_string(at) + " of " +
-                std::to_string(invocations.size()));
+                std::to_string(invocations.size()) +
+                " (prep planned_layers=" +
+                std::to_string(state.prepared_planned_layers) + ")");
         }
         ++state.prepared_cursor[phase_index];
         HookPreparedInvocation& invocation = invocations[at];
@@ -6575,7 +6579,7 @@ bool Dispatch::finish(
     // full model — the split narrows rows, not the layer walk.
     const std::uint32_t expected_layers =
         view.planned_max_layers == 0xffffffffu ||
-                view.planned_full_depth_rows > 0
+                view.planned_full_depth_rows != 0xffffffffu
             ? impl_->model_layers
             : std::min(impl_->model_layers, view.planned_max_layers);
     for (std::uint8_t phase :
