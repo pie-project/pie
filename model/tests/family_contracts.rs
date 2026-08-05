@@ -1012,6 +1012,58 @@ fn llama_mlx_metal_int4_from_f16() {
     );
 }
 
+/// An already-quantized checkpoint is not quantized again.
+///
+/// The U32-triplet arm is checked before the encode arm, and the order is the
+/// whole guarantee: reversed, `--quant int4` over an MLX checkpoint would try
+/// to encode packed codes as if they were values. Nothing in a type would
+/// catch that, so the property is asserted — no widening tensor appears, and
+/// every projection is still the affine the checkpoint shipped.
+///
+/// This is what makes `optimize --quant int4` idempotent: run twice, the second
+/// artifact is the same size as the first and gates identically.
+#[test]
+fn an_mlx_checkpoint_is_not_requantized_by_int4() {
+    let mut facts = facts("llama3", 1);
+    facts.mlx_quant_bits = 4;
+    facts.mlx_quant_group_size = 64;
+    let contract = author(
+        &facts,
+        &llama_mlx_checkpoint(),
+        &metal_target(),
+        &Policy {
+            runtime_quant: RuntimeQuant::Int4,
+            ..mlx_policy()
+        },
+    )
+    .expect("authoring an MLX checkpoint with int4 succeeds")
+    .expect("llama has an author");
+
+    assert!(
+        !contract.tensors.iter().any(|t| t.name.ends_with(".bf16")),
+        "an already-quantized checkpoint grew a widening tensor: {:?}",
+        contract
+            .tensors
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let projections = contract.tensors.iter().filter(|t| {
+        t.name.ends_with(".weight") && (t.name.contains("self_attn.") || t.name.contains("mlp."))
+    });
+    let mut seen = 0;
+    for tensor in projections {
+        seen += 1;
+        assert!(
+            matches!(&tensor.encoding, Encoding::Quant(spec) if spec.bits_per_element == 4),
+            "{} lost the affine the checkpoint shipped: {:?}",
+            tensor.name,
+            tensor.encoding
+        );
+    }
+    assert!(seen >= 7, "fixture should carry every projection, saw {seen}");
+}
+
 fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {
     let hidden = 64;
     let mut ck = Checkpoint::new();
