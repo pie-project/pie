@@ -2770,19 +2770,34 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             // would demote a lane's k silently, so refuse loudly instead.
             {
                 const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
+                const std::uint32_t* rk2 = s.dispatch_view.region_k.data();
                 const std::size_t nreg = ind.size() - 1;
                 bool seen_hook = false;
-                std::size_t trunc_regions = 0;
+                // DISTINCT truncations, not truncated regions: a hooked
+                // and a plain region at the SAME k (sigs differ, depth
+                // agrees) is the uniform-stamp shape, served without
+                // bands — the region count would misfire on it (caught
+                // by the extended soak: wire hook@k8 + devgeo k8).
+                std::uint32_t k_seen[3] = {0, 0, 0};
+                std::size_t distinct_k = 0;
                 for (std::size_t r = 0; r < nreg; ++r) {
                     if (rsig[r] & PIE_REGION_SIG_HOOK) seen_hook = true;
-                    if (rsig[r] & PIE_REGION_SIG_TRUNCATED) ++trunc_regions;
+                    if (rsig[r] & PIE_REGION_SIG_TRUNCATED) {
+                        bool known = false;
+                        for (std::size_t q = 0; q < distinct_k; ++q) {
+                            if (k_seen[q] == rk2[r]) known = true;
+                        }
+                        if (!known && distinct_k < 3) {
+                            k_seen[distinct_k++] = rk2[r];
+                        }
+                    }
                 }
-                if (seen_hook && trunc_regions >= 2 &&
+                if (seen_hook && distinct_k >= 2 &&
                     s.depth_band_k.empty()) {
                     throw std::runtime_error(
                         "hooked multi-depth fire reached the driver without "
-                        "armed bands (" + std::to_string(trunc_regions) +
-                        " truncated regions) — the admission gate should "
+                        "armed bands (" + std::to_string(distinct_k) +
+                        " distinct truncations) — the admission gate should "
                         "have split it");
                 }
             }
