@@ -94,7 +94,7 @@ struct MultiBatchPsos {
     /// padded every expert's run to -- a tile that spanned two experts would
     /// read one expert's weights for the other's rows -- so both widths are
     /// compiled and the fire picks. Three column tiles at each, as elsewhere.
-    Pso qmm_routed[2][3]{};  // [tile width][bn]
+    Pso qmm_routed[3][3]{};  // [tile width][bn]
     Pso qmm_t_splitk[3]{};
     Pso qmm_t_splitk_f32[3]{};
     // FP16-compute counterparts, with bf16 or float partials respectively.

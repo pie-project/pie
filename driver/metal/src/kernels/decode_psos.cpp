@@ -241,7 +241,7 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         // number the sort padded every expert's run to, and a tile that
         // disagreed with the padding would read one expert's weights for
         // another's rows.
-        for (int t = 0; t < 2; ++t) {
+        for (int t = 0; t < 3; ++t) {
             for (int i = 0; i < 3; ++i) {
                 want(qmm,
                      "affine_qmm_t_routed" + q + "_bm_" +

@@ -76,7 +76,7 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         // this the one place that did not follow the constant -- and a grid
         // built for one tiling against a pipeline compiled for another is
         // wrong numbers, not a crash.
-        for (int t = 0; t < 2; ++t) {
+        for (int t = 0; t < 3; ++t) {
             for (int i = 0; i < 3; ++i) {
                 const std::string fn =
                     "mxfp4_qmm_t_routed_bias_bfloat16_bm_" +

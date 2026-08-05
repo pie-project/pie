@@ -52,7 +52,7 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         // widths `moe_tile_rows` can pick. `bm` is what the sort padded every
         // expert's run to -- naming it here would be a second statement of the
         // same number, so it is spelled from the shared table.
-        for (int t = 0; t < 2; ++t) {
+        for (int t = 0; t < 3; ++t) {
             const std::string routed_bm =
                 "affine_qmm_t_routed" + q + "_bm_" +
                 std::to_string(shared_kernels::kMoeTileWidths[t]);

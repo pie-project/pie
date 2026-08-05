@@ -9,6 +9,7 @@
 /// not a compile error: the GPU reads whatever bytes sit at the offset.
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -103,10 +104,8 @@ inline void routed_qmv_dispatch(int N, int experts_per_token, Grid& g, Threadgro
 /// The narrow tile, and the one the batching threshold is written against.
 constexpr int kMoeTileRows = 16;
 
-/// The wide one. Instantiated for every routed GEMM this driver has, and taken
-/// when `moe_tile_rows` says the arithmetic it buys outweighs the padding it
-/// wastes.
-constexpr int kMoeWideTileRows = 32;
+/// The three widths a routed GEMM is compiled for, narrow first.
+inline constexpr int kMoeTileWidths[3] = {16, 32, 64};
 
 /// When sorting the rows by expert pays for itself.
 ///
@@ -129,41 +128,44 @@ inline bool moe_should_batch(int n_pairs, int n_experts) {
 
 /// Rows each expert's run is padded to, for a batch of `n_pairs`.
 ///
-/// Two costs pull opposite ways and neither is constant. A wider tile does the
-/// arithmetic faster -- measured with `roofline_probe` at the expert shape
-/// K=N=2880, in GFLOP/s: BM=16 2744, BM=32 3746, BM=64 4291 -- and pads more,
-/// because every touched expert rounds its run up and pays `tile - 1` rows for
-/// it. So the choice depends on the batch AND on how many experts it spreads
-/// over, which is why this cannot be the constant it used to be.
+/// A wider tile does the arithmetic faster and rounds each expert's run up
+/// further. What it does NOT cost is the allocation's worst case:
+/// `moe_sorted_rows` is deliberately pessimistic and the tiles past the routing
+/// decline at `tile_expert < 0`, so a wider tile dispatches more threadgroups
+/// that do nothing rather than more arithmetic. An earlier rule here priced
+/// that worst case as work, which is why it refused BM=64 everywhere -- at
+/// gpt-oss's 448 rows all three widths do the same 2048 rows of work.
 ///
-/// The two together, as time per fire, are `sorted_rows(tile) / rate(tile)`,
-/// and this picks the smallest. What that works out to: gpt-oss routes 4 of 32
-/// experts, so 448 rows already amortize the wide tile and it takes it --
-/// measured 457.4 -> 514.7 tok/s prefill, and 446.5 -> 514.7 at 1024 rows.
-/// gemma-4-26B and Qwen3-30B route 8 of 128, where the same 448 rows would
-/// waste 128 * 31 padded rows to save a third of the arithmetic, and they stay
-/// narrow. A constant could not have said both.
+/// Priced instead off ROWS PER EXPERT, because that is what decides how much of
+/// a tile a run fills, and measured end to end rather than modelled -- a model
+/// built on the probe's rates picked 64 at 448 rows where the machine prefers
+/// 32. Prefill tok/s, best of each row starred:
 ///
-/// BM=64 is measured above and not offered. Its crossover against BM=32 is at
-/// ~6000 pairs even for gpt-oss's 32 experts -- 1500 rows -- which is past any
-/// fire this driver builds, so wiring it would be a pipeline nothing selects.
+///     per   model            BM=16    BM=32    BM=64
+///      12   26B    192       407.5   *416.5*     --
+///      16   gptoss 128      *409.0*   406.3      --
+///      28   26B    448       454.3   *493.3*   462.7
+///      56   gptoss 448       471.0   *531.1*   509.4
+///      64   26B   1024       443.5   *495.8*   493.7
+///      80   gptoss 640         --     545.3    545.2
+///      96   gptoss 768         --     549.9   *554.1*
+///     128   gptoss 1024        --     548.7   *558.6*
+///
+/// So 32 almost always, 64 once a run fills one, and 16 only where a run is too
+/// short to fill even a 32 -- which `moe_should_batch` already keeps to a sliver,
+/// since it admits nothing below eight rows an expert. The thresholds sit in the
+/// gaps the sweep leaves: 32 wins at twelve, and 64 ties at eighty and wins at
+/// ninety-six.
 inline int moe_tile_rows(int n_pairs, int n_experts) {
     if (!moe_should_batch(n_pairs, n_experts)) return 1;
-    const int touched = n_pairs < n_experts ? n_pairs : n_experts;
-    // Integer arithmetic, cross-multiplied: rows(w)/rate(w) < rows(n)/rate(n).
-    constexpr int kRateNarrow = 2744;
-    constexpr int kRateWide = 3746;
-    const long narrow = long(n_pairs) + long(touched) * (kMoeTileRows - 1);
-    const long wide = long(n_pairs) + long(touched) * (kMoeWideTileRows - 1);
-    return wide * kRateNarrow < narrow * kRateWide ? kMoeWideTileRows : kMoeTileRows;
+    const int per = n_pairs / n_experts;
+    if (per >= 88) return 64;
+    return per >= 12 ? 32 : 16;
 }
 
 /// Which row of a routed PSO table a tile selects. The tables hold the two
 /// widths `moe_tile_rows` can return, in that order.
-inline int moe_bm_slot(int tile) { return tile >= kMoeWideTileRows ? 1 : 0; }
-
-/// The two tile widths a routed PSO table is compiled for, narrow first.
-inline constexpr int kMoeTileWidths[2] = {kMoeTileRows, kMoeWideTileRows};
+inline int moe_bm_slot(int tile) { return tile >= 64 ? 2 : (tile >= 32 ? 1 : 0); }
 
 /// How many sorted rows a batch of `n_pairs` can produce.
 ///
