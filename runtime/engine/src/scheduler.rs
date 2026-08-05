@@ -487,6 +487,10 @@ pub(crate) struct RunAheadAcc {
     pub retq2: AtomicU64,
     /// Implicit rejoins (parked lane accepted a fire) since the last wave.
     pub rejoins: AtomicU64,
+    /// `PIE_REJOIN_DEFER=1`: rejoins from a park that the gate let the fleet
+    /// seal WITHOUT — counted once per deferral episode, not per gate
+    /// evaluation. Zero means the lever never engaged.
+    pub defer_rejoins: AtomicU64,
     /// Awaited lanes seen blocking the gate, summed over gate evaluations.
     pub blocking: AtomicU64,
     /// Composition of those blocking lanes: the engine owes them a retire or
@@ -495,6 +499,11 @@ pub(crate) struct RunAheadAcc {
     pub blk_owed: AtomicU64,
     pub blk_empty: AtomicU64,
     pub blk_partial: AtomicU64,
+    /// Reason census for blocking lanes, independent of the `owes`-first
+    /// classification above: no frame queued at all vs a frame that has
+    /// arrived only partially (some of its k slots still missing).
+    pub blk_noframes: AtomicU64,
+    pub blk_incomplete: AtomicU64,
     pub leave_close: AtomicU64,
     pub leave_hit: AtomicU64,
     pub leave_removed: AtomicU64,
@@ -552,10 +561,13 @@ pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
     retq1: AtomicU64::new(0),
     retq2: AtomicU64::new(0),
     rejoins: AtomicU64::new(0),
+    defer_rejoins: AtomicU64::new(0),
     blocking: AtomicU64::new(0),
     blk_owed: AtomicU64::new(0),
     blk_empty: AtomicU64::new(0),
     blk_partial: AtomicU64::new(0),
+    blk_noframes: AtomicU64::new(0),
+    blk_incomplete: AtomicU64::new(0),
     leave_close: AtomicU64::new(0),
     leave_hit: AtomicU64::new(0),
     leave_removed: AtomicU64::new(0),

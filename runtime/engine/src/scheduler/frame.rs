@@ -112,6 +112,45 @@ fn seal_mode_ready() -> bool {
     *CONFIGURED.get_or_init(|| std::env::var("PIE_SEAL_MODE").is_ok_and(|value| value == "ready"))
 }
 
+/// `PIE_REJOIN_DEFER=1`: a lane REJOINING from a park-shaped exit (the
+/// planner's KV allocation park, the guest's `forward.park()`, the leash)
+/// does not deny the EARLY SEAL of a fleet that is otherwise gatherable —
+/// it is gathered into the NEXT boundary instead.
+///
+/// Under KV pressure ~2.7 lanes/wave park on a page-boundary ask and the
+/// leave/rejoin traffic keeps ~13 lanes short of a fully submitted next
+/// frame at any gate evaluation. `plan_dispatch` then returns `Park` on
+/// `missing > 0 && executing`, so the early seal engages in 29% of waves
+/// instead of 94% and the whole post-completion serial chain (retire →
+/// gate → build → post → driver submit, ~5 ms) leaves the shadow of device
+/// execution and lands on the critical path (analysis §10.19/§10.20).
+///
+/// This changes join-vs-chain PRECEDENCE for parked rejoins only, and
+/// nothing else: no frame is fabricated, skipped or reordered (the
+/// deferred lane's queued frames stay in submission order and dispatch
+/// when its boundary comes), wait-all still holds for the members of a
+/// boundary, fresh binds/admissions keep the narrow-epoch protection, and
+/// the deferral is consumed by the very next boundary OPEN — one boundary,
+/// never more (see [`FramePolicy::open_boundary`]). The engine, not the
+/// guest, imposes it, so the submit-deadline and silence clocks stop for
+/// its duration. Default: off (byte-identical behaviour).
+/// `PIE_REJOIN_DEFER=<boundaries>`: how many boundaries a lane returning
+/// from a park is granted before the gate waits for it again (0/absent =
+/// off). ONE boundary was measured too short: the lane rejoins with the
+/// single frame its park had blocked, that frame dispatches immediately,
+/// and the lane is then EMPTY and owed a result for a whole frame round
+/// trip — blocking every gate evaluation in between (analysis.md 10.21).
+/// The grace is a hard bound, so starvation-freedom survives it.
+fn rejoin_defer() -> u8 {
+    static CONFIGURED: OnceLock<u8> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_REJOIN_DEFER")
+            .ok()
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// The frame identity one fire carries from `forward.submit`: which lane
 /// (pipeline scope), which frame of that lane, which wave slot, and how many
 /// fires the whole frame holds (so arrival completeness is decidable).
@@ -216,6 +255,24 @@ struct LaneState {
     /// can ask whether the lanes holding a seal are the ones that just came
     /// back from a planner park.
     rejoin_seal: u64,
+    /// `PIE_REJOIN_DEFER=1` only: this lane is IN a rejoin from a park-shaped
+    /// exit — its membership was re-established by the rejoining fire and it
+    /// has not been through a boundary open since. While it holds, the gate
+    /// does not count the lane missing (it is in transition, and the fleet's
+    /// chain must not break for it) and neither the leash nor the silence
+    /// clock runs against it. Cleared by the next [`FramePolicy::open_boundary`]
+    /// — which is what bounds the deferral to exactly one boundary — and by
+    /// the partition that gathers the lane, whichever comes first.
+    rejoining: bool,
+    /// Boundaries of grace remaining for a lane that returned from a park
+    /// (see [`rejoin_defer`]). Decremented at every boundary open; the
+    /// deferral ends when it reaches zero, so it is bounded by construction.
+    rejoin_grace: u8,
+    /// Whether this rejoin has already been counted into
+    /// `RUN_AHEAD.defer_rejoins`, so the probe measures deferral EPISODES
+    /// rather than the ~46 gate evaluations a wave makes. Cleared with
+    /// `rejoining`.
+    defer_counted: bool,
 }
 
 /// One sealed (immutable) frame, dispatched WHOLE: per-wave fire-id lists in
@@ -373,6 +430,26 @@ pub(super) struct FramePolicy {
     /// normally dropped the moment its frames drain, well before the late
     /// slot lands.
     truncated_seqs: BTreeMap<ProcessId, u64>,
+    /// `PIE_REJOIN_DEFER=1` only (empty otherwise): lanes that left the
+    /// wait-set through a PARK-shaped exit — the planner's KV allocation park
+    /// (`on_lane_leave` without a purge), the guest's `forward.park()`, or the
+    /// leash — and have not fired since, mapped to their owning process.
+    ///
+    /// Kept OUTSIDE `lanes` for the same reason as `truncated_seqs`: a parked
+    /// lane whose queued frames have drained is dropped from `lanes` by the
+    /// next seal's retain, long before its KV grant lands, so the lane entry
+    /// itself cannot tell the eventual arrival apart from a fresh bind's first
+    /// fire. This is the only surviving evidence of that difference, and the
+    /// deferral below is granted on nothing else — a joining cohort's lane id
+    /// was never here, so the narrow-epoch protection is untouched.
+    ///
+    /// Written at exactly the three park sites, consumed by the rejoining
+    /// arrival, and purged by every path that ends the lane or supersedes the
+    /// park (terminate, process leave, planner suspend), which is what bounds
+    /// it: a graceful close lands here too and is inert (a closed pipeline
+    /// never fires again), and its entry is reclaimed by the owner's
+    /// terminate.
+    park_exits: BTreeMap<ProcessId, ProcessId>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
     /// Monotonic count of accepted frame-fire arrivals — the ready-mode
@@ -409,6 +486,10 @@ pub(super) struct FramePolicy {
     /// already protects the fleet, so nothing but a genuinely abandoned
     /// process reaches this.
     silence_timeout: Duration,
+    /// [`rejoin_defer`], read once at construction so the lever is fixed for
+    /// the policy's life (and overridable in tests without touching the
+    /// process environment).
+    rejoin_defer: u8,
     /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
     stats: Option<Arc<SchedulerStats>>,
 }
@@ -442,6 +523,17 @@ impl FramePolicy {
         self
     }
 
+    /// Pin the parked-rejoin deferral for one policy. Tests only, and it
+    /// pins BOTH directions on purpose: the live lever is the process-wide
+    /// `PIE_REJOIN_DEFER`, so a test that read the environment would assert
+    /// on whatever the suite was run with, and one that SET it would decide
+    /// the answer for every other test in the binary.
+    #[cfg(test)]
+    fn with_rejoin_defer(mut self, on: bool) -> Self {
+        self.rejoin_defer = u8::from(on);
+        self
+    }
+
     pub fn new(
         k: usize,
         max_wave_rows: usize,
@@ -463,6 +555,7 @@ impl FramePolicy {
             departing: BTreeSet::new(),
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
+            park_exits: BTreeMap::new(),
             strict_watchdog_deadline: None,
             arrival_seq: 0,
             quiesce_mark: None,
@@ -471,6 +564,7 @@ impl FramePolicy {
             in_flight_lanes: BTreeSet::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
+            rejoin_defer: rejoin_defer(),
             stats,
         }
     }
@@ -542,6 +636,7 @@ impl FramePolicy {
     }
 
     fn record_arrival(&mut self, stamp: FrameStamp, owner: Option<ProcessId>, fire: ArrivedFire) {
+        let defer_grace = self.rejoin_defer;
         // Staged -> live promotion: the owner's fire arrived, so its
         // wait-set membership takes over from the join-in-flight hold.
         // Keyed by OWNER (the process id): `staged`/`joins_in_flight`
@@ -573,6 +668,14 @@ impl FramePolicy {
             }
             _ => false,
         };
+        // `PIE_REJOIN_DEFER`: is this arrival a REJOIN from a park-shaped exit
+        // rather than a fresh lane's first fire? Only `park_exits` can say so
+        // — a drained parked lane has already been dropped from `lanes`, so
+        // the entry below is about to be re-created exactly as a bring-up
+        // lane's would be. Consumed here: one arrival ends the exit. A fire
+        // racing a suspend broadcast does not spend it for the same reason the
+        // `parked` latch is not spent there — the lane is leaving.
+        let park_rejoin = !suspended && self.park_exits.remove(&stamp.lane).is_some();
         let seal_seq = self.seal_seq;
         let lane = self.lanes.entry(stamp.lane).or_insert_with(|| LaneState {
             owner,
@@ -589,9 +692,21 @@ impl FramePolicy {
             // between boundaries is picked up by the next gate.
             fired_this_boundary: true,
             rejoin_seal: u64::MAX,
+            rejoining: false,
+            rejoin_grace: 0,
+            defer_counted: false,
         });
         if lane.owner.is_none() {
             lane.owner = owner;
+        }
+        // The lane is a member again from this fire on, and the gate will wait
+        // for it like any other — but for ONE boundary it is a lane in
+        // transition rather than a lane being slow, and the fleet's chain does
+        // not break for it. See `rejoin_defer` and `plan_dispatch`'s gate.
+        if park_rejoin {
+            lane.rejoining = true;
+            lane.rejoin_grace = defer_grace;
+            lane.defer_counted = false;
         }
         // Implicit rejoin: a parked lane returns to the quorum on its next
         // accepted fire. Atomic with the fire on purpose — an explicit join
@@ -754,7 +869,11 @@ impl FramePolicy {
     }
 
     fn retire_parks(&mut self) {
-        for state in self.lanes.values_mut() {
+        let defer = self.rejoin_defer > 0;
+        // Collected rather than inserted in place: `park_exits` is a sibling
+        // field of the map being iterated.
+        let mut exits: Vec<(ProcessId, ProcessId)> = Vec::new();
+        for (lane_id, state) in self.lanes.iter_mut() {
             while state.frames.front().is_some_and(|frame| frame.park) {
                 state.frames.pop_front();
                 // Only an exit with nothing behind it removes the lane. A
@@ -766,9 +885,13 @@ impl FramePolicy {
                     state.awaited = false;
                     state.parked = true;
                     state.clock_from = None;
+                    if defer && let Some(owner) = state.owner {
+                        exits.push((*lane_id, owner));
+                    }
                 }
             }
         }
+        self.park_exits.extend(exits);
     }
 
     /// A bind control entered the scheduler. A bind on its own means
@@ -954,6 +1077,7 @@ impl FramePolicy {
         if purge_queued {
             self.lanes.remove(&lane);
             self.truncated_seqs.remove(&lane);
+            self.park_exits.remove(&lane);
         } else if let Some(state) = self.lanes.get_mut(&lane) {
             state.awaited = false;
             // The leave is a PARK, not a verdict: both callers (the planner's
@@ -979,6 +1103,12 @@ impl FramePolicy {
                     .leave_removed
                     .fetch_add(1, Ordering::Relaxed);
             }
+            // Park-shaped exit: remember it so the eventual rejoin is
+            // recognizable as one whether or not the lane entry survives the
+            // next seal's retain. `PIE_REJOIN_DEFER` only.
+            if self.rejoin_defer > 0 && let Some(owner) = owner {
+                self.park_exits.insert(lane, owner);
+            }
         }
         if let Some(owner) = owner {
             self.pending_binds.remove(&owner);
@@ -999,6 +1129,7 @@ impl FramePolicy {
             self.truncated_seqs.remove(&id);
         }
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
+        self.park_exits.retain(|_, parked_owner| *parked_owner != owner);
         self.pending_binds.remove(&owner);
         self.suspended.remove(&owner);
         self.forget_staged(owner);
@@ -1015,6 +1146,10 @@ impl FramePolicy {
     /// recreates it awaited.
     pub fn on_process_suspend(&mut self, owner: ProcessId) {
         self.suspended.insert(owner);
+        // An eviction SUPERSEDES a park: the process is being swapped out, and
+        // its post-restore rejoin is a restore, not a lane in transition. Drop
+        // any pending park exit so the restore path keeps its own behaviour.
+        self.park_exits.retain(|_, parked_owner| *parked_owner != owner);
         let owned: Vec<ProcessId> = self
             .lanes
             .iter()
@@ -1120,9 +1255,22 @@ impl FramePolicy {
     }
 
     /// Open a fresh boundary: every awaited lane owes it one frame.
+    ///
+    /// This is also where a deferred parked rejoin ends, and the reason the
+    /// deferral is bounded by exactly ONE boundary: from this open the lane is
+    /// an ordinary awaited member again, so the very next gate evaluation
+    /// counts it missing and wait-all holds for it like anyone else. No
+    /// boundary can open without paying off every outstanding deferral, and
+    /// deferring is the only thing that lets a boundary open early — so a lane
+    /// can never be deferred twice in a row.
     fn open_boundary(&mut self) {
         for lane in self.lanes.values_mut() {
             lane.fired_this_boundary = false;
+            lane.rejoin_grace = lane.rejoin_grace.saturating_sub(1);
+            if lane.rejoin_grace == 0 {
+                lane.rejoining = false;
+            }
+            lane.defer_counted = false;
         }
     }
 
@@ -1289,6 +1437,12 @@ impl FramePolicy {
             for member in &members {
                 if let Some(lane) = self.lanes.get_mut(member) {
                     lane.fired_this_boundary = true;
+                    // Gathered into a boundary — including a later partition
+                    // of one already open: the rejoin is over, so a deferral
+                    // cannot outlive it either.
+                    lane.rejoining = false;
+                    lane.rejoin_grace = 0;
+                    lane.defer_counted = false;
                 }
             }
             self.record_sealed_waves(waves.iter().filter(|wave| !wave.is_empty()).count());
@@ -1466,8 +1620,16 @@ impl FramePolicy {
             let mut expired: Vec<ProcessId> = Vec::new();
             let mut blocking_pin = false;
             let (mut blk_owed, mut blk_empty, mut blk_partial) = (0u64, 0u64, 0u64);
+            let (mut blk_noframes, mut blk_incomplete) = (0u64, 0u64);
             let leash = self.submit_deadline;
             let silence = self.silence_timeout;
+            // `PIE_REJOIN_DEFER=1` (see `rejoin_defer`): only meaningful while
+            // a frame is EXECUTING, which is the only time the gate's verdict
+            // decides whether the chain engages. With the device idle there is
+            // no chain to protect and dense gathering is simply right, so the
+            // rejoining lane is waited for exactly as today.
+            let defer_enabled = self.rejoin_defer > 0;
+            let defer_rejoins = defer_enabled && executing;
             for (lane_id, lane) in self.lanes.iter_mut() {
                 let owes = self.in_flight_lanes.contains(lane_id)
                     || lane
@@ -1481,6 +1643,32 @@ impl FramePolicy {
                     lane.awaited && !lane.frames.front().is_some_and(PendingFrame::is_complete);
                 if !blocking && !lane.leashed {
                     lane.clock_from = None;
+                    continue;
+                }
+                // A lane REJOINING from a park is in transition, and the whole
+                // fleet's pipelining must not be denied by it: it stays
+                // awaited and its queued frames stay in submission order, but
+                // it is not counted missing, so a fleet that is otherwise
+                // gatherable seals NOW and this lane is gathered into the next
+                // boundary (`open_boundary`, one boundary and no more). Its
+                // frames are neither dropped nor reordered — nothing here
+                // touches them.
+                //
+                // The clock is disarmed with it: this deferral is the
+                // ENGINE's, not the guest's silence, and the same "clock stops
+                // for debts owed to this lane" principle that covers an
+                // unretired dispatch covers a wait we imposed. Because the
+                // arm/leash/terminate ladder below is skipped entirely, a
+                // deferred lane can also never be leashed OUT of the wait-set
+                // for the deferral we granted it.
+                if defer_rejoins && blocking && lane.rejoining && !lane.leashed {
+                    lane.clock_from = None;
+                    if !lane.defer_counted {
+                        lane.defer_counted = true;
+                        crate::scheduler::RUN_AHEAD
+                            .defer_rejoins
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 if owes {
@@ -1509,6 +1697,14 @@ impl FramePolicy {
                             lane.awaited = false;
                             lane.parked = true;
                             lane.leashed = true;
+                            // Park-shaped, so its rejoin is one too
+                            // (`PIE_REJOIN_DEFER` only). The lane keeps its
+                            // silence clock while leashed; the deferral above
+                            // is granted only once it has actually submitted,
+                            // which is what clears `leashed`.
+                            if defer_enabled && let Some(owner) = lane.owner {
+                                self.park_exits.insert(*lane_id, owner);
+                            }
                             continue;
                         }
                         Some(_) => {}
@@ -1518,6 +1714,16 @@ impl FramePolicy {
                 if blocking {
                     missing += 1;
                     blocking_pin = true;
+                    // Reason census, INDEPENDENT of `owes`: the classification
+                    // below is priority-ordered with `owes` first, and during
+                    // execution every member of the in-flight frame is owed,
+                    // so `blk_owed` hides whether the lane has no frame at all
+                    // or a half-arrived one. These two count the actual state.
+                    if lane.frames.is_empty() {
+                        blk_noframes += 1;
+                    } else {
+                        blk_incomplete += 1;
+                    }
                     if owes {
                         blk_owed += 1;
                     } else if lane.frames.is_empty() {
@@ -1544,6 +1750,8 @@ impl FramePolicy {
                 acc.blk_owed.fetch_add(blk_owed, Ordering::Relaxed);
                 acc.blk_empty.fetch_add(blk_empty, Ordering::Relaxed);
                 acc.blk_partial.fetch_add(blk_partial, Ordering::Relaxed);
+                acc.blk_noframes.fetch_add(blk_noframes, Ordering::Relaxed);
+                acc.blk_incomplete.fetch_add(blk_incomplete, Ordering::Relaxed);
                 acc.gate_evals.fetch_add(1, Ordering::Relaxed);
                 acc.miss_max.fetch_max(missing as u64, Ordering::Relaxed);
                 if executing {
@@ -1692,12 +1900,14 @@ impl FramePolicy {
     pub fn debug_summary(&self) -> String {
         use std::fmt::Write as _;
         let mut out = format!(
-            "frame k={} lanes={} awaited={} sealed={} pending_binds={} \
-staged={} joins_in_flight={} departing={} suspended={} pending_slots={} \
-watchdog={:?}",
+            "frame k={} lanes={} awaited={} rejoining={} park_exits={} sealed={} \
+pending_binds={} staged={} joins_in_flight={} departing={} suspended={} \
+pending_slots={} watchdog={:?}",
             self.k,
             self.lanes.len(),
             self.lanes.values().filter(|lane| lane.awaited).count(),
+            self.lanes.values().filter(|lane| lane.rejoining).count(),
+            self.park_exits.len(),
             self.sealed.len(),
             self.pending_binds.values().sum::<usize>(),
             self.staged.len(),
@@ -1721,9 +1931,10 @@ watchdog={:?}",
             let front_complete = lane.frames.front().is_some_and(PendingFrame::is_complete);
             let _ = write!(
                 out,
-                "\n  lane {pid}: owner={:?} awaited={} queued_frames={} front_complete={front_complete}",
+                "\n  lane {pid}: owner={:?} awaited={} rejoining={} queued_frames={} front_complete={front_complete}",
                 lane.owner,
                 lane.awaited,
+                lane.rejoining,
                 lane.frames.len(),
             );
         }
@@ -2709,6 +2920,159 @@ mod tests {
         let mut sealed = fires(&plan(&mut policy, &queued, Instant::now()));
         sealed.sort_unstable();
         assert_eq!(sealed, vec![420, 421, 430, 431]);
+    }
+
+    /// One fleet of three lanes, one dense boundary behind it, and then the
+    /// §10.20 shape: `p` parks on a page-boundary allocation ask (the
+    /// planner's park is a non-purging lane leave), the other two submit
+    /// their next frames in full, and `p`'s rejoining frame is half arrived —
+    /// slot 0 of 2 — when the gate is evaluated. Its lane entry was dropped
+    /// outright at the park (its frames had drained), which is exactly the
+    /// case where nothing in `lanes` can still tell its next fire from a
+    /// bring-up lane's first one.
+    fn parked_rejoin_scenario(
+        defer: bool,
+        deadline: Duration,
+        at: Instant,
+    ) -> (FramePolicy, ProcessId, ProcessId, ProcessId) {
+        let mut policy = FramePolicy::new(2, 64, 4096, None)
+            .with_submit_deadline(deadline)
+            .with_rejoin_defer(defer);
+        let (a, b, p) = (pid(), pid(), pid());
+        for (lane, base) in [(a, 10u64), (b, 20), (p, 30)] {
+            policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), base, 1, 1);
+            policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), base + 1, 1, 1);
+        }
+        let queued: QueuedFireIds = [10, 11, 20, 21, 30, 31].into_iter().collect();
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, at)).len(),
+            6,
+            "the fleet starts as one dense boundary"
+        );
+        retire(&mut policy, [a, b, p]);
+        policy.on_lane_leave(p, Some(p), false);
+
+        for (lane, base) in [(a, 12u64), (b, 22)] {
+            policy.on_fire_enqueued(stamp(lane, 1, 0, 2), Some(lane), base, 1, 1);
+            policy.on_fire_enqueued(stamp(lane, 1, 1, 2), Some(lane), base + 1, 1, 1);
+        }
+        policy.on_fire_enqueued(stamp(p, 1, 0, 2), Some(p), 32, 1, 1);
+        (policy, a, b, p)
+    }
+
+    /// THE `PIE_REJOIN_DEFER=1` regression test (§10.20's lever). Under KV
+    /// pressure a few lanes are always in park/rejoin transition, and wait-all
+    /// turns "a few lanes in transition" into "no pipelining for the whole
+    /// fleet": the gate sees `missing > 0` while a frame executes, parks, and
+    /// the next frame is sealed only after the current one retires — putting
+    /// the whole retire → gate → build → post chain on the critical path.
+    ///
+    /// With the lever, a lane rejoining from a PARK does not deny the early
+    /// seal of a fleet that is otherwise gatherable. Everything else holds:
+    /// the deferral is spent by the very next boundary open (so wait-all
+    /// covers the lane again one boundary later, never two), the lane's
+    /// already-submitted slots are neither dropped nor reordered, and the
+    /// engine's own deferral does not run the guest's leash.
+    #[test]
+    fn a_parked_rejoin_defers_to_the_next_boundary_instead_of_breaking_the_chain() {
+        let deadline = Duration::from_millis(50);
+        let start = Instant::now();
+        let (mut policy, a, b, p) = parked_rejoin_scenario(true, deadline, start);
+        // Deliberately far past the submit deadline: the deferral is the
+        // ENGINE's, so none of it may be charged to `p`.
+        let now = start + deadline * 10;
+
+        let queued: QueuedFireIds = [12, 13, 22, 23, 32].into_iter().collect();
+        let mut sealed = fires(&policy.plan_dispatch(&queued, &HashSet::new(), true, now));
+        sealed.sort_unstable();
+        assert_eq!(
+            sealed,
+            vec![12, 13, 22, 23],
+            "the gatherable fleet must seal while p rejoins, not park on it"
+        );
+        assert!(
+            !policy.leashed(p),
+            "a lane deferred by the engine is not a lane being slow"
+        );
+
+        // The deferral was spent by that boundary open: p is an ordinary
+        // awaited member again, so the very next gate holds for it. One
+        // boundary, never two.
+        retire(&mut policy, [a, b]);
+        for (lane, base) in [(a, 14u64), (b, 24)] {
+            policy.on_fire_enqueued(stamp(lane, 2, 0, 2), Some(lane), base, 1, 1);
+            policy.on_fire_enqueued(stamp(lane, 2, 1, 2), Some(lane), base + 1, 1, 1);
+        }
+        let queued: QueuedFireIds = [14, 15, 24, 25, 32].into_iter().collect();
+        assert!(
+            matches!(
+                policy.plan_dispatch(&queued, &HashSet::new(), true, now),
+                FramePlan::Park
+            ),
+            "wait-all must hold for the rejoined lane at the next boundary"
+        );
+
+        // And its half-submitted frame was only ever waiting: it seals whole,
+        // in slot order, with the boundary that gathered it.
+        policy.on_fire_enqueued(stamp(p, 1, 1, 2), Some(p), 33, 1, 1);
+        let queued: QueuedFireIds = [14, 15, 24, 25, 32, 33].into_iter().collect();
+        let FramePlan::Dispatch(waves) = policy.plan_dispatch(&queued, &HashSet::new(), true, now)
+        else {
+            panic!("the completed rejoin must seal with the fleet");
+        };
+        assert_eq!(waves.len(), 2);
+        assert_eq!(waves[0].len(), 3, "wave 0 holds all three lanes' slot 0");
+        assert!(waves[0].contains(&32), "p's slot 0 kept its wave");
+        assert!(waves[1].contains(&33), "p's slot 1 kept its wave");
+    }
+
+    /// Default OFF: the lever changes nothing unless it is asked for. Same
+    /// scenario, same instant — today's rule parks the whole fleet on the
+    /// rejoining lane.
+    #[test]
+    fn without_the_lever_a_parked_rejoin_still_denies_the_chain() {
+        let now = Instant::now();
+        let (mut policy, _a, _b, _p) =
+            parked_rejoin_scenario(false, Duration::from_millis(50), now);
+        let queued: QueuedFireIds = [12, 13, 22, 23, 32].into_iter().collect();
+        assert!(
+            matches!(
+                policy.plan_dispatch(&queued, &HashSet::new(), true, now),
+                FramePlan::Park
+            ),
+            "strict wait-all holds the whole fleet for the rejoining lane"
+        );
+    }
+
+    /// The deferral is for REJOINS, not for arrivals in general: a bring-up
+    /// lane's first frame is a join in flight, and the cohort-boundary window
+    /// exists so it lands in this boundary rather than a narrow epoch. Same
+    /// half-arrived frame, same executing device, lever on — and the gate
+    /// still holds, because this lane never parked.
+    #[test]
+    fn a_fresh_lane_is_not_a_rejoin_and_still_holds_the_gate() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None).with_rejoin_defer(true);
+        let (a, fresh) = (pid(), pid());
+        policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 10, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 11, 1, 1);
+        let queued: QueuedFireIds = [10, 11].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 2);
+        retire(&mut policy, [a]);
+
+        // A newly admitted process submits slot 0 of its first frame while a
+        // frame executes, and the incumbent's next frame is complete.
+        policy.on_bind_enqueued(Some(fresh));
+        policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 12, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 13, 1, 1);
+        policy.on_fire_enqueued(stamp(fresh, 0, 0, 2), Some(fresh), 20, 1, 1);
+        let queued: QueuedFireIds = [12, 13, 20].into_iter().collect();
+        assert!(
+            matches!(
+                policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now()),
+                FramePlan::Park
+            ),
+            "a fresh join keeps the narrow-epoch protection"
+        );
     }
 
     /// The engine's own debts hold the clock: a lane whose rebind the engine
