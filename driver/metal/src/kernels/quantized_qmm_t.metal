@@ -1457,8 +1457,9 @@ struct QuantizedBlockLoader {
 };
 
 // ── pie entry ────────────────────────────────────────────────────────────────
-// Aligned-only form of MLX's qmm_t_impl: every tile is full, so there is no
-// `M`/`num_els`/`num_outs` bookkeeping and no safe-load branch.
+// The one full-tile MMA loop. Callers choose the weight loader, input/output
+// row pitches, K span, and epilogue; every exported variant keeps the same
+// unsafe full-tile contract and therefore the same hot loop.
 template <typename T, typename P, typename LoaderW, int BM, int BK, int BN,
           bool WITH_RESIDUAL, bool WITH_BIAS>
 METAL_FUNC void qmm_t_loaded_impl(
@@ -1467,8 +1468,9 @@ METAL_FUNC void qmm_t_loaded_impl(
     const device P* residual,
     threadgroup T* Xs,
     threadgroup T* Ws,
-    const constant int& K,
-    const constant int& N,
+    int x_row_stride,
+    int y_row_stride,
+    int k_len,
     uint3 tid,
     uint simd_gid,
     uint simd_lid,
@@ -1483,12 +1485,12 @@ METAL_FUNC void qmm_t_loaded_impl(
 
   const int y_row = int(tid.y) * BM;
   const int y_col = int(tid.x) * BN;
-  x += y_row * static_cast<int64_t>(K);
-  y += y_row * static_cast<int64_t>(N) + y_col;
+  x += y_row * static_cast<int64_t>(x_row_stride);
+  y += y_row * static_cast<int64_t>(y_row_stride) + y_col;
 
-  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
+  loader_x_t loader_x(x, x_row_stride, Xs, simd_gid, simd_lid);
   mma_t mma_op(simd_gid, simd_lid);
-  for (int k = 0; k < K; k += BK) {
+  for (int k = 0; k < k_len; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     loader_x.load_unsafe();
     loader_w.load_unsafe();
@@ -1500,29 +1502,30 @@ METAL_FUNC void qmm_t_loaded_impl(
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (WITH_RESIDUAL) {
-    residual += y_row * static_cast<int64_t>(N) + y_col;
-    mma_op.store_result(y, N);
+    residual += y_row * static_cast<int64_t>(y_row_stride) + y_col;
+    mma_op.store_result(y, y_row_stride);
     threadgroup_barrier(mem_flags::mem_device);
     for (uint idx = simd_gid * 32u + simd_lid; idx < uint(BM * BN);
          idx += uint(WM * WN * SIMD_SIZE)) {
       const int r = int(idx) / BN;
       const int c = int(idx) % BN;
-      y[r * static_cast<int64_t>(N) + c] = P(
-          float(y[r * static_cast<int64_t>(N) + c]) +
-          float(residual[r * static_cast<int64_t>(N) + c]));
+      y[r * static_cast<int64_t>(y_row_stride) + c] = P(
+          float(y[r * static_cast<int64_t>(y_row_stride) + c]) +
+          float(residual[r * static_cast<int64_t>(y_row_stride) + c]));
     }
   } else if (WITH_BIAS) {
-    mma_op.store_result(y, N);
+    mma_op.store_result(y, y_row_stride);
     threadgroup_barrier(mem_flags::mem_device);
     for (uint idx = simd_gid * 32u + simd_lid; idx < uint(BM * BN);
          idx += uint(WM * WN * SIMD_SIZE)) {
       const int r = int(idx) / BN;
       const int c = int(idx) % BN;
-      y[r * static_cast<int64_t>(N) + c] =
-          P(float(y[r * static_cast<int64_t>(N) + c]) + float(residual[y_col + c]));
+      y[r * static_cast<int64_t>(y_row_stride) + c] =
+          P(float(y[r * static_cast<int64_t>(y_row_stride) + c]) +
+            float(residual[y_col + c]));
     }
   } else {
-    mma_op.store_result(y, N);
+    mma_op.store_result(y, y_row_stride);
   }
 }
 
@@ -1558,7 +1561,7 @@ METAL_FUNC void qmm_t_aligned_impl(
   biases += y_col * K_g;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS>(
-      x, y, residual, Xs, Ws, K, N, tid, simd_gid, simd_lid, loader_w);
+      x, y, residual, Xs, Ws, K, N, K, tid, simd_gid, simd_lid, loader_w);
 }
 
 template <typename P, int group_size, int bits, int BM, int BK, int BN>
@@ -1576,46 +1579,25 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = BK + 16 / sizeof(half);
 
-  using mma_t = mlx::steel::
-      BlockMMA<half, P, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
-  using loader_x_t =
-      mlx::steel::BlockLoader<half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
-      bfloat, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
+      bfloat, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits, half>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = int(tid.y) * BM;
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  x += y_row * static_cast<int64_t>(K);
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
-  y += y_row * static_cast<int64_t>(N) + y_col;
-
-  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  mma_t mma_op(simd_gid, simd_lid);
-
-  for (int k = 0; k < k_len; k += BK) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    loader_x.load_unsafe();
-    loader_w.load_unsafe();
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mma_op.mma(Xs, Ws);
-    loader_x.next();
-    loader_w.next();
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  mma_op.store_result(y, N);
+  qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, false, false>(
+      x, y, nullptr, Xs, Ws, K, N, k_len,
+      tid, simd_gid, simd_lid, loader_w);
 }
 
 // Dense g64/b4 keeps the model ABI in BF16 but stages each projection source
@@ -1796,7 +1778,7 @@ template <typename T, int BM, int BK, int BN>
       mlx::steel::Mxfp4BlockLoader<T, BN, BK, BK_padded, 1, tgp_size>;
   loader_w_t loader_w(wb, sb, K, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, false, true>(
-      x, y, bias + size_t(e) * N, Xs, Ws, K, N, tid, simd_gid, simd_lid,
+      x, y, bias + size_t(e) * N, Xs, Ws, K, N, K, tid, simd_gid, simd_lid,
       loader_w);
 }
 
@@ -1950,58 +1932,26 @@ METAL_FUNC void qmm_t_strided_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  using mma_t = mlx::steel::
-      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
-  using loader_x_t =
-      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = int(tid.y) * BM;
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  x += y_row * static_cast<int64_t>(row_stride);
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
-  y += y_row * static_cast<int64_t>(row_stride) + y_col;
-
-  loader_x_t loader_x(x, row_stride, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  mma_t mma_op(simd_gid, simd_lid);
-
-  for (int k = 0; k < K; k += BK) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    loader_x.load_unsafe();
-    loader_w.load_unsafe();
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mma_op.mma(Xs, Ws);
-    loader_x.next();
-    loader_w.next();
-  }
-
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  mma_op.store_result(y, row_stride);
-  if (WITH_RESIDUAL) {
-    residual += y_row * static_cast<int64_t>(row_stride) + y_col;
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint idx = simd_gid * 32u + simd_lid; idx < uint(BM * BN);
-         idx += uint(WM * WN * SIMD_SIZE)) {
-      const int r = int(idx) / BN;
-      const int c = int(idx) % BN;
-      const int64_t off = r * static_cast<int64_t>(row_stride) + c;
-      y[off] = static_cast<T>(float(y[off]) + float(residual[off]));
-    }
-  }
+  qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, WITH_RESIDUAL, false>(
+      x, y, residual, Xs, Ws, row_stride, row_stride, K,
+      tid, simd_gid, simd_lid, loader_w);
+  (void)N;
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
@@ -2076,58 +2026,27 @@ METAL_FUNC void qmm_t_strided_fp16_precast_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   constexpr int BK_padded = BK + 16 / sizeof(half);
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  using mma_t = mlx::steel::
-      BlockMMA<half, bfloat, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
-  using loader_x_t =
-      mlx::steel::BlockLoader<half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
-      bfloat, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
+      bfloat, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits, half>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = int(tid.y) * BM;
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  x += y_row * static_cast<int64_t>(row_stride);
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
-  y += y_row * static_cast<int64_t>(row_stride) + y_col;
-
-  loader_x_t loader_x(x, row_stride, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  mma_t mma_op(simd_gid, simd_lid);
-
-  for (int k = 0; k < K; k += BK) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    loader_x.load_unsafe();
-    loader_w.load_unsafe();
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mma_op.mma(Xs, Ws);
-    loader_x.next();
-    loader_w.next();
-  }
-
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  mma_op.store_result(y, row_stride);
-  if (WITH_RESIDUAL) {
-    residual += y_row * static_cast<int64_t>(row_stride) + y_col;
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint idx = simd_gid * 32u + simd_lid; idx < uint(BM * BN);
-         idx += uint(WM * WN * SIMD_SIZE)) {
-      const int r = int(idx) / BN;
-      const int c = int(idx) % BN;
-      const int64_t off = r * static_cast<int64_t>(row_stride) + c;
-      y[off] = bfloat(float(y[off]) + float(residual[off]));
-    }
-  }
+  qmm_t_loaded_impl<half, bfloat, loader_w_t, BM, BK, BN,
+                    WITH_RESIDUAL, false>(
+      x, y, residual, Xs, Ws, row_stride, row_stride, K,
+      tid, simd_gid, simd_lid, loader_w);
+  (void)N;
 }
 
 template <int group_size, int bits, int BM, int BK, int BN, bool WITH_RESIDUAL>
@@ -2269,8 +2188,8 @@ template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
 instantiate_qmv_wide_strided(4, 8)
 
 
-// Same as `qmm_t_aligned_impl`, except the K loop runs `k_len` columns from the
-// bases the caller advanced, while the row pitches still come from the full K.
+// Split-K's affine-loader adapter. The common loop runs `k_len` columns from
+// bases the caller advanced, while row pitches still come from the full K.
 template <typename T, typename P, int group_size, int bits, int BM, int BK, int BN>
 METAL_FUNC void qmm_t_splitk_impl(
     const device uint32_t* w,
@@ -2286,46 +2205,25 @@ METAL_FUNC void qmm_t_splitk_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  using mma_t = mlx::steel::
-      BlockMMA<T, P, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
-  using loader_x_t =
-      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = int(tid.y) * BM;
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  x += y_row * static_cast<int64_t>(K);
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
-  y += y_row * static_cast<int64_t>(N) + y_col;
-
-  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  mma_t mma_op(simd_gid, simd_lid);
-
-  for (int k = 0; k < k_len; k += BK) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    loader_x.load_unsafe();
-    loader_w.load_unsafe();
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mma_op.mma(Xs, Ws);
-    loader_x.next();
-    loader_w.next();
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  mma_op.store_result(y, N);
+  qmm_t_loaded_impl<T, P, loader_w_t, BM, BK, BN, false, false>(
+      x, y, nullptr, Xs, Ws, K, N, k_len,
+      tid, simd_gid, simd_lid, loader_w);
 }
 
 // ── Split-K, following MLX's dispatch ────────────────────────────────────────
