@@ -1278,8 +1278,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         req.device_resolved_geometry = decode_envelope.is_some();
         // Carried to the batcher, which keeps such a fire out of shared
         // waves — see `scheduler::worker::has_dense_device_mask`. The
-        // binding is the program's, so it holds for every fire of the pass
-        // whether or not this one's geometry resolved on the host wire.
+        // stamp is the program's binding, but it is NOT final: a fire
+        // whose mask lowers host-side to wire BRLE rows clears it in
+        // `FireAttnMask::Host::apply_to` (the batcher's wire-mask rules
+        // co-batch those), so only genuinely device-resident masks keep
+        // the dense-device solo.
         req.dense_device_mask = dense_mask;
         req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
             && req.qo_indptr.windows(2).all(|lane| lane[1] - lane[0] == 1);

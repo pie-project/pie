@@ -1445,6 +1445,7 @@ struct Dispatch::Impl {
     // each batch and reported loudly when it grows.
     std::uint32_t* d_fixed_decode_kills = nullptr;
     std::uint32_t* h_fixed_decode_kills = nullptr;
+    std::uint32_t fixed_decode_kill_reasons_reported[16] = {};
     std::uint32_t fixed_decode_kills_reported = 0;
     // Same diagnostic for the decode-envelope compose path (RV-16).
     std::uint32_t* d_envelope_kills = nullptr;
@@ -7852,10 +7853,13 @@ bool Dispatch::enqueue_fixed_decode(
                   << fresh << " lane(s): geometry/containment inconsistency; "
                   << "the affected chains are killed (successors dummy-run)"
                   << " reasons[null,cap,pages!=expected,wbounds,lease,"
-                  << "wxlate,pxlate,commit,ready,token]=";
+                  << "wxlate,pxlate,commit,ready,token]+=";
         for (int reason = 1; reason <= 10; ++reason) {
+            const std::uint32_t now = state.h_fixed_decode_kills[reason];
             std::cerr << (reason == 1 ? "" : ",")
-                      << state.h_fixed_decode_kills[reason];
+                      << now - state.fixed_decode_kill_reasons_reported
+                                   [reason];
+            state.fixed_decode_kill_reasons_reported[reason] = now;
         }
         std::cerr << "\n";
     }

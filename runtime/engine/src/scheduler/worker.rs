@@ -457,6 +457,20 @@ pub(crate) struct LaunchGrouping {
     has_multi_token: bool,
 }
 
+/// One token per row — the paged-decode-path shape, independent of
+/// `single_token_mode` (which a masked row clears to pick the mask-aware
+/// attention variant while still carrying exactly one token).
+fn one_token_rows(request: &crate::driver::LaunchPlan) -> bool {
+    request.qo_indptr.windows(2).all(|w| w[1] - w[0] == 1)
+}
+
+/// `PIE_WAVE_TRACE` — wave/enqueue observability, resolved once (this sits
+/// on the per-fire enqueue path).
+pub(crate) fn wave_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_WAVE_TRACE").is_some())
+}
+
 /// A fire the driver will resolve a DENSE per-cell attention mask for out of
 /// a descriptor channel. Such a fire composes only SOLO: the driver's
 /// multi-program batch has no way to merge one program's dense mask with
@@ -475,14 +489,11 @@ pub(crate) struct LaunchGrouping {
 /// BOTH wire BRLE rows (`masks` non-empty, so the second clause is false)
 /// AND a channel-bound `AttnMask`, so the batcher merged them and the first
 /// concurrent step failed the driver's contract, poisoned descriptor
-/// channel 0, and lost all 8 streams.
-/// One token per row — the paged-decode-path shape, independent of
-/// `single_token_mode` (which a masked row clears to pick the mask-aware
-/// attention variant while still carrying exactly one token).
-fn one_token_rows(request: &crate::driver::LaunchPlan) -> bool {
-    request.qo_indptr.windows(2).all(|w| w[1] - w[0] == 1)
-}
-
+/// channel 0, and lost all 8 streams. (Since the FireAttnMask::Host
+/// narrowing, a host-lowered wire-mask fire clears `dense_device_mask`;
+/// device-geometry wire-mask fires stay out of shared waves via the
+/// `wire_mask_on_device_geometry` clause in `accepts`, which is what
+/// keeps that test green.)
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
     request.dense_device_mask || (request.has_user_mask && request.masks.is_empty())
 }
@@ -3181,7 +3192,7 @@ impl BatchScheduler {
                     // stamped fire counts toward its lane's frame arrival
                     // even while it sits in `pending` behind an
                     // in-flight-depth or seal hold.
-                    if std::env::var_os("PIE_WAVE_TRACE").is_some() {
+                    if wave_trace() {
                         eprintln!(
                             "[wave-trace] enq fire={} framed={} mask={} masks={} stm={} pipe={}",
                             launch.logical_fire_id,
@@ -4162,7 +4173,7 @@ impl BatchScheduler {
                 vec![scan.drain_eligible.clone()]
             } else if let Some(untracked) = scan.untracked {
                 rider_batch = true;
-                if std::env::var_os("PIE_WAVE_TRACE").is_some() {
+                if wave_trace() {
                     eprintln!("[wave-trace] rider fire={untracked}");
                 }
                 vec![vec![untracked]]
@@ -4174,7 +4185,7 @@ impl BatchScheduler {
                     now,
                 ) {
                     FramePlan::Dispatch(waves) => {
-                        if std::env::var_os("PIE_WAVE_TRACE").is_some() {
+                        if wave_trace() {
                             eprintln!(
                                 "[wave-trace] dispatch waves={:?}",
                                 waves.iter().map(Vec::len).collect::<Vec<_>>()

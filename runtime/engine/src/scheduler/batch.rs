@@ -415,7 +415,7 @@ pub(crate) fn build_frame_submission(
         // Engine-side region observability: the driver's [band-gate] trace
         // skips masked/multi-token frames before printing sigs, so batteries
         // that need per-step region truth (the AC-5 census) read this line.
-        if std::env::var_os("PIE_WAVE_TRACE").is_some() {
+        if super::worker::wave_trace() {
             let sigs: Vec<String> = region_sig
                 .iter()
                 .zip(&region_k)
