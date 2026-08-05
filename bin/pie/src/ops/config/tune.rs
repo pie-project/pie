@@ -2,8 +2,7 @@
 //! else's.
 //!
 //! `optimize` until the rename; `pie model build` builds an artifact and
-//! this one tunes a machine, and one verb could not carry both. The old
-//! spelling survives as a hidden alias.
+//! this one tunes a machine, and one verb could not carry both.
 //!
 //! One boot, many rounds. The design and the arguments behind it are in
 //! `.wiki/plan/config-optimize.md`; what matters here is the three rules the

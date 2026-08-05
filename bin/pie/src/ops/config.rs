@@ -82,9 +82,11 @@ pub enum ConfigCmd {
     /// run against a machine that is serving. Reports by default; `--write`
     /// applies.
     //
-    // `optimize` until this rename -- see the note on `pie model build`. The
-    // old spelling stays as a hidden alias.
-    #[command(alias = "optimize")]
+    // `optimize` until this rename, and briefly a hidden alias after it. The
+    // alias is gone: this command shipped on `dev` two days ago and has never
+    // been in a release, so there is nothing out there calling it by the old
+    // name -- and an alias nobody needs is a second spelling a reader has to
+    // learn is the same thing.
     Tune(tune::TuneArgs),
 }
 
