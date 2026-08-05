@@ -26,8 +26,15 @@ use crate::trace::{
 type Qwen35Lower<'a> = Option<(&'a Qwen35CudaFacts, FireClass)>;
 
 /// The llama_like body — SEMANTIC form: no structural divergence, one
-/// trace serves every fire shape, kernel choice stays with the consumer.
-/// [`llama_like_cuda`] is the same text with the class arms live.
+/// trace serves every fire shape, kernel choice stays with the consumer
+/// (Metal, the engine's site table, `declared_dag`).
+///
+/// This is its OWN text. It was until recently the `lower: None` reading
+/// of a single text shared with [`llama_like_cuda`], with eight
+/// `m.lowering()` tests deciding which of two programs the reader was
+/// looking at. `.wiki/tart/dsl.md` ③ says a model file is written for one
+/// backend, so the two readings are now two texts and neither asks "am I
+/// lowered?". The goldens pin that the split changed no traced byte.
 ///
 /// Mirrors `driver/cuda/src/model/llama_like/llama_like.cpp`
 /// (`llama_like_forward_paged`) op for op; the golden test pins that
@@ -44,7 +51,74 @@ type Qwen35Lower<'a> = Option<(&'a Qwen35CudaFacts, FireClass)>;
 ///   a separate `ResidualAdd` lands it — the hand-written post-norm walk's
 ///   gemm → `launch_rmsnorm_bf16` → `launch_residual_add_bf16` triplet.
 pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
-    llama_like_text(facts, None)
+    dsl::trace_semantic(facts, |m| {
+        let f = m.facts().clone();
+        let q_w = f.q_width();
+        let kv_w = f.kv_width();
+        let post_norm = f.norm_placement == NormPlacement::Post;
+
+        let mut y = m.embed();
+
+        for l in 0..f.layers {
+            let w = m.layer(l);
+
+            // Attention block: (pre-norm) -> qkv -> (q/k norms) -> rope
+            // -> append -> attention -> o_proj landed on the residual.
+            let x = if post_norm {
+                y.clone()
+            } else {
+                rmsnorm(&y, &w.attn_norm)
+            };
+
+            let (q, k, v) = if f.fused_qkv {
+                split_qkv(&matmul(&x, &w.qkv), q_w, kv_w)
+            } else {
+                (
+                    matmul(&x, &w.q_proj),
+                    matmul(&x, &w.k_proj),
+                    matmul(&x, &w.v_proj),
+                )
+            };
+            // Qwen-2 family qkv biases: on the raw projections, before
+            // norms and rope.
+            let (q, k, v) = if f.qkv_bias {
+                (
+                    add_bias(&q, &w.q_bias),
+                    add_bias(&k, &w.k_bias),
+                    add_bias(&v, &w.v_bias),
+                )
+            } else {
+                (q, k, v)
+            };
+            // The q/k norm convention is the weight handle's ("the weight
+            // knows"); the semantic text states norm and rope separately
+            // because their kernels are 1:1.
+            let (q, k) = if f.qk_norm == QkNorm::Off {
+                (q, k)
+            } else {
+                (rmsnorm(&q, &w.q_norm), rmsnorm(&k, &w.k_norm))
+            };
+            let (q, k) = rope(&q, &k, f.rope);
+            w.kv.append(&k, &v);
+            let a = attention(&q, &w.kv, q_w);
+
+            if post_norm {
+                // Post-norm: o_proj to scratch, norm the OUTPUT, then the
+                // separate residual landing (`+=` of a non-matmul records
+                // the explicit ResidualAdd launch).
+                y += rmsnorm(&matmul(&a, &w.o_proj), &w.attn_norm);
+                let mlp = matmul(&swiglu(&matmul(&y, &w.gate_up), f.intermediate), &w.down);
+                y += rmsnorm(&mlp, &w.mlp_norm);
+            } else {
+                // Pre-norm: `+=` of a fresh matmul IS the beta=1 fold.
+                y += matmul(&a, &w.o_proj);
+                let x = rmsnorm(&y, &w.mlp_norm);
+                y += matmul(&swiglu(&matmul(&x, &w.gate_up), f.intermediate), &w.down);
+            }
+        }
+
+        m.logits(&rmsnorm(&y, &m.final_norm()));
+    })
 }
 
 /// The LOWERED llama_like: the SAME text as [`llama_like`], traced with
@@ -57,31 +131,32 @@ pub fn llama_like_cuda(
     cuda: &LlamaLikeCudaFacts,
     class: FireClass,
 ) -> ForwardPlan {
-    llama_like_text(facts, Some((cuda, class)))
+    llama_like_cuda_text(facts, cuda, class)
 }
 
-/// THE one llama_like text (north-star-dsl.md): computation and kernel
-/// choice together, on the dsl surface. With `lower: None` this is the
-/// semantic trace — the general arm everywhere, no kernel stated,
-/// byte-identical to what `llama_like` always produced (the goldens pin
-/// it). With a lowering, the class arms run as ordinary trace-time
-/// matches beside the fact arms, and what they choose is exactly what
+/// The llama_like CUDA text (`.wiki/tart/dsl.md` ③): computation and
+/// kernel choice together, on the dsl surface, for ONE backend. The
+/// semantic text is [`llama_like`] — a separate text, because a model
+/// file is written for a backend and "am I lowered?" is not a question a
+/// body asks. The class arms run as ordinary trace-time matches beside
+/// the fact arms, and what they choose is exactly what
 /// `declared_forward.cpp` chooses at fire time today — the migration
 /// deletes the C++ copy of these matches, not this one.
-fn llama_like_text(
+fn llama_like_cuda_text(
     facts: &LlamaLikeFacts,
-    lower: Option<(&LlamaLikeCudaFacts, FireClass)>,
+    cuda: &LlamaLikeCudaFacts,
+    class: FireClass,
 ) -> ForwardPlan {
-    dsl::trace(facts, lower, |m| {
+    dsl::trace_cuda(facts, class, |m| {
         let f = m.facts().clone();
         let q_w = f.q_width();
         let kv_w = f.kv_width();
         let post_norm = f.norm_placement == NormPlacement::Post;
-        let cuda_of = |class_want: FireClass| {
-            m.lowering()
-                .filter(|(_, class)| *class == class_want)
-                .map(|(c, _)| c)
-        };
+        // The backend facts, readable only under the class this text is
+        // being traced for — the `FireClass` match, spelled as a filter
+        // so the arms below read as they did when the lowering arrived
+        // through the context.
+        let cuda_of = |class_want: FireClass| (class == class_want).then_some(cuda);
 
         // STRUCTURAL S-3, stated IN THE BODY (V2 rung ②; formerly the
         // post-trace paint-over the review named): the lowered Decode
@@ -140,7 +215,7 @@ fn llama_like_text(
                         matmul(&x, &w.v_proj),
                     )
                 };
-                if m.lowering().is_some() {
+                {
                     // The adapter value seam (§5.1): attachments land on
                     // the just-materialized RAW q/v projections, BEFORE
                     // anything consumes them — bias, norms, rope, the KV
@@ -165,15 +240,14 @@ fn llama_like_text(
                 } else {
                     (q, k, v)
                 };
-                // A lowered arm with the per-head convention and Standard
-                // rope states the fused norm+rope kernel (the hand-written
+                // The per-head convention with Standard rope states the
+                // fused norm+rope kernel (the hand-written
                 // `fuse_qk_norm_rope` branch — bf16 rounds differently
                 // from the triple, so parity requires the same launch);
-                // the Global and Off conventions keep the semantic ops,
-                // whose kernels are 1:1.
-                let per_head_fused = m.lowering().is_some()
-                    && f.qk_norm == QkNorm::PerHead
-                    && f.rope == RopeKind::Standard;
+                // the Global and Off conventions state the separate
+                // kernels, whose semantic ops are 1:1.
+                let per_head_fused =
+                    f.qk_norm == QkNorm::PerHead && f.rope == RopeKind::Standard;
                 let (q, k) = if per_head_fused {
                     cuda::qk_rmsnorm_rope(&q, &k, &w.q_norm, &w.k_norm)
                 } else {
@@ -184,21 +258,17 @@ fn llama_like_text(
                     };
                     rope(&q, &k, f.rope)
                 };
-                if m.lowering().is_some() {
-                    // The KV-write mechanism is a per-fire runtime input
-                    // (explicit descriptors when the fire steers a graph
-                    // replay, page-derived otherwise). Under the fused
-                    // deployment's mask arm this guard NESTS inside the
-                    // HasCustomMask guard (A1 — the walk keeps a stack).
-                    dsl::guard(
-                        m,
-                        GuardPred::HasWriteDesc,
-                        || cuda::write_kv_explicit(&k, &v, &w.kv),
-                        || cuda::write_kv_to_pages(&k, &v, &w.kv),
-                    );
-                } else {
-                    w.kv.append(&k, &v);
-                }
+                // The KV-write mechanism is a per-fire runtime input
+                // (explicit descriptors when the fire steers a graph
+                // replay, page-derived otherwise). Under the fused
+                // deployment's mask arm this guard NESTS inside the
+                // HasCustomMask guard (A1 — the walk keeps a stack).
+                dsl::guard(
+                    m,
+                    GuardPred::HasWriteDesc,
+                    || cuda::write_kv_explicit(&k, &v, &w.kv),
+                    || cuda::write_kv_to_pages(&k, &v, &w.kv),
+                );
                 q
             };
             let attn_out_shape = (
@@ -206,11 +276,7 @@ fn llama_like_text(
                 DType::BF16,
             );
 
-            let a = match m.lowering() {
-                None => {
-                    let q = general_qkv();
-                    attention(&q, &w.kv, q_w)
-                }
+            let a = match class {
                 // A1–A3 (the class-collapse amendment): per-fire
                 // attachments are guard arms and ROW WINDOWS of the
                 // shape classes, not classes. The chain per layer:
@@ -239,7 +305,8 @@ fn llama_like_text(
                 // structurally one body already (the goldens pin the
                 // collapse is byte-identical); rung ③ makes the window
                 // class a PER-ROW operand and this match a region table.
-                Some((c, class @ (FireClass::Decode | FireClass::Prefill))) => {
+                FireClass::Decode | FireClass::Prefill => {
+                    let c = cuda;
                     let window_one = class == FireClass::Decode;
                     // ORDER IS LOAD-BEARING: `guarded_value` OPENS the
                     // chain, and every op recorded after it counts into
@@ -413,10 +480,7 @@ fn llama_like_text(
                     }
                     a
                 }
-                Some((
-                    _,
-                    FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify,
-                )) => {
+                FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify => {
                     unreachable!("llama_like refuses the service classes at trace start")
                 }
             };

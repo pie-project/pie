@@ -27,7 +27,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::facts::{LlamaLikeCudaFacts, LlamaLikeFacts, QkNorm};
+use crate::facts::{LlamaLikeFacts, QkNorm};
 use crate::trace::{
     DType, Dim, FireClass, ForwardPlan, NormVariant, RopeKind, Shape, StateRef, StateStore,
     TraceBuilder,
@@ -157,12 +157,17 @@ pub struct Layer {
     pub kv: Kv,
 }
 
-/// The model context a declaration runs against: facts, the optional
-/// lowering (backend facts + fire class), and the tape.
+/// The model context a declaration runs against: the facts and the tape.
+///
+/// It carries NO lowering. A model text is written for one backend
+/// (`.wiki/tart/dsl.md` ③: the model file is
+/// `families/<family>/<backend>.rs`), so "am I lowered?" is not a
+/// question a body can ask — the semantic text and the CUDA text are two
+/// texts, and each states its own kernels unconditionally. What used to
+/// be `m.lowering()` is now the CUDA text's own parameters.
 pub struct M {
     t: Trace,
     f: LlamaLikeFacts,
-    lower: Option<(LlamaLikeCudaFacts, FireClass)>,
 }
 
 impl M {
@@ -174,12 +179,6 @@ impl M {
     /// need it directly.
     pub fn trace(&self) -> &Trace {
         &self.t
-    }
-
-    /// The lowering in hand, if this is a lowered trace: the backend
-    /// facts and the fire class the declaration's class arms match on.
-    pub fn lowering(&self) -> Option<(&LlamaLikeCudaFacts, FireClass)> {
-        self.lower.as_ref().map(|(c, class)| (c, *class))
     }
 
     /// V2 rung ②: the body STATES the depth axis (with its deployment
@@ -269,39 +268,44 @@ impl M {
     }
 }
 
-/// Run a declaration and return its traced form. `lower: None` is the
-/// semantic trace; with a lowering the class arms run and the family
-/// name records which class this launch form serves.
-pub fn trace(
+/// Run the SEMANTIC llama_like declaration: no kernel is stated, and the
+/// consumer (Metal, the site table, `declared_dag`) chooses.
+pub fn trace_semantic(facts: &LlamaLikeFacts, body: impl FnOnce(&mut M)) -> ForwardPlan {
+    run("llama_like".to_string(), facts, body)
+}
+
+/// Run a LOWERED llama_like declaration — one per [`FireClass`], the
+/// family name recording which launch form this trace serves. The body
+/// takes the backend facts as its own parameter; nothing about the
+/// lowering reaches it through [`M`].
+pub fn trace_cuda(
     facts: &LlamaLikeFacts,
-    lower: Option<(&LlamaLikeCudaFacts, FireClass)>,
+    class: FireClass,
     body: impl FnOnce(&mut M),
 ) -> ForwardPlan {
-    let family = match &lower {
-        None => "llama_like".to_string(),
-        Some((_, class)) => format!(
-            "llama_like.cuda.{}",
-            match class {
-                FireClass::Decode => "decode",
-                FireClass::Prefill => "prefill",
-                // The service classes are qwen3_5's; llama_like has no
-                // spec-decode repair pass. The ffi entry rejects them
-                // before tracing; this is the same statement for direct
-                // Rust callers.
-                FireClass::CommitAdvance
-                | FireClass::StateOnly
-                | FireClass::FrozenVerify => {
-                    panic!("llama_like has no MTP service classes")
-                }
+    let family = format!(
+        "llama_like.cuda.{}",
+        match class {
+            FireClass::Decode => "decode",
+            FireClass::Prefill => "prefill",
+            // The service classes are qwen3_5's; llama_like has no
+            // spec-decode repair pass. The ffi entry rejects them
+            // before tracing; this is the same statement for direct
+            // Rust callers.
+            FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify => {
+                panic!("llama_like has no MTP service classes")
             }
-        ),
-    };
+        }
+    );
+    run(family, facts, body)
+}
+
+fn run(family: String, facts: &LlamaLikeFacts, body: impl FnOnce(&mut M)) -> ForwardPlan {
     let mut m = M {
         t: Trace {
             inner: Rc::new(RefCell::new(TraceBuilder::new(family))),
         },
         f: facts.clone(),
-        lower: lower.map(|(c, class)| (c.clone(), class)),
     };
     body(&mut m);
     Rc::try_unwrap(m.t.inner)
