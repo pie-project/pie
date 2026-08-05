@@ -7,7 +7,7 @@
 //! programs differ, not the way two runtime paths do.
 
 use crate::facts::{
-    LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
+    LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 use crate::dsl::{
@@ -129,6 +129,145 @@ pub fn llama_like_cuda(
     class: FireClass,
 ) -> ForwardPlan {
     llama_like_cuda_text(facts, cuda, class)
+}
+
+/// The llama_like METAL text (`.wiki/tart/dsl.md` ③) — the second
+/// backend's own model file, stating Metal's kernels.
+///
+/// ★ UNVERIFIED, AND DELIBERATELY SO (2026-08-05). Nothing has executed
+/// this. The Metal driver cannot build on the machine we have —
+/// `xcrun --find metal` fails, because the shader compiler ships with
+/// full Xcode and only CommandLineTools is installed — so this text is
+/// written against the driver's SOURCE, not against a running
+/// deployment. It is boilerplate, requested as such, and it is here so
+/// the shape exists to be corrected rather than invented under time
+/// pressure later. `.wiki/tart/macos.md` rung 3 states the proof it
+/// owes: the descriptors `driver/metal/src/model/llama_like/declared_dag.hpp`
+/// emits must come out unchanged.
+///
+/// WHAT IT IS FOR. Metal today consumes the SEMANTIC trace and chooses
+/// its kernels in C++ (`decode_psos.cpp`), which is the same "the driver
+/// decides" shape the CUDA side is being cured of, approached from the
+/// other end. A backend with a text of its own can be read: this file
+/// says what runs.
+///
+/// WHAT IS ALMOST CERTAINLY WRONG, so a reader does not mistake
+/// plausibility for correctness:
+///
+/// * the M>1 (Prefill) lane is a guess. The driver's `MultiBatchPsos`
+///   carries split-k, fp16-precast, strided and bias variants and a
+///   `kQmmMinBatch` gate; this text states one GEMM and one paged
+///   attention.
+/// * `sdpa_*_d_256` pins head_dim 256. The driver compiles other widths
+///   (`d_512` for gemma4); which one a deployment needs is a fact this
+///   text does not yet take.
+/// * no seams. The adapter, the two observation taps and the boundaries
+///   are stated by the CUDA text and absent here, because none of the
+///   machinery behind them exists on this backend yet.
+/// * qk-norm and bias are stated as ordinary norms and are untested
+///   against `declared_dag.hpp`'s expectations.
+fn llama_like_metal_text(
+    facts: &LlamaLikeFacts,
+    metal: &LlamaLikeMetalFacts,
+    class: FireClass,
+) -> ForwardPlan {
+    // The two lanes the Metal driver actually has: M=1 (the per-token
+    // decode step) and M>1 (the multi-batch lane). `FireClass` is the
+    // same instantiation index it is on CUDA.
+    let multi_batch = class != FireClass::Decode;
+    dsl::trace_metal(facts, class, |m| {
+        let f = m.facts().clone();
+        let q_w = f.q_width();
+        let kv_w = f.kv_width();
+        let post_norm = f.norm_placement == NormPlacement::Post;
+
+        // The projection arm this deployment takes, chosen once: GEMV on
+        // the M=1 lane, MLX's steel GEMM above the batch gate.
+        let gemm = |x: &Val, w: &MatW| {
+            if multi_batch && metal.qmm_multi_batch {
+                dsl::metal::qmm(x, w)
+            } else {
+                dsl::metal::qmv(x, w)
+            }
+        };
+        // A `beta_one` matmul: the epilogue fold when the deployment has
+        // it, the projection plus an explicit landing when it does not.
+        let gemm_add = |x: &Val, w: &MatW, residual: &Val| {
+            if metal.fuse_residual_gemv {
+                if multi_batch && metal.qmm_multi_batch {
+                    dsl::metal::qmm_residual(x, w, residual)
+                } else {
+                    dsl::metal::qmv_residual(x, w, residual)
+                }
+            } else {
+                dsl::metal::residual_add(&gemm(x, w), residual)
+            }
+        };
+        let paged = multi_batch && metal.paged_multi_batch;
+
+        let mut y = dsl::metal::embed_gather(m.trace(), "embed", f.hidden, multi_batch);
+
+        for l in 0..f.layers {
+            let w = m.layer(l);
+
+            let x = if post_norm {
+                y.clone()
+            } else {
+                dsl::metal::rms_norm(&y, &w.attn_norm)
+            };
+
+            let (q, k, v) = if f.fused_qkv {
+                split_qkv(&gemm(&x, &w.qkv), q_w, kv_w)
+            } else {
+                (
+                    gemm(&x, &w.q_proj),
+                    gemm(&x, &w.k_proj),
+                    gemm(&x, &w.v_proj),
+                )
+            };
+            let (q, k) = if f.qk_norm == QkNorm::Off {
+                (q, k)
+            } else {
+                (
+                    dsl::metal::rms_norm(&q, &w.q_norm),
+                    dsl::metal::rms_norm(&k, &w.k_norm),
+                )
+            };
+            // One dispatch for q and k together, as `declared_dag.hpp`'s
+            // `Kind::Rope` states it.
+            let (q, k) = dsl::metal::rope(&q, &k, multi_batch);
+            dsl::metal::kv_append(&k, &v, &w.kv, paged);
+            let a = dsl::metal::sdpa(&q, &w.kv, q_w, paged)
+                .expect("a plain attention statement produces its value");
+
+            if post_norm {
+                let o = dsl::metal::rms_norm(&gemm(&a, &w.o_proj), &w.attn_norm);
+                y = dsl::metal::residual_add(&o, &y);
+                let h = dsl::metal::silu_mul(&gemm(&y, &w.gate_up), f.intermediate);
+                let d = dsl::metal::rms_norm(&gemm(&h, &w.down), &w.mlp_norm);
+                y = dsl::metal::residual_add(&d, &y);
+            } else {
+                y = gemm_add(&a, &w.o_proj, &y);
+                let x = dsl::metal::rms_norm(&y, &w.mlp_norm);
+                let h = dsl::metal::silu_mul(&gemm(&x, &w.gate_up), f.intermediate);
+                y = gemm_add(&h, &w.down, &y);
+            }
+        }
+
+        let normed = dsl::metal::rms_norm(&y, &m.final_norm());
+        let head = if f.tied_embeddings { "embed" } else { "lm_head" };
+        dsl::metal::lm_head(&normed, head, f.vocab);
+    })
+}
+
+/// Trace the llama_like METAL text for one [`FireClass`]. See
+/// [`llama_like_metal_text`] for what is and is not verified about it.
+pub fn llama_like_metal(
+    facts: &LlamaLikeFacts,
+    metal: &LlamaLikeMetalFacts,
+    class: FireClass,
+) -> ForwardPlan {
+    llama_like_metal_text(facts, metal, class)
 }
 
 /// The llama_like CUDA text (`.wiki/tart/dsl.md` ③): computation and
@@ -2754,5 +2893,92 @@ mod tests {
                 assert!(!dense.contains(token), "{token} leaked into a pre-GDN plan");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod metal_tests {
+    use super::*;
+    use crate::facts::LlamaLikeMetalFacts;
+    use crate::trace::OpKind;
+
+    /// The Metal text TRACES, and every kernel it states is declared in
+    /// Metal's table.
+    ///
+    /// This is not a claim that the text is RIGHT — nothing has executed
+    /// it, and `llama_like_metal_text`'s comment lists what is probably
+    /// wrong. What it does check is the one thing that can be checked
+    /// without a device: the text and the ② table agree, which is the
+    /// discipline the empty table was put there to force.
+    #[test]
+    fn the_metal_text_states_only_declared_kernels() {
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            // Tracing runs `kernels::check_plan` from `finish`, so an
+            // undeclared symbol would have panicked before we get here.
+            let plan = llama_like_metal(
+                &LlamaLikeFacts::qwen3_0_6b(),
+                &LlamaLikeMetalFacts::synthetic(),
+                class,
+            );
+            assert_eq!(
+                crate::kernels::Backend::of_family(&plan.family),
+                Some(crate::kernels::Backend::Metal)
+            );
+            assert!(crate::kernels::check_plan(&plan).is_empty());
+
+            let launches = plan
+                .ops
+                .iter()
+                .filter(|op| matches!(op.kind, OpKind::Launch { .. }))
+                .count();
+            // Every op of this text is a stated kernel except the
+            // SplitQkv the fused binding traces.
+            assert_eq!(launches + 28, plan.ops.len(), "one split per layer");
+        }
+    }
+
+    /// The deployment facts BRANCH the text, and the branches vanish —
+    /// the load-time-condition rule (`.wiki/tart/dsl.md`: "resolves once,
+    /// vanishes"). A deployment without the epilogue fold states an
+    /// explicit residual landing per block instead.
+    #[test]
+    fn the_metal_facts_resolve_at_trace_time() {
+        let facts = LlamaLikeFacts::qwen3_0_6b();
+        let fold = llama_like_metal(
+            &facts,
+            &LlamaLikeMetalFacts::synthetic(),
+            FireClass::Decode,
+        );
+        let no_fold = llama_like_metal(
+            &facts,
+            &LlamaLikeMetalFacts {
+                fuse_residual_gemv: false,
+                ..LlamaLikeMetalFacts::synthetic()
+            },
+            FireClass::Decode,
+        );
+        let count = |p: &ForwardPlan, sym: &str| {
+            p.ops
+                .iter()
+                .filter(|op| matches!(&op.kind, OpKind::Launch { kernel, .. } if kernel == sym))
+                .count()
+        };
+        assert_eq!(count(&fold, "residual_add_bfloat16"), 0);
+        // Two folds per block (o_proj and down), landed explicitly.
+        assert_eq!(
+            count(&no_fold, "residual_add_bfloat16"),
+            2 * facts.layers as usize
+        );
+
+        // And the M>1 lane takes the GEMM where M=1 takes the GEMV.
+        let mb = llama_like_metal(
+            &facts,
+            &LlamaLikeMetalFacts::synthetic(),
+            FireClass::Prefill,
+        );
+        assert_eq!(count(&mb, "affine_qmv_fast"), 1, "the readout only");
+        assert!(count(&mb, "affine_qmm_t_residual") > 0);
+        assert!(count(&mb, "sdpa_paged_decode_bfloat16_d_256") > 0);
+        assert!(count(&fold, "sdpa_vector_decode_bfloat16_d_256") > 0);
     }
 }

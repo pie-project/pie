@@ -1207,6 +1207,269 @@ pub fn seam(t: &Trace, def: &seam::Def, sees: &[&Val], layer: Option<u32>) {
     }
 }
 
+// ── Metal kernel signatures ────────────────────────────────────────────
+
+/// The METAL launchers a lowered declaration may state — the `dsl::cuda`
+/// of the second backend (`.wiki/tart/dsl.md` ②).
+///
+/// UNVERIFIED (2026-08-05). Every symbol here is an MSL entrypoint read
+/// off the driver's source (`driver/metal/src/kernels/decode_psos.cpp`'s
+/// `PsoSpec` table and `model/qwen3_5/decode_step.hpp`'s `Kernel` kinds),
+/// not something a running deployment produced: the Metal driver cannot
+/// build on the machine we have, because `xcrun --find metal` fails —
+/// the shader compiler ships with full Xcode. Nothing consumes this yet.
+/// `.wiki/tart/macos.md` rung 3 is where it gets proven, by showing
+/// `declared_dag.hpp`'s emitted descriptors come out unchanged.
+///
+/// ONE DECISION worth stating, because it will look like an omission:
+/// the quantized entrypoints are spelled by their BASE name
+/// (`affine_qmv_fast`), not with the checkpoint's affine suffix
+/// (`..._bfloat16_gs_64_b_4`, `AffineFormat::kernel_suffix()`). The
+/// suffix is the driver's binding of a checkpoint fact, in the same
+/// class as the stream and the workspace scratch — it selects no
+/// different arithmetic and no different arm. What the text chooses is
+/// the kernel FAMILY.
+pub mod metal {
+    use super::*;
+
+    fn record(
+        t: &Trace,
+        layer: Option<u32>,
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        inputs: Vec<crate::trace::ValueId>,
+        out: Option<(Shape, DType)>,
+    ) -> Option<Val> {
+        let ids = t.with(layer, |b| {
+            b.launch(kernel, weights, state, inputs, out.into_iter().collect())
+        });
+        ids.first().map(|&id| Val {
+            t: t.clone(),
+            id,
+            layer,
+        })
+    }
+
+    fn kv_state(kv: &Kv) -> Option<StateRef> {
+        Some(StateRef {
+            store: StateStore::KvCache,
+            layer: kv.l,
+        })
+    }
+
+    fn same_shape(v: &Val) -> (Shape, DType) {
+        (v.t.inner.borrow().value_shape(v.id), DType::BF16)
+    }
+
+    /// `embed_gather.metal::embed_gather_4bit` (M=1) /
+    /// `embed_gather_mb_4bit` (M>1).
+    pub fn embed_gather(t: &Trace, weight: &str, hidden: u32, multi_batch: bool) -> Val {
+        let kernel = if multi_batch {
+            "embed_gather_mb_4bit"
+        } else {
+            "embed_gather_4bit"
+        };
+        record(
+            t,
+            None,
+            kernel,
+            vec![weight.to_string()],
+            None,
+            vec![],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
+        )
+        .expect("embed produces the residual stream")
+    }
+
+    /// `rms_norm.metal::rms_single_row_bfloat16` — ONE entrypoint for
+    /// every norm this family states (attn_norm, mlp_norm, q_norm,
+    /// k_norm, final_norm; the driver fans five `Kernel` kinds onto it).
+    pub fn rms_norm(x: &Val, w: &NormW) -> Val {
+        let out = same_shape(x);
+        record(
+            &x.t,
+            w.layer,
+            "rms_single_row_bfloat16",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            Some(out),
+        )
+        .expect("a norm produces its value")
+    }
+
+    /// `quantized_qmv.metal::affine_qmv_fast` — the projection GEMV,
+    /// M=1. The driver fans every projection kind onto it.
+    pub fn qmv(x: &Val, w: &MatW) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "affine_qmv_fast",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+        )
+        .expect("a projection produces its value")
+    }
+
+    /// `quantized_qmv.metal::affine_qmv_fast_residual` — the same GEMV
+    /// with the block residual folded into its epilogue, which is what a
+    /// `beta_one` matmul is on this backend.
+    pub fn qmv_residual(x: &Val, w: &MatW, residual: &Val) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "affine_qmv_fast_residual",
+            vec![w.name.clone()],
+            None,
+            vec![x.id, residual.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+        )
+        .expect("a folded projection produces its value")
+    }
+
+    /// `quantized_qmm_t.metal::affine_qmm_t` — MLX's steel quantized
+    /// GEMM, the M>1 projection.
+    pub fn qmm(x: &Val, w: &MatW) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "affine_qmm_t",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+        )
+        .expect("a projection produces its value")
+    }
+
+    /// `quantized_qmm_t.metal::affine_qmm_t_residual`.
+    pub fn qmm_residual(x: &Val, w: &MatW, residual: &Val) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "affine_qmm_t_residual",
+            vec![w.name.clone()],
+            None,
+            vec![x.id, residual.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+        )
+        .expect("a folded projection produces its value")
+    }
+
+    /// `residual_add.metal::residual_add_bfloat16` — the explicit
+    /// landing, for the deployments and positions where no epilogue fold
+    /// exists.
+    pub fn residual_add(x: &Val, residual: &Val) -> Val {
+        let out = same_shape(x);
+        record(
+            &x.t,
+            x.layer,
+            "residual_add_bfloat16",
+            vec![],
+            None,
+            vec![x.id, residual.id],
+            Some(out),
+        )
+        .expect("the residual landing produces its value")
+    }
+
+    /// `rope.metal::rope_neox_decode_bfloat16` (M=1) /
+    /// `rope_neox_mb_bfloat16` (M>1). One dispatch for q and k together,
+    /// as the plan states it (`declared_dag.hpp`'s `Kind::Rope`).
+    pub fn rope(q: &Val, k: &Val, multi_batch: bool) -> (Val, Val) {
+        let kernel = if multi_batch {
+            "rope_neox_mb_bfloat16"
+        } else {
+            "rope_neox_decode_bfloat16"
+        };
+        let q_sh = same_shape(q);
+        let k_sh = same_shape(k);
+        let ids = q.t.with(q.layer, |b| {
+            b.launch(kernel, vec![], None, vec![q.id, k.id], vec![q_sh, k_sh])
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kv_append.metal::kv_append_bfloat16` (contiguous) /
+    /// `kv_append_paged.metal::kv_append_paged_bfloat16` (page table).
+    pub fn kv_append(k: &Val, v: &Val, kv: &Kv, paged: bool) {
+        let kernel = if paged {
+            "kv_append_paged_bfloat16"
+        } else {
+            "kv_append_bfloat16"
+        };
+        record(
+            &kv.t,
+            Some(kv.l),
+            kernel,
+            vec![],
+            kv_state(kv),
+            vec![k.id, v.id],
+            None,
+        );
+    }
+
+    /// `sdpa_vector.metal::sdpa_vector_decode_bfloat16_d_256` (M=1) /
+    /// `sdpa_paged.metal::sdpa_paged_decode_bfloat16_d_256` (M>1).
+    pub fn sdpa(q: &Val, kv: &Kv, q_width: u32, paged: bool) -> Option<Val> {
+        let kernel = if paged {
+            "sdpa_paged_decode_bfloat16_d_256"
+        } else {
+            "sdpa_vector_decode_bfloat16_d_256"
+        };
+        record(
+            &q.t,
+            Some(kv.l),
+            kernel,
+            vec![],
+            kv_state(kv),
+            vec![q.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
+        )
+    }
+
+    /// `silu_mul.metal::silu_mul_bfloat16` — the SwiGLU activation over
+    /// the packed gate/up bank.
+    pub fn silu_mul(x: &Val, intermediate: u32) -> Val {
+        record(
+            &x.t,
+            x.layer,
+            "silu_mul_bfloat16",
+            vec![],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the activation produces its value")
+    }
+
+    /// `quantized_qmv.metal::affine_qmv_fast` against the lm head — the
+    /// readout, `[Requests, vocab]` f32 like every family's.
+    pub fn lm_head(x: &Val, weight: &str, vocab: u32) -> Val {
+        record(
+            &x.t,
+            None,
+            "affine_qmv_fast",
+            vec![weight.to_string()],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::F32)),
+        )
+        .expect("the readout produces the logits")
+    }
+}
+
 // ── Raw kernel signatures ──────────────────────────────────────────────
 
 /// The CUDA launchers a lowered declaration may state, one function per
