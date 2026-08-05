@@ -79,6 +79,7 @@ hf-hub = "1.0.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "stream"] }
 tar = "0.4"
 xz2 = "0.1"
+toml_edit = "0.25.13"
 
 # What this crate's OWN tests need, which is now what is here. The engine's
 # on-device suite moved to `tests/gpu` (`pie-gpu-tests`) and took `pie-engine`

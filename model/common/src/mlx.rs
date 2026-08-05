@@ -517,6 +517,28 @@ pub fn author_mlx_file(
     let quant_bits = i64::from(b.facts().quant_bits);
     let quant_group = i64::from(b.facts().quant_group_size);
     let encode_floats = int4_requested(b, schema)?;
+    // These three families bind every projection through Metal's affine-U4
+    // path (`push_quant` in `driver/metal/src/loader/heap_bind.cpp` asks for
+    // `.weight`/`.scales`/`.biases` unconditionally). A bf16 checkpoint has no
+    // `.scales` at all, so without a request to encode them it used to author a
+    // contract that looked fine and then died deep in the loader with `llama
+    // bind: unstaged weight embed_tokens.scales` -- a message about an internal
+    // staging table, from which nothing about the actual problem is
+    // recoverable. Say it here, where the checkpoint is still in view.
+    //
+    // Only when nothing will supply those tensors: under `--quant int4` the
+    // floats are encoded below, which is the other, equally valid way to serve
+    // an unquantized release.
+    if !encode_floats && !b.tensors().iter().any(|t| t.name.ends_with(".scales")) {
+        return fail(format!(
+            "Metal {schema} needs quantized weights: this checkpoint carries no \
+             `.scales` tensors, so it is unquantized (bf16/fp16), and the Metal \
+             driver binds every projection through its affine-U4 path. Either \
+             build it with `--quant int4` to encode the weights now, or use a \
+             pre-quantized repo -- the `mlx-community/*-4bit` conversions are \
+             the ones this path is built for."
+        ));
+    }
     let mut declared = 0usize;
     for raw in b.tensors().to_vec() {
         let Some(output) = rename(b, &raw.name)? else {

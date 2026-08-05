@@ -47,13 +47,16 @@ pub enum ModelCmd {
     /// Precompute a serve boot: author the family contract, run the load
     /// transforms offline, write the runtime tensors as a `.zt` artifact.
     //
-    // `optimize` until this rename. It shared a verb with `pie config
-    // optimize`, which tunes the *machine*, and the two were far enough apart
-    // that the help text had to carry a "not to be confused with" line -- a
-    // name that needs a disclaimer is the wrong name. This one builds a thing,
-    // so it is `build`. The old spelling stays as a hidden alias: it is what
-    // scripts and the docs say today, and breaking them buys nothing.
-    #[command(alias = "optimize")]
+    // `optimize` until this rename. It shared a verb with what is now `pie
+    // config tune`, which tunes the *machine*, and the two were far enough
+    // apart that the help text had to carry a "not to be confused with" line
+    // -- a name that needs a disclaimer is the wrong name. This one builds a
+    // thing, so it is `build`.
+    //
+    // No alias. The old spelling was kept as one on the theory that the
+    // published docs taught it; they do not -- `website/` does not mention
+    // this command under either name, and the only references anywhere are
+    // four lines of migration narrative in `.wiki/plan/`.
     Build(build::BuildArgs),
 }
 

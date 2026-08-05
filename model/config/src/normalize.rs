@@ -69,11 +69,29 @@ fn round_up_attn_head_dim(head_dim: i32) -> i32 {
 }
 
 /// `use_qk_norm`: explicit if present, else inferred from the model type.
+///
+/// Qwen3 RMS-normalises q and k per head; llama, mistral and qwen2 do not.
+/// There is no `config.json` key for it — it is implied by the architecture.
+/// This list must stay in step with the driver's own inference
+/// (`driver/metal/src/model_facts.cpp`, `ll_qk_norm`) and with the family
+/// table in `driver/metal/src/model/facts.hpp`; a checkpoint that silently
+/// runs without q/k norm produces fluent, plausible, wrong tokens.
 fn infer_qk_norm(model_type: &str, text: &Value, path: &str) -> Result<bool> {
     if text.get("use_qk_norm").is_some() {
         return opt_bool(text, "use_qk_norm", false, path);
     }
-    Ok(model_type == "qwen3" || model_type == "qwen3_5")
+    Ok(matches!(
+        model_type,
+        "qwen3"
+            | "qwen3_moe"
+            | "qwen3_5"
+            | "qwen3_5_text"
+            | "qwen3_5_moe"
+            | "qwen3_5_moe_text"
+            | "qwen3_next"
+            | "qwen3_next_text"
+            | "qwen3_6"
+    ))
 }
 
 /// Normalizes a parsed `config.json`.
@@ -211,6 +229,22 @@ pub fn normalize(root: &Value, path: &str) -> Result<HfConfig> {
                 cfg.max_position_embeddings,
                 path,
             )?;
+        } else if (rope_type == "linear" || rope_type == "default")
+            && s.get("factor").is_some()
+        {
+            // Linear scaling is the plain geometric series with positions
+            // divided by `factor` — there is no separate schedule, so the kind
+            // stays `None`, which also keeps the descriptor's enum wire-
+            // compatible with the drivers' strict parsers. But the factor is a
+            // real numeric fact and has to survive: dropping it makes an
+            // imported artifact differ from the same checkpoint read as a raw
+            // `config.json` (which does honour it), and the difference only
+            // shows past the original context length.
+            //
+            // Gated on `factor` being present: a bare `rope_type: "default"`
+            // (which Qwen3.5 ships) declares no scaling at all.
+            cfg.has_rope_scaling = true;
+            cfg.rope_factor = opt_f32(s, "factor", 1.0, path)?;
         }
     }
 
