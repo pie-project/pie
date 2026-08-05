@@ -487,23 +487,17 @@ pub(crate) struct RunAheadAcc {
     pub retq2: AtomicU64,
     /// Implicit rejoins (parked lane accepted a fire) since the last wave.
     pub rejoins: AtomicU64,
-    /// `PIE_REJOIN_DEFER=1`: rejoins from a park that the gate let the fleet
-    /// seal WITHOUT — counted once per deferral episode, not per gate
-    /// evaluation. Zero means the lever never engaged.
-    pub defer_rejoins: AtomicU64,
     /// Awaited lanes seen blocking the gate, summed over gate evaluations.
     pub blocking: AtomicU64,
-    /// Composition of those blocking lanes: the engine owes them a retire or
+    /// Composition of those blocking lanes. `blk_empty` (nothing queued) and
+    /// `blk_partial` (a frame that has arrived only partially) PARTITION them
+    /// — the two sum to `blocking`. `blk_owed` overlaps both: it marks the
+    /// subset the engine owes a retire or
     /// a bind (`owed`), they have nothing queued at all (`empty`), or a frame
     /// is queued but has not fully arrived (`partial`).
     pub blk_owed: AtomicU64,
     pub blk_empty: AtomicU64,
     pub blk_partial: AtomicU64,
-    /// Reason census for blocking lanes, independent of the `owes`-first
-    /// classification above: no frame queued at all vs a frame that has
-    /// arrived only partially (some of its k slots still missing).
-    pub blk_noframes: AtomicU64,
-    pub blk_incomplete: AtomicU64,
     /// Lanes the contributed-lane relaxation did not count as missing.
     pub contrib_skipped: AtomicU64,
     pub leave_close: AtomicU64,
@@ -563,13 +557,10 @@ pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
     retq1: AtomicU64::new(0),
     retq2: AtomicU64::new(0),
     rejoins: AtomicU64::new(0),
-    defer_rejoins: AtomicU64::new(0),
     blocking: AtomicU64::new(0),
     blk_owed: AtomicU64::new(0),
     blk_empty: AtomicU64::new(0),
     blk_partial: AtomicU64::new(0),
-    blk_noframes: AtomicU64::new(0),
-    blk_incomplete: AtomicU64::new(0),
     contrib_skipped: AtomicU64::new(0),
     leave_close: AtomicU64::new(0),
     leave_hit: AtomicU64::new(0),

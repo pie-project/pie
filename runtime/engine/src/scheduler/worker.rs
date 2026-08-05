@@ -4718,9 +4718,8 @@ impl BatchScheduler {
             take(&racc.retq1),
             take(&racc.retq2),
         );
-        let (ra_rejoins, ra_defer_rejoins, ra_blocking, ra_block_us) = (
+        let (ra_rejoins, ra_blocking, ra_block_us) = (
             take(&racc.rejoins),
-            take(&racc.defer_rejoins),
             take(&racc.blocking),
             take(&racc.block_ns) / 1_000,
         );
@@ -4730,8 +4729,6 @@ impl BatchScheduler {
             take(&racc.blk_empty),
             take(&racc.blk_partial),
         );
-        let (ra_blk_noframes, ra_blk_incomplete) =
-            (take(&racc.blk_noframes), take(&racc.blk_incomplete));
         let ra_contrib_skipped = take(&racc.contrib_skipped);
         let (ra_leave_close, ra_leave_hit, ra_leave_removed) = (
             take(&racc.leave_close),
@@ -4973,13 +4970,10 @@ impl BatchScheduler {
                 ("ra_retq1", ra_retq1),
                 ("ra_retq2", ra_retq2),
                 ("ra_rejoins", ra_rejoins),
-                ("ra_defer_rejoins", ra_defer_rejoins),
                 ("ra_blocking", ra_blocking),
                 ("ra_blk_owed", ra_blk_owed),
                 ("ra_blk_empty", ra_blk_empty),
                 ("ra_blk_partial", ra_blk_partial),
-                ("ra_blk_noframes", ra_blk_noframes),
-                ("ra_blk_incomplete", ra_blk_incomplete),
                 ("ra_contrib_skipped", ra_contrib_skipped),
                 ("ra_exec_evals", ra_exec_evals),
                 ("ra_exec_blk_owed", ra_exec_blk_owed),

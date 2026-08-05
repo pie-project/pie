@@ -1136,6 +1136,14 @@ enum Step {
     /// device for all of it. FCFS is untouched: the run is re-derived under
     /// the lock via `unmet_head` exactly as the sequential drain would, and
     /// it stops at the first waiter it cannot fund — no skipping, no bypass.
+    ///
+    /// One clarification, because the walk does step over entries: a RESTORE
+    /// inside the run is passed rather than served, and that is not an
+    /// inversion — [`Inner::unmet_head`] already ranks an unmet allocation
+    /// ahead of any older restore unless [`Inner::fleet_stalled`] holds, and
+    /// the burst's first serve (a served, uncollected grant) falsifies that
+    /// predicate for the rest of the pass. The sequential drain reaches the
+    /// same entries in the same order.
     ServeAllocationBurst {
         extra: u32,
     },
@@ -2093,7 +2101,7 @@ impl ResidencyPlanner {
                     // An RS-carrying ask keeps the per-step path: its RS
                     // reservation is a port call, and the port is never
                     // touched under the planner lock.
-                    Some(demand) if demand.rs_slots > 0 || !batch_grants_enabled() => {
+                    Some(demand) if demand.rs_slots > 0 => {
                         Step::ServeAllocation { key, demand }
                     }
                     Some(_) => Step::ServeAllocationBurst {
@@ -4061,21 +4069,6 @@ fn rotation_damping_enabled() -> bool {
     })
 }
 
-/// `PIE_BATCH_GRANTS=0` disables the burst serve pass
-/// ([`Step::ServeAllocationBurst`]) and puts every allocation back on the
-/// one-at-a-time [`Step::ServeAllocation`] path. Default ON.
-///
-/// The burst is a pure latency fix — same waiters, same FCFS order, same
-/// grants, same counters, only the lock cycling and the per-serve free-list
-/// round trip removed — so it does not gate a behaviour choice. The switch
-/// exists because the drain is the fleet's single serialization point and an
-/// integrator hitting anything odd there must be able to A/B it without a
-/// rebuild (the [`rotation_damping_enabled`] idiom).
-fn batch_grants_enabled() -> bool {
-    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CONFIGURED.get_or_init(|| !std::env::var("PIE_BATCH_GRANTS").is_ok_and(|value| value == "0"))
-}
-
 /// `PIE_SUPPLY_RUNWAY=<pages>`: the supply-phase runway target (§10.14).
 /// When nonzero the planner treats the free list itself as a demand: it
 /// starts and sizes eviction rounds so `free` is pulled back toward this
@@ -4547,23 +4540,16 @@ mod starvation_race_tests {
         // a pure latency fix. What changes is the shape of the pass: how many
         // times the drain had to leave the lock and go back to the pool.
         let pulls = pool.pulls.lock().clone();
-        if batch_grants_enabled() {
-            assert_eq!(
-                pulls,
-                vec![1, 4, 1],
-                "the head is covered by the ordinary absorb rung (1), the REST \
-                 of the run is asked for in a SINGLE pull (4 — the four live \
-                 asks behind the head), and the one ask the supply did not \
-                 reach re-enters the absorb rung (1)"
-            );
-        } else {
-            assert_eq!(
-                pulls,
-                vec![1, 1, 1, 1, 1],
-                "PIE_BATCH_GRANTS=0: one absorb round trip per served waiter, \
-                 which is the serialization the burst removes"
-            );
-        }
+        assert_eq!(
+            pulls,
+            vec![1, 4, 1],
+            "the head is covered by the ordinary absorb rung (1), the REST of \
+             the run is asked for in a SINGLE pull (4 — the four live asks \
+             behind the head), and the one ask the supply did not reach \
+             re-enters the absorb rung (1). The pre-burst drain took one \
+             absorb round trip per served waiter (vec![1, 1, 1, 1, 1]), which \
+             is the serialization this removes"
+        );
         assert_eq!(
             planner.diagnostics().device_pages_free,
             0,
