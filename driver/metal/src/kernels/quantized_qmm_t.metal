@@ -1884,6 +1884,9 @@ instantiate_qmm_t(128, 64, 32, 64, 8)
 instantiate_mxfp4_qmm_t_routed(16, 16)
 instantiate_mxfp4_qmm_t_routed(16, 32)
 instantiate_mxfp4_qmm_t_routed(16, 64)
+instantiate_mxfp4_qmm_t_routed(32, 16)
+instantiate_mxfp4_qmm_t_routed(32, 32)
+instantiate_mxfp4_qmm_t_routed(32, 64)
 
 #define instantiate_qmm_t_fp16_precast(bm, bn)                              \
   template [[host_name("affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_"   \

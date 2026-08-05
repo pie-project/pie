@@ -100,13 +100,13 @@ inline void routed_qmv_dispatch(int N, int experts_per_token, Grid& g, Threadgro
     tg = Threadgroup{32, 2, 1};
 }
 
-/// The tile a batched mixture pads each expert's run to.
-///
-/// `kQmmBM`'s narrow tile rather than the wide one, and deliberately: the
-/// padding an expert wastes is up to `tile - 1` rows, paid `n_experts` times,
-/// so the wide tile doubles the waste to buy a shape the routed case rarely
-/// fills anyway.
+/// The narrow tile, and the one the batching threshold is written against.
 constexpr int kMoeTileRows = 16;
+
+/// The wide one. Instantiated for every routed GEMM this driver has, and taken
+/// when `moe_tile_rows` says the arithmetic it buys outweighs the padding it
+/// wastes.
+constexpr int kMoeWideTileRows = 32;
 
 /// When sorting the rows by expert pays for itself.
 ///
@@ -116,6 +116,10 @@ constexpr int kMoeTileRows = 16;
 /// run half fills a tile, which for `min(n, n_experts)` touched experts is
 /// `n >= n_experts * tile / 2`.
 ///
+/// Written against the NARROW tile, because that is the cheapest way in: a
+/// batch that cannot pay for a 16-row tile cannot pay for a wider one either,
+/// and `moe_tile_rows` widens only after this has said yes.
+///
 /// Below that the matvec wins outright, and it is not close: a decode routes
 /// eight pairs over a hundred and twenty-eight experts, where every tile would
 /// be one live row in sixteen.
@@ -124,9 +128,42 @@ inline bool moe_should_batch(int n_pairs, int n_experts) {
 }
 
 /// Rows each expert's run is padded to, for a batch of `n_pairs`.
+///
+/// Two costs pull opposite ways and neither is constant. A wider tile does the
+/// arithmetic faster -- measured with `roofline_probe` at the expert shape
+/// K=N=2880, in GFLOP/s: BM=16 2744, BM=32 3746, BM=64 4291 -- and pads more,
+/// because every touched expert rounds its run up and pays `tile - 1` rows for
+/// it. So the choice depends on the batch AND on how many experts it spreads
+/// over, which is why this cannot be the constant it used to be.
+///
+/// The two together, as time per fire, are `sorted_rows(tile) / rate(tile)`,
+/// and this picks the smallest. What that works out to: gpt-oss routes 4 of 32
+/// experts, so 448 rows already amortize the wide tile and it takes it --
+/// measured 457.4 -> 514.7 tok/s prefill, and 446.5 -> 514.7 at 1024 rows.
+/// gemma-4-26B and Qwen3-30B route 8 of 128, where the same 448 rows would
+/// waste 128 * 31 padded rows to save a third of the arithmetic, and they stay
+/// narrow. A constant could not have said both.
+///
+/// BM=64 is measured above and not offered. Its crossover against BM=32 is at
+/// ~6000 pairs even for gpt-oss's 32 experts -- 1500 rows -- which is past any
+/// fire this driver builds, so wiring it would be a pipeline nothing selects.
 inline int moe_tile_rows(int n_pairs, int n_experts) {
-    return moe_should_batch(n_pairs, n_experts) ? kMoeTileRows : 1;
+    if (!moe_should_batch(n_pairs, n_experts)) return 1;
+    const int touched = n_pairs < n_experts ? n_pairs : n_experts;
+    // Integer arithmetic, cross-multiplied: rows(w)/rate(w) < rows(n)/rate(n).
+    constexpr int kRateNarrow = 2744;
+    constexpr int kRateWide = 3746;
+    const long narrow = long(n_pairs) + long(touched) * (kMoeTileRows - 1);
+    const long wide = long(n_pairs) + long(touched) * (kMoeWideTileRows - 1);
+    return wide * kRateNarrow < narrow * kRateWide ? kMoeWideTileRows : kMoeTileRows;
 }
+
+/// Which row of a routed PSO table a tile selects. The tables hold the two
+/// widths `moe_tile_rows` can return, in that order.
+inline int moe_bm_slot(int tile) { return tile >= kMoeWideTileRows ? 1 : 0; }
+
+/// The two tile widths a routed PSO table is compiled for, narrow first.
+inline constexpr int kMoeTileWidths[2] = {kMoeTileRows, kMoeWideTileRows};
 
 /// How many sorted rows a batch of `n_pairs` can produce.
 ///

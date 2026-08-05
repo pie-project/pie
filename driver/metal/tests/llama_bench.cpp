@@ -553,9 +553,20 @@ int main(int argc, char** argv) {
             // 30-layer 128-expert stack, and nothing that broke the mixture, the
             // second dense branch, the 8-bit set or the k-eq-v attention would
             // reproduce them.
+            //
+            // What that costs is this: the long answer is pinned to an
+            // arithmetic, so a legitimate change of arithmetic moves it. Tiling
+            // the prefill attention did, and the evidence that it is the tie and
+            // not the kernel is that tiling ONE layer moves it exactly as far as
+            // tiling all thirty -- a compounding error would not do that, a
+            // coin landing the other way once does. `gemma4_prefill_numerics`
+            // measures the perturbation that flips it: the two attention
+            // pipelines agree to 0.001 of 13.75, under a bf16 ulp, and on the
+            // E2B -- whose reference is stable -- both still answer mlx-lm's 818.
+            // The short answer below is untouched: a decode does not tile.
             {"Gemma-4-26B-A4B", 30, 128, 4, 2816, 64,
              {246427, 243599, 243599, 243599, 243599, 243599},
-             {785, 6722, 244674, 236900, 238270, 237184}},
+             {785, 6722, 244674, 237409, 236900, 28901}},
             // gpt-oss-20b. The only MXFP4 checkpoint here, and the row that
             // says the driver reads openai's format rather than converting it:
             // until the expert bank was bound as the E2M1 nibbles and E8M0

@@ -130,9 +130,14 @@ inline int qmm_bn(int out_vec, int N) {
 
 /// The threadgroup count past which this GEMM stops caring about more of them.
 ///
-/// The same number the sweep above the `qmm_bn` comment reports: ~380 GFLOP/s
-/// at 16 threadgroups, ~900 at 32, ~1600 at 112, saturating past ~200.
-inline constexpr int kQmmSaturationTg = 200;
+/// Where BN=32 starts beating BN=16, in threadgroups.
+///
+/// NOT the machine's saturation point, which is what an earlier version of this
+/// called it. The sweep below brackets the crossover between 144 threadgroups
+/// (where 16 still wins) and 192 (where 32 does); the machine saturates higher
+/// than that, and using the saturation number here cost up to 12% because it
+/// let the choice run past 32 to 64.
+inline constexpr int kQmmBnCrossoverTg = 160;
 
 /// `qmm_bn` for a family whose GEMM has no split-K behind it.
 ///
@@ -142,34 +147,41 @@ inline constexpr int kQmmSaturationTg = 200;
 /// projection to 1024 columns gets `1024/64 * 128/64` = 32 threadgroups, which
 /// the curve prices at a third of what the same work does at 200.
 ///
-/// So this restores what the split retired — widest tile that still fills the
-/// machine, narrowest when nothing does. Measured with `roofline_probe` at
-/// M=128, BM=64, in GFLOP/s, with the rule's choice in bold:
+/// So: the narrow tile until there is enough work to fill the machine, and 32
+/// after that. Never 64 -- that is the finding, not an omission. Measured with
+/// `roofline_probe` on gemma-4-E2B's own projections, BM=64, GFLOP/s, best of
+/// each row starred:
 ///
-///     N        BN=16    BN=32    BN=64
-///     512     *2187*    1829     1054
-///     1024    *3249*    3115     2234
-///     2048    *3399*    3346     3333
-///     3584     3595    *3904*    3098
-///     6144     3829    *4302*    4012
+///     M     N        tg@32    BN=16     BN=32     BN=64
+///     128    512        16   *2187*     1829      1054
+///     128   1024        32   *3249*     3115      2234
+///     128   2048        64   *3399*     3346      3333
+///     128   3584       112    3595     *3904*     3098
+///     128   6144       192    3829     *4302*     4012
+///     192   1536       144   *3820*     3529      2386
+///     192   2048       192    3694     *4082*     3103
+///     192   6144       576    3919     *4457*     4162
+///     448    256        56   *2727*     2603      1896
+///     448   1536       336    3865     *4101*     3573
+///     448   2048       448    3820     *4337*     3851
+///     448   6144      1344    3986     *4569*     4275
+///    1024   1536       768    4000     *4565*     4252
+///    1024   2048      1024    3941     *4511*     4131
+///    1024   6144      3072    4016     *4619*     4326
 ///
-/// The rule picks the measured best at every one of them, and BN=64 -- what the
-/// unconditional rule would have chosen for all five -- is optimal at none.
+/// Sixteen columns of measurement and BN=64 is the best of none of them, which
+/// is why the rule no longer reaches for it. The threshold sits in the only gap
+/// the sweep leaves: 144 threadgroups still wants 16, 192 already wants 32.
 ///
 /// BN partitions output columns only, so this is bit-exact whichever way it
 /// goes; it decides how many times a weight tile is dequantized, not what the
 /// sum is.
 inline int qmm_bn_unsplit(int out_vec, int N) {
     const int bm = qmm_bm(N);
-    if (N < kQmmMinBatch || N % bm != 0) return 0;
+    if (N < kQmmMinBatch || N % bm != 0 || out_vec % 16 != 0) return 0;
     const int row_tiles = N / bm;
-    int narrowest = 0, widest_that_fills = 0;
-    for (int bn : {16, 32, 64}) {
-        if (out_vec % bn != 0) continue;
-        if (narrowest == 0) narrowest = bn;
-        if ((out_vec / bn) * row_tiles >= kQmmSaturationTg) widest_that_fills = bn;
-    }
-    return widest_that_fills != 0 ? widest_that_fills : narrowest;
+    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= kQmmBnCrossoverTg) return 32;
+    return 16;
 }
 
 // Split the K dimension when the output tiles alone leave the machine short.

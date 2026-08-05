@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "checkpoint_path.hpp"
 #include "mtl4_context.hpp"
 #include "batch/decode_abi.hpp"
 #include "batch/golden_tap.hpp"
@@ -246,8 +247,8 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::string ckpt = argc > 1 ? argv[1] : std::string();
     if (ckpt.empty()) {
-        const char* home = std::getenv("HOME");
-        if (home != nullptr) ckpt = std::string(home) + "/.pie-bench/gemma4-e2b-pie";
+        ckpt = pie::metal::test::find_checkpoint("gemma4-e2b-pie",
+                                                 "models--mlx-community--gemma-4-e2b-it-4bit");
     }
     std::string kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
 

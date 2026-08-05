@@ -425,6 +425,15 @@ template <typename T, int D, int V = D, bool WITH_SINK = false>
 
 instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 128, 128, false)
 instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 64, 64, false)
+// gemma4's two head widths. `KT = 4096 / D` keeps the staged tile at 16 KB of
+// each of K and V no matter how wide the head is, so these cost the same
+// threadgroup memory as the narrow ones -- only the pass count changes.
+instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 256, 256, false)
+instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 512, 512, false)
+// gpt-oss's head width, with the learned per-head sink in the denominator. The
+// tiled kernel already merges the sink; it had simply never been asked for with
+// one, because the family that has sinks was not tiling.
+instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", bfloat16, bfloat, 64, 64, true)
 
 #define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
