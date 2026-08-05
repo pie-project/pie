@@ -335,7 +335,7 @@ fn llama_like_cuda_text(
                     // to plan.
                     let masked_attention = |q: &Val| {
                         if c.head_dim_padded || (window_one && c.xqa_decode) {
-                            cuda::attention_flashinfer_prefill_custom_region(q, &w.kv);
+                            cuda::attention_flashinfer_prefill_custom(q, &w.kv);
                         } else {
                             dsl::peel_masked(
                                 m.trace(),
@@ -353,20 +353,18 @@ fn llama_like_cuda_text(
                                     // fires: any mix of prefill and
                                     // plain-decode requests, ragged qo.
                                     if window_one && !c.force_prefill_path {
-                                        cuda::attention_flashinfer_decode_region(
+                                        cuda::attention_flashinfer_decode(
                                             q, &w.kv,
                                         );
                                     } else {
                                         cuda::dequant_only(&w.kv);
-                                        cuda::attention_flashinfer_prefill_region(
+                                        cuda::attention_flashinfer_prefill(
                                             q, &w.kv,
                                         );
                                     }
                                 },
                                 || {
-                                    cuda::attention_flashinfer_prefill_custom_region(
-                                        q, &w.kv,
-                                    )
+                                    cuda::attention_flashinfer_prefill_custom(q, &w.kv);
                                 },
                             );
                         }
@@ -379,23 +377,23 @@ fn llama_like_cuda_text(
                             cuda::dequant_only(&w.kv);
                             dsl::guarded(m)
                                 .arm(GuardPred::WantsAttnScore, || {
-                                    cuda::attention_flashinfer_prefill_capture(q, &w.kv)
+                                    cuda::attention_flashinfer_prefill_capture(q, &w.kv);
                                 })
                                 .otherwise(|| {
-                                    cuda::attention_flashinfer_prefill_region(q, &w.kv)
+                                    cuda::attention_flashinfer_prefill(q, &w.kv);
                                 });
                         } else if c.xqa_decode {
-                            cuda::attention_xqa_decode_region(q, &w.kv);
+                            cuda::attention_xqa_decode(q, &w.kv);
                         } else if c.force_prefill_path {
                             cuda::dequant_only(&w.kv);
-                            cuda::attention_flashinfer_prefill_region(q, &w.kv);
+                            cuda::attention_flashinfer_prefill(q, &w.kv);
                         } else {
                             dsl::guarded(m)
                                 .arm(GuardPred::WantsAttnScore, || {
-                                    cuda::attention_flashinfer_decode_capture(q, &w.kv)
+                                    cuda::attention_flashinfer_decode_capture(q, &w.kv);
                                 })
                                 .otherwise(|| {
-                                    cuda::attention_flashinfer_decode_region(q, &w.kv)
+                                    cuda::attention_flashinfer_decode(q, &w.kv);
                                 });
                         }
                         dsl::seam_observe(&dsl::seam::ATTN_OUT, q, l);
@@ -1146,14 +1144,17 @@ fn full_attn_body_cuda(
     // CommitAdvance skips full-attention layers entirely and never enters
     // this body ([`commit_advance_body`]).
     let attn = match class {
-        FireClass::Decode => cuda::attention_flashinfer_decode(&q, &w.kv, facts.q_width()),
+        FireClass::Decode => cuda::attention_flashinfer_decode(&q, &w.kv),
         FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify => {
-            cuda::attention_flashinfer_prefill_planned(&q, &w.kv, facts.q_width())
+            // No dequant statement beside it: qwen3_5's full-attention
+            // path gates on a native-bf16 cache.
+            cuda::attention_flashinfer_prefill(&q, &w.kv)
         }
         FireClass::CommitAdvance => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
+    let attn = attn.expect("a plain attention statement produces its value");
     let gated = sigmoid_gate_mul(&attn, &gate);
     // The OnAttn site: after the output gate, before the o_proj — the
     // hand-written invoke's position (observing q).

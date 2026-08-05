@@ -1057,42 +1057,30 @@ pub mod cuda {
     }
 
     /// `ops::launch_attention_xqa_decode_bf16_prepared` (whose contract
-    /// includes the fire-wide XQA prepare).
-    pub fn attention_xqa_decode(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        attn(q, kv, q_width, "launch_attention_xqa_decode_bf16_prepared")
+    /// includes the fire-wide XQA prepare — and which is therefore
+    /// declared `whole`; see [`crate::kernels`]).
+    pub fn attention_xqa_decode(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "launch_attention_xqa_decode_bf16_prepared")
     }
 
     /// `ops::dispatch_attention_flashinfer_decode` against the decode
     /// plan its contract obligates.
-    pub fn attention_flashinfer_decode(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_decode")
+    pub fn attention_flashinfer_decode(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_decode")
     }
 
-    /// The decode-shaped fallback for GQA ratios outside the decode
-    /// kernel set (`force_prefill_path`): the exact pair the hand-written
-    /// arm launches — `kernels::launch_dequant_kv_cache_layer_to_bf16_active`
-    /// then `ops::dispatch_attention_flashinfer_prefill_bf16`.
-    pub fn attention_prefill_dequant(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        dequant(kv);
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
-    }
-
-    /// The planned prefill every prefill-shaped fire runs: the same
-    /// dequant + `ops::dispatch_attention_flashinfer_prefill_bf16` pair.
-    pub fn attention_flashinfer_prefill(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        dequant(kv);
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
-    }
-
-    /// `ops::dispatch_attention_flashinfer_prefill_bf16` ALONE — no
-    /// dequant launch. The llama_like pair above is llama-specific: its
-    /// cache may be quantized, so the hand-written prefill path dequants
-    /// the layer first. qwen3_5's full-attention path gates on a
-    /// native-bf16 cache and launches only the dispatch
-    /// (`qwen3_5_forward.cpp::full_attn_layer_body`), so its lowered arm
-    /// states exactly one launch.
-    pub fn attention_flashinfer_prefill_planned(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
+    /// `ops::dispatch_attention_flashinfer_prefill_bf16` — the dispatch
+    /// ALONE.
+    ///
+    /// Three wrappers used to differ here only by whether they also
+    /// launched the dequant staging: llama_like's cache may be
+    /// quantized, so its prefill-shaped arms dequant the layer first,
+    /// while qwen3_5's full-attention path gates on a native-bf16 cache
+    /// and launches only the dispatch. That is not a property of this
+    /// kernel — it is a second STATEMENT the text either makes or does
+    /// not, so the text makes it ([`dequant_only`] beside this call).
+    pub fn attention_flashinfer_prefill(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_prefill_bf16")
     }
 
     /// `kernels::launch_write_kv_explicit_bf16`: the explicit-descriptor
@@ -1365,45 +1353,14 @@ pub mod cuda {
     /// its contract includes the capture publish against the possibly
     /// page-mask-compacted CSR). Region launch of the WantsAttnScore
     /// guard — output-less; the guard owns the attention output.
-    pub fn attention_flashinfer_decode_capture(q: &Val, kv: &Kv) {
-        record(
-            &q.t,
-            Some(kv.l),
-            "dispatch_attention_flashinfer_decode_capture",
-            vec![],
-            kv_state(kv),
-            vec![q.id],
-            None,
-        );
+    pub fn attention_flashinfer_decode_capture(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_decode_capture")
     }
 
     /// `ops::dispatch_attention_flashinfer_prefill_capture_bf16` — the
     /// prefill counterpart, same guard-region contract.
-    pub fn attention_flashinfer_prefill_capture(q: &Val, kv: &Kv) {
-        record(
-            &q.t,
-            Some(kv.l),
-            "dispatch_attention_flashinfer_prefill_capture_bf16",
-            vec![],
-            kv_state(kv),
-            vec![q.id],
-            None,
-        );
-    }
-
-    /// Output-less plain-dispatch forms for guard regions (the guard owns
-    /// the output; these bind it).
-    pub fn attention_flashinfer_decode_region(q: &Val, kv: &Kv) {
-        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_decode",
-               vec![], kv_state(kv), vec![q.id], None);
-    }
-    pub fn attention_flashinfer_prefill_region(q: &Val, kv: &Kv) {
-        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_prefill_bf16",
-               vec![], kv_state(kv), vec![q.id], None);
-    }
-    pub fn attention_xqa_decode_region(q: &Val, kv: &Kv) {
-        record(&q.t, Some(kv.l), "launch_attention_xqa_decode_bf16_prepared",
-               vec![], kv_state(kv), vec![q.id], None);
+    pub fn attention_flashinfer_prefill_capture(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_prefill_capture_bf16")
     }
 
     /// Output-less [`qkv_decode_qk_norm_rope_write_kv`] for the Peel's
@@ -1436,15 +1393,9 @@ pub mod cuda {
     /// no pseudo-symbol is needed. The mask data (BRLE bytes + indptr)
     /// crosses as runtime args of the stated kernel, commit_lens's peer.
     /// Since A1 (the class-collapse amendment) it is stated inside the
-    /// `HasCustomMask` guard arm of the Decode/Prefill traces — the
-    /// output-less region form below is what the arm records; this
-    /// value-producing form remains for consumers outside a guard.
-    pub fn attention_flashinfer_prefill_custom(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_custom")
-    }
-    pub fn attention_flashinfer_prefill_custom_region(q: &Val, kv: &Kv) {
-        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_prefill_custom",
-               vec![], kv_state(kv), vec![q.id], None);
+    /// `HasCustomMask` guard arm of the Decode/Prefill traces.
+    pub fn attention_flashinfer_prefill_custom(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_prefill_custom")
     }
 
     /// `"pie_lora_qkv_correction"`: the §5.1 adapter correction — every
@@ -1468,14 +1419,12 @@ pub mod cuda {
         );
     }
 
-    /// The standalone dequant staging launch, for arms whose attention
-    /// lives inside a guard (the dequant is common to both regions, so
-    /// it precedes the guard).
+    /// `kernels::launch_dequant_kv_cache_layer_to_bf16_active`: the
+    /// staging launch a quantized cache needs before a prefill-shaped
+    /// dispatch. Its OWN statement — see
+    /// [`attention_flashinfer_prefill`] for why it is not folded into
+    /// any attention wrapper.
     pub fn dequant_only(kv: &Kv) {
-        dequant(kv);
-    }
-
-    fn dequant(kv: &Kv) {
         record(
             &kv.t,
             Some(kv.l),
@@ -1487,7 +1436,23 @@ pub mod cuda {
         );
     }
 
-    fn attn(q: &Val, kv: &Kv, q_width: u32, kernel: &str) -> Val {
+    /// ONE attention statement, whatever position it is written in
+    /// (`.wiki/tart/dsl.md` ②, migration step 2).
+    ///
+    /// A dispatch inside a value-producing guard or peel region binds
+    /// that construct's output and records no SSA output of its own; the
+    /// same dispatch written as a plain statement produces its own
+    /// value. That is a property of the STATEMENT'S POSITION, which the
+    /// tape knows ([`crate::trace::TraceBuilder::inside_value_region`]),
+    /// so it stops being spelled in the wrapper's name — the `_region`
+    /// half of every attention wrapper is deleted by this one function.
+    ///
+    /// The output shape is q's own: these kernels are width-preserving
+    /// on the query, which is what the retired `q_width` parameter was
+    /// re-stating at each call site.
+    fn attn_at(q: &Val, kv: &Kv, kernel: &str) -> Option<Val> {
+        let out = q.t.inner.borrow().inside_value_region();
+        let shape = (!out).then(|| q.t.inner.borrow().value_shape(q.id));
         record(
             &q.t,
             Some(kv.l),
@@ -1495,8 +1460,8 @@ pub mod cuda {
             vec![],
             kv_state(kv),
             vec![q.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
+            shape.map(|s| (s, DType::BF16)),
         )
-        .expect("attention produces a value")
     }
+
 }

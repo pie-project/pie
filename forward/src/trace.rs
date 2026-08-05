@@ -703,6 +703,17 @@ pub struct TraceBuilder {
     /// region lengths count it and its regions, the aux wire encoding
     /// is unchanged, the walk keeps a skip stack, the emitter recurses.
     guard_depth: u32,
+    /// Open VALUE-PRODUCING regions ([`Self::open_guard`] /
+    /// [`Self::open_peel`] with output shapes). A launch recorded while
+    /// this is non-zero is a LOWERING of the enclosing construct's
+    /// output — it binds that buffer and records no SSA output of its
+    /// own — and a launch recorded at zero produces its own value.
+    ///
+    /// That is a property of WHERE THE STATEMENT IS, not of the kernel,
+    /// and encoding it in the wrapper name is why `dsl::cuda` grew ten
+    /// wrappers over five kernels (`.wiki/tart/dsl.md` ②, migration
+    /// step 2). Tracking it here lets one wrapper serve both positions.
+    value_region_depth: u32,
     /// V2 rung ②: the depth axis, DECLARED BY THE BODY
     /// ([`Self::declare_depth_window`]) instead of painted on after the
     /// trace (the review's smell — family.rs:64-91). While set, every
@@ -720,6 +731,7 @@ impl TraceBuilder {
             ops: Vec::new(),
             layer: None,
             guard_depth: 0,
+            value_region_depth: 0,
             depth_axis: false,
         }
     }
@@ -765,6 +777,9 @@ impl TraceBuilder {
     /// enclosing arm's length simply counts them.
     pub(crate) fn open_guard(&mut self, out_shapes: Vec<(Shape, DType)>) -> (usize, Vec<ValueId>) {
         self.guard_depth += 1;
+        if !out_shapes.is_empty() {
+            self.value_region_depth += 1;
+        }
         let outs = self.push(
             OpKind::Guard {
                 arms: Vec::new(),
@@ -778,6 +793,12 @@ impl TraceBuilder {
 
     pub(crate) fn op_count_now(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Is the statement being recorded a LOWERING of an enclosing
+    /// construct's output rather than a producer of its own value?
+    pub(crate) fn inside_value_region(&self) -> bool {
+        self.value_region_depth > 0
     }
 
     /// Open an [`OpKind::Peel`]: records the op with empty region
@@ -799,6 +820,9 @@ impl TraceBuilder {
             vec![],
             out_shapes,
         );
+        if !outs.is_empty() {
+            self.value_region_depth += 1;
+        }
         (self.ops.len() - 1, outs)
     }
 
@@ -813,6 +837,9 @@ impl TraceBuilder {
         };
         *prefix_ops = prefix;
         *tail_ops = tail;
+        if !self.ops[peel_idx].outputs.is_empty() {
+            self.value_region_depth -= 1;
+        }
     }
 
     pub(crate) fn push_hook_site(&mut self, stage: HookStage, layer: u32, q: ValueId) {
@@ -831,6 +858,9 @@ impl TraceBuilder {
         *e = else_ops;
         assert!(self.guard_depth > 0, "close_guard without open_guard");
         self.guard_depth -= 1;
+        if !self.ops[guard_idx].outputs.is_empty() {
+            self.value_region_depth -= 1;
+        }
     }
 
     /// The `+=` fold ([`crate::dsl`]): if `rhs` is the output of the op
