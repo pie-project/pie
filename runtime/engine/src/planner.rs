@@ -469,6 +469,13 @@ pub struct PlannerStats {
     /// still making progress — the load-control rung. Every one of these is
     /// a fence/quiesce/D2H/H2D round trip not paid.
     pub eviction_deferrals: AtomicU64,
+    /// §10.14: eviction rounds the supply runway motivated — started with
+    /// an empty ask queue, or enlarged past the queued demand. Zero unless
+    /// `PIE_SUPPLY_RUNWAY` is set.
+    pub runway_rounds: AtomicU64,
+    /// Pages those rounds ordered on the runway's account (the shortfall
+    /// component, not the queued-demand component).
+    pub runway_pages: AtomicU64,
     /// Evictions that committed (working sets moved to host swap).
     pub evictions: AtomicU64,
     /// Evictions abandoned before commit (nothing reclaimable, non-detachable
@@ -591,6 +598,9 @@ pub struct PlannerDiagnostics {
     pub h2d_pages_total: u64,
     pub d2h_copy_us_total: u64,
     pub h2d_copy_us_total: u64,
+    /// §10.14 supply-runway probes — zero unless `PIE_SUPPLY_RUNWAY`.
+    pub runway_rounds_total: u64,
+    pub runway_pages_total: u64,
 }
 
 /// One process the FCFS anti-thrash rule permits evicting for the current
@@ -626,6 +636,11 @@ struct VictimSet {
     head_pid: ProcessId,
     deficit: u32,
     members: Vec<Victim>,
+    /// §10.14: how many of `deficit`'s pages are the supply runway's
+    /// shortfall rather than queued demand. Nonzero only with
+    /// `PIE_SUPPLY_RUNWAY` set and no runway round already in flight;
+    /// committing such a round latches the hysteresis flag.
+    runway_grab: u32,
 }
 
 /// Where a registered process stands. Two real states plus the two
@@ -808,6 +823,14 @@ struct Inner {
     prepare_blocked: HashSet<ProcessId>,
     /// Destructions ordered but not yet paid out — see [`Inner::kill_in_flight`].
     killing: HashSet<ProcessId>,
+    /// §10.14 runway hysteresis: a runway-motivated eviction round is in
+    /// flight. At most one at a time — the runway's contribution must never
+    /// pyramid the way the first whole-queue supply cut did in tiny-pool
+    /// regimes (onefits: 58 starvation kills). Set when a round the runway
+    /// started or enlarged commits; cleared by [`Inner::settle_eviction`]
+    /// once nothing is in flight at all. Always `false` while
+    /// `PIE_SUPPLY_RUNWAY` is unset, and never read then.
+    runway_round_in_flight: bool,
 }
 
 impl Inner {
@@ -838,6 +861,35 @@ impl Inner {
                     .values()
                     .any(|waiter| waiter.pid == *pid && waiter.is_unmet())
         })
+    }
+
+    /// Retire one eviction from the in-flight set (landed, rolled back, or
+    /// the victim unregistered) and release the §10.14 runway latch once
+    /// nothing at all is in flight: the runway may motivate its next round
+    /// only after the previous round's victims have all settled. Every
+    /// `evicting` removal goes through here so the latch can never wedge.
+    fn settle_eviction(&mut self, pid: ProcessId) {
+        self.evicting.remove(&pid);
+        if self.evicting.is_empty() {
+            self.runway_round_in_flight = false;
+        }
+    }
+
+    /// §10.14: the seq floor for a runway round's victims. The OLDEST
+    /// admitted resident — the runway must never evict the last resident,
+    /// because with nobody resident nothing can complete and the pool loses
+    /// its only organic supply — raised to the FCFS head's seq when one is
+    /// queued (the anti-thrash rule: victims are younger than the head).
+    /// `None` when nobody admitted is resident, which is also "no round".
+    fn runway_floor(&self) -> Option<u64> {
+        let oldest = self
+            .procs
+            .values()
+            .filter(|proc| proc.admitted && proc.state == Residency::Resident)
+            .map(|proc| proc.seq)
+            .min()?;
+        let head = self.unmet_head().map_or(0, |(key, _)| key.0);
+        Some(oldest.max(head))
     }
 
     /// Count non-resident processes AND refresh each process's lock-free
@@ -1165,6 +1217,23 @@ impl ResidencyPlanner {
         }
     }
 
+    /// §10.14: poke the drain when the free list has fallen below the
+    /// configured supply runway. The uncontended paths neither park nor
+    /// poke — nothing would ever wake the planner to rebuild the runway
+    /// while the fast path quietly drains the pool toward the phase
+    /// mismatch the runway exists to pre-empt. One flag load (and nothing
+    /// else) with the runway off.
+    fn poke_if_runway_short(self: &Arc<Self>) {
+        let runway = supply_runway_pages();
+        if runway == 0 {
+            return;
+        }
+        let (free, _) = self.port.device_stats();
+        if free < runway {
+            self.poke();
+        }
+    }
+
     /// The single semantic site for "device pages actually became free":
     /// re-arms rung 0 (the idle-reclaim scan may find work again). Every
     /// caller pairs it with a poke; only the poke's condition differs.
@@ -1274,7 +1343,7 @@ impl ResidencyPlanner {
                 inner.completion_credit = inner.completion_credit.saturating_add(1);
             }
             let signal = departed.map(|proc| proc.signal);
-            inner.evicting.remove(&pid);
+            inner.settle_eviction(pid);
             inner.killing.remove(&pid);
             // Teardown returns this process's host slots (and drops it from
             // the candidate pool either way), so re-arm the parked victims.
@@ -1320,6 +1389,10 @@ impl ResidencyPlanner {
             crate::scheduler::RUN_AHEAD
                 .freed_skip
                 .fetch_add(1, Ordering::Relaxed);
+            // §10.14: with nobody waiting the poke is normally skipped, but
+            // a free event is also the runway's chance to notice it is
+            // still short and top up before the next ask parks.
+            self.poke_if_runway_short();
         }
     }
 
@@ -1445,6 +1518,7 @@ impl ResidencyPlanner {
                 self.note_progress(pid);
             }
             if uncontended && let Some(grant) = self.try_reserve(demand) {
+                self.poke_if_runway_short();
                 return Ok(Acquired::Granted(grant));
             }
             // The reserve failed (or the fast path is closed): run the
@@ -1629,6 +1703,7 @@ impl ResidencyPlanner {
             self.note_progress(pid);
         }
         if uncontended && let Some(grant) = self.try_reserve(demand) {
+            self.poke_if_runway_short();
             return Ok(Enqueued::Granted(grant));
         }
         // Exact-arithmetic exhaustion check before parking — slow path only,
@@ -1918,9 +1993,20 @@ impl ResidencyPlanner {
                 }
             });
             match step {
-                Step::Done => return,
+                Step::Done => {
+                    // §10.14: the drain has nothing to serve (empty queue,
+                    // or a covered-but-damped restore head) — exactly the
+                    // idle phase in which the runway is rebuilt. One flag
+                    // load with the runway off.
+                    self.plan_runway();
+                    return;
+                }
                 Step::Release(stranded) => {
                     drop(stranded);
+                    // As above; the release has just returned the stranded
+                    // accumulation to the free lists, so the shortfall is
+                    // measured against the honest free count.
+                    self.plan_runway();
                     return;
                 }
                 Step::Absorb {
@@ -2294,7 +2380,176 @@ impl ResidencyPlanner {
             self.check_starvation(StarveCause::NoEligibleVictim);
             return;
         }
-        self.commit_evictions(victims.head, picks, false);
+        self.commit_evictions(victims.head, picks, false, victims.runway_grab);
+    }
+
+    /// §10.14 SUPPLY-PHASE RUNWAY, drain-idle entry (`PIE_SUPPLY_RUNWAY`;
+    /// off = this returns after one flag load). `plan_eviction` is only
+    /// reachable behind an unmet head, so a shortfall against the runway
+    /// target with an EMPTY ask queue — the phase §10.14 exists for: demand
+    /// is continuous, supply is lumpy, and the reactive gate opens only
+    /// after the boundary asks have already parked — needs its own entry
+    /// from the drain's idle exits.
+    ///
+    /// This rung is OPPORTUNISTIC, which is the whole difference from
+    /// `plan_eviction`: no head is starving, so there is no starvation or
+    /// hog rung on any of its exits — an unquotable fleet, an exhausted
+    /// host pool, or a missing transport simply mean "no round". The
+    /// victims it does order are ordinary evictions: same executor, same
+    /// landing, their yield returns to the free lists / accumulation like
+    /// any eviction yield, and grants stay strictly FCFS.
+    ///
+    /// Rotation damping is not routed around: a runway victim's restore
+    /// entry queues at its spawn position exactly as today, and its SERVE
+    /// still waits for a completion credit. The round itself funds
+    /// ALLOCATIONS — which is why `runway_shortfall_set` refuses to run
+    /// with a banked credit, see there.
+    fn plan_runway(self: &Arc<Self>) {
+        let runway = supply_runway_pages();
+        if runway == 0 {
+            return;
+        }
+        // The same physical precondition as `plan_eviction`, minus its
+        // starvation rung: no transport or no host room is "no round".
+        let (host_free, _) = self.port.host_stats();
+        if !self.port.suspend_capable() || host_free == 0 {
+            return;
+        }
+        let (free, _) = self.port.device_stats();
+        let Some((deficit, members)) = self.runway_shortfall_set(runway, free) else {
+            return;
+        };
+        let (model, driver) = self.port.locus();
+        let (picks, _unhostable) = self.quote_and_pick(members, deficit, host_free, model, driver);
+        if picks.is_empty() {
+            return;
+        }
+        self.commit_runway(picks);
+    }
+
+    /// The detection + candidate half of [`Self::plan_runway`], under one
+    /// planner-lock snapshot. `Some((deficit, members))` when a runway
+    /// round should be ordered: the free list (plus accumulation and
+    /// in-flight eviction yield — the same supply arithmetic as
+    /// `supply_stalled`) is short of `runway`, no runway round is already
+    /// in flight (hysteresis), no kill is pending, and the readmission
+    /// rotation is credit-starved.
+    ///
+    /// The credit check is what keeps this rung physical: with a banked
+    /// completion the damping gate is open, so the round's yield would be
+    /// absorbed by a serveable restore — including the restore the round
+    /// itself creates — and the free list ends where it started, one
+    /// D2H+H2D round trip poorer. Credit-starved is precisely the regime
+    /// where evicted pages stay free for the boundary-ask stream.
+    ///
+    /// Membership is the anti-thrash rule against [`Inner::runway_floor`]:
+    /// younger than the oldest admitted resident (the round must never
+    /// evict the LAST resident — that clamp is what keeps a onefits-sized
+    /// pool safe from an over-large runway) and younger than any queued
+    /// head. E6 hysteresis is honored and never relaxed: an opportunistic
+    /// round has no liveness claim on a just-restored victim.
+    ///
+    /// Takes `runway` and `free` as parameters so the arithmetic is
+    /// testable without the process-global env latch.
+    fn runway_shortfall_set(&self, runway: u32, free: u32) -> Option<(u32, Vec<(ProcessId, u64)>)> {
+        self.with_inner(|inner| {
+            // No credit gate here: measured on the D cell, completions bank
+            // credits continuously, so gating on credit == 0 kept the runway
+            // at 0 rounds for a whole run (runway=0/0). FCFS itself already
+            // orders queued boundary asks against the victim's restore; the
+            // idle-churn case the gate aimed at is bounded by the in-flight
+            // latch and the shortfall arithmetic (a restored victim's pages
+            // re-enter `free` and close the deficit).
+            if inner.runway_round_in_flight
+                || inner.kill_in_flight()
+                || !rotation_damping_enabled()
+            {
+                return None;
+            }
+            let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
+            let deficit = runway
+                .saturating_sub(free)
+                .saturating_sub(inner.accum.len() as u32 + expected);
+            if deficit == 0 {
+                return None;
+            }
+            let floor = inner.runway_floor()?;
+            let members: Vec<(ProcessId, u64)> = inner
+                .procs
+                .iter()
+                .filter(|(pid, proc)| {
+                    proc.admitted
+                        && proc.seq > floor
+                        && proc.state == Residency::Resident
+                        && proc.progressed
+                        && !inner.host_swap_blocked.contains(*pid)
+                        && !inner.prepare_blocked.contains(*pid)
+                })
+                .map(|(pid, proc)| (*pid, proc.seq))
+                .collect();
+            if members.is_empty() {
+                return None;
+            }
+            Some((deficit, members))
+        })
+    }
+
+    /// Commit a runway round: [`Self::commit_evictions`]'s re-validation
+    /// with [`Inner::runway_floor`] standing in for the head (there may be
+    /// none), and the §10.14 hysteresis latched under the same lock hold
+    /// that marks the victims — a racing plan can never order a second
+    /// runway round in between.
+    fn commit_runway(self: &Arc<Self>, picks: Vec<(ProcessId, u32)>) {
+        let mut spawned = Vec::new();
+        let mut wake = Vec::new();
+        let mut pages = 0u64;
+        self.with_inner(|inner| {
+            if inner.runway_round_in_flight || inner.kill_in_flight() {
+                return; // a concurrent plan won; its round is the one
+            }
+            let Some(floor) = inner.runway_floor() else {
+                return;
+            };
+            for (pid, expected) in picks {
+                let Some(proc) = inner.procs.get_mut(&pid) else {
+                    continue;
+                };
+                if proc.state != Residency::Resident || proc.seq <= floor || !proc.progressed {
+                    continue;
+                }
+                proc.state = Residency::Evicting;
+                inner.evicting.insert(pid, EvictionMark { pages: expected });
+                pages += u64::from(expected);
+                spawned.push(pid);
+                // The victim's parked allocations yield exactly as on the
+                // routine path: their fire tasks settle the pipeline tail
+                // the eviction quiesces on.
+                for waiter in inner.queue.values_mut().filter(|w| w.pid == pid) {
+                    if let WaitKind::Allocation {
+                        notify, yielded, ..
+                    } = &mut waiter.kind
+                    {
+                        *yielded = true;
+                        wake.push(notify.clone());
+                    }
+                }
+            }
+            if !spawned.is_empty() {
+                inner.runway_round_in_flight = true;
+            }
+        });
+        for notify in wake {
+            notify.notify_waiters();
+        }
+        if spawned.is_empty() {
+            return;
+        }
+        self.stats.runway_rounds.fetch_add(1, Ordering::Relaxed);
+        self.stats.runway_pages.fetch_add(pages, Ordering::Relaxed);
+        for pid in spawned {
+            self.stats.evictions_started.fetch_add(1, Ordering::Relaxed);
+            exec::spawn_evict(self.clone(), pid);
+        }
     }
 
     /// Snapshot every process FCFS permits evicting for the current head.
@@ -2310,6 +2565,15 @@ impl ResidencyPlanner {
     /// enough to re-take at every decision point — callers are expected to
     /// build a FRESH one rather than carry one across a lock release.
     fn victim_set(&self) -> Option<VictimSet> {
+        // §10.14: read the pool BEFORE the planner lock (`inner` is
+        // innermost; the pool must never be taken inside it). One flag load
+        // and no read at all with the runway off.
+        let runway = supply_runway_pages();
+        let runway_free = if runway > 0 {
+            self.port.device_stats().0
+        } else {
+            0
+        };
         self.with_inner(|inner| {
             let (head, waiter) = inner.unmet_head()?;
             // The round covers the head's shortfall PLUS the queued
@@ -2328,9 +2592,20 @@ impl ResidencyPlanner {
                     _ => None,
                 })
                 .sum();
+            // §10.14: the round ALSO restores the free-page runway, on the
+            // same one-round-in-flight and completion-credit brakes as the
+            // `supply_stalled` clause that orders it (see there). With the
+            // runway off (or latched) `runway_grab` is 0 and the target is
+            // exactly the shipped demand-exact arithmetic.
+            let runway_grab =
+                if runway > 0 && !inner.runway_round_in_flight {
+                    runway.saturating_sub(runway_free)
+                } else {
+                    0
+                };
             let missing = waiter
                 .kv_need()
-                .max(queued_quantum)
+                .max(queued_quantum.saturating_add(runway_grab))
                 .saturating_sub(inner.accum.len() as u32);
             // Evictions already in flight fund the head when they land;
             // never over-evict for pages that are already on their way.
@@ -2366,6 +2641,7 @@ impl ResidencyPlanner {
                 head_pid: waiter.pid,
                 deficit,
                 members,
+                runway_grab,
             })
         })
     }
@@ -2382,12 +2658,17 @@ impl ResidencyPlanner {
     /// without it a relaxed pick is silently dropped at this re-validation
     /// and the planner spins (the livelock in §18.9).
     ///
+    /// `runway_grab` is the §10.14 shortfall component of the round's
+    /// deficit ([`VictimSet::runway_grab`], 0 with the runway off):
+    /// committing a round it enlarged latches the one-round hysteresis.
+    ///
     /// Returns whether anything was actually spawned.
     fn commit_evictions(
         self: &Arc<Self>,
         head_key: EntryKey,
         picks: Vec<(ProcessId, u32)>,
         e6_relaxed: bool,
+        runway_grab: u32,
     ) -> bool {
         let mut spawned = Vec::new();
         let mut wake = Vec::new();
@@ -2419,11 +2700,20 @@ impl ResidencyPlanner {
                     }
                 }
             }
+            if runway_grab > 0 && !spawned.is_empty() {
+                inner.runway_round_in_flight = true;
+            }
         });
         for notify in wake {
             notify.notify_waiters();
         }
         let any = !spawned.is_empty();
+        if runway_grab > 0 && any {
+            self.stats.runway_rounds.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .runway_pages
+                .fetch_add(u64::from(runway_grab), Ordering::Relaxed);
+        }
         for pid in spawned {
             self.stats.evictions_started.fetch_add(1, Ordering::Relaxed);
             exec::spawn_evict(self.clone(), pid);
@@ -2488,6 +2778,28 @@ impl ResidencyPlanner {
             }
             if inner.unmet_head().is_none() {
                 return false;
+            }
+            // §10.14 supply-phase runway (`PIE_SUPPLY_RUNWAY`, default off):
+            // the free list itself is a demand. Demand at D is continuous
+            // (~32 pages/wave of 1-page boundary asks) while supply is lumpy
+            // (~35 pages per completion), so at free≈0 the demand-exact gate
+            // below is still REACTIVE — it opens only once asks have queued.
+            // A shortfall against the runway target opens the rung by
+            // itself, so the round starts before the boundary asks park.
+            // Same supply arithmetic as the gate below (accumulation and
+            // in-flight eviction yield count as pages on their way, so an
+            // in-flight round shuts this clause), plus two brakes of its
+            // own: the hysteresis latch (one runway-motivated round in
+            // flight at a time) and the completion-credit check — with a
+            // banked credit the damping gate is open, meaning the yield
+            // would be absorbed by a serveable restore rather than staying
+            // free, and the runway cannot be defended by evicting.
+            let runway = supply_runway_pages();
+            if runway > 0 && !inner.runway_round_in_flight {
+                let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
+                if runway.saturating_sub(free) > inner.accum.len() as u32 + expected {
+                    return true;
+                }
             }
             // Demand-exact over the WHOLE queued allocation demand, not just
             // the head's ask. The old `free == 0 && head short` form started
@@ -2651,7 +2963,8 @@ impl ResidencyPlanner {
             return false;
         };
         let n = picks.len();
-        if !self.commit_evictions(head, picks, true) {
+        // The last-resort rung is liveness, never runway: `runway_grab` 0.
+        if !self.commit_evictions(head, picks, true, 0) {
             return false;
         }
         self.stats.e6_relaxations.fetch_add(1, Ordering::Relaxed);
@@ -3177,7 +3490,7 @@ impl ResidencyPlanner {
     /// its spawn position, and its freed pages drain to the head.
     fn report_evicted(self: &Arc<Self>, pid: ProcessId, freed: u32) {
         self.with_inner(|inner| {
-            inner.evicting.remove(&pid);
+            inner.settle_eviction(pid);
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return;
             };
@@ -3238,7 +3551,7 @@ impl ResidencyPlanner {
         prepare_deferred: bool,
     ) {
         let signal = self.with_inner(|inner| {
-            inner.evicting.remove(&pid);
+            inner.settle_eviction(pid);
             if host_swap_full {
                 inner.host_swap_blocked.insert(pid);
             }
@@ -3517,6 +3830,8 @@ impl ResidencyPlanner {
             h2d_pages_total: self.stats.h2d_pages.load(Relaxed),
             d2h_copy_us_total: self.stats.d2h_copy_us.load(Relaxed),
             h2d_copy_us_total: self.stats.h2d_copy_us.load(Relaxed),
+            runway_rounds_total: self.stats.runway_rounds.load(Relaxed),
+            runway_pages_total: self.stats.runway_pages.load(Relaxed),
         }
     }
 
@@ -3581,6 +3896,23 @@ fn rotation_damping_enabled() -> bool {
     static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CONFIGURED.get_or_init(|| {
         !std::env::var("PIE_ROTATION_DAMPING").is_ok_and(|value| value == "0")
+    })
+}
+
+/// `PIE_SUPPLY_RUNWAY=<pages>`: the supply-phase runway target (§10.14).
+/// When nonzero the planner treats the free list itself as a demand: it
+/// starts and sizes eviction rounds so `free` is pulled back toward this
+/// many device pages, even with an empty ask queue — supply runs ahead of
+/// the decode boundary-ask stream instead of reacting to it. Absent,
+/// empty, `0`, or unparseable = off (behavior identical to before the
+/// runway existed).
+fn supply_runway_pages() -> u32 {
+    static CONFIGURED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_SUPPLY_RUNWAY")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
     })
 }
 
@@ -4165,6 +4497,14 @@ mod starvation_race_tests {
             pool.clone(),
             PlannerConfig::default(),
         ));
+        // §10.14: pin the runway latch closed so the DEMAND-EXACT arithmetic
+        // stays under test even when the verification environment exports
+        // PIE_SUPPLY_RUNWAY (the env read is a process-global OnceLock, so a
+        // test cannot scope it). With the runway off the latch is never
+        // read; nothing in this test settles an eviction, so it stays
+        // pinned. The runway's own arithmetic is covered separately by
+        // `a_runway_shortfall_starts_a_round_with_an_empty_queue`.
+        planner.with_inner(|inner| inner.runway_round_in_flight = true);
 
         // An unparked admitted runner: relief is still on its way, so the
         // fleet is not wedged.
@@ -4244,6 +4584,82 @@ mod starvation_race_tests {
         assert!(planner.supply_stalled(), "and open again once it lands");
 
         parked.abort();
+    }
+
+    /// §10.14 supply-phase runway: a free-list shortfall ALONE — empty ask
+    /// queue, nobody parked — must be able to open an eviction round, and
+    /// the round must respect its three brakes: the one-round hysteresis
+    /// latch, the completion-credit check, and the oldest-resident floor
+    /// (the clamp that keeps a onefits-sized pool from being evicted down
+    /// to nobody).
+    ///
+    /// Exercised through `runway_shortfall_set` with an explicit target:
+    /// the env read is a process-global OnceLock, so a test cannot set and
+    /// unset `PIE_SUPPLY_RUNWAY` per-case; `plan_runway` is that read plus
+    /// the transport gate in front of this exact arithmetic. (The commit
+    /// half gets no further than the victim quotes in this fixture — the
+    /// real residency registry is empty — same limit as the load-control
+    /// test above.)
+    #[test]
+    fn a_runway_shortfall_starts_a_round_with_an_empty_queue() {
+        let pool = Arc::new(RacePool::with_swap(4, 64));
+        let planner = Arc::new(ResidencyPlanner::new(
+            pool.clone() as Arc<dyn PoolPort>,
+            PlannerConfig::default(),
+        ));
+
+        // Two admitted residents; the free list and the queue are empty.
+        let elder = ProcessId::new_v4();
+        let younger = ProcessId::new_v4();
+        for pid in [elder, younger] {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+
+        let (deficit, members) = planner
+            .runway_shortfall_set(32, 0)
+            .expect("a shortfall with an empty queue must open a round");
+        assert_eq!(deficit, 32, "the round is sized to the whole shortfall");
+        assert_eq!(
+            members.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
+            vec![younger],
+            "the oldest resident is never a runway victim"
+        );
+
+        // In-flight eviction yield is supply on its way — same arithmetic
+        // as `supply_stalled` — so it shrinks the deficit page for page.
+        let mark = ProcessId::new_v4();
+        planner.with_inner(|inner| {
+            inner.evicting.insert(mark, EvictionMark { pages: 30 });
+        });
+        let (deficit, _) = planner
+            .runway_shortfall_set(32, 0)
+            .expect("a two-page residue still opens a round");
+        assert_eq!(deficit, 2, "in-flight yield funds the runway first");
+        planner.with_inner(|inner| {
+            inner.evicting.remove(&mark);
+        });
+
+        // Hysteresis: one runway-motivated round in flight at a time.
+        planner.with_inner(|inner| inner.runway_round_in_flight = true);
+        assert!(
+            planner.runway_shortfall_set(32, 0).is_none(),
+            "no second runway round until the first settles"
+        );
+
+        // A banked completion credit does NOT stand the runway down:
+        // measured on the D cell, completions bank credits continuously and
+        // a credit gate held the runway at zero rounds for whole runs.
+        // FCFS already arbitrates the yield between queued boundary asks
+        // and the victim's (still credit-gated) restore.
+        planner.with_inner(|inner| {
+            inner.runway_round_in_flight = false;
+            inner.completion_credit = 1;
+        });
+        assert!(
+            planner.runway_shortfall_set(32, 0).is_some(),
+            "a banked credit must not veto the runway (D-cell measurement)"
+        );
     }
 
     /// The destruction guard clears on BOTH of its exits, so it can never
