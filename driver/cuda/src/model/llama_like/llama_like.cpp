@@ -2321,13 +2321,35 @@ void llama_like_forward_paged(
                         // AC-4: the ATTN page views (hook-narrowed when
                         // sites ran, aliases of the raw CSRs otherwise)
                         // — hooked prefix lanes keep their page masks.
-                        ops::dispatch_attention_flashinfer_decode(
-                            *decode_plan,
-                            attn_q, kv_view, attn_out_buf,
-                            attn_page_indices, attn_page_indptr,
-                            attn_last_page_lens,
-                            attn_ws, stream, layer_window_left,
-                            /*logits_soft_cap=*/0.f, sm_scale_override);
+                        // hook×mask: the prefix decode IS the paged decode
+                        // path, and the hook rows live in it (seriation
+                        // puts masked rows in the suffix), so the score
+                        // capture rides here exactly as in the unsplit
+                        // decode arm — request ordinals start at row 0,
+                        // identical indexing.
+                        if (score_capture.active()) {
+                            ops::dispatch_attention_flashinfer_decode_capture(
+                                *decode_plan,
+                                attn_q, kv_view, attn_out_buf,
+                                attn_page_indices, attn_page_indptr,
+                                attn_last_page_lens,
+                                attn_ws, stream,
+                                score_capture.raw(),
+                                score_capture.indptr_d(),
+                                layer_window_left,
+                                /*logits_soft_cap=*/0.f, sm_scale_override);
+                            score_capture.publish(
+                                attn_page_indptr, attn_last_page_lens,
+                                cache.page_size());
+                        } else {
+                            ops::dispatch_attention_flashinfer_decode(
+                                *decode_plan,
+                                attn_q, kv_view, attn_out_buf,
+                                attn_page_indices, attn_page_indptr,
+                                attn_last_page_lens,
+                                attn_ws, stream, layer_window_left,
+                                /*logits_soft_cap=*/0.f, sm_scale_override);
+                        }
                     }
                 }
                 // BASE buffers + ABSOLUTE device CSR values at +split —
