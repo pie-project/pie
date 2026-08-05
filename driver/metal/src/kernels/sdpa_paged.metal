@@ -32,6 +32,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "sdpa_online.h"
+
 // The online softmax strides keys by BN simdgroups. The generic kernel uses
 // BN=32; the d64/page32 Llama specialization uses eight and gives simdgroup 0
 // the final cross-group reduction. The launch must match the instantiation:
@@ -162,11 +164,9 @@ template <
     for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];
     score = simd_sum(score);
 
-    U new_max = max(max_score, score);
-    U factor = fast::exp(max_score - new_max);
-    U exp_score = fast::exp(score - new_max);
-    max_score = new_max;
-    sum_exp_score = sum_exp_score * factor + exp_score;
+    U factor, exp_score;
+    sdpa_online_update(
+        score, max_score, sum_exp_score, factor, exp_score);
     for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * vptr[j];
   }
 
@@ -185,9 +185,7 @@ template <
     U orescale = 1;
     if (WITH_SINK) {
       const U sink = static_cast<U>(sinks[tid.x]);
-      const U m2 = max(new_max, sink);
-      orescale = fast::exp(new_max - m2);
-      sum_exp_score = sum_exp_score * orescale + fast::exp(sink - m2);
+      orescale = sdpa_merge_sink(sink, new_max, sum_exp_score);
     }
 
     for (int i = 0; i < v_per_thread; i++) {
@@ -211,10 +209,8 @@ template <
       if (simd_lid == 0) {
         if (WITH_SINK) {
           const U sink = static_cast<U>(sinks[tid.x]);
-          const U m2 = max(new_max, sink);
-          const U rescale = fast::exp(new_max - m2);
+          const U rescale = sdpa_merge_sink(sink, new_max, total);
           for (int s = 0; s < BN; ++s) factors[s] *= rescale;
-          total = total * rescale + fast::exp(sink - m2);
         }
         final_sum[0] = total;
       }
@@ -388,11 +384,9 @@ template <typename T, int D, int V = D, bool WITH_SINK = false>
         for (int j = 0; j < per_lane; j++) score += q[j] * static_cast<U>(kptr[j]);
         score = simd_sum(score);
 
-        const U new_max = max(max_score, score);
-        const U factor = fast::exp(max_score - new_max);
-        const U exp_score = fast::exp(score - new_max);
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
+        U factor, exp_score;
+        sdpa_online_update(
+            score, max_score, sum_exp_score, factor, exp_score);
         const threadgroup T* vptr = vbase + kk * D;
         for (int j = 0; j < per_lane; j++)
           o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[j]);
@@ -408,9 +402,7 @@ template <typename T, int D, int V = D, bool WITH_SINK = false>
   U orescale = 1;
   if (WITH_SINK) {
     const U sink = static_cast<U>(sinks[q_head]);
-    const U m2 = max(max_score, sink);
-    orescale = fast::exp(max_score - m2);
-    sum_exp_score = sum_exp_score * orescale + fast::exp(sink - m2);
+    orescale = sdpa_merge_sink(sink, max_score, sum_exp_score);
   }
 
   device T* op = out + (size_t(row) * n_q_heads + q_head) * V + simd_lid * per_lane;
