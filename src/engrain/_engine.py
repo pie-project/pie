@@ -3434,13 +3434,12 @@ class DeviceGrammar:
         words = self.mask_words or (self.vocab_size + 31) // 32
         memo_configs = min(self.max_configs, _MEMO_CONFIGS)
         memo_stride = min(self.max_stack, _MEMO_DEPTH)
-        memo_slots = _memo_slots(
-            words * 4 + memo_configs * (8 + memo_stride * 4) + 16
-        )
+        memo_slots = _memo_slots(words * 4 + memo_configs * (8 + memo_stride * 4) + 16)
         blocks = _sweep_blocks(batch)
         replayers = max(
             blocks,
-            (blocks + _CANDIDATE_THREADS - 1) // _CANDIDATE_THREADS
+            (blocks + _CANDIDATE_THREADS - 1)
+            // _CANDIDATE_THREADS
             * _CANDIDATE_THREADS,
         )
         sizes = {

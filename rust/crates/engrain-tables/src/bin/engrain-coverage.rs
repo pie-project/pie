@@ -60,8 +60,7 @@ fn main() -> Result<()> {
         }
         terminals.push(lexicon.terminals.len());
 
-        let Some(cfg) = flatten_within(&lexicon, engrain_lr::cfg::DEFAULT_PRODUCTION_BUDGET)
-        else {
+        let Some(cfg) = flatten_within(&lexicon, engrain_lr::cfg::DEFAULT_PRODUCTION_BUDGET) else {
             *reasons
                 .entry("parser: grammar exceeds the production budget".into())
                 .or_default() += 1;

@@ -194,7 +194,7 @@ pub struct CompiledGrammar {
     /// schema allows - that is the direction it must err in - so a caller that
     /// needs the schema itself has to check the finished document against
     /// these, and cannot do that without being told which they are.
-    relaxations: Vec<String>,
+    relaxations: Vec<engrain_tables::pipeline::Relaxation>,
     /// The vocabulary this was compiled against, as a digest.
     digest: u64,
 }
@@ -259,8 +259,24 @@ impl CompiledGrammar {
     }
 
     #[getter]
-    fn relaxations(&self) -> Vec<String> {
-        self.relaxations.clone()
+    /// What this grammar does not enforce, where, and what to change.
+    ///
+    /// One dictionary per finding: the keyword responsible, a JSON pointer to
+    /// the place, what the mask now admits that the schema does not, and the
+    /// edit that would enforce it. A sentence saying "this schema is relaxed"
+    /// sends an author looking; a pointer sends them to the object.
+    fn relaxations<'py>(&self, python: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.relaxations
+            .iter()
+            .map(|note| {
+                let entry = PyDict::new(python);
+                entry.set_item("keyword", &note.keyword)?;
+                entry.set_item("at", &note.at)?;
+                entry.set_item("effect", &note.effect)?;
+                entry.set_item("remedy", &note.remedy)?;
+                Ok(entry)
+            })
+            .collect()
     }
 
     #[getter]

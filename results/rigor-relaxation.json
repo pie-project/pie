@@ -1,0 +1,64 @@
+{
+  "gpu": "NVIDIA A100 80GB PCIe",
+  "answers": [],
+  "totals": {
+    "schemas": 200,
+    "relaxed": 145,
+    "notes": 1010,
+    "walks": 4000,
+    "complete": 2003,
+    "valid": 1570,
+    "invalid": 420,
+    "attributed": 420
+  },
+  "attributed": 100.0,
+  "per_keyword": {
+    "additionalProperties": {
+      "grammars declaring it": 650,
+      "grammars where it fired": 0,
+      "fires": 0.0
+    },
+    "required": {
+      "grammars declaring it": 146,
+      "grammars where it fired": 27,
+      "fires": 18.5
+    },
+    "oneOf": {
+      "grammars declaring it": 124,
+      "grammars where it fired": 0,
+      "fires": 0.0
+    },
+    "anyOf": {
+      "grammars declaring it": 50,
+      "grammars where it fired": 2,
+      "fires": 4.0
+    },
+    "properties": {
+      "grammars declaring it": 27,
+      "grammars where it fired": 0,
+      "fires": 0.0
+    },
+    "dependencies": {
+      "grammars declaring it": 6,
+      "grammars where it fired": 1,
+      "fires": 16.7
+    },
+    "not": {
+      "grammars declaring it": 5,
+      "grammars where it fired": 0,
+      "fires": 0.0
+    },
+    "items": {
+      "grammars declaring it": 1,
+      "grammars where it fired": 0,
+      "fires": 0.0
+    },
+    "multipleOf": {
+      "grammars declaring it": 1,
+      "grammars where it fired": 0,
+      "fires": 0.0
+    }
+  },
+  "undeclared": {},
+  "examples": []
+}

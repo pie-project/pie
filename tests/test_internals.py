@@ -323,11 +323,95 @@ class Approximations(unittest.TestCase):
             {"type": "array", "items": {"type": "integer"}, "uniqueItems": True}
         )
         declared = self.engine.compile_json_schema(schema).relaxations
-        self.assertTrue(any("uniqueItems" in text for text in declared))
+        self.assertTrue(any(note["keyword"] == "uniqueItems" for note in declared))
 
     def test_a_schema_that_never_mentions_them_is_not_warned_about_them(self):
         schema = json.dumps({"type": "array", "items": {"type": "integer"}})
         self.assertEqual(self.engine.compile_json_schema(schema).relaxations, [])
+
+    def test_a_note_points_at_the_place_and_says_what_to_change(self):
+        """"This schema is relaxed" sends an author looking; a pointer does not."""
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "inner": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "uniqueItems": True,
+                    }
+                },
+                "additionalProperties": False,
+            }
+        )
+        [note] = self.engine.compile_json_schema(schema).relaxations
+        self.assertEqual(note["keyword"], "uniqueItems")
+        self.assertEqual(note["at"], "#/properties/inner")
+        self.assertIn("duplicate", note["effect"])
+        # Uniqueness is not a property of a prefix, so no rewrite buys it and
+        # promising one would be worse than saying nothing.
+        self.assertEqual(note["remedy"], "")
+
+    def test_a_keyword_the_front_end_never_reads_is_declared(self):
+        """The list is closed against the specification, not against memory.
+
+        A validation keyword this front end does not lower is unenforced
+        whether or not anybody remembered to write a case for it, so the
+        declaration is driven by the keyword being in JSON Schema rather than
+        by it being in a list of things that occurred to us.
+        """
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {"a": {"type": "integer", "multipleOf": 3}},
+                "additionalProperties": False,
+            }
+        )
+        [note] = self.engine.compile_json_schema(schema).relaxations
+        self.assertEqual(note["keyword"], "multipleOf")
+        self.assertEqual(note["at"], "#/properties/a")
+
+    def test_an_extension_key_is_not_declared(self):
+        """A validator ignores it too, so it widens nothing and is noise here.
+
+        The list is the only thing standing between a widened mask and a wrong
+        document, and a list that reports harmless keys is one callers stop
+        reading.
+        """
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {"a": {"type": "integer", "x-units": "metres"}},
+                "additionalProperties": False,
+            }
+        )
+        self.assertEqual(self.engine.compile_json_schema(schema).relaxations, [])
+
+    def test_a_keyword_beside_a_choice_is_declared(self):
+        """A branch lowered on its own does not carry its siblings.
+
+        `{"required": [...], "oneOf": [...]}` means the object *and* one of the
+        branches, and lowering the branches alone throws the requirement away.
+        Measured over 200 corpus schemas, this was the last unattributed
+        over-acceptance: every invalid document a random walk produces is now
+        explained by an entry in this list.
+        """
+        schema = json.dumps(
+            {
+                "type": "object",
+                "required": ["op"],
+                "oneOf": [
+                    {"properties": {"op": {"enum": ["add"]}, "value": {}}},
+                    {"properties": {"op": {"enum": ["remove"]}}},
+                ],
+            }
+        )
+        declared = self.engine.compile_json_schema(schema).relaxations
+        beside = [note for note in declared if note["keyword"] == "required"]
+        self.assertEqual(len(beside), 1)
+        self.assertEqual(beside[0]["at"], "#")
+        self.assertIn("oneOf", beside[0]["effect"])
+        self.assertTrue(self.accepts(self.engine.compile_json_schema(schema), "{}"))
 
 
 class FusedStepThroughTheLibrary(unittest.TestCase):

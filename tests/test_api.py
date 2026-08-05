@@ -177,9 +177,10 @@ class RelaxationsAreDeclared(unittest.TestCase):
                 {"type": "object", "properties": {"a": {"type": "integer"}}}
             )
         )
-        self.assertTrue(
-            any("additionalProperties" in note for note in grammar.relaxations)
-        )
+        [note] = grammar.relaxations
+        self.assertEqual(note["keyword"], "additionalProperties")
+        self.assertEqual(note["at"], "#")
+        self.assertIn("additionalProperties", note["remedy"])
 
     def test_exact_enforces_it_and_then_declares_nothing(self):
         source = json.dumps(

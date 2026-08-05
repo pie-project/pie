@@ -143,11 +143,13 @@ class Engine:
         three methods, because which front end lowered a grammar is not
         something the rest of the API cares about.
 
-        **Read `grammar.relaxations` before you trust the mask.** It lists, in
-        words, what this grammar does *not* enforce - and it is empty when
-        there is nothing to check. The mask may admit more than the source
-        allows and never less, so a caller that needs the source itself
-        validates the finished document against exactly these.
+        **Read `grammar.relaxations` before you trust the mask.** Each entry
+        names the keyword this grammar does *not* enforce, points at it with a
+        JSON pointer, says what the mask now admits, and gives the edit that
+        would enforce it - and the list is empty when there is nothing to
+        check. The mask may admit more than the source allows and never less,
+        so a caller that needs the source itself validates the finished
+        document against exactly these.
 
         Useful options: `exact=True` on a schema enforces a declared property's
         type even where `additionalProperties` is open, at several times the

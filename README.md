@@ -76,14 +76,26 @@ grammars, and the step is still one launch.
 
 ```python
 grammar = engine.compile(json_schema=schema)
-if grammar.relaxations:
-    ...    # validate the finished document against exactly these
+for note in grammar.relaxations:
+    print(note["keyword"], "at", note["at"])
+    print(" ", note["effect"])
+    print(" ", note["remedy"] or "nothing here would fix it")
 ```
 
-The mask may admit more than the source allows and never less. `relaxations`
-says, in words, which keywords this grammar stopped enforcing and why — and is
-empty when there is nothing to check. A constrained decoder that widens a
-schema without saying so is the failure this list exists to prevent.
+```
+required at #/properties/order
+  an object here may close with properties missing: 9 are required and the
+  parser can carry 7 at once
+  require fewer properties here, or close the object with
+  `additionalProperties: false` to raise the budget
+```
+
+The mask may admit more than the source allows and never less. Each entry names
+the keyword, points at the place with a JSON pointer, says what the mask now
+admits, and gives the edit that would enforce it — and the list is empty when
+there is nothing to check. A constrained decoder that widens a schema without
+saying so is the failure this list exists to prevent; one that says only *that*
+it widened sends its author looking.
 
 ### Handing the constraint to a sampler you do not own
 

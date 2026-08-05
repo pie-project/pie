@@ -103,108 +103,346 @@ pub struct Compiled {
     pub precision: Precision,
     /// What this grammar does not enforce, so the caller knows what a
     /// downstream check still has to do.
-    pub relaxations: Vec<String>,
+    pub relaxations: Vec<Relaxation>,
 }
 
-/// What this grammar does not enforce, given the level it settled on and the
-/// keywords the schema actually uses.
+/// One thing this grammar does not enforce, where it is, and what to change.
 ///
-/// Gated on both, because a declaration is only useful if it is exact. Saying
-/// that `uniqueItems` is unenforced to a caller whose schema never mentions it
-/// teaches them to ignore the list, and the list is the only thing standing
-/// between a widened mask and a wrong document.
+/// Gated on both the level and the keywords the schema uses, because a
+/// declaration is only useful if it is exact. Saying that `uniqueItems` is
+/// unenforced to a caller whose schema never mentions it teaches them to
+/// ignore the list, and the list is the only thing standing between a widened
+/// mask and a wrong document.
 ///
 /// `oneOf` and `uniqueItems` are here whatever the level: `oneOf` means
 /// *exactly one* branch, and a mask that admits a token because some branch
 /// allows it cannot also know no other branch does; `uniqueItems` compares an
 /// item with every earlier one, which is not a property of the prefix. Both
-/// are decidable on the finished document and cheap there.
-fn relaxations(schema: &str, precision: Precision) -> Vec<String> {
-    let mut found = Vec::new();
+/// are decidable on the finished document and cheap there, which is what the
+/// remedy says.
+#[derive(Clone, Debug)]
+pub struct Relaxation {
+    /// The JSON Schema keyword responsible.
+    pub keyword: String,
+    /// A JSON pointer to where it is, so a schema author can go there.
+    pub at: String,
+    /// What the mask now admits that the schema does not.
+    pub effect: String,
+    /// What to change. Empty when there is nothing to change - `uniqueItems`
+    /// is not a property of a prefix and no rewrite makes it one.
+    pub remedy: String,
+}
+
+/// Validation keywords across the drafts that this front end does not lower.
+///
+/// Naming what is *unenforced* rather than what is enforced, and doing it from
+/// the specification rather than from the schema, is what makes the list both
+/// closed and quiet. Closed, because a keyword a validator checks and we do
+/// not is in this list by construction rather than because somebody
+/// remembered it; quiet, because a key that is not a JSON Schema keyword at
+/// all - an extension, or a `properties` map somebody forgot to wrap - is
+/// ignored by a validator too, so it widens nothing and saying so would be
+/// noise. A list that reports noise is a list callers stop reading.
+///
+/// Measured: before this, 13.8% of over-accepted documents were rejected on a
+/// keyword no entry mentioned. That is precisely the caller who reads the
+/// list, re-checks what it names, and ships a wrong document.
+/// Keywords that constrain the object a choice sits on, and are therefore lost
+/// when the choice is lowered branch by branch.
+const BESIDE_A_CHOICE: &[&str] = &[
+    "required",
+    "properties",
+    "patternProperties",
+    "additionalProperties",
+    "minProperties",
+    "maxProperties",
+    "items",
+    "prefixItems",
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "pattern",
+    "enum",
+    "const",
+];
+
+const UNLOWERED: &[&str] = &[
+    "multipleOf",
+    "dependencies",
+    "dependentRequired",
+    "dependentSchemas",
+    "not",
+    "contains",
+    "minContains",
+    "maxContains",
+    "propertyNames",
+    "if",
+    "then",
+    "else",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "$recursiveRef",
+    "$dynamicRef",
+];
+
+fn relaxations(schema: &str, precision: Precision) -> Vec<Relaxation> {
+    let mut found: Vec<Relaxation> = Vec::new();
     let Ok(value) = serde_json::from_str::<serde_json::Value>(schema) else {
         return found;
     };
-    let (mut shadowable, mut counted, mut one_of_objects, mut any_of) = (false, false, false, false);
-    let mut asks_counting = false;
-    let (mut one_of, mut unique) = (false, false);
-    let mut stack = vec![&value];
-    while let Some(node) = stack.pop() {
-        match node {
-            serde_json::Value::Object(map) => {
-                let open = !matches!(
-                    map.get("additionalProperties"),
-                    Some(serde_json::Value::Bool(false))
-                );
-                let declares = map
-                    .get("properties")
-                    .and_then(|properties| properties.as_object())
-                    .is_some_and(|properties| !properties.is_empty());
-                shadowable |= declares && open;
-                // `counted` means the schema asks for counting *and does not
-                // get it*, which is not the same as the schema asking. An
-                // order-free object enumerates subsets of its required set, so
-                // it gives up - and silently widens, per object - when that set
-                // is past its budget, when `maxProperties` is present at all,
-                // or when `minProperties` demands more than `required` names.
-                // Reporting only the precision level missed every one of these,
-                // which is how 141 of 194 corpus schemas came to accept
-                // documents their own `required` forbids without saying so.
-                let required = map
-                    .get("required")
-                    .and_then(|value| value.as_array())
-                    .map_or(0, |names| names.len());
-                let budget = if open {
-                    json_schema::UNORDERED_REQUIRED_BUDGET_OPEN
-                } else {
-                    json_schema::UNORDERED_REQUIRED_BUDGET_CLOSED
-                };
-                let minimum = map
-                    .get("minProperties")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                asks_counting |= ["required", "minProperties", "maxProperties"]
-                    .iter()
-                    .any(|keyword| map.contains_key(*keyword));
-                counted |= map.contains_key("maxProperties")
-                    || required > budget
-                    || minimum > required as u64;
-                if let Some(branches) = map.get("oneOf").and_then(|value| value.as_array()) {
-                    one_of = true;
-                    one_of_objects |= branches.len() > 1
-                        && branches.iter().all(|branch| {
-                            branch.get("properties").is_some()
-                                || branch.get("type") == Some(&serde_json::Value::from("object"))
-                        });
-                }
-                any_of |= map.contains_key("anyOf");
-                unique |= map.get("uniqueItems") == Some(&serde_json::Value::Bool(true));
-                stack.extend(map.values());
+    let mut seen: std::collections::HashSet<(String, String)> = Default::default();
+    let mut push =
+        |found: &mut Vec<Relaxation>, keyword: &str, at: &str, effect: String, remedy: &str| {
+            if seen.insert((keyword.to_string(), at.to_string())) {
+                found.push(Relaxation {
+                    keyword: keyword.to_string(),
+                    at: at.to_string(),
+                    effect,
+                    remedy: remedy.to_string(),
+                });
             }
-            serde_json::Value::Array(items) => stack.extend(items),
-            _ => {}
+        };
+
+    // The walk carries the pointer, because "this schema is relaxed" sends an
+    // author looking and "this object is" sends them to the object.
+    let mut stack = vec![(&value, String::from("#"))];
+    while let Some((node, at)) = stack.pop() {
+        if let serde_json::Value::Object(map) = node {
+            let open = !matches!(
+                map.get("additionalProperties"),
+                Some(serde_json::Value::Bool(false))
+            );
+            let declared: Vec<&String> = map
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+                .map(|properties| properties.keys().collect())
+                .unwrap_or_default();
+            if open && !declared.is_empty() && !precision.excludes_declared_names() {
+                let names: Vec<&str> = declared.iter().take(3).map(|name| name.as_str()).collect();
+                push(
+                    &mut found,
+                    "additionalProperties",
+                    &at,
+                    format!(
+                        "the declared types of {}{} are not enforced, because a \
+                             key that spells one of them also reads as an additional \
+                             property",
+                        names.join(", "),
+                        if declared.len() > 3 { ", ..." } else { "" }
+                    ),
+                    "set `additionalProperties: false` here",
+                );
+            }
+
+            let required = map
+                .get("required")
+                .and_then(|value| value.as_array())
+                .map_or(0, |names| names.len());
+            let budget = if open {
+                json_schema::UNORDERED_REQUIRED_BUDGET_OPEN
+            } else {
+                json_schema::UNORDERED_REQUIRED_BUDGET_CLOSED
+            };
+            let minimum = map
+                .get("minProperties")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let asks = ["required", "minProperties", "maxProperties"]
+                .iter()
+                .any(|keyword| map.contains_key(*keyword));
+            let over =
+                map.contains_key("maxProperties") || required > budget || minimum > required as u64;
+            if asks && (over || !precision.enforces_counting()) {
+                push(
+                    &mut found,
+                    "required",
+                    &at,
+                    format!(
+                        "an object here may close with properties missing: {required} \
+                             are required and the parser can carry {budget} at once"
+                    ),
+                    if required > budget {
+                        "require fewer properties here, or close the object with \
+                             `additionalProperties: false` to raise the budget"
+                    } else {
+                        "drop `maxProperties`, or lower `minProperties` to the \
+                             number of required names"
+                    },
+                );
+            }
+
+            if let Some(branches) = map.get("oneOf").and_then(|value| value.as_array()) {
+                push(
+                    &mut found,
+                    "oneOf",
+                    &at,
+                    "a document may satisfy more than one branch, which `oneOf` \
+                         forbids and a mask over a prefix cannot see"
+                        .to_string(),
+                    "give the branches a discriminator - a `const` on a shared \
+                         property - or use `anyOf` if more than one may match",
+                );
+                let objects = branches.len() > 1
+                    && branches.iter().all(|branch| {
+                        branch.get("properties").is_some()
+                            || branch.get("type") == Some(&serde_json::Value::from("object"))
+                    });
+                if objects && precision.merges_objects() {
+                    push(
+                        &mut found,
+                        "oneOf",
+                        &at,
+                        "the branches were merged into one object, so a document \
+                             may take properties from several of them"
+                            .to_string(),
+                        "give the branches a discriminator, which lets them stay \
+                             separate",
+                    );
+                }
+            }
+            // A choice whose branches cannot be merged is lowered branch by
+            // branch, and every keyword sitting beside it is discarded with
+            // the object it described. That is the largest relaxation the
+            // schema does not show, and it is why schema 25 of the corpus
+            // admitted `[{}]` against `required: ["op", "path"]`: the
+            // requirement lives beside a `oneOf`, not inside it.
+            //
+            // Declared per discarded keyword rather than once for the
+            // choice, because "your `required` is not enforced, here" is
+            // what an author can act on and "this object has a oneOf" is
+            // not.
+            if map.contains_key("anyOf") || map.contains_key("oneOf") {
+                let choice = if map.contains_key("oneOf") {
+                    "oneOf"
+                } else {
+                    "anyOf"
+                };
+                for key in map.keys() {
+                    if !BESIDE_A_CHOICE.contains(&key.as_str()) {
+                        continue;
+                    }
+                    push(
+                        &mut found,
+                        key,
+                        &at,
+                        format!(
+                            "`{key}` sits beside a `{choice}` whose branches may be \
+                                 lowered on their own, and a branch lowered on its own \
+                                 does not carry its siblings"
+                        ),
+                        "move it inside each branch, where it is lowered with them",
+                    );
+                }
+            }
+
+            if map.contains_key("anyOf") {
+                push(
+                    &mut found,
+                    "anyOf",
+                    &at,
+                    "a document may satisfy no branch: the mask admits any \
+                         prefix some branch allows, and whether a branch can \
+                         still be completed is not a property of a prefix"
+                        .to_string(),
+                    "give the branches a discriminator - a `const` on a \
+                         shared property - so the first token picks one",
+                );
+                if !precision.merges_branches() {
+                    push(
+                        &mut found,
+                        "anyOf",
+                        &format!("{at}/anyOf"),
+                        "the branches do not inherit the keywords beside them".to_string(),
+                        "move the sibling keywords inside each branch",
+                    );
+                }
+            }
+            // Anything the lowering does not read is unenforced, and the
+            // list has to be closed rather than a set of cases somebody
+            // remembered. Measured: naming keywords one at a time left
+            // 13.8% of over-accepted documents rejected on a keyword no
+            // entry mentioned, which is exactly the caller who reads the
+            // list, checks what it says, and ships a wrong document.
+            for key in map.keys() {
+                if !UNLOWERED.contains(&key.as_str()) {
+                    continue;
+                }
+                push(
+                    &mut found,
+                    key,
+                    &at,
+                    format!("`{key}` is not lowered, so nothing here enforces it"),
+                    "remove it and check it on the finished document instead",
+                );
+            }
+
+            if map.get("uniqueItems") == Some(&serde_json::Value::Bool(true)) {
+                push(
+                    &mut found,
+                    "uniqueItems",
+                    &at,
+                    "duplicate items are admitted: uniqueness compares an item \
+                         with every earlier one, which a prefix does not know"
+                        .to_string(),
+                    "",
+                );
+            }
+
+            // Descend only where a schema can be. `default` and `examples`
+            // hold documents, `enum` holds values, and `required` holds
+            // names - walking into those would read a property name as a
+            // keyword and report it as unenforced, which is how a closed
+            // list becomes a list nobody reads.
+            for (key, child) in map {
+                match key.as_str() {
+                    "properties" | "patternProperties" | "$defs" | "definitions"
+                    | "dependentSchemas" => {
+                        if let Some(entries) = child.as_object() {
+                            for (name, value) in entries {
+                                stack.push((value, format!("{at}/{key}/{name}")));
+                            }
+                        }
+                    }
+                    "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                        if let Some(entries) = child.as_array() {
+                            for (index, value) in entries.iter().enumerate() {
+                                stack.push((value, format!("{at}/{key}/{index}")));
+                            }
+                        }
+                    }
+                    "items"
+                    | "additionalItems"
+                    | "additionalProperties"
+                    | "unevaluatedProperties"
+                    | "unevaluatedItems"
+                    | "not"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "contains"
+                    | "propertyNames" => {
+                        if child.is_object() {
+                            stack.push((child, format!("{at}/{key}")));
+                        } else if let Some(entries) = child.as_array() {
+                            for (index, value) in entries.iter().enumerate() {
+                                stack.push((value, format!("{at}/{key}/{index}")));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
-    if shadowable && !precision.excludes_declared_names() {
-        found.push(json_schema::SHADOWED.to_string());
-    }
-    if asks_counting && (counted || !precision.enforces_counting()) {
-        found.push(json_schema::COUNTING.to_string());
-    }
-    if one_of_objects && precision.merges_objects() {
-        found.push(json_schema::MERGED.to_string());
-    }
-    if any_of && !precision.merges_branches() {
-        found.push(json_schema::SIBLINGS.to_string());
-    }
-    if one_of {
-        found.push(
-            "oneOf exclusivity is not enforced: a document may satisfy more than one branch"
-                .to_string(),
-        );
-    }
-    if unique {
-        found.push("uniqueItems is not enforced".to_string());
-    }
+    found.sort_by(|one, other| (&one.at, &one.keyword).cmp(&(&other.at, &other.keyword)));
     found
 }
 

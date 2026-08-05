@@ -23,11 +23,11 @@ pub mod pipeline;
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
-use rayon::prelude::*;
 use engrain_lex::lexicon::Lexicon;
 use engrain_lex::{Lexer, VocabularyGroups};
 use engrain_lr::cfg::Cfg;
 use engrain_lr::tables::Tables;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 
@@ -456,8 +456,7 @@ fn precompute_verdicts(
     let mut stride = Vec::with_capacity(lexer_states);
     let mut words = 0usize;
     for state in 0..lexer_states {
-        let groups =
-            (group_offsets[state + 1] - group_offsets[state]) as usize;
+        let groups = (group_offsets[state + 1] - group_offsets[state]) as usize;
         let row = groups.div_ceil(16);
         stride.push(row as u32);
         words += row * parser_states;

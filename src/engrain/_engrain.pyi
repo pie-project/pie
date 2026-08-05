@@ -42,8 +42,13 @@ class CompiledGrammar:
     """Tables for one grammar, against one vocabulary."""
 
     @property
-    def relaxations(self) -> list[str]:
+    def relaxations(self) -> list[dict[str, str]]:
         """Exactly what this grammar does not enforce, and empty when nothing.
+
+        One entry per finding, with `keyword` (the JSON Schema keyword
+        responsible), `at` (a JSON pointer to the place in the schema),
+        `effect` (what the mask now admits that the schema does not) and
+        `remedy` (the edit that would enforce it, empty where no edit would).
 
         A mask may admit more than the grammar allows and never less, so a
         caller needing the grammar itself checks the finished document against
