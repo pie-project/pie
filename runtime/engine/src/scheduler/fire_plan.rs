@@ -399,31 +399,57 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
         )
     });
 
-    #[cfg(debug_assertions)]
+    // The Act-2 cutover sentinel (north-star-dsl.md "the cutover
+    // trigger"): the first admitted combination whose Gray order
+    // diverges from the lexicographic order is the signal to land the
+    // Gray reorder + (start, len) consumers + gather together. It must
+    // run IN PRODUCTION — a debug-only sentinel can never fire where
+    // the combinations actually arrive — so it is gated on the one
+    // cheap precondition that makes divergence possible at all: at
+    // least two distinct axis-bit patterns in the group. Homogeneous
+    // groups (nearly every step) skip both the sort and the compare.
     {
-        let mut gray_order: Vec<usize> = (0..members.len()).collect();
-        gray_order.sort_by_key(|&i| {
-            (
-                members[i].device_resolved_geometry,
-                gray_rank(axis_bits(&members[i])),
-                std::cmp::Reverse(members[i].max_layers.unwrap_or(u32::MAX)),
-                !members[i].multi_token,
-                members[i].arrival,
-            )
-        });
-        if member_order != gray_order {
-            // NOT an assert: a hooked+truncated lane coexisting with a
-            // plain hooked one already ranks differently under Gray
-            // (011 before 010). The sentinel's job is DETECTION — the
-            // fire still runs on the lexicographic order the window
-            // consumers contract for; this line is the signal to bring
-            // the Gray reorder and the (start, len) consumer
-            // generalization in together.
-            eprintln!(
-                "[seriation] gray/lex divergence: lex={member_order:?} \
-                 gray={gray_order:?} — a combination outside the \
-                 nesting set is live"
-            );
+        let mut seen_bits: u32 = 0;
+        let mut patterns = 0u32;
+        for member in members {
+            let bit = 1u32 << (axis_bits(member) & 31);
+            if seen_bits & bit == 0 {
+                seen_bits |= bit;
+                patterns += 1;
+            }
+        }
+        if patterns > 1 {
+            let mut gray_order: Vec<usize> = (0..members.len()).collect();
+            gray_order.sort_by_key(|&i| {
+                (
+                    members[i].device_resolved_geometry,
+                    gray_rank(axis_bits(&members[i])),
+                    std::cmp::Reverse(members[i].max_layers.unwrap_or(u32::MAX)),
+                    !members[i].multi_token,
+                    members[i].arrival,
+                )
+            });
+            if member_order != gray_order {
+                // NOT an assert: a hooked+truncated lane coexisting with a
+                // plain hooked one already ranks differently under Gray
+                // (011 before 010). The sentinel's job is DETECTION — the
+                // fire still runs on the lexicographic order the window
+                // consumers contract for; this line is the signal to bring
+                // the Gray reorder and the (start, len) consumer
+                // generalization in together. Latched once per process:
+                // the design needs the EVENT, not a per-step stream (a
+                // masked-full + masked-truncated wave diverges on every
+                // step it recurs).
+                static FIRED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[seriation] gray/lex divergence: lex={member_order:?} \
+                         gray={gray_order:?} — a combination outside the \
+                         nesting set is live"
+                    );
+                }
+            }
         }
     }
     let hook_members = members.iter().filter(|m| m.hook_program).count();
