@@ -84,7 +84,7 @@ struct LlamaPsos {
     /// at each of the two widths `moe_tile_rows` can pick. The row tile is
     /// whatever the sort padded to and the two must agree, which is why both
     /// are compiled rather than one chosen here.
-    Pso qmm_routed[2][3]{};  // [tile width][bn]
+    Pso qmm_routed[3][3]{};  // [tile width][bn]
 
     bool dense_valid() const {
         return sdpa.valid() && sdpa_paged.valid() &&
@@ -96,9 +96,12 @@ struct LlamaPsos {
     bool moe_valid() const {
         return router_topk.valid() && qmv_routed.valid() &&
                moe_sort.valid() && moe_gather.valid() && moe_combine.valid() &&
-               qmm_routed[0][0].valid() && qmm_routed[0][1].valid() &&
-               qmm_routed[0][2].valid() && qmm_routed[1][0].valid() &&
-               qmm_routed[1][1].valid() && qmm_routed[1][2].valid();
+               [&] {
+                   for (int t = 0; t < 3; ++t)
+                       for (int i = 0; i < 3; ++i)
+                           if (!qmm_routed[t][i].valid()) return false;
+                   return true;
+               }();
     }
     /// A dense checkpoint must not be held to the MoE PSOs: compiling them for
     /// a model that never dispatches them would make an unrelated shader error

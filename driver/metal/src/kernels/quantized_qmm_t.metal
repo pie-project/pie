@@ -1711,6 +1711,39 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 /// stall, so the spare tiles have to be dispatched and then decline. The return
 /// is uniform across the threadgroup, which is what makes it safe to take
 /// before the barriers inside the impl.
+///
+/// The worst case is the ALLOCATION's problem and not the arithmetic's, which
+/// is worth saying because the two are easy to confuse. `moe_sorted_rows` is
+/// pessimistic by design -- at 448 rows of top-4 over 32 experts it asks for
+/// 2784 sorted rows where 1792 carry a token -- but the surplus tiles decline
+/// above and cost a threadgroup launch rather than a GEMM. What the arithmetic
+/// actually pays is each expert's own run rounded up, which for a router that
+/// spreads evenly is nearer 14% than the bound's 55%.
+///
+/// And the mixture's kernel is not the slow one. Measured with `roofline_probe`
+/// at the expert shape K=N=2880, GFLOP/s, against the affine kernel it shares
+/// an inner loop with:
+///
+///     BM=16    affine 2741    mxfp4 3141
+///     BM=32    affine 3741    mxfp4 4002
+///
+/// and 4504 at BM=64. MXFP4 is ahead of affine at every width.
+///
+/// In situ it does not reach that. A 1024-row gpt-oss prefill puts 128 rows in
+/// each of 32 experts, which BM=64 covers in two whole tiles with NO padding at
+/// all, and the 72 dispatches then run 4892 GFLOP in 1.289 s: 3796 GFLOP/s,
+/// 16% under the probe. The difference is not bandwidth -- the same fire moves
+/// 10.2 GB of expert weight, which is 7.9 GB/s and nowhere near any roof -- it
+/// is that the probe reads ONE expert over and over where a mixture reads
+/// thirty-two. A threadgroup here reuses its weight slice across the tiles of
+/// its own expert and no further, which at two tiles an expert is a reuse of
+/// two.
+///
+/// So the remaining gap to a dense prefill is that reuse and one other thing:
+/// the input cannot be staged to FP16. Not for the reason first written here --
+/// see `llama_bench`'s gpt-oss row, whose answers turn out not to be mlx-lm's
+/// either -- but because under FP16 this checkpoint tracks mlx-lm for two
+/// tokens where BF16 tracks it for four.
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
 [[kernel]] void affine_qmm_t_routed(
     const device uint32_t* w   [[buffer(0)]],
@@ -1887,6 +1920,9 @@ instantiate_mxfp4_qmm_t_routed(16, 64)
 instantiate_mxfp4_qmm_t_routed(32, 16)
 instantiate_mxfp4_qmm_t_routed(32, 32)
 instantiate_mxfp4_qmm_t_routed(32, 64)
+instantiate_mxfp4_qmm_t_routed(64, 16)
+instantiate_mxfp4_qmm_t_routed(64, 32)
+instantiate_mxfp4_qmm_t_routed(64, 64)
 
 #define instantiate_qmm_t_fp16_precast(bm, bn)                              \
   template [[host_name("affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_"   \

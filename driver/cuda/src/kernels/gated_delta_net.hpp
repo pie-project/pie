@@ -265,37 +265,6 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     cudaStream_t stream, bool write_state = true,
     const std::uint8_t* write_state_mask = nullptr);
 
-// Warp-tiled small-T variant. Four warps per block process four V rows for a
-// single (request, head), keeping each lane's K-fragment of recurrent state in
-// registers across the short verification window.
-void launch_chunk_gated_delta_prefill_batched_warp_tiled(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    float*       state_base,
-    const std::int32_t*  slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long    slot_stride_elems,
-    float*       out,
-    int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state = true,
-    const std::uint8_t* write_state_mask = nullptr);
-void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    void*        state_base,
-    const std::int32_t*  slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long    slot_stride_elems,
-    float*       out,
-    int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state = true,
-    const std::uint8_t* write_state_mask = nullptr);
 
 // Same warp-tiled small-T recurrence, but Q/K are stored with fewer heads
 // than V and are repeated logically (`V_h % K_h == 0`). This avoids

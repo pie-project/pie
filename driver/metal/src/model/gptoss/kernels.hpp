@@ -47,7 +47,7 @@ struct GptOssPsos {
     Pso qmv_tail{};
     Pso qmv_tail_bias{};
     Pso qmv_routed_bias{};
-    Pso qmm_routed_bias[2][3]{};  // [tile width][bn]
+    Pso qmm_routed_bias[3][3]{};  // [tile width][bn]
     /// The router's matvec, at whatever width the checkpoint quantized it to.
     /// `mlx_lm`'s predicate usually keeps it at 8 bits while everything else
     /// goes to 4, but a uniformly-quantized checkpoint ships a 4-bit one. Same

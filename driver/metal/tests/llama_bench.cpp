@@ -578,6 +578,20 @@ int main(int argc, char** argv) {
             // a global mxfp4 g32 that most of its tensors then override back to
             // affine g64. The key is what the config says, not what any one
             // tensor is, which is the same thing every other row's group means.
+            //
+            // These answers are NOT mlx-lm's, whatever the Gemma-4-26B comment's
+            // "every other row" says. Fed the same twelve ids, mlx-lm greedy
+            // answers 13 279 410 12038 142760 1328 -- the same four tokens and
+            // then a different fifth. So this row is pinned to an arithmetic
+            // like the 26B's is, and the same care applies to moving it.
+            //
+            // That is what stops the dense projections from taking the FP16
+            // GEMM the other families take. It is worth ~4.5% here, and the
+            // objection is measured rather than assumed: activation taps say
+            // FP16 costs about one bf16 ulp per projection, which is ordinary,
+            // but under it this checkpoint tracks mlx-lm for TWO tokens where
+            // BF16 tracks it for four. A ulp that halves the agreement with the
+            // only outside reference there is has not earned the 4.5%.
             {"gpt-oss-20b", 24, 32, 4, 2880, 32, {13, 279, 410, 12038, 410, 25},
              {785, 6722, 315, 9625, 1455, 12095}},
             // The same Llama-3.2-1B at 8 bits. It is here because it is the
