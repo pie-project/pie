@@ -31,8 +31,12 @@ int main(int argc, char** argv) {
     if (argc > 5) facts.quant_bits = std::uint32_t(std::atoi(argv[5]));
     if (argc > 6) facts.quant_group_size = std::uint32_t(std::atoi(argv[6]));
     try {
+        // The descriptor is what crosses now. A real boot forwards the
+        // artifact's own `pie.model/1`; this states the handful of fields a
+        // family reads and lets the same helper the tests use synthesize one.
         auto plan = pie::metal::compile_load_plan(
-            dir, pie::metal::metal_device_target(), model_type, facts);
+            dir, pie::metal::metal_device_target(),
+            pie::metal::descriptor_for_testing(model_type, facts));
         const auto& view = plan.view();
         const auto gib = [](std::uint64_t bytes) {
             return double(bytes) / double(1ull << 30);

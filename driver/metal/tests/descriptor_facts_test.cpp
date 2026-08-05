@@ -11,7 +11,6 @@
 // at zero is not "unknown", it is "four bits" -- and an 8-bit checkpoint served
 // as an artifact would be decoded by 4-bit kernels with nothing to say so.
 #include <cstdio>
-#include <fstream>
 #include <string>
 
 #include "model_facts.hpp"
@@ -22,13 +21,6 @@ int g_pass = 0, g_fail = 0;
 void expect(bool ok, const std::string& what) {
     if (ok) { ++g_pass; std::printf("  PASS  %s\n", what.c_str()); }
     else    { ++g_fail; std::printf("  FAIL  %s\n", what.c_str()); }
-}
-
-std::string write_descriptor(const std::string& name, const std::string& body) {
-    const std::string path = std::string(PIE_METAL_TEST_TMP_DIR) + "/" + name;
-    std::ofstream out(path);
-    out << body;
-    return path;
 }
 
 }  // namespace
@@ -47,7 +39,7 @@ int main() {
       "quant_group_size": 64
     })";
     const auto facts = pie::metal::read_model_facts_from_descriptor(
-        write_descriptor("eight_bit.json", eight_bit));
+        eight_bit);
     expect(facts.has_value(), "a pie.model/1 descriptor is accepted");
     if (facts) {
         expect(facts->model_type == "llama", "model_type crosses");
@@ -66,7 +58,7 @@ int main() {
       "num_hidden_layers": 16
     })";
     const auto plain = pie::metal::read_model_facts_from_descriptor(
-        write_descriptor("unquantized.json", unquantized));
+        unquantized);
     expect(plain.has_value(), "a descriptor without a quant block is accepted");
     if (plain) {
         expect(plain->quant_bits == 0 && plain->quant_group_size == 0,
@@ -76,9 +68,7 @@ int main() {
     // Not a descriptor at all: a raw `config.json` has no `version`, and
     // reading one here would report HF's field names as pie's.
     const std::string foreign = R"({"model_type": "llama", "quant_bits": 8})";
-    expect(!pie::metal::read_model_facts_from_descriptor(
-               write_descriptor("foreign.json", foreign))
-                .has_value(),
+    expect(!pie::metal::read_model_facts_from_descriptor(foreign).has_value(),
            "a JSON object without pie.model/1 is refused");
 
     std::printf("%d passed, %d failed\n", g_pass, g_fail);

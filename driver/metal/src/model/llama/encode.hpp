@@ -73,7 +73,8 @@ int llama_qmm_pool_rows(int max_rows);
 int llama_moe_pairs(const LlamaGeometry& g, int rows);
 
 /// The rows the sort pads each expert's run to: 1 leaves the routed
-/// projections matvecs, `shared_kernels::kMoeTileRows` makes them matmuls.
+/// projections matvecs, and `shared_kernels::moe_tile_rows`'s answer -- 16 or
+/// 32, by the batch and the expert count -- makes them matmuls.
 ///
 /// One question in one place. The sort kernel, the three projections' launch
 /// shapes, their pipeline choice and the pool sizer all have to give the same
@@ -92,6 +93,11 @@ bool llama_is_dense_proj(Kind k);
 
 /// The GEMM's column tile for a dense projection, or 0 to keep the matvec.
 int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows, int requests = 1);
+
+/// The column tile a dispatch actually LAUNCHES: `llama_qmm_bn`'s answer where
+/// the split is behind it, and the unsplit rule where it is not. Two functions
+/// because `llama_qmm_split` reads the first one and cannot read this one.
+int llama_qmm_bn_for(Kind k, const LlamaGeometry& g, int rows, int requests = 0);
 
 /// The K partitions a dense projection's GEMM takes, or 1 for no split.
 ///

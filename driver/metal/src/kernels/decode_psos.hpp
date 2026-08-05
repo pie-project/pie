@@ -65,6 +65,11 @@ struct MultiBatchPsos {
     Pso gdn_recurrent_slotted{}; // gdn_core_recurrent_slotted_bfloat16
     Pso sdpa_paged{};      // sdpa_paged_decode_bfloat16_d_256          (page-table gather)
     Pso sdpa_paged_d512{}; // sdpa_paged_decode_bfloat16_d_512          (gemma4 full-attn)
+    // Same attention, one simdgroup per row instead of one threadgroup, with
+    // the keys staged once per 32-row tile. Earned by row count and request
+    // count together -- see `sdpa_should_tile`.
+    Pso sdpa_paged_tiled{};      // sdpa_paged_tiled_bfloat16_d_256
+    Pso sdpa_paged_tiled_d512{}; // sdpa_paged_tiled_bfloat16_d_512
     Pso kv_append_paged{}; // kv_append_paged_bfloat16                  (page-table scatter write)
     // affine_qmm_t: MLX's steel quantized GEMM, for the batched decode. [0] is
     // BN=32, [1] is BN=64. Selected only above `qmm_min_batch()`.
@@ -85,11 +90,11 @@ struct MultiBatchPsos {
     // Split-K: [bm_wide] x {gemm, reduce}.  MLX sends every transposed
     // non-batched decode down this path; the split is chosen per shape.
     /// The mixture's batched form: the same GEMM with the weight stack indexed
-    /// per TILE rather than per dispatch. `bm` is fixed at `kMoeTileRows`,
-    /// because that is what the sort padded every expert's run to -- a tile
-    /// that spanned two experts would read one expert's weights for the
-    /// other's rows. Three column tiles, as elsewhere.
-    Pso qmm_routed[3]{};
+    /// per TILE rather than per dispatch. `bm` is whichever width the sort
+    /// padded every expert's run to -- a tile that spanned two experts would
+    /// read one expert's weights for the other's rows -- so both widths are
+    /// compiled and the fire picks. Three column tiles at each, as elsewhere.
+    Pso qmm_routed[2][3]{};  // [tile width][bn]
     Pso qmm_t_splitk[3]{};
     Pso qmm_t_splitk_f32[3]{};
     // FP16-compute counterparts, with bf16 or float partials respectively.
