@@ -257,6 +257,16 @@ pub struct KvStore {
     /// via [`Self::retire_idle`] when nothing is in flight.
     seq: u64,
     in_flight: u64,
+    /// Sequences of prepared writes that have not settled yet. Freed pages
+    /// tagged at epoch E are safe to reuse once every fire that could still
+    /// name them — those prepared at or before E — has settled, so the pool
+    /// retires through `min(outstanding) - 1` (or `seq` when nothing is in
+    /// flight). Tracking the set rather than a counter is what lets a
+    /// completion's pages return within a wave instead of waiting for a
+    /// moment of GLOBAL quiescence, which at high concurrency never comes:
+    /// that wait was measured as a 4.5 ms per-completion supply drip
+    /// (analysis.md 10.16-10.17).
+    outstanding: std::collections::BTreeSet<u64>,
 }
 
 #[cfg(test)]
@@ -306,6 +316,7 @@ impl KvStore {
             indexes: HashMap::new(),
             seq: 0,
             in_flight: 0,
+            outstanding: std::collections::BTreeSet::new(),
         }
     }
 
@@ -320,10 +331,24 @@ impl KvStore {
         self.seq
     }
 
-    /// Retire everything immediately when no prepared write is in flight.
+    /// Retire every recycle epoch that no in-flight fire can still name.
+    ///
+    /// A page freed at epoch E may sit in the device translation of a fire
+    /// prepared at or before E, so E is retirable exactly when the oldest
+    /// unsettled sequence is greater than E. With nothing in flight the whole
+    /// pending set retires.
     pub fn retire_idle(&mut self) {
+        // Nothing in flight: everything retires, and the tracking set is
+        // resynced — `settle` drops `in_flight` without knowing its own
+        // sequence (its paired `retire_through` supplies that), so this is
+        // also the self-heal for any unpaired settle.
         if self.in_flight == 0 {
+            self.outstanding.clear();
             self.pool.retire_through(self.seq);
+            return;
+        }
+        if let Some(&oldest) = self.outstanding.iter().next() {
+            self.pool.retire_through(oldest.saturating_sub(1));
         }
     }
 
@@ -847,6 +872,7 @@ impl KvStore {
 
         self.seq += 1;
         self.in_flight += 1;
+        self.outstanding.insert(self.seq);
         Ok(KvPreparedWrite {
             ws,
             targets,
@@ -958,6 +984,7 @@ impl KvStore {
         self.pool
             .recycle_after_epoch(prepared.allocated, prepared.seq);
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.outstanding.remove(&prepared.seq);
         self.retire_idle();
     }
 
@@ -987,8 +1014,9 @@ impl KvStore {
         self.retire_idle();
     }
 
-    /// Retire completion epochs `<= epoch`, making recycled slots allocatable.
-    pub fn retire_through(&mut self, _epoch: u64) {
+    /// Settle `epoch`'s fire and retire every recycle epoch it was gating.
+    pub fn retire_through(&mut self, epoch: u64) {
+        self.outstanding.remove(&epoch);
         self.retire_idle();
     }
 
