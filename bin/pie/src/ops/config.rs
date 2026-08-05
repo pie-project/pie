@@ -696,7 +696,7 @@ fn unset(global: &startup::GlobalArgs, key: String) -> Result<Answer> {
     // unset" for `serrver.port` tells the operator their edit took effect.
     schema_field(&root, &key)?;
     if !remove_nested(&mut root, &key)? {
-        return Ok(Answer::did(format!("{key} was already unset")));
+        return Ok(Answer::noop(format!("{key} was already unset")));
     }
     let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
     // A removal can be invalid too -- a required key has no derived form.

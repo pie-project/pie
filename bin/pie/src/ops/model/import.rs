@@ -148,7 +148,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         if args.delete_source {
             println!("  (--delete-source has nothing to do: the source is the artifact)");
         }
-        return Ok(crate::ui::Answer::did(format!(
+        return Ok(crate::ui::Answer::noop(format!(
             "{} is already pie's own format; nothing to convert",
             source.name
         )));
@@ -163,21 +163,28 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
                 out_file.display()
             );
         } else {
-            // An artifact already standing in for the source is exactly the
-            // situation the flag describes, so honor it here too.
-            if args.delete_source {
-                if args.dry_run {
-                    report_would_delete(&metadata);
-                    return Ok(crate::ui::Answer::quiet());
-                }
-                delete_source(&source.name, &metadata, &out_file)?;
-                return Ok(crate::ui::Answer::quiet());
-            }
-            return Ok(crate::ui::Answer::did(format!(
+            // Said in every branch, because it is the answer to what the user
+            // asked. Under `--delete-source` it used to be printed here and
+            // then the delete reported underneath it; folding the two into one
+            // return dropped it, so the flag turned "nothing was rebuilt" into
+            // silence at exactly the moment source files are being deleted.
+            let up_to_date = format!(
                 "{} is up to date at {}",
                 source.name,
                 crate::ui::short_path(&out_file)
-            )));
+            );
+            // An artifact already standing in for the source is exactly the
+            // situation the flag describes, so honor it here too.
+            if args.delete_source {
+                println!("{up_to_date}");
+                if args.dry_run {
+                    report_would_delete(&metadata);
+                    return Ok(crate::ui::Answer::noop("dry run: nothing was deleted"));
+                }
+                delete_source(&source.name, &metadata, &out_file)?;
+                return Ok(crate::ui::Answer::did("deleted the source files"));
+            }
+            return Ok(crate::ui::Answer::noop(up_to_date));
         }
     }
 
@@ -225,7 +232,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         if args.delete_source {
             report_would_delete(&metadata);
         }
-        return Ok(crate::ui::Answer::did(format!(
+        return Ok(crate::ui::Answer::noop(format!(
             "dry run: would write {}",
             crate::ui::short_path(&out_file)
         )));

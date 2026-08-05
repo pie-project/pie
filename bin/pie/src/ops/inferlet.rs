@@ -104,7 +104,12 @@ fn open(registry_url: String) -> Repository {
 }
 
 /// The inferlets on this disk.
+///
+/// `transparent`, so this serializes as the bare array it was before the
+/// report type existed. There is nothing to carry alongside the list, and a
+/// wrapper object would have broken `jq '.[0].name'` to hold one field.
 #[derive(serde::Serialize)]
+#[serde(transparent)]
 pub struct InferletList {
     inferlets: Vec<CachedInferlet>,
 }
@@ -174,7 +179,7 @@ async fn download(args: TargetArgs, global: &startup::GlobalArgs) -> Result<Answ
     let name = resolve_inferlet_id(&args.inferlet, &cfg.server.registry).await?;
     let mut repo = open(cfg.server.registry.clone());
     if repo.exists(&name) {
-        return Ok(Answer::did(format!(
+        return Ok(Answer::noop(format!(
             "{}@{} was already downloaded",
             name.name, name.version
         )));
@@ -222,11 +227,11 @@ async fn remove(args: TargetArgs) -> Result<Answer> {
             }
         }
     };
-    Ok(Answer::did(if repo.remove(&name)? {
-        format!("removed {}@{}", name.name, name.version)
+    Ok(if repo.remove(&name)? {
+        Answer::did(format!("removed {}@{}", name.name, name.version))
     } else {
-        format!("{}@{} was not downloaded", name.name, name.version)
-    }))
+        Answer::noop(format!("{}@{} was not downloaded", name.name, name.version))
+    })
 }
 
 async fn info(args: InfoArgs, global: &startup::GlobalArgs) -> Result<Answer> {

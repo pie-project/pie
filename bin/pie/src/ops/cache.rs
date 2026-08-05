@@ -206,7 +206,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<Answer> {
         .collect();
 
     if present.is_empty() {
-        return Ok(Answer::did("nothing to clear"));
+        return Ok(Answer::noop("nothing to clear"));
     }
 
     let total: u64 = present.iter().map(|(_, size)| *size).sum();
@@ -222,7 +222,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<Answer> {
             present.len()
         );
         if !ui::confirm(&question, "pie cache clear --yes")? {
-            return Ok(Answer::did("aborted; nothing was deleted"));
+            return Ok(Answer::noop("aborted; nothing was deleted"));
         }
     }
 

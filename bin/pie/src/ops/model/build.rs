@@ -390,7 +390,7 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
         None => store_path(&optimized),
     };
     if args.dry_run {
-        return Ok(crate::ui::Answer::did(format!(
+        return Ok(crate::ui::Answer::noop(format!(
             "dry run: would write {}",
             crate::ui::short_path(&out_file)
         )));

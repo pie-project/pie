@@ -389,8 +389,24 @@ impl crate::ui::Report for TuneReport {
 
         match (self.winner, self.gain_percent) {
             (Some(winner), Some(gain)) => {
+                // The two numbers the percentage is a ratio of. A bare "12.3%
+                // better" cannot be sanity-checked against the table above it,
+                // and this line is the one an operator copies into a decision.
+                let ranked = |c: &Candidate| {
+                    if self.ranked_by_throughput {
+                        c.throughput_tok_s
+                    } else {
+                        c.lane_p95_ms
+                    }
+                };
+                let from = self.candidates.iter().find(|c| c.current).map(ranked);
+                let to = self.candidates.iter().find(|c| c.winner).map(ranked);
+                let change = match (from, to) {
+                    (Some(from), Some(to)) => format!(" ({from:.0} -> {to:.0})"),
+                    _ => String::new(),
+                };
                 println!(
-                    "  k={} submit={} dispatch={} beats the current config by {gain:.1}% on {}.",
+                    "  k={} submit={} dispatch={} beats the current config by {gain:.1}% on {}{change}.",
                     winner.frame_size, winner.submit_depth, winner.dispatch_depth, self.ranked_by
                 );
                 if self.wrote {

@@ -208,11 +208,17 @@ impl crate::ui::Report for ModelList {
                 palette.dim("(none — `pie model import <org>/<name>`)")
             );
         }
-        let mut table = Table::new([Align::Left, Align::Right, Align::Left], 1);
+        // Four columns, not three. Folding the tensor count in with the
+        // provenance put all three facts in the column `Table` cuts to fit, so
+        // an 80-column terminal lost the tensor count *and* the source. Only
+        // the last column is ever cut, so only the least load-bearing fact --
+        // where it came from, which `pie model info` prints in full -- is at
+        // risk.
+        let mut table = Table::new([Align::Left, Align::Right, Align::Right, Align::Left], 1);
         for artifact in &self.artifacts {
             let shards = match artifact.shards {
                 0 => String::new(),
-                n => format!(", {n} shards"),
+                n => format!(" +{n}"),
             };
             let from = artifact
                 .source
@@ -231,7 +237,8 @@ impl crate::ui::Report for ModelList {
                 [
                     artifact.name.clone(),
                     crate::ui::bytes(artifact.bytes),
-                    format!("{} tensors{shards}  {from}{by}", artifact.tensors),
+                    format!("{} tensors{shards}", artifact.tensors),
+                    format!("{from}{by}"),
                 ],
             ));
         }
@@ -645,7 +652,7 @@ fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
             &format!("pie model remove {name} --yes"),
         )?
     {
-        return Ok(Answer::did("aborted; nothing was removed"));
+        return Ok(Answer::noop("aborted; nothing was removed"));
     }
 
     crate::local::store::remove(&entry)?;

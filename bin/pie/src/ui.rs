@@ -683,7 +683,8 @@ pub struct Answer {
 
 enum Kind {
     Quiet,
-    Did(String),
+    /// `bool` is whether anything actually changed. See [`Answer::noop`].
+    Did(bool, String),
     // `Send`, because the ops that block run on `spawn_blocking` and the answer
     // crosses back over that boundary. A report is plain data, so saying so
     // costs nothing.
@@ -696,9 +697,24 @@ impl Answer {
         Self::of(Kind::Quiet)
     }
 
-    /// One result line: what the command did.
+    /// One result line: what the command changed. Marked [`Mark::Did`].
     pub fn did(text: impl Into<String>) -> Self {
-        Self::of(Kind::Did(text.into()))
+        Self::of(Kind::Did(true, text.into()))
+    }
+
+    /// One result line for a command that changed **nothing** — it was already
+    /// in the asked-for state, the user declined the prompt, or `--dry-run` was
+    /// on.
+    ///
+    /// Unmarked, because `Mark::Did` means "the command did something" and
+    /// these did not. Printing `✓ aborted; nothing was deleted` says the
+    /// opposite of what happened, and it is the same glyph the tables use for
+    /// success. The distinction was there before this type existed -- the
+    /// no-op lines printed bare while `set`/`unset`/`download` printed a `✓` --
+    /// and collapsing the two is a regression this constructor exists to
+    /// prevent, since a caller now has to pick one.
+    pub fn noop(text: impl Into<String>) -> Self {
+        Self::of(Kind::Did(false, text.into()))
     }
 
     /// A document.
@@ -734,9 +750,20 @@ pub fn present(answer: Answer, json: bool) -> anyhow::Result<()> {
     let palette = Palette::for_stream(Stream::Stdout);
     match answer.kind {
         Kind::Quiet => Ok(()),
-        Kind::Did(line) if json => emit_json(&serde_json::json!({ "did": line })),
-        Kind::Did(line) => {
+        // `changed` rather than the message alone: "already downloaded" and
+        // "downloaded" are both successes and a script has to tell them apart
+        // without reading English.
+        Kind::Did(changed, line) if json => {
+            emit_json(&serde_json::json!({ "changed": changed, "message": line }))
+        }
+        Kind::Did(true, line) => {
             println!("{} {line}", Mark::Did.render(&palette));
+            Ok(())
+        }
+        Kind::Did(false, line) => {
+            // Indented to the same column as a marked line, so a run of result
+            // lines still aligns and the marked ones are what the eye finds.
+            println!("{} {line}", Mark::Plain.render(&palette));
             Ok(())
         }
         Kind::Report(report) if json => emit_json(&report.to_json()?),
