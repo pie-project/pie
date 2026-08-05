@@ -595,23 +595,31 @@ __global__ void compose_fixed_decode(
     const FixedDecodeLane* descriptor =
         valid ? &lanes[lane] : nullptr;
 
+    std::uint32_t entry_kill_reason = 0;
     if (valid) {
         const auto* commit =
             fixed_decode_pointer<std::uint32_t>(
             descriptor->pass_commit);
-        valid = commit != nullptr && *commit != 0;
+        if (commit == nullptr || *commit == 0) {
+            valid = false;
+            entry_kill_reason = 8;
+        }
         for (std::size_t port = 0;
              port < kFixedDecodePortCount;
              ++port) {
             const auto* ready =
                 fixed_decode_pointer<std::uint8_t>(
                     descriptor->ready[port]);
-            if (ready != nullptr && *ready == 0) valid = false;
+            if (ready != nullptr && *ready == 0) {
+                valid = false;
+                if (entry_kill_reason == 0) entry_kill_reason = 9;
+            }
         }
         const auto* token_source =
             fixed_decode_pointer<std::uint32_t>(descriptor->token);
         if (token_source == nullptr) {
             valid = false;
+            if (entry_kill_reason == 0) entry_kill_reason = 10;
         } else {
             token = *token_source;
             sentinel =
@@ -623,6 +631,7 @@ __global__ void compose_fixed_decode(
     std::uint32_t kv_len = 1;
     std::uint32_t write_page = output.dummy_page;
     std::uint32_t write_offset = 0;
+    std::uint32_t kill_reason = entry_kill_reason;
     if (valid && !sentinel) {
         const auto* page_indptr =
             fixed_decode_pointer<std::uint32_t>(
@@ -647,6 +656,7 @@ __global__ void compose_fixed_decode(
             w_slot == nullptr || w_off == nullptr ||
             page_indptr[0] != 0) {
             valid = false;
+            kill_reason = 1;
         } else {
             page_count = page_indptr[1];
             kv_len = *kv_len_source;
@@ -663,24 +673,36 @@ __global__ void compose_fixed_decode(
                           output.page_size;
             if (page_count == 0 ||
                 page_count > descriptor->pages_capacity ||
-                page_count > descriptor->translation_len ||
-                page_count != expected_pages ||
-                logical_write_page >= descriptor->translation_len ||
-                write_offset >= output.page_size ||
-                logical_write_position < descriptor->write_lower_bound ||
-                logical_write_position >=
-                    descriptor->write_upper_bound) {
+                page_count > descriptor->translation_len) {
                 valid = false;
+                kill_reason = 2;
+            } else if (page_count != expected_pages) {
+                valid = false;
+                kill_reason = 3;
+            } else if (logical_write_page >= descriptor->translation_len ||
+                       write_offset >= output.page_size) {
+                valid = false;
+                kill_reason = 4;
+            } else if (logical_write_position <
+                           descriptor->write_lower_bound ||
+                       logical_write_position >=
+                           descriptor->write_upper_bound) {
+                valid = false;
+                kill_reason = 5;
             } else {
                 write_page = translation[logical_write_page];
-                if (write_page >= output.device_pages) valid = false;
+                if (write_page >= output.device_pages) {
+                    valid = false;
+                    kill_reason = 6;
+                }
                 for (std::uint32_t page = 0;
-                     page < page_count;
+                     valid && page < page_count;
                      ++page) {
                     const std::uint32_t logical_page = pages[page];
                     if (logical_page >= descriptor->translation_len ||
                         translation[logical_page] >= output.device_pages) {
                         valid = false;
+                        kill_reason = 7;
                         break;
                     }
                 }
@@ -701,6 +723,9 @@ __global__ void compose_fixed_decode(
         }
         if (output.chain_kills != nullptr) {
             atomicAdd(output.chain_kills, 1u);
+            if (kill_reason >= 1 && kill_reason <= 10) {
+                atomicAdd(output.chain_kills + kill_reason, 1u);
+            }
         }
         page_count = 1;
         kv_len = 1;
@@ -7808,10 +7833,10 @@ bool Dispatch::enqueue_fixed_decode(
     // (the mirror copy below is async on the launch stream), then arm this
     // batch's counter.
     if (state.d_fixed_decode_kills == nullptr) {
-        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kills, sizeof(std::uint32_t)));
-        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kills, 0, sizeof(std::uint32_t)));
-        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kills, sizeof(std::uint32_t)));
-        *state.h_fixed_decode_kills = 0;
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kills, 16 * sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kills, 0, 16 * sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kills, 16 * sizeof(std::uint32_t)));
+        std::memset(state.h_fixed_decode_kills, 0, 16 * sizeof(std::uint32_t));
     }
     if (const std::uint32_t seen = *state.h_fixed_decode_kills;
         seen > state.fixed_decode_kills_reported) {
@@ -7821,7 +7846,14 @@ bool Dispatch::enqueue_fixed_decode(
         state.stats.fixed_decode_chain_kills += fresh;
         std::cerr << "[pie-driver-cuda] fixed-decode compose FAIL-STOPPED "
                   << fresh << " lane(s): geometry/containment inconsistency; "
-                  << "the affected chains are killed (successors dummy-run)\n";
+                  << "the affected chains are killed (successors dummy-run)"
+                  << " reasons[null,cap,pages!=expected,wbounds,lease,"
+                  << "wxlate,pxlate,commit,ready,token]=";
+        for (int reason = 1; reason <= 10; ++reason) {
+            std::cerr << (reason == 1 ? "" : ",")
+                      << state.h_fixed_decode_kills[reason];
+        }
+        std::cerr << "\n";
     }
 
     const FixedDecodeLane* device_lanes =
@@ -7863,7 +7895,7 @@ bool Dispatch::enqueue_fixed_decode(
     CUDA_CHECK(cudaMemcpyAsync(
         state.h_fixed_decode_kills,
         state.d_fixed_decode_kills,
-        sizeof(std::uint32_t),
+        16 * sizeof(std::uint32_t),
         cudaMemcpyDeviceToHost,
         staged.stream));
     state.fixed_decode_upload.mark_used(staged.stream);
