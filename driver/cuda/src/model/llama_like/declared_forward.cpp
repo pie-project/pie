@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include "model/declared/depth_window.hpp"
+#include "model/declared/arms.hpp"
 #include "model/declared/weights.hpp"
 #include "batch/supergraph.hpp"
 #include "kernels/add_bias.hpp"
@@ -1908,14 +1909,7 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::Swiglu: {
-            if (gate_up_used_fused) {
-                kernels::launch_chunked_swiglu_bf16(
-                    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-            } else {
-                kernels::launch_swiglu_bf16(
-                    ws.gate.data(), ws.up.data(), ws.gate.data(),
-                    N * I, stream);
-            }
+            declared::arm_swiglu(ws, gate_up_used_fused, N, I, stream);
             break;
         }
         case PieForwardOpKind::ResidualAdd: {
