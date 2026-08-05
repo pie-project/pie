@@ -551,13 +551,22 @@ fn typed_by_schema(
     schema_field(&parsed, &normalize_key(key))?;
     let mut errors: Vec<anyhow::Error> = Vec::new();
     for candidate in candidates(value) {
+        // Validated on a plain re-serialization, but *written* from a
+        // `toml_edit` document so the file keeps its comments. The two carry
+        // the same assignment; only the formatting differs.
         let mut root: toml::Value =
             toml::from_str(content).map_err(|e| anyhow!("parse config: {e}"))?;
         set_nested(&mut root, key, candidate.clone())?;
         let serialized =
             toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
         match crate::derive::derive_standalone(&serialized) {
-            Ok(_) => return Ok((serialized, candidate)),
+            Ok(_) => {
+                let mut doc: toml_edit::DocumentMut = content
+                    .parse()
+                    .map_err(|e| anyhow!("parse config: {e}"))?;
+                set_nested_doc(&mut doc, key, &candidate)?;
+                return Ok((doc.to_string(), candidate));
+            }
             Err(error) => errors.push(error),
         }
     }
@@ -594,6 +603,15 @@ fn is_type_mismatch(error: &anyhow::Error) -> bool {
 /// validation error names the field's real type.
 fn candidates(value: &str) -> Vec<toml::Value> {
     let mut out = Vec::new();
+    // A literal in TOML's own syntax, read first because it is the only
+    // spelling that can denote a value the heuristics below cannot: an array
+    // (`["metal:0"]`), an inline table, or a string that would otherwise be
+    // read as a number. Without it `config set driver.device '["metal:0"]'`
+    // fell through to the string reading and the file got the brackets stored
+    // as text, while the confirmation line printed an array.
+    if let Some(parsed) = parse_toml_literal(value) {
+        out.push(parsed);
+    }
     match value.to_ascii_lowercase().as_str() {
         "true" => out.push(toml::Value::Boolean(true)),
         "false" => out.push(toml::Value::Boolean(false)),
@@ -614,7 +632,27 @@ fn candidates(value: &str) -> Vec<toml::Value> {
         ));
     }
     out.push(toml::Value::String(value.to_string()));
+    out.dedup();
     out
+}
+
+/// Read the argument as a TOML value literal, or `None` if it is not one.
+///
+/// Restricted to the bracketed and quoted forms on purpose. Every bare literal
+/// (`8080`, `true`, `1.5`) already has a reading below, and letting this
+/// function claim them first would change nothing except the order errors are
+/// reported in.
+fn parse_toml_literal(value: &str) -> Option<toml::Value> {
+    let trimmed = value.trim();
+    let bracketed = (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        || (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2);
+    if !bracketed {
+        return None;
+    }
+    let table: toml::Value = toml::from_str(&format!("value = {trimmed}")).ok()?;
+    table.get("value").cloned()
 }
 
 /// `pie config edit` -- `$EDITOR`, then validate before keeping the result.
@@ -827,6 +865,80 @@ fn step<'a>(
         table.insert(part.to_string(), toml::Value::Table(Default::default()));
     }
     Ok(table.get_mut(part).unwrap())
+}
+
+/// The same edit as `set_nested`, applied to a document that remembers how it
+/// was written.
+///
+/// `config init` writes a heavily commented file, and those comments *are* the
+/// documentation -- "delete a line to get the default back" only means
+/// something while the line explaining it is still there. Re-serializing a
+/// `toml::Value` throws every one of them away, so the first `config set`
+/// turned the annotated file into a bare table. `toml_edit` keeps the original
+/// bytes for everything it did not touch, so only the assigned value moves.
+fn set_nested_doc(doc: &mut toml_edit::DocumentMut, key: &str, value: &toml::Value) -> Result<()> {
+    let key = normalize_key(key);
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.is_empty() {
+        bail!("empty key");
+    }
+
+    let mut cursor = doc.as_table_mut();
+    for (i, part) in parts.iter().take(parts.len() - 1).enumerate() {
+        let entry = cursor
+            .entry(part)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        cursor = entry
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("{} is not a table", parts[..=i].join(".")))?;
+    }
+
+    let last = parts[parts.len() - 1];
+    let item = edit_item(value)?;
+    // Assigning through the existing entry keeps its decor -- the comment above
+    // the key and any trailing one on the same line survive the write.
+    match cursor.get_mut(last) {
+        Some(slot) => {
+            let decor = slot.as_value().map(|v| v.decor().clone());
+            *slot = item;
+            if let (Some(decor), Some(v)) = (decor, slot.as_value_mut()) {
+                *v.decor_mut() = decor;
+            }
+        }
+        None => {
+            cursor.insert(last, item);
+        }
+    }
+
+    if parts.len() >= 2 {
+        for (old, new) in RENAMED_KEYS {
+            let (old_table, stale) = old.rsplit_once('.').expect("renamed keys are dotted");
+            let (_, current) = new.rsplit_once('.').expect("renamed keys are dotted");
+            if last == current && parts[parts.len() - 2] == old_table {
+                cursor.remove(stale);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Carry a `toml::Value` across into `toml_edit` by way of its TOML text.
+///
+/// The two crates have separate value types with no conversion between them,
+/// and the candidate readings in `candidates` are `toml::Value`. Round-tripping
+/// through the serialized form is exact for every shape a config field can
+/// hold.
+fn edit_item(value: &toml::Value) -> Result<toml_edit::Item> {
+    let mut wrapper = toml::value::Table::new();
+    wrapper.insert("value".to_string(), value.clone());
+    let text = toml::to_string(&toml::Value::Table(wrapper))
+        .map_err(|e| anyhow!("serialize value: {e}"))?;
+    let doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e| anyhow!("re-parse value: {e}"))?;
+    doc.get("value")
+        .cloned()
+        .ok_or_else(|| anyhow!("value did not round-trip"))
 }
 
 #[cfg(test)]
@@ -1105,5 +1217,75 @@ arch_name = "qwen3"
         assert!(!remove_nested(&mut root, "nothing.here").unwrap());
         assert!(get_nested(&root, "server.port").is_none());
         assert!(get_nested(&root, "model.name").is_some());
+    }
+
+    /// C3: an array literal lands in the file as an array.
+    ///
+    /// `pie config set driver.device '["metal:0"]'` used to print
+    /// `= ["metal:0"]` and write `device = '["metal:0"]'` -- a string whose
+    /// text happens to look like an array. The confirmation hid it, and the
+    /// next boot read a one-element device list named `["metal:0"]`.
+    #[test]
+    fn an_array_literal_is_stored_as_an_array() {
+        let (written, chosen) =
+            typed_by_schema(fixture(), "driver.device", r#"["metal:0"]"#).unwrap();
+        assert_eq!(
+            chosen,
+            toml::Value::Array(vec![toml::Value::String("metal:0".into())])
+        );
+        let back: toml::Value = toml::from_str(&written).unwrap();
+        assert_eq!(
+            get_nested(&back, "driver.device")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1),
+            "written file should hold an array, got: {written}"
+        );
+    }
+
+    /// A quoted literal is a string even when its text parses as a number, so
+    /// there is a way to say "the string 3" that does not depend on the
+    /// schema's opinion.
+    #[test]
+    fn a_quoted_literal_is_a_string() {
+        assert_eq!(
+            candidates(r#""42""#).first().unwrap(),
+            &toml::Value::String("42".into())
+        );
+    }
+
+    /// C4: comments survive a `config set`.
+    ///
+    /// `config init` writes the documentation as comments, and the file was
+    /// re-serialized from a `toml::Value` -- which has nowhere to keep them.
+    /// One `config set` erased the entire explanation.
+    #[test]
+    fn setting_a_value_keeps_the_comments_around_it() {
+        let annotated = r#"# pie configuration
+# Delete a line to get the default back.
+
+[server]
+# The port the engine listens on.
+port = 8080
+
+[model]
+name = "default"
+model = "Qwen/Qwen3-0.6B"
+
+[driver]
+type = "dummy"          # trailing note
+device = ["cpu"]
+vocab_size = 151936
+arch_name = "qwen3"
+"#;
+        let (written, _) = typed_by_schema(annotated, "server.port", "9090").unwrap();
+        assert!(written.contains("# pie configuration"), "got: {written}");
+        assert!(
+            written.contains("# The port the engine listens on."),
+            "got: {written}"
+        );
+        assert!(written.contains("# trailing note"), "got: {written}");
+        assert!(written.contains("port = 9090"), "got: {written}");
+        assert!(!written.contains("port = 8080"), "got: {written}");
     }
 }

@@ -13,7 +13,8 @@ use pie_worker::driver_ffi::{self, Flavor};
 
 /// Render the default `config.toml`.
 pub fn default_config_content() -> String {
-    let driver_block = match driver_ffi::default_flavor() {
+    let flavor = driver_ffi::default_flavor();
+    let driver_block = match flavor {
         #[cfg(feature = "driver-cuda")]
         Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
         #[cfg(feature = "driver-metal")]
@@ -26,7 +27,15 @@ pub fn default_config_content() -> String {
         // land here → the dummy block.
         _ => DUMMY_DRIVER_BLOCK,
     };
-    format!("{HEADER}{driver_block}{TAIL}")
+    let model_block = match flavor {
+        // Metal's llama path binds `.weight`/`.scales`/`.biases` for every
+        // matvec and has no unquantized kernel, so the stock bf16 default
+        // imports fine and then cannot bind at load. A default has to run.
+        #[cfg(feature = "driver-metal")]
+        Some(Flavor::Metal) => METAL_MODEL_BLOCK,
+        _ => DEFAULT_MODEL_BLOCK,
+    };
+    format!("{HEADER}{model_block}{driver_block}{TAIL}")
 }
 
 const HEADER: &str = r#"# Pie configuration, written by `pie config init`. Edit freely.
@@ -46,9 +55,23 @@ telemetry = false
 # max_upload      = "256MiB"
 # python_snapshot = true
 
-[model]
+"#;
+
+const DEFAULT_MODEL_BLOCK: &str = r#"[model]
 name = "default"
 model = "Qwen/Qwen3-0.6B"
+# weight_cache_dir = ""       # empty derives $PIE_HOME/models
+"#;
+
+/// Metal's llama path is 4-bit-only, so the default names a quantized repo.
+#[cfg(feature = "driver-metal")]
+const METAL_MODEL_BLOCK: &str = r#"[model]
+name = "default"
+# Metal's llama path is 4-bit-only: every matvec binds `.weight`/`.scales`/
+# `.biases`, and there is no unquantized kernel to fall back to. So the default
+# is an MLX-quantized checkpoint -- a raw bf16 repo (e.g. `Qwen/Qwen3-0.6B`)
+# imports fine and then fails to bind at load.
+model = "mlx-community/Qwen3-0.6B-4bit"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/models
 "#;
 
