@@ -25,9 +25,19 @@ T optional(const nlohmann::json& j, const char* key, T default_value) {
 // Qwen3-specific signal: HF marks `use_qk_norm` implicitly via model_type.
 // Some other archs use the same flag explicitly. Until we add per-arch
 // metadata, derive it here.
+//
+// The list must stay in step with the Metal driver's own inference
+// (`driver/metal/src/model_facts.cpp`, `ll_qk_norm`) and the family table in
+// `driver/metal/src/model/facts.hpp`. A checkpoint that silently runs WITHOUT
+// q/k norm produces fluent, plausible, wrong tokens, so a missing entry here
+// is not a crash, it is a quiet accuracy regression.
 bool infer_qk_norm(const std::string& model_type, const nlohmann::json& j) {
     if (j.contains("use_qk_norm")) return j["use_qk_norm"].get<bool>();
-    return model_type == "qwen3" || model_type == "qwen3_5";
+    return model_type == "qwen3" || model_type == "qwen3_moe" ||
+           model_type == "qwen3_5" || model_type == "qwen3_5_text" ||
+           model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text" ||
+           model_type == "qwen3_next" || model_type == "qwen3_next_text" ||
+           model_type == "qwen3_6";
 }
 
 }  // namespace
@@ -187,6 +197,20 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
             cfg.rope_original_max_position =
                 optional<int>(s, "original_max_position_embeddings",
                               cfg.max_position_embeddings);
+        } else if ((rope_type == "linear" || rope_type == "default") &&
+                   s.contains("factor")) {
+            // Linear scaling is the plain geometric series with positions
+            // divided by `factor`, so the KIND stays `None`. The factor is
+            // still a real numeric fact and has to survive normalization:
+            // dropping it makes an imported artifact disagree with the same
+            // checkpoint read as a raw `config.json`, and the difference only
+            // shows past the original context length.
+            //
+            // Gated on `factor` being present: a bare `rope_type: "default"`
+            // (which Qwen3.5 ships) declares no scaling at all, and must stay
+            // `has_rope_scaling = false`.
+            cfg.has_rope_scaling = true;
+            cfg.rope_factor      = optional<float>(s, "factor", 1.0f);
         }
     }
 

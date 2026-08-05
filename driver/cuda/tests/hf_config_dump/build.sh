@@ -45,8 +45,10 @@ find_nlohmann() {
 }
 
 inc="$(find_nlohmann)"
+# `${a[@]+"${a[@]}"}` rather than a bare `"${a[@]}"`: macOS ships bash 3.2,
+# where expanding an EMPTY array under `set -u` is an unbound-variable error.
 args=(-std=c++20 -O1 -o "$out"
-      "$main" "$driver/src/model/config.cpp" "${extra[@]}"
+      "$main" "$driver/src/model/config.cpp" ${extra[@]+"${extra[@]}"}
       -I "$driver/src" -I "$here")
 [[ -n "$inc" ]] && args+=(-I "$inc")
 
