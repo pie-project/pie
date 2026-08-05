@@ -53,6 +53,7 @@ from common import (
     finish,
     hf_chat_prompts_and_counts,
     make_prompts,
+    request_max_tokens,
     summarize,
 )
 
@@ -180,11 +181,11 @@ async def run(args: argparse.Namespace):
     async with maybe_server(args, batch) as base_url:
         endpoint = base_url.rstrip("/") + "/v1/completions"
 
-        async def one(prompt: str, prompt_count: int) -> RequestResult:
+        async def one(prompt: str, prompt_count: int, max_tokens: int) -> RequestResult:
             payload = {
                 "model": args.model,
                 "prompt": prompt,
-                "max_tokens": args.max_tokens,
+                "max_tokens": max_tokens,
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "stream": False,
@@ -232,17 +233,31 @@ async def run(args: argparse.Namespace):
                         await asyncio.sleep(wait / 1000.0)
                 raise AssertionError("unreachable: the loop returns on every path")
 
+        # Indexed by ABSOLUTE prompt index and sliced with the same
+        # `[warmup:]` slice as `prompts`, so a request can never be paired
+        # with another request's output budget. This harness sent a flat
+        # `args.max_tokens` to every request while pie honoured the per-request
+        # budget, which meant every `--mixed-phase` and `--output-spread` shape
+        # compared two different amounts of work and called it a speed
+        # difference. Same precedent, same indexing as `sglang_bench.py`.
+        budgets = [request_max_tokens(args, i) for i in range(len(prompts))]
+
         for i in range(args.warmup):
-            await one(prompts[i], prompt_counts[i])
+            await one(prompts[i], prompt_counts[i], budgets[i])
 
         run_prompts = prompts[args.warmup:]
         run_counts = prompt_counts[args.warmup:]
+        run_budgets = budgets[args.warmup:]
         start = time.perf_counter()
         if args.mode == "latency":
-            results = [await one(p, c) for p, c in zip(run_prompts, run_counts)]
+            results = [
+                await one(p, c, m)
+                for p, c, m in zip(run_prompts, run_counts, run_budgets)
+            ]
         else:
             results = await asyncio.gather(
-                *(one(p, c) for p, c in zip(run_prompts, run_counts))
+                *(one(p, c, m)
+                  for p, c, m in zip(run_prompts, run_counts, run_budgets))
             )
         wall = time.perf_counter() - start
 

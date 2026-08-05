@@ -16,6 +16,7 @@ from common import (
     finish,
     hf_chat_prompts_and_counts,
     make_prompts,
+    request_max_tokens,
     summarize,
 )
 
@@ -86,10 +87,10 @@ async def run(args: argparse.Namespace):
     async with maybe_server(args) as base_url:
         endpoint = base_url.rstrip("/") + "/v1/completions"
 
-        async def one(prompt: str, prompt_count: int) -> RequestResult:
+        async def one(prompt: str, prompt_count: int, max_tokens: int) -> RequestResult:
             payload = {
                 "prompt": prompt,
-                "max_tokens": args.max_tokens,
+                "max_tokens": max_tokens,
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
@@ -110,17 +111,28 @@ async def run(args: argparse.Namespace):
             except Exception as e:
                 return RequestResult(False, time.perf_counter() - start, 0, error=f"{type(e).__name__}: {e}")
 
+        # Indexed by ABSOLUTE prompt index and sliced with the same
+        # `[warmup:]` slice as `prompts`; see the note in `mlx_bench.py`. A
+        # flat budget here against pie's per-request one compared two
+        # different amounts of work under every unequal-budget shape.
+        budgets = [request_max_tokens(args, i) for i in range(len(prompts))]
+
         for i in range(args.warmup):
-            await one(prompts[i], prompt_counts[i])
+            await one(prompts[i], prompt_counts[i], budgets[i])
 
         run_prompts = prompts[args.warmup:]
         run_counts = prompt_counts[args.warmup:]
+        run_budgets = budgets[args.warmup:]
         start = time.perf_counter()
         if args.mode == "latency":
-            results = [await one(p, c) for p, c in zip(run_prompts, run_counts)]
+            results = [
+                await one(p, c, m)
+                for p, c, m in zip(run_prompts, run_counts, run_budgets)
+            ]
         else:
             results = await asyncio.gather(
-                *(one(p, c) for p, c in zip(run_prompts, run_counts))
+                *(one(p, c, m)
+                  for p, c, m in zip(run_prompts, run_counts, run_budgets))
             )
         wall = time.perf_counter() - start
 
