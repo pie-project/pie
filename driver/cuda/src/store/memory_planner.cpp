@@ -931,8 +931,8 @@ CudaMemoryPlan plan_cuda_memory(
                           << (budget / (1024 * 1024)) << " MiB ("
                           << static_cast<int>(drift * 100.0)
                           << "% apart); the measurement does not describe this "
-                          << "machine, so the scored rule decides. Re-run with "
-                          << "[driver] calibrate_planner if the change is "
+                          << "machine, so the scored rule decides. Re-run "
+                          << "`pie config optimize` if the change is "
                           << "permanent, or free the device if it is not.\n";
                 measured.reset();
             }

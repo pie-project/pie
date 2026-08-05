@@ -291,12 +291,8 @@ pub fn report(
         println!("  {skipped} candidate(s) not measured (--budget). The report ranks only what ran.");
     }
     println!();
-    println!(
-        "  Not searched: kv_page_size, max_forward_tokens and max_forward_requests are"
-    );
-    println!(
-        "  fixed at boot and belong to the driver's own sweep (`[driver] calibrate_planner`)."
-    );
+    println!("  Not searched: kv_page_size, max_forward_tokens and max_forward_requests are");
+    println!("  fixed at boot, and belong to stage 1 above rather than to this sweep.");
 }
 
 /// One lane's input. A bare integer makes the `generate` family decode that
@@ -326,6 +322,17 @@ pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
     Ok(content)
 }
 
+/// When the planner profile was last written, or `None` if it is not there.
+///
+/// Modification time and length together: a calibration that replaces an entry
+/// with one the same size still moves the mtime, and a filesystem with coarse
+/// mtime still changes the length when the numbers differ. Either alone has a
+/// case where a real write looks like no write.
+fn written_at(profile: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(profile).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 /// Measure the memory planner on this device, in its own boot.
 ///
 /// **This is why `calibrate_planner` is not a config key.** It is one run of a
@@ -340,6 +347,14 @@ pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
 /// pool that leaves. That is the right arena to measure the forward step in and
 /// the wrong one to measure anything else in, so it goes away before stage two
 /// opens a fresh one from the profile it just wrote.
+///
+/// **The cost is a second weight load, and that is not free.** The premise the
+/// frame-knob sweep is built on is that boots are expensive and knob changes
+/// are not — a TB-scale model spends minutes loading — so a command that boots
+/// twice spends those minutes twice. There is no way around it while the arena
+/// is decided at boot: the two stages need different ones. What there is, is
+/// `--skip-planner`, which is the right flag for every run after the first on a
+/// machine whose forward step has not changed.
 async fn calibrate_planner(content: &str) -> Result<()> {
     let (controller, gateway, mut worker) = crate::derive::derive_standalone(content)?;
     worker.server.calibrate_planner = true;
@@ -422,11 +437,26 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
         println!("  a cached measurement if one applies, the analytic score otherwise.");
     } else {
         println!("Stage 1/2  calibrating the memory planner (one boot, serves nothing)");
+        // Said before it is paid, not after. The two stages need two different
+        // arenas and therefore two boots, which on a large model is the weight
+        // load twice -- and the whole reason the frame-knob sweep reuses one
+        // boot is that weight loads are the expensive part.
+        println!("  This boots the model a second time; `--skip-planner` reuses an earlier one.");
+        let profile = pie_worker::state::planner_profile_path();
+        // Observed, not assumed. The driver REFUSES to calibrate for
+        // `tensor_parallel_size > 1` and for recurrent-state models, saying so
+        // on stderr and booting normally -- so a successful boot is not a
+        // measurement, and claiming "written to ..." after one would be this
+        // command telling an operator it did something it did not.
+        let before = written_at(&profile);
         calibrate_planner(&content).await?;
-        println!(
-            "  written to {}",
-            crate::ui::short_path(&pie_worker::state::planner_profile_path())
-        );
+        if written_at(&profile) == before {
+            println!("  no measurement was recorded -- the driver declined to calibrate");
+            println!("  (it refuses for tensor_parallel_size > 1 and recurrent-state models;");
+            println!("   its reason is on stderr above). Stage 2 runs against the scored shape.");
+        } else {
+            println!("  written to {}", crate::ui::short_path(&profile));
+        }
     }
     println!();
     println!("Stage 2/2  sweeping the frame knobs inside that arena");

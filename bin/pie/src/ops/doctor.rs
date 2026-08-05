@@ -322,9 +322,10 @@ fn check_gpus() -> Vec<(String, String, Status)> {
 /// measured?
 ///
 /// The plan's §7 makes this mandatory rather than nice. `pie config optimize`
-/// and `[driver] calibrate_planner` write values that pin the forward shape and
-/// the batching policy; a machine where neither has run gets the analytic
-/// planner's judgement, which is a model of the machine rather than the machine.
+/// writes both of the things below: its first stage measures the forward shape
+/// and its second the batching knobs. A machine where it has not run gets the
+/// analytic planner's judgement, which is a model of the machine rather than
+/// the machine.
 /// That is a perfectly serviceable state -- it is what every deployment has had
 /// until now -- but it is not one an operator should have to infer from the
 /// absence of keys in a file.
@@ -406,7 +407,7 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
     } else {
         (
             "planner profile".to_string(),
-            "none; the forward step has never been timed here (`[driver] calibrate_planner`)"
+            "none; the forward step has never been timed here (`pie config optimize` measures it)"
                 .to_string(),
             Status::Warn,
         )

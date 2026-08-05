@@ -29,11 +29,11 @@ use std::path::PathBuf;
 /// Named here — the one filename this module spells out — because it is the
 /// only thing under `cache/` that a boot does **not** re-derive. Every sibling
 /// (compiled PTIR, GEMM autotuning) is rebuilt on the next cold start; this
-/// file is written *only* by a boot that was explicitly asked to calibrate
-/// (`[driver] calibrate_planner`), which costs a dedicated startup and serves
-/// nothing while it runs. Clearing it with the rest would look like reclaiming
-/// a cache and would actually discard a measurement, so it is its own entry
-/// with its own reclaim policy.
+/// file is written *only* by a boot that was explicitly asked to calibrate,
+/// which is stage one of `pie config optimize` and costs a dedicated startup
+/// that serves nothing. Clearing it with the rest would look like reclaiming a
+/// cache and would actually discard a measurement, so it is its own entry with
+/// its own reclaim policy.
 ///
 /// The C++ side owns the spelling (`store/planner_profile_cache.cpp`); this is
 /// the one place the Rust side repeats it, and `pie doctor` reads it from here
@@ -189,9 +189,9 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
             // `pie cache clear` would read as reclaiming a cache and would in
             // fact throw away a measurement of this machine.
             what: "The forward step as measured on THIS machine, read by the \
-                   planner instead of its analytic score. Only a \
-                   `[driver] calibrate_planner` boot writes it -- serving \
-                   never does, so losing it costs another calibration run.",
+                   planner instead of its analytic score. Only `pie config \
+                   optimize` writes it -- serving never does, so losing it \
+                   costs another calibration run.",
             reclaim: Reclaim::OnRequest,
             keep: &[],
         },
@@ -416,9 +416,9 @@ mod tests {
     /// The planner profile is never swept up by a bare `pie cache clear`.
     ///
     /// It sits under `cache/` with the compiled modules and the GEMM tuning,
-    /// and reads like one more derived thing. It is not: only a
-    /// `[driver] calibrate_planner` boot writes it, so clearing it discards a
-    /// measurement that no amount of serving brings back.
+    /// and reads like one more derived thing. It is not: only `pie config
+    /// optimize` writes it, so clearing it discards a measurement that no
+    /// amount of serving brings back.
     #[test]
     fn the_planner_profile_is_not_reclaimed_by_default() {
         let profile = entries(None)

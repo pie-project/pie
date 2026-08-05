@@ -160,15 +160,7 @@ pub fn arguments_to_input(arguments: &[String]) -> String {
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
-        // A lone `-` is a filename convention, not a flag.
-        let key = match argument.strip_prefix("--") {
-            Some(key) if !key.is_empty() => Some(key.replace('-', "_")),
-            _ => match argument.strip_prefix('-') {
-                Some(key) if key.len() == 1 => Some(key.to_string()),
-                _ => None,
-            },
-        };
-        let Some(key) = key else {
+        let Some(key) = flag_key(argument) else {
             positional.push(typed(argument));
             index += 1;
             continue;
@@ -176,7 +168,7 @@ pub fn arguments_to_input(arguments: &[String]) -> String {
         // The next word is this flag's value unless it is itself a flag --
         // which is what makes `--stream --prompt hi` two arguments and not one.
         match arguments.get(index + 1) {
-            Some(next) if !next.starts_with('-') => {
+            Some(next) if !is_flag(next) => {
                 object.insert(key, typed(next));
                 index += 2;
             }
@@ -193,6 +185,39 @@ pub fn arguments_to_input(arguments: &[String]) -> String {
         );
     }
     serde_json::Value::Object(object).to_string()
+}
+
+/// Whether a token introduces a flag rather than being a value.
+///
+/// The leading `-` is not enough on its own, because a negative number wears
+/// one. `--seed -1` read `-1` as a flag, so the seed became `true` and a key
+/// named `1` appeared beside it -- two wrong arguments out of one correct
+/// invocation, and no complaint from anything. Faithfully ported from the
+/// Python command, which had the same rule and the same bug.
+///
+/// A lone `-` stays a value: it is the filename convention for stdin, and
+/// nothing spells a flag that way.
+fn is_flag(token: &str) -> bool {
+    token.starts_with('-') && token.len() > 1 && token.parse::<f64>().is_err()
+}
+
+/// The field name a flag token carries, or `None` if it is not a flag.
+fn flag_key(token: &str) -> Option<String> {
+    if !is_flag(token) {
+        return None;
+    }
+    match token.strip_prefix("--") {
+        // `--max-tokens` is how a flag is spelled, `max_tokens` is how a field
+        // is.
+        Some(key) if !key.is_empty() => Some(key.replace('-', "_")),
+        // `-k value`. Longer single-dash clusters (`-abc`) are not a spelling
+        // this ever supported, so they stay whole and land in `_positional`
+        // rather than being invented into three flags.
+        _ => match token.strip_prefix('-') {
+            Some(key) if key.len() == 1 => Some(key.to_string()),
+            _ => None,
+        },
+    }
 }
 
 /// Integer, then float, then boolean, then string.
@@ -307,11 +332,13 @@ async fn drive(
     // Streamed, not collected. An inferlet that prints as it decodes should
     // look like it is printing as it decodes -- collecting until `Return` would
     // turn every run into a silence followed by a wall of text.
-    let mut streamed = false;
+    // What the inferlet has already shown, kept so the return value can be
+    // recognised as a repeat of it rather than assumed to be one.
+    let mut shown = String::new();
     let code = loop {
         match process.recv().await.context("reading process output")? {
             ProcessEvent::Stdout(text) => {
-                streamed = true;
+                shown.push_str(&text);
                 print!("{text}");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
@@ -322,27 +349,26 @@ async fn drive(
                 let _ = std::io::Write::flush(&mut std::io::stderr());
             }
             ProcessEvent::Message(text) => {
-                streamed = true;
+                shown.push_str(&text);
                 println!("{text}");
             }
             ProcessEvent::File(bytes) => {
                 eprintln!("[received a {} byte file]", bytes.len());
             }
-            // Only when nothing was streamed. `chat-completion` returns the
-            // same completion it just streamed token by token, so printing both
-            // showed the whole answer twice -- and the second copy arrived all
-            // at once, which reads as the model having said it again. An
-            // inferlet that streamed has already produced its output; one that
-            // did not (`generate` returns a token array and prints nothing) has
-            // its return value as the only thing it produced.
+            // Printed unless it is a repeat of what the reader already saw.
+            //
+            // `chat-completion` returns the completion it just streamed token
+            // by token, so printing both showed the whole answer twice -- the
+            // second copy arriving all at once, which reads as the model having
+            // said it again. But "it streamed something, so skip the return"
+            // is too blunt: an inferlet that streams progress and returns a
+            // result would lose the result, and the first version of this hid
+            // that behind a `debug!` nobody runs at. Comparing is what makes
+            // the duplicate go away without taking anything else with it.
             ProcessEvent::Return(value) => {
-                if !streamed {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() && !shown.contains(trimmed) {
                     println!("{value}");
-                } else if !value.trim().is_empty() {
-                    // Not silently dropped: a return that is not what was
-                    // streamed is still the program's answer, and a person who
-                    // wants it should be told where it went.
-                    tracing::debug!(%value, "process return value, already streamed");
                 }
                 break std::process::ExitCode::SUCCESS;
             }
@@ -417,6 +443,39 @@ mod tests {
             input(&["--model", "1.2.3"]),
             serde_json::json!({"model": "1.2.3"})
         );
+    }
+
+    #[test]
+    fn a_negative_number_is_a_value_and_not_a_flag() {
+        // `--seed -1` produced `{"seed": true, "1": true}` -- two wrong
+        // arguments out of one correct invocation, silently. The leading `-`
+        // is not enough to call something a flag when it is a number.
+        assert_eq!(
+            input(&["--seed", "-1"]),
+            serde_json::json!({"seed": -1})
+        );
+        assert_eq!(
+            input(&["--temp", "-0.5", "--top-k", "40"]),
+            serde_json::json!({"temp": -0.5, "top_k": 40})
+        );
+        // And a negative number standing alone is still a value.
+        assert_eq!(
+            input(&["-3"]),
+            serde_json::json!({"_positional": [-3]})
+        );
+    }
+
+    #[test]
+    fn a_short_flag_still_reads_as_one() {
+        // The negative-number rule must not swallow real short flags.
+        assert_eq!(input(&["-k", "5"]), serde_json::json!({"k": 5}));
+        assert_eq!(input(&["-v"]), serde_json::json!({"v": true}));
+        // A lone `-` is the stdin convention, not a flag.
+        assert_eq!(input(&["-"]), serde_json::json!({"_positional": ["-"]}));
+        // A single-dash cluster is kept whole rather than invented into three
+        // flags -- a spelling this never supported, so guessing at it would be
+        // making something up on a person's behalf.
+        assert_eq!(input(&["-abc"]), serde_json::json!({"_positional": ["-abc"]}));
     }
 
     #[test]
