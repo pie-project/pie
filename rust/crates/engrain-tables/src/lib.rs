@@ -165,9 +165,38 @@ pub struct Artifact {
 
 impl Artifact {
     /// Bytes the runtime keeps resident.
+    ///
+    /// Every array the arena uploads, because this number is what a table
+    /// budget is spent in and a budget denominated in a number smaller than
+    /// the truth is not a budget. It used to leave out the readings and the
+    /// verdicts and charge a flat 20 bytes for a group, which came to 2.9 MB
+    /// against a real 7.5 - so a 1 GiB budget held what a 2.6 GiB one was
+    /// asked for, and the eviction that followed looked like a mystery: on
+    /// 409 corpus schemas the arena thrashed at 2 GiB and ran at 4, against a
+    /// reported need of 1.4.
     pub fn resident_bytes(&self) -> usize {
+        // Readings intern across the groups of a grammar, so the flat arrays
+        // carry one slot per group reading and one body per *distinct*
+        // reading. Counting the bodies per group instead was 42% high.
+        let slots: usize = self.groups.iter().map(|group| group.readings.len()).sum();
+        let mut distinct: std::collections::HashSet<(&[u32], u32)> = Default::default();
+        for group in &self.groups {
+            for reading in &group.readings {
+                distinct.insert((reading.terminals.as_slice(), reading.next_lexer_state));
+            }
+        }
+        let bodies: usize = distinct
+            .iter()
+            .map(|(terminals, _)| terminals.len() + 2)
+            .sum();
         4 * (self.set_payload.len()
             + self.group_offsets.len()
+            + self.groups.len() * 3
+            + self.groups.len()
+            + slots
+            + bodies
+            + self.pending_offsets.len()
+            + self.pending_terminals.len()
             + self.action_offsets.len()
             + self.action_terminals.len()
             + self.action_values.len()
@@ -177,8 +206,10 @@ impl Artifact {
             + self.goto_nonterminals.len()
             + self.goto_targets.len()
             + self.production_lhs.len()
-            + self.production_arity.len())
-            + self.groups.len() * 20
+            + self.production_arity.len()
+            + self.verdicts.len()
+            + self.verdict_stride.len()
+            + self.num_lexer_states as usize * 2)
     }
 
     /// What a per-configuration token row table would have cost instead.
