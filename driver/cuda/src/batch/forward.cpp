@@ -494,6 +494,37 @@ cudaGraphExec_t capture_forward_graph_exec(
             ", node_types:" + histogram + ", pending_before=" +
             cudaGetErrorName(pending) + ")");
     }
+    // PIE_GRAPH_NODE_TRACE: per-capture node census — the discriminating
+    // probe for "does a slow bucket's graph CONTAIN more work or just
+    // slower kernels".
+    static const bool node_trace = [] {
+        const char* v = std::getenv("PIE_GRAPH_NODE_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (node_trace) {
+        std::size_t nodes = 0;
+        cudaGraphGetNodes(graph.get(), nullptr, &nodes);
+        std::string histogram;
+        std::vector<cudaGraphNode_t> node_list(nodes);
+        if (nodes > 0 &&
+            cudaGraphGetNodes(graph.get(), node_list.data(), &nodes) ==
+                cudaSuccess) {
+            std::map<int, int> by_type;
+            for (cudaGraphNode_t node : node_list) {
+                cudaGraphNodeType type{};
+                if (cudaGraphNodeGetType(node, &type) == cudaSuccess) {
+                    ++by_type[static_cast<int>(type)];
+                }
+            }
+            for (const auto& [type, count] : by_type) {
+                histogram += " t" + std::to_string(type) + "=" +
+                             std::to_string(count);
+            }
+        }
+        std::fprintf(stderr,
+                     "[graph-nodes] N=%d R=%d nodes=%zu%s\n",
+                     N, R, nodes, histogram.c_str());
+    }
     CUDA_CHECK(cudaGraphUpload(exec.get(), nullptr));
     return exec.release();
 }

@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -1110,12 +1111,36 @@ bool dense_tactic_already_gemv(int M, int N, int K, float beta) {
            static_cast<GemmKind>(it->second.kind) == GemmKind::Gemv;
 }
 
+// PIE_GEMM_PATH_TRACE: one line per dense bf16 GEMM naming the shape, the
+// capture status, and the branch that served it — the discriminating probe
+// for "what did the boot lattice bake". First 200 calls only.
+static bool gemm_path_trace_take() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_GEMM_PATH_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (!on) return false;
+    static std::atomic<int> budget{40000};
+    return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
 void gemm_bf16_impl(
     cublasHandle_t handle,
     const void* act, const void* W, void* y,
     int M, int N, int K,
     float beta)
 {
+    const bool path_trace = gemm_path_trace_take();
+    if (path_trace) {
+        cudaStream_t ts = nullptr;
+        cudaStreamCaptureStatus tc = cudaStreamCaptureStatusNone;
+        if (cublas_stream(handle, ts)) cudaStreamIsCapturing(ts, &tc);
+        cudaGetLastError();
+        std::fprintf(stderr,
+                     "[gemm-path] M=%d N=%d K=%d beta=%g capturing=%d\n",
+                     M, N, K, static_cast<double>(beta),
+                     static_cast<int>(tc));
+    }
     const float alpha = 1.f;
     // Which of the three kernel families below is fastest for this shape is a
     // measurement, not a rule -- so take it, once per shape, and remember it.
@@ -1131,7 +1156,15 @@ void gemm_bf16_impl(
             dense_tactic_for(handle, W, M, N, K, beta, capturing, &plan,
                              &tactic) &&
             run_dense_tactic(handle, tactic, plan, act, W, y, M, N, K, beta)) {
+            if (path_trace) {
+                std::fprintf(stderr,
+                             "[gemm-path]   -> tuned kind=%d algo=%d\n",
+                             tactic.kind, tactic.algo);
+            }
             return;
+        }
+        if (path_trace) {
+            std::fprintf(stderr, "[gemm-path]   -> tuner declined/failed\n");
         }
         cudaGetLastError();
     }
@@ -1144,6 +1177,7 @@ void gemm_bf16_impl(
     if (M == 1 && beta == 0.f && use_bf16_gemv() &&
         cublas_stream(handle, gemv_stream) &&
         kernels::launch_gemv_bf16(W, act, nullptr, y, N, K, gemv_stream)) {
+        if (path_trace) std::fprintf(stderr, "[gemm-path]   -> gemv\n");
         return;
     }
     const int lt_max_n = cublaslt_bf16_max_n();
@@ -1153,6 +1187,7 @@ void gemm_bf16_impl(
         K >= cublaslt_bf16_min_k() &&
         (lt_max_n == 0 || N <= lt_max_n) &&
         gemm_bf16_lt_impl(handle, act, W, y, M, N, K, beta)) {
+        if (path_trace) std::fprintf(stderr, "[gemm-path]   -> lt-ladder\n");
         return;
     }
     const auto status = cublasGemmEx(
