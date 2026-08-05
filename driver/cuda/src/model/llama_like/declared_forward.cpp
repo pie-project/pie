@@ -144,6 +144,15 @@ void pin_llama_like_values(const pie_forward::ForwardPlan& plan,
             } else if (nm.field == "o_proj" || nm.field == "down") {
                 values.pin(outs[0], post_norm ? ws.norm_x.data()
                                               : ws.y.data());
+                if (nm.field == "o_proj") {
+                    // Pinned by CONSUMER, not producer: a lowered trace
+                    // may state its attention as a stated-kernel Launch
+                    // rather than the semantic `Attention` op, and the
+                    // value it produces still lives in `ws.attn_out`.
+                    // Saying it here covers both spellings.
+                    const auto ins = plan.inputs(op);
+                    if (ins.size > 0) values.pin(ins[0], ws.attn_out.data());
+                }
             }
             break;
         }
@@ -1046,12 +1055,12 @@ void llama_like_forward_declared(
                     // ResidualAdd land it on the stream — the hand-written
                     // post-norm block, same buffers, same order.
                     ops::gemm_act_x_w(cublas.handle(),
-                        // NOT the arena: a beta=1 GEMM's operand list
-                        // carries the ACCUMULATOR too, so `inputs[0]` is
-                        // not the activation here. Which operand is which
-                        // is a question for the trace's own ordering rule,
-                        // not a guess — this island waits for it.
-                        ws.attn_out.data(),
+                        // The trace's operand order, from the builder:
+                        // `matmul_inner(x, ...)` records the activation
+                        // FIRST and `matmul_add` appends the residual, so
+                        // inputs[0] is the activation on both forms.
+                        values.slot(plan.inputs(op)[0],
+                                    plan.value(plan.inputs(op)[0])),
                         make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
                         out_slot(0), N, H, Hq, beta);
@@ -1060,12 +1069,12 @@ void llama_like_forward_declared(
                     // the trace's beta_one), exactly the hand-written T==1
                     // branch.
                     ops::gemm_act_x_w(cublas.handle(),
-                        // NOT the arena: a beta=1 GEMM's operand list
-                        // carries the ACCUMULATOR too, so `inputs[0]` is
-                        // not the activation here. Which operand is which
-                        // is a question for the trace's own ordering rule,
-                        // not a guess — this island waits for it.
-                        ws.attn_out.data(),
+                        // The trace's operand order, from the builder:
+                        // `matmul_inner(x, ...)` records the activation
+                        // FIRST and `matmul_add` appends the residual, so
+                        // inputs[0] is the activation on both forms.
+                        values.slot(plan.inputs(op)[0],
+                                    plan.value(plan.inputs(op)[0])),
                         make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
                         out_slot(0), N, H, Hq, beta);
