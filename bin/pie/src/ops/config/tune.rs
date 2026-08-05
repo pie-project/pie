@@ -1,5 +1,9 @@
-//! `pie config optimize` — measure this machine instead of remembering someone
+//! `pie config tune` — measure this machine instead of remembering someone
 //! else's.
+//!
+//! `optimize` until the rename; `pie model build` builds an artifact and
+//! this one tunes a machine, and one verb could not carry both. The old
+//! spelling survives as a hidden alias.
 //!
 //! One boot, many rounds. The design and the arguments behind it are in
 //! `.wiki/plan/config-optimize.md`; what matters here is the three rules the
@@ -97,21 +101,61 @@ pub struct Workload {
     pub repeats: usize,
 }
 
-pub struct Args {
+/// What one `pie config tune` run was asked to do.
+#[derive(clap::Args, Debug)]
+pub struct TuneArgs {
+    /// Which serving shape to optimize for. Sets `[driver] memory_profile` as
+    /// well as choosing the load. Required when the profile is `auto`.
+    #[arg(long = "for", value_name = "SHAPE")]
     pub objective: Option<Objective>,
+
+    /// The inferlet to drive the load with, e.g. `generate@0.1.0`.
+    /// `pie inferlet list` shows what is available.
+    #[arg(long)]
     pub program: String,
-    /// Overrides for the objective's own workload. Absent means "use the shape
-    /// the objective implies", which is the answer for almost everyone.
+
+    /// Lanes per fleet. Defaults to the shape `--for` implies: 4 for latency,
+    /// 64 for throughput.
+    //
+    // These four are overrides for the objective's own workload. Absent means
+    // "use the shape the objective implies", which is the answer for almost
+    // everyone.
+    #[arg(long)]
     pub fleet: Option<usize>,
+
+    /// Fleets per candidate. Defaults to the shape `--for` implies. Below 3 the
+    /// spread means little, and the spread is what decides whether a difference
+    /// is real.
+    #[arg(long)]
     pub repeats: Option<usize>,
+
+    /// Tokens each lane decodes. Defaults to 256. Shorter fleets are measurably
+    /// noisier, and the noise decides what counts as a win — at 48 tokens the
+    /// sweep reported a 20% improvement that a longer fleet showed was nothing.
+    #[arg(long)]
     pub tokens: Option<usize>,
+
+    /// Stop after this many candidates. Counts candidates, not minutes: an
+    /// operator cannot predict how many fleets fit in a wall-clock budget.
+    #[arg(long)]
     pub budget: Option<usize>,
+
+    /// Apply the winner to the config file.
+    #[arg(long)]
     pub write: bool,
-    /// Skip stage one on a machine whose planner has already been measured.
+
+    /// Skip stage one, the memory-planner calibration.
+    ///
+    /// Stage one costs a boot and measures the forward step on this device; its
+    /// result is cached, so a machine that has already been measured does not
+    /// need it again. Nothing else changes -- the sweep then runs against
+    /// whatever shape the planner picks, which is that cached measurement if it
+    /// still applies and the analytic score otherwise.
+    #[arg(long)]
     pub skip_planner: bool,
 }
 
-impl Args {
+impl TuneArgs {
     /// The load actually run: the objective's shape, with any explicit override
     /// applied over it.
     pub fn workload(&self, objective: Objective) -> Workload {
@@ -373,7 +417,7 @@ async fn calibrate_planner(content: &str) -> Result<()> {
 
 /// Calibrate the planner, then sweep the frame knobs inside the arena that
 /// produced.
-pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
+pub async fn run(global: &startup::GlobalArgs, args: TuneArgs) -> Result<()> {
     let (cfg_path, origin) = startup::cli_config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
         format!(
@@ -735,7 +779,7 @@ calibrate_planner = true
             "a small fleet yields few lane samples, so it needs more passes"
         );
 
-        let args = Args {
+        let args = TuneArgs {
             objective: None,
             program: String::new(),
             fleet: Some(7),

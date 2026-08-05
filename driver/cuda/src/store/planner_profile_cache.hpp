@@ -64,7 +64,7 @@ struct PlannerProfileShape {
     // memory situation changed underneath them. Two ways it changes that
     // matter — another process holding VRAM (which is how a contaminated GPU
     // silently produced a different plan once), and a checkpoint whose weights
-    // are a different size, which `pie model optimize --quant fp8` now makes an
+    // are a different size, which `pie model build --quant fp8` now makes an
     // ordinary thing to do to a model without changing one field of the key.
     std::size_t budget_bytes = 0;
 };

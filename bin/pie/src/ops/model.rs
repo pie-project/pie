@@ -1,8 +1,10 @@
-//! `pie model { list | download | remove }` — manage HF cache.
+//! `pie model { list | info | import | build | remove }` — the models pie serves.
 //!
-//! Mirrors `pie/src/pie_cli/commands/model.py` against the same
-//! `~/.cache/huggingface/hub/` layout. Models pulled via either the
-//! Python CLI or the standalone are interchangeable.
+//! `list` and `info` read the artifact store ([`crate::local::store`]) with the
+//! HF snapshot cache beside it, because "what do I have" and "where did it come
+//! from" are one question. The two that produce an artifact are big enough to
+//! own a file each: [`import`] normalizes any checkpoint into a `.zt`, and
+//! [`build`] runs the family-aware transforms a serve boot would do.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -14,7 +16,10 @@ use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
 
-use crate::ops::hf::runtime_snapshot_allow_patterns;
+use crate::local::hf::runtime_snapshot_allow_patterns;
+
+pub mod build;
+pub mod import;
 
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
@@ -35,7 +40,7 @@ pub enum ModelCmd {
     },
     /// Make a model servable: fetch it if it is remote, convert it to a
     /// `.zt` artifact, and put it in the store.
-    Import(crate::ops::convert::ConvertArgs),
+    Import(import::ImportArgs),
     /// Remove a stored artifact by name. Prompts for confirmation;
     /// `--yes` skips the prompt.
     Remove {
@@ -47,11 +52,15 @@ pub enum ModelCmd {
     },
     /// Precompute a serve boot: author the family contract, run the load
     /// transforms offline, write the runtime tensors as a `.zt` artifact.
-    ///
-    /// Not to be confused with `pie config optimize`, which measures this
-    /// machine and tunes the batching knobs. This one prepares an artifact;
-    /// that one prepares a config.
-    Optimize(crate::ops::optimize::OptimizeArgs),
+    //
+    // `optimize` until this rename. It shared a verb with `pie config
+    // optimize`, which tunes the *machine*, and the two were far enough apart
+    // that the help text had to carry a "not to be confused with" line -- a
+    // name that needs a disclaimer is the wrong name. This one builds a thing,
+    // so it is `build`. The old spelling stays as a hidden alias: it is what
+    // scripts and the docs say today, and breaking them buys nothing.
+    #[command(alias = "optimize")]
+    Build(build::BuildArgs),
 }
 
 pub fn run(cmd: ModelCmd) -> Result<()> {
@@ -60,9 +69,9 @@ pub fn run(cmd: ModelCmd) -> Result<()> {
         ModelCmd::Info { name, json } => info(name, json),
         // `download` and `convert` were both "make this servable", so they are
         // one verb now; `import` fetches when the source is remote.
-        ModelCmd::Import(args) => crate::ops::convert::run(args),
+        ModelCmd::Import(args) => import::run(args),
         ModelCmd::Remove { name, yes } => remove(name, yes),
-        ModelCmd::Optimize(args) => crate::ops::optimize::run(args),
+        ModelCmd::Build(args) => build::run(args),
     }
 }
 
@@ -162,9 +171,9 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
 
 fn list(json: bool) -> Result<()> {
     if json {
-        let artifacts = crate::ops::store::entries()?;
+        let artifacts = crate::local::store::entries()?;
         return crate::ui::emit_json(&serde_json::json!({
-            "store": crate::ops::store::dir(),
+            "store": crate::local::store::dir(),
             "artifacts": artifacts
                 .iter()
                 .map(|e| serde_json::json!({
@@ -189,8 +198,8 @@ fn list(json: bool) -> Result<()> {
     // What pie can serve. This is the store, and it comes first because it is
     // the answer to "what models do I have" — the HF cache below it is where
     // these came *from*.
-    let artifacts = crate::ops::store::entries()?;
-    println!("Artifacts ({}):", crate::ops::store::dir().display());
+    let artifacts = crate::local::store::entries()?;
+    println!("Artifacts ({}):", crate::local::store::dir().display());
     if artifacts.is_empty() {
         println!("  {dim}(none — `pie model import <org>/<name>`){reset}");
     }
@@ -212,7 +221,7 @@ fn list(json: bool) -> Result<()> {
         println!(
             "  {green}●{reset} {} {dim}({}, {} tensors{shards}){reset}{dim}{from},{by}{reset}",
             entry.name,
-            crate::ops::store::format_bytes(entry.bytes),
+            crate::local::store::format_bytes(entry.bytes),
             entry.tensors,
         );
     }
@@ -228,7 +237,7 @@ fn list(json: bool) -> Result<()> {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let repo_id = dirname_to_repo_id(&name)?;
                 let (ok, info) = check_pie_compatibility(&e.path());
-                let bytes = crate::ops::store::staging_bytes(&e.path());
+                let bytes = crate::local::store::staging_bytes(&e.path());
                 Some((repo_id, ok, info, bytes))
             })
             .collect(),
@@ -241,13 +250,13 @@ fn list(json: bool) -> Result<()> {
         println!(
             "\nRaw snapshots ({}, {}):",
             hub.display(),
-            crate::ops::store::format_bytes(total)
+            crate::local::store::format_bytes(total)
         );
         for (repo_id, ok, info, bytes) in &staged {
             let mark = if *ok { "○" } else { "×" };
             println!(
                 "  {dim}{mark} {repo_id} ({}, {info}){reset}",
-                crate::ops::store::format_bytes(*bytes)
+                crate::local::store::format_bytes(*bytes)
             );
         }
     }
@@ -262,7 +271,7 @@ fn list(json: bool) -> Result<()> {
 /// became the thing pie serves: a repo is one way an artifact got here, and
 /// `source` below is where that is recorded.
 fn info(name: String, json: bool) -> Result<()> {
-    let Some(entry) = crate::ops::store::find(&name)? else {
+    let Some(entry) = crate::local::store::find(&name)? else {
         bail!(
             "no artifact {name:?} in the store; `pie model list` shows what is there"
         );
@@ -560,17 +569,17 @@ impl ProgressHandler for ProgressBar {
 /// asks before deleting, and reports what it got back. A command that removes
 /// a model has no business deciding what else its origin is worth keeping.
 fn remove(name: String, skip_confirm: bool) -> Result<()> {
-    let Some(entry) = crate::ops::store::find(&name)? else {
+    let Some(entry) = crate::local::store::find(&name)? else {
         bail!(
             "no artifact named {name:?} in {}",
-            crate::ops::store::dir().display()
+            crate::local::store::dir().display()
         );
     };
 
     let bytes = entry.bytes;
     let what = format!(
         "artifact {name} ({}, {} file(s))",
-        crate::ops::store::format_bytes(bytes),
+        crate::local::store::format_bytes(bytes),
         entry.files.len()
     );
 
@@ -590,7 +599,7 @@ fn remove(name: String, skip_confirm: bool) -> Result<()> {
         }
     }
 
-    crate::ops::store::remove(&entry)?;
+    crate::local::store::remove(&entry)?;
     println!(
         "{} removed {what}",
         crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout))

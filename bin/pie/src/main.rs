@@ -10,7 +10,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use pie_bin::{compose, derive, ops, ui};
+use pie_bin::{compose, derive, local, ops, ui};
 /// Top-level `pie` invocation. The shared global flags (`--config`,
 /// `--log-level`, `--metrics-addr`) are flattened from `startup`.
 #[derive(Parser, Debug)]
@@ -186,7 +186,7 @@ async fn serve(global: startup::GlobalArgs) -> anyhow::Result<ExitCode> {
     // Provision the embedded Python-WASM runtime before booting — the worker
     // daemon never downloads (R3), so the standalone root does it. Best-effort:
     // a present runtime is a no-op; a failure is logged, not fatal here.
-    tokio::task::spawn_blocking(ops::py_runtime::ensure_installed_best_effort)
+    tokio::task::spawn_blocking(local::py_runtime::ensure_installed_best_effort)
         .await
         .ok();
     let (controller, gateway, worker) = derive::derive_standalone(ctx.config_str())?;

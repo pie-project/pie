@@ -528,7 +528,7 @@ CudaMemoryPlan plan_cuda_memory(
     uniq_clip_desc(Rs, 4096);
 
     // A pinned axis is a single-candidate lattice. This is the point of
-    // `pie config optimize` writing what it measured: with the shape pinned,
+    // `pie config tune` writing what it measured: with the shape pinned,
     // the analytic score and every per-(model, GPU) special case below stop
     // running at all, because there is nothing left for them to choose between.
     //
@@ -876,7 +876,7 @@ CudaMemoryPlan plan_cuda_memory(
             why +=
                 ". [driver] max_forward_tokens/max_forward_requests pin the "
                 "shape to a single candidate; unset them to let the planner "
-                "choose, or re-run `pie config optimize` on this machine";
+                "choose, or re-run `pie config tune` on this machine";
         }
         throw std::runtime_error(why);
     }
@@ -915,7 +915,7 @@ CudaMemoryPlan plan_cuda_memory(
         // key pins the device and the model, and neither notices that this boot
         // has materially more or less memory to give than the sweep did --
         // another process holding VRAM, or a checkpoint requantized offline by
-        // `pie model optimize`. Left unchecked this fails in the quiet
+        // `pie model build`. Left unchecked this fails in the quiet
         // direction: with a LARGER budget the measured shape is still feasible,
         // so it is selected, and the extra memory is simply never used.
         if (measured.has_value() && measured->budget_bytes > 0) {
@@ -932,7 +932,7 @@ CudaMemoryPlan plan_cuda_memory(
                           << static_cast<int>(drift * 100.0)
                           << "% apart); the measurement does not describe this "
                           << "machine, so the scored rule decides. Re-run "
-                          << "`pie config optimize` if the change is "
+                          << "`pie config tune` if the change is "
                           << "permanent, or free the device if it is not.\n";
                 measured.reset();
             }

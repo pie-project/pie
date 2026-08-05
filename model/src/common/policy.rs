@@ -4,7 +4,7 @@
 //! would have to read GPU code, not the checkpoint" — which is exactly what
 //! makes it a parameter. A family's `author` is one function over
 //! `(ModelFacts, checkpoint, StorageTarget, Policy)`; CUDA, Metal and an
-//! offline `pie model optimize` are three points in this type's space, not
+//! offline `pie model build` are three points in this type's space, not
 //! three authors.
 //!
 //! The types mirror the driver's own enums (`model/contract.hpp`) during the

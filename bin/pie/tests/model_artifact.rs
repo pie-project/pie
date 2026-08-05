@@ -1,9 +1,9 @@
 //! The two family-aware offline paths, end to end on real files.
 //!
-//! `optimize` authors the serve contract, materializes it through the
+//! `build` authors the serve contract, materializes it through the
 //! streaming executor and the disk spool, and writes the *runtime* tensors —
 //! the fused QKV banks are the proof, because no checkpoint ships one.
-//! `convert` on an F32 snapshot exercises the same spool from the other
+//! `import` on an F32 snapshot exercises the same spool from the other
 //! side: the decoded set is the whole model, which is exactly the case the
 //! spool exists for, and the artifact must hold the BF16 the engine reads.
 //!
@@ -104,16 +104,16 @@ fn write_snapshot(dir: &Path, dtype: &str) {
     .expect("write config");
 }
 
-/// optimize writes runtime tensors: the fused banks exist, their views
+/// build writes runtime tensors: the fused banks exist, their views
 /// exist, and every digest verifies.
 #[test]
-fn optimize_materializes_the_serve_contract() {
+fn build_materializes_the_serve_contract() {
     let staging = tempfile::tempdir().expect("staging");
     write_snapshot(staging.path(), "BF16");
     let store = tempfile::tempdir().expect("store");
     let artifact = store.path().join("optimized.zt");
 
-    pie_bin::ops::optimize::run(pie_bin::ops::optimize::OptimizeArgs {
+    pie_bin::ops::model::build::run(pie_bin::ops::model::build::BuildArgs {
         source: staging.path().to_string_lossy().into_owned(),
         quant: None,
         fp8_native: false,
@@ -125,7 +125,7 @@ fn optimize_materializes_the_serve_contract() {
         out: Some(artifact.clone()),
         dry_run: false,
     })
-    .expect("optimize failed");
+    .expect("build failed");
 
     let parsed = parse_checkpoint(&artifact).expect("parse artifact");
     let names: Vec<&str> = parsed.weights().map(|t| t.name.as_str()).collect();
@@ -148,17 +148,17 @@ fn optimize_materializes_the_serve_contract() {
     assert_eq!(verified as usize, parsed.tensors.len());
 }
 
-/// convert on an F32 snapshot decodes *everything* — the whole-model case
+/// import on an F32 snapshot decodes *everything* — the whole-model case
 /// the streaming executor and the disk spool exist for — and the artifact
 /// holds BF16 under the original names.
 #[test]
-fn convert_streams_a_fully_decoded_model_through_the_spool() {
+fn import_streams_a_fully_decoded_model_through_the_spool() {
     let staging = tempfile::tempdir().expect("staging");
     write_snapshot(staging.path(), "F32");
     let store = tempfile::tempdir().expect("store");
     let artifact = store.path().join("converted.zt");
 
-    pie_bin::ops::convert::run(pie_bin::ops::convert::ConvertArgs {
+    pie_bin::ops::model::import::run(pie_bin::ops::model::import::ImportArgs {
         source: staging.path().to_string_lossy().into_owned(),
         out: Some(artifact.clone()),
         dry_run: false,
@@ -166,7 +166,7 @@ fn convert_streams_a_fully_decoded_model_through_the_spool() {
         max_shard_size: None,
         delete_source: false,
     })
-    .expect("convert failed");
+    .expect("import failed");
 
     let parsed = parse_checkpoint(&artifact).expect("parse artifact");
     for tensor in parsed.weights() {

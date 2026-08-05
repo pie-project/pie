@@ -14,8 +14,8 @@
 // back — the sweep costs a few seconds of startup and writes to the profile
 // cache. A process that never calibrates selects exactly as it did before.
 //
-// That startup TOML is generated per boot, and stage one of `pie config
-// optimize` is the only thing that ever sets the key in it. There is no key in
+// That startup TOML is generated per boot, and stage one of `pie config tune`
+// is the only thing that ever sets the key in it. There is no key in
 // the pie config: the request is one run of a measurement, not a description of
 // a deployment, and written down it needed the operator to perform a three-step
 // ritual whose third step — turning it back off — was the one that mattered.

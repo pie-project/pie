@@ -1188,7 +1188,7 @@ mod tests {
     /// A calibration request reaches the driver, and only ever from memory.
     ///
     /// This is the whole route that replaced `[driver] calibrate_planner`:
-    /// `pie config optimize` sets `server.calibrate_planner` on a config it
+    /// `pie config tune` sets `server.calibrate_planner` on a config it
     /// derived, `engine::apply_embedded_calibration` puts it on the driver
     /// options, and this is where it becomes something the C++ side reads. The
     /// per-launch startup TOML is the only file it ever appears in, and that
@@ -1267,7 +1267,7 @@ calibrate_planner = true
         assert!(val["batching"].get("total_pages").is_none());
         // An ordinary boot says nothing about calibration: it is one run of a
         // measurement, not a setting every startup file restates. The only
-        // thing that ever turns it on is `pie config optimize`, on a config it
+        // thing that ever turns it on is `pie config tune`, on a config it
         // derived in memory -- see `CudaNativeDriverOptions::calibrate_planner`
         // for why it cannot come from a file.
         assert!(val["batching"].get("calibrate_planner").is_none());

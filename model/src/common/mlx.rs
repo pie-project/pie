@@ -57,7 +57,7 @@ pub fn decoder_member(raw_name: &str) -> Option<&str> {
 /// from a checkpoint.
 ///
 /// Why it is needed at all: a serve boot re-authors the contract from the
-/// names its checkpoint holds, so an artifact `pie model optimize` wrote —
+/// names its checkpoint holds, so an artifact `pie model build` wrote —
 /// whose tensors ARE the runtime tensors — is fed back through the very rename
 /// that produced them. Without an identity arm each schema refuses its own
 /// output (`no declared mapping or skip for 'final_norm.weight'`) and the
@@ -476,7 +476,7 @@ pub type RenameRule<'r> = &'r dyn Fn(&Builder<'_>, &str) -> Result<Option<String
 /// is the same rule gpt-oss applies unconditionally — its published checkpoint
 /// mixes MXFP4 experts with BF16 attention, and the matvecs are quantized — and
 /// the same `Encode` op, so what runs at load without a request and offline
-/// under `pie model optimize --quant int4` is one transform, not two. Rank is
+/// under `pie model build --quant int4` is one transform, not two. Rank is
 /// what separates these from the norms, which must stay values.
 pub fn author_mlx_file(
     b: &mut Builder<'_>,

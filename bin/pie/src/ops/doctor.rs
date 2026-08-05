@@ -265,8 +265,8 @@ fn check_platform() -> (String, String, Status) {
 /// belongs with the other "will this work here" answers, and the fix happens
 /// by itself.
 fn check_py_runtime() -> (String, String, Status) {
-    let dir = crate::ops::py_runtime::runtime_dir();
-    if crate::ops::py_runtime::is_installed() {
+    let dir = crate::local::py_runtime::runtime_dir();
+    if crate::local::py_runtime::is_installed() {
         (
             "python".to_string(),
             format!("runtime at {}", crate::ui::short_path(&dir)),
@@ -321,7 +321,7 @@ fn check_gpus() -> Vec<(String, String, Status)> {
 /// Has this machine been measured, or is it running on defaults someone else
 /// measured?
 ///
-/// The plan's §7 makes this mandatory rather than nice. `pie config optimize`
+/// The plan's §7 makes this mandatory rather than nice. `pie config tune`
 /// writes both of the things below: its first stage measures the forward shape
 /// and its second the batching knobs. A machine where it has not run gets the
 /// analytic planner's judgement, which is a model of the machine rather than
@@ -334,7 +334,7 @@ fn check_gpus() -> Vec<(String, String, Status)> {
 ///
 /// This briefly grew a blocking check for a `calibrate_planner` left on in the
 /// config. The check is gone because what it guarded is gone: calibration is a
-/// stage of `pie config optimize` now, set on a config derived in memory, and
+/// stage of `pie config tune` now, set on a config derived in memory, and
 /// the key is `#[serde(skip)]` — a file cannot carry it, so it cannot be left
 /// on. Guarding a state that no longer exists is how a checklist grows a step
 /// nobody can explain.
@@ -370,7 +370,7 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
         )),
         (None, None) => checks.push((
             "forward shape".to_string(),
-            "derived by the planner's analytic score (`pie config optimize --for ...`)".to_string(),
+            "derived by the planner's analytic score (`pie config tune --for ...`)".to_string(),
             Status::Warn,
         )),
     }
@@ -380,7 +380,7 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
     checks.push(if pinned.is_empty() {
         (
             "batching".to_string(),
-            "defaults, measured on other hardware (`pie config optimize --for ...`)".to_string(),
+            "defaults, measured on other hardware (`pie config tune --for ...`)".to_string(),
             Status::Warn,
         )
     } else {
@@ -407,7 +407,7 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
     } else {
         (
             "planner profile".to_string(),
-            "none; the forward step has never been timed here (`pie config optimize` measures it)"
+            "none; the forward step has never been timed here (`pie config tune` measures it)"
                 .to_string(),
             Status::Warn,
         )

@@ -917,7 +917,7 @@ fn llama_bf16_checkpoint() -> CheckpointMetadata {
 /// Every rank-2 `.weight` becomes an affine-U4 `Encode` and the rank-1 norms
 /// stay values — the same arm gpt-oss applies unconditionally to the BF16 half
 /// of its published checkpoint, and the same `Encode` a serve boot would run.
-/// `pie model optimize --backend metal --quant int4` is this contract with the
+/// `pie model build --backend metal --quant int4` is this contract with the
 /// transform executed on the host instead of at load.
 #[test]
 fn llama_mlx_metal_int4() {

@@ -30,7 +30,7 @@ use std::path::PathBuf;
 /// only thing under `cache/` that a boot does **not** re-derive. Every sibling
 /// (compiled PTIR, GEMM autotuning) is rebuilt on the next cold start; this
 /// file is written *only* by a boot that was explicitly asked to calibrate,
-/// which is stage one of `pie config optimize` and costs a dedicated startup
+/// which is stage one of `pie config tune` and costs a dedicated startup
 /// that serves nothing. Clearing it with the rest would look like reclaiming a
 /// cache and would actually discard a measurement, so it is its own entry with
 /// its own reclaim policy.

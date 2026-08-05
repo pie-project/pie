@@ -24,7 +24,7 @@
 //! converting a checkpoint far larger than memory is fine; only the decoded set
 //! is ever resident, and only GGUF checkpoints decode today.
 //!
-//! The family-aware step landed as its own command: `pie model optimize`
+//! The family-aware step landed as its own command: `pie model build`
 //! authors the serve contract through `pie_model::contract` — no FFI, no
 //! driver — and materializes it offline. This command stays the
 //! family-blind half of the pair.
@@ -94,7 +94,7 @@ pub(crate) fn pie_version() -> &'static str {
 }
 
 #[derive(Args, Debug)]
-pub struct ConvertArgs {
+pub struct ImportArgs {
     /// What to import: a HuggingFace repo ID, a snapshot directory, or a
     /// single `.safetensors`/`.gguf`/`.zt` file. A repo ID that is not in the
     /// local cache is fetched first.
@@ -127,7 +127,7 @@ pub struct ConvertArgs {
     pub delete_source: bool,
 }
 
-pub fn run(args: ConvertArgs) -> Result<()> {
+pub fn run(args: ImportArgs) -> Result<()> {
     let source = resolve_source(&args.source)?;
     let metadata = parse_checkpoint_metadata(&source.path)
         .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?;

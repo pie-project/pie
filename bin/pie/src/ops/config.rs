@@ -1,8 +1,14 @@
-//! `pie config { init | show | set }` — manage the user's config TOML.
+//! `pie config { list | show | set | unset | edit | init | tune }` — the
+//! user's config TOML.
 //!
-//! Mirrors `pie/src/pie_cli/config.py`. The dot-path setter
-//! (`pie config set model.model Qwen/Qwen3-1.7B`) walks nested
-//! TOML tables, matching Python's behavior.
+//! Six of these read or write the file; [`tune`] is the one that does not. It
+//! measures this machine and reports the batching knobs that suit it, which is
+//! a config-shaped answer arrived at by holding the device for minutes, so it
+//! owns a file.
+//!
+//! The dot-path setter (`pie config set model.model Qwen/Qwen3-1.7B`) walks
+//! nested TOML tables, and types the value by the schema rather than by how it
+//! looks.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -11,9 +17,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
 
 
-mod optimize;
 mod template;
-pub use optimize::Objective;
+pub mod tune;
+pub use tune::Objective;
 use template::default_config_content;
 
 /// The generated default config, for tests in this module's children that
@@ -77,54 +83,11 @@ pub enum ConfigCmd {
     /// Holds the whole device throughout -- a provisioning command, not one to
     /// run against a machine that is serving. Reports by default; `--write`
     /// applies.
-    Optimize {
-        /// Which serving shape to optimize for. Sets `[driver] memory_profile`
-        /// as well as choosing the load. Required when the profile is `auto`.
-        #[arg(long = "for", value_name = "SHAPE")]
-        objective: Option<Objective>,
-
-        /// The inferlet to drive the load with, e.g. `generate@0.1.0`.
-        /// `pie inferlet list` shows what is available.
-        #[arg(long)]
-        program: String,
-
-        /// Lanes per fleet. Defaults to the shape `--for` implies: 4 for
-        /// latency, 64 for throughput.
-        #[arg(long)]
-        fleet: Option<usize>,
-
-        /// Fleets per candidate. Defaults to the shape `--for` implies. Below
-        /// 3 the spread means little, and the spread is what decides whether a
-        /// difference is real.
-        #[arg(long)]
-        repeats: Option<usize>,
-
-        /// Tokens each lane decodes. Defaults to 256. Shorter fleets are
-        /// measurably noisier, and the noise decides what counts as a win — at
-        /// 48 tokens the sweep reported a 20% improvement that a longer fleet
-        /// showed was nothing.
-        #[arg(long)]
-        tokens: Option<usize>,
-
-        /// Stop after this many candidates. Counts candidates, not minutes: an
-        /// operator cannot predict how many fleets fit in a wall-clock budget.
-        #[arg(long)]
-        budget: Option<usize>,
-
-        /// Apply the winner to the config file.
-        #[arg(long)]
-        write: bool,
-
-        /// Skip stage one, the memory-planner calibration.
-        ///
-        /// Stage one costs a boot and measures the forward step on this device;
-        /// its result is cached, so a machine that has already been measured
-        /// does not need it again. Nothing else changes -- the sweep then runs
-        /// against whatever shape the planner picks, which is that cached
-        /// measurement if it still applies and the analytic score otherwise.
-        #[arg(long)]
-        skip_planner: bool,
-    },
+    //
+    // `optimize` until this rename -- see the note on `pie model build`. The
+    // old spelling stays as a hidden alias.
+    #[command(alias = "optimize")]
+    Tune(tune::TuneArgs),
 }
 
 pub async fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
@@ -135,31 +98,7 @@ pub async fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
         ConfigCmd::Unset { key } => unset(global, key),
         ConfigCmd::Edit => edit(global),
         ConfigCmd::Init { force } => init(global, force),
-        ConfigCmd::Optimize {
-            objective,
-            program,
-            fleet,
-            repeats,
-            tokens,
-            budget,
-            write,
-            skip_planner,
-        } => {
-            optimize::run(
-                global,
-                optimize::Args {
-                    objective,
-                    program,
-                    fleet,
-                    repeats,
-                    tokens,
-                    budget,
-                    write,
-                    skip_planner,
-                },
-            )
-            .await
-        }
+        ConfigCmd::Tune(args) => tune::run(global, args).await,
     }
 }
 

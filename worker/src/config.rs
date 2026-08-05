@@ -435,7 +435,7 @@ pub struct ServerConfig {
     pub python_snapshot: bool,
     /// Ask this boot to measure the memory planner instead of scoring it.
     ///
-    /// Set by `pie config optimize` on the config it derives in memory, never
+    /// Set by `pie config tune` on the config it derives in memory, never
     /// read from a file — `#[serde(skip)]`, so it cannot be written down and
     /// cannot outlive the boot that asked for it. See
     /// [`CudaNativeDriverOptions::calibrate_planner`] for why a measurement
@@ -854,7 +854,7 @@ impl Default for SchedulerConfig {
 /// submit simply waits for a slot and every submit re-serializes with no
 /// diagnostic at all. That silence is why this is rejected here rather than
 /// clamped: the config layer is the only place it can be caught.
-/// Public because `pie config optimize` enumerates knob candidates against
+/// Public because `pie config tune` enumerates knob candidates against
 /// this bound rather than generating combinations the engine will refuse --
 /// and a second copy of the number is exactly the disagreement this
 /// constant's own doc warns about.
@@ -1250,7 +1250,7 @@ pub struct CudaNativeDriverOptions {
     /// `kv_page_size` does — which is the point: a value measured on this
     /// machine beats one scored by a model of it.
     ///
-    /// `pie config optimize` and `calibrate_planner` are how you get a number
+    /// `pie config tune` and `calibrate_planner` are how you get a number
     /// worth pinning. A guess here is worse than absence, because absence still
     /// gets the planner's judgement.
     ///
@@ -1275,7 +1275,7 @@ pub struct CudaNativeDriverOptions {
     /// the budget ladder on THIS device and caches the winner, so the next boot
     /// selects by evidence instead.
     ///
-    /// **Not settable, and not a setting.** `pie config optimize` turns it on
+    /// **Not settable, and not a setting.** `pie config tune` turns it on
     /// for the one boot it runs and never writes it anywhere; see below for why
     /// it cannot be a key.
     ///

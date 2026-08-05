@@ -1,4 +1,4 @@
-//! `pie model optimize` — precompute a serve boot, offline.
+//! `pie model build` — precompute a serve boot, offline.
 //!
 //! The command `author_abi.cpp` was built to serve, finally landed the way
 //! the migration made possible: no FFI at all. The same family author a
@@ -9,7 +9,7 @@
 //! the names the bind path reads. The expensive transforms happen once,
 //! offline; loading the optimized artifact afterwards is extent writes.
 //!
-//! `pie model convert` stays the family-blind sibling: it normalizes
+//! `pie model import` stays the family-blind sibling: it normalizes
 //! encodings and touches nothing else. This command is the family-aware
 //! step behind the same store, and the split is the one the convert header
 //! promised ("family-aware steps slot in behind the same command").
@@ -52,13 +52,13 @@ use pie_model::common::facts::ModelFacts;
 use pie_model::common::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
 use pie_model_config::DESCRIPTOR_OBJECT;
 
-use super::convert::{
+use super::import::{
     ProgressLine, Spool, artifact_path, compile_descriptor, compile_tokenizer, pie_version,
     resolve_source, store_path,
 };
 
 #[derive(Args, Debug)]
-pub struct OptimizeArgs {
+pub struct BuildArgs {
     /// What to optimize: a HuggingFace repo ID in the local cache, a snapshot
     /// directory, or a `.zt` artifact.
     pub source: String,
@@ -268,7 +268,7 @@ fn read_facts(config: &serde_json::Value) -> Result<ModelFacts> {
     })
 }
 
-pub fn run(args: OptimizeArgs) -> Result<()> {
+pub fn run(args: BuildArgs) -> Result<()> {
     let source = resolve_source(&args.source)?;
     // Two kinds of source, and the difference is only where the facts live: a
     // snapshot states them in `config.json` and a pie artifact states them in
