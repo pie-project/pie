@@ -538,21 +538,6 @@ impl ProgressHandler for ProgressBar {
     }
 }
 
-fn format_bytes(n: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if n >= GIB {
-        format!("{:.2} GiB", n as f64 / GIB as f64)
-    } else if n >= MIB {
-        format!("{:.1} MiB", n as f64 / MIB as f64)
-    } else if n >= KIB {
-        format!("{:.1} KiB", n as f64 / KIB as f64)
-    } else {
-        format!("{n} B")
-    }
-}
-
 // -----------------------------------------------------------------------------
 // remove
 // -----------------------------------------------------------------------------
@@ -666,10 +651,4 @@ mod tests {
         assert_eq!(info, "no config");
     }
 
-    #[test]
-    fn format_bytes_units() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
-        assert!(format_bytes(2_500_000_000).starts_with("2."));
-    }
 }

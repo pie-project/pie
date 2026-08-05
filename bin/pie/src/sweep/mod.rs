@@ -233,35 +233,14 @@ pub async fn measure(
     knobs: Knobs,
     repeats: usize,
 ) -> Result<Round> {
-    // Once per candidate, not once per repeat: the knobs are what the repeats
-    // hold fixed, and re-applying them between identical fleets would only add
-    // a way for the sweep to fail.
-    pie_engine::scheduler::reconfigure(knobs.frame_size, knobs.submit_depth, knobs.dispatch_depth)
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("apply {knobs}"))?;
-
-    let repeats = repeats.max(1);
-    let mut throughputs = Vec::with_capacity(repeats);
-    let mut p95s = Vec::with_capacity(repeats);
-    let mut failed_lanes = 0;
-    for _ in 0..repeats {
-        let run = fleet::run(addr, program, inputs).await;
-        throughputs.push(run.throughput_tok_s());
-        p95s.push(run.lane_percentile_us(95) as f64);
-        failed_lanes += run.failed_lanes();
-    }
-
-    let (throughput_tok_s, throughput_rel_sigma) = median_and_rel_sigma(&throughputs);
-    let (lane_p95, lane_p95_rel_sigma) = median_and_rel_sigma(&p95s);
-    Ok(Round {
-        knobs,
-        throughput_tok_s,
-        throughput_rel_sigma,
-        lane_p95_us: lane_p95 as u128,
-        lane_p95_rel_sigma,
-        failed_lanes,
-        repeats,
-    })
+    // One candidate, so interleaving is a no-op and this is [`sweep_all`] with
+    // a shorter list. Delegating rather than repeating the loop keeps ONE
+    // definition of what a `Round` means: two aggregations that must agree
+    // about medians, spreads and failed lanes is two chances to disagree.
+    Ok(sweep_all(addr, program, inputs, &[knobs], repeats, |_, _| {})
+        .await?
+        .pop()
+        .expect("one candidate in, one round out"))
 }
 
 /// Measure every candidate, interleaved.
@@ -337,7 +316,13 @@ pub fn candidates(staging_depth: usize) -> Vec<Knobs> {
     for frame_size in [1usize, 2, 3, 4] {
         let mut group = Vec::new();
         for dispatch_depth in 1usize..=4 {
-            if frame_size * dispatch_depth >= staging_depth {
+            // `submit_depth` does not enter the bound, so any value answers it.
+            let shape = Knobs {
+                frame_size,
+                submit_depth: 2,
+                dispatch_depth,
+            };
+            if shape.steps_in_flight() >= staging_depth {
                 continue;
             }
             // `frame_submit_depth` must be at least 2 -- one frame runs while

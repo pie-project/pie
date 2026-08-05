@@ -22,25 +22,6 @@ use crate::sweep::{self, Knobs};
 use crate::ui::{Align, Mark, Palette, Row, Stream, Table};
 
 
-/// Fleets per candidate. Three is the smallest count that gives a median an
-/// outlier cannot move and a spread that means anything.
-const DEFAULT_REPEATS: usize = 3;
-/// Tokens each lane decodes.
-///
-/// **The measurement's precision is set here, not by the repeat count.** At 48
-/// tokens over 8 lanes the fast configurations finished in about a quarter of a
-/// second and came back at 10-12% spread, while the slow ones — running four
-/// times longer — sat near 2%. That is timing noise on a short interval, and no
-/// number of repeats fixes it. At 256 over 16 the same configurations measure
-/// 1-6%.
-///
-/// It is not a cosmetic difference. At the short setting a candidate was
-/// reported as beating the baseline by 20.4% against a 15.5% noise floor; at
-/// the long one nothing in that region beats the baseline at all. The sweep was
-/// producing a false positive and clearing its own significance test while
-/// doing it.
-const DEFAULT_TOKENS: usize = 256;
-
 /// The serving shape being optimised for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Objective {
@@ -82,6 +63,16 @@ impl Objective {
     /// lane latencies, and a p95 over twenty samples is the second-worst of
     /// them. `--repeats` is the lever if that is too coarse; there is no
     /// arrangement that makes a low-concurrency measurement dense.
+    ///
+    /// **256 tokens is not arbitrary, and shorter is not a smaller version of
+    /// the same measurement.** At 48 tokens over 8 lanes the fast candidates
+    /// finished in about a quarter second and measured at 10-12% spread while
+    /// the slow ones, running four times longer, sat near 2%. That is timing
+    /// noise on a short interval and no number of repeats removes it: at the
+    /// short setting the sweep reported a candidate beating the baseline by
+    /// 20.4% against a 15.5% noise floor -- clearing its own significance test
+    /// with a false positive -- and at the long one nothing in that region
+    /// beats the baseline at all.
     pub fn workload(self) -> Workload {
         match self {
             Self::Latency => Workload {
@@ -203,12 +194,12 @@ pub fn winner<'a>(
 pub fn report(
     rounds: &[sweep::Round],
     baseline: &Knobs,
+    best: Option<&sweep::Round>,
     metric: sweep::Metric,
     skipped: usize,
     wrote: bool,
 ) {
     let palette = Palette::for_stream(Stream::Stdout);
-    let best = winner(rounds, baseline, metric);
     let base = rounds.iter().find(|r| r.knobs == *baseline);
 
     println!("Measured {} candidate(s), ranked by {}:", rounds.len(), metric.label());
@@ -426,8 +417,12 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
     .await?;
     println!();
 
+    // Decided once and then rendered. Computing it again inside `report` would
+    // be a second answer to the same question, and the one thing that must not
+    // differ is what was written from what the operator is told was written.
+    let best = winner(&rounds, &baseline, metric);
     let mut wrote = false;
-    if let Some(best) = winner(&rounds, &baseline, metric)
+    if let Some(best) = best
         && args.write
     {
         let content = apply(&content, best.knobs)?;
@@ -435,7 +430,7 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
         wrote = true;
     }
 
-    report(&rounds, &baseline, metric, skipped, wrote);
+    report(&rounds, &baseline, best, metric, skipped, wrote);
     Ok(())
 }
 
