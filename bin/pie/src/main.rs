@@ -24,12 +24,13 @@ struct Cli {
     #[command(flatten)]
     global: startup::GlobalArgs,
 
-    /// Emit one JSON document instead of the human rendering.
-    ///
-    /// Global, so it works on every command. It was a per-subcommand flag on
-    /// five of them and absent from the rest, which is not a policy so much as
-    /// the order things were written in -- `pie cache list` was scriptable and
-    /// `pie config show` was not, for no reason either could state.
+    /// Emit one JSON document instead of the human rendering. Works on every
+    /// command.
+    //
+    // Global for that last reason. It was a per-subcommand flag on five of them
+    // and absent from the rest, which is not a policy so much as the order
+    // things were written in -- `pie cache list` was scriptable and `pie config
+    // show` was not, for no reason either could state.
     #[arg(long, global = true)]
     json: bool,
 
