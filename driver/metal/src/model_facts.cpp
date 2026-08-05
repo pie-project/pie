@@ -560,8 +560,8 @@ std::optional<ModelFacts> read_model_facts_from_descriptor(
     // contract (`push_mlx_affine_declared`) and the forward geometry
     // (`batch/forward.cpp`) answer undeclared with 4 bits. An 8-bit
     // checkpoint read as 4-bit is not a refusal, it is wrong numbers.
-    u32_of("quant_bits", facts.quant_bits);
-    u32_of("quant_group_size", facts.quant_group_size);
+    i32_of("quant_bits", facts.quant_bits);
+    i32_of("quant_group_size", facts.quant_group_size);
 
     // `arch_name` is `architectures[0]` verbatim in the descriptor; this driver
     // keys on the lowercased stem, so apply the same reduction it applies to
