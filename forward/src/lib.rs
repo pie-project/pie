@@ -54,6 +54,7 @@ pub mod emit_cuda;
 pub mod emit_qwen35;
 pub mod facts;
 pub mod kernels;
+pub mod lower;
 pub mod family;
 pub mod ffi;
 pub mod trace;
