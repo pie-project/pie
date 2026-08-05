@@ -1,0 +1,320 @@
+{
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "shared_embedding.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "model.embed_tokens.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "MlxAffineU4",
+              "logical_dtype": "BF16",
+              "bits_per_element": 4,
+              "group_size": 64,
+              "channel_axis": 1
+            }
+          }
+        }
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "MlxAffineU4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 64,
+          "channel_axis": 1
+        }
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.input_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.0.input_layernorm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.self_attn.q_proj.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.self_attn.q_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "MlxAffineU4",
+              "logical_dtype": "BF16",
+              "bits_per_element": 4,
+              "group_size": 64,
+              "channel_axis": 1
+            }
+          }
+        }
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "MlxAffineU4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 64,
+          "channel_axis": 1
+        }
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.self_attn.k_proj.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.self_attn.k_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "MlxAffineU4",
+              "logical_dtype": "BF16",
+              "bits_per_element": 4,
+              "group_size": 64,
+              "channel_axis": 1
+            }
+          }
+        }
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "MlxAffineU4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 64,
+          "channel_axis": 1
+        }
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.self_attn.v_proj.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.self_attn.v_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "MlxAffineU4",
+              "logical_dtype": "BF16",
+              "bits_per_element": 4,
+              "group_size": 64,
+              "channel_axis": 1
+            }
+          }
+        }
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "MlxAffineU4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 64,
+          "channel_axis": 1
+        }
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.self_attn.o_proj.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.self_attn.o_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "MlxAffineU4",
+              "logical_dtype": "BF16",
+              "bits_per_element": 4,
+              "group_size": 64,
+              "channel_axis": 1
+            }
+          }
+        }
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "MlxAffineU4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 64,
+          "channel_axis": 1
+        }
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.post_attention_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.0.post_attention_layernorm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.mlp.gate_proj.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.mlp.gate_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "MlxAffineU4",
+              "logical_dtype": "BF16",
+              "bits_per_element": 4,
+              "group_size": 64,
+              "channel_axis": 1
+            }
+          }
+        }
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "MlxAffineU4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 64,
+          "channel_axis": 1
+        }
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.mlp.up_proj.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.mlp.up_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "MlxAffineU4",
+              "logical_dtype": "BF16",
+              "bits_per_element": 4,
+              "group_size": 64,
+              "channel_axis": 1
+            }
+          }
+        }
+      },
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "MlxAffineU4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 64,
+          "channel_axis": 1
+        }
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "layers.0.mlp.down_proj.weight",
+      "expr": {
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.mlp.down_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "MlxAffineU4",
+              "logical_dtype": "BF16",
+              "bits_per_element": 4,
+              "group_size": 64,
+              "channel_axis": 1
+            }
+          }
+        }
+      },
+      "shape": [
+        64,
+        128
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "MlxAffineU4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 64,
+          "channel_axis": 1
+        }
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "final_norm.weight",
+      "expr": {
+        "Src": "model.norm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    }
+  ],
+  "groups": []
+}

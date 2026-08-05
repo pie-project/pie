@@ -17,6 +17,7 @@ use pie_loader::error::Error;
 use pie_loader::types::{Axis, DType, Encoding, QuantScheme, QuantSpec};
 
 use super::builder::{Builder, is_raw};
+use super::policy::RuntimeQuant;
 
 pub(crate) fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))
@@ -469,6 +470,14 @@ pub type RenameRule<'r> = &'r dyn Fn(&Builder<'_>, &str) -> Result<Option<String
 /// `rename` answers with the runtime name, `None` to skip, or an error for a
 /// tensor the schema has no opinion on — the same trichotomy every Metal
 /// header states.
+///
+/// `RuntimeQuant::Int4` adds one arm: a rank-2 `.weight` the checkpoint left
+/// in a float type is encoded to affine-U4 instead of declared as values. It
+/// is the same rule gpt-oss applies unconditionally — its published checkpoint
+/// mixes MXFP4 experts with BF16 attention, and the matvecs are quantized — and
+/// the same `Encode` op, so what runs at load without a request and offline
+/// under `pie model optimize --quant int4` is one transform, not two. Rank is
+/// what separates these from the norms, which must stay values.
 pub fn author_mlx_file(
     b: &mut Builder<'_>,
     schema: &str,
@@ -476,6 +485,16 @@ pub fn author_mlx_file(
 ) -> Result<(), Error> {
     let quant_bits = i64::from(b.facts().mlx_quant_bits);
     let quant_group = i64::from(b.facts().mlx_quant_group_size);
+    let encode_floats = match b.runtime_quant() {
+        RuntimeQuant::None => false,
+        RuntimeQuant::Int4 => true,
+        other => {
+            return fail(format!(
+                "Metal {schema}: runtime_quant={other:?} has no encoder here; these \
+                 kernels read MLX affine, so `int4` is the only request they can serve"
+            ));
+        }
+    };
     let mut declared = 0usize;
     for raw in b.tensors().to_vec() {
         let Some(output) = rename(b, &raw.name)? else {
@@ -493,6 +512,14 @@ pub fn author_mlx_file(
                 ));
             };
             push_mlx_affine_declared(b, raw, scales, biases, quant_bits, quant_group, output)?;
+        } else if encode_floats
+            && raw.name.ends_with(".weight")
+            && raw.shape.len() == 2
+            && (is_raw(&raw.encoding, DType::BF16)
+                || is_raw(&raw.encoding, DType::F16)
+                || is_raw(&raw.encoding, DType::F32))
+        {
+            push_encoded_affine(b, Expr::src(&raw.name), raw.shape[0], raw.shape[1], output)?;
         } else {
             push_direct(b, raw, output);
         }

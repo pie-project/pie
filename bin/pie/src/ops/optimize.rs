@@ -62,9 +62,13 @@ pub struct OptimizeArgs {
     /// What to optimize: a HuggingFace repo ID in the local cache, a snapshot
     /// directory, or a `.zt` artifact.
     pub source: String,
-    /// Load-time requantization to bake in: `fp8`, `int8`, or `mxfp4`.
-    /// Absent means none — the optimization is then the layout work alone
-    /// (fused banks, expert stacks, dequantized schemes).
+    /// Load-time requantization to bake in: `fp8`, `int8` or `mxfp4` for
+    /// `--backend cuda`, `int4` for `--backend metal`. Absent means none — the
+    /// optimization is then the layout work alone (fused banks, expert stacks,
+    /// dequantized schemes).
+    ///
+    /// Whatever is named here is the transform a serve boot would otherwise
+    /// run over every weight, done once and written down instead.
     #[arg(long)]
     pub quant: Option<String>,
     /// The serving device has native FP8 GEMMs. `--quant fp8` on a device
@@ -313,6 +317,22 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
         "metal" => (Projections::InPlace, Naming::Mlx),
         other => bail!("--backend {other:?} is not `cuda` or `metal`"),
     };
+    // A requantization is only real if the serving driver's kernels read what
+    // it produces, so the two flags are checked against each other rather than
+    // each alone. Refusing here is the difference between an artifact that
+    // cannot be bound and one that is quietly the wrong numbers.
+    match (args.backend.as_str(), runtime_quant) {
+        ("metal", RuntimeQuant::Fp8 | RuntimeQuant::Int8 | RuntimeQuant::Mxfp4) => bail!(
+            "--quant {} is CUDA's; Metal's matvecs read MLX affine, so `--quant int4` \
+             is the requantization this backend can serve",
+            args.quant.as_deref().unwrap_or("")
+        ),
+        ("cuda", RuntimeQuant::Int4) => bail!(
+            "--quant int4 is MLX affine, which no CUDA kernel reads; it is \
+             `--backend metal`'s requantization"
+        ),
+        _ => {}
+    }
     let policy = Policy {
         projections,
         naming,

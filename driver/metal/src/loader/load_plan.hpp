@@ -29,6 +29,30 @@ using LoadPlan = pie_loader::LoadPlan;
 inline constexpr std::uint32_t kMetalTileMapMask =
     pie_loader::kTileMapCast | pie_loader::kTileMapEncode | pie_loader::kTileMapScale;
 
+/// Did the contract tie the embedding and the head, or ship two tensors?
+///
+/// Decided ONCE, by the contract, and read back rather than decided a second
+/// time. The rule is that a shipped `lm_head` beats whatever the config says,
+/// and the config can be wrong in both directions: Qwen3.5-35B-A3B is a
+/// multimodal wrapper spelling `tie_word_embeddings` at the TOP level, outside
+/// the `text_config` its family parses, so the facts default to tied; Qwen3-
+/// 0.6B says `tie_word_embeddings: true` and then ships an `lm_head.weight`
+/// anyway. Either way the contract staged `embed_tokens` and `lm_head` while
+/// the DAG asked for `shared_embedding`, and the load stopped on "unstaged
+/// weight shared_embedding.weight" — two opinions about one fact.
+///
+/// The plan's own tensor list is the only opinion that cannot be wrong in a
+/// way the binding survives, so it is the one every family follows.
+inline bool plan_ties_embeddings(const LoadPlan& plan) {
+    const auto view = plan.view();
+    for (std::size_t i = 0; i < view.tensors.len; ++i) {
+        if (pie_loader::bytes_to_string(view.tensors.ptr[i].name) == "shared_embedding.weight") {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// This driver's storage capability. One definition, two readers: the device
 /// facts JSON published at create time, and the target spec supplied with every
 /// compile request.
