@@ -969,6 +969,35 @@ fn metal_refuses_a_requantization_it_cannot_encode() {
     }
 }
 
+/// A BF16 release with NO quantization requested is refused while the
+/// checkpoint is still in view.
+///
+/// `llama_mlx_metal_int4` above is the same checkpoint with `--quant int4`, and
+/// it authors fine — the encode supplies what the driver needs. Without that
+/// request nothing does: `push_quant` asks for `.weight`/`.scales`/`.biases`
+/// unconditionally, so the artifact used to look well-formed and then fail deep
+/// in the loader with `llama bind: unstaged weight embed_tokens.scales`, which
+/// names an internal staging table rather than the problem. The refusal has to
+/// name the two ways out, since both are real.
+#[test]
+fn an_unquantized_checkpoint_is_refused_unless_it_is_being_quantized() {
+    let mut facts = facts("llama3", 1);
+    facts.mlx_quant_bits = 4;
+    facts.mlx_quant_group_size = 64;
+
+    let err = author(
+        &facts,
+        &llama_bf16_checkpoint(),
+        &metal_target(),
+        &mlx_policy(),
+    )
+    .expect_err("bf16 with no --quant has no Metal binding and must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("scales"), "names what is missing: {msg}");
+    assert!(msg.contains("int4"), "names the offline encode: {msg}");
+    assert!(msg.contains("4bit"), "names the pre-quantized repos: {msg}");
+}
+
 /// The same decoder again, in F16 — the width many older releases ship.
 ///
 /// Not a cosmetic variant: the driver's `encode_mlx_affine_u4` is handed a byte
