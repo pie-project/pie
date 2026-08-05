@@ -994,6 +994,12 @@ void llama_like_forward_declared(
             // normed copies (norm_x for QKV, norm_y for gate/up), post-norm
             // reads the residual stream raw — the hand-written `qkv_in` /
             // `mlp_in` indirections.
+            // Every projection writes its VALUE (all of them pinned by
+            // the pass, so this is the same memory the conventions named).
+            const auto out_slot = [&](std::size_t i) {
+                return values.slot(plan.outputs(op)[i],
+                                   plan.value(plan.outputs(op)[i]));
+            };
             // The island's consumers: the projection reads the value the
             // attn_norm arm produced (pinned, so LoRA's captured pointer
             // and this slot are the same bytes).
@@ -1014,25 +1020,25 @@ void llama_like_forward_declared(
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
                     ops::WeightView(wb.require(name)),
-                    ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+                    out_slot(0), N, Hq + 2 * Hk, H);
             } else if (nm.field == "q_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
                     make_weight_view(&wb.require(name),
                                      layer.q_proj_quant),
-                    ws.q.data(), N, Hq, H);
+                    out_slot(0), N, Hq, H);
             } else if (nm.field == "k_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
                     make_weight_view(&wb.require(name),
                                      layer.k_proj_quant),
-                    ws.k.data(), N, Hk, H);
+                    out_slot(0), N, Hk, H);
             } else if (nm.field == "v_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
                     make_weight_view(&wb.require(name),
                                      layer.v_proj_quant),
-                    ws.v.data(), N, Hk, H);
+                    out_slot(0), N, Hk, H);
             } else if (nm.field == "o_proj") {
                 if (post_norm) {
                     // Post-norm: o_proj lands in the norm_x scratch (the
@@ -1040,19 +1046,29 @@ void llama_like_forward_declared(
                     // ResidualAdd land it on the stream — the hand-written
                     // post-norm block, same buffers, same order.
                     ops::gemm_act_x_w(cublas.handle(),
+                        // NOT the arena: a beta=1 GEMM's operand list
+                        // carries the ACCUMULATOR too, so `inputs[0]` is
+                        // not the activation here. Which operand is which
+                        // is a question for the trace's own ordering rule,
+                        // not a guess — this island waits for it.
                         ws.attn_out.data(),
                         make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
-                        ws.norm_x.data(), N, H, Hq, beta);
+                        out_slot(0), N, H, Hq, beta);
                 } else {
                     // Residual accumulate folded into the GEMM (beta from
                     // the trace's beta_one), exactly the hand-written T==1
                     // branch.
                     ops::gemm_act_x_w(cublas.handle(),
+                        // NOT the arena: a beta=1 GEMM's operand list
+                        // carries the ACCUMULATOR too, so `inputs[0]` is
+                        // not the activation here. Which operand is which
+                        // is a question for the trace's own ordering rule,
+                        // not a guess — this island waits for it.
                         ws.attn_out.data(),
                         make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
-                        ws.y.data(), N, H, Hq, beta);
+                        out_slot(0), N, H, Hq, beta);
                 }
             } else if (nm.field == "gate_up") {
                 // The island's consumer: the same traced value the
