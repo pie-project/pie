@@ -243,26 +243,10 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
 
             // ── elementwise ──
+            case Kind::ExpertSiluMul:
+            case Kind::SiluMul:
             case Kind::AttnResidual:
             case Kind::FfnResidual:
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Residual::Width,
-                                         std::int32_t(R * std::uint32_t(g.hidden)), &count);
-                break;
-            case Kind::SiluMul:
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::SiluMul::Width,
-                                         std::int32_t(R * std::uint32_t(g.intermediate)),
-                                         &count);
-                break;
-            case Kind::ExpertSiluMul:
-                // The whole SORTED stack, flat: gate, up and out share a
-                // layout, so the pair axis is just more elements. Sized off
-                // the sorted count and not `rows * k`, because the sort pads
-                // every expert's run to a tile and the padding rows are real
-                // rows of the buffers this reads.
-                bind_const<std::int32_t>(
-                    ctx, ord, (std::uint8_t)bind::SiluMul::Width,
-                    std::int32_t(llama_moe_sorted_rows(g, int(R)) * g.moe_intermediate),
-                    &count);
                 break;
 
             // ── routing ──

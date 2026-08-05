@@ -40,13 +40,13 @@ int required_slots(Kernel k) {
         case Kernel::GatedRms: return 5;
         case Kernel::Residual:
         case Kernel::LayerOut:
-        case Kernel::SiluMul:
+        case Kernel::SiluMul: return 3;
         case Kernel::QSplit: return 4;
         case Kernel::Rope:
         case Kernel::RopeK: return 5;
         case Kernel::KvAppendPaged: return 15;
         case Kernel::SdpaPaged: return 12;
-        case Kernel::AttnGate: return 3;
+        case Kernel::AttnGate: return 2;
         default: return 0;
     }
 }
@@ -281,22 +281,17 @@ int main() {
                    at_narrow.width == uint32_t(moe.hidden),
                "while the width-invariant half of the same struct survives the rebind");
 
-        // `bind::Residual::Width` and `bind::GoRouterTopK::Params` are both
-        // index 3. A residual that falls into the routing's arm of the binder
-        // is bound to a plausible slot holding a two-field struct where an int
-        // is declared, and residual_add ignores its width, so nothing faults
-        // and nothing looks wrong.
-        bool residual_holds_a_width = false;
+        // Residual dispatches derive their flat extent from the launch. They
+        // no longer carry a decorative width constant at slot 3, which also
+        // removes the old collision with GoRouterTopK::Params.
+        bool residual_slot_is_clear = false;
         for (const Dispatch& d : moe_dag) {
             if (d.kind != Kernel::Residual && d.kind != Kernel::LayerOut) continue;
-            SlotHandle s = ctx->const_slot(d.ordinal, uint8_t(bind::Residual::Width), sizeof(int));
-            int w = 0;
-            if (s.valid()) std::memcpy(&w, s.contents(), sizeof(w));
-            residual_holds_a_width = w == moe.hidden;
+            residual_slot_is_clear = !ctx->arg_slot_is_bound(d.ordinal, 3);
             break;
         }
-        expect(residual_holds_a_width,
-               "a residual in a routed DAG is bound its own width, not the router's params");
+        expect(residual_slot_is_clear,
+               "a residual in a routed DAG has no stale width/route-param slot");
     }
     std::printf("\n==== decode_step_mb_test: %d passed, %d failed ====\n", pass, fail);
     return fail == 0 ? 0 : 1;

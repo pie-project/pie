@@ -15,11 +15,10 @@
 // index of the max). This kernel reproduces that exactly — `float(bfloat)` is the
 // same exact widening, and the reduction keeps the lower index on every value tie.
 //
-// bind::Argmax (proposed extension, pending alpha's ordinal assignment):
+// bind::Argmax:
 //   Logits=0 (in, [n_rows,vocab] row-major), NextToken=1 (out u32[n_rows]),
 //   Params=2 (ArgmaxParams: vocab + inline eos id list), EosFlag=3 (out u32[n_rows]).
-// The locked 2-buffer bind (Logits=0/NextToken=1) is unchanged; Params/EosFlag are
-// ADD-ONLY (inert until the resident-loop / M>1 wiring binds them).
+// Params/EosFlag are append-only extensions to the original two-buffer bind.
 //
 // Dispatch: Grid{1024, n_rows, 1}, Threadgroup{1024,1,1} (M=1 → grid.y=1 → row 0,
 // byte-identical single-row reduction). One threadgroup (32 simdgroups) per row.
