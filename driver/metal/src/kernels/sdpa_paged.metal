@@ -315,9 +315,15 @@ template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LAN
   // a per-pass probability tile to hand the result back to the accumulation,
   // which still wants the original layout because that one needs no reduction.
   //
-  // Not free at every width: q and the probabilities are `QT*D` and `QT*KT`, and
-  // at d=256 those push the threadgroup past its 32 KB. Compiled for the widths
-  // where they fit and where the reduction dominates most.
+  // Not free at every width, and the width is what decides it. q and the
+  // probabilities are `QT*D` and `QT*KT` on top of the staged keys and values:
+  // 28 KB at d=64 and d=128, 34 KB at d=256, and at d=512 q alone is the whole
+  // 32 KB. Halving KT does make d=256 fit, at 25 KB, and it was measured: 1304
+  // -> 1196 tok/s on a 448-row gemma-4 prefill, because a pass half as deep is
+  // twice as many staging barriers and at d=256 the reduction this removes is
+  // only 62% of the arithmetic it sits on, against 250% at d=64. So the wide
+  // heads keep the per-row shape, and this is compiled for the two widths where
+  // it both fits and pays.
   constexpr int kq = KEY_PER_LANE ? QT * D : 1;
   constexpr int kp_tile = KEY_PER_LANE ? QT * KT : 1;
   // K's rows are read one per LANE in that shape, so a bare `D` stride puts all
@@ -446,8 +452,13 @@ template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LAN
           const U factor = max_score == NEG_INF ? U(0) : fast::exp(max_score - new_max);
           U block_sum = 0;
           for (int c = 0; c < kcols; c++) {
+            const int kk = c * 32 + int(simd_lid);
             const U p = s[c] == NEG_INF ? U(0) : fast::exp(s[c] - new_max);
-            ptile[simd_gid * KT + c * 32 + int(simd_lid)] = p;
+            // A pass narrower than the simdgroup leaves lanes with no key of
+            // their own, and their slot is the NEXT row's. `KT >= 32` at every
+            // width compiled here, so this guards a shape rather than a bug --
+            // but it guards it where the shape is decided, not where it is read.
+            if (kk < KT) ptile[simd_gid * KT + kk] = p;
             block_sum += p;
           }
           block_sum = simd_sum(block_sum);
