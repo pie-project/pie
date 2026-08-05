@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "asap-grammar-aligned-decoding",
     "attention-sink",
+    "tart-masked",
     "beam-search",
     "cacheback-speculative-decoding",
     "chat-completion",

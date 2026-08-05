@@ -1,0 +1,13 @@
+[package]
+name = "tart-masked"
+version = "0.1.0"
+description = "tart: dense custom-mask probe (causal numerics, dense-packed) — the 0.3 naive-masked"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt"}
+max_tokens = {type = "int", optional = true, description = "Max generated tokens (default: 32)"}
+max_layers = {type = "int", optional = true, description = "Optional layer truncation"}
