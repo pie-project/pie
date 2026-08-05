@@ -483,6 +483,13 @@ impl FireAttnMask {
                 // A decode-shaped custom mask still needs the mask-aware
                 // prefill attention path.
                 request.single_token_mode = false;
+                // The pass-level `dense_device_mask` stamp records the
+                // PROGRAM's channel binding; this FIRE's mask resolved on
+                // the host into wire BRLE rows, which the batcher's
+                // wire-mask rules co-batch (one mask row per request,
+                // synthesized causal for unmasked peers). Only a mask that
+                // stays device-resident needs the dense-device solo.
+                request.dense_device_mask = false;
             }
             FireAttnMask::Device => {
                 request.has_user_mask = true;

@@ -24,6 +24,22 @@ struct Input {
     /// 2 = no masks at all (prefill causal channel still bound? no — none).
     #[serde(default)]
     bisect: u32,
+    /// CO-FIRE: run two lanes (masked + plain) through one pipeline, both
+    /// fires of each step submitted into the same frame.
+    #[serde(default)]
+    co: bool,
+    /// The plain lane's prompt in co mode.
+    #[serde(default = "default_prompt_b")]
+    prompt_b: String,
+    /// NON-CAUSAL probe: additionally hide this KV position from every
+    /// query. Distinguishes "mask applied" from "mask elided as causal" —
+    /// output must differ from the maskless run.
+    #[serde(default)]
+    blind: Option<u32>,
+}
+
+fn default_prompt_b() -> String {
+    "Name three rivers.".into()
 }
 
 fn default_prompt() -> String {
@@ -38,6 +54,10 @@ fn default_max_tokens() -> usize {
 async fn main(input: Input) -> Result<String> {
     if input.max_tokens == 0 {
         return Ok(String::new());
+    }
+    if input.co {
+        let prompt_b = input.prompt_b.clone();
+        return run_co(&input, &prompt_b).await;
     }
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
@@ -65,10 +85,13 @@ async fn main(input: Input) -> Result<String> {
     let prefill_indptr = Channel::from([0u32, n.div_ceil(PAGE_T)]);
     // The DENSE causal literal: byte-for-byte causal numerics, packed as
     // a custom mask because a host literal has no structured form.
+    let blind = input.blind;
     let causal = Channel::from_shaped(
         [n, pool_len],
         (0..n)
-            .flat_map(|query| (0..pool_len).map(move |key| key <= query))
+            .flat_map(|query| {
+                (0..pool_len).map(move |key| key <= query && Some(key) != blind)
+            })
             .collect::<Vec<_>>(),
     );
     let first_out = Channel::new([1], dtype::i32).named("first_token");
@@ -121,7 +144,9 @@ async fn main(input: Input) -> Result<String> {
     let write_offset = Channel::from([n % PAGE_T]);
     let mask = Channel::from_shaped(
         [1, pool_len],
-        (0..pool_len).map(|key| key <= n).collect::<Vec<_>>(),
+        (0..pool_len)
+            .map(|key| key <= n && Some(key) != blind)
+            .collect::<Vec<_>>(),
     );
     let pages = Channel::from(pool_ids.clone());
     let page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]);
@@ -171,24 +196,250 @@ async fn main(input: Input) -> Result<String> {
         if generated.len() >= input.max_tokens {
             break;
         }
-        // Host-advance the geometry for the next fire.
+        // Host-advance the geometry for the next fire. Two channel
+        // postures here (engine program.rs channel_accesses): channels
+        // bound to EmbedTokens/Positions/WSlot/WOff (or ChanTake'd in a
+        // stage) are CONSUMED per fire — queue the next value with `put`.
+        // Everything else (KvLen/Pages/PageIndptr/EmbedIndptr/AttnMask)
+        // is latest-value: the device never advances its head, so a
+        // second `put` blocks forever on a full ring — REPLACE the
+        // committed front with `set` instead, and leave constant
+        // channels (pages, decode_indptr) untouched.
         let pos = filled;
         token_in.put([token as i32]);
         position.put([pos]);
-        klen.put([pos + 1]);
+        klen.set([pos + 1])?;
         write_slot.put([pool_ids[(pos / PAGE_T) as usize]]);
         write_offset.put([pos % PAGE_T]);
         if input.bisect == 0 {
-            mask.put((0..pool_len).map(|key| key <= pos).collect::<Vec<bool>>());
+            mask.set(
+                (0..pool_len)
+                    .map(|key| key <= pos && Some(key) != blind)
+                    .collect::<Vec<bool>>(),
+            )?;
         }
-        page_indptr.put([0u32, (pos + 1).div_ceil(PAGE_T)]);
-        // Host-route fires POP every host-writer channel per fire (the
-        // host shadow's only record) — even read-only ones must be
-        // re-staged, unlike the device route's latest-value posture.
-        pages.put(pool_ids.clone());
-        decode_indptr.put([0u32, 1]);
+        page_indptr.set([0u32, (pos + 1).div_ceil(PAGE_T)])?;
         filled += 1;
     }
     pipeline.close();
     model::decode(&generated)
+}
+
+/// One sequential decode lane of the co-fired pair: its own KV pages,
+/// geometry channels, and decode pass; masked lanes re-`set` the dense
+/// causal row before every fire.
+struct Lane {
+    pool_ids: Vec<u32>,
+    pool_len: u32,
+    decode: ForwardPass,
+    token_in: Channel,
+    position: Channel,
+    klen: Channel,
+    write_slot: Channel,
+    write_offset: Channel,
+    mask: Option<Channel>,
+    page_indptr: Channel,
+    token_out: Channel,
+    filled: u32,
+    primed: bool,
+    blind: Option<u32>,
+    generated: Vec<u32>,
+}
+
+impl Lane {
+    /// Stage the next fire's geometry. The first call SEEDS the empty
+    /// channels with `put`; later calls `put` only the consumed channels
+    /// (EmbedTokens/Positions/WSlot/WOff) and `set` the latest-value ones
+    /// (KvLen/AttnMask/PageIndptr), whose device head never advances.
+    fn advance(&mut self, token: u32) -> Result<()> {
+        self.generated.push(token);
+        let pos = self.filled;
+        self.token_in.put([token as i32]);
+        self.position.put([pos]);
+        self.write_slot
+            .put([self.pool_ids[(pos / PAGE_T) as usize]]);
+        self.write_offset.put([pos % PAGE_T]);
+        let klen = [pos + 1];
+        let indptr = [0u32, (pos + 1).div_ceil(PAGE_T)];
+        let blind = self.blind;
+        let mask_row = self.mask.as_ref().map(|_| {
+            (0..self.pool_len)
+                .map(|key| key <= pos && Some(key) != blind)
+                .collect::<Vec<bool>>()
+        });
+        if self.primed {
+            self.klen.set(klen)?;
+            if let (Some(mask), Some(row)) = (&self.mask, mask_row) {
+                mask.set(row)?;
+            }
+            self.page_indptr.set(indptr)?;
+        } else {
+            self.klen.put(klen);
+            if let (Some(mask), Some(row)) = (&self.mask, mask_row) {
+                mask.put(row);
+            }
+            self.page_indptr.put(indptr);
+            self.primed = true;
+        }
+        self.filled += 1;
+        Ok(())
+    }
+}
+
+/// CO-FIRE: one process, one pipeline, two lanes per step — lane A carries
+/// the dense custom mask (exactly-causal numerics), lane B is plain causal.
+/// Both fires of a step are submitted back-to-back before either take, so
+/// they ride one frame: the scheduler's region table must show a MASK
+/// region next to a plain region, and the driver's planned mask split must
+/// engage. Stop tokens are ignored so the lanes stay in lockstep.
+async fn run_co(input: &Input, prompt_b: &str) -> Result<String> {
+    let ws = WorkingSet::new();
+    let pipeline = Pipeline::new();
+
+    let build = |text: &str, masked: bool| -> Result<(Lane, Channel, ForwardPass)> {
+        let mut prompt = chat::system_user("You are a helpful assistant.", text);
+        prompt.extend(chat::cue());
+        if prompt.is_empty() {
+            prompt.push(0);
+        }
+        let n = prompt.len() as u32;
+        let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(PAGE_T);
+        let pool_len = pool_pages * PAGE_T;
+        let slots = ws.reserve(pool_pages).context("reserve co-lane KV")?;
+        let pool_ids = slots.ids().to_vec();
+
+        let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
+        let prefill_embed_indptr = Channel::from([0u32, n]);
+        let prefill_positions = Channel::from_iter(0..n);
+        let prefill_slots =
+            Channel::from_iter((0..n).map(|position| pool_ids[(position / PAGE_T) as usize]));
+        let prefill_offsets = Channel::from_iter((0..n).map(|position| position % PAGE_T));
+        let prefill_klen = Channel::from([n]);
+        let prefill_pages = Channel::from(pool_ids.clone());
+        let prefill_indptr = Channel::from([0u32, n.div_ceil(PAGE_T)]);
+        let blind = input.blind;
+        let prefill_mask = masked.then(|| {
+            Channel::from_shaped(
+                [n, pool_len],
+                (0..n)
+                    .flat_map(|query| {
+                        (0..pool_len).map(move |key| key <= query && Some(key) != blind)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let first_out = Channel::new([1], dtype::i32);
+
+        let prefill = ForwardPass::new();
+        prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
+        prefill.attention(
+            &ws,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &prefill_klen,
+                pages: &prefill_pages,
+                page_indptr: &prefill_indptr,
+                w_slot: &prefill_slots,
+                w_off: &prefill_offsets,
+                positions: &prefill_positions,
+                mask: prefill_mask.as_ref(),
+            },
+        )?;
+        {
+            let first_out = first_out.clone();
+            prefill.epilogue(move || {
+                first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+            });
+        }
+
+        let token_in = Channel::new([1], dtype::i32);
+        let decode_indptr = Channel::from([0u32, 1]);
+        let position = Channel::new([1], dtype::u32);
+        let klen = Channel::new([1], dtype::u32);
+        let write_slot = Channel::new([1], dtype::u32);
+        let write_offset = Channel::new([1], dtype::u32);
+        let mask = masked.then(|| Channel::new([1, pool_len], dtype::bool));
+        let pages = Channel::from(pool_ids.clone());
+        let page_indptr = Channel::new([2], dtype::u32);
+        let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        // Fold-shaped anchor for the host shadow classifier (see solo path).
+        let step_counter = Channel::from([0u32]);
+
+        let decode = ForwardPass::new();
+        decode.embed(&token_in, &decode_indptr)?;
+        decode.attention(
+            &ws,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &write_slot,
+                w_off: &write_offset,
+                positions: &position,
+                mask: mask.as_ref(),
+            },
+        )?;
+        {
+            let token_out = token_out.clone();
+            decode.epilogue(move || {
+                let step = step_counter.take();
+                token_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+                step_counter.put(&step + 1u32);
+            });
+        }
+
+        let lane = Lane {
+            pool_ids,
+            pool_len,
+            decode,
+            token_in,
+            position,
+            klen,
+            write_slot,
+            write_offset,
+            mask,
+            page_indptr,
+            token_out,
+            filled: n,
+            primed: false,
+            blind: masked.then_some(input.blind).flatten(),
+            generated: Vec::with_capacity(input.max_tokens),
+        };
+        Ok((lane, first_out, prefill))
+    };
+
+    let (mut lane_a, first_a, prefill_a) = build(&input.prompt, true)?;
+    let (mut lane_b, first_b, prefill_b) = build(prompt_b, false)?;
+
+    // Both prefills before either take: one frame, MULTI_TOKEN|MASK next
+    // to MULTI_TOKEN.
+    println!("[co] submit prefills");
+    prefill_a.submit(&pipeline).context("co prefill A")?;
+    prefill_b.submit(&pipeline).context("co prefill B")?;
+    println!("[co] take first A");
+    let first_a = first_a.take_host::<i32>().await? as u32;
+    println!("[co] take first B");
+    let first_b = first_b.take_host::<i32>().await? as u32;
+    lane_a.advance(first_a)?;
+    lane_b.advance(first_b)?;
+
+    for step in 1..input.max_tokens {
+        println!("[co] submit {step}");
+        lane_a.decode.submit(&pipeline).context("co decode A")?;
+        lane_b.decode.submit(&pipeline).context("co decode B")?;
+        println!("[co] take {step} B");
+        let token_b = lane_b.token_out.take_host::<i32>().await? as u32;
+        println!("[co] take {step} A");
+        let token_a = lane_a.token_out.take_host::<i32>().await? as u32;
+        lane_a.advance(token_a)?;
+        lane_b.advance(token_b)?;
+    }
+    pipeline.close();
+
+    let text_a = model::decode(&lane_a.generated)?;
+    let text_b = model::decode(&lane_b.generated)?;
+    Ok(format!("{text_a}\n=====\n{text_b}"))
 }

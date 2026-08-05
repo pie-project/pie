@@ -3146,6 +3146,17 @@ impl BatchScheduler {
                     // stamped fire counts toward its lane's frame arrival
                     // even while it sits in `pending` behind an
                     // in-flight-depth or seal hold.
+                    if std::env::var_os("PIE_WAVE_TRACE").is_some() {
+                        eprintln!(
+                            "[wave-trace] enq fire={} framed={} mask={} masks={} stm={} pipe={}",
+                            launch.logical_fire_id,
+                            launch.frame.is_some(),
+                            launch.request.has_user_mask,
+                            launch.request.masks.len(),
+                            launch.request.single_token_mode,
+                            launch.pipeline_id.is_some()
+                        );
+                    }
                     if let Some(stamp) = launch.frame {
                         frame_policy.on_fire_enqueued(
                             stamp,
@@ -4116,6 +4127,9 @@ impl BatchScheduler {
                 vec![scan.drain_eligible.clone()]
             } else if let Some(untracked) = scan.untracked {
                 rider_batch = true;
+                if std::env::var_os("PIE_WAVE_TRACE").is_some() {
+                    eprintln!("[wave-trace] rider fire={untracked}");
+                }
                 vec![vec![untracked]]
             } else {
                 match frame_policy.plan_dispatch(
@@ -4124,7 +4138,15 @@ impl BatchScheduler {
                     !in_flight_launches.is_empty(),
                     now,
                 ) {
-                    FramePlan::Dispatch(waves) => waves,
+                    FramePlan::Dispatch(waves) => {
+                        if std::env::var_os("PIE_WAVE_TRACE").is_some() {
+                            eprintln!(
+                                "[wave-trace] dispatch waves={:?}",
+                                waves.iter().map(Vec::len).collect::<Vec<_>>()
+                            );
+                        }
+                        waves
+                    }
                     FramePlan::Hold(hold) => {
                         merge_hint(&mut wait_hint, hold);
                         break;
