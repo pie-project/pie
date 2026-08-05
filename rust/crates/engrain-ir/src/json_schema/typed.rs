@@ -8,7 +8,7 @@ use super::{
     generate_integer_range_regex, parse_i64_keyword, sanitize_rule_name,
 };
 use crate::frontend::{FrontendExpr as Expr, FrontendGrammar, FrontendRule};
-use crate::regex::regex_to_expr;
+use crate::regex::{regex_to_expr, within_json_string};
 
 pub(super) fn convert(schema: &Value, options: &JsonSchemaOptions) -> Result<FrontendGrammar> {
     Converter::new(options, schema).convert(schema)
@@ -287,13 +287,28 @@ impl<'a> Converter<'a> {
             )),
             Some(_) => bail!("unexpected type value"),
             None => {
+                // Which type a schema without `type` describes, from the
+                // keywords only that type has. `additionalProperties` belongs
+                // here for the same reason `properties` does, and leaving it
+                // out meant `{"additionalProperties": {"type": "array"}}`
+                // lowered to any JSON value at all - so the mask took
+                // `{"x": 5}` and said nothing about it. Found by generating
+                // under the mask over the fragment this engine claims to
+                // enforce exactly.
                 if object.contains_key("properties")
+                    || object.contains_key("patternProperties")
+                    || object.contains_key("additionalProperties")
                     || object.contains_key("required")
                     || object.contains_key("minProperties")
                     || object.contains_key("maxProperties")
                 {
                     self.visit_object(schema, hint)
-                } else if object.contains_key("items") || object.contains_key("prefixItems") {
+                } else if object.contains_key("items")
+                    || object.contains_key("prefixItems")
+                    || object.contains_key("additionalItems")
+                    || object.contains_key("minItems")
+                    || object.contains_key("maxItems")
+                {
                     self.visit_array(schema, hint)
                 } else if object.contains_key("pattern")
                     || object.contains_key("minLength")
@@ -392,7 +407,11 @@ impl<'a> Converter<'a> {
                 if has_length || object.contains_key("pattern") {
                     bail!("format cannot be combined with pattern or length constraints");
                 }
-                return Ok(seq(vec![lit("\""), regex_to_expr(&pattern)?, lit("\"")]));
+                return Ok(seq(vec![
+                    lit("\""),
+                    within_json_string(regex_to_expr(&pattern)?)?,
+                    lit("\""),
+                ]));
             }
         }
         if let Some(pattern) = object.get("pattern") {
@@ -424,7 +443,11 @@ impl<'a> Converter<'a> {
                 }
                 return Ok(seq(vec![lit("\""), expr, lit("\"")]));
             }
-            let body = seq(vec![lit("\""), regex_to_expr(pattern)?, lit("\"")]);
+            let body = seq(vec![
+                lit("\""),
+                within_json_string(regex_to_expr(pattern)?)?,
+                lit("\""),
+            ]);
             return self.lexeme("pattern", body);
         }
         self.json_string(min, max)
@@ -440,7 +463,7 @@ impl<'a> Converter<'a> {
     fn pattern_key(&mut self, pattern: &str) -> Result<Expr> {
         let anchored_start = pattern.starts_with('^');
         let anchored_end = pattern.ends_with('$') && !pattern.ends_with("\\$");
-        let body = regex_to_expr(pattern)?;
+        let body = within_json_string(regex_to_expr(pattern)?)?;
         let mut parts = vec![lit("\"")];
         if !anchored_start {
             parts.push(json_character().repeat(0, None));

@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -50,17 +51,28 @@ def _walk(matcher: Any, rng: random.Random) -> tuple[str, bool]:
     return produced.decode("utf-8", "replace"), matcher.can_terminate()
 
 
-def _blamed(error: Any) -> tuple[str, str]:
-    """The keyword a validator rejected on, and a pointer to where it lives.
+def _blamed(error: Any) -> list[tuple[str, str]]:
+    """Every keyword a validator's rejection implicates, outermost last.
 
-    `absolute_schema_path` ends with the keyword itself, so the pointer is
-    everything before it - which is the object the relaxation walk pointed at.
-    Numeric elements are array indices inside `oneOf` and friends and are kept,
-    because the walk keeps them too.
+    `absolute_schema_path` ends with the keyword the error was raised on, and
+    the pointer is everything before it - which is the object the relaxation
+    walk pointed at. But a validator reports the *deepest* best-match error, so
+    a document failing a root `oneOf` comes back as `#/oneOf/0/anyOf`. Failing
+    the inner `anyOf` is what makes branch 0 fail, which is what makes the
+    root `oneOf` fail, so an entry naming either one explains this document.
+    Walking back up the path recovers all of them.
     """
-    path = list(error.absolute_schema_path)
-    keyword = str(path[-1]) if path else str(error.validator)
-    return keyword, "#" + "".join(f"/{part}" for part in path[:-1])
+    path = [str(part) for part in error.absolute_schema_path]
+    if not path:
+        return [(str(error.validator), "#")]
+    found = []
+    for cut in range(len(path), 0, -1):
+        if path[cut - 1].isdigit():
+            continue
+        found.append(
+            (path[cut - 1], "#" + "".join(f"/{part}" for part in path[: cut - 1]))
+        )
+    return found
 
 
 def _aliases(schema: Any) -> dict[str, str]:
@@ -88,14 +100,25 @@ def _aliases(schema: Any) -> dict[str, str]:
 
 
 def _spellings(at: str, aliases: dict[str, str]) -> set[str]:
-    """Every pointer naming the same place, following `$ref` up to a fixpoint."""
+    """Every pointer naming the same place.
+
+    Two rewrites, to a fixpoint. A `$ref` is followed, because a validator
+    reports the path through the resolved schema. And an `/allOf/<n>` segment
+    is dropped, because an `allOf` branch is merged into the object above it
+    before anything is lowered - so a constraint the validator locates in a
+    branch is one the engine reports on the parent, and they are the same
+    place under two names.
+    """
     found = {at}
-    for _ in range(4):
+    for _ in range(6):
         grown = set(found)
         for pointer in found:
             for site, target in aliases.items():
                 if pointer == site or pointer.startswith(site + "/"):
                     grown.add(target + pointer[len(site) :])
+            collapsed = re.sub(r"/allOf/\d+", "", pointer)
+            if collapsed != pointer:
+                grown.add(collapsed or "#")
         if grown == found:
             break
         found = grown
@@ -186,8 +209,12 @@ def measure(
                 jsonschema.validate(document, schema)
             except jsonschema.ValidationError as error:
                 totals["invalid"] += 1
-                keyword, at = _blamed(error)
-                covering = _covered(notes, keyword, _spellings(at, aliases))
+                covering = None
+                keyword, at = "?", "#"
+                for keyword, at in _blamed(error):
+                    covering = _covered(notes, keyword, _spellings(at, aliases))
+                    if covering is not None:
+                        break
                 if covering is not None:
                     totals["attributed"] += 1
                     hit.add(covering["keyword"])

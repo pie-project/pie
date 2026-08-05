@@ -830,3 +830,124 @@ class TheShortlistIsWhicheverListIsShorter(unittest.TestCase):
         kind, count = self._check(admits_most=True)
         self.assertEqual(kind, 1)
         self.assertGreater(count, 0)
+
+
+class WhatAPatternMayMatchInsideAString(unittest.TestCase):
+    """A regex has no idea it is being read inside a JSON string.
+
+    `.` means "any character", and a JSON string may not hold a raw quotation
+    mark, reverse solidus or control character - so a pattern whose `.` matched
+    one made this engine emit a document `json.loads` refuses. Found by
+    generating under the mask over the fragment the engine claims to enforce
+    exactly, which is the only way a bug of this shape is ever found.
+    """
+
+    def setUp(self):
+        self.engine = _Engine([bytes([b]) for b in range(256)])
+
+    def accepts(self, grammar, text: str) -> bool:
+        matcher = grammar.matcher()
+        for byte in text.encode():
+            if byte not in matcher.allowed_tokens():
+                return False
+            matcher.accept_token(byte)
+        return matcher.can_terminate()
+
+    def test_a_dot_does_not_match_a_raw_control_character(self):
+        grammar = self.engine.compile_json_schema(
+            json.dumps({"type": "string", "pattern": "a.b"})
+        )
+        self.assertTrue(self.accepts(grammar, '"axb"'))
+        self.assertFalse(self.accepts(grammar, '"a\x01b"'))
+        self.assertFalse(self.accepts(grammar, '"a"b"'))
+
+    def test_it_matches_the_escape_instead(self):
+        """Widening is what a lowering may do; narrowing is not.
+
+        A pattern's `.` matches the *character* a quotation mark is, and JSON
+        spells that character `\\"`. Dropping it from the class would be a
+        valid document this mask can no longer produce.
+        """
+        grammar = self.engine.compile_json_schema(
+            json.dumps({"type": "string", "pattern": "a.b"})
+        )
+        self.assertTrue(self.accepts(grammar, '"a\\"b"'))
+        self.assertTrue(self.accepts(grammar, '"a\\\\b"'))
+        self.assertTrue(self.accepts(grammar, '"a\\nb"'))
+        self.assertTrue(self.accepts(grammar, '"a\\u0001b"'))
+        self.assertTrue(self.accepts(grammar, '"a\\u001Fb"'))
+
+
+class AnUntypedSchemaIsStillAShape(unittest.TestCase):
+    """`{"additionalProperties": {...}}` describes an object, as `properties` does.
+
+    The inference that reads a type off the keywords knew about `properties`
+    and not about `additionalProperties`, so a schema carrying only the second
+    lowered to any JSON value at all and the mask took `{"x": 5}` without
+    saying anything about it.
+    """
+
+    def setUp(self):
+        self.engine = _Engine([bytes([b]) for b in range(256)])
+
+    def accepts(self, grammar, text: str) -> bool:
+        matcher = grammar.matcher()
+        for byte in text.encode():
+            if byte not in matcher.allowed_tokens():
+                return False
+            matcher.accept_token(byte)
+        return matcher.can_terminate()
+
+    def test_additional_properties_alone_constrains_the_values(self):
+        grammar = self.engine.compile_json_schema(
+            json.dumps({"additionalProperties": {"type": "array"}})
+        )
+        self.assertTrue(self.accepts(grammar, '{"x":[]}'))
+        self.assertFalse(self.accepts(grammar, '{"x":5}'))
+
+    def test_a_pattern_key_that_is_open_is_declared(self):
+        """A key matching a pattern is not an additional property.
+
+        This lowering reads it as one wherever the object is open, and then the
+        pattern's value schema is not enforced - so it has to be said.
+        """
+        grammar = self.engine.compile_json_schema(
+            json.dumps({"type": "object", "patternProperties": {".*": {"type": "object"}}})
+        )
+        self.assertTrue(
+            any(note["keyword"] == "patternProperties" for note in grammar.relaxations)
+        )
+        closed = self.engine.compile_json_schema(
+            json.dumps(
+                {
+                    "type": "object",
+                    "patternProperties": {".*": {"type": "object"}},
+                    "additionalProperties": False,
+                }
+            )
+        )
+        self.assertEqual(closed.relaxations, [])
+        self.assertFalse(self.accepts(closed, '{"x":5}'))
+        self.assertTrue(self.accepts(closed, '{"x":{}}'))
+
+    def test_an_all_of_is_reported_on_the_object_it_merges_to(self):
+        """Each branch was inside the budget and their union was not.
+
+        `allOf` is merged before anything else is lowered, so reading the
+        branches alone let a schema report nothing relaxed and still admit a
+        document missing nine required names.
+        """
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {name: {"type": "integer"} for name in "abcdefghi"},
+                "additionalProperties": False,
+                "allOf": [
+                    {"required": list("abcde")},
+                    {"required": list("fghi")},
+                ],
+            }
+        )
+        grammar = self.engine.compile_json_schema(schema)
+        [note] = [n for n in grammar.relaxations if n["keyword"] == "required"]
+        self.assertIn("9 ", note["effect"])

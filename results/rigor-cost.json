@@ -3,26 +3,26 @@
   "answers": [
     {
       "question_id": "q16-mem",
-      "headline": "median schema costs 0.94 MB resident, about 7 tokens of KV cache for a 7B model; 19 MB for all 15 compiled schemas",
+      "headline": "median schema costs 1.14 MB resident, about 9 tokens of KV cache for a 7B model; 1582 MB for all 456 compiled schemas",
       "detail": {
         "kv_bytes_per_token": 131072,
         "resident_per_schema_bytes": {
-          "count": 15,
-          "p50": 940636.0,
-          "p90": 3103640.0,
-          "p99": 5530888.0,
-          "maximum": 5530888.0,
-          "minimum": 6544.0,
-          "mean": 1258484.2666666666
+          "count": 456,
+          "p50": 1140956.0,
+          "p90": 9640468.0,
+          "p99": 33630744.0,
+          "maximum": 75617880.0,
+          "minimum": 488.0,
+          "mean": 3469252.456140351
         },
         "groups": {
-          "count": 15,
-          "p50": 11112.0,
-          "p90": 32046.0,
-          "p99": 72001.0,
-          "maximum": 72001.0,
-          "minimum": 182.0,
-          "mean": 15268.733333333334
+          "count": 456,
+          "p50": 13108.0,
+          "p90": 137564.0,
+          "p99": 874310.0,
+          "maximum": 3560331.0,
+          "minimum": 8.0,
+          "mean": 59605.57675438596
         },
         "note": "Not comparable to XGrammar's cache: it keeps an automaton on the host and recomputes the token mapping every step. That recomputation is the cost this memory buys out, and quoting the two side by side as if they were the same quantity would be dishonest."
       },
@@ -30,53 +30,53 @@
     },
     {
       "question_id": "q17-vocab",
-      "headline": "Qwen3-0.6B vocab 151669: 19 MB over 15 schemas",
+      "headline": "Qwen3-0.6B vocab 151669: 1582 MB over 456 schemas",
       "detail": {
         "per_model": [
           {
             "model": "Qwen/Qwen3-0.6B",
             "vocabulary": 151669,
-            "schemas": 15,
-            "ours_compiled": 15,
-            "theirs_compiled": 15,
-            "our_failures": 0,
+            "schemas": 468,
+            "ours_compiled": 456,
+            "theirs_compiled": 468,
+            "our_failures": 12,
             "their_failures": 0,
             "ours_compile_ms": {
-              "count": 15,
-              "p50": 81.94955415092409,
-              "p90": 655.2339859772474,
-              "p99": 6552.370182937011,
-              "maximum": 6552.370182937011,
-              "minimum": 12.747636996209621,
-              "mean": 546.7001414392143
+              "count": 456,
+              "p50": 98.90017565339804,
+              "p90": 871.3953690603375,
+              "p99": 4074.439992196858,
+              "maximum": 8015.082004014403,
+              "minimum": 5.9255920350551605,
+              "mean": 358.4880247413949
             },
             "theirs_compile_ms": {
-              "count": 15,
-              "p50": 16.400441993027925,
-              "p90": 100.04654596559703,
-              "p99": 599.5943290181458,
-              "maximum": 599.5943290181458,
-              "minimum": 1.2214421294629574,
-              "mean": 62.94661187566817
+              "count": 468,
+              "p50": 16.723554581403732,
+              "p90": 124.78459719568491,
+              "p99": 15199.562963098288,
+              "maximum": 54392.59892702103,
+              "minimum": 0.6873523816466331,
+              "mean": 455.30692339003184
             },
-            "resident_total_mb": 18.877264,
+            "resident_total_mb": 1581.97912,
             "resident_per_schema_bytes": {
-              "count": 15,
-              "p50": 940636.0,
-              "p90": 3103640.0,
-              "p99": 5530888.0,
-              "maximum": 5530888.0,
-              "minimum": 6544.0,
-              "mean": 1258484.2666666666
+              "count": 456,
+              "p50": 1140956.0,
+              "p90": 9640468.0,
+              "p99": 33630744.0,
+              "maximum": 75617880.0,
+              "minimum": 488.0,
+              "mean": 3469252.456140351
             },
             "groups": {
-              "count": 15,
-              "p50": 11112.0,
-              "p90": 32046.0,
-              "p99": 72001.0,
-              "maximum": 72001.0,
-              "minimum": 182.0,
-              "mean": 15268.733333333334
+              "count": 456,
+              "p50": 13108.0,
+              "p90": 137564.0,
+              "p99": 874310.0,
+              "maximum": 3560331.0,
+              "minimum": 8.0,
+              "mean": 59605.57675438596
             }
           }
         ]
@@ -85,7 +85,7 @@
     },
     {
       "question_id": "q18-compile",
-      "headline": "Qwen3-0.6B: ours p50 81.9 ms p99 6552 ms, xgrammar p50 16.4 ms p99 600 ms",
+      "headline": "Qwen3-0.6B: ours p50 98.9 ms p99 4074 ms, xgrammar p50 16.7 ms p99 15200 ms",
       "detail": {
         "note": "XGrammar's compiler cache is disabled so that both engines are measured cold, which is the case that matters when schemas arrive per request."
       },
@@ -96,47 +96,47 @@
     {
       "model": "Qwen/Qwen3-0.6B",
       "vocabulary": 151669,
-      "schemas": 15,
-      "ours_compiled": 15,
-      "theirs_compiled": 15,
-      "our_failures": 0,
+      "schemas": 468,
+      "ours_compiled": 456,
+      "theirs_compiled": 468,
+      "our_failures": 12,
       "their_failures": 0,
       "ours_compile_ms": {
-        "count": 15,
-        "p50": 81.94955415092409,
-        "p90": 655.2339859772474,
-        "p99": 6552.370182937011,
-        "maximum": 6552.370182937011,
-        "minimum": 12.747636996209621,
-        "mean": 546.7001414392143
+        "count": 456,
+        "p50": 98.90017565339804,
+        "p90": 871.3953690603375,
+        "p99": 4074.439992196858,
+        "maximum": 8015.082004014403,
+        "minimum": 5.9255920350551605,
+        "mean": 358.4880247413949
       },
       "theirs_compile_ms": {
-        "count": 15,
-        "p50": 16.400441993027925,
-        "p90": 100.04654596559703,
-        "p99": 599.5943290181458,
-        "maximum": 599.5943290181458,
-        "minimum": 1.2214421294629574,
-        "mean": 62.94661187566817
+        "count": 468,
+        "p50": 16.723554581403732,
+        "p90": 124.78459719568491,
+        "p99": 15199.562963098288,
+        "maximum": 54392.59892702103,
+        "minimum": 0.6873523816466331,
+        "mean": 455.30692339003184
       },
-      "resident_total_mb": 18.877264,
+      "resident_total_mb": 1581.97912,
       "resident_per_schema_bytes": {
-        "count": 15,
-        "p50": 940636.0,
-        "p90": 3103640.0,
-        "p99": 5530888.0,
-        "maximum": 5530888.0,
-        "minimum": 6544.0,
-        "mean": 1258484.2666666666
+        "count": 456,
+        "p50": 1140956.0,
+        "p90": 9640468.0,
+        "p99": 33630744.0,
+        "maximum": 75617880.0,
+        "minimum": 488.0,
+        "mean": 3469252.456140351
       },
       "groups": {
-        "count": 15,
-        "p50": 11112.0,
-        "p90": 32046.0,
-        "p99": 72001.0,
-        "maximum": 72001.0,
-        "minimum": 182.0,
-        "mean": 15268.733333333334
+        "count": 456,
+        "p50": 13108.0,
+        "p90": 137564.0,
+        "p99": 874310.0,
+        "maximum": 3560331.0,
+        "minimum": 8.0,
+        "mean": 59605.57675438596
       }
     }
   ]

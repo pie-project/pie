@@ -1,0 +1,45 @@
+{
+  "schemas": 64,
+  "rows": [
+    {
+      "batch": 1,
+      "distinct": 1,
+      "engrain_us": 489.34295773506165,
+      "xgrammar_serial_us": 62.44145333766937,
+      "xgrammar_threaded_us": 62.44145333766937,
+      "forward_us": 28618.44734288752
+    },
+    {
+      "batch": 8,
+      "distinct": 8,
+      "engrain_us": 591.708580031991,
+      "xgrammar_serial_us": 213.01768720149994,
+      "xgrammar_threaded_us": 213.01768720149994,
+      "forward_us": 29469.7436504066
+    },
+    {
+      "batch": 32,
+      "distinct": 32,
+      "engrain_us": 840.0017395615578,
+      "xgrammar_serial_us": 956.9136891514063,
+      "xgrammar_threaded_us": 781.2967523932457,
+      "forward_us": 30236.615054309368
+    },
+    {
+      "batch": 128,
+      "distinct": 64,
+      "engrain_us": 1270.068809390068,
+      "xgrammar_serial_us": 7885.562023147941,
+      "xgrammar_threaded_us": 3197.1330754458904,
+      "forward_us": 29648.957401514053
+    },
+    {
+      "batch": 512,
+      "distinct": 64,
+      "engrain_us": 1990.9203983843327,
+      "xgrammar_serial_us": 31405.2680041641,
+      "xgrammar_threaded_us": 8689.576527103782,
+      "forward_us": 29660.865594632924
+    }
+  ]
+}

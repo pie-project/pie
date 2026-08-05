@@ -3,8 +3,8 @@
   "answers": [],
   "totals": {
     "schemas": 200,
-    "relaxed": 145,
-    "notes": 1010,
+    "relaxed": 142,
+    "notes": 966,
     "walks": 4000,
     "complete": 2003,
     "valid": 1570,
@@ -14,27 +14,27 @@
   "attributed": 100.0,
   "per_keyword": {
     "additionalProperties": {
-      "grammars declaring it": 650,
+      "grammars declaring it": 645,
       "grammars where it fired": 0,
       "fires": 0.0
     },
     "required": {
-      "grammars declaring it": 146,
+      "grammars declaring it": 148,
       "grammars where it fired": 27,
-      "fires": 18.5
+      "fires": 18.2
     },
     "oneOf": {
-      "grammars declaring it": 124,
+      "grammars declaring it": 119,
+      "grammars where it fired": 1,
+      "fires": 0.8
+    },
+    "patternProperties": {
+      "grammars declaring it": 26,
       "grammars where it fired": 0,
       "fires": 0.0
     },
-    "anyOf": {
-      "grammars declaring it": 50,
-      "grammars where it fired": 2,
-      "fires": 4.0
-    },
     "properties": {
-      "grammars declaring it": 27,
+      "grammars declaring it": 13,
       "grammars where it fired": 0,
       "fires": 0.0
     },
@@ -43,8 +43,13 @@
       "grammars where it fired": 1,
       "fires": 16.7
     },
+    "anyOf": {
+      "grammars declaring it": 4,
+      "grammars where it fired": 1,
+      "fires": 25.0
+    },
     "not": {
-      "grammars declaring it": 5,
+      "grammars declaring it": 3,
       "grammars where it fired": 0,
       "fires": 0.0
     },

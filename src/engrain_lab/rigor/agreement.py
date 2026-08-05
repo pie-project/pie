@@ -49,8 +49,22 @@ def _synthetic(count: int, seed: int) -> list[dict]:
     """Schemas both engines should lower to the same language."""
     rng = np.random.default_rng(seed)
     words = [
-        "name", "size", "colour", "count", "active", "label", "kind", "score",
-        "owner", "tags", "note", "level", "state", "code", "title", "path",
+        "name",
+        "size",
+        "colour",
+        "count",
+        "active",
+        "label",
+        "kind",
+        "score",
+        "owner",
+        "tags",
+        "note",
+        "level",
+        "state",
+        "code",
+        "title",
+        "path",
     ]
     schemas = []
     for index in range(count):
@@ -91,6 +105,12 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument(
+        "--corpus",
+        default=str(RESULTS / "jsonschemabench-instances.json"),
+        help="which corpus to compare on. `results/corpus-exact.json` is the "
+        "fragment this engine enforces with nothing left over.",
+    )
     parser.add_argument("--schemas", type=int, default=200)
     parser.add_argument("--walks", type=int, default=8)
     parser.add_argument("--steps", type=int, default=96)
@@ -148,9 +168,9 @@ def main() -> int:
             for schema in _synthetic(arguments.synthetic, arguments.seed)
         ]
     else:
-        instances = json.loads(
-            (RESULTS / "jsonschemabench-instances.json").read_text()
-        )["instances"][: arguments.schemas]
+        instances = json.loads(Path(arguments.corpus).read_text())["instances"][
+            : arguments.schemas
+        ]
 
     rng = np.random.default_rng(arguments.seed)
     disagreements: collections.Counter[str] = collections.Counter()

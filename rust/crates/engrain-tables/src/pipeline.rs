@@ -193,6 +193,148 @@ const UNLOWERED: &[&str] = &[
     "$dynamicRef",
 ];
 
+/// Does this object constrain a shape, rather than only counting properties?
+///
+/// Mirrors the lowering's own test: `required` alone does not say the document
+/// is an object, so a schema built from it admits every JSON value.
+fn describes_shape(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    const SHAPE: &[&str] = &[
+        "type",
+        "properties",
+        "patternProperties",
+        "items",
+        "prefixItems",
+        "enum",
+        "const",
+        "pattern",
+        "format",
+        "$ref",
+        "anyOf",
+        "oneOf",
+        "allOf",
+    ];
+    map.keys().any(|key| SHAPE.contains(&key.as_str()))
+}
+
+/// Are these branches pinned apart by a shared property fixed to a distinct
+/// value in each?
+///
+/// If so no document satisfies two of them, so `oneOf` asks for nothing a
+/// union does not already give. Only `const` and a one-element `enum` count:
+/// anything weaker leaves an overlap this cannot rule out, and the whole point
+/// of the check is that it may only ever say yes when it is certain.
+fn discriminated(branches: &[serde_json::Value]) -> bool {
+    if branches.len() < 2 {
+        return true;
+    }
+    let pinned = |branch: &serde_json::Value, name: &str| -> Option<serde_json::Value> {
+        let property = branch.get("properties")?.get(name)?;
+        if let Some(value) = property.get("const") {
+            return Some(value.clone());
+        }
+        match property.get("enum")?.as_array()?.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
+    };
+    let names: Vec<String> = match branches[0].get("properties").and_then(|p| p.as_object()) {
+        Some(properties) => properties.keys().cloned().collect(),
+        None => return false,
+    };
+    names.iter().any(|name| {
+        let mut seen: Vec<serde_json::Value> = Vec::new();
+        for branch in branches {
+            match pinned(branch, name) {
+                Some(value) if !seen.contains(&value) => seen.push(value),
+                _ => return false,
+            }
+        }
+        true
+    })
+}
+
+/// The object an `allOf` describes, or `None` where there is no `allOf`.
+///
+/// A shallow union is enough for what this file asks: which names are
+/// declared, how many are required, and whether the object is closed. Local
+/// `$ref`s are followed because a branch is usually one, and a conflict is
+/// resolved the tighter way, which is the direction the lowering resolves it.
+fn merge_all_of(
+    map: &serde_json::Map<String, serde_json::Value>,
+    root: &serde_json::Value,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let branches = map.get("allOf")?.as_array()?;
+    let mut merged = map.clone();
+    merged.remove("allOf");
+    for branch in branches {
+        let Some(branch) = resolve(branch, root).and_then(|node| node.as_object()) else {
+            continue;
+        };
+        for (key, value) in branch {
+            match key.as_str() {
+                "properties" | "patternProperties" => {
+                    let mut names = merged
+                        .get(key)
+                        .and_then(|existing| existing.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(added) = value.as_object() {
+                        for (name, schema) in added {
+                            names.insert(name.clone(), schema.clone());
+                        }
+                    }
+                    merged.insert(key.clone(), serde_json::Value::Object(names));
+                }
+                "required" => {
+                    let mut names = merged
+                        .get(key)
+                        .and_then(|existing| existing.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(added) = value.as_array() {
+                        for name in added {
+                            if !names.contains(name) {
+                                names.push(name.clone());
+                            }
+                        }
+                    }
+                    merged.insert(key.clone(), serde_json::Value::Array(names));
+                }
+                "additionalProperties" => {
+                    if value == &serde_json::Value::Bool(false)
+                        || merged.get(key) == Some(&serde_json::Value::Bool(false))
+                    {
+                        merged.insert(key.clone(), serde_json::Value::Bool(false));
+                    }
+                }
+                _ => {
+                    merged.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+    }
+    Some(merged)
+}
+
+/// Follow a local `$ref` once, so a branch that is one can be read.
+fn resolve<'a>(
+    node: &'a serde_json::Value,
+    root: &'a serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    let Some(pointer) = node.get("$ref").and_then(|target| target.as_str()) else {
+        return Some(node);
+    };
+    let mut found = root;
+    for part in pointer
+        .trim_start_matches('#')
+        .split('/')
+        .filter(|part| !part.is_empty())
+    {
+        found = found.get(part)?;
+    }
+    Some(found)
+}
+
 fn relaxations(schema: &str, precision: Precision) -> Vec<Relaxation> {
     let mut found: Vec<Relaxation> = Vec::new();
     let Ok(value) = serde_json::from_str::<serde_json::Value>(schema) else {
@@ -213,9 +355,24 @@ fn relaxations(schema: &str, precision: Precision) -> Vec<Relaxation> {
 
     // The walk carries the pointer, because "this schema is relaxed" sends an
     // author looking and "this object is" sends them to the object.
-    let mut stack = vec![(&value, String::from("#"))];
-    while let Some((node, at)) = stack.pop() {
-        if let serde_json::Value::Object(map) = node {
+    // The third element says this node is an `allOf` branch. A branch is never
+    // lowered on its own - it is merged into the object above it - so checking
+    // it as an object reports a budget it never has to meet. Its children
+    // still need walking, and their pointers have to name where they really
+    // are, so the branch stays on the stack and only its own checks are off.
+    let mut stack = vec![(&value, String::from("#"), false)];
+    while let Some((node, at, branch_of_all_of)) = stack.pop() {
+        if let serde_json::Value::Object(original) = node
+            && !branch_of_all_of
+        {
+            // `allOf` is merged before anything else is lowered, so the object
+            // the parser builds is the merged one and the branches on their
+            // own say nothing about it. Reading the branches instead was how a
+            // schema could report *nothing* relaxed and still admit a document
+            // missing nine required names: each branch was inside the budget
+            // and their union was not.
+            let merged = merge_all_of(original, &value);
+            let map = merged.as_ref().unwrap_or(original);
             let open = !matches!(
                 map.get("additionalProperties"),
                 Some(serde_json::Value::Bool(false))
@@ -225,6 +382,28 @@ fn relaxations(schema: &str, precision: Precision) -> Vec<Relaxation> {
                 .and_then(|properties| properties.as_object())
                 .map(|properties| properties.keys().collect())
                 .unwrap_or_default();
+            // A key matching a `patternProperties` entry is not an additional
+            // property, but this lowering reads it as one wherever the object
+            // is open - and then the pattern's value schema is not enforced.
+            // `Exact` does not help: it excludes the names a schema *spells*,
+            // and a pattern spells none of them.
+            if open
+                && map
+                    .get("patternProperties")
+                    .and_then(|value| value.as_object())
+                    .is_some_and(|patterns| !patterns.is_empty())
+            {
+                push(
+                    &mut found,
+                    "patternProperties",
+                    &at,
+                    "a key matching a pattern here also reads as an additional \
+                     property, so the pattern's value schema is not enforced"
+                        .to_string(),
+                    "set `additionalProperties: false` here",
+                );
+            }
+
             if open && !declared.is_empty() && !precision.excludes_declared_names() {
                 let names: Vec<&str> = declared.iter().take(3).map(|name| name.as_str()).collect();
                 push(
@@ -279,17 +458,83 @@ fn relaxations(schema: &str, precision: Precision) -> Vec<Relaxation> {
                 );
             }
 
-            if let Some(branches) = map.get("oneOf").and_then(|value| value.as_array()) {
-                push(
-                    &mut found,
-                    "oneOf",
-                    &at,
-                    "a document may satisfy more than one branch, which `oneOf` \
-                         forbids and a mask over a prefix cannot see"
-                        .to_string(),
-                    "give the branches a discriminator - a `const` on a shared \
-                         property - or use `anyOf` if more than one may match",
-                );
+            // What a choice costs depends on which of three shapes the
+            // lowering finds, and guessing the worst one for all three is how
+            // a list starts crying wolf: `oneOf` and `anyOf` are between them
+            // 774 of the 965 notes this file used to emit, and neither fired
+            // on a single walk.
+            //
+            // A choice lowered branch by branch *is* a union, which is what
+            // `anyOf` means, so nothing is lost by it. What is lost is the
+            // three cases below.
+            if let Some(key) = ["oneOf", "anyOf"]
+                .into_iter()
+                .find(|key| map.contains_key(*key))
+            {
+                let branches = map
+                    .get(key)
+                    .and_then(|value| value.as_array())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+
+                // 1. Branches that only say what is required are folded into
+                //    the object as the requirements they *share*, because
+                //    distributing the siblings one branch at a time gives
+                //    alternatives an LALR parser cannot tell apart. Two
+                //    branches sharing nothing therefore require nothing.
+                let required_only = !branches.is_empty()
+                    && branches.iter().all(|branch| {
+                        branch
+                            .as_object()
+                            .is_some_and(|branch| branch.keys().all(|key| key == "required"))
+                    })
+                    && describes_shape(map);
+                if required_only && precision.merges_branches() {
+                    push(
+                        &mut found,
+                        key,
+                        &at,
+                        format!(
+                            "the `{key}` branches only say what is required, so they \
+                             are folded into this object as the names every branch \
+                             requires - and a document may satisfy none of them"
+                        ),
+                        "give each branch a shape of its own, so the choice survives \
+                         as a choice",
+                    );
+                }
+
+                // 2. Otherwise the branches lower on their own, and every
+                //    keyword beside the choice is discarded with the object it
+                //    described. The largest relaxation the schema does not
+                //    show: corpus schema 25 admits `[{}]` against
+                //    `required: ["op", "path"]` because the requirement lives
+                //    beside the choice rather than inside it.
+                //
+                //    Declared per discarded keyword, since "your `required` is
+                //    not enforced, here" is what an author can act on and
+                //    "this object has a oneOf" is not.
+                if !required_only {
+                    for beside in map.keys() {
+                        if !BESIDE_A_CHOICE.contains(&beside.as_str()) {
+                            continue;
+                        }
+                        push(
+                            &mut found,
+                            beside,
+                            &at,
+                            format!(
+                                "`{beside}` sits beside a `{key}` whose branches are \
+                                 lowered on their own, and a branch lowered on its own \
+                                 does not carry its siblings"
+                            ),
+                            "move it inside each branch, where it is lowered with them",
+                        );
+                    }
+                }
+
+                // 3. Object branches may collapse into one object, and then a
+                //    document can take properties from several of them.
                 let objects = branches.len() > 1
                     && branches.iter().all(|branch| {
                         branch.get("properties").is_some()
@@ -298,73 +543,38 @@ fn relaxations(schema: &str, precision: Precision) -> Vec<Relaxation> {
                 if objects && precision.merges_objects() {
                     push(
                         &mut found,
-                        "oneOf",
-                        &at,
-                        "the branches were merged into one object, so a document \
-                             may take properties from several of them"
-                            .to_string(),
-                        "give the branches a discriminator, which lets them stay \
-                             separate",
-                    );
-                }
-            }
-            // A choice whose branches cannot be merged is lowered branch by
-            // branch, and every keyword sitting beside it is discarded with
-            // the object it described. That is the largest relaxation the
-            // schema does not show, and it is why schema 25 of the corpus
-            // admitted `[{}]` against `required: ["op", "path"]`: the
-            // requirement lives beside a `oneOf`, not inside it.
-            //
-            // Declared per discarded keyword rather than once for the
-            // choice, because "your `required` is not enforced, here" is
-            // what an author can act on and "this object has a oneOf" is
-            // not.
-            if map.contains_key("anyOf") || map.contains_key("oneOf") {
-                let choice = if map.contains_key("oneOf") {
-                    "oneOf"
-                } else {
-                    "anyOf"
-                };
-                for key in map.keys() {
-                    if !BESIDE_A_CHOICE.contains(&key.as_str()) {
-                        continue;
-                    }
-                    push(
-                        &mut found,
                         key,
                         &at,
                         format!(
-                            "`{key}` sits beside a `{choice}` whose branches may be \
-                                 lowered on their own, and a branch lowered on its own \
-                                 does not carry its siblings"
+                            "the `{key}` branches were merged into one object, so a \
+                             document may take properties from several of them"
                         ),
-                        "move it inside each branch, where it is lowered with them",
+                        "give the branches a discriminator, which lets them stay \
+                         separate",
+                    );
+                }
+
+                // `oneOf` asks for *exactly* one branch, and a union cannot
+                // tell that a second one also matched. Unless no second one
+                // can: branches pinned apart by a shared discriminator are
+                // pairwise disjoint, and there `oneOf` and a union are the
+                // same language. That is worth checking rather than assuming,
+                // because a discriminated union is the shape structured output
+                // is written in.
+                if key == "oneOf" && !discriminated(branches) {
+                    push(
+                        &mut found,
+                        "oneOf",
+                        &at,
+                        "a document may satisfy more than one branch, which `oneOf` \
+                         forbids and a mask over a prefix cannot see"
+                            .to_string(),
+                        "give the branches a discriminator - a `const` on a shared \
+                         property - or use `anyOf` if more than one may match",
                     );
                 }
             }
 
-            if map.contains_key("anyOf") {
-                push(
-                    &mut found,
-                    "anyOf",
-                    &at,
-                    "a document may satisfy no branch: the mask admits any \
-                         prefix some branch allows, and whether a branch can \
-                         still be completed is not a property of a prefix"
-                        .to_string(),
-                    "give the branches a discriminator - a `const` on a \
-                         shared property - so the first token picks one",
-                );
-                if !precision.merges_branches() {
-                    push(
-                        &mut found,
-                        "anyOf",
-                        &format!("{at}/anyOf"),
-                        "the branches do not inherit the keywords beside them".to_string(),
-                        "move the sibling keywords inside each branch",
-                    );
-                }
-            }
             // Anything the lowering does not read is unenforced, and the
             // list has to be closed rather than a set of cases somebody
             // remembered. Measured: naming keywords one at a time left
@@ -396,54 +606,64 @@ fn relaxations(schema: &str, precision: Precision) -> Vec<Relaxation> {
                 );
             }
 
-            // Descend only where a schema can be. `default` and `examples`
-            // hold documents, `enum` holds values, and `required` holds
-            // names - walking into those would read a property name as a
-            // keyword and report it as unenforced, which is how a closed
-            // list becomes a list nobody reads.
-            for (key, child) in map {
-                match key.as_str() {
-                    "properties" | "patternProperties" | "$defs" | "definitions"
-                    | "dependentSchemas" => {
-                        if let Some(entries) = child.as_object() {
-                            for (name, value) in entries {
-                                stack.push((value, format!("{at}/{key}/{name}")));
-                            }
-                        }
-                    }
-                    "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
-                        if let Some(entries) = child.as_array() {
-                            for (index, value) in entries.iter().enumerate() {
-                                stack.push((value, format!("{at}/{key}/{index}")));
-                            }
-                        }
-                    }
-                    "items"
-                    | "additionalItems"
-                    | "additionalProperties"
-                    | "unevaluatedProperties"
-                    | "unevaluatedItems"
-                    | "not"
-                    | "if"
-                    | "then"
-                    | "else"
-                    | "contains"
-                    | "propertyNames" => {
-                        if child.is_object() {
-                            stack.push((child, format!("{at}/{key}")));
-                        } else if let Some(entries) = child.as_array() {
-                            for (index, value) in entries.iter().enumerate() {
-                                stack.push((value, format!("{at}/{key}/{index}")));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            walk_children(original, &at, &mut stack);
+        } else if let serde_json::Value::Object(original) = node {
+            walk_children(original, &at, &mut stack);
         }
     }
     found.sort_by(|one, other| (&one.at, &one.keyword).cmp(&(&other.at, &other.keyword)));
     found
+}
+
+/// Push every place under this node where a schema can be.
+///
+/// `default` and `examples` hold documents, `enum` holds values, and
+/// `required` holds names - walking into those would read a property name as a
+/// keyword and report it as unenforced, which is how a closed list becomes a
+/// list nobody reads.
+fn walk_children<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    at: &str,
+    stack: &mut Vec<(&'a serde_json::Value, String, bool)>,
+) {
+    for (key, child) in map {
+        match key.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
+                if let Some(entries) = child.as_object() {
+                    for (name, value) in entries {
+                        stack.push((value, format!("{at}/{key}/{name}"), false));
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                if let Some(entries) = child.as_array() {
+                    for (index, value) in entries.iter().enumerate() {
+                        stack.push((value, format!("{at}/{key}/{index}"), key == "allOf"));
+                    }
+                }
+            }
+            "items"
+            | "additionalItems"
+            | "additionalProperties"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contains"
+            | "propertyNames" => {
+                if child.is_object() {
+                    stack.push((child, format!("{at}/{key}"), false));
+                } else if let Some(entries) = child.as_array() {
+                    for (index, value) in entries.iter().enumerate() {
+                        stack.push((value, format!("{at}/{key}/{index}"), false));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Compile a JSON Schema, trying each lowering from most precise to least.

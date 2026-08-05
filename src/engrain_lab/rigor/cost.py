@@ -21,6 +21,7 @@ problem from a uniformly slow compiler.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import time
 from typing import Any
 
@@ -39,7 +40,9 @@ from .harness import (
 KV_BYTES_PER_TOKEN = 32 * 2 * 8 * 128 * 2
 
 
-def measure(model: str, limit: int | None, lexer_states: int) -> dict[str, Any]:
+def measure(
+    model: str, limit: int | None, lexer_states: int, corpus: str | None = None
+) -> dict[str, Any]:
     """Compile the corpus in both engines, timing and weighing each schema."""
     import engrain
     import engrain.internals
@@ -48,7 +51,7 @@ def measure(model: str, limit: int | None, lexer_states: int) -> dict[str, Any]:
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     vocabulary = load_vocabulary(model)
-    instances = load_corpus()
+    instances = load_corpus(Path(corpus)) if corpus else load_corpus()
     if limit:
         instances = instances[:limit]
 
@@ -103,12 +106,22 @@ def main() -> None:
     parser.add_argument("--models", nargs="+", default=list(TOKENIZERS.values()))
     parser.add_argument("--schemas", type=int, default=120)
     parser.add_argument("--lexer-states", type=int, default=4000)
+    parser.add_argument(
+        "--corpus",
+        default=None,
+        help="which corpus to compile. `results/corpus-exact.json` is the "
+        "fragment this engine enforces with nothing left over.",
+    )
     arguments = parser.parse_args()
 
     per_model = []
     for model in arguments.models:
         try:
-            per_model.append(measure(model, arguments.schemas, arguments.lexer_states))
+            per_model.append(
+                measure(
+                    model, arguments.schemas, arguments.lexer_states, arguments.corpus
+                )
+            )
         except Exception as error:  # noqa: BLE001
             per_model.append({"model": model, "error": str(error)[:200]})
         latest = per_model[-1]

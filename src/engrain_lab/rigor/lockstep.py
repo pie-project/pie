@@ -46,6 +46,14 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument(
+        "--corpus",
+        default=str(RESULTS / "jsonschemabench-instances.json"),
+        help="which corpus to drive both engines through. "
+        "`results/corpus-exact.json` is the fragment this engine enforces with "
+        "nothing left over, built by `rigor.fragment` - on it neither engine "
+        "is allowed to be wrong, so a difference is only a difference in cost.",
+    )
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 32, 128, 512])
     parser.add_argument("--schemas", type=int, default=64)
     parser.add_argument("--steps", type=int, default=48)
@@ -58,6 +66,7 @@ def main() -> int:
         "engine.",
     )
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--out", default=str(OUT))
     parser.add_argument(
         "--forward",
         action="store_true",
@@ -98,9 +107,8 @@ def main() -> int:
     ours = Compiler(vocabulary)
     info = xg.TokenizerInfo.from_huggingface(tokenizer, vocab_size=len(tokenizer))
     xgc = xg.GrammarCompiler(info)
-    instances = json.loads(
-        (RESULTS / "jsonschemabench-instances.json").read_text()
-    )["instances"]
+    instances = json.loads(Path(arguments.corpus).read_text())["instances"]
+    instances = [instance for instance in instances if instance.get("text")]
 
     # A schema, a grammar from each engine, and a document both accept. All
     # three have to hold or the pair is dropped: a state only one engine can
@@ -110,9 +118,7 @@ def main() -> int:
         if len(pairs) >= arguments.schemas:
             break
         try:
-            document = json.dumps(
-                json.loads(instance["text"]), separators=(",", ":")
-            )
+            document = json.dumps(json.loads(instance["text"]), separators=(",", ":"))
             grammar = ours.compile_json_schema(instance["schema"])
             compiled = xgc.compile_json_schema(
                 instance["schema"], any_whitespace=True, any_order=True
@@ -203,8 +209,7 @@ def main() -> int:
                         threaded = serial
                     else:
                         chunks = [
-                            range(at, min(at + 16, batch))
-                            for at in range(0, batch, 16)
+                            range(at, min(at + 16, batch)) for at in range(0, batch, 16)
                         ]
                         list(
                             pool_of_threads.map(
@@ -253,10 +258,10 @@ def main() -> int:
             torch.cuda.empty_cache()
 
     RESULTS.mkdir(exist_ok=True)
-    OUT.write_text(
+    Path(arguments.out).write_text(
         json.dumps({"schemas": len(pairs), "rows": report}, indent=2)
     )
-    print(f"\nwritten to {OUT}")
+    print(f"\nwritten to {arguments.out}")
     return 0
 
 
