@@ -2022,23 +2022,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     copy_to(IoSlot::SeqLen, seq_len);
 
     const auto step_t0 = std::chrono::steady_clock::now();
-    if (!schedule.is_pure_decode) {
-        if constexpr (true)
-            return run_prefill_step(schedule, in, err, ptir);
-        // Whether prompts are spread out in time or arriving together and just
-        // not being grouped is the difference between a scheduler problem and a
-        // budget one, and only the arrival pattern separates them.
-        using clock = std::chrono::steady_clock;
-        static const auto t_origin = clock::now();
-        const auto t0 = clock::now();
-        const bool ok = run_prefill_step(schedule, in, err, ptir);
-        const auto t1 = clock::now();
-        std::fprintf(
-            stderr, "[pf] at=%.1f ms N=%d R=%d took=%.1f ms\n",
-            std::chrono::duration<double, std::milli>(t0 - t_origin).count(), schedule.N,
-            schedule.R, std::chrono::duration<double, std::milli>(t1 - t0).count());
-        return ok;
-    }
+    if (!schedule.is_pure_decode) return run_prefill_step(schedule, in, err, ptir);
 
     std::vector<uint32_t> active_slots;
     active_slots.reserve(size_t(schedule.R));

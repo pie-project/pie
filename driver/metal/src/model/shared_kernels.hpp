@@ -44,8 +44,8 @@ inline void elementwise_dispatch(int n, Grid& g, Threadgroup& tg) {
 /// that refuses an oversized config read the same number. The kernel clamps to
 /// them; a host that also clamped would route with fewer experts than the
 /// config asked for and say nothing, so `geometry_from_facts` refuses instead.
-constexpr int kRouterMaxTopK = 16;                // moe_route.metal
-constexpr std::uint32_t kRouterMaxExperts = 1024;  // one lane per expert
+constexpr int kRouterMaxTopK = 16;      // moe_route.metal
+constexpr int kRouterMaxExperts = 1024;  // one lane per expert
 
 /// `router_topk` in moe_route.metal: one threadgroup per row, one lane per expert.
 ///
@@ -54,9 +54,9 @@ constexpr std::uint32_t kRouterMaxExperts = 1024;  // one lane per expert
 /// Capped at the 1024-thread threadgroup limit, which is also the widest expert
 /// count this shape can serve. 32 on gpt-oss, 128 on Qwen3-MoE.
 inline void router_topk_dispatch(int n_experts, Grid& g, Threadgroup& tg, int rows = 1) {
-    std::uint32_t w = std::uint32_t(n_experts < 1 ? 1 : n_experts);
-    w = (w + 31u) / 32u * 32u;
-    if (w > kRouterMaxExperts) w = kRouterMaxExperts;
+    const int capped = n_experts < 1 ? 1 : (n_experts > kRouterMaxExperts ? kRouterMaxExperts
+                                                                          : n_experts);
+    const std::uint32_t w = (std::uint32_t(capped) + 31u) / 32u * 32u;
     g = Grid{w, std::uint32_t(rows < 1 ? 1 : rows), 1};
     tg = Threadgroup{w, 1, 1};
 }
@@ -137,9 +137,9 @@ inline int moe_sorted_rows(int n_pairs, int n_experts) {
 
 /// `moe_route_sort`: one threadgroup, sized to the expert count it scans.
 inline void moe_route_sort_dispatch(int n_experts, Grid& g, Threadgroup& tg) {
-    std::uint32_t w = std::uint32_t(n_experts < 1 ? 1 : n_experts);
-    w = (w + 31u) / 32u * 32u;
-    if (w > kRouterMaxExperts) w = kRouterMaxExperts;
+    const int capped = n_experts < 1 ? 1 : (n_experts > kRouterMaxExperts ? kRouterMaxExperts
+                                                                          : n_experts);
+    const std::uint32_t w = (std::uint32_t(capped) + 31u) / 32u * 32u;
     g = Grid{w, 1, 1};
     tg = Threadgroup{w, 1, 1};
 }
