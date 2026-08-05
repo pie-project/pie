@@ -91,6 +91,7 @@ class ValueArena {
         r_fire_ = r_fire;
         op_ = 0;
         free_.clear();
+        pinned_.clear();
         const std::size_t values = plan.value_count();
         slots_.assign(values, nullptr);
         sizes_.assign(values, 0);
@@ -116,12 +117,27 @@ class ValueArena {
         op_ = index;
         for (std::size_t id = 0; id < slots_.size(); ++id) {
             if (slots_[id] == nullptr || last_use_[id] >= index) continue;
+            if (last_use_[id] == kNeverFreed) continue;  // pinned
             free_.push_back(Block{
                 static_cast<std::size_t>(
                     static_cast<std::uint8_t*>(slots_[id]) - block_),
                 sizes_[id]});
             slots_[id] = nullptr;
         }
+    }
+
+    // PIN a value to memory the arena does not own: the buffer some
+    // machinery OUTSIDE the traced ops reaches by name — LoRA captures the
+    // normed activation's pointer at fire setup, hook sites observe the
+    // query buffer, the sampler reads the logits. Declared once per family
+    // by a pass over the plan, so an ARM still just asks by value id and
+    // stays family-blind; the convention lives in the pass, not in 82
+    // scattered arm sites. A pinned value never allocates and never frees.
+    void pin(std::uint32_t value_id, void* ptr) {
+        if (value_id >= slots_.size() || ptr == nullptr) return;
+        slots_[value_id] = ptr;
+        pinned_.push_back(value_id);
+        last_use_[value_id] = kNeverFreed;
     }
 
     // The slot for one value, allocated on first ask and stable until its
@@ -162,6 +178,9 @@ class ValueArena {
     std::size_t used() const { return used_; }
 
    private:
+    static constexpr std::size_t kNeverFreed =
+        static_cast<std::size_t>(-1);
+
     struct Block {
         std::size_t offset;
         std::size_t size;
@@ -177,6 +196,7 @@ class ValueArena {
     std::vector<std::size_t> sizes_;
     std::vector<std::size_t> last_use_;
     std::vector<Block> free_;
+    std::vector<std::uint32_t> pinned_;
 };
 
 }  // namespace pie_cuda_driver::model::declared

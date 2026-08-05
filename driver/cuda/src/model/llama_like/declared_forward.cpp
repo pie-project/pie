@@ -96,6 +96,76 @@ const DeviceTensor* bind_llama_like_weight(
     throw_unknown_weight(name);
 }
 
+// This family's PIN PASS: which traced values live in a buffer the rest
+// of the driver reaches BY NAME. Stated once, over the plan, instead of
+// once per arm — LoRA captures the normed activation's pointer at fire
+// setup, the fused decode launch reads the qkv bank, hook sites observe
+// the query, the sampler reads the logits. An arm then just asks the
+// arena by value id and never learns whose convention it is serving.
+void pin_llama_like_values(const pie_forward::ForwardPlan& plan,
+                           Workspace& ws,
+                           bool post_norm,
+                           declared::ValueArena& values)
+{
+    const std::size_t ops = plan.op_count();
+    for (std::size_t i = 0; i < ops; ++i) {
+        const PieForwardOp& op = plan.op(i);
+        const auto outs = plan.outputs(op);
+        if (outs.size == 0) continue;
+        switch (op.kind) {
+        case PieForwardOpKind::Embed:
+        case PieForwardOpKind::ResidualAdd:
+            // The residual stream.
+            values.pin(outs[0], ws.y.data());
+            break;
+        case PieForwardOpKind::Rmsnorm: {
+            const ParsedWeightName nm = parse_weight_name(plan.weight_name(op));
+            if (nm.field == "attn_norm") {
+                // LoRA's `qkv_in`, captured at fire setup.
+                values.pin(outs[0], post_norm ? ws.norm_y.data()
+                                              : ws.norm_x.data());
+            } else if (nm.field == "final_norm") {
+                values.pin(outs[0], ws.norm_y.data());
+            }
+            // `mlp_norm`'s output is read only by the gate/up matmul, so
+            // it stays an arena value (converted island).
+            break;
+        }
+        case PieForwardOpKind::Matmul: {
+            const ParsedWeightName nm = parse_weight_name(plan.weight_name(op));
+            if (nm.field == "qkv") {
+                values.pin(outs[0], ws.qkv_fused.data());
+            } else if (nm.field == "q_proj") {
+                values.pin(outs[0], ws.q.data());
+            } else if (nm.field == "k_proj") {
+                values.pin(outs[0], ws.k.data());
+            } else if (nm.field == "v_proj") {
+                values.pin(outs[0], ws.v.data());
+            } else if (nm.field == "o_proj" || nm.field == "down") {
+                values.pin(outs[0], post_norm ? ws.norm_x.data()
+                                              : ws.y.data());
+            }
+            break;
+        }
+        case PieForwardOpKind::SplitQkv:
+            if (outs.size >= 3) {
+                values.pin(outs[0], ws.q.data());
+                values.pin(outs[1], ws.k.data());
+                values.pin(outs[2], ws.v.data());
+            }
+            break;
+        case PieForwardOpKind::Attention:
+            values.pin(outs[0], ws.attn_out.data());
+            break;
+        case PieForwardOpKind::LmHead:
+            values.pin(outs[0], ws.logits.data());
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 const Qwen3LayerWeights& layer_of(
     const Qwen3Weights& w, const ParsedWeightName& nm, std::string_view name)
 {
@@ -637,6 +707,8 @@ void llama_like_forward_declared(
     // reads/writes and how the block norms route — the same buffer walk as
     // the hand-written `post_norm` branches, stated once here.
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
+    // This family's conventions, stated once over the plan (see the pass).
+    pin_llama_like_values(plan, ws, post_norm, values);
     // Inherit cublas's stream so every launch lands on the captured graph,
     // for the reason llama_like_forward_paged states at its stream setup.
     cudaStream_t stream = cublas.stream();
@@ -831,18 +903,18 @@ void llama_like_forward_declared(
             const ParsedWeightName nm = parse_weight_name(name);
             if (nm.field == "attn_norm") {
                 const auto& layer = layer_of(w, nm, name);
-                if (post_norm) {
-                    // Post-norm: the o_proj OUTPUT (in norm_x, the
-                    // hand-written scratch) is normed into norm_y; the
-                    // following ResidualAdd lands it on the stream.
-                    kernels::launch_rmsnorm_bf16(
-                        ws.norm_x.data(), wb.require(name).data(),
-                        ws.norm_y.data(), N, H, eps, stream);
-                } else {
-                    kernels::launch_rmsnorm_bf16(
-                        ws.y.data(), wb.require(name).data(),
-                        ws.norm_x.data(), N, H, eps, stream);
-                }
+                // ISLAND (pinned value): the normed activation is a traced
+                // VALUE whose buffer the pin pass states, because LoRA
+                // reaches it by name outside the walk.
+                void* const attn_norm_out =
+                    values.slot(plan.outputs(op)[0],
+                                plan.value(plan.outputs(op)[0]));
+                kernels::launch_rmsnorm_bf16(
+                    // Post-norm norms the o_proj OUTPUT (the pinned
+                    // scratch), pre-norm the residual stream.
+                    post_norm ? ws.norm_x.data() : ws.y.data(),
+                    wb.require(name).data(),
+                    attn_norm_out, N, H, eps, stream);
             } else if (nm.field == "mlp_norm") {
                 const auto& layer = layer_of(w, nm, name);
                 if (post_norm) {
@@ -922,8 +994,15 @@ void llama_like_forward_declared(
             // normed copies (norm_x for QKV, norm_y for gate/up), post-norm
             // reads the residual stream raw — the hand-written `qkv_in` /
             // `mlp_in` indirections.
+            // The island's consumers: the projection reads the value the
+            // attn_norm arm produced (pinned, so LoRA's captured pointer
+            // and this slot are the same bytes).
             const void* const qkv_in =
-                post_norm ? ws.y.data() : ws.norm_x.data();
+                plan.inputs(op).size > 0
+                    ? static_cast<const void*>(
+                          values.slot(plan.inputs(op)[0],
+                                      plan.value(plan.inputs(op)[0])))
+                    : (post_norm ? ws.y.data() : ws.norm_x.data());
             const void* const mlp_in =
                 post_norm ? ws.y.data() : ws.norm_y.data();
             if (nm.field == "qkv") {
