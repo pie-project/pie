@@ -46,15 +46,42 @@ They are described by `StorageProgram.stream`:
 - `stream.files` / `section_offsets` / `section_bytes` / `slot_bytes`: layout
   the driver's expert stream cache needs to open shards and size the slab.
 - `stream.pack_kind`: selects the driver's offline pack builder (`None`,
-  GPT-OSS Native Marlin, GPT-OSS Eager BF16); set by the same arch selectors
-  that choose section layout.
+  GPT-OSS Native Marlin, GPT-OSS Eager BF16, GPT-OSS RoutedDecode TP MXFP4);
+  set by the same arch selectors that choose section layout.
 
 Boot execution runs `schedule` only. On a cache miss the driver executes the
 template into `slot_base` with sources taken from `bindings` for that
 `(layer, expert)` — deferred loader execution, not a parallel I/O path.
 
 Supported arches today: `deepseek_v4`, `gpt_oss`, `mixtral`, `qwen3_moe`,
-`qwen3_5_moe` (plain ExtentWrite; GPT-OSS RoutedDequant streams HF packs;
-GPT-OSS native streams a Marlin expert pack; GPT-OSS eager_bf16 streams a
-BF16 expert pack; biases stay resident; Qwen shared expert / router stay
-resident).
+`qwen3_5_moe` (plain ExtentWrite; GPT-OSS RoutedDequant streams HF packs at
+`tp_size=1`; GPT-OSS native streams a Marlin expert pack; GPT-OSS eager_bf16
+streams a BF16 expert pack; biases stay resident; Qwen shared expert / router
+stay resident).
+
+## Version 6 — TP + streaming packs
+
+`STORAGE_PROGRAM_VERSION = 6` adds TP-local expert packs so
+`stream_routed_experts && tp_size > 1` can page contiguous per-rank extents
+(cache key already includes `tp_rank`/`tp_size`):
+
+- GPT-OSS `GptOssRoutedMxfp4` / Native Marlin / Eager BF16: section sizes use
+  `I_local = I_full / tp_size`; builders apply the same row/column offsets as
+  resident TP (RoutedDecode densifies strided down groups).
+- DeepSeek-V4 `Dsv4TpMxfp4`: contiguous MXFP4 `w1`/`w3` row slices and densified
+  `w2` columns (weight+scale) under `tp_size > 1`; shared experts / MTP /
+  router stay resident. At `tp_size = 1`, named experts page as full HF
+  tensors (`pack_kind = None`).
+- Mixtral `MixtralTpBf16`: contiguous BF16 `w1`/`w3` row slices and densified
+  `w2` columns under `tp_size > 1`; at `tp_size = 1` Mixtral still pages full
+  HF experts (`pack_kind = None`).
+- Qwen3.5-MoE `Qwen35MoeTpBf16`: contiguous fused BF16 `gate_up`/`down` local-I
+  sections under `tp_size > 1` (gate/up halves concatenated, down columns
+  densified); shared expert and router stay resident. At `tp_size = 1`, fused
+  banks page as full HF expert slices (`pack_kind = None`).
+- Qwen3-MoE `Qwen3MoeTpBf16`: contiguous named BF16 `gate`/`up`/`down` local-I
+  sections under `tp_size > 1` (down columns densified); at `tp_size = 1`,
+  named experts page as full HF tensors (`pack_kind = None`).
+
+Arches without a per-rank pack still reject `stream_routed_experts &&
+tp_size > 1`.

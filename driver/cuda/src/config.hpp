@@ -36,10 +36,12 @@ struct ModelConfig {
     //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
     //   * "native" — require a true MXFP4 MoE GEMM backend.
     std::string mxfp4_moe = "auto";
-    // SSD expert streaming (DeepSeek-V4 / GPT-OSS / Mixtral / Qwen MoE,
-    // tp_size=1). When true, routed MoE expert weights are not materialized
-    // on the GPU at load time; instead they are paged on demand from the
-    // safetensors shards into a bounded LRU expert cache at forward time.
+    // SSD expert streaming (DeepSeek-V4 / GPT-OSS / Mixtral / Qwen MoE).
+    // When true, routed MoE expert weights are not materialized on the GPU
+    // at load time; instead they are paged on demand from safetensors (or a
+    // per-rank offline pack) into a bounded LRU expert cache at forward time.
+    // TP+streaming is DeepSeek-V4 / GPT-OSS / Mixtral / Qwen MoE (per-rank
+    // packs); other arches need tp=1.
     bool stream_routed_experts = false;
     // Expert stream cache budget in GiB. 0 (default) = auto: half of the
     // free device memory after resident weights, capped at the full routed
@@ -204,10 +206,10 @@ inline Config load_config(const std::filesystem::path& path) {
         throw std::runtime_error(
             "config: [model].expert_cache_gb must be >= 0");
     }
-    if (c.model.stream_routed_experts && c.distributed.tp_size > 1) {
-        throw std::runtime_error(
-            "config: [model].stream_routed_experts requires tp_size=1");
-    }
+    // stream_routed_experts + tp_size>1 is allowed in config (DeepSeek-V4 /
+    // GPT-OSS / Mixtral / Qwen MoE use per-rank packs). Other arches are
+    // rejected after model type is known (entry) and again in the
+    // weight-loader compiler.
     if (!(c.batching.gpu_mem_utilization > 0.0 &&
           c.batching.gpu_mem_utilization <= 1.0)) {
         throw std::runtime_error(

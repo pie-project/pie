@@ -6,7 +6,7 @@ use crate::types::{
     TensorDecl, TensorId,
 };
 
-pub const STORAGE_PROGRAM_VERSION: u32 = 5;
+pub const STORAGE_PROGRAM_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
@@ -181,8 +181,8 @@ pub enum StorageInstr {
 ///
 /// When non-[`Self::None`], the CUDA driver builds (or opens) a transformed
 /// host pack with bounded staging before paging sections through the expert
-/// stream cache. Plain ExtentWrite streams (HF packs / Mixtral BF16) leave
-/// this as `None`.
+/// stream cache. Plain ExtentWrite streams (HF packs / Mixtral BF16 at
+/// `tp_size=1`) leave this as `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u32)]
 pub enum ExpertPackKind {
@@ -190,6 +190,16 @@ pub enum ExpertPackKind {
     None = 0,
     GptOssNativeMarlin = 1,
     GptOssEagerBf16 = 2,
+    /// Contiguous TP-local HF MXFP4 sections (RoutedDecode under tp_size>1).
+    GptOssRoutedMxfp4 = 3,
+    /// Contiguous TP-local Mixtral BF16 w1/w2/w3 (tp_size>1 densify).
+    MixtralTpBf16 = 4,
+    /// Contiguous TP-local Qwen3.5-MoE fused BF16 gate_up/down (tp_size>1).
+    Qwen35MoeTpBf16 = 5,
+    /// Contiguous TP-local Qwen3-MoE named BF16 gate/up/down (tp_size>1).
+    Qwen3MoeTpBf16 = 6,
+    /// Contiguous TP-local DeepSeek-V4 MXFP4 w1/w2/w3 × weight/scale (tp>1).
+    Dsv4TpMxfp4 = 7,
 }
 
 /// One deferred source extent for a streamed expert section.

@@ -369,9 +369,12 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     if (boot_cfg.model.stream_routed_experts) {
         log_stage("build streamed expert table begin");
         e.streamed_experts_ = streamed_expert_table_from_program(rust_view);
-        // Offline packs (native Marlin / eager BF16): build/remap with
-        // bounded staging *before* resident materialize so peak VRAM stays
-        // O(one expert). Kind is set by the stream arch recipe.
+        e.streamed_experts_.tp_rank = boot_cfg.distributed.tp_rank;
+        e.streamed_experts_.tp_size =
+            std::max(1, boot_cfg.distributed.tp_size);
+        // Offline packs (native Marlin / eager BF16 / RoutedDecode TP):
+        // build/remap with bounded staging *before* resident materialize so
+        // peak VRAM stays O(one expert). Kind is set by the stream arch recipe.
         log_stage("ensure streamed expert pack begin");
         ensure_streamed_expert_pack(
             e.streamed_experts_, rust_plan.cache_key, loader, verbose);

@@ -17,7 +17,10 @@
 // Section count and layout come from the stream plan (arch-specific naming
 // lives in the weight loader / model forward, not here).
 //
-// Scope (v1): on-demand only — no prefetch, no popularity preload, tp=1.
+// Scope (v1): on-demand only — no prefetch, no popularity preload.
+// TP+streaming uses per-rank offline packs (DeepSeek-V4 MXFP4, GPT-OSS
+// MXFP4/BF16/Marlin, Mixtral BF16, Qwen3/3.5-MoE BF16) with dense local-I
+// sections; other arches remain tp_size=1.
 // The table/slot bookkeeping (`ExpertSlotIndex`) is host-only so it can be
 // unit-tested without a GPU.
 
@@ -51,6 +54,9 @@ struct StreamedExpertTable {
     int sections_per_expert = 0;
     // Matches pie_weight_loader::PieLoaderExpertPackKind / ExpertPackKind.
     std::uint32_t pack_kind = 0;
+    // TP geometry for offline pack builders (local I = I_full / tp_size).
+    int tp_rank = 0;
+    int tp_size = 1;
     std::vector<std::uint64_t> section_bytes;
     std::vector<std::uint64_t> section_offsets;
     std::uint64_t slot_bytes = 0;  // 0 = cache computes from section_bytes

@@ -501,11 +501,6 @@ impl DriverConfig {
                     })?;
                 opts.validate()?;
                 validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
-                ensure!(
-                    !opts.stream_routed_experts || self.tensor_parallel_size == 1,
-                    "model.driver.options.stream_routed_experts requires \
-                     tensor_parallel_size = 1"
-                );
             }
             DriverKind::Dummy => {
                 let _: DummyDriverOptions = toml::Value::Table(self.options.clone())
@@ -817,10 +812,13 @@ pub struct CudaNativeDriverOptions {
     /// latency-regime win (helps at low batch, costs at compute saturation), so
     /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
     pub enable_system_speculation: bool,
-    /// SSD expert streaming (DeepSeek-V4 / GPT-OSS, tensor_parallel_size = 1):
+    /// SSD expert streaming (DeepSeek-V4 / GPT-OSS / Mixtral / Qwen MoE):
     /// keep routed MoE expert weights on disk and page them into a bounded
     /// LRU GPU cache on demand at forward time instead of materializing
-    /// them in VRAM at startup.
+    /// them in VRAM at startup. Combined with `tensor_parallel_size > 1`,
+    /// DeepSeek-V4, GPT-OSS, Mixtral, and Qwen MoE are supported (per-rank
+    /// packs); other arches fail in the CUDA driver after the model type is
+    /// known.
     pub stream_routed_experts: bool,
     /// Expert stream cache budget in GiB. 0 (default) = auto: half of the
     /// post-weights free VRAM, capped at the full routed expert set. Only
@@ -1027,11 +1025,11 @@ expert_cache_gb = 24.0
     }
 
     #[test]
-    fn cuda_rejects_stream_routed_experts_with_tensor_parallel() {
+    fn cuda_accepts_stream_routed_experts_with_tensor_parallel() {
         let text = r#"
 [[model]]
 name = "default"
-hf_repo = "org/DeepSeek-V4"
+hf_repo = "org/gpt-oss"
 
 [model.driver]
 type = "cuda_native"
@@ -1042,9 +1040,7 @@ tensor_parallel_size = 2
 stream_routed_experts = true
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("stream_routed_experts"), "got: {err}");
-        assert!(err.contains("tensor_parallel_size"), "got: {err}");
+        cfg.validate().unwrap();
     }
 
     #[test]

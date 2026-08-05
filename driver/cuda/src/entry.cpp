@@ -169,16 +169,6 @@ int run_impl(int argc,
     if (!cli_nccl_unique_id_hex.empty())
         cfg.distributed.nccl_unique_id_hex = cli_nccl_unique_id_hex;
     const bool verbose = cfg.runtime.verbose;
-    // SSD expert streaming is single-GPU only for now (per-expert TP shards
-    // are strided file extents the streamer does not support). The config
-    // loader rejects the TOML combination; re-check here because --tp-size
-    // can override [distributed] after load_config.
-    if (cfg.model.stream_routed_experts && cfg.distributed.tp_size > 1) {
-        std::cerr << "[pie-driver-cuda] model.stream_routed_experts requires "
-                     "tp_size=1 (got tp_size="
-                  << cfg.distributed.tp_size << ")\n";
-        return 1;
-    }
     if (cfg.distributed.tp_size > 1 &&
         cfg.distributed.tp_rank > 0 &&
         cfg.distributed.nccl_unique_id_hex.empty()) {
@@ -483,6 +473,18 @@ int run_impl(int argc,
                          "qwen3_moe/qwen3_5_moe (got '"
                       << engine.hf_config().model_type << "')\n";
             return 2;
+        }
+        // TP+streaming: DSv4 / GPT-OSS / Mixtral / Qwen MoE build per-rank packs.
+        // Other arches still rely on strided HF extents the streamer cannot
+        // page — reject here so --tp-size overrides fail before compile.
+        if (cfg.distributed.tp_size > 1 && !is_dsv4_arch && !is_gpt_oss_arch &&
+            !is_mixtral_arch && !is_qwen3_5_moe_arch) {
+            std::cerr << "[pie-driver-cuda] model.stream_routed_experts with "
+                         "tp_size>1 is only supported for deepseek_v4, gpt_oss, "
+                         "mixtral, and qwen3_moe/qwen3_5_moe (got '"
+                      << engine.hf_config().model_type << "', tp_size="
+                      << cfg.distributed.tp_size << ")\n";
+            return 1;
         }
         std::size_t free_bytes = 0;
         std::size_t total_bytes = 0;

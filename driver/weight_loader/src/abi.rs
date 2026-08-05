@@ -653,10 +653,13 @@ impl DefaultAbiBuilder<'_> {
                 self.cfg.model_type
             )));
         };
-        if self.target.tp_size > 1 {
+        // Under tp_size>1 the streamer needs contiguous per-rank extents, so
+        // the arch recipe must request an offline pack (GPT-OSS / Mixtral).
+        if self.target.tp_size > 1 && arch.pack_kind == crate::storage::ExpertPackKind::None {
             return Err(CompileError::InvalidInput(
-                "stream_routed_experts requires tp_size=1 (per-expert TP shards \
-                 are strided file extents, which streaming does not support yet)"
+                "stream_routed_experts with tp_size>1 requires a per-rank \
+                 expert pack (supported: deepseek_v4, gpt_oss, mixtral, \
+                 qwen3_moe, qwen3_5_moe); other arches still require tp_size=1"
                     .to_string(),
             ));
         }
@@ -1190,6 +1193,11 @@ impl DefaultAbiBuilder<'_> {
         if self.target.tp_size <= 1 {
             return Ok(());
         }
+        // Streamed fused banks are densified offline into a per-rank pack;
+        // do not also emit resident TP ByteSpans from the same HF tensors.
+        if self.target.stream_routed_experts {
+            return Ok(());
+        }
         let candidates: Vec<RawTensor> = self
             .metadata
             .tensors
@@ -1665,7 +1673,7 @@ impl DefaultAbiBuilder<'_> {
                 if self.target.stream_routed_experts {
                     // Marlin weights live in the offline expert pack; keep
                     // biases resident for bind-time deinterleave.
-                    self.push_direct(bias, format!("{base}.bias"), None);
+                    self.push_gpt_oss_streaming_bias(bias, base)?;
                 } else {
                     self.add_gpt_oss_native_mxfp4_group(block, scale, bias, base)?;
                 }
@@ -1674,7 +1682,7 @@ impl DefaultAbiBuilder<'_> {
             {
                 // Packed weight/scale are deferred to the stream plan; keep
                 // the BF16 bias resident for bind-time deinterleave.
-                self.push_direct(bias, format!("{base}.bias"), None);
+                self.push_gpt_oss_streaming_bias(bias, base)?;
             } else {
                 self.push_direct(block, format!("{base}.weight"), None);
                 self.push_direct(scale, format!("{base}.weight_scale"), None);
@@ -1684,6 +1692,73 @@ impl DefaultAbiBuilder<'_> {
             self.consumed.insert(scale.id);
             self.consumed.insert(bias.id);
         }
+        Ok(())
+    }
+
+    /// Streaming keeps fused gate_up / down biases resident. Under TP, shard
+    /// gate_up bias rows to `{E, 2*I_local}` so bind_gpt_oss deinterleave matches
+    /// local intermediate; down bias stays full `{E, H}`.
+    fn push_gpt_oss_streaming_bias(
+        &mut self,
+        bias: &RawTensor,
+        base: &str,
+    ) -> Result<(), CompileError> {
+        if base.ends_with("down_proj") || self.target.tp_size <= 1 {
+            self.push_direct(bias, format!("{base}.bias"), None);
+            return Ok(());
+        }
+        if !base.ends_with("gate_up_proj") {
+            self.push_direct(bias, format!("{base}.bias"), None);
+            return Ok(());
+        }
+        if bias.shape.len() != 2 {
+            return Err(CompileError::InvalidInput(format!(
+                "GPT-OSS streaming gate_up bias '{base}' expected rank-2, got {:?}",
+                bias.shape
+            )));
+        }
+        let experts = bias.shape[0];
+        let fused_rows = bias.shape[1];
+        if fused_rows % 2 != 0 {
+            return Err(CompileError::InvalidInput(format!(
+                "GPT-OSS streaming gate_up bias '{base}' expected even fused rows, got {fused_rows}"
+            )));
+        }
+        let full_intermediate = fused_rows / 2;
+        let (local_start, local_intermediate) = local_range(full_intermediate, self.target)?;
+        let local_fused = local_intermediate * 2;
+        let source_row_offset = local_start * 2;
+        let (dtype, encoding) = match &bias.encoding {
+            Encoding::Raw(dt) => (*dt, bias.encoding.clone()),
+            other => {
+                return Err(CompileError::InvalidInput(format!(
+                    "GPT-OSS streaming gate_up bias '{base}' expected raw encoding, got {other:?}"
+                )));
+            }
+        };
+        self.push_repack(
+            format!("{base}.bias"),
+            bias,
+            dtype,
+            encoding,
+            vec![experts, local_fused],
+            RepackSpec {
+                layout: RepackLayout::DenseRowGather,
+                row_map: RowMap::Identity,
+                batch: u32_dim(experts, "GPT-OSS experts")?,
+                source_rows: u32_dim(fused_rows, "GPT-OSS gate_up bias source rows")?,
+                source_row_offset: u32_dim(
+                    source_row_offset,
+                    "GPT-OSS gate_up bias source row offset",
+                )?,
+                target_rows: u32_dim(local_fused, "GPT-OSS gate_up bias target rows")?,
+                valid_rows: u32_dim(local_fused, "GPT-OSS gate_up bias valid rows")?,
+                source_stride_cols: 1,
+                source_col_offset: 0,
+                source_cols: 1,
+                target_cols: 1,
+            },
+        );
         Ok(())
     }
 
@@ -2013,7 +2088,7 @@ fn dense_fused_projection_budget_bytes() -> u64 {
         .unwrap_or(DEFAULT_BUDGET)
 }
 
-fn local_range(full: i64, target: &StorageTarget) -> Result<(i64, i64), CompileError> {
+pub(crate) fn local_range(full: i64, target: &StorageTarget) -> Result<(i64, i64), CompileError> {
     let world = i64::from(target.tp_size.max(1));
     let rank = i64::from(target.tp_rank);
     if full % world != 0 {

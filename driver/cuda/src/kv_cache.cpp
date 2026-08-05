@@ -336,7 +336,13 @@ std::size_t kv_cache_device_bytes_per_page(const KvCacheFormat& format,
 std::size_t kv_page_bytes_homogeneous(const HfConfig& cfg,
                                       int tp_size,
                                       const KvCacheFormat& format) {
-    const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
+    const int world = std::max(1, tp_size);
+    // DeepSeek-V4 is MQA (num_key_value_heads=1): the single KV head is
+    // replicated on every TP rank, matching KvCache::allocate(..., 1, ...)
+    // in entry.cpp. Dividing by tp_size would yield 0 heads and zero bytes.
+    const int kv_heads = (cfg.model_type == "deepseek_v4")
+        ? std::max(1, cfg.num_key_value_heads)
+        : cfg.num_key_value_heads / world;
     return static_cast<std::size_t>(cfg.num_hidden_layers) *
            kv_cache_device_bytes_per_page(
                format, 1, kv_heads, cfg.head_dim_kernel);

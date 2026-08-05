@@ -7,19 +7,20 @@
 #include <vector>
 
 #include "cuda_check.hpp"
-#include "kernels/deinterleave.hpp"
-#include "kernels/dequant_fp4.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
 namespace {
 
-struct GptOssEagerBf16PackTraits {
-    static constexpr int kSections = 3;
+// Contiguous TP-local HF MXFP4 sections for RoutedDecode under tp_size>1.
+// Gate/up fused rows are contiguous; down groups are strided in the HF bank
+// and must be gathered into a dense local buffer.
+struct GptOssRoutedMxfp4PackTraits {
+    static constexpr int kSections = 4;
 
     static const char* miss_label()
     {
-        return "streaming eager BF16 dequant";
+        return "streaming RoutedDecode TP MXFP4 pack";
     }
 
     static void require_build_support() {}
@@ -29,6 +30,9 @@ struct GptOssEagerBf16PackTraits {
         int local_start = 0;
         int local_intermediate = 0;
         int hidden = 0;
+        int gu_groups = 0;
+        int down_groups_full = 0;
+        int down_groups_local = 0;
         std::uint64_t gu_w_span = 0;
         std::uint64_t gu_s_span = 0;
         std::uint64_t dn_w_span = 0;
@@ -37,13 +41,10 @@ struct GptOssEagerBf16PackTraits {
         DeviceBuf src_gu_s;
         DeviceBuf src_dn_w;
         DeviceBuf src_dn_s;
-        DeviceBuf fused_bf16;
-        DeviceBuf full_gate;
-        DeviceBuf full_up;
-        DeviceBuf full_down;
-        DeviceBuf dst_gate;
-        DeviceBuf dst_up;
-        DeviceBuf dst_down;
+        DeviceBuf dst_gu_w;
+        DeviceBuf dst_gu_s;
+        DeviceBuf dst_dn_w;
+        DeviceBuf dst_dn_s;
     };
 
     static Context prepare(
@@ -53,6 +54,10 @@ struct GptOssEagerBf16PackTraits {
         const int E = table.num_experts;
         const int tp = std::max(1, table.tp_size);
         const int rank = table.tp_rank;
+        if (tp <= 1) {
+            throw std::runtime_error(
+                "expert pack: GptOssRoutedMxfp4 requires tp_size>1");
+        }
         const auto& sb = table.section_bytes;
 
         const std::string gu_w_name =
@@ -65,10 +70,10 @@ struct GptOssEagerBf16PackTraits {
             throw std::runtime_error(
                 "expert pack: unexpected GPT-OSS expert block ranks");
         }
-        const int fused_rows = static_cast<int>(gu_w_info.shape[1]);
-        const int gu_groups = static_cast<int>(gu_w_info.shape[2]);
 
         Context ctx;
+        const int fused_rows = static_cast<int>(gu_w_info.shape[1]);
+        ctx.gu_groups = static_cast<int>(gu_w_info.shape[2]);
         ctx.full_intermediate = fused_rows / 2;
         if (ctx.full_intermediate % tp != 0) {
             throw std::runtime_error(
@@ -76,32 +81,44 @@ struct GptOssEagerBf16PackTraits {
         }
         ctx.local_intermediate = ctx.full_intermediate / tp;
         ctx.local_start = rank * ctx.local_intermediate;
-        ctx.hidden = gu_groups * 32;
+        if (ctx.local_start % 32 != 0 || ctx.local_intermediate % 32 != 0) {
+            throw std::runtime_error(
+                "expert pack: RoutedDecode TP shard must align to 32");
+        }
+        ctx.hidden = ctx.gu_groups * 32;
+        ctx.down_groups_full = static_cast<int>(dn_w_info.shape[2]);
+        if (ctx.down_groups_full != ctx.full_intermediate / 32) {
+            throw std::runtime_error(
+                "expert pack: RoutedDecode down groups " +
+                std::to_string(ctx.down_groups_full) +
+                " != full_intermediate/32 (" +
+                std::to_string(ctx.full_intermediate / 32) + ")");
+        }
+        ctx.down_groups_local = ctx.local_intermediate / 32;
 
-        // Match Rust gpt_oss_eager_bf16_section_bytes: I_local*H*2 BF16.
-        const std::uint64_t gate =
-            static_cast<std::uint64_t>(ctx.local_intermediate) *
-            static_cast<std::uint64_t>(ctx.hidden) * 2;
-        const std::uint64_t down =
-            static_cast<std::uint64_t>(ctx.hidden) *
-            static_cast<std::uint64_t>(ctx.local_intermediate) * 2;
-        const std::uint64_t expect[kSections] = {gate, gate, down};
+        const std::uint64_t i_local =
+            static_cast<std::uint64_t>(ctx.local_intermediate);
+        const std::uint64_t h = static_cast<std::uint64_t>(ctx.hidden);
+        const std::uint64_t gu_w = i_local * h;
+        const std::uint64_t gu_s = 2 * i_local * (h / 32);
+        const std::uint64_t dn_w = h * i_local / 2;
+        const std::uint64_t dn_s = h * (i_local / 32);
+        const std::uint64_t expect[kSections] = {gu_w, gu_s, dn_w, dn_s};
         if (sb.size() != static_cast<std::size_t>(kSections)) {
             throw std::runtime_error(
-                "expert pack: eager BF16 expected " +
+                "expert pack: RoutedDecode TP expected " +
                 std::to_string(kSections) + " section_bytes, got " +
                 std::to_string(sb.size()));
         }
         for (int i = 0; i < kSections; ++i) {
             if (sb[static_cast<std::size_t>(i)] != expect[i]) {
                 throw std::runtime_error(
-                    "expert pack: eager BF16 section_bytes[" +
+                    "expert pack: RoutedDecode TP section_bytes[" +
                     std::to_string(i) + "]=" +
                     std::to_string(sb[static_cast<std::size_t>(i)]) +
                     " != expected " + std::to_string(expect[i]) +
                     " (I_local=" + std::to_string(ctx.local_intermediate) +
-                    " H=" + std::to_string(ctx.hidden) +
-                    " tp=" + std::to_string(tp) + ")");
+                    " H=" + std::to_string(ctx.hidden) + ")");
             }
         }
 
@@ -120,21 +137,10 @@ struct GptOssEagerBf16PackTraits {
         ctx.src_gu_s = DeviceBuf(ctx.gu_s_span);
         ctx.src_dn_w = DeviceBuf(ctx.dn_w_span);
         ctx.src_dn_s = DeviceBuf(ctx.dn_s_span);
-        ctx.fused_bf16 = DeviceBuf(
-            static_cast<std::uint64_t>(2 * ctx.full_intermediate) *
-            static_cast<std::uint64_t>(ctx.hidden) * 2);
-        const std::uint64_t full_gate_bytes =
-            static_cast<std::uint64_t>(ctx.full_intermediate) *
-            static_cast<std::uint64_t>(ctx.hidden) * 2;
-        const std::uint64_t full_down_bytes =
-            static_cast<std::uint64_t>(ctx.hidden) *
-            static_cast<std::uint64_t>(ctx.full_intermediate) * 2;
-        ctx.full_gate = DeviceBuf(full_gate_bytes);
-        ctx.full_up = DeviceBuf(full_gate_bytes);
-        ctx.full_down = DeviceBuf(full_down_bytes);
-        ctx.dst_gate = DeviceBuf(sb[0]);
-        ctx.dst_up = DeviceBuf(sb[1]);
-        ctx.dst_down = DeviceBuf(sb[2]);
+        ctx.dst_gu_w = DeviceBuf(sb[0]);
+        ctx.dst_gu_s = DeviceBuf(sb[1]);
+        ctx.dst_dn_w = DeviceBuf(sb[2]);
+        ctx.dst_dn_s = DeviceBuf(sb[3]);
         return ctx;
     }
 
@@ -167,45 +173,59 @@ struct GptOssEagerBf16PackTraits {
 
     static void transform(Context& ctx)
     {
-        kernels::launch_dequant_mxfp4_to_bf16(
-            static_cast<const std::uint8_t*>(ctx.src_gu_w.ptr),
-            static_cast<const std::uint8_t*>(ctx.src_gu_s.ptr),
-            ctx.fused_bf16.ptr, 2 * ctx.full_intermediate, ctx.hidden,
-            /*stream=*/0);
-        kernels::launch_deinterleave_rows_bf16(
-            ctx.fused_bf16.ptr, ctx.full_gate.ptr, ctx.full_up.ptr,
-            ctx.full_intermediate, ctx.hidden, /*stream=*/0);
-        kernels::launch_dequant_mxfp4_to_bf16(
-            static_cast<const std::uint8_t*>(ctx.src_dn_w.ptr),
-            static_cast<const std::uint8_t*>(ctx.src_dn_s.ptr),
-            ctx.full_down.ptr, ctx.hidden, ctx.full_intermediate, /*stream=*/0);
-
-        // Copy TP-local gate/up rows and down columns into pack sections.
-        const std::size_t row_bytes =
-            static_cast<std::size_t>(ctx.hidden) * 2;
-        const std::size_t gate_offset =
-            static_cast<std::size_t>(ctx.local_start) * row_bytes;
-        const std::size_t gate_bytes =
-            static_cast<std::size_t>(ctx.local_intermediate) * row_bytes;
+        // Gate/up fused weight: [2I, H/32, 16] → contiguous row slice.
+        // Each fused row is (H/32)*16 = H/2 bytes.
+        const std::size_t gu_row_bytes =
+            static_cast<std::size_t>(ctx.hidden) / 2;
+        const std::size_t gu_row_offset =
+            static_cast<std::size_t>(2 * ctx.local_start) * gu_row_bytes;
+        const std::size_t gu_copy_bytes =
+            static_cast<std::size_t>(2 * ctx.local_intermediate) * gu_row_bytes;
         CUDA_CHECK(cudaMemcpy(
-            ctx.dst_gate.ptr,
-            static_cast<const std::uint8_t*>(ctx.full_gate.ptr) + gate_offset,
-            gate_bytes, cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            ctx.dst_up.ptr,
-            static_cast<const std::uint8_t*>(ctx.full_up.ptr) + gate_offset,
-            gate_bytes, cudaMemcpyDeviceToDevice));
+            ctx.dst_gu_w.ptr,
+            static_cast<const std::uint8_t*>(ctx.src_gu_w.ptr) + gu_row_offset,
+            gu_copy_bytes, cudaMemcpyDeviceToDevice));
 
-        const std::size_t full_row_bytes =
-            static_cast<std::size_t>(ctx.full_intermediate) * 2;
-        const std::size_t local_row_bytes =
-            static_cast<std::size_t>(ctx.local_intermediate) * 2;
-        const std::size_t col_offset =
-            static_cast<std::size_t>(ctx.local_start) * 2;
+        // Gate/up scales: [2I, H/32] u8 → contiguous row slice.
+        const std::size_t gu_s_row_bytes =
+            static_cast<std::size_t>(ctx.gu_groups);
+        const std::size_t gu_s_offset =
+            static_cast<std::size_t>(2 * ctx.local_start) * gu_s_row_bytes;
+        const std::size_t gu_s_copy =
+            static_cast<std::size_t>(2 * ctx.local_intermediate) *
+            gu_s_row_bytes;
+        CUDA_CHECK(cudaMemcpy(
+            ctx.dst_gu_s.ptr,
+            static_cast<const std::uint8_t*>(ctx.src_gu_s.ptr) + gu_s_offset,
+            gu_s_copy, cudaMemcpyDeviceToDevice));
+
+        // Down weight: [H, I/32, 16] — gather local groups per hidden row.
+        // Each group is 16 bytes; full row pitch = down_groups_full * 16.
+        const std::size_t dn_group_bytes = 16;
+        const std::size_t dn_full_pitch =
+            static_cast<std::size_t>(ctx.down_groups_full) * dn_group_bytes;
+        const std::size_t dn_local_pitch =
+            static_cast<std::size_t>(ctx.down_groups_local) * dn_group_bytes;
+        const std::size_t dn_col_offset =
+            static_cast<std::size_t>(ctx.local_start / 32) * dn_group_bytes;
         CUDA_CHECK(cudaMemcpy2D(
-            ctx.dst_down.ptr, local_row_bytes,
-            static_cast<const std::uint8_t*>(ctx.full_down.ptr) + col_offset,
-            full_row_bytes, local_row_bytes,
+            ctx.dst_dn_w.ptr, dn_local_pitch,
+            static_cast<const std::uint8_t*>(ctx.src_dn_w.ptr) + dn_col_offset,
+            dn_full_pitch, dn_local_pitch,
+            static_cast<std::size_t>(ctx.hidden), cudaMemcpyDeviceToDevice));
+
+        // Down scales: [H, I/32] u8 — same gather pattern.
+        const std::size_t dn_s_full_pitch =
+            static_cast<std::size_t>(ctx.down_groups_full);
+        const std::size_t dn_s_local_pitch =
+            static_cast<std::size_t>(ctx.down_groups_local);
+        const std::size_t dn_s_col_offset =
+            static_cast<std::size_t>(ctx.local_start / 32);
+        CUDA_CHECK(cudaMemcpy2D(
+            ctx.dst_dn_s.ptr, dn_s_local_pitch,
+            static_cast<const std::uint8_t*>(ctx.src_dn_s.ptr) +
+                dn_s_col_offset,
+            dn_s_full_pitch, dn_s_local_pitch,
             static_cast<std::size_t>(ctx.hidden), cudaMemcpyDeviceToDevice));
 
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -218,9 +238,10 @@ struct GptOssEagerBf16PackTraits {
         std::vector<std::uint8_t>& host_bounce)
     {
         const DeviceBuf* sections[kSections] = {
-            &ctx.dst_gate,
-            &ctx.dst_up,
-            &ctx.dst_down,
+            &ctx.dst_gu_w,
+            &ctx.dst_gu_s,
+            &ctx.dst_dn_w,
+            &ctx.dst_dn_s,
         };
         expert_pack_emit_slot_sections(
             writer, table, sections, kSections, host_bounce);
@@ -229,13 +250,13 @@ struct GptOssEagerBf16PackTraits {
 
 }  // namespace
 
-bool ensure_gpt_oss_eager_bf16_expert_pack(
+bool ensure_gpt_oss_routed_mxfp4_expert_pack(
     StreamedExpertTable& table,
     const std::string& cache_key,
     SafetensorsCheckpointSource& checkpoint,
     bool verbose)
 {
-    return ensure_expert_pack<GptOssEagerBf16PackTraits>(
+    return ensure_expert_pack<GptOssRoutedMxfp4PackTraits>(
         table, cache_key, checkpoint, verbose);
 }
 

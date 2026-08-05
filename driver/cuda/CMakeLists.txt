@@ -51,12 +51,12 @@ endif()
 # call sites are gated on tp_size > 1), but we always link so a TP-enabled
 # wrapper can talk to the same binary. System NCCL only — vendoring via CPM
 # is impractical (kernel-heavy build).
-find_path(NCCL_INCLUDE_DIR nccl.h
-  HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/include /usr/local/include
-  REQUIRED)
-find_library(NCCL_LIBRARY nccl
-  HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/lib/x86_64-linux-gnu /usr/local/lib
-  REQUIRED)
+  find_path(NCCL_INCLUDE_DIR nccl.h
+    HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/include /usr/local/include
+    REQUIRED)
+  find_library(NCCL_LIBRARY nccl
+    HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/lib/x86_64-linux-gnu /usr/local/lib
+    REQUIRED)
 message(STATUS "Using NCCL: ${NCCL_LIBRARY} (header: ${NCCL_INCLUDE_DIR})")
 
 include(cmake/CPM.cmake)
@@ -175,6 +175,11 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/expert_pack_build.cpp
   src/model/gpt_oss_native_marlin_pack.cpp
   src/model/gpt_oss_eager_bf16_pack.cpp
+  src/model/gpt_oss_routed_mxfp4_pack.cpp
+  src/model/mixtral_tp_bf16_pack.cpp
+  src/model/qwen35_moe_tp_bf16_pack.cpp
+  src/model/qwen3_moe_tp_bf16_pack.cpp
+  src/model/dsv4_tp_mxfp4_pack.cpp
   src/model/weight_store.cpp
   src/mla_cache.cpp
   src/model/loaded_model.cpp

@@ -1231,6 +1231,10 @@ fn dsv4_stream_routed_experts_excludes_expert_tensors_from_program() {
     assert_eq!(streamed.stream.num_layers, 1);
     assert_eq!(streamed.stream.num_experts, 2);
     assert_eq!(streamed.stream.sections_per_expert, 6);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::None
+    );
     assert_eq!(streamed.stream.template.len(), 6);
     assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 6);
     assert!(streamed.stream.slot_bytes > 0);
@@ -1261,25 +1265,49 @@ fn dsv4_stream_routed_experts_excludes_expert_tensors_from_program() {
 }
 
 #[test]
-fn dsv4_stream_routed_experts_rejects_tensor_parallel() {
-    // Enough of a streamed tensor for skip_streamed to fire before the TP check.
+fn dsv4_stream_plan_tp_local_section_bytes() {
+    // I=64, H=64, tp=2 → I_local=32. MXFP4: w1/w3 [I,H/2]+[I,H/32], w2 [H,I/2]+[H,I/32].
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>| {
+        let bytes = shape.iter().fold(1u64, |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(DType::U8),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "layers.0.ffn.gate.weight", vec![2, 64]);
+    push(next(), "layers.0.ffn.shared_experts.w1.weight", vec![32, 64]);
+    for e in 0..2 {
+        let prefix = format!("layers.0.ffn.experts.{e}");
+        push(next(), &format!("{prefix}.w1.weight"), vec![64, 32]);
+        push(next(), &format!("{prefix}.w1.scale"), vec![64, 2]);
+        push(next(), &format!("{prefix}.w2.weight"), vec![64, 32]);
+        push(next(), &format!("{prefix}.w2.scale"), vec![64, 2]);
+        push(next(), &format!("{prefix}.w3.weight"), vec![64, 32]);
+        push(next(), &format!("{prefix}.w3.scale"), vec![64, 2]);
+    }
     let meta = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
             path: "model.safetensors".into(),
-            size_bytes: 32,
+            size_bytes: offset,
             format: CheckpointFormat::Safetensors,
         }],
-        tensors: vec![RawTensor {
-            id: TensorId(0),
-            name: "layers.0.ffn.experts.0.w1.weight".into(),
-            file_id: FileId(0),
-            file_offset: 0,
-            span_bytes: 32,
-            shape: vec![32],
-            encoding: Encoding::Raw(DType::U8),
-            layout: Layout::dense(1),
-        }],
+        tensors,
     };
     let cfg = pie_weight_loader::config::ModelConfig {
         model_type: "deepseek_v4".to_string(),
@@ -1295,10 +1323,36 @@ fn dsv4_stream_routed_experts_rejects_tensor_parallel() {
         stream_routed_experts: true,
         ..StorageTarget::default()
     };
-    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("tp_size=1"), "unexpected error: {err}");
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 6);
+    // I_local=32, H=64 → [I*H/2, I*H/32, H*I/2, H*I/32, ...]
+    assert_eq!(
+        streamed.stream.section_bytes,
+        vec![1024, 64, 1024, 64, 1024, 64]
+    );
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::Dsv4TpMxfp4
+    );
+    assert_eq!(streamed.stream.bindings[0].file_id.0, 0);
+    assert_eq!(streamed.stream.bindings[0].file_offset, 0);
+    assert_eq!(streamed.stream.bindings[0].span_bytes, 1024);
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name == "layers.0.ffn.shared_experts.w1.weight"),
+        "shared expert must remain resident under TP+streaming"
+    );
+    assert!(
+        !streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.starts_with("layers.") && t.name.contains(".ffn.experts.")),
+        "main-stack routed experts must not be resident under TP stream plan"
+    );
 }
 
 #[test]
@@ -1437,6 +1491,10 @@ fn mixtral_stream_routed_experts_excludes_expert_tensors_from_program() {
     assert_eq!(streamed.stream.num_layers, 1);
     assert_eq!(streamed.stream.num_experts, 2);
     assert_eq!(streamed.stream.sections_per_expert, 3);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::None
+    );
     assert_eq!(streamed.stream.template.len(), 3);
     assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 3);
     for id in &streamed.stream.template {
@@ -1446,24 +1504,50 @@ fn mixtral_stream_routed_experts_excludes_expert_tensors_from_program() {
 }
 
 #[test]
-fn mixtral_stream_routed_experts_rejects_tensor_parallel() {
+fn mixtral_stream_plan_tp_local_section_bytes() {
+    // w1/w3: [I=32, H=16], w2: [H=16, I=32], tp=2 → I_local=16.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>| {
+        let bytes = shape.iter().fold(2u64, |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64]);
+    push(
+        next(),
+        "model.layers.0.block_sparse_moe.gate.weight",
+        vec![2, 16],
+    );
+    for e in 0..2 {
+        let prefix = format!("model.layers.0.block_sparse_moe.experts.{e}");
+        push(next(), &format!("{prefix}.w1.weight"), vec![32, 16]);
+        push(next(), &format!("{prefix}.w2.weight"), vec![16, 32]);
+        push(next(), &format!("{prefix}.w3.weight"), vec![32, 16]);
+    }
     let meta = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
             path: "mixtral.safetensors".into(),
-            size_bytes: 64,
+            size_bytes: offset,
             format: CheckpointFormat::Safetensors,
         }],
-        tensors: vec![RawTensor {
-            id: TensorId(0),
-            name: "model.layers.0.block_sparse_moe.experts.0.w1.weight".into(),
-            file_id: FileId(0),
-            file_offset: 0,
-            span_bytes: 64,
-            shape: vec![32, 1],
-            encoding: Encoding::Raw(DType::BF16),
-            layout: Layout::dense(1),
-        }],
+        tensors,
     };
     let cfg = pie_weight_loader::config::ModelConfig {
         model_type: "mixtral".to_string(),
@@ -1479,10 +1563,23 @@ fn mixtral_stream_routed_experts_rejects_tensor_parallel() {
         stream_routed_experts: true,
         ..StorageTarget::default()
     };
-    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("tp_size=1"), "unexpected error: {err}");
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 3);
+    // I_local=16, H=16 → [I*H*2, H*I*2, I*H*2] = [512, 512, 512]
+    assert_eq!(streamed.stream.section_bytes, vec![512, 512, 512]);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::MixtralTpBf16
+    );
+    assert_eq!(streamed.stream.bindings[0].file_id.0, 0);
+    assert_eq!(streamed.stream.bindings[0].file_offset, 0);
+    assert_eq!(streamed.stream.bindings[0].span_bytes, 512);
+    assert!(
+        !streamed.tensors.iter().any(|t| t.name.contains("block_sparse_moe.experts.")),
+        "TP stream plan must exclude Mixtral expert tensors from resident ABI"
+    );
 }
 
 #[test]
@@ -1808,6 +1905,321 @@ fn gpt_oss_native_stream_plan_section_bytes() {
 }
 
 #[test]
+fn gpt_oss_native_stream_plan_tp_local_section_bytes() {
+    // E=2, I_full=256, H=64, tp=2 → I_local=128, I_native=128.
+    // gate/up weight: 128*64/2=4096; scale: 128*2=256;
+    // down weight: 64*128/2=4096; scale: 64*(128/32)=256.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>, span: u64| {
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: span,
+            shape,
+            encoding: Encoding::Raw(DType::U8),
+            layout: Layout::dense(1),
+        });
+        offset += span;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64], 64);
+    // gate_up [E=2, 2I=512, H/32=2, 16]
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_blocks",
+        vec![2, 512, 2, 16],
+        32768,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_scales",
+        vec![2, 512, 2],
+        2048,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_bias",
+        vec![2, 512],
+        2048,
+    );
+    // down [E=2, H=64, I/32=8, 16]
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_blocks",
+        vec![2, 64, 8, 16],
+        16384,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_scales",
+        vec![2, 64, 8],
+        1024,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_bias",
+        vec![2, 64],
+        256,
+    );
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "gpt-oss.safetensors".into(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    };
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "gpt_oss".to_string(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+        ..pie_weight_loader::config::ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tp_rank: 1,
+        tp_size: 2,
+        stream_routed_experts: true,
+        mxfp4_moe: pie_weight_loader::types::Mxfp4MoePolicy::NativeGemm,
+        native_mxfp4_moe: true,
+        ..StorageTarget::default()
+    };
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 6);
+    assert_eq!(
+        streamed.stream.section_bytes,
+        vec![4096, 256, 4096, 256, 4096, 256]
+    );
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::GptOssNativeMarlin
+    );
+    // Gate_up bias sharded to {E, 2*I_local=256}.
+    let bias = streamed
+        .tensors
+        .iter()
+        .find(|t| t.name.contains("gate_up_proj.bias"))
+        .expect("gate_up bias resident");
+    assert_eq!(bias.shape, vec![2, 256]);
+}
+
+#[test]
+fn gpt_oss_eager_bf16_stream_plan_tp_local_section_bytes() {
+    // E=2, I_full=256, H=64, tp=2 → I_local=128.
+    // gate/up: 128*64*2=16384; down: 64*128*2=16384.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>, span: u64| {
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: span,
+            shape,
+            encoding: Encoding::Raw(DType::U8),
+            layout: Layout::dense(1),
+        });
+        offset += span;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64], 64);
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_blocks",
+        vec![2, 512, 2, 16],
+        32768,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_scales",
+        vec![2, 512, 2],
+        2048,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_bias",
+        vec![2, 512],
+        2048,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_blocks",
+        vec![2, 64, 8, 16],
+        16384,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_scales",
+        vec![2, 64, 8],
+        1024,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_bias",
+        vec![2, 64],
+        256,
+    );
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "gpt-oss.safetensors".into(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    };
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "gpt_oss".to_string(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+        ..pie_weight_loader::config::ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tp_rank: 0,
+        tp_size: 2,
+        stream_routed_experts: true,
+        mxfp4_moe: pie_weight_loader::types::Mxfp4MoePolicy::EagerBf16,
+        ..StorageTarget::default()
+    };
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 3);
+    assert_eq!(
+        streamed.stream.section_bytes,
+        vec![16384, 16384, 16384]
+    );
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::GptOssEagerBf16
+    );
+}
+
+#[test]
+fn gpt_oss_routed_decode_stream_plan_tp_pack() {
+    // E=2, I_full=128, H=64, tp=2 → I_local=64.
+    // gu_w=64*64=4096; gu_s=2*64*2=256; dn_w=64*64/2=2048; dn_s=64*2=128.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>, span: u64| {
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: span,
+            shape,
+            encoding: Encoding::Raw(DType::U8),
+            layout: Layout::dense(1),
+        });
+        offset += span;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64], 64);
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_blocks",
+        vec![2, 256, 2, 16],
+        16384,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_scales",
+        vec![2, 256, 2],
+        1024,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_bias",
+        vec![2, 256],
+        1024,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_blocks",
+        vec![2, 64, 4, 16],
+        8192,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_scales",
+        vec![2, 64, 4],
+        512,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_bias",
+        vec![2, 64],
+        256,
+    );
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "gpt-oss.safetensors".into(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    };
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "gpt_oss".to_string(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+        ..pie_weight_loader::config::ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tp_rank: 0,
+        tp_size: 2,
+        stream_routed_experts: true,
+        mxfp4_moe: pie_weight_loader::types::Mxfp4MoePolicy::RoutedDecode,
+        ..StorageTarget::default()
+    };
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 4);
+    assert_eq!(
+        streamed.stream.section_bytes,
+        vec![4096, 256, 2048, 128]
+    );
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::GptOssRoutedMxfp4
+    );
+    // Pack-relative bindings (virtual file 0).
+    assert_eq!(streamed.stream.bindings[0].file_id.0, 0);
+    assert_eq!(streamed.stream.bindings[0].file_offset, 0);
+    assert_eq!(streamed.stream.bindings[0].span_bytes, 4096);
+}
+
+#[test]
 fn qwen35_moe_stream_routed_experts_fused_plan() {
     // Minimal Qwen3.5-MoE fused banks: 1 layer × 2 experts + shared expert.
     let mut offset = 0u64;
@@ -1925,27 +2337,72 @@ fn qwen35_moe_stream_routed_experts_fused_plan() {
     assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 2);
     // Per-expert slices: gate_up 2*I*H*2 bytes, down H*I*2 bytes.
     assert_eq!(streamed.stream.section_bytes, vec![8192, 4096]);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::None
+    );
 }
 
 #[test]
-fn qwen35_moe_stream_routed_experts_rejects_tensor_parallel() {
+fn qwen35_moe_stream_plan_tp_local_section_bytes() {
+    // Fused [E=2, 2I=64, H=64] / [E=2, H=64, I=32], tp=2 → I_local=16.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>| {
+        let bytes = shape.iter().fold(2u64, |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64]);
+    push(next(), "model.layers.0.mlp.gate.weight", vec![2, 64]);
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj",
+        vec![2, 64, 64],
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj",
+        vec![2, 64, 32],
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.shared_expert.gate_proj.weight",
+        vec![32, 64],
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.shared_expert.up_proj.weight",
+        vec![32, 64],
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.shared_expert.down_proj.weight",
+        vec![64, 32],
+    );
     let meta = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
             path: "qwen35-moe.safetensors".into(),
-            size_bytes: 64,
+            size_bytes: offset,
             format: CheckpointFormat::Safetensors,
         }],
-        tensors: vec![RawTensor {
-            id: TensorId(0),
-            name: "model.layers.0.mlp.experts.gate_up_proj".into(),
-            file_id: FileId(0),
-            file_offset: 0,
-            span_bytes: 64,
-            shape: vec![32, 1],
-            encoding: Encoding::Raw(DType::BF16),
-            layout: Layout::dense(1),
-        }],
+        tensors,
     };
     let cfg = pie_weight_loader::config::ModelConfig {
         model_type: "qwen3_5_moe".to_string(),
@@ -1961,10 +2418,34 @@ fn qwen35_moe_stream_routed_experts_rejects_tensor_parallel() {
         stream_routed_experts: true,
         ..StorageTarget::default()
     };
-    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("tp_size=1"), "unexpected error: {err}");
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 2);
+    // I_local=16, H=64 → [2*I*H*2, H*I*2] = [4096, 2048]
+    assert_eq!(streamed.stream.section_bytes, vec![4096, 2048]);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::Qwen35MoeTpBf16
+    );
+    assert_eq!(streamed.stream.bindings[0].file_id.0, 0);
+    assert_eq!(streamed.stream.bindings[0].file_offset, 0);
+    assert_eq!(streamed.stream.bindings[0].span_bytes, 4096);
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("mlp.shared_expert.")),
+        "shared expert must remain resident under TP+streaming"
+    );
+    assert!(
+        !streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("mlp.experts.gate_up_proj")
+                || t.name.contains("mlp.experts.down_proj")),
+        "fused routed banks must not be resident under TP stream plan"
+    );
 }
 
 #[test]
@@ -2053,6 +2534,10 @@ fn qwen3_moe_stream_routed_experts_named_plan() {
     assert_eq!(streamed.stream.num_layers, 1);
     assert_eq!(streamed.stream.num_experts, 2);
     assert_eq!(streamed.stream.sections_per_expert, 3);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::None
+    );
     assert_eq!(streamed.stream.template.len(), 3);
     assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 3);
     for id in &streamed.stream.template {
@@ -2062,24 +2547,46 @@ fn qwen3_moe_stream_routed_experts_named_plan() {
 }
 
 #[test]
-fn qwen3_moe_stream_routed_experts_rejects_tensor_parallel() {
+fn qwen3_moe_stream_plan_tp_local_section_bytes() {
+    // gate/up: [I=32, H=16], down: [H=16, I=32], tp=2 → I_local=16.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>| {
+        let bytes = shape.iter().fold(2u64, |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64]);
+    push(next(), "model.layers.0.mlp.gate.weight", vec![2, 16]);
+    for e in 0..2 {
+        let prefix = format!("model.layers.0.mlp.experts.{e}");
+        push(next(), &format!("{prefix}.gate_proj.weight"), vec![32, 16]);
+        push(next(), &format!("{prefix}.up_proj.weight"), vec![32, 16]);
+        push(next(), &format!("{prefix}.down_proj.weight"), vec![16, 32]);
+    }
     let meta = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
             path: "qwen3-moe.safetensors".into(),
-            size_bytes: 64,
+            size_bytes: offset,
             format: CheckpointFormat::Safetensors,
         }],
-        tensors: vec![RawTensor {
-            id: TensorId(0),
-            name: "model.layers.0.mlp.experts.0.gate_proj.weight".into(),
-            file_id: FileId(0),
-            file_offset: 0,
-            span_bytes: 64,
-            shape: vec![32, 1],
-            encoding: Encoding::Raw(DType::BF16),
-            layout: Layout::dense(1),
-        }],
+        tensors,
     };
     let cfg = pie_weight_loader::config::ModelConfig {
         model_type: "qwen3_moe".to_string(),
@@ -2095,9 +2602,22 @@ fn qwen3_moe_stream_routed_experts_rejects_tensor_parallel() {
         stream_routed_experts: true,
         ..StorageTarget::default()
     };
-    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("tp_size=1"), "unexpected error: {err}");
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 3);
+    // I_local=16, H=16 → [I*H*2, I*H*2, H*I*2] = [512, 512, 512]
+    assert_eq!(streamed.stream.section_bytes, vec![512, 512, 512]);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::Qwen3MoeTpBf16
+    );
+    assert_eq!(streamed.stream.bindings[0].file_id.0, 0);
+    assert_eq!(streamed.stream.bindings[0].file_offset, 0);
+    assert_eq!(streamed.stream.bindings[0].span_bytes, 512);
+    assert!(
+        !streamed.tensors.iter().any(|t| t.name.contains("mlp.experts.")),
+        "TP stream plan must exclude Qwen3-MoE expert tensors from resident ABI"
+    );
 }
 

@@ -27,9 +27,11 @@ void repack_weight_one(
     std::uint8_t* dst,
     std::uint8_t* gptq_stage,
     int source_rows,
+    int source_row_offset,
     int target_rows,
     int valid_rows,
     int source_stride_k,
+    int source_col_offset,
     int source_k,
     int target_k,
     kernels::Mxfp4RowSelect row_map)
@@ -37,16 +39,18 @@ void repack_weight_one(
 #if defined(PIE_CUDA_HAS_MARLIN)
     kernels::launch_mxfp4_weight_to_gptq_w4(
         src, gptq_stage,
-        source_rows, /*source_row_offset=*/0, target_rows, valid_rows,
-        source_stride_k, /*source_col_offset=*/0, source_k, target_k,
+        source_rows, source_row_offset, target_rows, valid_rows,
+        source_stride_k, source_col_offset, source_k, target_k,
         row_map, /*stream=*/0);
     marlin::launch_gptq_repack_w4_no_perm(
         gptq_stage, dst, target_k, target_rows, /*stream=*/0);
     CUDA_CHECK(cudaGetLastError());
 #else
     (void)src; (void)dst; (void)gptq_stage;
-    (void)source_rows; (void)target_rows; (void)valid_rows;
-    (void)source_stride_k; (void)source_k; (void)target_k; (void)row_map;
+    (void)source_rows; (void)source_row_offset;
+    (void)target_rows; (void)valid_rows;
+    (void)source_stride_k; (void)source_col_offset;
+    (void)source_k; (void)target_k; (void)row_map;
     throw std::runtime_error(
         "expert pack: Marlin repack requires PIE_CUDA_HAS_MARLIN");
 #endif
@@ -56,17 +60,19 @@ void repack_scale_one(
     const std::uint8_t* src,
     std::uint8_t* dst,
     int source_rows,
+    int source_row_offset,
     int target_rows,
     int valid_rows,
     int source_stride_groups,
+    int source_group_offset,
     int source_groups,
     int target_groups,
     kernels::Mxfp4RowSelect row_map)
 {
     kernels::launch_mxfp4_scales_to_marlin_e8m0(
         src, dst,
-        source_rows, /*source_row_offset=*/0, target_rows, valid_rows,
-        source_stride_groups, /*source_group_offset=*/0, source_groups,
+        source_rows, source_row_offset, target_rows, valid_rows,
+        source_stride_groups, source_group_offset, source_groups,
         target_groups, row_map, /*stream=*/0);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -89,7 +95,9 @@ struct GptOssNativeMarlinPackTraits {
 
     struct Context {
         int fused_rows = 0;
-        int intermediate = 0;
+        int full_intermediate = 0;
+        int local_start = 0;
+        int local_intermediate = 0;
         int intermediate_native = 0;
         int hidden = 0;
         int gu_groups = 0;
@@ -116,6 +124,8 @@ struct GptOssNativeMarlinPackTraits {
         SafetensorsCheckpointSource& checkpoint)
     {
         const int E = table.num_experts;
+        const int tp = std::max(1, table.tp_size);
+        const int rank = table.tp_rank;
         const auto& sb = table.section_bytes;
 
         const std::string gu_w_name =
@@ -136,8 +146,18 @@ struct GptOssNativeMarlinPackTraits {
         Context ctx;
         ctx.fused_rows = static_cast<int>(gu_w_info.shape[1]);
         ctx.gu_groups = static_cast<int>(gu_w_info.shape[2]);
-        ctx.intermediate = ctx.fused_rows / 2;
-        ctx.intermediate_native = align_up_int(ctx.intermediate, 128);
+        ctx.full_intermediate = ctx.fused_rows / 2;
+        if (ctx.full_intermediate % tp != 0) {
+            throw std::runtime_error(
+                "expert pack: intermediate not divisible by tp_size");
+        }
+        ctx.local_intermediate = ctx.full_intermediate / tp;
+        ctx.local_start = rank * ctx.local_intermediate;
+        if (ctx.local_start % 32 != 0 || ctx.local_intermediate % 32 != 0) {
+            throw std::runtime_error(
+                "expert pack: native Marlin TP shard must align to 32");
+        }
+        ctx.intermediate_native = align_up_int(ctx.local_intermediate, 128);
         ctx.hidden = ctx.gu_groups * 32;
         ctx.down_groups = static_cast<int>(dn_w_info.shape[2]);
 
@@ -171,7 +191,8 @@ struct GptOssNativeMarlinPackTraits {
                     " != expected " + std::to_string(expect[i]) +
                     " (I_native=" + std::to_string(ctx.intermediate_native) +
                     " H=" + std::to_string(ctx.hidden) +
-                    " groups=" + std::to_string(ctx.gu_groups) + ")");
+                    " groups=" + std::to_string(ctx.gu_groups) +
+                    " tp=" + std::to_string(tp) + ")");
             }
         }
 
@@ -236,41 +257,43 @@ struct GptOssNativeMarlinPackTraits {
         auto* dn_w_ptr = static_cast<std::uint8_t*>(ctx.src_dn_w.ptr);
         auto* dn_s_ptr = static_cast<std::uint8_t*>(ctx.src_dn_s.ptr);
 
-        // Gate (even rows) / up (odd rows).
+        // Gate (even rows) / up (odd rows); source_row_offset = TP local_start.
         repack_weight_one(
             gu_w_ptr, static_cast<std::uint8_t*>(ctx.dst_gate_w.ptr),
             static_cast<std::uint8_t*>(ctx.gptq_stage.ptr),
-            ctx.fused_rows, ctx.intermediate_native, ctx.intermediate,
-            ctx.hidden, ctx.hidden, ctx.hidden, kernels::Mxfp4RowSelect::Even);
+            ctx.fused_rows, ctx.local_start, ctx.intermediate_native,
+            ctx.local_intermediate, ctx.hidden, /*source_col_offset=*/0,
+            ctx.hidden, ctx.hidden, kernels::Mxfp4RowSelect::Even);
         repack_scale_one(
             gu_s_ptr, static_cast<std::uint8_t*>(ctx.dst_gate_s.ptr),
-            ctx.fused_rows, ctx.intermediate_native, ctx.intermediate,
-            ctx.gu_groups, ctx.gu_groups, ctx.gu_groups,
-            kernels::Mxfp4RowSelect::Even);
+            ctx.fused_rows, ctx.local_start, ctx.intermediate_native,
+            ctx.local_intermediate, ctx.gu_groups, /*source_group_offset=*/0,
+            ctx.gu_groups, ctx.gu_groups, kernels::Mxfp4RowSelect::Even);
 
         repack_weight_one(
             gu_w_ptr, static_cast<std::uint8_t*>(ctx.dst_up_w.ptr),
             static_cast<std::uint8_t*>(ctx.gptq_stage.ptr),
-            ctx.fused_rows, ctx.intermediate_native, ctx.intermediate,
-            ctx.hidden, ctx.hidden, ctx.hidden, kernels::Mxfp4RowSelect::Odd);
+            ctx.fused_rows, ctx.local_start, ctx.intermediate_native,
+            ctx.local_intermediate, ctx.hidden, /*source_col_offset=*/0,
+            ctx.hidden, ctx.hidden, kernels::Mxfp4RowSelect::Odd);
         repack_scale_one(
             gu_s_ptr, static_cast<std::uint8_t*>(ctx.dst_up_s.ptr),
-            ctx.fused_rows, ctx.intermediate_native, ctx.intermediate,
-            ctx.gu_groups, ctx.gu_groups, ctx.gu_groups,
-            kernels::Mxfp4RowSelect::Odd);
+            ctx.fused_rows, ctx.local_start, ctx.intermediate_native,
+            ctx.local_intermediate, ctx.gu_groups, /*source_group_offset=*/0,
+            ctx.gu_groups, ctx.gu_groups, kernels::Mxfp4RowSelect::Odd);
 
-        // Down: Identity row map, pad K to intermediate_native.
+        // Down: Identity rows; source_col_offset = TP local_start.
         repack_weight_one(
             dn_w_ptr, static_cast<std::uint8_t*>(ctx.dst_dn_w.ptr),
             static_cast<std::uint8_t*>(ctx.gptq_stage.ptr),
-            ctx.hidden, ctx.hidden, ctx.hidden,
-            ctx.intermediate, ctx.intermediate, ctx.intermediate_native,
-            kernels::Mxfp4RowSelect::Identity);
+            ctx.hidden, /*source_row_offset=*/0, ctx.hidden, ctx.hidden,
+            ctx.full_intermediate, ctx.local_start, ctx.local_intermediate,
+            ctx.intermediate_native, kernels::Mxfp4RowSelect::Identity);
         repack_scale_one(
             dn_s_ptr, static_cast<std::uint8_t*>(ctx.dst_dn_s.ptr),
-            ctx.hidden, ctx.hidden, ctx.hidden,
-            ctx.down_groups, ctx.down_groups, ctx.intermediate_native / 32,
-            kernels::Mxfp4RowSelect::Identity);
+            ctx.hidden, /*source_row_offset=*/0, ctx.hidden, ctx.hidden,
+            ctx.down_groups, ctx.local_start / 32, ctx.local_intermediate / 32,
+            ctx.intermediate_native / 32, kernels::Mxfp4RowSelect::Identity);
 
         CUDA_CHECK(cudaDeviceSynchronize());
     }

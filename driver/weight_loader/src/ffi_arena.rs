@@ -187,6 +187,21 @@ impl FfiArena {
                     crate::storage::ExpertPackKind::GptOssEagerBf16 => {
                         PieLoaderExpertPackKind::GptOssEagerBf16
                     }
+                    crate::storage::ExpertPackKind::GptOssRoutedMxfp4 => {
+                        PieLoaderExpertPackKind::GptOssRoutedMxfp4
+                    }
+                    crate::storage::ExpertPackKind::MixtralTpBf16 => {
+                        PieLoaderExpertPackKind::MixtralTpBf16
+                    }
+                    crate::storage::ExpertPackKind::Qwen35MoeTpBf16 => {
+                        PieLoaderExpertPackKind::Qwen35MoeTpBf16
+                    }
+                    crate::storage::ExpertPackKind::Qwen3MoeTpBf16 => {
+                        PieLoaderExpertPackKind::Qwen3MoeTpBf16
+                    }
+                    crate::storage::ExpertPackKind::Dsv4TpMxfp4 => {
+                        PieLoaderExpertPackKind::Dsv4TpMxfp4
+                    }
                 },
             },
         }
