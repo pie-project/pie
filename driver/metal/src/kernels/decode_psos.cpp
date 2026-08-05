@@ -128,7 +128,7 @@ bool load_decode_psos(RawMetalContext& ctx,
         // has no `mlp.gate`, and claiming the kind for it makes the loader
         // demand a tensor that does not exist.
         want("quantized_qmv.metal", qmv_fast_fn.c_str(), {Kernel::LlRouter});
-        want("gptoss.metal", "router_topk_bfloat16", {Kernel::GoRouterTopK});
+        want("moe_route.metal", "router_topk_bfloat16", {Kernel::GoRouterTopK});
         want("moe_route.metal", "moe_route_sort", {Kernel::LlMoeSort});
         want("moe_route.metal", "moe_route_gather", {Kernel::LlMoeGather});
         want("moe_route.metal", "moe_combine_sorted", {Kernel::LlMoeCombine});

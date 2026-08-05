@@ -27,23 +27,17 @@ namespace pie::metal::gptoss {
 // `router_topk`, not of gpt-oss.
 using shared_kernels::router_topk_dispatch;
 
+using shared_kernels::ExpertCombineParams;
 using shared_kernels::RowGatherParams;
+using shared_kernels::RouterParams;
 using shared_kernels::elementwise_dispatch;
 
 /// Params structs, replicated EXACTLY from the .metal sources. A mismatch here
 /// is silent: the GPU reads whatever bytes are at the offset.
-struct RouterParams {          // gptoss.metal
-    std::uint32_t n_experts;
-    std::uint32_t experts_per_token;
-};
 struct SwiGluParams {          // gptoss.metal
     std::uint32_t n;
     float limit;
     float alpha;
-};
-struct ExpertCombineParams {   // gptoss.metal
-    std::uint32_t width;
-    std::uint32_t experts_per_token;
 };
 
 /// The PSOs this family needs beyond the shared set.

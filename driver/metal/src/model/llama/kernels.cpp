@@ -43,7 +43,7 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // compiling them anyway would let an unrelated shader error fail a load
     // that would otherwise have worked.
     if (g.is_moe()) {
-        specs.push_back({"gptoss.metal", "router_topk_bfloat16", &out.router_topk});
+        specs.push_back({"moe_route.metal", "router_topk_bfloat16", &out.router_topk});
         specs.push_back({"quantized_qmv.metal", "affine_qmv_routed" + q, &out.qmv_routed});
         specs.push_back({"moe_route.metal", "moe_route_sort", &out.moe_sort});
         specs.push_back({"moe_route.metal", "moe_route_gather", &out.moe_gather});

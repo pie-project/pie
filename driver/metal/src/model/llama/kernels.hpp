@@ -16,10 +16,8 @@
 ///     (gpt-oss). Llama and every Qwen use 128, so that is one instantiation
 ///     each, not a kernel.
 ///   * `row_gather`, for the prefill tail.
-///   * the routed FFN, which is entirely borrowed: `router_topk` and
-///     `expert_combine` from `gptoss.metal` -- both generic, neither
-///     gpt-oss-specific -- and the unbiased routed matvec, which is
-///     `qmv_gptoss_impl` with BIASED off.
+///   * the routed FFN, built from the generic `moe_route.metal` kernels and
+///     the unbiased routed matvec (`qmv_gptoss_impl` with BIASED off).
 ///
 /// Notably NOT borrowed: `gptoss_swiglu`. That kernel bakes in gpt-oss's
 /// asymmetric clamp, its `alpha`, and its `(up + 1)` term. Qwen3-MoE uses plain
@@ -36,9 +34,7 @@
 
 namespace pie::metal::llama {
 
-// The routing kernels and their launch shapes are shared: `gptoss.metal` is
-// where they live, but nothing in `router_topk` or `expert_combine` is
-// gpt-oss-specific, and this family dispatches both.
+// Routing kernels and launch shapes are shared across every MoE family.
 using shared_kernels::ExpertCombineParams;
 using shared_kernels::MoeRouteParams;
 using shared_kernels::RouterParams;
