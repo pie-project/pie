@@ -1305,6 +1305,21 @@ def build_parser() -> argparse.ArgumentParser:
                  "0 disables speculation; 1 is piggyback (default). Forwards "
                  "to scheduler.speculation_depth in the generated toml.",
         )
+        # `choices.values()` can yield the same parser under an alias; the
+        # duplicate add_argument then raises. Guard by option string.
+        if not any(
+            "--run-ahead-frames" in a.option_strings for a in sp._actions
+        ):
+            sp.add_argument(
+                "--run-ahead-frames",
+                dest="run_ahead_frames",
+                type=int,
+                default=None,
+                help="Override the inferlet's run-ahead window depth, in "
+                     "frames (forwarded as the bench input's "
+                     "run_ahead_frames; the ring grows to match). "
+                     "Default: the inferlet's own sizing.",
+            )
         sp.add_argument(
             "--dump-first-text",
             action="store_true",
