@@ -32,6 +32,12 @@ enum Command {
     /// Boot the engine. Binds `server.host`, which is loopback by default.
     Serve,
 
+    /// Run one inferlet on a one-shot engine, print what it produces, exit.
+    ///
+    /// Arguments for the inferlet go after `--`:
+    /// `pie run chat-completion -- --prompt "The capital of France is"`.
+    Run(ops::run::RunArgs),
+
     /// The models pie serves (list / info / import / remove / optimize).
     Model {
         #[command(subcommand)]
@@ -123,6 +129,13 @@ async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve => serve(cli.global).await,
+
+        Command::Run(args) => {
+            startup::init_cli(&cli.global)?;
+            // The inferlet's own exit status, not this command's: `pie run`
+            // succeeded at running something that failed.
+            ops::run::run(&cli.global, args).await
+        }
 
         Command::Model { cmd } => {
             startup::init_cli(&cli.global)?;

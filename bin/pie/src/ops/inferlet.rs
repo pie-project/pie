@@ -66,6 +66,24 @@ fn programs_dir() -> std::path::PathBuf {
     pie_worker::paths::pie_home().join("programs")
 }
 
+/// The newest cached version of a bare inferlet name, if it is already here.
+///
+/// `pub(crate)` for `pie run`, which asks this before the registry. Downloading
+/// is about what the registry has, so `download` and `info` still go straight
+/// there; running is about what this machine can run, and a program already on
+/// disk needs no network to name. That is not a refinement -- the registry does
+/// not serve every inferlet in `pie inferlet list` (the test set is local), so
+/// registry-first made `pie run <one of those>` fail with a 404 for a program
+/// sitting in the cache.
+pub(crate) fn cached_version(name: &str) -> Option<ProgramName> {
+    open(String::new())
+        .cached()
+        .into_iter()
+        .map(|(program, _, _)| program)
+        .filter(|program| program.name == name)
+        .max_by(|a, b| a.version.cmp(&b.version))
+}
+
 /// Open the on-disk cache. The registry URL is only needed for downloads, so
 /// listing and removing work with an empty one rather than requiring a config.
 fn open(registry_url: String) -> Repository {
@@ -235,7 +253,13 @@ struct RegistryVersion {
     num: String,
 }
 
-async fn resolve_inferlet_id(inferlet: &str, registry_url: &str) -> Result<ProgramName> {
+/// Turn what a person typed into a `name@version`, asking the registry for the
+/// version when they did not pin one.
+///
+/// `pub(crate)` for `pie run`, which resolves exactly the way `download` and
+/// `info` do -- a bare name meaning "latest" in one command and something else
+/// in another would be its own bug.
+pub(crate) async fn resolve_inferlet_id(inferlet: &str, registry_url: &str) -> Result<ProgramName> {
     match inferlet.split_once('@') {
         Some((name, "latest")) => {
             validate_bare_inferlet_name(name)?;
