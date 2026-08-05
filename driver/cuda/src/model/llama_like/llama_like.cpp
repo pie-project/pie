@@ -1243,6 +1243,26 @@ void prepare_llama_like_decode_plan(
         state.use_xqa_decode = true;
         state.xqa_max_pages_per_seq =
             ops::xqa_decode_page_bucket(max_pages);
+        // ④ envelope banding: this deployment's band walk is PLAN-FREE
+        // (the XQA arm reads the fire's staged device CSRs and takes the
+        // row count as a parameter), so stamping k/rows is ALL the
+        // prepare owes — no flashinfer band plans. Without this stamp
+        // the early return demoted every XQA deployment (14B) to the
+        // full-depth walk with neither [depth-bands] nor DECLINE.
+        state.depth_band_count = 0;
+        if (depth_band_count >= 2 && depth_band_count <= 3 &&
+            !have_custom_mask) {
+            for (std::uint32_t j = 0; j < depth_band_count; ++j) {
+                state.depth_band_k[j] = depth_band_k[j];
+                state.depth_band_rows[j] = depth_band_rows[j];
+            }
+            state.depth_band_count = depth_band_count;
+        }
+        if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[band-prep] xqa-branch in=%u stamped=%u\n",
+                         depth_band_count, state.depth_band_count);
+        }
         return;
     }
     if (!is_pure_decode) {
@@ -1294,6 +1314,26 @@ void prepare_llama_like_decode_plan(
     if (fwd_cfg.force_prefill_path) {
         state.use_prefill_plan = false;
         state.use_prefill_decode_plan = false;
+        // ④ envelope banding, force_prefill deployment (14B-class: the
+        // GQA ratio keeps the decode kernel out, decode runs the
+        // PLAN-FREE prefill dispatch): a band is the prefix call
+        // N = R = rows on that same dispatch — the spatial split's
+        // prefix already runs exactly this shape. k/rows is all the
+        // prepare owes; there are no plans on this deployment at all.
+        state.depth_band_count = 0;
+        if (depth_band_count >= 2 && depth_band_count <= 3 &&
+            is_pure_decode && !have_custom_mask) {
+            for (std::uint32_t j = 0; j < depth_band_count; ++j) {
+                state.depth_band_k[j] = depth_band_k[j];
+                state.depth_band_rows[j] = depth_band_rows[j];
+            }
+            state.depth_band_count = depth_band_count;
+        }
+        if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[band-prep] force-prefill-branch in=%u stamped=%u\n",
+                         depth_band_count, state.depth_band_count);
+        }
         return;
     }
     const int min_prefill_decode_pages =
@@ -1433,6 +1473,14 @@ void prepare_llama_like_decode_plan(
             state.depth_band_k[j] = depth_band_k[j];
             state.depth_band_rows[j] = rows;
             if (rows == 0) continue;
+            // ④ envelope banding: the XQA deployment is PLAN-FREE — its
+            // kernels read the (compose-written) device CSRs directly and
+            // take the row count as a parameter, so a band is just the
+            // prefix call R = rows. No flashinfer band plans are built
+            // (the host CSRs are 1-page placeholders on the composed
+            // path and would plan garbage); the band walk dispatches XQA
+            // against the fire's own staged workspace instead.
+            if (state.use_xqa_decode) continue;
             if (!state.depth_band_plans[j]) {
                 state.depth_band_plans[j] = ops::make_decode_plan();
             }
@@ -2732,8 +2780,9 @@ void llama_like_forward_paged(
     };
     const bool bands_runnable =
         plan_state.depth_band_count >= 2 && is_pure_decode &&
-        !has_custom_mask && hooks == nullptr && !use_xqa_decode_path &&
-        (use_decode_path || use_prefill_decode_path) &&
+        !has_custom_mask && hooks == nullptr &&
+        (use_decode_path || use_prefill_decode_path ||
+         fwd_cfg.force_prefill_path) &&
         layer_bound == cfg.num_hidden_layers;
     if (plan_state.depth_band_count >= 2 && !bands_runnable &&
         std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
@@ -2785,14 +2834,28 @@ void llama_like_forward_paged(
                 plan_state
                     .depth_band_prefill_plans[static_cast<std::size_t>(j)]
                     .get();
-            if (use_prefill_decode_path ? band_prefill == nullptr
-                                        : band_plan == nullptr) {
+            // ④ envelope banding: the XQA arm is PLAN-FREE — it reads
+            // the fire's staged device CSRs and takes the row count as
+            // a parameter, so the band's prefix call needs neither a
+            // band plan nor a separate workspace (the per-band
+            // workspace isolation exists for flashinfer plan state; the
+            // XQA staging in the fire's own workspace is read-only to
+            // the launches and the band call must see it).
+            // Plan-free deployments (XQA, and force_prefill's plan-free
+            // prefill dispatch) band by the prefix row count alone.
+            const bool plan_free_bands =
+                use_xqa_decode_path ||
+                (fwd_cfg.force_prefill_path && !use_prefill_decode_path);
+            if (!plan_free_bands &&
+                (use_prefill_decode_path ? band_prefill == nullptr
+                                         : band_plan == nullptr)) {
                 throw std::runtime_error(
                     "depth bands: band active but prepare built no "
                     "plan for it");
             }
             for (int L = from; L < to; ++L) {
-                run_layer(L, live, live, band_plan, depth_band_ws(j),
+                run_layer(L, live, live, band_plan,
+                          plan_free_bands ? attn_ws : depth_band_ws(j),
                           band_prefill);
             }
         }
