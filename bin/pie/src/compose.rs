@@ -126,9 +126,16 @@ pub async fn run_standalone(
 
     // Boot the embedded worker against the injected control link, dialing INTO
     // the in-proc gateway (M3 inversion — the same path a remote worker takes).
-    let worker = pie_worker::run_with(worker, control, vec![format!("tcp://{worker_addr}")])
-        .await
-        .context("boot embedded worker")?;
+    let worker = pie_worker::run_with(
+        worker,
+        control,
+        vec![format!("tcp://{worker_addr}")],
+        // The client edge, taken from the bound socket rather than the config:
+        // `port = 0` means the OS chose, and the config still says 0.
+        Some(format!("ws://{listen_addr}")),
+    )
+    .await
+    .context("boot embedded worker")?;
 
     // Serve the gateway client edge (its worker-facing accept loop is already up).
     let gateway = tokio::spawn(async move {

@@ -262,8 +262,9 @@ pub async fn run_with<C: ControlLink>(
     cfg: config::Config,
     control: C,
     gateways: Vec<String>,
+    client_edge: Option<String>,
 ) -> Result<WorkerHandle> {
-    let engine = start_engine_embedded(cfg, control, gateways).await?;
+    let engine = start_engine_embedded(cfg, control, gateways, client_edge).await?;
     Ok(WorkerHandle {
         inner: WorkerKind::Decode(engine),
     })
@@ -309,19 +310,24 @@ impl StartupBanner {
         ];
         let label_width = 12;
         let header = "─ Pie Engine ";
+        // Character counts, not `str::len()`. `header` opens with `─` (U+2500,
+        // three bytes), so its byte length is 15 against 13 columns -- the top
+        // border came out two dashes short of every other line. Rust's format
+        // width counts characters, so byte lengths cannot be mixed with it.
+        let header_cols = header.chars().count();
         let content_width = rows
             .iter()
-            .map(|(_, value)| label_width + 1 + value.len())
+            .map(|(_, value)| label_width + 1 + value.chars().count())
             .max()
             .unwrap_or(0)
-            .max(header.len() - 2);
+            .max(header_cols - 2);
         let inner_width = content_width + 2;
         let mut out = String::new();
 
         out.push_str(&format!(
             "╭{}{}╮\n",
             header,
-            "─".repeat(inner_width - header.len())
+            "─".repeat(inner_width - header_cols)
         ));
         for (label, value) in rows {
             let content = format!("{label:<label_width$} {value}");
@@ -775,6 +781,7 @@ pub async fn start_engine_embedded<C: ControlLink>(
     user_cfg: config::Config,
     control: C,
     gateways: Vec<String>,
+    client_edge: Option<String>,
 ) -> Result<EngineHandle> {
     let (model, caps, partner_metadata, runtime) = boot_engine(&user_cfg).await?;
     let partner_bootstrap = build_partner_bootstrap(&user_cfg, partner_metadata, runtime.model_idx);
@@ -791,7 +798,13 @@ pub async fn start_engine_embedded<C: ControlLink>(
         partner_bootstrap,
     )
     .await?;
-    let url = edge_server.url();
+    // `edge_server.url()` reports the address the worker DIALED -- the
+    // gateway's worker-facing listener. In standalone that is an ephemeral port
+    // that speaks the worker protocol, so advertising it told the user to point
+    // their client at a socket no client can use, and at a different (random)
+    // port on every boot. The composition root knows the real client edge, so it
+    // passes it; the dial-in listing is only right when nobody knows better.
+    let url = client_edge.unwrap_or_else(|| edge_server.url());
     log_serving(&user_cfg, &url);
     Ok(EngineHandle {
         url,
@@ -1144,6 +1157,39 @@ mod tests {
         assert!(rendered.contains("Device"));
         assert!(rendered.contains("✓ Server ready at ws://127.0.0.1:8080"));
         assert!(!rendered.contains("internal token"));
+    }
+
+    /// The box lines up.
+    ///
+    /// It did not: `content_width` and the top border's dash count were taken
+    /// from `str::len()` (bytes) while `format!`'s width pads by characters,
+    /// and `"─ Pie Engine "` opens with a three-byte `─`. The top border came
+    /// out two columns short of the rows beneath it. A short model name hides
+    /// it (the header is not the widest line), so the case that matters is a
+    /// long one.
+    #[test]
+    fn startup_banner_box_is_aligned() {
+        for model in [
+            "default (Qwen/Qwen3-0.6B)",
+            "default (mlx-community/Qwen3.5-0.8B-4bit)",
+            "d",
+        ] {
+            let banner = StartupBanner {
+                model: model.to_string(),
+                driver: "metal".to_string(),
+                device: "metal:0".to_string(),
+            };
+            let rendered = banner.render("ws://127.0.0.1:8080");
+            let widths: Vec<usize> = rendered
+                .lines()
+                .take_while(|l| !l.is_empty())
+                .map(|l| l.chars().count())
+                .collect();
+            assert!(
+                widths.windows(2).all(|w| w[0] == w[1]),
+                "unaligned for {model:?}: {widths:?}\n{rendered}"
+            );
+        }
     }
 
     #[test]
