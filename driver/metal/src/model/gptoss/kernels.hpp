@@ -65,6 +65,10 @@ struct GptOssPsos {
     /// The same attention against page-addressed KV, which is what lets several
     /// sequences be resident at once.
     Pso sdpa_sink_paged{};
+    /// The same attention again, a simdgroup per query row instead of a
+    /// threadgroup, with the keys staged once per thirty-two rows. Earned by
+    /// row count and request count together -- see `sdpa_should_tile`.
+    Pso sdpa_sink_paged_tiled{};
     /// YaRN, as a frequency table the host computed once.
     Pso rope_freqs{};
     /// The M>1 counterparts: the two kernels whose ROW indexing differs, rather

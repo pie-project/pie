@@ -295,14 +295,28 @@ Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPs
     }
 }
 
+/// Whether this fire's attention runs the tiled pipeline.
+///
+/// One predicate, read by `pso_for_mb_rows` and `launch_shape_mb` both: they
+/// must agree or the grid describes a different kernel than the one that runs,
+/// and that is wrong numbers rather than a crash. `requests == 0` is a caller
+/// that did not say, and an unknown fire does not tile -- the tiled kernel
+/// loses badly on a fleet of decodes, so the safe default is the per-row shape.
+bool sdpa_tile_this_fire(int rows, int requests) {
+    return requests > 0 && sdpa_should_tile(rows, requests);
+}
+
 /// The pipeline for a dispatch whose tiling depends on the batch. Split from
 /// `pso_for_mb` because the tile choice must mirror `launch_shape_mb`'s
 /// EXACTLY: a grid computed for one tiling against a pipeline compiled for
 /// another is not a crash, it is wrong numbers.
 Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
                     const DecodeStepPsos& base, const MultiBatchPsos& mb,
-                    const GptOssPsos& go, int head_rows) {
+                    const GptOssPsos& go, int head_rows, int requests) {
     const int N = rows < 1 ? 1 : rows;
+    if (d.kind == Kind::SdpaSink && sdpa_tile_this_fire(N, requests)) {
+        return go.sdpa_sink_paged_tiled;
+    }
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
     const int m = d.kind == Kind::LmHead ? S : N;
     if (const int bn = gptoss_moe_qmm_bn(d.kind, g, N); bn > 0) {
@@ -320,7 +334,7 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
 }
 
 void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid& grid,
-                     Threadgroup& tg, int head_rows) {
+                     Threadgroup& tg, int head_rows, int requests) {
     const int N = rows < 1 ? 1 : rows;
     // The tail runs on the rows the fire will SAMPLE, which `RowGather`
     // compacted. The LM head is `hidden * vocab` per row, so on a prefill it is
@@ -379,7 +393,11 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
             kv_append_mb_dispatch(g.head_dim, g.n_kv_heads, N, grid, tg);
             return;
         case Kind::SdpaSink:
-            sdpa_sink_dispatch(g.n_q_heads, grid, tg, N);
+            // Same predicate as `pso_for_mb_rows`, for the same reason.
+            if (sdpa_tile_this_fire(N, requests))
+                sdpa_paged_tiled_dispatch(g.n_q_heads, N, grid, tg);
+            else
+                sdpa_sink_dispatch(g.n_q_heads, grid, tg, N);
             return;
         case Kind::RouterTopK:
             router_topk_dispatch(g.n_experts, grid, tg, N);
@@ -411,7 +429,7 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
 void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const GptOssGeometry& g, int rows, const DecodeStepPsos& base,
                            const MultiBatchPsos& mb, const GptOssPsos& go, int ordinal_base,
-                           int head_rows, std::size_t begin, std::size_t end) {
+                           int head_rows, int requests, std::size_t begin, std::size_t end) {
     // Deliberately the same walk as `encode_gptoss_step`: the DAG, its order
     // and its concurrency runs belong to the MODEL, not to the batch size.
     // Off the WHOLE dag, not the slice: a run's extent is the model's, and
@@ -422,8 +440,8 @@ void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
         const Dispatch& d = dag[i];
         Grid grid;
         Threadgroup tg;
-        launch_shape_mb(d, g, rows, grid, tg, head_rows);
-        se.set_pso(pso_for_mb_rows(d, g, rows, base, mb, go, head_rows));
+        launch_shape_mb(d, g, rows, grid, tg, head_rows, requests);
+        se.set_pso(pso_for_mb_rows(d, g, rows, base, mb, go, head_rows, requests));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
         if (i + 1 >= end || run_ends[i] == static_cast<int>(i)) se.barrier();
