@@ -268,7 +268,7 @@ fn read_facts(config: &serde_json::Value) -> Result<ModelFacts> {
     })
 }
 
-pub fn run(args: BuildArgs) -> Result<()> {
+pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
     let source = resolve_source(&args.source)?;
     // Two kinds of source, and the difference is only where the facts live: a
     // snapshot states them in `config.json` and a pie artifact states them in
@@ -390,8 +390,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
         None => store_path(&optimized),
     };
     if args.dry_run {
-        println!("dry run: would write {}", out_file.display());
-        return Ok(());
+        return Ok(crate::ui::Answer::did(format!(
+            "dry run: would write {}",
+            crate::ui::short_path(&out_file)
+        )));
     }
 
     let plan = pie_loader::plan::compile(&metadata, &contract, target)
@@ -496,11 +498,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
     spool.remove();
     bar.finish();
 
-    println!(
-        "{}: {} MB of runtime tensors → {}",
+    Ok(crate::ui::Answer::did(format!(
+        "built {} — {} of runtime tensors → {}",
         source.name,
-        written / (1 << 20),
-        out_file.display()
-    );
-    Ok(())
+        crate::ui::bytes(written),
+        crate::ui::short_path(&out_file)
+    )))
 }

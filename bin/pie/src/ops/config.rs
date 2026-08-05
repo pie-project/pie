@@ -13,6 +13,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use crate::ui::Answer;
 use clap::Subcommand;
 
 
@@ -34,9 +36,6 @@ pub enum ConfigCmd {
     List {
         /// Show only keys under this prefix, e.g. `sandbox`.
         prefix: Option<String>,
-        /// Emit one JSON document instead of the table.
-        #[arg(long)]
-        json: bool,
     },
 
     /// Print the config, or one value from it by dot-path. Says which file
@@ -89,9 +88,9 @@ pub enum ConfigCmd {
     Tune(tune::TuneArgs),
 }
 
-pub async fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
+pub async fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<Answer> {
     match cmd {
-        ConfigCmd::List { prefix, json } => list(global, prefix, json),
+        ConfigCmd::List { prefix } => list(global, prefix),
         ConfigCmd::Show { key } => show(global, key),
         ConfigCmd::Set { key, value } => set(global, key, value),
         ConfigCmd::Unset { key } => unset(global, key),
@@ -107,7 +106,7 @@ fn config_path(global: &startup::GlobalArgs) -> PathBuf {
     startup::cli_config_path(global).0
 }
 
-fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
+fn init(global: &startup::GlobalArgs, force: bool) -> Result<Answer> {
     let cfg_path = config_path(global);
     if cfg_path.exists() && !force {
         bail!("config file already exists at {cfg_path:?}; pass --force to overwrite");
@@ -118,18 +117,14 @@ fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
     }
     std::fs::write(&cfg_path, default_config_content())
         .map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
-    println!(
-        "{} config written to {}",
-        crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
-        crate::ui::short_path(&cfg_path)
-    );
+    let did = format!("config written to {}", crate::ui::short_path(&cfg_path));
     // Writing a config file does not install anything. This used to fetch the
     // Python-WASM runtime here, and told you to rerun `pie config init
     // --force` if it failed -- overwriting your config to retry a download.
     // No mention of a separate install step: `pie serve` provisions the
     // Python-WASM runtime on the way up, and `pie doctor` says whether it is
     // there.
-    Ok(())
+    Ok(Answer::did(did))
 }
 
 /// `pie config list` -- the schema, not the file.
@@ -137,7 +132,7 @@ fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
 /// `show` prints what you wrote; this prints what pie will use, which is a
 /// different and usually more useful answer. A key you never set still has a
 /// value, and until now the only way to learn it was to read the Rust.
-fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Result<()> {
+fn list(global: &startup::GlobalArgs, prefix: Option<String>) -> Result<Answer> {
     let (cfg_path, origin) = startup::cli_config_path(global);
     let file: toml::Value = match std::fs::read_to_string(&cfg_path) {
         Ok(content) => toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?,
@@ -179,95 +174,117 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
         );
     }
 
-    if json {
-        return crate::ui::emit_json(&serde_json::json!(
-            selected
-                .iter()
-                .map(|field| serde_json::json!({
-                    "key": field.key,
-                    "doc": field.doc,
-                    // Three states a consumer has to tell apart, so they are
-                    // three fields rather than one nullable value: what pie
-                    // will use, whether the file said so, and whether the file
-                    // must.
-                    // The TYPED value, not the string the table shows:
-                    // `null` here means pie derives it, and `required` is what
-                    // separates that from "the file must say".
-                    "value": pie_worker::config_schema::lookup(&file, &field.key)
-                        .cloned()
-                        .or_else(|| field.default.clone()),
-                    "set": is_set(&file, &field.key),
-                    "required": field.required,
-                }))
-                .collect::<Vec<_>>()
-        ));
-    }
+    Ok(Answer::report(ConfigList {
+        config_path: cfg_path,
+        fields: selected
+            .iter()
+            .map(|field| ConfigField {
+                key: field.key.to_string(),
+                doc: field.doc.to_string(),
+                // The TYPED value, not the string the table shows: `null` here
+                // means pie derives it, and `required` is what separates that
+                // from "the file must say".
+                value: pie_worker::config_schema::lookup(&file, &field.key)
+                    .cloned()
+                    .or_else(|| field.default.clone()),
+                set: is_set(&file, &field.key),
+                required: field.required,
+                shown: effective(&file, field),
+            })
+            .collect(),
+    }))
+}
 
-    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
+/// Every key, what it is worth now, and whether the file said so.
+///
+/// `value` and `shown` are the same fact in two renderings and both are
+/// carried, because they are read by different things: a script wants the
+/// typed value, a person wants the string the table prints. Deriving one from
+/// the other at render time is what let the two disagree before.
+#[derive(serde::Serialize)]
+pub struct ConfigList {
+    config_path: PathBuf,
+    fields: Vec<ConfigField>,
+}
 
-    // Column widths from the rows actually being printed, so a filtered
-    // listing is not padded out to the width of the ones it excluded.
-    let leaf = |key: &str| key.rsplit('.').next().unwrap_or(key).to_string();
+/// Three states a consumer has to tell apart, so they are three fields rather
+/// than one nullable value: what pie will use, whether the file said so, and
+/// whether the file must.
+#[derive(serde::Serialize)]
+struct ConfigField {
+    key: String,
+    doc: String,
+    value: Option<toml::Value>,
+    set: bool,
+    required: bool,
+    shown: String,
+}
 
-    // Grouped rather than printed as the walk emits them: the walk descends
-    // into `model.driver` and comes back to `model.weight_cache_dir`, so
-    // following it directly printed `[worker.model]` twice. Sections keep the
-    // order they first appear in, which is declaration order.
-    let mut order: Vec<String> = Vec::new();
-    let mut sections: std::collections::HashMap<String, Vec<&&pie_worker::config_schema::Field>> =
-        std::collections::HashMap::new();
-    for field in &selected {
-        let parent = field
-            .key
-            .rsplit_once('.')
-            .map(|(p, _)| p.to_string())
-            .unwrap_or_default();
-        if !sections.contains_key(&parent) {
-            order.push(parent.clone());
+impl crate::ui::Report for ConfigList {
+    fn render(&self, palette: &crate::ui::Palette) {
+        let leaf = |key: &str| key.rsplit('.').next().unwrap_or(key).to_string();
+
+        // Grouped rather than printed as the walk emits them: the walk descends
+        // into `model.driver` and comes back to `model.weight_cache_dir`, so
+        // following it directly printed `[worker.model]` twice. Sections keep
+        // the order they first appear in, which is declaration order.
+        let mut order: Vec<&str> = Vec::new();
+        let mut sections: std::collections::HashMap<&str, Vec<&ConfigField>> =
+            std::collections::HashMap::new();
+        for field in &self.fields {
+            let parent = field.key.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+            if !sections.contains_key(parent) {
+                order.push(parent);
+            }
+            sections.entry(parent).or_default().push(field);
         }
-        sections.entry(parent).or_default().push(field);
-    }
 
-    for (index, section) in order.iter().enumerate() {
-        // No leading blank line: `pie config list | head -1` should be a
-        // heading, not nothing.
-        if index > 0 {
-            println!();
-        }
-        println!("{}", palette.bold(format!("[{section}]")));
-        let mut table = crate::ui::Table::new(
-            [
-                crate::ui::Align::Left,
-                crate::ui::Align::Left,
-                crate::ui::Align::Left,
-            ],
-            2,
-        );
-        for field in &sections[section.as_str()] {
-            // A marker rather than a colour: this is the column a person scans
-            // for -- what have I actually changed? -- and it has to survive a
-            // pipe.
-            let mark = if is_set(&file, &field.key) {
-                crate::ui::Mark::Chosen
-            } else {
-                crate::ui::Mark::Plain
-            };
-            table.push(crate::ui::Row::new(
-                mark,
+        for (index, section) in order.iter().enumerate() {
+            // No leading blank line: `pie config list | head -1` should be a
+            // heading, not nothing.
+            if index > 0 {
+                println!();
+            }
+            println!("{}", palette.bold(format!("[{section}]")));
+            // Column widths from the rows actually being printed, so a
+            // filtered listing is not padded out to the width of the ones it
+            // excluded.
+            let mut table = crate::ui::Table::new(
                 [
-                    leaf(&field.key),
-                    effective(&file, field),
-                    plain(&field.doc),
+                    crate::ui::Align::Left,
+                    crate::ui::Align::Left,
+                    crate::ui::Align::Left,
                 ],
-            ));
+                2,
+            );
+            for field in &sections[section] {
+                // A marker rather than a colour: this is the column a person
+                // scans for -- what have I actually changed? -- and it has to
+                // survive a pipe.
+                let mark = if field.set {
+                    crate::ui::Mark::Chosen
+                } else {
+                    crate::ui::Mark::Plain
+                };
+                table.push(crate::ui::Row::new(
+                    mark,
+                    [
+                        leaf(&field.key),
+                        field.shown.clone(),
+                        plain(&field.doc),
+                    ],
+                ));
+            }
+            table.print(palette);
         }
-        table.print(&palette);
+        println!(
+            "\n{}",
+            palette.dim(format!(
+                "• set in {}",
+                crate::ui::short_path(&self.config_path)
+            ))
+        );
     }
-    println!(
-        "\n{}",
-        palette.dim(format!("• set in {}", crate::ui::short_path(&cfg_path)))
-    );
-    Ok(())
 }
 
 /// What pie will use for a field, given the file.
@@ -331,7 +348,76 @@ fn plain(doc: &str) -> String {
 }
 
 
-fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
+/// The config file as `show` prints it, or one value out of it.
+///
+/// Both are documents now. `pie config show` was the one screen with no
+/// machine rendering at all, so a script that wanted a value had to parse the
+/// syntax-highlighted output or re-read the file itself.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum ConfigShow {
+    /// The whole file.
+    File {
+        path: PathBuf,
+        origin: String,
+        /// `None` when there is no file and pie is running on defaults.
+        content: Option<String>,
+        /// How the path is written in the frame above the file: relative to
+        /// the cwd when it is under it, absolute otherwise.
+        #[serde(skip)]
+        display: String,
+        #[serde(skip)]
+        redirected: bool,
+    },
+    /// One key, resolved the way the engine would resolve it.
+    Value { key: String, value: toml::Value },
+}
+
+impl crate::ui::Report for ConfigShow {
+    fn render(&self, palette: &crate::ui::Palette) {
+        match self {
+            ConfigShow::Value { value, .. } => println!("{}", display_value(value)),
+            ConfigShow::File {
+                path,
+                origin,
+                content: None,
+                ..
+            } => {
+                println!("no config file at {}", path.display());
+                println!("  looked there because of {origin}");
+                println!(
+                    "  pie is running on built-in defaults; `pie config init` writes them out"
+                );
+            }
+            ConfigShow::File {
+                origin,
+                content: Some(content),
+                display,
+                redirected,
+                ..
+            } => {
+                if !palette.enabled() {
+                    print!("{content}");
+                    return;
+                }
+                // A thin separator line above and below, labelled with the path.
+                println!("{}", palette.dim(format!("── {display} ──")));
+                // Only when something redirected us. On the default path the
+                // origin is the answer to a question nobody asked; on the other
+                // two it is the answer to "why am I not seeing my edits?".
+                if *redirected {
+                    println!("{}", palette.dim(format!("   from {origin}")));
+                }
+                for line in content.lines() {
+                    println!("{}", crate::ui::toml_line(line, palette));
+                }
+                println!("{}", palette.dim("─".repeat(display.chars().count() + 6)));
+            }
+        }
+    }
+}
+
+fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<Answer> {
     let (cfg_path, origin) = startup::cli_config_path(global);
     if !cfg_path.exists() {
         // Absence means opposite things depending on how we got here, and
@@ -345,10 +431,13 @@ fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
         // file as fatal, so saying "running on defaults" would be the untrue
         // one.
         if origin == startup::Origin::Default {
-            println!("no config file at {}", cfg_path.display());
-            println!("  looked there because of {}", origin.describe());
-            println!("  pie is running on built-in defaults; `pie config init` writes them out");
-            return Ok(());
+            return Ok(Answer::report(ConfigShow::File {
+                path: cfg_path,
+                origin: origin.describe().to_string(),
+                content: None,
+                display: String::new(),
+                redirected: false,
+            }));
         }
         bail!(
             "no config file at {} ({}); pie will not start without it",
@@ -363,20 +452,22 @@ fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
         let root: toml::Value =
             toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
         if let Some(found) = get_nested(&root, &key) {
-            println!("{}", display_value(found));
-            return Ok(());
+            let value = found.clone();
+            return Ok(Answer::report(ConfigShow::Value { key, value }));
         }
         // Not in the file is not the same as having no value. `show` used to
         // stop here and say "pie derives it" for every key the file omitted --
         // which is most of them, and which disagreed with `pie config list`
         // three lines down the terminal. It answers with what pie will USE.
         let field = schema_field(&root, &key)?;
-        match (&field.default, field.required) {
-            (Some(default), _) => println!("{}", display_value(default)),
+        return match (&field.default, field.required) {
+            (Some(default), _) => Ok(Answer::report(ConfigShow::Value {
+                key,
+                value: default.clone(),
+            })),
             (None, true) => bail!("{key} has no value: the config must set it"),
             (None, false) => bail!("{key} is not set; pie derives it at startup"),
-        }
-        return Ok(());
+        };
     }
     let cwd = std::env::current_dir().ok();
     let display = cwd
@@ -384,33 +475,19 @@ fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
         .and_then(|c| cfg_path.strip_prefix(c).ok())
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| cfg_path.display().to_string());
-    // `Palette`, not `is_terminal()`. Asking the file descriptor directly is
-    // what made this screen ignore `NO_COLOR` and `TERM=dumb`: both are the
-    // user saying so, and a TTY check is only a guess about what they want.
-    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
-    if !palette.enabled() {
-        print!("{content}");
-        return Ok(());
-    }
-    // A thin separator line above and below, labelled with the path.
-    println!("{}", palette.dim(format!("── {display} ──")));
-    // Only when something redirected us. On the default path the origin is
-    // the answer to a question nobody asked; on the other two it is the
-    // answer to "why am I not seeing my edits?".
-    if origin != startup::Origin::Default {
-        println!("{}", palette.dim(format!("   from {}", origin.describe())));
-    }
-    for line in content.lines() {
-        println!("{}", crate::ui::toml_line(line, &palette));
-    }
-    println!(
-        "{}",
-        palette.dim("─".repeat(display.chars().count() + 6))
-    );
-    Ok(())
+    // Whether to colour is `Palette`'s question and it is asked at render time.
+    // This function used to ask `is_terminal()` here and hand-roll the escapes,
+    // which is how the screen came to ignore `NO_COLOR` and `TERM=dumb`.
+    Ok(Answer::report(ConfigShow::File {
+        path: cfg_path,
+        origin: origin.describe().to_string(),
+        content: Some(content),
+        display,
+        redirected: origin != startup::Origin::Default,
+    }))
 }
 
-fn set(global: &startup::GlobalArgs, key: String, value: String) -> Result<()> {
+fn set(global: &startup::GlobalArgs, key: String, value: String) -> Result<Answer> {
     let cfg_path = config_path(global);
     if !cfg_path.exists() {
         bail!("config file not found at {cfg_path:?} (run `pie config init`)");
@@ -422,15 +499,12 @@ fn set(global: &startup::GlobalArgs, key: String, value: String) -> Result<()> {
     std::fs::write(&cfg_path, serialized).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
     // Report the key that was actually written, which a renamed one is not.
     let written = normalize_key(&key);
-    if written == key {
-        println!("✓ Set {key} = {}", display_value(&chosen));
+    let value = display_value(&chosen);
+    Ok(Answer::did(if written == key {
+        format!("set {key} = {value}")
     } else {
-        println!(
-            "✓ Set {written} = {} ({key} was renamed)",
-            display_value(&chosen)
-        );
-    }
-    Ok(())
+        format!("set {written} = {value} ({key} was renamed)")
+    }))
 }
 
 /// Choose the TOML type for `value` by asking the schema, not by looking at
@@ -547,7 +621,7 @@ fn candidates(value: &str) -> Vec<toml::Value> {
 /// express gets set, and the way that goes wrong is a typo discovered at the
 /// next boot rather than at the moment of saving. The edit happens on a copy;
 /// the original is only replaced once the copy parses.
-fn edit(global: &startup::GlobalArgs) -> Result<()> {
+fn edit(global: &startup::GlobalArgs) -> Result<Answer> {
     let (cfg_path, _) = startup::cli_config_path(global);
     if !cfg_path.exists() {
         bail!(
@@ -602,15 +676,13 @@ fn edit(global: &startup::GlobalArgs) -> Result<()> {
         });
     }
     std::fs::rename(&scratch, &cfg_path).map_err(|e| anyhow!("replace {cfg_path:?}: {e}"))?;
-    println!(
-        "{} saved {}",
-        crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
+    Ok(Answer::did(format!(
+        "saved {}",
         crate::ui::short_path(&cfg_path)
-    );
-    Ok(())
+    )))
 }
 
-fn unset(global: &startup::GlobalArgs, key: String) -> Result<()> {
+fn unset(global: &startup::GlobalArgs, key: String) -> Result<Answer> {
     let cfg_path = config_path(global);
     if !cfg_path.exists() {
         bail!("config file not found at {cfg_path:?} (run `pie config init`)");
@@ -624,16 +696,14 @@ fn unset(global: &startup::GlobalArgs, key: String) -> Result<()> {
     // unset" for `serrver.port` tells the operator their edit took effect.
     schema_field(&root, &key)?;
     if !remove_nested(&mut root, &key)? {
-        println!("{key} is already unset");
-        return Ok(());
+        return Ok(Answer::did(format!("{key} was already unset")));
     }
     let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
     // A removal can be invalid too -- a required key has no derived form.
     crate::derive::derive_standalone(&serialized)
         .with_context(|| format!("unsetting {key}"))?;
     std::fs::write(&cfg_path, serialized).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
-    println!("✓ Unset {key}");
-    Ok(())
+    Ok(Answer::did(format!("unset {key}")))
 }
 
 /// Read a dot-path out of the tree.

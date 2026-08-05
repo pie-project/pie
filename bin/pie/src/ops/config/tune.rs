@@ -23,7 +23,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use super::typed_by_schema;
 use crate::sweep::{self, Knobs};
-use crate::ui::{Align, Mark, Palette, Row, Stream, Table};
+use crate::ui::{Align, Mark, Palette, Row, Table};
 
 
 /// The serving shape being optimised for.
@@ -236,107 +236,187 @@ pub fn winner<'a>(
         })
 }
 
-/// Print what was measured, whether anything won, and what was not looked at.
-pub fn report(
+/// What the sweep measured, whether anything won, and what was not looked at.
+///
+/// Every number the ranking used is carried, including the spreads: at the
+/// serving level the noise floor measured ~6% on an L40S while the gap between
+/// two candidates was ~2.4%, so a report of the ranking without the spread is a
+/// report of noise. A script reading this needs the same thing the table shows.
+#[derive(serde::Serialize)]
+pub struct TuneReport {
+    /// What the candidates were ranked by, as `Metric::label` words it.
+    ranked_by: &'static str,
+    ranked_by_throughput: bool,
+    candidates: Vec<Candidate>,
+    /// Set only when something beat the current config by more than the
+    /// measurement noise.
+    winner: Option<KnobSet>,
+    gain_percent: Option<f64>,
+    /// Whether the winner was applied. `--write` applies; reporting is default.
+    wrote: bool,
+    /// Candidates `--budget` cut. Never silently: the report ranks only what
+    /// ran, and says how much did not.
+    not_measured: usize,
+}
+
+#[derive(serde::Serialize, Clone, Copy, PartialEq)]
+struct KnobSet {
+    frame_size: usize,
+    submit_depth: usize,
+    dispatch_depth: usize,
+}
+
+impl From<Knobs> for KnobSet {
+    fn from(k: Knobs) -> Self {
+        Self {
+            frame_size: k.frame_size,
+            submit_depth: k.submit_depth,
+            dispatch_depth: k.dispatch_depth,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct Candidate {
+    #[serde(flatten)]
+    knobs: KnobSet,
+    throughput_tok_s: f64,
+    lane_p95_ms: f64,
+    /// Spread of the RANKED quantity, as a fraction of its median.
+    rel_sigma: f64,
+    /// The knobs the config currently asks for.
+    current: bool,
+    winner: bool,
+}
+
+/// Bundle what was measured into the report `present` will render.
+pub fn build_report(
     rounds: &[sweep::Round],
     baseline: &Knobs,
     best: Option<&sweep::Round>,
     metric: sweep::Metric,
     skipped: usize,
     wrote: bool,
-) {
-    let palette = Palette::for_stream(Stream::Stdout);
+) -> TuneReport {
     let base = rounds.iter().find(|r| r.knobs == *baseline);
-
-    println!("Measured {} candidate(s), ranked by {}:", rounds.len(), metric.label());
-    let mut table = Table::new(
-        [
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Left,
-        ],
-        5,
-    );
-    for round in rounds {
-        let mark = if Some(round.knobs) == best.map(|b| b.knobs) {
-            Mark::Chosen
-        } else {
-            Mark::Plain
-        };
-        table.push(Row::new(
-            mark,
-            [
-                format!("k={}", round.knobs.frame_size),
-                format!("submit={}", round.knobs.submit_depth),
-                format!("dispatch={}", round.knobs.dispatch_depth),
-                // The RANKED quantity, with the spread that decided the
-                // ranking. Printing the throughput spread beside a p95 ordering
-                // was the same mismatch this command had between `--for` and
-                // its metric.
-                match metric {
-                    sweep::Metric::Throughput => format!("{:.0} tok/s", round.throughput_tok_s),
-                    sweep::Metric::LaneP95 => {
-                        format!("p95 {:.0} ms", round.lane_p95_us as f64 / 1_000.0)
-                    }
-                },
-                format!("+/-{:.1}%", metric.sigma(round) * 100.0),
-                {
-                    let other = match metric {
-                        sweep::Metric::Throughput => {
-                            format!("p95 {:.0} ms", round.lane_p95_us as f64 / 1_000.0)
-                        }
-                        sweep::Metric::LaneP95 => format!("{:.0} tok/s", round.throughput_tok_s),
-                    };
-                    if round.knobs == *baseline {
-                        format!("{other}  (current)")
-                    } else {
-                        other
-                    }
-                },
-            ],
-        ));
-    }
-    table.print(&palette);
-    println!();
-
-    match (best, base) {
+    let gain = match (best, base) {
         (Some(best), Some(base)) => {
             let (mine, theirs) = (metric.value(best), metric.value(base));
-            let gain = if metric.higher_is_better() {
+            Some(if metric.higher_is_better() {
                 (mine - theirs) / theirs * 100.0
             } else {
                 (theirs - mine) / theirs * 100.0
-            };
-            println!(
-                "  {} beats the current config by {gain:.1}% on {} ({:.0} -> {:.0}).",
-                best.knobs,
-                metric.label(),
-                theirs,
-                mine
-            );
-            if wrote {
-                println!("  Written to the config.");
-            } else {
-                println!("  Run again with --write to apply it.");
-            }
+            })
         }
-        _ => println!(
-            "  Nothing measured better than the current config on {} by more than \
-             the measurement noise. Nothing to change.",
-            metric.label()
-        ),
+        _ => None,
+    };
+    TuneReport {
+        ranked_by: metric.label(),
+        ranked_by_throughput: matches!(metric, sweep::Metric::Throughput),
+        candidates: rounds
+            .iter()
+            .map(|round| Candidate {
+                knobs: round.knobs.into(),
+                throughput_tok_s: round.throughput_tok_s,
+                lane_p95_ms: round.lane_p95_us as f64 / 1_000.0,
+                rel_sigma: metric.sigma(round),
+                current: round.knobs == *baseline,
+                winner: Some(round.knobs) == best.map(|b| b.knobs),
+            })
+            .collect(),
+        winner: best.map(|b| b.knobs.into()),
+        gain_percent: gain,
+        wrote,
+        not_measured: skipped,
     }
+}
 
-    if skipped > 0 {
+impl crate::ui::Report for TuneReport {
+    fn render(&self, palette: &Palette) {
+        println!(
+            "Measured {} candidate(s), ranked by {}:",
+            self.candidates.len(),
+            self.ranked_by
+        );
+        let mut table = Table::new(
+            [
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Left,
+            ],
+            5,
+        );
+        for candidate in &self.candidates {
+            // The RANKED quantity, with the spread that decided the ranking.
+            // Printing the throughput spread beside a p95 ordering was the same
+            // mismatch this command had between `--for` and its metric.
+            let (ranked, other) = if self.ranked_by_throughput {
+                (
+                    format!("{:.0} tok/s", candidate.throughput_tok_s),
+                    format!("p95 {:.0} ms", candidate.lane_p95_ms),
+                )
+            } else {
+                (
+                    format!("p95 {:.0} ms", candidate.lane_p95_ms),
+                    format!("{:.0} tok/s", candidate.throughput_tok_s),
+                )
+            };
+            table.push(Row::new(
+                if candidate.winner {
+                    Mark::Chosen
+                } else {
+                    Mark::Plain
+                },
+                [
+                    format!("k={}", candidate.knobs.frame_size),
+                    format!("submit={}", candidate.knobs.submit_depth),
+                    format!("dispatch={}", candidate.knobs.dispatch_depth),
+                    ranked,
+                    format!("+/-{:.1}%", candidate.rel_sigma * 100.0),
+                    if candidate.current {
+                        format!("{other}  (current)")
+                    } else {
+                        other
+                    },
+                ],
+            ));
+        }
+        table.print(palette);
         println!();
-        println!("  {skipped} candidate(s) not measured (--budget). The report ranks only what ran.");
+
+        match (self.winner, self.gain_percent) {
+            (Some(winner), Some(gain)) => {
+                println!(
+                    "  k={} submit={} dispatch={} beats the current config by {gain:.1}% on {}.",
+                    winner.frame_size, winner.submit_depth, winner.dispatch_depth, self.ranked_by
+                );
+                if self.wrote {
+                    println!("  Written to the config.");
+                } else {
+                    println!("  Run again with --write to apply it.");
+                }
+            }
+            _ => println!(
+                "  Nothing measured better than the current config on {} by more than \
+                 the measurement noise. Nothing to change.",
+                self.ranked_by
+            ),
+        }
+
+        if self.not_measured > 0 {
+            println!();
+            println!(
+                "  {} candidate(s) not measured (--budget). The report ranks only what ran.",
+                self.not_measured
+            );
+        }
+        println!();
+        println!("  Not searched: kv_page_size, max_forward_tokens and max_forward_requests are");
+        println!("  fixed at boot, and belong to stage 1 above rather than to this sweep.");
     }
-    println!();
-    println!("  Not searched: kv_page_size, max_forward_tokens and max_forward_requests are");
-    println!("  fixed at boot, and belong to stage 1 above rather than to this sweep.");
 }
 
 /// One lane's input. A bare integer makes the `generate` family decode that
@@ -417,7 +497,7 @@ async fn calibrate_planner(content: &str) -> Result<()> {
 
 /// Calibrate the planner, then sweep the frame knobs inside the arena that
 /// produced.
-pub async fn run(global: &startup::GlobalArgs, args: TuneArgs) -> Result<()> {
+pub async fn run(global: &startup::GlobalArgs, args: TuneArgs) -> Result<crate::ui::Answer> {
     let (cfg_path, origin) = startup::cli_config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
         format!(
@@ -558,8 +638,9 @@ pub async fn run(global: &startup::GlobalArgs, args: TuneArgs) -> Result<()> {
         wrote = true;
     }
 
-    report(&rounds, &baseline, best, metric, skipped, wrote);
-    Ok(())
+    Ok(crate::ui::Answer::report(build_report(
+        &rounds, &baseline, best, metric, skipped, wrote,
+    )))
 }
 
 #[cfg(test)]

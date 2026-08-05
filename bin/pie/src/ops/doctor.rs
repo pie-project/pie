@@ -20,21 +20,107 @@ use std::process::Command;
 
 use anyhow::Result;
 
-use crate::ui::{Mark, Palette, Stream};
+use crate::ui::{Mark, Palette};
 
-/// `pie doctor` entry point. Returns whether pie can boot.
-pub fn doctor(global: &startup::GlobalArgs, json: bool) -> Result<bool> {
+/// Everything `doctor` checked, and the verdict that follows from it.
+///
+/// Collected first and rendered second, so the table and the JSON cannot drift
+/// into disagreeing about `ready` -- which is the one thing a readiness probe
+/// reads. That discipline used to be this command's alone, held by a comment;
+/// it is [`crate::ui::Report`] now and every command has it.
+#[derive(serde::Serialize)]
+pub struct DoctorReport {
+    ready: bool,
+    passed: usize,
+    warnings: usize,
+    blocking: usize,
+    sections: Vec<Section>,
+}
+
+#[derive(serde::Serialize)]
+struct Section {
+    section: &'static str,
+    checks: Vec<Check>,
+}
+
+#[derive(serde::Serialize)]
+struct Check {
+    check: String,
+    detail: String,
+    status: &'static str,
+}
+
+impl Status {
+    fn word(self) -> &'static str {
+        match self {
+            Status::Pass => "pass",
+            Status::Warn => "warn",
+            Status::Fail => "blocking",
+        }
+    }
+
+    /// The glyph a status carries. Keyed off [`Status::word`] rather than the
+    /// enum, because the word is what crossed into the report and is the
+    /// serialized contract a script reads.
+    fn mark(word: &str) -> Mark {
+        match word {
+            "pass" => Mark::Did,
+            "warn" => Mark::Warn,
+            _ => Mark::Blocked,
+        }
+    }
+}
+
+impl crate::ui::Report for DoctorReport {
+    fn render(&self, palette: &Palette) {
+        println!("Pie standalone — environment doctor");
+        for section in &self.sections {
+            println!("\n{}", palette.bold(format!("[{}]", section.section)));
+            let mut table =
+                crate::ui::Table::new([crate::ui::Align::Left, crate::ui::Align::Left], 1);
+            for check in &section.checks {
+                table.push(crate::ui::Row::new(
+                    Status::mark(check.status),
+                    [check.check.clone(), check.detail.clone()],
+                ));
+            }
+            table.print(palette);
+        }
+
+        println!();
+        let plural = if self.warnings == 1 { "" } else { "s" };
+        // The same three glyphs the tables use, from the same vocabulary. These
+        // three lines spelled them out as literals, which is how `✓` came to
+        // mean one thing here and another in `pie model list`.
+        let (mark, line) = if !self.ready {
+            (
+                Mark::Blocked,
+                format!(
+                    "pie cannot boot here ({} blocking, {} warning{plural}).",
+                    self.blocking, self.warnings
+                ),
+            )
+        } else if self.warnings > 0 {
+            (
+                Mark::Warn,
+                format!(
+                    "Ready, with warnings ({} passed, {} warning{plural}).",
+                    self.passed, self.warnings
+                ),
+            )
+        } else {
+            (Mark::Did, format!("Ready ({} checks).", self.passed))
+        };
+        println!("{} {line}", mark.render(palette));
+    }
+}
+
+/// `pie doctor` entry point. Exits non-zero when pie cannot boot here.
+pub fn run(global: &startup::GlobalArgs) -> Result<crate::ui::Answer> {
     let mut warnings = 0usize;
     let mut passes = 0usize;
     let mut failures = 0usize;
 
-    if !json {
-        println!("Pie standalone — environment doctor\n");
-    }
-
-    // Sections collected first, rendered second, so the table and the JSON
-    // cannot drift into disagreeing about the verdict -- which is the one
-    // thing a readiness probe reads.
     let mut sections: Vec<(&'static str, Vec<(String, String, Status)>)> = Vec::new();
 
     sections.push(("system", vec![check_platform(), check_py_runtime()]));
@@ -86,64 +172,35 @@ pub fn doctor(global: &startup::GlobalArgs, json: bool) -> Result<bool> {
     }
     let ready = failures == 0;
 
-    if json {
-        return crate::ui::emit_json(&serde_json::json!({
-            "ready": ready,
-            "passed": passes,
-            "warnings": warnings,
-            "blocking": failures,
-            "sections": sections
-                .iter()
-                .map(|(name, checks)| serde_json::json!({
-                    "section": name,
-                    "checks": checks
-                        .iter()
-                        .map(|(key, value, status)| serde_json::json!({
-                            "check": key,
-                            "detail": value,
-                            "status": match status {
-                                Status::Pass => "pass",
-                                Status::Warn => "warn",
-                                Status::Fail => "blocking",
-                            },
-                        }))
-                        .collect::<Vec<_>>(),
-                }))
-                .collect::<Vec<_>>(),
-        }))
-        .map(|()| ready);
-    }
+    let report = DoctorReport {
+        ready,
+        passed: passes,
+        warnings,
+        blocking: failures,
+        sections: sections
+            .into_iter()
+            .map(|(section, checks)| Section {
+                section,
+                checks: checks
+                    .into_iter()
+                    .map(|(check, detail, status)| Check {
+                        check,
+                        detail,
+                        status: status.word(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
 
-    let palette = Palette::for_stream(Stream::Stdout);
-    for (name, checks) in &sections {
-        println!("\n{}", palette.bold(format!("[{name}]")));
-        let mut table = crate::ui::Table::new(
-            [crate::ui::Align::Left, crate::ui::Align::Left],
-            1,
-        );
-        for (key, value, status) in checks {
-            table.push(crate::ui::Row::new(
-                match status {
-                    Status::Pass => Mark::Did,
-                    Status::Warn => Mark::Warn,
-                    Status::Fail => Mark::Blocked,
-                },
-                [key.clone(), value.clone()],
-            ));
-        }
-        table.print(&palette);
-    }
-
-    println!();
-    let plural = if warnings == 1 { "" } else { "s" };
-    if !ready {
-        println!("✗ pie cannot boot here ({failures} blocking, {warnings} warning{plural}).");
-    } else if warnings > 0 {
-        println!("! Ready, with warnings ({passes} passed, {warnings} warning{plural}).");
+    // The exit code IS the answer -- `pie doctor && pie serve` should be a
+    // thing an operator can write.
+    let answer = crate::ui::Answer::report(report);
+    Ok(if ready {
+        answer
     } else {
-        println!("✓ Ready ({passes} checks).");
-    }
-    Ok(ready)
+        answer.with_code(std::process::ExitCode::FAILURE)
+    })
 }
 
 /// Parse the config and say whether this binary could serve it.

@@ -623,6 +623,131 @@ pub fn emit_json(value: &serde_json::Value) -> anyhow::Result<()> {
 }
 
 // -----------------------------------------------------------------------------
+// What a command answers with
+// -----------------------------------------------------------------------------
+
+/// A command's answer, in a form that reads to a person and parses to `jq`.
+///
+/// The two renderings come off **one** value. They were built separately: each
+/// `--json` branch assembled its own `json!({...})` and returned early, and the
+/// table below it was written from the same data by different code. Nothing
+/// stopped the two from drifting, and `doctor` -- the one command whose whole
+/// job is to be believed -- carries a comment saying it collects its sections
+/// before rendering precisely so "the table and the JSON cannot drift into
+/// disagreeing about the verdict". That was one command holding a rule the
+/// other seven did not know about.
+///
+/// `Serialize` gives the machine rendering; [`Report::render`] gives the human
+/// one. There is no way to implement one and forget the other.
+pub trait Report: serde::Serialize {
+    /// Draw to stdout. Never called when `--json` is on.
+    fn render(&self, p: &Palette);
+}
+
+/// The object-safe half of [`Report`], so [`Output`] can carry any of them.
+///
+/// `Serialize` is not object-safe, so the erasure happens here: the blanket
+/// impl is the only implementor and it forwards to the real thing.
+pub trait AnyReport {
+    fn render_any(&self, p: &Palette);
+    fn to_json(&self) -> anyhow::Result<serde_json::Value>;
+}
+
+impl<T: Report> AnyReport for T {
+    fn render_any(&self, p: &Palette) {
+        self.render(p)
+    }
+    fn to_json(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+}
+
+/// What an op hands back instead of printing: an answer, and the status the
+/// process exits with.
+///
+/// Three shapes of answer, because commands come in three kinds and pretending
+/// otherwise is what put `--json` on five subcommands out of twenty and left
+/// the rest unscriptable. A command either answers a question ([`Answer::report`]),
+/// changes something ([`Answer::did`]), or has already said everything it had
+/// to say while it worked ([`Answer::quiet`] -- `pie run`, whose output is the
+/// inferlet's).
+///
+/// The exit status rides along because for two commands it *is* the answer:
+/// `pie doctor && pie serve` has to work, and `pie run` reports the inferlet's
+/// status rather than its own. Everything else exits zero, and no longer has to
+/// write `Ok(ExitCode::SUCCESS)` to say so.
+pub struct Answer {
+    kind: Kind,
+    code: std::process::ExitCode,
+}
+
+enum Kind {
+    Quiet,
+    Did(String),
+    // `Send`, because the ops that block run on `spawn_blocking` and the answer
+    // crosses back over that boundary. A report is plain data, so saying so
+    // costs nothing.
+    Report(Box<dyn AnyReport + Send>),
+}
+
+impl Answer {
+    /// Nothing to print; the effect was the point, or it was already streamed.
+    pub fn quiet() -> Self {
+        Self::of(Kind::Quiet)
+    }
+
+    /// One result line: what the command did.
+    pub fn did(text: impl Into<String>) -> Self {
+        Self::of(Kind::Did(text.into()))
+    }
+
+    /// A document.
+    pub fn report(report: impl Report + Send + 'static) -> Self {
+        Self::of(Kind::Report(Box::new(report)))
+    }
+
+    fn of(kind: Kind) -> Self {
+        Self {
+            kind,
+            code: std::process::ExitCode::SUCCESS,
+        }
+    }
+
+    /// The same answer, exiting non-zero. For a verdict, not for an error --
+    /// an error is an `Err` and is rendered by `main`'s reporter.
+    pub fn with_code(mut self, code: std::process::ExitCode) -> Self {
+        self.code = code;
+        self
+    }
+
+    pub fn code(&self) -> std::process::ExitCode {
+        self.code
+    }
+}
+
+/// Show a command's answer, in whichever of the two renderings was asked for.
+///
+/// The single place that decides. An action under `--json` reports what it did
+/// rather than nothing, so a script driving `pie model remove --json` gets a
+/// document like every other command instead of an empty stdout.
+pub fn present(answer: Answer, json: bool) -> anyhow::Result<()> {
+    let palette = Palette::for_stream(Stream::Stdout);
+    match answer.kind {
+        Kind::Quiet => Ok(()),
+        Kind::Did(line) if json => emit_json(&serde_json::json!({ "did": line })),
+        Kind::Did(line) => {
+            println!("{} {line}", Mark::Did.render(&palette));
+            Ok(())
+        }
+        Kind::Report(report) if json => emit_json(&report.to_json()?),
+        Kind::Report(report) => {
+            report.render_any(&palette);
+            Ok(())
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Terminal
 // -----------------------------------------------------------------------------
 

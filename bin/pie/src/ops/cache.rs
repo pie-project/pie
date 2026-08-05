@@ -8,16 +8,12 @@ use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use pie_worker::state::{self, Reclaim};
 
-use crate::ui::{self, Align, Mark, Palette, Row, Stream, Table};
+use crate::ui::{self, Align, Answer, Mark, Palette, Row, Table};
 
 #[derive(Subcommand, Debug)]
 pub enum CacheCmd {
     /// Show what pie has written, where, and how much of it there is.
-    List {
-        /// Emit one JSON document instead of the table.
-        #[arg(long)]
-        json: bool,
-    },
+    List,
 
     /// Delete what pie can rebuild. With no names, everything safe to lose.
     Clear {
@@ -30,14 +26,86 @@ pub enum CacheCmd {
     },
 }
 
-pub fn run(cmd: CacheCmd) -> Result<()> {
+pub fn run(cmd: CacheCmd) -> Result<Answer> {
     match cmd {
-        CacheCmd::List { json } => list(json),
+        CacheCmd::List => list(),
         CacheCmd::Clear { names, yes } => clear(names, yes),
     }
 }
 
-fn list(json: bool) -> Result<()> {
+/// What pie has written, and how much of it a `clear` would take back.
+#[derive(serde::Serialize)]
+pub struct CacheReport {
+    home: std::path::PathBuf,
+    entries: Vec<CacheRow>,
+    reclaimable_bytes: u64,
+    on_request_bytes: u64,
+}
+
+#[derive(serde::Serialize)]
+struct CacheRow {
+    name: &'static str,
+    path: std::path::PathBuf,
+    what: &'static str,
+    /// The word the CLI uses, not the enum's Rust spelling: a consumer should
+    /// be able to pass it back to `clear`.
+    reclaim: &'static str,
+    exists: bool,
+    bytes: u64,
+}
+
+impl ui::Report for CacheReport {
+    fn render(&self, palette: &Palette) {
+        println!(
+            "{} {}",
+            palette.dim("pie writes under"),
+            palette.bold(ui::short_path(&self.home))
+        );
+        let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
+        for row in &self.entries {
+            // An absent entry is reported rather than hidden: "pie has not
+            // written this yet" and "pie does not know about this" are
+            // different answers, and only the listing can tell them apart.
+            let mark = if row.exists { Mark::Plain } else { Mark::Absent };
+            table.push(Row::new(
+                mark,
+                [
+                    row.name.to_string(),
+                    if row.exists {
+                        ui::bytes(row.bytes)
+                    } else {
+                        String::new()
+                    },
+                    // The name already says which directory this is -- five of
+                    // the nine rows repeated the same word -- so the note
+                    // column carries what deleting it costs instead.
+                    match row.reclaim {
+                        "safe" => "",
+                        "on-request" => "kept unless asked",
+                        _ => "never reclaimed",
+                    }
+                    .to_string(),
+                ],
+            ));
+        }
+        table.print(palette);
+
+        println!();
+        if self.reclaimable_bytes == 0 && self.on_request_bytes == 0 {
+            // "0B reclaimable, 0B more if asked" reads as a failure to find
+            // something rather than as there being nothing to reclaim.
+            println!("  nothing to reclaim");
+        } else {
+            println!(
+                "  {} reclaimable, {} more if asked",
+                ui::bytes(self.reclaimable_bytes),
+                ui::bytes(self.on_request_bytes)
+            );
+        }
+    }
+}
+
+fn list() -> Result<Answer> {
     let entries = state::entries(Some(hf_hub::resolve_cache_dir()));
     let home = pie_worker::paths::pie_home();
 
@@ -69,75 +137,26 @@ fn list(json: bool) -> Result<()> {
         .map(|(_, _, size)| *size)
         .sum();
 
-    if json {
-        return ui::emit_json(&serde_json::json!({
-            "home": home,
-            "entries": measured
-                .iter()
-                .map(|(entry, exists, size)| serde_json::json!({
-                    "name": entry.name,
-                    "path": entry.path,
-                    "what": entry.what,
-                    // The word the CLI uses, not the enum's Rust spelling: a
-                    // consumer should be able to pass it back to `clear`.
-                    "reclaim": match entry.reclaim {
-                        Reclaim::Safe => "safe",
-                        Reclaim::OnRequest => "on-request",
-                        Reclaim::Never => "never",
-                    },
-                    "exists": exists,
-                    "bytes": size,
-                }))
-                .collect::<Vec<_>>(),
-            "reclaimable_bytes": reclaimable,
-            "on_request_bytes": on_request,
-        }));
-    }
-
-    let palette = Palette::for_stream(Stream::Stdout);
-    println!(
-        "{} {}",
-        palette.dim("pie writes under"),
-        palette.bold(ui::short_path(&home))
-    );
-    let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
-    for (entry, exists, size) in &measured {
-        // An absent entry is reported rather than hidden: "pie has not written
-        // this yet" and "pie does not know about this" are different answers,
-        // and only the listing can tell them apart.
-        let mark = if *exists { Mark::Plain } else { Mark::Absent };
-        let note = match entry.reclaim {
-            Reclaim::Safe => "",
-            Reclaim::OnRequest => "kept unless asked",
-            Reclaim::Never => "never reclaimed",
-        };
-        table.push(Row::new(
-            mark,
-            [
-                entry.name.to_string(),
-                if *exists { ui::bytes(*size) } else { String::new() },
-                // The name already says which directory this is -- five of the
-                // nine rows repeated the same word -- so the note column
-                // carries what deleting it costs instead.
-                note.to_string(),
-            ],
-        ));
-    }
-    table.print(&palette);
-
-    println!();
-    if reclaimable == 0 && on_request == 0 {
-        // "0B reclaimable, 0B more if asked" reads as a failure to find
-        // something rather than as there being nothing to reclaim.
-        println!("  nothing to reclaim");
-    } else {
-        println!(
-            "  {} reclaimable, {} more if asked",
-            ui::bytes(reclaimable),
-            ui::bytes(on_request)
-        );
-    }
-    Ok(())
+    Ok(Answer::report(CacheReport {
+        home,
+        entries: measured
+            .into_iter()
+            .map(|(entry, exists, bytes)| CacheRow {
+                name: entry.name,
+                path: entry.path,
+                what: entry.what,
+                reclaim: match entry.reclaim {
+                    Reclaim::Safe => "safe",
+                    Reclaim::OnRequest => "on-request",
+                    Reclaim::Never => "never",
+                },
+                exists,
+                bytes,
+            })
+            .collect(),
+        reclaimable_bytes: reclaimable,
+        on_request_bytes: on_request,
+    }))
 }
 
 /// Resolve the entries a `clear` should act on.
@@ -175,7 +194,7 @@ fn selected(names: &[String]) -> Result<Vec<state::Entry>> {
     Ok(chosen)
 }
 
-fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
+fn clear(names: Vec<String>, skip_confirm: bool) -> Result<Answer> {
     let chosen = selected(&names)?;
     let present: Vec<(state::Entry, u64)> = chosen
         .into_iter()
@@ -187,8 +206,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
         .collect();
 
     if present.is_empty() {
-        println!("(nothing to clear)");
-        return Ok(());
+        return Ok(Answer::did("nothing to clear"));
     }
 
     let total: u64 = present.iter().map(|(_, size)| *size).sum();
@@ -204,8 +222,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
             present.len()
         );
         if !ui::confirm(&question, "pie cache clear --yes")? {
-            println!("(aborted)");
-            return Ok(());
+            return Ok(Answer::did("aborted; nothing was deleted"));
         }
     }
 
@@ -222,8 +239,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
             Err(error) => eprintln!("  ! {}: {error}", entry.path.display()),
         }
     }
-    println!("freed {}", ui::bytes(freed));
-    Ok(())
+    Ok(Answer::did(format!("freed {}", ui::bytes(freed))))
 }
 
 #[cfg(test)]

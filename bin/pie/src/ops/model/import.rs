@@ -127,7 +127,7 @@ pub struct ImportArgs {
     pub delete_source: bool,
 }
 
-pub fn run(args: ImportArgs) -> Result<()> {
+pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     let source = resolve_source(&args.source)?;
     let metadata = parse_checkpoint_metadata(&source.path)
         .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?;
@@ -145,14 +145,13 @@ pub fn run(args: ImportArgs) -> Result<()> {
         .all(|file| file.format == CheckpointFormat::Zt)
         && !args.force
     {
-        println!(
-            "{}: already pie's own format; nothing to convert",
-            source.name
-        );
         if args.delete_source {
             println!("  (--delete-source has nothing to do: the source is the artifact)");
         }
-        return Ok(());
+        return Ok(crate::ui::Answer::did(format!(
+            "{} is already pie's own format; nothing to convert",
+            source.name
+        )));
     }
 
     // Up to date means: written by this pie, from this source.
@@ -164,17 +163,21 @@ pub fn run(args: ImportArgs) -> Result<()> {
                 out_file.display()
             );
         } else {
-            println!("{}: up to date at {}", source.name, out_file.display());
             // An artifact already standing in for the source is exactly the
             // situation the flag describes, so honor it here too.
             if args.delete_source {
                 if args.dry_run {
                     report_would_delete(&metadata);
-                    return Ok(());
+                    return Ok(crate::ui::Answer::quiet());
                 }
-                return delete_source(&source.name, &metadata, &out_file);
+                delete_source(&source.name, &metadata, &out_file)?;
+                return Ok(crate::ui::Answer::quiet());
             }
-            return Ok(());
+            return Ok(crate::ui::Answer::did(format!(
+                "{} is up to date at {}",
+                source.name,
+                crate::ui::short_path(&out_file)
+            )));
         }
     }
 
@@ -212,18 +215,20 @@ pub fn run(args: ImportArgs) -> Result<()> {
 
     if let Some(max) = args.max_shard_size {
         println!(
-            "convert: sharding at about {} MB per file; the root is {}",
-            max / (1 << 20),
+            "import: sharding at about {} per file; the root is {}",
+            crate::ui::bytes(max),
             out_file.display()
         );
     }
 
     if args.dry_run {
-        println!("dry run: would write {}", out_file.display());
         if args.delete_source {
             report_would_delete(&metadata);
         }
-        return Ok(());
+        return Ok(crate::ui::Answer::did(format!(
+            "dry run: would write {}",
+            crate::ui::short_path(&out_file)
+        )));
     }
 
     // The passthrough set, resolved to source addresses up front — the copy
@@ -321,17 +326,20 @@ pub fn run(args: ImportArgs) -> Result<()> {
         spool.remove();
     }
 
-    println!(
-        "{}: {} MB in {:.1?} → {}",
+    // `ui::bytes` and `ui::duration`, not `/ (1 << 20)` and `{:.1?}`: this line
+    // reported megabytes while every other line pie prints reports GiB, and a
+    // Debug-formatted Duration ("94.31234s") is not a rendering anyone chose.
+    let did = format!(
+        "imported {} — {} in {} → {}",
         source.name,
-        written_bytes / (1 << 20),
-        started.elapsed(),
-        out_file.display()
+        crate::ui::bytes(written_bytes),
+        crate::ui::duration(started.elapsed()),
+        crate::ui::short_path(&out_file)
     );
     if args.delete_source {
-        return delete_source(&source.name, &metadata, &out_file);
+        delete_source(&source.name, &metadata, &out_file)?;
     }
-    Ok(())
+    Ok(crate::ui::Answer::did(did))
 }
 
 fn report_would_delete(metadata: &CheckpointMetadata) {
@@ -377,8 +385,8 @@ fn delete_source(repo_id: &str, metadata: &CheckpointMetadata, artifact: &Path) 
         }
     }
     println!(
-        "{repo_id}: artifact verified ({verified} tensors), deleted {removed} source file(s), freed {} MB",
-        freed / (1 << 20)
+        "{repo_id}: artifact verified ({verified} tensors), deleted {removed} source file(s), freed {}",
+        crate::ui::bytes(freed)
     );
     Ok(())
 }

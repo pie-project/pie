@@ -23,6 +23,16 @@ use pie_bin::{compose, derive, local, ops, ui};
 struct Cli {
     #[command(flatten)]
     global: startup::GlobalArgs,
+
+    /// Emit one JSON document instead of the human rendering.
+    ///
+    /// Global, so it works on every command. It was a per-subcommand flag on
+    /// five of them and absent from the rest, which is not a policy so much as
+    /// the order things were written in -- `pie cache list` was scriptable and
+    /// `pie config show` was not, for no reason either could state.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -38,7 +48,7 @@ enum Command {
     /// `pie run chat-completion -- --prompt "The capital of France is"`.
     Run(ops::run::RunArgs),
 
-    /// The models pie serves (list / info / import / remove / optimize).
+    /// The models pie serves (list / info / import / build / remove).
     Model {
         #[command(subcommand)]
         cmd: ops::model::ModelCmd,
@@ -50,7 +60,7 @@ enum Command {
         cmd: ops::cache::CacheCmd,
     },
 
-    /// Manage configuration (list / show / set / unset / edit / init).
+    /// Manage configuration (list / show / set / unset / edit / init / tune).
     Config {
         #[command(subcommand)]
         cmd: ops::config::ConfigCmd,
@@ -63,11 +73,7 @@ enum Command {
     },
 
     /// Will pie run here, and with this config? Exits non-zero if not.
-    Doctor {
-        /// Emit one JSON document instead of the report.
-        #[arg(long)]
-        json: bool,
-    },
+    Doctor,
 }
 
 /// Die quietly when a reader goes away, the way every other CLI does.
@@ -127,52 +133,49 @@ async fn main() -> ExitCode {
 
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Serve => serve(cli.global).await,
 
-        Command::Run(args) => {
-            startup::init_cli(&cli.global)?;
-            // The inferlet's own exit status, not this command's: `pie run`
-            // succeeded at running something that failed.
-            ops::run::run(&cli.global, args).await
-        }
-
-        Command::Model { cmd } => {
-            startup::init_cli(&cli.global)?;
-            // `model::run` is synchronous + blocking (HF download); keep it off
-            // the async reactor.
-            tokio::task::spawn_blocking(move || ops::model::run(cmd)).await??;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Doctor { json } => {
-            startup::init_cli(&cli.global)?;
-            // The exit code IS the answer -- `pie doctor && pie serve` should
-            // be a thing an operator can write.
-            Ok(match ops::doctor::doctor(&cli.global, json)? {
-                true => ExitCode::SUCCESS,
-                false => ExitCode::FAILURE,
-            })
-        }
-        Command::Cache { cmd } => {
-            startup::init_cli(&cli.global)?;
-            ops::cache::run(cmd)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Config { cmd } => {
-            startup::init_cli(&cli.global)?;
-            // Not `spawn_blocking`: `config init` used to download the
-            // Python-WASM runtime through `reqwest::blocking`, which builds a
-            // tokio runtime and drops it inside this one. Writing a config file
-            // no longer reaches the network, so there is nothing to isolate.
-            ops::config::run(cmd, &cli.global).await?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Inferlet { cmd } => {
-            startup::init_cli(&cli.global)?;
-            ops::inferlet::run(cmd, &cli.global).await?;
-            Ok(ExitCode::SUCCESS)
-        }
+    // `serve` is the one command that is not an op: it takes the full daemon
+    // `init` (banner, config, metrics) rather than the light CLI one, and it
+    // ends on a signal rather than with an answer.
+    if let Command::Serve = cli.command {
+        return serve(cli.global).await;
     }
+
+    // Once, for every op. It was written out at the head of all six arms, which
+    // is the kind of repetition that stays correct only until somebody adds a
+    // seventh arm.
+    startup::init_cli(&cli.global)?;
+
+    // What each op decides for itself is whether it blocks and what it answers
+    // with. The threading policy used to be made arm by arm -- `model` got a
+    // `spawn_blocking`, `cache` walked weight-sized directory trees on the
+    // reactor, and `config` carried a comment explaining why it was no longer
+    // `spawn_blocking` -- so it is stated here instead, in one place where the
+    // three answers can be compared.
+    let answer = match cli.command {
+        // Handled above; `Command` has no other arm that skips `init_cli`.
+        Command::Serve => unreachable!("serve returns before the op dispatch"),
+
+        // Blocking: HF downloads and multi-gigabyte checkpoint rewrites.
+        Command::Model { cmd } => tokio::task::spawn_blocking(move || ops::model::run(cmd)).await??,
+
+        // Blocking: `cache list` walks the whole of `$PIE_HOME`, and `doctor`
+        // shells out to `nvidia-smi`.
+        Command::Cache { cmd } => tokio::task::spawn_blocking(move || ops::cache::run(cmd)).await??,
+        Command::Doctor => {
+            let global = cli.global.clone();
+            tokio::task::spawn_blocking(move || ops::doctor::run(&global)).await??
+        }
+
+        // Async: these reach the engine or the registry over the network.
+        Command::Run(args) => ops::run::run(&cli.global, args).await?,
+        Command::Config { cmd } => ops::config::run(cmd, &cli.global).await?,
+        Command::Inferlet { cmd } => ops::inferlet::run(cmd, &cli.global).await?,
+    };
+
+    let code = answer.code();
+    ui::present(answer, cli.json)?;
+    Ok(code)
 }
 
 /// The `serve` path: full daemon `init` → derive the three typed role Configs

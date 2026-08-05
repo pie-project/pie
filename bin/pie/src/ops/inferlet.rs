@@ -12,17 +12,13 @@ use serde::Deserialize;
 
 use pie_engine::inferlet::program::{Manifest, ProgramName, Repository};
 
-use crate::ui::{self, Align, Mark, Palette, Row, Stream, Table};
+use crate::ui::{self, Align, Answer, Mark, Palette, Row, Table};
 
 
 #[derive(Subcommand, Debug)]
 pub enum InferletCmd {
     /// List the inferlets already downloaded.
-    List {
-        /// Emit one JSON document instead of the table.
-        #[arg(long)]
-        json: bool,
-    },
+    List,
 
     /// Show manifest metadata and accepted input parameters.
     Info(InfoArgs),
@@ -46,14 +42,11 @@ pub struct InfoArgs {
     /// Inferlet name, with optional version (e.g. `chat-completion`
     /// or `chat-completion@0.1.0`).
     pub inferlet: String,
-    /// Emit one JSON document instead of the report.
-    #[arg(long)]
-    pub json: bool,
 }
 
-pub async fn run(cmd: InferletCmd, global: &startup::GlobalArgs) -> Result<()> {
+pub async fn run(cmd: InferletCmd, global: &startup::GlobalArgs) -> Result<Answer> {
     match cmd {
-        InferletCmd::List { json } => list(json),
+        InferletCmd::List => list(),
         InferletCmd::Info(args) => info(args, global).await,
         InferletCmd::Download(args) => download(args, global).await,
         InferletCmd::Remove(args) => remove(args).await,
@@ -110,74 +103,92 @@ fn open(registry_url: String) -> Repository {
     repo
 }
 
-fn list(json: bool) -> Result<()> {
-    let repo = open(String::new());
-    let cached = repo.cached();
-    if json {
-        return ui::emit_json(&serde_json::json!(
-            cached
-                .iter()
-                .map(|(name, manifest, size)| serde_json::json!({
-                    "name": name.name,
-                    "version": name.version,
-                    "description": manifest.package.description,
-                    "bytes": size,
-                }))
-                .collect::<Vec<_>>()
-        ));
-    }
-
-    if cached.is_empty() {
-        println!("nothing downloaded yet");
-        println!("  inferlets arrive on first use, or with `pie inferlet download <name>`");
-        return Ok(());
-    }
-    let palette = Palette::for_stream(Stream::Stdout);
-    let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
-    for (name, manifest, size) in &cached {
-        // Descriptions are author-written and unbounded -- one in the test set
-        // runs to a paragraph on mask semantics -- so the table cuts the last
-        // column to fit. `pie inferlet info` prints the whole thing.
-        let description = manifest
-            .package
-            .description
-            .as_deref()
-            .unwrap_or("")
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        table.push(Row::new(
-            Mark::Plain,
-            [
-                format!("{}@{}", name.name, name.version),
-                ui::bytes(*size),
-                description,
-            ],
-        ));
-    }
-    table.print(&palette);
-    Ok(())
+/// The inferlets on this disk.
+#[derive(serde::Serialize)]
+pub struct InferletList {
+    inferlets: Vec<CachedInferlet>,
 }
 
-async fn download(args: TargetArgs, global: &startup::GlobalArgs) -> Result<()> {
+#[derive(serde::Serialize)]
+struct CachedInferlet {
+    name: String,
+    version: String,
+    description: Option<String>,
+    bytes: u64,
+}
+
+impl ui::Report for InferletList {
+    fn render(&self, palette: &Palette) {
+        if self.inferlets.is_empty() {
+            println!("nothing downloaded yet");
+            println!("  inferlets arrive on first use, or with `pie inferlet download <name>`");
+            return;
+        }
+        let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
+        for inferlet in &self.inferlets {
+            // Descriptions are author-written and unbounded -- one in the test
+            // set runs to a paragraph on mask semantics -- so the table cuts
+            // the last column to fit. `pie inferlet info` prints the whole
+            // thing.
+            let description = inferlet
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            table.push(Row::new(
+                Mark::Plain,
+                [
+                    format!("{}@{}", inferlet.name, inferlet.version),
+                    ui::bytes(inferlet.bytes),
+                    description,
+                ],
+            ));
+        }
+        table.print(palette);
+    }
+}
+
+fn list() -> Result<Answer> {
+    let repo = open(String::new());
+    Ok(Answer::report(InferletList {
+        inferlets: repo
+            .cached()
+            .into_iter()
+            .map(|(name, manifest, bytes)| CachedInferlet {
+                name: name.name,
+                version: name.version,
+                description: manifest.package.description,
+                bytes,
+            })
+            .collect(),
+    }))
+}
+
+async fn download(args: TargetArgs, global: &startup::GlobalArgs) -> Result<Answer> {
     let (cfg_path, _) = startup::cli_config_path(global);
     let cfg = crate::derive::load_worker_config(&cfg_path)?;
     let name = resolve_inferlet_id(&args.inferlet, &cfg.server.registry).await?;
     let mut repo = open(cfg.server.registry.clone());
     if repo.exists(&name) {
-        println!("{}@{} already downloaded", name.name, name.version);
-        return Ok(());
+        return Ok(Answer::did(format!(
+            "{}@{} was already downloaded",
+            name.name, name.version
+        )));
     }
     // `force_overwrite: false` -- the `exists` check above already answered
     // that, and reporting "already downloaded" beats silently doing nothing.
     repo.add_from_registry(&name, false).await?;
-    println!("✓ downloaded {}@{}", name.name, name.version);
-    Ok(())
+    Ok(Answer::did(format!(
+        "downloaded {}@{}",
+        name.name, name.version
+    )))
 }
 
-async fn remove(args: TargetArgs) -> Result<()> {
+async fn remove(args: TargetArgs) -> Result<Answer> {
     // Resolved against the local cache, never the registry: removing is about
     // what is on this disk, and asking the network which version to delete
     // would make the command fail while offline -- and could delete a version
@@ -211,15 +222,14 @@ async fn remove(args: TargetArgs) -> Result<()> {
             }
         }
     };
-    if repo.remove(&name)? {
-        println!("removed {}@{}", name.name, name.version);
+    Ok(Answer::did(if repo.remove(&name)? {
+        format!("removed {}@{}", name.name, name.version)
     } else {
-        println!("{}@{} is not downloaded", name.name, name.version);
-    }
-    Ok(())
+        format!("{}@{} was not downloaded", name.name, name.version)
+    }))
 }
 
-async fn info(args: InfoArgs, global: &startup::GlobalArgs) -> Result<()> {
+async fn info(args: InfoArgs, global: &startup::GlobalArgs) -> Result<Answer> {
     // The global `--config` rather than a local one: this reads the registry
     // URL out of the same config the engine would boot from, so resolving it
     // by a different rule than the engine's could point `info` at one registry
@@ -231,34 +241,115 @@ async fn info(args: InfoArgs, global: &startup::GlobalArgs) -> Result<()> {
     let program = resolve_inferlet_id(&args.inferlet, &cfg.server.registry).await?;
     let manifest = Manifest::from_url(&cfg.server.registry, &program).await?;
 
-    if args.json {
-        // The manifest as the registry serves it, plus the resolved version --
-        // which is the part the caller could not have known, since a bare name
-        // means "newest".
-        return ui::emit_json(&serde_json::json!({
-            "name": program.name,
-            "version": program.version,
-            "description": manifest.package.description,
-            "authors": manifest.package.authors,
-            "repository": manifest.package.repository,
-            "runtime": manifest.runtime,
-            "dependencies": manifest.dependencies,
-            "parameters": manifest
-                .parameters
-                .iter()
-                .map(|(name, p)| {
-                    serde_json::json!({
-                        "name": name,
-                        "type": format!("{:?}", p.param_type).to_lowercase(),
-                        "optional": p.optional,
-                        "description": p.description,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        }));
+    // The manifest as the registry serves it, plus the resolved version --
+    // which is the part the caller could not have known, since a bare name
+    // means "newest".
+    Ok(Answer::report(InferletInfo {
+        name: program.name.clone(),
+        version: program.version.clone(),
+        description: manifest.package.description.clone(),
+        authors: manifest.package.authors.clone(),
+        repository: manifest.package.repository.clone(),
+        runtime: serde_json::to_value(&manifest.runtime)?,
+        dependencies: serde_json::to_value(&manifest.dependencies)?,
+        parameters: manifest
+            .parameters
+            .iter()
+            .map(|(name, p)| Parameter {
+                name: name.clone(),
+                r#type: parameter_type_name(&p.param_type),
+                optional: p.optional,
+                description: p.description.clone(),
+            })
+            .collect(),
+    }))
+}
+
+/// One inferlet's manifest, as the registry serves it.
+#[derive(serde::Serialize)]
+pub struct InferletInfo {
+    name: String,
+    version: String,
+    description: Option<String>,
+    authors: Vec<String>,
+    repository: Option<String>,
+    runtime: serde_json::Value,
+    dependencies: serde_json::Value,
+    parameters: Vec<Parameter>,
+}
+
+#[derive(serde::Serialize)]
+struct Parameter {
+    name: String,
+    r#type: &'static str,
+    optional: bool,
+    description: Option<String>,
+}
+
+impl ui::Report for InferletInfo {
+    fn render(&self, palette: &Palette) {
+        println!("{}", palette.bold(format!("{}@{}", self.name, self.version)));
+        if let Some(description) = &self.description {
+            println!("{description}");
+        }
+        if let Some(repository) = &self.repository {
+            println!("{}", palette.dim(repository));
+        }
+
+        if self.parameters.is_empty() {
+            println!("\n{}", palette.dim("(no parameters)"));
+            return;
+        }
+
+        println!("\n{}", palette.bold("Parameters"));
+        let name_width = self
+            .parameters
+            .iter()
+            .map(|p| p.name.chars().count())
+            .max()
+            .unwrap_or(4)
+            .max("name".len());
+        let type_width = self
+            .parameters
+            .iter()
+            .map(|p| p.r#type.chars().count())
+            .max()
+            .unwrap_or(4)
+            .max("type".len());
+
+        println!(
+            "{}",
+            palette.dim(format!(
+                "{:<name_width$}  {:<type_width$}  required  description",
+                "name", "type"
+            ))
+        );
+        for parameter in &self.parameters {
+            // Pad first, colour second. `{:<8}` counts what is in the string,
+            // and what was in the string was `\x1b[2moptional\x1b[0m` -- so the
+            // width it padded to was the byte count of the escapes, not the
+            // eight columns a reader sees. Every row of this table was
+            // misaligned with colour on and aligned with it off.
+            let required = format!(
+                "{:<8}",
+                if parameter.optional { "optional" } else { "yes" }
+            );
+            let required = if parameter.optional {
+                palette.dim(required).to_string()
+            } else {
+                palette.green(required).to_string()
+            };
+            println!(
+                "{}  {:<type_width$}  {required}  {}",
+                // Cyan is this one screen's own accent for parameter names; the
+                // shared vocabulary carries the roles every command uses, not
+                // every colour.
+                palette.accent(format!("{:<name_width$}", parameter.name)),
+                parameter.r#type,
+                palette.dim(parameter.description.as_deref().unwrap_or("")),
+            );
+        }
     }
-    print_manifest(&program, &manifest);
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -346,68 +437,6 @@ fn validate_bare_inferlet_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_manifest(program: &ProgramName, manifest: &Manifest) {
-    let palette = Palette::for_stream(Stream::Stdout);
-
-    println!("{}", palette.bold(program));
-    if let Some(description) = &manifest.package.description {
-        println!("{description}");
-    }
-    if let Some(repository) = &manifest.package.repository {
-        println!("{}", palette.dim(repository));
-    }
-
-    if manifest.parameters.is_empty() {
-        println!("\n{}", palette.dim("(no parameters)"));
-        return;
-    }
-
-    println!("\n{}", palette.bold("Parameters"));
-    let name_width = manifest
-        .parameters
-        .keys()
-        .map(|name| name.chars().count())
-        .max()
-        .unwrap_or(4)
-        .max("name".len());
-    let type_width = manifest
-        .parameters
-        .values()
-        .map(|param| parameter_type_name(&param.param_type).chars().count())
-        .max()
-        .unwrap_or(4)
-        .max("type".len());
-
-    println!(
-        "{}",
-        palette.dim(format!(
-            "{:<name_width$}  {:<type_width$}  required  description",
-            "name", "type"
-        ))
-    );
-    for (name, param) in &manifest.parameters {
-        // Pad first, colour second. `{:<8}` counts what is in the string, and
-        // what was in the string was `\x1b[2moptional\x1b[0m` -- so the width
-        // it padded to was the byte count of the escapes, not the eight columns
-        // a reader sees. Every row of this table was misaligned with colour on
-        // and aligned with it off.
-        let required = format!("{:<8}", if param.optional { "optional" } else { "yes" });
-        let required = if param.optional {
-            palette.dim(required).to_string()
-        } else {
-            palette.green(required).to_string()
-        };
-        println!(
-            "{}  {:<type_width$}  {required}  {}",
-            // Cyan is this one screen's own accent for parameter names; the
-            // shared vocabulary carries the roles every command uses, not
-            // every colour.
-            palette.accent(format!("{name:<name_width$}")),
-            parameter_type_name(&param.param_type),
-            palette.dim(param.description.as_deref().unwrap_or("")),
-        );
-    }
-}
 
 fn parameter_type_name(param_type: &pie_engine::inferlet::program::ParameterType) -> &'static str {
     match param_type {

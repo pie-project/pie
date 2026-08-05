@@ -238,7 +238,7 @@ fn typed(value: &str) -> serde_json::Value {
 }
 
 /// Boot, run, print, exit.
-pub async fn run(global: &startup::GlobalArgs, args: RunArgs) -> Result<std::process::ExitCode> {
+pub async fn run(global: &startup::GlobalArgs, args: RunArgs) -> Result<crate::ui::Answer> {
     let (cfg_path, origin) = startup::cli_config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
         format!(
@@ -297,7 +297,11 @@ pub async fn run(global: &startup::GlobalArgs, args: RunArgs) -> Result<std::pro
         .context("boot the engine")?;
     let outcome = drive(&pie.listen_addr.to_string(), &target, &program, &args.arguments).await;
     pie.shutdown().await;
-    outcome
+    // Quiet, because the inferlet's own output already went to stdout as it
+    // was produced -- there is nothing left to render. The status is the
+    // inferlet's, not this command's: `pie run` succeeded at running something
+    // that failed.
+    Ok(crate::ui::Answer::quiet().with_code(outcome?))
 }
 
 /// Connect, upload if local, launch, and mirror everything the process says.
