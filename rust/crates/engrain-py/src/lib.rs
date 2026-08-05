@@ -346,8 +346,15 @@ impl CompiledGrammar {
         // what the mask fill costs, so identical readings collapse to one
         // entry here and a group points at the entries it uses. What the
         // kernel can then share is the replay, not merely the bytes.
-        let mut reading_offsets = vec![0u32];
+        // One entry per group, naming a length-prefixed block. A group's list
+        // of ways to read its tokens is the same list in state after state -
+        // measured 4.77x over the corpus - so the lists are shared here, and
+        // the prefix is what lets a shared block say how long it is when it is
+        // no longer followed by the next one.
+        let mut reading_offsets = Vec::new();
         let mut reading_index = Vec::new();
+        let mut interned_lists: FxHashMap<Vec<u32>, u32> = FxHashMap::default();
+        let mut list = Vec::new();
         let mut reading_next_state = Vec::new();
         let mut reading_term_offsets = vec![0u32];
         let mut reading_terminals = Vec::new();
@@ -374,9 +381,20 @@ impl CompiledGrammar {
                         fresh
                     }
                 };
-                reading_index.push(index);
+                list.push(index);
             }
-            reading_offsets.push(reading_index.len() as u32);
+            let at = match interned_lists.get(&list) {
+                Some(&existing) => existing,
+                None => {
+                    let fresh = reading_index.len() as u32;
+                    reading_index.push(list.len() as u32);
+                    reading_index.extend(list.iter().copied());
+                    interned_lists.insert(list.clone(), fresh);
+                    fresh
+                }
+            };
+            reading_offsets.push(at);
+            list.clear();
         }
 
         out.set_item("group_offsets", words(python, &artifact.group_offsets))?;

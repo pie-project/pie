@@ -64,7 +64,12 @@ def main() -> None:
                 # It claims refused. Re-derive that: no reading of this group
                 # may survive by shifting alone, and none may reach a reduce -
                 # a reduce depends on the stack, so it cannot be settled here.
-                for use in range(int(ro[grp]), int(ro[grp + 1])):
+                # `reading_offsets[group]` names a length-prefixed block, not
+                # the start of a CSR run: a block is shared with every group in
+                # the pool that wants the same reading list, so it cannot say
+                # how long it is by where the next one starts.
+                at = int(ro[grp])
+                for use in range(at + 1, at + 1 + int(ri[at])):
                     reading = int(ri[use])
                     state, alive, reduced = top, True, False
                     for k in range(int(to[reading]), int(to[reading + 1])):

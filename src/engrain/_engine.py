@@ -2717,20 +2717,26 @@ def _blocks(raw: bytes, starts, lengths):
     """Which distinct blocks an offset array points at, by content.
 
     Returns one digest and one span per distinct block, and which block each
-    slot wants. The *bodies* are not built here: a block that some other
-    grammar already holds is never copied, and building every one of them
-    would be the cost this exists to avoid. Digested straight off the raw
-    buffer for the same reason - a numpy slice and a cast per block doubled a
-    compile, on the path a request waits on.
+    slot wants. Two costs are avoided deliberately. The bodies are not built:
+    a block some other grammar already holds is never copied, and building
+    every one of them is the work this exists to save. And a block is digested
+    once rather than once per slot that wants it - a reading list is shared by
+    the groups of state after state, so the two differ by five times.
     """
-    at = np.asarray(starts, dtype=np.int64)
-    size = np.asarray(lengths, dtype=np.int64)
+    at = np.asarray(starts, dtype=np.uint64)
+    size = np.asarray(lengths, dtype=np.uint64)
+    together, of_slot = np.unique(
+        (at << np.uint64(32)) | size, return_inverse=True
+    )
+    of_slot = of_slot.reshape(-1).astype(np.int64)
+
     view = memoryview(raw)
     digests: list[bytes] = []
     spans: list[tuple[int, int]] = []
-    of_slot = np.zeros(at.size, dtype=np.int64)
+    of_block = np.zeros(together.size, dtype=np.int64)
     seen: dict[bytes, int] = {}
-    for slot, (block_at, block_size) in enumerate(zip(at.tolist(), size.tolist())):
+    for block, packed in enumerate(together.tolist()):
+        block_at, block_size = packed >> 32, packed & 0xFFFFFFFF
         digest = hashlib.blake2b(
             view[4 * block_at : 4 * (block_at + block_size)], digest_size=16
         ).digest()
@@ -2740,8 +2746,8 @@ def _blocks(raw: bytes, starts, lengths):
             seen[digest] = found
             digests.append(digest)
             spans.append((block_at, block_size))
-        of_slot[slot] = found
-    return digests, spans, of_slot
+        of_block[block] = found
+    return digests, spans, of_block[of_slot]
 
 
 @dataclass
@@ -3066,7 +3072,7 @@ class DeviceGrammar:
         out: dict[str, object] = {}
         held: dict[str, tuple] = {}
         for store, (digests, spans, of_slot) in tables.shared.items():
-            prefix = 1 if store in _PREFIXED else 0
+            prefix = 0
             source = tables.runs[store].numpy()
             table = self._interned.setdefault(store, {})
             placed = [0] * len(digests)
@@ -3289,6 +3295,7 @@ class DeviceGrammar:
         # 1.56x. Both are stored once here and pointed at from wherever they
         # are wanted, which costs nothing at all to run.
         starts = np.frombuffer(arrays["reading_offsets"], dtype=np.uint32)
+        block_words = np.frombuffer(arrays["reading_index"], dtype=np.uint32)
         shared = {
             "set_payload": _blocks(
                 arrays["set_payload"],
@@ -3299,8 +3306,12 @@ class DeviceGrammar:
             # by where the next one starts. One word per *distinct* block is
             # cheaper than one per group, and it keeps the arena's array count
             # where it was.
+            # Already one length-prefixed block per group, shared within the
+            # grammar; this shares them across the pool as well.
             "reading_index": _blocks(
-                arrays["reading_index"], starts[:-1], np.diff(starts)
+                arrays["reading_index"],
+                starts,
+                block_words[starts] + 1 if starts.size else starts,
             ),
         }
         return ResidentTables(
@@ -3313,7 +3324,7 @@ class DeviceGrammar:
             num_groups=int(
                 np.frombuffer(arrays["group_set_kind"], dtype=np.uint32).size
             ),
-            max_readings=max(1, int(np.diff(starts).max()) if starts.size > 1 else 1),
+            max_readings=max(1, int(block_words[starts].max()) if starts.size else 1),
             max_reading_terms=widest("reading_term_offsets"),
             nullable_chain=nullable,
             window_bound=_window_bound(arrays, nullable),
