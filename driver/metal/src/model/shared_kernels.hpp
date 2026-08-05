@@ -151,6 +151,16 @@ inline bool moe_should_batch(int n_pairs, int n_experts) {
 ///      96   gptoss 768         --     549.9   *554.1*
 ///     128   gptoss 1024        --     548.7   *558.6*
 ///
+/// A width past 64 was tried and is not compiled. `roofline_probe` puts the
+/// MXFP4 kernel at 4504 GFLOP/s at BM=64 and 5057 at BM=128, and in a real
+/// mixture BM=128 is SLOWER: 558.5 -> 545.5 tok/s at 1024 rows, where 128 rows
+/// an expert makes it exactly one tile with no padding to blame. That is the
+/// second time the probe has over-promised here -- it also prefers 64 at 448
+/// rows where the machine wants 32 -- and the reason is the same both times.
+/// The probe reads ONE expert with a hot cache; a mixture's threadgroups read
+/// thirty-two and would rather be many and small than few and large. Which is
+/// why what follows is a table of measurements and not a curve.
+///
 /// So 32 almost always, 64 once a run fills one, and 16 only where a run is too
 /// short to fill even a 32 -- which `moe_should_batch` already keeps to a sliver,
 /// since it admits nothing below eight rows an expert. The thresholds sit in the
