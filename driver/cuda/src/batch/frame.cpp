@@ -1,4 +1,5 @@
 #include "batch/frame.hpp"
+#include "pie/driver/region_plans.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2748,46 +2749,18 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         const auto& ind = s.dispatch_view.region_row_indptr;
         if (bands_on && s.is_pure_decode && !s.have_custom_mask &&
             !ind.empty()) {
-            const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
-            const std::uint32_t* rk = s.dispatch_view.region_k.data();
-            const std::size_t nreg = ind.size() - 1;
-            bool ok = true;
-            bool seen_trunc = false;
-            bool seen_hook = false;
-            std::size_t trunc_regions = 0;
-            for (std::size_t r = 0; r < nreg && ok; ++r) {
-                if (rsig[r] & PIE_REGION_SIG_TRUNCATED) ++trunc_regions;
-                if (rsig[r] & PIE_REGION_SIG_HOOK) seen_hook = true;
-                if (rsig[r] &
-                    (PIE_REGION_SIG_MASK | PIE_REGION_SIG_MULTI_TOKEN)) {
-                    ok = false;
-                } else if ((rsig[r] & PIE_REGION_SIG_HOOK) &&
-                           ((rsig[r] & PIE_REGION_SIG_TRUNCATED) ||
-                            seen_trunc)) {
-                    // ④ tier 1 (hook-aware banding, Act-2 order): a
-                    // FULL-DEPTH hook region sits in the plain prefix —
-                    // the walk's permanent live rows — so run_layer's
-                    // existing per-layer invocations cover exactly its
-                    // planned depth. A TRUNCATED hook region (or one the
-                    // seriation somehow sorted after a band) would go
-                    // dormant mid-walk while the fire-wide hook context
-                    // keeps firing — tier 2, undeclared.
-                    ok = false;
-                } else if (rsig[r] & PIE_REGION_SIG_TRUNCATED) {
-                    if (rsig[r] & PIE_REGION_SIG_LORA) { ok = false; break; }
-                    if (seen_trunc &&
-                        rk[r] >= s.depth_band_k.back()) { ok = false; break; }
-                    seen_trunc = true;
-                    s.depth_band_k.push_back(rk[r]);
-                    s.depth_band_rows.push_back(ind.data()[r]);
-                } else if (seen_trunc) {
-                    ok = false;  // a full-depth region after a band
-                }
-            }
-            if (!ok || s.depth_band_k.size() < 2 ||
-                s.depth_band_k.size() > 3) {
-                s.depth_band_k.clear();
-                s.depth_band_rows.clear();
+            // ④/Act 3: SINGLE SOURCE — the same derivation that
+            // suppresses the split/uniform stamps for banded fires
+            // (region_plans.hpp derive_depth_bands) produces the band
+            // arrays here; the gate and the planned words can no longer
+            // disagree.
+            std::uint32_t bk[3];
+            std::uint32_t brows[3];
+            const std::uint32_t m = pie::driver::fire::derive_depth_bands(
+                s.dispatch_view, bk, brows);
+            for (std::uint32_t j = 0; j < m; ++j) {
+                s.depth_band_k.push_back(bk[j]);
+                s.depth_band_rows.push_back(brows[j]);
             }
             // Tier-1 contract backstop: a hooked fire with two or more
             // distinct truncations has exactly one correct server — the
@@ -2795,18 +2768,31 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             // depth) only groups such fires in band-servable shapes, so an
             // unarmed arrival here is an admission bug; the fallback paths
             // would demote a lane's k silently, so refuse loudly instead.
-            if (seen_hook && trunc_regions >= 2 &&
-                s.depth_band_k.empty()) {
-                throw std::runtime_error(
-                    "hooked multi-depth fire reached the driver without "
-                    "armed bands (" + std::to_string(trunc_regions) +
-                    " truncated regions) — the admission gate should have "
-                    "split it");
+            {
+                const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
+                const std::size_t nreg = ind.size() - 1;
+                bool seen_hook = false;
+                std::size_t trunc_regions = 0;
+                for (std::size_t r = 0; r < nreg; ++r) {
+                    if (rsig[r] & PIE_REGION_SIG_HOOK) seen_hook = true;
+                    if (rsig[r] & PIE_REGION_SIG_TRUNCATED) ++trunc_regions;
+                }
+                if (seen_hook && trunc_regions >= 2 &&
+                    s.depth_band_k.empty()) {
+                    throw std::runtime_error(
+                        "hooked multi-depth fire reached the driver without "
+                        "armed bands (" + std::to_string(trunc_regions) +
+                        " truncated regions) — the admission gate should "
+                        "have split it");
+                }
             }
             if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+                const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
+                const std::uint32_t* rk = s.dispatch_view.region_k.data();
+                const std::size_t nreg = ind.size() - 1;
                 std::fprintf(stderr,
-                             "[band-gate] ok=%d nreg=%zu bands=%zu",
-                             ok ? 1 : 0, nreg, s.depth_band_k.size());
+                             "[band-gate] bands=%zu",
+                             s.depth_band_k.size());
                 for (std::size_t r = 0; r < nreg; ++r) {
                     std::fprintf(stderr, " sig%zu=%u k=%u", r, rsig[r],
                                  rk[r]);

@@ -249,7 +249,9 @@ fn planned_region_table(
                 * pie_driver_abi::PIE_REGION_SIG_MASK
             | u32::from(req.request.max_layers.is_some())
                 * pie_driver_abi::PIE_REGION_SIG_TRUNCATED
-            | u32::from(req.lora_program) * pie_driver_abi::PIE_REGION_SIG_LORA;
+            | u32::from(req.lora_program) * pie_driver_abi::PIE_REGION_SIG_LORA
+            | u32::from(req.hook_program && req.request.hook_page_mask)
+                * pie_driver_abi::PIE_REGION_SIG_HOOK_PAGE_MASK;
         let k = req
             .request
             .max_layers

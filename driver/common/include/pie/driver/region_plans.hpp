@@ -31,6 +31,65 @@ struct RegionPlans {
     std::uint32_t full_depth_rows = 0xffffffffu;
 };
 
+// ④/Act 3: the banded-depth derivation, SINGLE SOURCE for both the
+// frame's band stamping and the planned-words suppression below. A
+// band is a TRUNCATED region under the Act-2 order ([full | trunc
+// deepest-first | mask]); the fire bands when:
+//   - no masked or multi-token region anywhere (the band walk is a
+//     pure-decode server and mask windows are end-anchored),
+//   - every HOOK region is full-depth, before the truncated block,
+//     and observation-only (a PIE_REGION_SIG_HOOK_PAGE_MASK hook
+//     needs the full-R paged decode path),
+//   - no truncated region carries LORA (the PQ-tree refusal),
+//   - the truncated regions form one contiguous descending-k suffix
+//     run of 1..3 bands (the walk's cap), and
+//   - at m == 1 a full-depth region exists beside the band (an
+//     all-truncated uniform fire keeps the cheaper uniform stamp).
+// PIE_DEPTH_BANDS=0 disarms (same default-on read as everywhere).
+// Returns the band count (0 = not banded); k/rows are the band's
+// truncation and the rows BEFORE its region (the walk's live count
+// above that band's k).
+inline std::uint32_t derive_depth_bands(const LaunchView& view,
+                                        std::uint32_t out_k[3],
+                                        std::uint32_t out_rows[3]) {
+    static const bool bands_on = [] {
+        const char* v = std::getenv("PIE_DEPTH_BANDS");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (!bands_on || view.region_row_indptr.empty()) return 0;
+    const std::uint32_t* ind = view.region_row_indptr.data();
+    const std::uint32_t* sig = view.region_sig.data();
+    const std::uint32_t* rk = view.region_k.data();
+    const std::size_t nreg = view.region_row_indptr.size() - 1;
+    std::uint32_t count = 0;
+    bool seen_trunc = false;
+    for (std::size_t r = 0; r < nreg; ++r) {
+        if (sig[r] & (PIE_REGION_SIG_MASK | PIE_REGION_SIG_MULTI_TOKEN)) {
+            return 0;
+        }
+        if (sig[r] & PIE_REGION_SIG_TRUNCATED) {
+            if (sig[r] & (PIE_REGION_SIG_LORA | PIE_REGION_SIG_HOOK)) {
+                return 0;
+            }
+            if (count == 3) return 0;
+            if (seen_trunc && rk[r] >= out_k[count - 1]) return 0;
+            out_k[count] = rk[r];
+            out_rows[count] = ind[r];
+            ++count;
+            seen_trunc = true;
+        } else {
+            if (seen_trunc) return 0;  // full-depth region after a band
+            if ((sig[r] & PIE_REGION_SIG_HOOK) &&
+                (sig[r] & PIE_REGION_SIG_HOOK_PAGE_MASK)) {
+                return 0;
+            }
+        }
+    }
+    if (count == 0) return 0;
+    if (count == 1 && nreg == 1) return 0;
+    return count;
+}
+
 // Derives the plans from the view's region table. Returns false (and
 // leaves `out` all-unplanned) when no table is present. Throws on a
 // structurally invalid table.
@@ -70,6 +129,19 @@ inline bool derive_region_plans(const LaunchView& view, RegionPlans& out) {
         if ((sig[r] & PIE_REGION_SIG_HOOK) &&
             (sig[r] & PIE_REGION_SIG_MASK)) {
             out.unmasked_prefix_rows = kUnplanned;
+        }
+    }
+
+    // ④/Act 3: a fire the band derivation serves carries FULL planned
+    // words — the walk owns the depth boundaries, the split/uniform
+    // stamps would hand the pre-band servers a shape the walk is about
+    // to serve differently (probed live: the m=1 stamp made
+    // bands_runnable's layer_bound term decline its own fire).
+    {
+        std::uint32_t bk[3];
+        std::uint32_t brows[3];
+        if (derive_depth_bands(view, bk, brows) >= 1) {
+            return true;
         }
     }
 

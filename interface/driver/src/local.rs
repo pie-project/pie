@@ -1280,6 +1280,12 @@ pub const PIE_REGION_SIG_TRUNCATED: u32 = 1 << 3;
 /// it (③b: the words' decline rules become derivable).
 pub const PIE_REGION_SIG_LORA: u32 = 1 << 4;
 
+/// [`PieStepDesc::region_sig`] bit: the region's hook programs write the
+/// `attn_page_mask` sink (Track B page substitution) — such a hook needs
+/// the full-R paged decode path, so the banded-depth derivation excludes
+/// it.
+pub const PIE_REGION_SIG_HOOK_PAGE_MASK: u32 = 1 << 5;
+
 /// [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
 /// sentinel. Not zero: zero is a legitimate planned value ("no fast
 /// prefix" — an all-hooked step).

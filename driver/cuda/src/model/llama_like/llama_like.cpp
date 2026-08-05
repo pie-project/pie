@@ -1250,7 +1250,7 @@ void prepare_llama_like_decode_plan(
         // the early return demoted every XQA deployment (14B) to the
         // full-depth walk with neither [depth-bands] nor DECLINE.
         state.depth_band_count = 0;
-        if (depth_band_count >= 2 && depth_band_count <= 3 &&
+        if (depth_band_count >= 1 && depth_band_count <= 3 &&
             !have_custom_mask) {
             for (std::uint32_t j = 0; j < depth_band_count; ++j) {
                 state.depth_band_k[j] = depth_band_k[j];
@@ -1321,7 +1321,7 @@ void prepare_llama_like_decode_plan(
         // prefix already runs exactly this shape. k/rows is all the
         // prepare owes; there are no plans on this deployment at all.
         state.depth_band_count = 0;
-        if (depth_band_count >= 2 && depth_band_count <= 3 &&
+        if (depth_band_count >= 1 && depth_band_count <= 3 &&
             is_pure_decode && !have_custom_mask) {
             for (std::uint32_t j = 0; j < depth_band_count; ++j) {
                 state.depth_band_k[j] = depth_band_k[j];
@@ -1388,7 +1388,7 @@ void prepare_llama_like_decode_plan(
         // dispatch on this deployment is the planned causal prefill —
         // one plan per boundary, identity-qo prefix restriction, each
         // in its OWN workspace (the per-band isolation rule).
-        if (depth_band_count >= 2 && depth_band_count <= 3 &&
+        if (depth_band_count >= 1 && depth_band_count <= 3 &&
             is_pure_decode && !have_custom_mask) {
             for (std::uint32_t j = 0; j < depth_band_count; ++j) {
                 const std::uint32_t rows = depth_band_rows[j];
@@ -1466,7 +1466,7 @@ void prepare_llama_like_decode_plan(
     // whose start row is 0 needs no plan — nothing lives past it and
     // the body stops walking layers there.
     state.depth_band_count = 0;
-    if (depth_band_count >= 2 && depth_band_count <= 3 &&
+    if (depth_band_count >= 1 && depth_band_count <= 3 &&
         is_pure_decode && !have_custom_mask) {
         for (std::uint32_t j = 0; j < depth_band_count; ++j) {
             const std::uint32_t rows = depth_band_rows[j];
@@ -2784,7 +2784,7 @@ void llama_like_forward_paged(
     // hook invocations inside run_layer cover exactly the hook rows'
     // planned depth, and the score capture rides each band's own plan.
     const bool bands_runnable =
-        plan_state.depth_band_count >= 2 && is_pure_decode &&
+        plan_state.depth_band_count >= 1 && is_pure_decode &&
         !has_custom_mask &&
         // A page-mask-writing hook substitutes the fire's page table at
         // full R on the paged decode path; the banded layers run attention
@@ -2795,7 +2795,7 @@ void llama_like_forward_paged(
         (use_decode_path || use_prefill_decode_path ||
          fwd_cfg.force_prefill_path) &&
         layer_bound == cfg.num_hidden_layers;
-    if (plan_state.depth_band_count >= 2 && !bands_runnable &&
+    if (plan_state.depth_band_count >= 1 && !bands_runnable &&
         std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
         // Degrade loudly-quietly: the fire runs full depth (today's
         // demotion) rather than dying — deployments the banded walk
