@@ -12,10 +12,15 @@ question is not "which backend is faster" but "how much of the step does each
 one cost". An unconstrained run is the denominator, and without it a difference
 between two constrained runs cannot be told from run-to-run variance.
 
-**Fixed work per arm.** The same prompts, the same seed, the same `max_tokens`,
-and the generated token count is reported next to the rate - because a backend
-whose grammar is a relaxation can emit longer documents, generate more tokens,
-and post a better tokens-per-second while doing more work for the same request.
+**Compare on the makespan, not on tokens per second.** Both arms serve the same
+512 requests, so how long that takes is the comparison an operator gets, and it
+needs no normalising. Tokens per second does: it is tokens over the makespan,
+so a backend whose requests run longer generates more tokens *and* keeps the
+batch fuller, and a fuller batch spreads the per-step fixed cost over more rows.
+Measured against XGrammar on the exact fragment, the inflation is exactly the
+gap in tokens generated - 17.7% more tokens, and a tokens-per-second ratio 17%
+better than the makespan ratio. Both are reported; the makespan is the one to
+quote.
 
 **One process per backend.** vLLM caches prefixes and compiles graphs on first
 use; running two backends in one process measures the second one warm.
@@ -333,6 +338,16 @@ def main() -> int:
         row = {
             "batch": batch,
             "distinct_schemas": distinct,
+            # The metric that needs no normalising, and the one to compare on.
+            # Tokens per second is tokens over the makespan, so an engine whose
+            # requests run longer generates more tokens *and* keeps the batch
+            # fuller, and a fuller batch spreads the per-step fixed cost over
+            # more rows. Measured against XGrammar on the exact fragment, the
+            # inflation is exactly the gap in tokens generated: 17.7% more
+            # tokens, 17% better tokens-per-second than the makespan says.
+            # Both arms serve the same 512 requests, so how long that takes is
+            # the comparison an operator actually gets.
+            "makespan_seconds": _quantiles(seconds),
             "seconds": _quantiles(seconds),
             "tokens_per_second": _quantiles(rates),
             "tokens_generated_p50": statistics.median(produced),
@@ -343,8 +358,11 @@ def main() -> int:
         }
         report["rows"].append(row)
         rate = row["tokens_per_second"]
+        span = row["makespan_seconds"]
         print(
-            f"  batch {batch:>4}: {rate['p50']:>8.0f} tok/s "
+            f"  batch {batch:>4}: {span['p50']:>7.3f} s to serve {batch} "
+            f"[p25 {span['p25']:.3f}, p75 {span['p75']:.3f}]  "
+            f"{rate['p50']:>8.0f} tok/s "
             f"[p25 {rate['p25']:.0f}, p75 {rate['p75']:.0f}, "
             f"range {rate['min']:.0f}-{rate['max']:.0f}]  "
             f"{row['tokens_generated_p50']} tokens  "
