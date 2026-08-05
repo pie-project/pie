@@ -24,7 +24,7 @@ use engrain_run::Matcher as RunMatcher;
 use engrain_tables::Artifact;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use pyo3::create_exception;
 use pyo3::types::{PyByteArray, PyBytes, PyDict};
 
@@ -280,8 +280,55 @@ impl CompiledGrammar {
     }
 
     #[getter]
+    /// What the arena holds for this grammar, in bytes.
+    ///
+    /// Counted from the same sharing `device_arrays` performs, because this is
+    /// the number a table budget is spent in and a budget denominated in
+    /// anything else is not a budget. The readings and their lists are shared
+    /// within a grammar - a group's list of ways to read its tokens is the
+    /// same list in state after state - so counting a copy per group was five
+    /// times high on the largest array there is.
     fn resident_bytes(&self) -> usize {
-        self.artifact.resident_bytes()
+        let artifact = &self.artifact;
+        let mut readings: FxHashMap<(&[u32], u32), u32> = FxHashMap::default();
+        let mut lists: FxHashSet<Vec<u32>> = FxHashSet::default();
+        let mut bodies = 0usize;
+        let mut list = Vec::new();
+        for group in &artifact.groups {
+            for reading in &group.readings {
+                let key = (reading.terminals.as_slice(), reading.next_lexer_state);
+                let next = readings.len() as u32;
+                let index = *readings.entry(key).or_insert_with(|| {
+                    bodies += reading.terminals.len() + 2;
+                    next
+                });
+                list.push(index);
+            }
+            if !lists.contains(&list) {
+                bodies += list.len() + 1;
+                lists.insert(list.clone());
+            }
+            list.clear();
+        }
+        4 * (artifact.set_payload.len()
+            + artifact.group_offsets.len()
+            + artifact.groups.len() * 4
+            + bodies
+            + artifact.pending_offsets.len()
+            + artifact.pending_terminals.len()
+            + artifact.action_offsets.len()
+            + artifact.action_terminals.len()
+            + artifact.action_values.len()
+            + artifact.action_extra_offsets.len()
+            + artifact.action_extra.len()
+            + artifact.goto_offsets.len()
+            + artifact.goto_nonterminals.len()
+            + artifact.goto_targets.len()
+            + artifact.production_lhs.len()
+            + artifact.production_arity.len()
+            + artifact.verdicts.len()
+            + artifact.verdict_stride.len()
+            + artifact.num_lexer_states as usize * 2)
     }
 
     /// `transitions[state * 256 + byte]`, `0xffffffff` where impossible.
