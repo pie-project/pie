@@ -23,25 +23,18 @@
 //!   routed-decode lowering materializes fine.
 //! * **Streamed expert groups.** A group is a paging decision; materializing
 //!   one eagerly would build exactly the residency it exists to avoid.
-//! * **Serving on Metal.** The policy here is `Policy::default()`, which is
-//!   `Projections::Fused` and `Naming::Hf` — CUDA's shape. Metal authors with
-//!   `InPlace` and `Mlx` (`driver/metal/src/loader/load_plan.hpp`), so what
-//!   this writes is not what that bind path reads.
 //!
-//!   Adding a `--backend metal` that flips the pair is not the fix, and was
-//!   tried: it materializes correctly and then cannot be booted, because a
-//!   serve boot always re-authors from *checkpoint* names and the MLX schemas
-//!   are not idempotent over their own output — authoring Llama-3.2-1B that
-//!   way and re-authoring the result fails with "Metal llama schema has no
-//!   declared mapping or skip for 'final_norm.weight'". Making that work is a
-//!   change to the family schemas, not to this command.
+//! Which driver the artifact is for is `--backend`, and it is not cosmetic:
+//! CUDA binds fused q/k/v banks under HuggingFace names, Metal binds in-place
+//! projections under MLX names, and an artifact materialized for one is not
+//! what the other's bind path reads. It defaults to `cuda`, which is what the
+//! policy silently was before the flag existed.
 //!
-//!   Meanwhile the boot cost it would save on Metal is small and `pie model
-//!   import` already saves it: on Llama-3.2-1B a Metal plan over the raw
-//!   snapshot is 1084 instructions with 259 `Cast` tile maps, over the
-//!   imported `.zt` it is 844 with none, and over what this command writes
-//!   today it is 1116 with the 259 back. Measured with
-//!   `driver/metal/tools/rawmetal/plan_cost_probe.cpp`.
+//! `--backend metal` needed the family schemas to accept their own output
+//! first. A serve boot re-authors from *checkpoint* names, so an artifact
+//! whose tensors are the runtime tensors is fed back through the rename that
+//! produced them; before `mlx::already_lowered` that refused with "Metal llama
+//! schema has no declared mapping or skip for 'final_norm.weight'".
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -56,7 +49,7 @@ use pie_loader::executor::host::Progress;
 use pie_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use pie_loader::types::Visibility;
 use pie_model::common::facts::ModelFacts;
-use pie_model::common::policy::{Mxfp4MoeRequest, Policy, RuntimeQuant};
+use pie_model::common::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
 use pie_model_config::DESCRIPTOR_OBJECT;
 
 use super::convert::{
@@ -85,6 +78,16 @@ pub struct OptimizeArgs {
     /// needs the device's Marlin repack and cannot be materialized offline.
     #[arg(long)]
     pub moe: Option<String>,
+    /// Which driver will serve the artifact: `cuda` or `metal`.
+    ///
+    /// Not cosmetic and not inferable: the two drivers read different tensors.
+    /// CUDA binds fused q/k/v banks under HuggingFace names, Metal binds
+    /// in-place projections under MLX names, and an artifact materialized for
+    /// one is not the artifact the other's bind path reads. Stated as a flag
+    /// for the reason `--fp8-native` is: an offline run cannot probe the
+    /// device it is optimizing for.
+    #[arg(long, default_value = "cuda")]
+    pub backend: String,
     /// Write the artifact here instead of the store. A path ending in `.zt`
     /// is the artifact; a directory receives `<name>-optimized.zt`.
     #[arg(long)]
@@ -301,7 +304,18 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
         ),
         Some(other) => bail!("--moe {other:?} is not `routed` or `bf16`"),
     };
+    // Which driver serves this decides which tensors exist, so it is resolved
+    // before anything is authored. The pair moves together -- there is no
+    // driver that wants MLX names over fused banks -- so one flag sets both
+    // and no combination can be spelled that no bind path reads.
+    let (projections, naming) = match args.backend.as_str() {
+        "cuda" => (Projections::Fused, Naming::Hf),
+        "metal" => (Projections::InPlace, Naming::Mlx),
+        other => bail!("--backend {other:?} is not `cuda` or `metal`"),
+    };
     let policy = Policy {
+        projections,
+        naming,
         runtime_quant,
         moe_request,
         ..Policy::default()
@@ -335,10 +349,11 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
         .filter(|tensor| tensor.visibility == Visibility::Public)
         .count();
     println!(
-        "optimize: {} declares {} tensors ({} bound), quant={:?}, moe={:?}",
+        "optimize: {} declares {} tensors ({} bound) for {}, quant={:?}, moe={:?}",
         facts.model_type,
         contract.tensors.len(),
         public,
+        args.backend,
         policy.runtime_quant,
         policy.moe_request,
     );

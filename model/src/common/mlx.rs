@@ -46,6 +46,63 @@ pub fn decoder_member(raw_name: &str) -> Option<&str> {
     None
 }
 
+/// Is this the name a Metal lowering already produced?
+///
+/// The bind path's namespace is closed and small — `layers.<n>.*` plus a
+/// handful of layer-less tables — and it is disjoint from the checkpoint
+/// namespace, where every decoder tensor arrives under `model.` or one of the
+/// two `language_model.` spellings. That disjointness is what makes an
+/// identity arm a fact rather than a guess: a name in this set did not come
+/// from a checkpoint.
+///
+/// Why it is needed at all: a serve boot re-authors the contract from the
+/// names its checkpoint holds, so an artifact `pie model optimize` wrote —
+/// whose tensors ARE the runtime tensors — is fed back through the very rename
+/// that produced them. Without an identity arm each schema refuses its own
+/// output (`no declared mapping or skip for 'final_norm.weight'`) and the
+/// artifact cannot boot. `f(f(x)) == f(x)` is the property, and it is what
+/// makes import → optimize → serve a pipeline rather than three dead ends.
+///
+/// `lm_head.` is deliberately absent. It is the one name living in both
+/// namespaces, and every family already answers it before reaching here —
+/// untied it maps to itself, tied it becomes `shared_embedding` — so an
+/// identity arm covering it would silently break the tied case for real
+/// checkpoints.
+///
+/// What this does NOT do is re-run the refusals `routed_expert_member` applies
+/// to a checkpoint's expert banks. Those describe shapes a *checkpoint* can
+/// arrive in; a lowered artifact holds only what the author already accepted,
+/// and a hand-written one that did not would fail at bind for want of the
+/// stacked bank instead.
+pub fn already_lowered(raw_name: &str) -> bool {
+    for table in [
+        "shared_embedding.",
+        "embed_tokens.",
+        // gemma4's per-layer embedding table and its two projections:
+        // layer-less, and they keep their own names through the lowering.
+        "embed_tokens_per_layer.",
+        "per_layer_model_projection.",
+        "per_layer_projection_norm.",
+    ] {
+        if raw_name.starts_with(table) {
+            return true;
+        }
+    }
+    if raw_name == "final_norm.weight" {
+        return true;
+    }
+    // `layers.<digits>.` and nothing looser. The digits are what separate a
+    // lowered name from a checkpoint that merely begins with the same word.
+    let Some(tail) = raw_name.strip_prefix("layers.") else {
+        return false;
+    };
+    let Some(dot) = tail.find('.') else {
+        return false;
+    };
+    let index = &tail[..dot];
+    !index.is_empty() && index.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Declare a tensor where it lies, casting the widths no Metal kernel reads.
 pub fn push_direct(b: &mut Builder<'_>, raw: &RawTensor, output: String) {
     if is_raw(&raw.encoding, DType::F16) || is_raw(&raw.encoding, DType::F32) {
@@ -449,7 +506,52 @@ pub fn author_mlx_file(
 
 #[cfg(test)]
 mod tests {
-    use super::routed_expert_member;
+    use super::{already_lowered, routed_expert_member};
+
+    /// `f(f(x)) == f(x)`, checked on the names the four Metal schemas emit.
+    ///
+    /// The property is what lets a serve boot re-author from an artifact whose
+    /// tensors are already the runtime tensors. Stated over `already_lowered`
+    /// rather than over each family's rename because the four call it at the
+    /// same point and differ only in what they do *before* it.
+    #[test]
+    fn the_runtime_namespace_is_recognized_and_the_checkpoint_one_is_not() {
+        for lowered in [
+            "layers.0.self_attn.q_proj.weight",
+            "layers.31.mlp.experts.gate_proj.scales",
+            "layers.7.input_layernorm.weight",
+            "final_norm.weight",
+            "embed_tokens.weight",
+            "shared_embedding.weight",
+            "embed_tokens_per_layer.weight",
+            "per_layer_model_projection.weight",
+            "per_layer_projection_norm.weight",
+        ] {
+            assert!(already_lowered(lowered), "{lowered} is a runtime name");
+        }
+        for checkpoint in [
+            // Every decoder tensor arrives under a wrapper. That is the
+            // disjointness the identity arm rests on.
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.mlp.down_proj.weight",
+            "language_model.model.norm.weight",
+            "model.norm.weight",
+            "model.embed_tokens.weight",
+            // `lm_head.` is excluded on purpose: tied, it is NOT an identity.
+            "lm_head.weight",
+            // `layers.` without an index is not a lowered name, and neither is
+            // a bare word that merely starts with it.
+            "layers.weight",
+            "layers.attn.weight",
+            "layersomething.weight",
+            "layers.",
+        ] {
+            assert!(
+                !already_lowered(checkpoint),
+                "{checkpoint} is not a runtime name"
+            );
+        }
+    }
 
     /// The refusal that used to be pinned from Metal's C++ side
     /// (`llama_decode_step_test.cpp`), ported here when the C++ author died:
