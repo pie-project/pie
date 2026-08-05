@@ -3017,9 +3017,54 @@ void llama_like_forward_paged(
                 N, H, eps, stream);
             lm_head_input = ws.norm_y.data();
         }
-        ops::gemm_act_x_w(cublas.handle(),
-            lm_head_input, *w.lm_head, ws.logits.data(),
-            lm_head_rows, V, H);
+        // Fused LM head + greedy argmax: the vocabulary is reduced slab by
+        // slab as it is produced, so the [rows, vocab] logits never exist
+        // (§20.37). The slab scratch is carved out of `ws.logits` -- by
+        // construction the buffer this path is not filling -- so the fused
+        // route allocates nothing.
+        //
+        // There is deliberately no quiet fallback. By the time the forward
+        // runs, `prepare_step` has already put `kGvFusedArgmax` in the graph
+        // key and `settle_step` will hand the epilogue `ws.sampled_tokens`
+        // whatever happens here; materializing logits instead would leave the
+        // epilogue publishing uninitialised memory as token ids. Every
+        // condition below is established before the fire is admitted
+        // (`ModelCapabilities::supports_fused_lm_head_argmax` for the weight,
+        // and `lm_head_rows <= workspace_logits_rows` for the shapes), so this
+        // is an assertion, not a branch.
+        const int chunk = fwd_cfg.logits_argmax_chunk_tokens;
+        if (chunk > 0) {
+            const auto rows = static_cast<std::size_t>(lm_head_rows);
+            const std::size_t accum = rows * kernels::kArgmaxAccumSlots;
+            if (ws.sampled_tokens.numel() < rows ||
+                ws.argmax_acc_val.numel() < accum ||
+                ws.argmax_acc_idx.numel() < accum) {
+                throw std::runtime_error(
+                    "fused lm_head argmax: workspace holds fewer rows than "
+                    "this fire samples");
+            }
+            if (ops::lm_head_argmax_slab_bytes(lm_head_rows, V, chunk) >
+                ws.logits.nbytes()) {
+                throw std::runtime_error(
+                    "fused lm_head argmax: vocabulary slab does not fit the "
+                    "logits arena");
+            }
+            if (!ops::lm_head_argmax_chunked(
+                    cublas.handle(), lm_head_input, *w.lm_head,
+                    static_cast<std::int32_t*>(ws.sampled_tokens.data()),
+                    ws.logits.data(),
+                    static_cast<float*>(ws.argmax_acc_val.data()),
+                    static_cast<std::int32_t*>(ws.argmax_acc_idx.data()),
+                    lm_head_rows, V, H, chunk)) {
+                throw std::runtime_error(
+                    "fused lm_head argmax: lm_head weight is not dense BF16, "
+                    "yet the model advertised the capability");
+            }
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                lm_head_input, *w.lm_head, ws.logits.data(),
+                lm_head_rows, V, H);
+        }
     }
 }
 
