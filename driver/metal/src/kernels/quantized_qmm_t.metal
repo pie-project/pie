@@ -1711,6 +1711,29 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 /// stall, so the spare tiles have to be dispatched and then decline. The return
 /// is uniform across the threadgroup, which is what makes it safe to take
 /// before the barriers inside the impl.
+///
+/// The worst case is the ALLOCATION's problem and not the arithmetic's, which
+/// is worth saying because the two are easy to confuse. `moe_sorted_rows` is
+/// pessimistic by design -- at 448 rows of top-4 over 32 experts it asks for
+/// 2784 sorted rows where 1792 carry a token -- but the surplus tiles decline
+/// above and cost a threadgroup launch rather than a GEMM. What the arithmetic
+/// actually pays is each expert's own run rounded up, which for a router that
+/// spreads evenly is nearer 14% than the bound's 55%.
+///
+/// And the mixture's kernel is not the slow one. Measured with `roofline_probe`
+/// at the expert shape K=N=2880, GFLOP/s, against the affine kernel it shares
+/// an inner loop with:
+///
+///     BM=16    affine 2741    mxfp4 3141
+///     BM=32    affine 3741    mxfp4 4002
+///
+/// MXFP4 is ahead at both, and in situ this kernel reaches 4404 -- above the
+/// probe, because a real mixture's tiles are shorter and its weights hotter
+/// than the probe's single expert. Where a gpt-oss prefill loses to the dense
+/// path is the two things the mixture takes away: BM cannot be 64, because the
+/// padding a wider tile costs outruns what it buys, and the input cannot be
+/// staged to FP16, because the answer this checkpoint is pinned to is mlx-lm's
+/// and a bf16 ulp moves it.
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
 [[kernel]] void affine_qmm_t_routed(
     const device uint32_t* w   [[buffer(0)]],
