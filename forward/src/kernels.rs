@@ -276,6 +276,38 @@ mod tests {
         assert!(check_plan(&plan_of(vec![launch(xqa)])).is_empty());
     }
 
+    /// The table is exactly the set of symbols `dsl::cuda` can record.
+    ///
+    /// This is the argument that [`check_plan`]'s coverage rule — which
+    /// runs at LOAD and fails the trace — can never fire spuriously on a
+    /// live deployment: reachability is a property of the dsl surface,
+    /// not of which fact combinations a test happens to exercise. And it
+    /// is the guard that makes the table's other three declarations get
+    /// written: a new `cuda::` wrapper fails this test until its
+    /// contract exists.
+    #[test]
+    fn the_table_is_exactly_the_dsl_surface() {
+        let dsl = include_str!("dsl.rs");
+        let mut stated: Vec<&str> = dsl
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| {
+                ["launch_", "dispatch_", "ops::", "pie_lora", "qwen35_verify"]
+                    .iter()
+                    .any(|p| s.starts_with(p))
+            })
+            .collect();
+        stated.sort_unstable();
+        stated.dedup();
+        let mut declared: Vec<&str> = KERNELS.iter().map(|k| k.symbol).collect();
+        declared.sort_unstable();
+        assert_eq!(
+            stated, declared,
+            "the kernel! table and dsl::cuda's stated symbols have drifted"
+        );
+    }
+
     /// No symbol is declared twice, and no dsl-side name is either.
     #[test]
     fn table_is_unambiguous() {
