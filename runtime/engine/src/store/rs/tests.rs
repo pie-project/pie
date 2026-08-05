@@ -464,6 +464,105 @@ fn release_frees_shared_slots_only_after_both_sides_drop() {
 }
 
 #[test]
+fn a_busy_store_still_retires_slots_freed_before_the_oldest_write() {
+    // The wedge: retirement used to require the store to be fully idle, so a
+    // pool under sustained load never returned anything. Every freed slot sat
+    // pending until the last fire drained -- which at steady state never
+    // happens -- and the pool bled to empty while all of its slots were
+    // releasable. Here one write stays outstanding the whole time, which is
+    // exactly the condition that used to block retirement forever.
+    let mut s = store();
+    let done = s.create_working_set(geom());
+    write_state(&mut s, done);
+    let held = s.capacity_slots() as usize - s.available_slots();
+    assert!(held > 0);
+
+    // The first holder exits. Its slots are tagged with the epoch current at
+    // that moment; nothing prepared after this can refer to them.
+    let freed_at = s.current_epoch();
+    s.release_working_set(done, freed_at);
+
+    // Now the store goes busy and STAYS busy: a later write is prepared and
+    // published but never settles. This is the condition that used to block
+    // retirement forever, even though this write cannot possibly touch slots
+    // that were released before it existed.
+    let busy = s.create_working_set(geom());
+    let prepared = s.prepare_write(busy, false, None).unwrap();
+    let published = s.publish_prepared(prepared).unwrap();
+    assert!(
+        s.current_epoch() > freed_at,
+        "the busy write must be newer than the free it is allowed to ignore"
+    );
+
+    // Drain everything the free list already had, so the next ask can only be
+    // met by retiring what the departed holder returned.
+    let spare = s.reserve_slots(s.available_slots()).unwrap();
+    assert_eq!(s.available_slots(), 0);
+
+    assert!(
+        s.reserve_slots(held).is_some(),
+        "slots freed before the oldest outstanding write must retire without \
+         waiting for the store to fall idle"
+    );
+
+    s.release_slot_reservation(spare);
+    s.settle(published);
+}
+
+#[test]
+fn the_last_holders_exit_leaves_the_pool_reservable_without_a_fire() {
+    // The wedge this guards: slots released by a departing process are parked
+    // pending, and the only thing that used to retire them was the fire path.
+    // At capacity that is circular — the next request cannot reserve, so no
+    // fire runs, so nothing retires, so the request never can. The planner
+    // read the empty free list, correctly concluded no completion could
+    // arrive, and destroyed the request over slots that were already free.
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    write_state(&mut s, ws);
+    let taken = s.capacity_slots() as usize - s.available_slots();
+    assert!(taken > 0, "the working set must hold something to release");
+
+    // Drain the free list so the next ask can only be met from pending.
+    let hoard = s.reserve_slots(s.available_slots()).unwrap();
+    assert_eq!(s.available_slots(), 0);
+
+    // The holder departs. Nothing else is running, and crucially no fire will
+    // ever call `retire_through` on our behalf.
+    s.release_working_set(ws, s.current_epoch());
+    assert_eq!(
+        s.available_slots(),
+        0,
+        "released slots are pending, not free — this is the trap being guarded"
+    );
+
+    assert!(
+        s.reserve_slots(taken).is_some(),
+        "the departed holder's slots must be reservable without a fire"
+    );
+
+    s.release_slot_reservation(hoard);
+}
+
+#[test]
+fn a_stats_read_sees_slots_that_only_a_retirement_stands_between() {
+    // The twin of the reservation path: the starvation rung re-reads the pool
+    // immediately before destroying a request, so a read that reports only the
+    // free list would have it kill the head over slots already returned.
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    write_state(&mut s, ws);
+    let taken = s.capacity_slots() as usize - s.available_slots();
+    let hoard = s.reserve_slots(s.available_slots()).unwrap();
+
+    s.release_working_set(ws, s.current_epoch());
+    assert_eq!(s.available_slots(), 0, "the raw free list under-reports");
+    assert_eq!(s.reservable_slots(), taken);
+
+    s.release_slot_reservation(hoard);
+}
+
+#[test]
 fn cancel_releases_pending_slots_and_leaves_the_mapping_untouched() {
     let mut s = store();
     let ws = s.create_working_set(geom());

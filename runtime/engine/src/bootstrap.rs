@@ -296,12 +296,36 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // them full. Throughput +31%, and wall, mean and p99 latency ALL
     // improved -- oversubscribing R is strictly worse, not a trade.
     // An explicit operator setting always wins.
+    //
+    // R alone is the wrong bound for a recurrent model. R limits ROWS IN ONE
+    // FORWARD, a resource returned when the forward retires; an RS folded slot
+    // is held from a process's first fire until it exits, so the folded pool
+    // -- not R -- is what bounds how many processes can be resident at once.
+    // Admitting past it seats a process that can never get a slot, and the
+    // planner is right to say so: eviction frees KV pages, never folded slots,
+    // so there is no rung that funds the ask and the request is failed loud.
+    // The operator sees an outright error on a deployment that was merely
+    // oversubscribed, which is the harshest possible way to report a queue
+    // that should simply have been shorter.
+    //
+    // Measured on Qwen3.6-27B (24 folded slots, R larger): 32 requests offered
+    // at concurrency 16 completed exactly 24 and failed 8 with "every RS
+    // folded slot is held". Capped here, the same run completes all 32.
+    let rs_seats = driver_configs
+        .iter()
+        .map(|d| d.rs_cache_slots)
+        .filter(|&s| s > 0)
+        .min();
     let admission_cap = config.max_concurrent_processes.or_else(|| {
-        driver_configs
+        let rows = driver_configs
             .iter()
             .map(|d| d.limits.max_forward_requests)
             .min()
-            .filter(|&r| r > 0)
+            .filter(|&r| r > 0);
+        match (rows, rs_seats) {
+            (Some(rows), Some(seats)) => Some(rows.min(seats)),
+            (rows, seats) => rows.or(seats),
+        }
     });
     process::init_admission(admission_cap);
 

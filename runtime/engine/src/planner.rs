@@ -181,7 +181,12 @@ impl PoolPort for RegistryPool {
     }
 
     fn rs_stats(&self) -> (u32, u32) {
-        self.with_rs(|rs| (rs.available_slots() as u32, rs.capacity_slots()))
+        // Retire first: a slot released by a departed process sits in the
+        // pool's pending list and is invisible to `available_slots` until
+        // something retires it. The starvation rung re-reads these numbers
+        // immediately before destroying a request, so reporting the free list
+        // alone would have it kill the head over slots that are already back.
+        self.with_rs(|rs| (rs.reservable_slots() as u32, rs.capacity_slots()))
     }
 
     fn reclaim_idle(&self) -> u32 {
@@ -229,6 +234,10 @@ impl PoolPort for RegistryPool {
         self.with_kv_tagged("planner-release", |kv| kv.release_device_reservation(pages));
     }
 
+    /// Reserve folded slots. `RsStore::reserve_slots` retires the pending list
+    /// before reporting failure, so an empty answer here means the pool really
+    /// is exhausted rather than merely un-retired -- which is what the
+    /// starvation rung's "no completion can ever arrive" conclusion rests on.
     fn reserve_rs(&self, count: u32) -> Option<Vec<crate::store::rs::RsSlotId>> {
         self.with_rs(|rs| rs.reserve_slots(count as usize))
     }

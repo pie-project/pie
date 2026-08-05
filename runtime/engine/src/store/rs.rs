@@ -55,7 +55,7 @@ pub mod write;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::pool::{Pool, PoolId};
@@ -280,7 +280,21 @@ pub struct RsStore {
     working_sets: GenMap<RsWsMarker, RsEntry>,
     /// See `KvStore::seq`: submission sequence for epoch retirement.
     seq: u64,
-    in_flight: u64,
+    /// Sequences of prepared writes that have not yet settled, smallest
+    /// first. The OLDEST of these is what bounds retirement: a slot recycled
+    /// at epoch E can still be referenced by any write prepared at or before
+    /// E, and by nothing prepared after it.
+    ///
+    /// This used to be a bare count, which could only answer "is anything in
+    /// flight at all" -- so retirement was possible only at full idle. Under
+    /// sustained load the store is never idle, freed slots accumulated
+    /// unretired, and the pool bled to empty while every one of its slots was
+    /// releasable. Keeping the sequences lets retirement advance continuously
+    /// and reduces to the old behaviour exactly when nothing is outstanding.
+    outstanding: BTreeSet<u64>,
+    /// Prepared sequences covered by each published receipt, so settlement
+    /// removes precisely what it published rather than guessing by count.
+    receipts: HashMap<u64, Vec<u64>>,
 }
 
 impl RsStore {
@@ -290,7 +304,8 @@ impl RsStore {
             refs: HashMap::new(),
             working_sets: GenMap::new(),
             seq: 0,
-            in_flight: 0,
+            outstanding: BTreeSet::new(),
+            receipts: HashMap::new(),
         }
     }
 
@@ -299,15 +314,18 @@ impl RsStore {
         self.seq
     }
 
-    /// Retire everything immediately when no prepared write is in flight.
+    /// Retire every epoch no outstanding write can still reference.
     ///
-    /// Nothing in flight means no device operation can still reference a
-    /// recycled slot, so every pending epoch is releasable — the bound is the
-    /// in-flight count, never the epoch value (host ops such as
-    /// `release_working_set` tag frees with caller-supplied epochs).
+    /// A slot recycled at epoch E is referenced only by writes prepared at or
+    /// before E, so it becomes free once the oldest unsettled write is newer
+    /// than E. With nothing outstanding that bound is unlimited, which is the
+    /// old "retire only when fully idle" behaviour -- but now it is the
+    /// special case rather than the only case, so a busy store still returns
+    /// its freed slots.
     pub fn retire_idle(&mut self) {
-        if self.in_flight == 0 {
-            self.pool.retire_through(u64::MAX);
+        match self.outstanding.iter().next() {
+            Some(&oldest) => self.pool.retire_through(oldest.saturating_sub(1)),
+            None => self.pool.retire_through(u64::MAX),
         }
     }
 
@@ -823,7 +841,7 @@ impl RsStore {
             .collect();
 
         self.seq += 1;
-        self.in_flight += 1;
+        self.outstanding.insert(self.seq);
         Ok(RsPreparedWrite {
             fold_len_is_bound: false,
             ws,
@@ -872,15 +890,13 @@ impl RsStore {
             return Err(error);
         }
         let rows = prepared.len();
-        let seq = prepared
-            .iter()
-            .map(RsPreparedWrite::seq)
-            .max()
-            .unwrap_or(self.seq);
+        let prepared_seqs: Vec<u64> = prepared.iter().map(RsPreparedWrite::seq).collect();
+        let seq = prepared_seqs.iter().copied().max().unwrap_or(self.seq);
         let mut folds = RsPendingFolds::default();
         for write in prepared {
             self.publish_prevalidated(write, &mut folds);
         }
+        self.receipts.insert(seq, prepared_seqs);
         Ok((RsPublished::new(seq, rows), folds))
     }
 
@@ -980,7 +996,11 @@ impl RsStore {
     /// The mapping is already authoritative (fail-stop, as in `KvStore`); all
     /// that remains is releasing the in-flight hold on pool retirement.
     pub fn settle(&mut self, published: RsPublished) {
-        self.in_flight = self.in_flight.saturating_sub(published.rows() as u64);
+        if let Some(seqs) = self.receipts.remove(&published.seq()) {
+            for seq in seqs {
+                self.outstanding.remove(&seq);
+            }
+        }
         self.retire_idle();
     }
 
@@ -988,9 +1008,9 @@ impl RsStore {
     /// failure between `prepare` and `publish_batch`. The committed mapping
     /// was never touched, so only the allocation is returned.
     pub fn cancel_prepared(&mut self, prepared: RsPreparedWrite) {
+        self.outstanding.remove(&prepared.seq);
         self.pool
             .recycle_after_epoch(prepared.allocated, prepared.seq);
-        self.in_flight = self.in_flight.saturating_sub(1);
         self.retire_idle();
     }
 
@@ -1118,13 +1138,39 @@ impl RsStore {
         self.pool.available()
     }
 
+    /// Free slots available to reserve right now, including any that only a
+    /// retirement stands between. `available_slots` reads the free list alone,
+    /// which under-reports whenever a holder has just departed -- and the
+    /// planner's starvation rung re-reads this immediately before destroying a
+    /// request, so it must not see a pool that is only bookkeeping-empty.
+    pub fn reservable_slots(&mut self) -> usize {
+        if self.pool.available() == 0 {
+            self.retire_idle();
+        }
+        self.pool.available()
+    }
+
     pub fn capacity_slots(&self) -> u32 {
         self.pool.capacity()
     }
 
     /// Reserve concrete slot ids for one acquisition grant. The caller owns
     /// them until consumed by a reserved-path prepare or released.
+    ///
+    /// Retires the pending list before reporting failure. A released slot does
+    /// not return to the free list directly -- `decref` parks it pending an
+    /// epoch, and until now only the fire path retired it. That made the pool
+    /// self-wedging at capacity: the last holder exits, its slots go pending,
+    /// the next reservation finds the free list empty, and the fire that would
+    /// have retired those slots is the one that cannot start without them.
+    /// Retiring here is safe for the same reason `retire_idle` is safe
+    /// anywhere -- it is gated on the in-flight count, so nothing outstanding
+    /// can still reference a recycled slot.
     pub fn reserve_slots(&mut self, count: usize) -> Option<Vec<RsSlotId>> {
+        if let Some(slots) = self.pool.try_alloc_n(count) {
+            return Some(slots);
+        }
+        self.retire_idle();
         self.pool.try_alloc_n(count)
     }
 
