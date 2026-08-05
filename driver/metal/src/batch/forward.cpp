@@ -863,9 +863,18 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // is the one case that matters most: it re-reserved the entire model
     // alongside its own mapping and the first command buffer came back out of
     // memory.
+    const std::size_t extra = SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
     const std::size_t heap_bytes = (weights >= streamed ? weights - streamed : 0) +
-                                   (slab ? std::size_t(cfg.expert_slab_bytes) : 0) +
-                                   SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
+                                   (slab ? std::size_t(cfg.expert_slab_bytes) : 0) + extra;
+    // These families carry their KV inside `extra_heap_bytes` rather than in
+    // an elastic budget, so the breakdown the other path traces is one number
+    // here -- but it is the number `max_model_len` moves, and a knob whose
+    // effect cannot be observed is a knob nobody can tune.
+    if (std::getenv("PIE_METAL_LOAD_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[pie-metal] load: ctx %d tokens; kv, state and scratch %.1f MB\n",
+                     max_ctx_, double(extra) / (1024.0 * 1024.0));
+    }
     // What to ALLOCATE and what must be RESIDENT are two numbers, and this
     // refusal is about the second. Weights bound where they lie leave the heap
     // but not the working set -- `wrap_host_memory` puts them in the residency
@@ -1031,6 +1040,17 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     const ElasticBreakdown elastic_parts{
         plan_.kv_bytes, plan_.kv_pool_bytes, plan_.state_bytes,
         plan_.scratch_bytes + (taps ? 0u : scratch_pool_bytes)};
+    // The same four numbers the refusal prints, printed on the path that
+    // SUCCEEDS too. A knob whose effect is only visible when the model fails
+    // to load is a knob nobody can tune.
+    if (std::getenv("PIE_METAL_LOAD_TRACE") != nullptr) {
+        const auto mb = [](std::size_t b) { return double(b) / (1024.0 * 1024.0); };
+        std::fprintf(stderr,
+                     "[pie-metal] load: ctx %d tokens; kv ring %.1f MB, kv pool %.1f MB, "
+                     "state %.1f MB, scratch %.1f MB\n",
+                     max_ctx_, mb(elastic_parts.kv_ring), mb(elastic_parts.kv_pool),
+                     mb(elastic_parts.state), mb(elastic_parts.scratch));
+    }
     if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err,
                           &elastic_parts))
         return false;

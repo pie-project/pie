@@ -420,6 +420,12 @@ pub fn write_metal_startup_toml(
         "kv_cache_dtype",
         options.kv_cache_dtype.clone(),
     );
+    // Omitted when unset rather than written as 0: the driver reads absent and
+    // zero the same way, and a config that does not mention the knob is the
+    // honest record of a run that did not use it.
+    if let Some(len) = options.max_model_len {
+        insert_int(&mut batching, "max_model_len", len);
+    }
     insert_table(&mut doc, "batching", batching);
 
     let mut runtime = toml::Table::new();
