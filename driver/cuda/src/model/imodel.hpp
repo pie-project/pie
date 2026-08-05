@@ -92,6 +92,16 @@ struct ModelCapabilities {
     // and a family that quietly materialised logits anyway would leave the
     // epilogue publishing uninitialised memory as token ids.
     bool supports_fused_lm_head_argmax = false;
+    // Whether the boot-time graph lattice (synthetic geometry: one shared
+    // page, kv_len=1) may pre-capture this deployment's decode buckets.
+    // On plan-free force_prefill deployments (GQA ratio keeps the decode
+    // kernel out; decode rides BatchPrefill) the capture-time attention
+    // launch is configured for the synthetic shape and REPLAYS ~700x slow
+    // against real geometry (7.2 ms/layer measured on Qwen2.5-14B/L40S —
+    // the "bimodal collapse", dev_merge_playbook.md). First-use capture
+    // with real metadata is correct — the nemotron_h precedent, declared
+    // as a capability instead of a name check.
+    bool upfront_capture_safe          = true;
 };
 
 // Polymorphic per-model interface. Implementations hold refs to per-arch

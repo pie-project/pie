@@ -61,6 +61,7 @@ void ForwardFn::attach_model(model::IModel* m) {
     supports_hook_graph_capture   = caps.supports_hook_graph_capture;
     supports_supergraph           = caps.supports_supergraph;
     supports_fused_lm_head_argmax = caps.supports_fused_lm_head_argmax;
+    upfront_capture_safe          = caps.upfront_capture_safe;
 }
 
 void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
@@ -501,6 +502,20 @@ cudaGraphExec_t capture_forward_graph_exec(
         const char* v = std::getenv("PIE_GRAPH_NODE_TRACE");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
+    // PIE_GRAPH_DOT_DIR: dump every captured graph's full topology (node
+    // kinds, event edges, kernel names) as DOT — the tool that names which
+    // subsystem's event-record/wait pairs ended up inside a bucket graph.
+    static const char* dot_dir = std::getenv("PIE_GRAPH_DOT_DIR");
+    if (dot_dir != nullptr && dot_dir[0] != '\0') {
+        static std::atomic<int> dot_seq{0};
+        const int seq = dot_seq.fetch_add(1);
+        const std::string path = std::string(dot_dir) + "/graph_R" +
+            std::to_string(R) + "_N" + std::to_string(N) + "_" +
+            std::to_string(seq) + ".dot";
+        cudaGraphDebugDotPrint(graph.get(), path.c_str(),
+                               cudaGraphDebugDotFlagsVerbose);
+        cudaGetLastError();
+    }
     if (node_trace) {
         std::size_t nodes = 0;
         cudaGraphGetNodes(graph.get(), nullptr, &nodes);
@@ -557,6 +572,12 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
         // real slot/page metadata is correct, so leave the cache cold here.
         return skip_upfront_capture(
             "nemotron_h recurrent state requires first-use capture");
+    }
+    if (!engine.forward_fn.upfront_capture_safe) {
+        return skip_upfront_capture(
+            "model declares synthetic upfront capture unsafe (plan-free "
+            "force_prefill attention bakes capture-shape launch config); "
+            "buckets capture on first use with real geometry");
     }
     const char* disable_upfront = std::getenv("PIE_CUDA_DISABLE_UPFRONT_GRAPHS");
     if (disable_upfront != nullptr && disable_upfront[0] != '\0' &&

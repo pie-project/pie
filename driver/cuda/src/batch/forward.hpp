@@ -101,6 +101,8 @@ struct ForwardFn {
     // Mirrors `ModelCapabilities::supports_fused_lm_head_argmax`: the attached
     // model's `body()` honours `ForwardInputs::logits_argmax_chunk_tokens`.
     bool supports_fused_lm_head_argmax = false;
+    // Mirrors `ModelCapabilities::upfront_capture_safe`.
+    bool upfront_capture_safe = true;
 
     // All metadata needed to execute one forward body call. Bundled as a
     // struct so adding a new field is a one-site addition rather than a

@@ -75,6 +75,11 @@ LlamaLikeModel::LlamaLikeModel(
     caps_.supports_fused_lm_head_argmax =
         weights_.lm_head != nullptr &&
         ops::lm_head_argmax_supported(*weights_.lm_head);
+    // force_prefill decode rides the plan-free BatchPrefill dispatch whose
+    // capture-time launch config binds the synthetic lattice shape — those
+    // pre-captured buckets replay pathologically (see the capability's
+    // declaration). Everything else keeps the boot lattice.
+    caps_.upfront_capture_safe = !fwd_cfg_.force_prefill_path;
 }
 
 void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
