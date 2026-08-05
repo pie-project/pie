@@ -17,44 +17,18 @@
 namespace pie::metal::shared_kernels {
 
 /// Params structs, replicated EXACTLY from the .metal sources.
-struct RmsParams {          // rms_norm.metal:22      (buffer 3)
-    float eps;
-    std::uint32_t axis_size;  // feature dim
-    std::uint32_t w_stride;   // 1 (contiguous)
-    std::uint32_t plus_one;   // 1 applies the `(1 + w)` gain, 0 uses `w` raw
-    /// A constant multiplier on the weight, defaulted so the four-field
-    /// aggregate initializers everywhere else keep meaning what they meant.
-    ///
-    /// Gemma 4's router is the only thing that needs it: mlx-lm normalizes with
-    /// `scale * hidden**-0.5`, and the checkpoint stores `scale`. Folding the
-    /// root at load would mean writing to a mapping the driver deliberately
-    /// never writes to.
-    float gain = 1.0f;
-};
+#include "../kernels/rms_params.h"
+static_assert(sizeof(RmsParams) == 20);
+static_assert(sizeof(VNormParams) == 8);
+static_assert(sizeof(GatedRmsParams) == 8);
 struct RowGatherParams {    // row_gather.metal       (buffer 3)
     std::uint32_t width;
     std::uint32_t count;
 };
-// The routing kernels live in `gptoss.metal` for historical reasons -- that is
-// the family that first needed them -- but neither is gpt-oss-specific, and
-// both are dispatched by the llama family's MoE path too. The mirrors belong
-// here for the same reason the rms one does.
-struct RouterParams {       // gptoss.metal:11        (buffer 3)
-    std::uint32_t n_experts;
-    std::uint32_t experts_per_token;
-};
-struct ExpertCombineParams {  // gptoss.metal         (buffer 3)
-    std::uint32_t width;
-    std::uint32_t experts_per_token;
-};
-struct MoeRouteParams {     // moe_route.metal:34
-    std::uint32_t n;
-    std::uint32_t n_experts;
-    std::uint32_t experts_per_token;
-    std::uint32_t tile_rows;
-    std::uint32_t padded;
-    std::uint32_t width;
-};
+#include "../kernels/moe_params.h"
+static_assert(sizeof(RouterParams) == 8);
+static_assert(sizeof(ExpertCombineParams) == 8);
+static_assert(sizeof(MoeRouteParams) == 24);
 
 /// Flat elementwise `dispatchThreads` grid: one thread per element, capped at a
 /// 256-wide threadgroup.
@@ -70,10 +44,10 @@ inline void elementwise_dispatch(int n, Grid& g, Threadgroup& tg) {
 /// that refuses an oversized config read the same number. The kernel clamps to
 /// them; a host that also clamped would route with fewer experts than the
 /// config asked for and say nothing, so `geometry_from_facts` refuses instead.
-constexpr int kRouterMaxTopK = 16;                // gptoss.metal:39
+constexpr int kRouterMaxTopK = 16;                // moe_route.metal
 constexpr std::uint32_t kRouterMaxExperts = 1024;  // one lane per expert
 
-/// `router_topk`: one threadgroup per token row, one lane per expert.
+/// `router_topk` in moe_route.metal: one threadgroup per row, one lane per expert.
 ///
 /// Rounded up to a whole simdgroup, because the kernel reduces ACROSS
 /// simdgroups and a partial one would leave a reduction slot uninitialised.

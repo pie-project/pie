@@ -22,6 +22,7 @@
 namespace pie::metal::gemma4 {
 
 using shared_kernels::RowGatherParams;
+using shared_kernels::VNormParams;
 using shared_kernels::elementwise_dispatch;
 
 /// Params structs, replicated EXACTLY from the .metal sources. A mismatch here
@@ -47,11 +48,6 @@ struct PleCombineParams {   // ple_combine.metal:15   (buffer 3)
     float inv_sqrt2;
     std::uint32_t n;
 };
-struct VNormParams {        // vnorm.metal:14         (buffer 2)
-    float eps;
-    std::uint32_t axis_size;
-};
-
 /// The PSOs this family needs beyond the shared set.
 struct Gemma4Psos {
     // Two head widths, because head_dim is per attention type: sliding layers

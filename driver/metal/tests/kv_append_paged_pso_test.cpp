@@ -89,10 +89,16 @@ int main() {
     // This test checks the M>1 row ABI, not the quantization axis, so it names
     // the pair the assertions below spell: gs_64/b_4.
     const pie::metal::AffineFormat q{/*bits=*/4, /*group=*/64};
-    expect(load_decode_psos(*ctx, kernels_dir, base, q, /*with_argmax=*/false, &err,
-                            /*fuse_residual=*/false, /*gdn_prep=*/true),
+    expect(load_decode_psos(
+               *ctx, kernels_dir, base, q, &err,
+               pie::metal::DecodePsoFeatures{
+                   .gdn = true, .gated_attention = true, .sdpa_d256 = true}),
            "load_decode_psos compiles base kernels after MB row ABI additions (" + err + ")");
-    const bool ok = load_multibatch_psos(*ctx, kernels_dir, psos, q, /*with_d512=*/true, &err);
+    const bool ok = load_multibatch_psos(
+        *ctx, kernels_dir, psos, q, &err,
+        pie::metal::MultiBatchPsoFeatures{
+            .d512 = true, .sdpa_d256 = true, .gdn = true,
+            .residual = true, .strided = true});
     expect(ok, "load_multibatch_psos compiles successfully (" + err + ")");
     expect(psos.embed_mb.valid(), "embed_gather_mb_4bit_bfloat16_gs_64_b_4 compiled");
     expect(psos.rope_mb.valid(), "rope_neox_mb_bfloat16 compiled");
@@ -104,7 +110,7 @@ int main() {
     expect(psos.kv_append_paged.valid(),
           "kv_append_paged_bfloat16 compiled — Phase 1b/3 review's cited gap "
           "(\"kv_append_paged has no PSO\") is closed at the compile level");
-    expect(psos.valid(), "MultiBatchPsos::valid() (all required paged/slotted PSOs) is true");
+    expect(psos.valid(), "MultiBatchPsos::valid() reports the shared M>1 substrate complete");
 
     if (ok) {
         constexpr std::size_t width = 256;

@@ -179,8 +179,8 @@ enum class SdpaPaged : uint8_t {
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
-// RmsParams{eps, axis_size, w_stride, plus_one}. qwen3.5 sets plus_one=1 for ALL
-// norms (attn_norm/q_norm/k_norm/ffn_norm/final_norm) → effective gain (1+weight).
+// RmsParams{eps, axis_size, w_stride, plus_one, gain}. qwen3.5 sets plus_one=1
+// for every norm; Gemma 4's router uses gain=hidden^-0.5.
 enum class Rms : uint8_t { X = 0, W = 1, Out = 2, Params = 3 };
 
 // residual add (golden `attn_resid`, `layer_out`): Out = X + Residual, elementwise.
@@ -316,6 +316,9 @@ enum class GdnCoreRecurrent : uint8_t {
     Params       = 10, // GdnCoreParams& (constant)
     SlotOfToken  = 11, // u32[N] — append-only slotted-MB variant only
 };
+// The prefill recurrent scan reuses these argument-table ordinals but reads
+// only RecurrentState, CoreOut, PreQ/PreK/PreGate, Params, and SlotOfToken;
+// buffers 0/1/4/5/9 belong only to the per-token recurrent kernel.
 
 // gated RMSNorm (GDN; golden `gdn_core` = post-norm): Out = (1+0)·rmsnorm(X)·silu(Z)
 // over V_d per V_head. W = gate_norm_w (RAW, F32, NO +1). Buffer 4 = GatedRmsParams

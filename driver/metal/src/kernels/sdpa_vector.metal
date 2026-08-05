@@ -18,6 +18,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "sdpa_online.h"
+
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_vector_decode(
     const device T* queries [[buffer(0)]],
@@ -85,12 +87,9 @@ template <typename T, int D, int V = D>
     }
     score = simd_sum(score);
 
-    U new_max = max(max_score, score);
-    U factor = fast::exp(max_score - new_max);
-    U exp_score = fast::exp(score - new_max);
-
-    max_score = new_max;
-    sum_exp_score = sum_exp_score * factor + exp_score;
+    U factor, exp_score;
+    sdpa_online_update(
+        score, max_score, sum_exp_score, factor, exp_score);
     for (int j = 0; j < v_per_thread; j++) {
       o[j] = o[j] * factor + exp_score * values[j];
     }
