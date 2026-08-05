@@ -44,7 +44,7 @@
 //!   `driver/metal/tools/rawmetal/plan_cost_probe.cpp`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
@@ -92,6 +92,107 @@ pub struct OptimizeArgs {
     /// Report what would be done without doing it.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// The facts the author needs, read off an artifact's `pie.model/1` descriptor.
+///
+/// The successor `read_facts` names, arriving early for the one source that
+/// already has it. Nothing here probes alternatives or steps through
+/// `text_config`, because normalizing those away is what the descriptor *is* —
+/// so this reads the fields flat and defaults only where the schema does.
+fn read_facts_from_descriptor(descriptor: &serde_json::Value) -> Result<ModelFacts> {
+    let version = descriptor
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if version != pie_model_config::VERSION {
+        bail!(
+            "the artifact's model descriptor is {version:?}, not {:?}",
+            pie_model_config::VERSION
+        );
+    }
+    let get_u32 = |key: &str| {
+        descriptor
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    Ok(ModelFacts {
+        model_type: descriptor
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("the artifact's model descriptor declares no model_type"))?
+            .to_string(),
+        quant_method: descriptor
+            .get("quant_method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        num_hidden_layers: get_u32("num_hidden_layers").ok_or_else(|| {
+            anyhow!("the artifact's model descriptor declares no num_hidden_layers")
+        })?,
+        num_experts: get_u32("num_experts").unwrap_or(0),
+        head_dim: get_u32("head_dim").unwrap_or(0),
+        mamba_groups: get_u32("mamba_n_groups").unwrap_or(0),
+        tied_embeddings: descriptor
+            .get("tie_word_embeddings")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        // `HfConfig` folds MLX's `quantization` and HF's `quantization_config`
+        // into one pair, so there is no dialect left to choose between here.
+        mlx_quant_bits: get_u32("quant_bits").unwrap_or(0),
+        mlx_quant_group_size: get_u32("quant_group_size").unwrap_or(0),
+        num_kv_shared_layers: get_u32("num_kv_shared_layers").unwrap_or(0),
+    })
+}
+
+/// pie's own objects, lifted out of an artifact being re-optimized.
+///
+/// An artifact is the one source that arrives with its metadata already
+/// compiled, and `compile_descriptor` / `compile_tokenizer` both answer `None`
+/// for it — correctly, since there is no `config.json` or `tokenizer.json` to
+/// compile. Writing the output without them would silently produce an artifact
+/// that cannot serve, so they are carried across verbatim instead.
+struct CarriedObjects {
+    descriptor: serde_json::Value,
+    descriptor_bytes: Vec<u8>,
+    tokenizer: Vec<(String, Vec<u8>)>,
+}
+
+fn read_carried_objects(path: &Path) -> Result<CarriedObjects> {
+    let checkpoint = parse_checkpoint_metadata(path)
+        .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
+    let descriptor_bytes =
+        pie_loader::checkpoint::read::read_meta(&checkpoint, DESCRIPTOR_OBJECT)?.ok_or_else(
+            || {
+                anyhow!(
+                    "{} carries no {DESCRIPTOR_OBJECT}; it is a checkpoint file rather \
+                     than a pie artifact, and optimize needs the normalized config",
+                    path.display()
+                )
+            },
+        )?;
+    let descriptor: serde_json::Value = serde_json::from_slice(&descriptor_bytes)
+        .map_err(|err| anyhow!("cannot parse {}'s model descriptor: {err}", path.display()))?;
+    let mut tokenizer = Vec::with_capacity(pie_tokenizer::canonical::OBJECTS.len());
+    for name in pie_tokenizer::canonical::OBJECTS {
+        let bytes = pie_loader::checkpoint::read::read_meta(&checkpoint, name)?.ok_or_else(
+            || {
+                anyhow!(
+                    "{} carries a model descriptor but not {name}; an artifact with half \
+                     its metadata cannot serve, and this command does not compile the rest",
+                    path.display()
+                )
+            },
+        )?;
+        tokenizer.push((name.to_string(), bytes));
+    }
+    Ok(CarriedObjects {
+        descriptor,
+        descriptor_bytes,
+        tokenizer,
+    })
 }
 
 /// The facts the author needs, read off `config.json` the way the CUDA
@@ -162,19 +263,27 @@ fn read_facts(config: &serde_json::Value) -> Result<ModelFacts> {
 
 pub fn run(args: OptimizeArgs) -> Result<()> {
     let source = resolve_source(&args.source)?;
-    if source.path.is_file() {
-        bail!(
-            "optimize needs a snapshot directory (it reads config.json for the \
-             model's facts); {} is a single file",
-            source.path.display()
-        );
-    }
-    let config_path = source.path.join("config.json");
-    let raw = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("cannot read {}", config_path.display()))?;
-    let config: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|err| anyhow!("cannot parse {}: {err}", config_path.display()))?;
-    let facts = read_facts(&config)?;
+    // Two kinds of source, and the difference is only where the facts live: a
+    // snapshot states them in `config.json` and a pie artifact states them in
+    // the descriptor it was imported with. The artifact is the better source
+    // of the two -- it is the normalized form, so nothing is re-derived and
+    // the two readers cannot drift on a defaulting rule.
+    let carried = if source.path.is_file() {
+        Some(read_carried_objects(&source.path)?)
+    } else {
+        None
+    };
+    let facts = match &carried {
+        Some(objects) => read_facts_from_descriptor(&objects.descriptor)?,
+        None => {
+            let config_path = source.path.join("config.json");
+            let raw = std::fs::read_to_string(&config_path)
+                .with_context(|| format!("cannot read {}", config_path.display()))?;
+            let config: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|err| anyhow!("cannot parse {}: {err}", config_path.display()))?;
+            read_facts(&config)?
+        }
+    };
 
     let runtime_quant = RuntimeQuant::resolve(args.quant.as_deref().unwrap_or(""), args.fp8_native)
         .map_err(|err| anyhow!("--quant: {err}"))?;
@@ -283,13 +392,30 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
         Tensor(&'a pie_loader::types::TensorDecl),
     }
     let mut meta: Vec<(String, Vec<u8>)> = Vec::new();
-    if let Some(canonical) = &tokenizer {
-        for (path, bytes) in canonical.objects() {
-            meta.push((meta_name(path), bytes.to_vec()));
+    match &carried {
+        // Already compiled once, at import. Recompiling is not available here
+        // (there is nothing to recompile from) and would not be wanted anyway:
+        // this command re-lays weights, so the metadata is carried, not
+        // re-derived.
+        Some(objects) => {
+            for (path, bytes) in &objects.tokenizer {
+                meta.push((meta_name(path), bytes.clone()));
+            }
+            meta.push((
+                meta_name(DESCRIPTOR_OBJECT),
+                objects.descriptor_bytes.clone(),
+            ));
         }
-    }
-    if let Some(descriptor) = &descriptor {
-        meta.push((meta_name(DESCRIPTOR_OBJECT), descriptor.clone()));
+        None => {
+            if let Some(canonical) = &tokenizer {
+                for (path, bytes) in canonical.objects() {
+                    meta.push((meta_name(path), bytes.to_vec()));
+                }
+            }
+            if let Some(descriptor) = &descriptor {
+                meta.push((meta_name(DESCRIPTOR_OBJECT), descriptor.clone()));
+            }
+        }
     }
     let mut entries: Vec<(&str, Entry<'_>)> = meta
         .iter()
