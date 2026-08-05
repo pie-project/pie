@@ -25,9 +25,9 @@ use pie_loader::contract::ModelContract;
 use pie_loader::error::Error;
 use pie_loader::plan::StorageTarget;
 
-use crate::common::builder::Builder;
-use crate::common::facts::ModelFacts;
-use crate::common::policy::{Mxfp4MoePolicy, Naming, Policy};
+use pie_model_common::builder::Builder;
+use pie_model_common::facts::ModelFacts;
+use pie_model_common::policy::{Mxfp4MoePolicy, Naming, Policy};
 
 /// What a row dispatches to: the family's authoring pass.
 pub type Author = fn(&mut Builder<'_>) -> Result<(), Error>;
@@ -42,54 +42,54 @@ pub type Author = fn(&mut Builder<'_>) -> Result<(), Error>;
 /// other. That check can only exist if at least this one can be enumerated.
 pub const HF_ROWS: &[(&str, Author)] = &[
     // ── llama lineage: dense/GQA decoders sharing one storage schema.
-    ("qwen3", crate::llama::contract::author_llama_like),
-    ("qwen2", crate::llama::contract::author_llama_like),
-    ("llama", crate::llama::contract::author_llama_like),
-    ("llama3", crate::llama::contract::author_llama_like),
-    ("mistral", crate::llama::contract::author_llama_like),
-    ("mistral3", crate::llama::contract::author_dense),
-    ("ministral3", crate::llama::contract::author_dense),
-    ("olmo2", crate::llama::contract::author_dense),
-    ("olmo3", crate::llama::contract::author_dense),
-    ("phi3", crate::llama::contract::author_phi3),
+    ("qwen3", pie_model_llama_3::contract::author_llama_like),
+    ("qwen2", pie_model_llama_3::contract::author_llama_like),
+    ("llama", pie_model_llama_3::contract::author_llama_like),
+    ("llama3", pie_model_llama_3::contract::author_llama_like),
+    ("mistral", pie_model_llama_3::contract::author_llama_like),
+    ("mistral3", pie_model_llama_3::contract::author_dense),
+    ("ministral3", pie_model_llama_3::contract::author_dense),
+    ("olmo2", pie_model_llama_3::contract::author_dense),
+    ("olmo3", pie_model_llama_3::contract::author_dense),
+    ("phi3", pie_model_phi_3::contract::author_phi3),
     // ── Mixtral family: plain Mixtral needs nothing beyond the dense
     //    rules; GPT-OSS is its own author (MXFP4 expert triplets).
-    ("mixtral", crate::llama::contract::author_dense),
-    ("gpt_oss", crate::gptoss::contract::author_gpt_oss),
+    ("mixtral", pie_model_llama_3::contract::author_dense),
+    ("gpt_oss", pie_model_gpt_oss::contract::author_gpt_oss),
     // ── Gemma-4: nested decoder, router-scale fold, encode scoping.
-    ("gemma4", crate::gemma::contract::author_gemma4),
-    ("gemma4_text", crate::gemma::contract::author_gemma4),
+    ("gemma4", pie_model_gemma_4::contract::author_gemma4),
+    ("gemma4_text", pie_model_gemma_4::contract::author_gemma4),
     // ── GLM-5.1: FP8 kv_b_proj dequant + per-expert stacks.
-    ("glm_moe_dsa", crate::glm5::contract::author_glm5),
+    ("glm_moe_dsa", pie_model_glm_5::contract::author_glm5),
     // ── CSM: fp32 checkpoints, bf16 kernels.
-    ("csm", crate::csm::contract::author_csm),
+    ("csm", pie_model_csm::contract::author_csm),
     // ── Qwen3.5 hybrids: GDN blocked shards; the MoE members add the
     //    shared-expert join and per-expert stacks.
-    ("qwen3_5", crate::qwen3_5::contract::author_qwen3_5),
-    ("qwen3_5_text", crate::qwen3_5::contract::author_qwen3_5),
+    ("qwen3_5", pie_model_qwen_3_5::contract::author_qwen3_5),
+    ("qwen3_5_text", pie_model_qwen_3_5::contract::author_qwen3_5),
     // Qwen3-VL binds the plain Qwen3 text tower; its contract is the
     // generic dense one, not the hybrid's.
-    ("qwen3_vl", crate::llama::contract::author_dense),
-    ("qwen3_vl_text", crate::llama::contract::author_dense),
-    ("qwen3_moe", crate::qwen3_5::contract::author_qwen3_5_moe),
-    ("qwen3_5_moe", crate::qwen3_5::contract::author_qwen3_5_moe),
-    ("qwen3_5_moe_text", crate::qwen3_5::contract::author_qwen3_5_moe),
+    ("qwen3_vl", pie_model_llama_3::contract::author_dense),
+    ("qwen3_vl_text", pie_model_llama_3::contract::author_dense),
+    ("qwen3_moe", pie_model_qwen_3_5::contract::author_qwen3_5_moe),
+    ("qwen3_5_moe", pie_model_qwen_3_5::contract::author_qwen3_5_moe),
+    ("qwen3_5_moe_text", pie_model_qwen_3_5::contract::author_qwen3_5_moe),
     // ── Nemotron-H: Mamba2 mixers sharded band-by-band, packed experts.
-    ("nemotron_h", crate::nemotron_h::contract::author_nemotron_h),
+    ("nemotron_h", pie_model_nemotron_h::contract::author_nemotron_h),
     // ── MLA lineage: DeepSeek-V2/V3 plain; Kimi-K2 adds the prefix,
     //    the embed/lm_head memory trade, and the W4A16 expert stacks.
-    ("deepseek_v2", crate::kimi::contract::author_deepseek_mla),
-    ("deepseek_v3", crate::kimi::contract::author_deepseek_mla),
-    ("kimi_k2", crate::kimi::contract::author_kimi),
-    ("kimi_k3", crate::kimi::contract_k3::author_kimi_k3),
+    ("deepseek_v2", pie_model_kimi_k2::contract::author_deepseek_mla),
+    ("deepseek_v3", pie_model_kimi_k2::contract::author_deepseek_mla),
+    ("kimi_k2", pie_model_kimi_k2::contract::author_kimi),
+    ("kimi_k3", pie_model_kimi_k3::contract::author_kimi_k3),
     // ── DeepSeek-V4: own shard rule, MXFP4 expert stacks or groups.
-    ("deepseek_v4", crate::deepseek_v4::contract::author_deepseek_v4),
+    ("deepseek_v4", pie_model_deepseek_v4::contract::author_deepseek_v4),
     // ── Gemma 2/3/3n bind the generic dense contract.
-    ("gemma2", crate::llama::contract::author_dense),
-    ("gemma3", crate::llama::contract::author_dense),
-    ("gemma3_text", crate::llama::contract::author_dense),
-    ("gemma3n", crate::llama::contract::author_dense),
-    ("gemma3n_text", crate::llama::contract::author_dense),
+    ("gemma2", pie_model_llama_3::contract::author_dense),
+    ("gemma3", pie_model_llama_3::contract::author_dense),
+    ("gemma3_text", pie_model_llama_3::contract::author_dense),
+    ("gemma3n", pie_model_llama_3::contract::author_dense),
+    ("gemma3n_text", pie_model_llama_3::contract::author_dense),
 ];
 
 /// The MLX-naming rows: the same families at a different point in policy
@@ -99,23 +99,23 @@ pub const HF_ROWS: &[(&str, Author)] = &[
 /// — the driver decides which decode DAG to run from the same string this
 /// dispatches an author on, so the two lists have to name the same set.
 pub const MLX_ROWS: &[(&str, Author)] = &[
-    ("llama", crate::llama::contract::author_llama_mlx),
-    ("llama3", crate::llama::contract::author_llama_mlx),
-    ("mistral", crate::llama::contract::author_llama_mlx),
-    ("qwen2", crate::llama::contract::author_llama_mlx),
-    ("qwen3", crate::llama::contract::author_llama_mlx),
-    ("qwen3_moe", crate::llama::contract::author_llama_mlx),
-    ("qwen2_moe", crate::llama::contract::author_llama_mlx),
-    ("qwen3_5", crate::qwen3_5::contract::author_qwen3_5_mlx),
-    ("qwen3_5_text", crate::qwen3_5::contract::author_qwen3_5_mlx),
-    ("qwen3_5_moe", crate::qwen3_5::contract::author_qwen3_5_mlx),
-    ("qwen3_5_moe_text", crate::qwen3_5::contract::author_qwen3_5_mlx),
-    ("qwen3_next", crate::qwen3_5::contract::author_qwen3_5_mlx),
-    ("qwen3_next_text", crate::qwen3_5::contract::author_qwen3_5_mlx),
-    ("qwen3_6", crate::qwen3_5::contract::author_qwen3_5_mlx),
-    ("gemma4", crate::gemma::contract::author_gemma4_mlx),
-    ("gemma4_text", crate::gemma::contract::author_gemma4_mlx),
-    ("gpt_oss", crate::gptoss::contract::author_gpt_oss_mlx),
+    ("llama", pie_model_llama_3::contract::author_llama_mlx),
+    ("llama3", pie_model_llama_3::contract::author_llama_mlx),
+    ("mistral", pie_model_llama_3::contract::author_llama_mlx),
+    ("qwen2", pie_model_llama_3::contract::author_llama_mlx),
+    ("qwen3", pie_model_llama_3::contract::author_llama_mlx),
+    ("qwen3_moe", pie_model_llama_3::contract::author_llama_mlx),
+    ("qwen2_moe", pie_model_llama_3::contract::author_llama_mlx),
+    ("qwen3_5", pie_model_qwen_3_5::contract::author_qwen3_5_mlx),
+    ("qwen3_5_text", pie_model_qwen_3_5::contract::author_qwen3_5_mlx),
+    ("qwen3_5_moe", pie_model_qwen_3_5::contract::author_qwen3_5_mlx),
+    ("qwen3_5_moe_text", pie_model_qwen_3_5::contract::author_qwen3_5_mlx),
+    ("qwen3_next", pie_model_qwen_3_5::contract::author_qwen3_5_mlx),
+    ("qwen3_next_text", pie_model_qwen_3_5::contract::author_qwen3_5_mlx),
+    ("qwen3_6", pie_model_qwen_3_5::contract::author_qwen3_5_mlx),
+    ("gemma4", pie_model_gemma_4::contract::author_gemma4_mlx),
+    ("gemma4_text", pie_model_gemma_4::contract::author_gemma4_mlx),
+    ("gpt_oss", pie_model_gpt_oss::contract::author_gpt_oss_mlx),
 ];
 
 /// The rows this naming dispatches through.

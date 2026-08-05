@@ -121,7 +121,7 @@ fn generated_count(output: &str) -> usize {
 #[test]
 fn mock_model_reports_recurrent_state() {
     let _ = state();
-    let caps = pie_model::model().rs_caps();
+    let caps = pie_engine::model::model().rs_caps();
     assert!(
         caps.state_size > 0,
         "the mock must report a recurrent state for this suite to mean anything"

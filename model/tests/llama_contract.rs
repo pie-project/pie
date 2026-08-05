@@ -34,8 +34,8 @@ use pie_loader::plan::compile as compile_load_plan;
 use pie_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 use pie_loader::verify::ContractView;
 
-use pie_model::common::facts::ModelFacts;
-use pie_model::common::policy::Policy;
+use pie_model_common::facts::ModelFacts;
+use pie_model_common::policy::Policy;
 use pie_model::contract::author;
 
 // ── the fixture checkpoint ──────────────────────────────────────────

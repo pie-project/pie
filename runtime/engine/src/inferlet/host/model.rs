@@ -1,12 +1,12 @@
 //! pie:core/model - Model and tokenizer global functions.
 //!
 //! The engine serves exactly one model, so these are free functions over the
-//! single global [`pie_model::Model`] rather than resource methods.
+//! single global [`crate::model::Model`] rather than resource methods.
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
-use pie_model as model;
+use crate::model;
 
 impl pie::inferlet::model::Host for ProcessCtx {
     async fn name(&mut self) -> Result<String> {

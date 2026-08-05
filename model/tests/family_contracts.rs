@@ -26,8 +26,8 @@ use pie_loader::plan::{
 use pie_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 use pie_loader::verify::ContractView;
 
-use pie_model::common::facts::ModelFacts;
-use pie_model::common::policy::{Mxfp4MoeRequest, Naming, Policy, Projections};
+use pie_model_common::facts::ModelFacts;
+use pie_model_common::policy::{Mxfp4MoeRequest, Naming, Policy, Projections};
 use pie_model::contract::author;
 
 // ── fixture machinery ───────────────────────────────────────────────
@@ -876,8 +876,8 @@ fn llama_mlx_checkpoint() -> CheckpointMetadata {
 #[test]
 fn llama_mlx_metal() {
     let mut facts = facts("llama3", 1);
-    facts.mlx_quant_bits = 4;
-    facts.mlx_quant_group_size = 64;
+    facts.quant_bits = 4;
+    facts.quant_group_size = 64;
     check(
         "llama_mlx_metal",
         &llama_mlx_checkpoint(),
@@ -905,8 +905,8 @@ fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {
 #[test]
 fn qwen3_5_mlx_metal() {
     let mut facts = facts("qwen3_5", 1);
-    facts.mlx_quant_bits = 4;
-    facts.mlx_quant_group_size = 64;
+    facts.quant_bits = 4;
+    facts.quant_group_size = 64;
     check(
         "qwen3_5_mlx_metal",
         &qwen3_5_mlx_checkpoint(),
@@ -937,8 +937,8 @@ fn gemma4_mlx_checkpoint() -> CheckpointMetadata {
 #[test]
 fn gemma4_mlx_metal() {
     let mut facts = facts("gemma4_text", 2);
-    facts.mlx_quant_bits = 4;
-    facts.mlx_quant_group_size = 64;
+    facts.quant_bits = 4;
+    facts.quant_group_size = 64;
     facts.num_kv_shared_layers = 1;
     check(
         "gemma4_mlx_metal",

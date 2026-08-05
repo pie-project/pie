@@ -42,6 +42,10 @@ pie-loader = { path = "..", default-features = false }
 # through pie_model::contract. `contract` alone, so the driver link never
 # carries the chat aspect's tokenizer or image decoders.
 pie-model = { path = "../../model", default-features = false, features = ["contract"] }
+# The authoring vocabulary the request is read into. Depended on directly
+# rather than through `pie-model`'s re-export: this crate reads `ModelFacts`
+# and `Policy`, which are shared vocabulary, not any one generation.
+pie-model-common = { path = "../../model/common", default-features = false, features = ["contract"] }
 serde_json = "1.0"
 
 [dev-dependencies]

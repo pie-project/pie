@@ -1,7 +1,7 @@
 """Parsing `model/config.hpp` into a field list.
 
 One parser, imported by every emitter. There used to be two copies — the C++
-one here and the Rust one under `runtime/model-config/` — and the same bug had
+one here and the Rust one under `model/config/` — and the same bug had
 to be found and fixed in both, twice: declarations whose line ends in a `//`
 comment (24 fields, `head_dim` and `use_qk_norm` among them), then a field that
 brace-initializes without `=` (`upsampling_ratios{8, 6, 5, 4}`). Both times the

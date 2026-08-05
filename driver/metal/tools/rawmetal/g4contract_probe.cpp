@@ -14,7 +14,8 @@ int main(int argc, char** argv) {
         facts.num_hidden_layers = argc > 2 ? std::atoi(argv[2]) : 0;
         facts.num_kv_shared_layers = argc > 3 ? std::atoi(argv[3]) : 0;
         auto plan = pie::metal::compile_load_plan(
-            dir, pie::metal::metal_device_target(), "gemma4", facts);
+            dir, pie::metal::metal_device_target(),
+            pie::metal::descriptor_for_testing("gemma4", facts));
         // The plan's size, not just its success: the KV-sharing facts are only
         // observable as tensors the author declined to declare, so a probe that
         // printed OK either way could not tell whether they arrived.

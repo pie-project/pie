@@ -5,6 +5,8 @@
 #include <string>
 #include <string_view>
 
+#include <nlohmann/json.hpp>
+
 #include "model/facts.hpp"
 #include "pie_loader.h"
 #include "pie_loader/plan.hpp"
@@ -45,14 +47,47 @@ inline pie_loader::DeviceTarget metal_device_target() {
     };
 }
 
-/// Compile the plan through the Rust author: facts and policy in, plan out.
+/// Build a `pie.model/1` document from facts assembled by hand.
+///
+/// **Test and tool scaffolding.** A serving boot forwards the descriptor it
+/// was handed (`SetupConfig::descriptor_json`); this exists for the probes and
+/// numerics tests that point at a checkpoint directory with no descriptor
+/// beside it and state the two or three facts their family needs.
+///
+/// It writes the schema's own field names, which is the only reason it is
+/// tolerable to spell a descriptor here at all: a name that drifts from
+/// `pie-model-config`'s schema stops being read rather than being read wrong,
+/// because `ModelFacts::from_descriptor` takes what it recognizes and leaves
+/// the rest at its default.
+inline std::string descriptor_for_testing(std::string_view model_type,
+                                          const model::ContractFacts& facts = {}) {
+    nlohmann::json j{
+        {"version", "pie.model/1"},
+        {"model_type", std::string(model_type)},
+        {"num_hidden_layers", facts.num_hidden_layers},
+        {"num_kv_shared_layers", facts.num_kv_shared_layers},
+        {"tie_word_embeddings", facts.tied_embeddings},
+        {"quant_bits", facts.quant_bits},
+        {"quant_group_size", facts.quant_group_size},
+    };
+    return j.dump();
+}
+
+/// Compile the plan through the Rust author: the descriptor and policy in,
+/// plan out.
 ///
 /// `plan/model-in-rust.md` §6 — the driver sends what only it can know (the
-/// config facts it parsed, and that this device wants MLX names with in-place
-/// projections) and authoring happens on the loader's side, in the same
-/// `pie_model::contract` registry the CUDA boot goes through. `model_type`
-/// crosses as a fact: it is the key the author registry dispatches on, and an
-/// unknown one comes back as a diagnostic naming it rather than a plan.
+/// compiled model descriptor it was handed, and that this device wants MLX
+/// names with in-place projections) and authoring happens on the loader's
+/// side, in the same `pie_model::contract` registry the CUDA boot goes
+/// through. `model_type` reaches the author registry as a field of the
+/// descriptor; an unknown one comes back as a diagnostic naming it rather
+/// than a plan.
+///
+/// `descriptor_json` used to be a `ContractFacts` distilled here — five
+/// fields, three of them sent as zero because the Metal authors never read
+/// them. The document travels now, so which fields matter is decided beside
+/// the authors that read them rather than at each call site.
 ///
 /// What the request does NOT carry mirrors what the Metal authors never read:
 /// no runtime quantization, no MXFP4 MoE lowering choice, no component split,
@@ -62,8 +97,7 @@ inline pie_loader::DeviceTarget metal_device_target() {
 inline LoadPlan compile_load_plan(
     std::string_view snapshot_dir,
     const pie_loader::DeviceTarget& target,
-    std::string_view model_type,
-    const model::ContractFacts& facts = {}) {
+    std::string_view descriptor_json) {
     std::string open_error;
     pie_loader::Checkpoint checkpoint =
         pie_loader::Checkpoint::open(snapshot_dir, &open_error);
@@ -74,19 +108,7 @@ inline LoadPlan compile_load_plan(
     const pie_loader::PieLoaderModelRequest request{
         .checkpoint = checkpoint.get(),
         .target = pie_loader::target_spec(target),
-        .facts =
-            pie_loader::PieLoaderModelFactsView{
-                .model_type = pie_loader::borrow(model_type),
-                .quant_method = pie_loader::borrow(std::string_view{}),
-                .num_hidden_layers = facts.num_hidden_layers,
-                .num_experts = 0,
-                .head_dim = 0,
-                .mamba_groups = 0,
-                .tied_embeddings = facts.tied_embeddings,
-                .mlx_quant_bits = facts.quant_bits,
-                .mlx_quant_group_size = facts.quant_group_size,
-                .num_kv_shared_layers = facts.num_kv_shared_layers,
-            },
+        .descriptor = pie_loader::borrow(descriptor_json),
         .projections = 1,  // InPlace: the MLX lowering.
         .naming = 1,       // MLX names, which is what this bind path reads.
         .runtime_quant = 0,

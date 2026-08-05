@@ -47,7 +47,7 @@ pub struct Speech {
 /// Build the CSM audio-output prompt host-side: BOS + "[speaker]text" + EOS,
 /// using the bound model's tokenizer. Mirrors the verified prompt the CSM
 /// processor produces with `add_special_tokens=True`.
-fn csm_frame_prompt(model: &pie_model::Model, text: &str, speaker: u32) -> Vec<u32> {
+fn csm_frame_prompt(model: &crate::model::Model, text: &str, speaker: u32) -> Vec<u32> {
     let prompt = format!("[{speaker}]{text}");
     let mut ids = Vec::with_capacity(2 + text.len() / 3);
     ids.push(CSM_BOS);
@@ -65,7 +65,7 @@ impl pie::inferlet::speech::HostSpeech for ProcessCtx {
         }
         // Gate on arch and frame the prompt — all host-side.
         let prompt = {
-            let m = pie_model::model();
+            let m = crate::model::model();
             let arch = m.arch_name();
             // CSM is the only audio-output arch. The driver also guards (negative
             // status when the bound model isn't CSM), but reject early here with a

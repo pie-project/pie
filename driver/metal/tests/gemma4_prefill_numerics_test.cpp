@@ -274,7 +274,8 @@ int main(int argc, char** argv) {
         pie::metal::model::ContractFacts facts;
         facts.num_hidden_layers = g.n_layers;
         facts.num_kv_shared_layers = g.num_kv_shared_layers;
-        plan = compile_load_plan(ckpt, metal_device_target(), "gemma4", facts);
+        plan = compile_load_plan(ckpt, metal_device_target(),
+                                 descriptor_for_testing("gemma4", facts));
     } catch (const std::exception& e) {
         std::printf("  FAIL  compile_load_plan: %s\n", e.what());
         return 1;

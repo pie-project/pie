@@ -20,44 +20,19 @@
 use pie_loader::cache_key::{ArtifactInputs, artifact_cache_key};
 use pie_loader::plan::compile as compile_load_plan;
 
-use pie_model::common::facts::ModelFacts;
-use pie_model::common::policy::Mxfp4MoePolicy;
-use pie_model::common::policy::{
+use pie_model_common::facts::ModelFacts;
+use pie_model_common::policy::Mxfp4MoePolicy;
+use pie_model_common::policy::{
     Component, FamilyKnobs, Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant,
 };
 
 use super::arena;
 use super::checkpoint::PieLoaderCheckpoint;
 use super::entry::{
-    DiagnosticSink, PieLoaderDiagnostics, PieLoaderStatus, PieLoaderTargetSpec, as_str,
+    DiagnosticSink, PieLoaderDiagnostics, PieLoaderStatus, PieLoaderTargetSpec, as_bytes,
     compile_error_status, emit,
 };
 use super::types::{PieLoaderBackendKind, PieLoaderBytes, PieLoaderPlan};
-
-/// The config facts a family needs beyond the checkpoint itself. Mirrors
-/// [`ModelFacts`]; strings are borrowed for the call.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderModelFactsView {
-    /// `model_type` from `config.json` — the key the author registry
-    /// dispatches on.
-    pub model_type: PieLoaderBytes,
-    /// `quantization_config.quant_method`, empty for an unquantized
-    /// checkpoint.
-    pub quant_method: PieLoaderBytes,
-    pub num_hidden_layers: u32,
-    pub num_experts: u32,
-    pub head_dim: u32,
-    pub mamba_groups: u32,
-    /// `tie_word_embeddings`, as the config states it (HF defaults it true).
-    pub tied_embeddings: bool,
-    /// `quantization.bits` from an mlx-converted checkpoint, 0 if undeclared.
-    pub mlx_quant_bits: u32,
-    /// `quantization.group_size` beside it, 0 if undeclared.
-    pub mlx_quant_group_size: u32,
-    /// Gemma-4's `num_kv_shared_layers`, 0 for families without KV sharing.
-    pub num_kv_shared_layers: u32,
-}
 
 /// The per-family switches, wire form. Mirrors [`FamilyKnobs`] field for
 /// field; the caller reads its environment and fills these, so an author
@@ -83,7 +58,17 @@ pub struct PieLoaderModelRequest {
     /// provably about one parse.
     pub checkpoint: *const PieLoaderCheckpoint,
     pub target: PieLoaderTargetSpec,
-    pub facts: PieLoaderModelFactsView,
+    /// The `pie.model/1` descriptor, as the JSON bytes the caller read.
+    ///
+    /// This used to be ten scalars in a `PieLoaderModelFactsView` — the
+    /// caller parsed `config.json`, picked out what it thought the loader
+    /// needed, and sent that. The document is the request now: the facts are
+    /// projected from it by `pie_model::ModelFacts::from_descriptor`, so
+    /// which fields matter is a question answered where the authors live
+    /// rather than in each driver, and a new fact needs no ABI change.
+    ///
+    /// Borrowed for the call, like every other pointer here.
+    pub descriptor: PieLoaderBytes,
     /// `Projections` wire value: 0 fused, 1 in-place.
     pub projections: u32,
     /// `Naming` wire value: 0 HF, 1 MLX.
@@ -117,22 +102,14 @@ unsafe fn read_model_request(
     req: &PieLoaderModelRequest,
 ) -> Result<(ModelFacts, Policy), (PieLoaderStatus, String)> {
     let bad = |err: String| (PieLoaderStatus::InvalidRequest, err);
-    let facts = ModelFacts {
-        model_type: unsafe { as_str(&req.facts.model_type, "facts.model_type") }
-            .map_err(bad)?
-            .to_string(),
-        quant_method: unsafe { as_str(&req.facts.quant_method, "facts.quant_method") }
-            .map_err(bad)?
-            .to_string(),
-        num_hidden_layers: req.facts.num_hidden_layers,
-        num_experts: req.facts.num_experts,
-        head_dim: req.facts.head_dim,
-        mamba_groups: req.facts.mamba_groups,
-        tied_embeddings: req.facts.tied_embeddings,
-        mlx_quant_bits: req.facts.mlx_quant_bits,
-        mlx_quant_group_size: req.facts.mlx_quant_group_size,
-        num_kv_shared_layers: req.facts.num_kv_shared_layers,
-    };
+    // The facts are read from the descriptor here rather than sent field by
+    // field: they are a projection of a document the caller already holds, and
+    // a wire struct of ten scalars was ten chances for the two sides to
+    // disagree about what a field means. `pie_model::ModelFacts` owns the
+    // mapping now, on this side alone.
+    let descriptor = unsafe { as_bytes(&req.descriptor, "descriptor") }.map_err(bad)?;
+    let facts = ModelFacts::from_descriptor(descriptor)
+        .map_err(|err| (PieLoaderStatus::InvalidRequest, err.to_string()))?;
     let policy = Policy {
         projections: enum_field(
             req.projections,

@@ -13,8 +13,7 @@ use pie_loader_capi::entry::{
     pie_loader_release, pie_loader_release_diagnostics,
 };
 use pie_loader_capi::model::{
-    PieLoaderFamilyKnobs, PieLoaderModelFactsView, PieLoaderModelRequest, pie_loader_compile_model,
-    pie_loader_verify_model,
+    PieLoaderFamilyKnobs, PieLoaderModelRequest, pie_loader_compile_model, pie_loader_verify_model,
 };
 use pie_loader_capi::{PieLoaderBackendKind, PieLoaderBytes, PieLoaderDiagnostics, PieLoaderPlan};
 
@@ -74,7 +73,30 @@ fn write_snapshot(dir: &Path) {
     pie_loader::testkit::write_safetensors_fixture(dir, &tensors);
 }
 
-/// The valid request every mutation test starts from: the `llama3` facts
+/// A `pie.model/1` descriptor for `write_snapshot`'s checkpoint.
+///
+/// Spelled out here rather than normalized from a `config.json` fixture: this
+/// test is about the ABI, and what crosses it is the descriptor. The fields
+/// are the ones `ModelFacts::from_descriptor` projects; the rest of the
+/// schema is `pie-model-config`'s business and has its own tests.
+///
+/// A `&'static str` so `bytes()` can borrow it for the whole call, the way a
+/// driver borrows the buffer it read the file into.
+const LLAMA_DESCRIPTOR: &str = r#"{
+    "version": "pie.model/1",
+    "model_type": "llama3",
+    "quant_method": "",
+    "num_hidden_layers": 2,
+    "num_experts": 0,
+    "head_dim": 16,
+    "mamba_n_groups": 0,
+    "tie_word_embeddings": true,
+    "quant_bits": 0,
+    "quant_group_size": 0,
+    "num_kv_shared_layers": 0
+}"#;
+
+/// The valid request every mutation test starts from: the `llama3` descriptor
 /// for `write_snapshot`'s checkpoint, against a plain CUDA target.
 fn llama_request(checkpoint: *const PieLoaderCheckpoint) -> PieLoaderModelRequest {
     PieLoaderModelRequest {
@@ -91,18 +113,7 @@ fn llama_request(checkpoint: *const PieLoaderCheckpoint) -> PieLoaderModelReques
             encode_scratch_dtype: pie_loader_capi::PieLoaderDType::BF16 as u32,
             block_scale_rows: 0,
         },
-        facts: PieLoaderModelFactsView {
-            model_type: bytes("llama3"),
-            quant_method: bytes(""),
-            num_hidden_layers: 2,
-            num_experts: 0,
-            head_dim: 16,
-            mamba_groups: 0,
-            tied_embeddings: true,
-            mlx_quant_bits: 0,
-            mlx_quant_group_size: 0,
-            num_kv_shared_layers: 0,
-        },
+        descriptor: bytes(LLAMA_DESCRIPTOR),
         projections: 0,
         naming: 0,
         runtime_quant: 0,
@@ -184,8 +195,14 @@ fn a_llama_request_compiles_to_a_plan_through_the_abi() {
     unsafe { pie_loader_release_diagnostics(verify_diags) };
 
     // An unknown model_type answers with the fallback's name, not a guess.
+    const UNKNOWN_DESCRIPTOR: &str = r#"{
+        "version": "pie.model/1",
+        "model_type": "not_a_model",
+        "num_hidden_layers": 2,
+        "head_dim": 16
+    }"#;
     let mut unknown = request;
-    unknown.facts.model_type = bytes("not_a_model");
+    unknown.descriptor = bytes(UNKNOWN_DESCRIPTOR);
     let mut no_plan: *mut PieLoaderPlan = std::ptr::null_mut();
     let mut unknown_diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
     let status = unsafe {

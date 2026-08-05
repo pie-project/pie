@@ -359,7 +359,7 @@ pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
 /// page-size + layer caps; model-gated intrinsics + second-party kernels default
 /// conservative until the model surfaces them).
 pub fn model_profile() -> ModelProfile {
-    let m = pie_model::model();
+    let m = crate::model::model();
     profile_from(
         m.vocab_size(),
         crate::store::registry::get(0, 0).kv_page_size,
@@ -374,7 +374,7 @@ fn profile_from(
     vocab: u32,
     page_size: u32,
     num_layers: u32,
-    ptir: pie_model::PtirCaps,
+    ptir: crate::model::PtirCaps,
 ) -> ModelProfile {
     ModelProfile {
         vocab,
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn quest_tap_binds_only_against_a_backend_with_kv_envelopes() {
-        let caps = |has: bool| pie_model::PtirCaps {
+        let caps = |has: bool| crate::model::PtirCaps {
             has_mtp_logits: false,
             has_mtp_drafts: false,
             has_value_head: false,
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn kv_envelope_capability_gates_the_envelope_dot_kernel() {
-        let caps = |has: bool| pie_model::PtirCaps {
+        let caps = |has: bool| crate::model::PtirCaps {
             has_mtp_logits: false,
             has_mtp_drafts: false,
             has_value_head: false,

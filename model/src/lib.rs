@@ -1,60 +1,67 @@
-//! What each model family is, backend-blind.
+//! The two registries that turn a model's name into an implementation.
 //!
-//! Organized family-first: one directory per lineage (`llama/`, `qwen3/`,
-//! `gemma/`, …), one file per aspect inside it — `chat/` today; `contract.rs`
-//! and `forward.rs` as those aspects migrate out of the drivers. `common/`
-//! holds what every family shares and knows about none of them.
+//! The implementations are not here. Each model *generation* is its own crate
+//! under `model/` — `pie-model-llama-3`, `pie-model-qwen-3-5`, twenty of them
+//! — named `<vendor>_<generation>` with a version's dots as underscores. A
+//! generation is a crate rather than a module because the generations differ
+//! enough to be worth separating (templates, storage schema, and the forward
+//! programs still to land), and because a crate boundary is the only thing
+//! Rust has that stops one generation reaching into another.
 //!
-//! The aspects deliberately partition the model space differently: templates
-//! split by release (llama2 vs llama3), contracts by storage schema (phi3
-//! loads as llama), forward passes by compute graph. So directories organize
-//! and never dispatch — each aspect has its own registry keyed by
-//! `model_type`, with every N:1 reuse written out as a row
-//! (`instruct::create` is the chat aspect's).
+//! What this crate holds is the dispatch:
 //!
-//! This crate also still carries the model *service* — the global model/
-//! tokenizer cache below — which is runtime machinery rather than family
-//! knowledge; it is slated to move back under `runtime/` once the contract
-//! aspect lands and the crate's consumers split into knowledge-only (capi)
-//! and runtime callers.
+//! * [`contract`] — `model_type` to the author that writes its load contract.
+//! * [`instruct`] — `arch_name` to the chat template that formats for it.
+//!
+//! The two deliberately partition the model space differently: templates
+//! split by release, contracts by storage schema. So a generation crate is
+//! reached through a *row*, never as a module path, and every N:1 reuse is
+//! written out — a dozen `model_type`s share Llama 3's dense author, and
+//! Qwen3's ChatML template serves four vendors.
+//!
+//! A generation with no implementation of its own gets no crate: `mixtral`,
+//! `deepseek_v2`, `deepseek_v3`, `ministral3`, `gemma3n`, `kimi_k25` and
+//! `qwen3_6` are rows naming the generation whose implementation they share.
+//!
+//! [`multimodal`] is the exception still here: host-side image and audio
+//! decode is a third aspect and it is family-aware, so it has not been split
+//! per generation the way chat and contract have.
+//!
+//! The model *service* — the global model/tokenizer cache — used to live
+//! here too. It was runtime machinery rather than family knowledge, and it
+//! moved to `runtime/engine/src/model.rs` once its consumers split cleanly:
+//! everything but [`ModelMetadata`] was read by the engine alone.
 
 // The aspects' shared vocabulary and traits.
-pub mod common;
 #[cfg(feature = "contract")]
 pub mod contract;
 #[cfg(feature = "chat")]
 pub mod instruct;
+
+// The model generations are crates now, one per generation, under `model/`.
+// This crate names them in its two registries (`contract::HF_ROWS`,
+// `instruct::create`) and nowhere else — a generation is reached through the
+// row that dispatches to it, never as a module path.
+//
+// A generation with no implementation of its own has no crate: it is a row
+// naming the generation whose implementation it shares. `mixtral`,
+// `deepseek_v2`, `deepseek_v3`, `ministral3`, `gemma3n`, `kimi_k25` and
+// `qwen3_6` are those today.
+
+// ── What a served model's metadata is ───────────────────────────────
+//
+// The shape an artifact's compiled metadata arrives in. The *service* that
+// used to sit here — the global `OnceLock` cache, `register`/`model()` — was
+// runtime machinery rather than family knowledge and moved to
+// `runtime/engine/src/model.rs`; this stayed, because the worker reads it
+// without linking the runtime.
+// Re-exported so a consumer's path survives the split: `ModelMetadata` and
+// the multimodal decode moved to `pie-model-common`, which is where a crate
+// that needs them without the generations can reach them.
+pub use pie_model_common::ModelMetadata;
+// Host-side image/audio decode. Family-aware — it dispatches on a
+// `VisionArch` and carries per-generation configs — so it is *not* in
+// `pie-model-common`, whose guard would rightly refuse it. Splitting it per
+// generation is the same move chat and contract have already made.
 #[cfg(feature = "chat")]
 pub mod multimodal;
-
-// The families, one directory per lineage.
-#[cfg(feature = "contract")]
-pub mod csm;
-#[cfg(feature = "contract")]
-pub mod deepseek_v4;
-pub mod gemma;
-#[cfg(feature = "contract")]
-pub mod glm5;
-pub mod gptoss;
-pub mod kimi;
-pub mod llama;
-pub mod mistral;
-#[cfg(feature = "contract")]
-pub mod nemotron_h;
-pub mod olmo;
-pub mod phi;
-pub mod qwen3;
-#[cfg(feature = "contract")]
-pub mod qwen3_5;
-pub mod r1;
-
-// ── The model service ────────────────────────────────────────────────
-//
-// The runtime's global model/tokenizer cache — service machinery, not family
-// knowledge, gated with the chat aspect it serves and re-exported so its
-// consumers' paths (`pie_model::register`, …) survive the split. It is
-// slated to move back under `runtime/` (see the module doc above).
-#[cfg(feature = "chat")]
-mod service;
-#[cfg(feature = "chat")]
-pub use service::*;

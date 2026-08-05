@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::Args;
 
 use pie_loader::checkpoint::meta::{SOURCE_KEY, VERSION_KEY, meta_name};
@@ -36,8 +36,8 @@ use pie_loader::checkpoint::write::CheckpointWriter;
 use pie_loader::executor::host::Progress;
 use pie_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use pie_loader::types::Visibility;
-use pie_model::common::facts::ModelFacts;
-use pie_model::common::policy::{Mxfp4MoeRequest, Policy, RuntimeQuant};
+use pie_model_common::facts::ModelFacts;
+use pie_model_common::policy::{Mxfp4MoeRequest, Policy, RuntimeQuant};
 use pie_model_config::DESCRIPTOR_OBJECT;
 
 use super::convert::{
@@ -75,72 +75,6 @@ pub struct OptimizeArgs {
     pub dry_run: bool,
 }
 
-/// The facts the author needs, read off `config.json` the way the CUDA
-/// driver's parser reads them — including the `text_config` nesting the
-/// multimodal releases use.
-///
-/// This read is temporary scaffolding with a named successor: once serving
-/// is artifact-only, the compiled descriptor carries these facts and the
-/// request keeps only policy (`plan/model-in-rust.md` §11).
-fn read_facts(config: &serde_json::Value) -> Result<ModelFacts> {
-    let text = config.get("text_config");
-    let get = |key: &str| {
-        config
-            .get(key)
-            .or_else(|| text.and_then(|text| text.get(key)))
-    };
-    let get_u32 = |key: &str| {
-        get(key)
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-    };
-    let model_type = get("model_type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("config.json declares no model_type"))?
-        .to_string();
-    let quant_method = config
-        .get("quantization_config")
-        .and_then(|quant| quant.get("quant_method"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let num_hidden_layers = get_u32("num_hidden_layers")
-        .or_else(|| get_u32("num_layers"))
-        .or_else(|| get_u32("n_layer"))
-        .ok_or_else(|| anyhow!("config.json declares no num_hidden_layers"))?;
-    // The families that need each of these declare them; absence means the
-    // author will not consult them.
-    let num_experts = get_u32("num_experts")
-        .or_else(|| get_u32("n_routed_experts"))
-        .or_else(|| get_u32("num_local_experts"))
-        .unwrap_or(0);
-    let head_dim = get_u32("head_dim").unwrap_or(0);
-    let mamba_groups = get_u32("mamba_n_groups").unwrap_or(0);
-    let tied_embeddings = get("tie_word_embeddings")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let quantization = config.get("quantization");
-    let quant_field = |key: &str| {
-        quantization
-            .and_then(|quant| quant.get(key))
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0)
-    };
-    Ok(ModelFacts {
-        model_type,
-        quant_method,
-        num_hidden_layers,
-        num_experts,
-        head_dim,
-        mamba_groups,
-        tied_embeddings,
-        mlx_quant_bits: quant_field("bits"),
-        mlx_quant_group_size: quant_field("group_size"),
-        num_kv_shared_layers: get_u32("num_kv_shared_layers").unwrap_or(0),
-    })
-}
-
 pub fn run(args: OptimizeArgs) -> Result<()> {
     let source = resolve_source(&args.source)?;
     if source.path.is_file() {
@@ -150,12 +84,15 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
             source.path.display()
         );
     }
-    let config_path = source.path.join("config.json");
-    let raw = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("cannot read {}", config_path.display()))?;
-    let config: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|err| anyhow!("cannot parse {}: {err}", config_path.display()))?;
-    let facts = read_facts(&config)?;
+    // The same descriptor this run will write into the artifact, compiled
+    // first because the author's facts are read out of it. One normalization
+    // per run, and the facts an offline optimize authors from are the ones a
+    // serve boot authors from — which is what makes the artifact this writes
+    // interchangeable with the plan a boot would have compiled.
+    let descriptor = compile_descriptor(&source)?
+        .ok_or_else(|| anyhow!("optimize needs a snapshot with a config.json to normalize"))?;
+    let facts = ModelFacts::from_descriptor(&descriptor)
+        .map_err(|err| anyhow!("cannot read the compiled model descriptor: {err}"))?;
 
     let runtime_quant = RuntimeQuant::resolve(args.quant.as_deref().unwrap_or(""), args.fp8_native)
         .map_err(|err| anyhow!("--quant: {err}"))?;
@@ -228,8 +165,10 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
         .map_err(|err| anyhow!("cannot compile: {err}"))?;
 
     // Metadata first, weights streamed after — the same shape convert has.
+    // The descriptor was compiled above, because the facts were read from it;
+    // the artifact carries that same document rather than a second
+    // normalization of the same file.
     let tokenizer = compile_tokenizer(&source)?;
-    let descriptor = compile_descriptor(&source)?;
 
     let mut bar = ProgressLine::new();
     let mut spool = Spool::create(&out_file)?;
@@ -269,9 +208,9 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
             meta.push((meta_name(path), bytes.to_vec()));
         }
     }
-    if let Some(descriptor) = &descriptor {
-        meta.push((meta_name(DESCRIPTOR_OBJECT), descriptor.clone()));
-    }
+    // Not conditional any more: the run could not have authored anything
+    // without this document, so by here it exists.
+    meta.push((meta_name(DESCRIPTOR_OBJECT), descriptor.clone()));
     let mut entries: Vec<(&str, Entry<'_>)> = meta
         .iter()
         .map(|(name, bytes)| (name.as_str(), Entry::Meta(bytes)))

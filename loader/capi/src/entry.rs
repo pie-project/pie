@@ -236,6 +236,31 @@ pub(super) unsafe fn as_str<'a>(value: &'a PieLoaderBytes, field: &str) -> Resul
     std::str::from_utf8(bytes).map_err(|err| format!("{field}: not valid UTF-8: {err}"))
 }
 
+/// Borrow a `PieLoaderBytes` as a byte slice, for the lifetime of the borrow it
+/// came from.
+///
+/// The same borrow as [`as_str`] without the UTF-8 check, for a payload that is
+/// parsed rather than read as text — a JSON document reports its own encoding
+/// errors, and with better context than "not valid UTF-8" can give.
+///
+/// An empty payload is refused rather than borrowed as an empty slice: every
+/// caller of this sends a document, and a zero-length one is a caller that
+/// forgot to, not a document that happens to say nothing.
+///
+/// # Safety
+///
+/// `value.ptr` must either be null or point at `value.len` initialized bytes
+/// that stay live and unwritten for `'a`.
+pub(super) unsafe fn as_bytes<'a>(
+    value: &'a PieLoaderBytes,
+    field: &str,
+) -> Result<&'a [u8], String> {
+    if value.ptr.is_null() || value.len == 0 {
+        return Err(format!("{field}: empty; the caller must send the document"));
+    }
+    Ok(unsafe { std::slice::from_raw_parts(value.ptr, value.len) })
+}
+
 /// How a compile failure crosses the ABI.
 ///
 /// Every variant that used to be `InvalidInput` still answers

@@ -147,10 +147,30 @@ LoadedModel LoadedModel::load(
     };
 
     const std::filesystem::path snapshot{boot_cfg.model.snapshot_dir};
-    if (!boot_cfg.model.descriptor.empty()) {
-        // The artifact carried its model config already normalized, so there
-        // is nothing to derive here. See model/descriptor.hpp.
-        log_stage("read model descriptor begin");
+    // The model config arrives already normalized, whatever the worker was
+    // pointed at: an artifact carries a `pie.model/1` descriptor, and a plain
+    // HF snapshot is normalized into one by `worker/src/weights.rs` before any
+    // driver is created. See model/descriptor.hpp.
+    //
+    // There used to be an `else` here — `parse_hf_config`, 855 lines and 25
+    // `model_type` conditionals, reading `config.json` a second time in a
+    // second language. It is gone, so this is an error rather than a fallback:
+    // a driver with no descriptor cannot answer what the model is made of, and
+    // guessing is what produced two answers that had to agree by coincidence.
+    if (boot_cfg.model.descriptor.empty()) {
+        throw std::runtime_error(
+            "engine: model.descriptor is empty. Every boot is handed a "
+            "pie.model/1 descriptor beside its startup TOML; a hand-written "
+            "config must point `[model] descriptor` at one "
+            "(`pie model import` writes an artifact that carries it, and "
+            "`cargo run -p pie-model-config --bin descriptor config.json` "
+            "compiles one from a snapshot).");
+    }
+    log_stage("read model descriptor begin");
+    // Kept for the whole load: the compile request borrows this document
+    // rather than a struct distilled from it, so it has to outlive
+    // `prepare_load_plan_rust_author` below.
+    const std::string descriptor_json = [&] {
         std::ifstream in(boot_cfg.model.descriptor);
         if (!in) {
             throw std::runtime_error("cannot open model descriptor: " +
@@ -158,16 +178,10 @@ LoadedModel LoadedModel::load(
         }
         std::ostringstream buffer;
         buffer << in.rdbuf();
-        e.hf_ = parse_pie_model_descriptor(buffer.str());
-        log_stage("read model descriptor done");
-    } else {
-        // A snapshot that predates the artifact format. The whole of
-        // `parse_hf_config` exists for this branch, and it goes when the
-        // descriptor has been proven on real hardware.
-        log_stage("parse hf config begin");
-        e.hf_ = parse_hf_config(snapshot / "config.json");
-        log_stage("parse hf config done");
-    }
+        return buffer.str();
+    }();
+    e.hf_ = parse_pie_model_descriptor(descriptor_json);
+    log_stage("read model descriptor done");
 
     // Bind to the requested CUDA device before we allocate anything.
     int dev_id = 0;
@@ -247,7 +261,7 @@ LoadedModel LoadedModel::load(
     // deleted.
     model::Mxfp4MoePolicy mxfp4_moe_policy = model::Mxfp4MoePolicy::RoutedDecode;
     LoadPlanResult planned_load = prepare_load_plan_rust_author(
-        checkpoint, facts, device_target,
+        checkpoint, descriptor_json, device_target,
         model::resolve_runtime_quant(runtime_quant, fp8_native),
         mxfp4_moe, component, boot_cfg.model.stream_routed_experts,
         &mxfp4_moe_policy);

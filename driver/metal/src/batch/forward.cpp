@@ -2464,8 +2464,15 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             contract_facts.num_kv_shared_layers =
                 std::uint32_t(cfg.gemma4.num_kv_shared_layers);
         }
-        load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type,
-                                      contract_facts);
+        // A serving boot forwards the document it was handed; a test harness
+        // that set up `SetupConfig` by hand states the facts its family needs
+        // and gets a synthesized one. The branch is on which of the two this
+        // is, and nothing else.
+        load_plan = compile_load_plan(
+            cfg.snapshot_dir, metal_device_target(),
+            cfg.descriptor_json.empty()
+                ? descriptor_for_testing(cfg.model_type, contract_facts)
+                : cfg.descriptor_json);
     } catch (const std::exception& error) {
         if (err != nullptr) {
             *err = std::string("LoadPlan compile failed: ") + error.what();

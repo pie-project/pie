@@ -359,9 +359,10 @@ public:
 };
 
 // ── Config validation hooks ──────────────────────────────────────────────
-// Most rows only need the generic dimension sanity check; the parser
-// (`model/config.cpp`) already enforces per-field requirements, so this is
-// defense-in-depth, not a parsing rewrite. CSM additionally requires its
+// Most rows only need the generic dimension sanity check; the normalizer
+// (`model/config`, whose output `model/descriptor.cpp` reads) already
+// enforces per-field requirements, so this is defense-in-depth, not a parsing
+// rewrite. CSM additionally requires its
 // optional config section (the one case where a missing section would
 // otherwise surface as a `bind_csm` throw deep inside binding instead of a
 // clear registry-level rejection).

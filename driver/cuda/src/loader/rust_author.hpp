@@ -85,7 +85,6 @@ inline std::vector<RustQuantAttachment> resolve_quant_attachments(
 }
 
 using pie_loader::PieLoaderFamilyKnobs;
-using pie_loader::PieLoaderModelFactsView;
 using pie_loader::PieLoaderModelRequest;
 
 /// The per-family switches, read from the same environment the C++ authors
@@ -136,9 +135,16 @@ inline std::uint32_t runtime_quant_wire(std::string_view resolved) {
 /// Compile the plan through the Rust author. The drop-in counterpart of
 /// `prepare_load_plan`, with the resolved MXFP4 policy handed back the way
 /// `ContractBuilder::mxfp4_moe()` hands it back on the C++ path.
+/// `descriptor_json` is the `pie.model/1` document this boot read, verbatim.
+/// It replaced the ten-scalar `ModelFacts` view that used to travel here: the
+/// driver picked out what it thought the loader needed, and four of the ten
+/// were sent as constants because they were "Metal vocabulary" -- which was
+/// true of who read them, not of what they meant. The document is the request
+/// now, and `pie_model::ModelFacts::from_descriptor` decides what a fact is,
+/// once, beside the authors that read them.
 inline LoadPlanResult prepare_load_plan_rust_author(
     const pie_loader::Checkpoint& checkpoint,
-    const model::ModelFacts& facts,
+    std::string_view descriptor_json,
     const pie_loader::DeviceTarget& target,
     std::string_view resolved_runtime_quant,
     model::Mxfp4MoeRequest mxfp4_moe_request,
@@ -148,19 +154,7 @@ inline LoadPlanResult prepare_load_plan_rust_author(
     const PieLoaderModelRequest request{
         .checkpoint = checkpoint.get(),
         .target = pie_loader::target_spec(target),
-        .facts =
-            PieLoaderModelFactsView{
-                .model_type = pie_loader::borrow(facts.model_type),
-                .quant_method = pie_loader::borrow(facts.quant_method),
-                .num_hidden_layers = facts.num_hidden_layers,
-                .num_experts = facts.num_experts,
-                .head_dim = facts.head_dim,
-                .mamba_groups = facts.mamba_groups,
-                .tied_embeddings = true,
-                .mlx_quant_bits = 0,
-                .mlx_quant_group_size = 0,
-                .num_kv_shared_layers = 0,
-            },
+        .descriptor = pie_loader::borrow(descriptor_json),
         .projections = 0,  // Fused: the CUDA lowering.
         .naming = 0,       // HF names, which is what this bind path reads.
         .runtime_quant = runtime_quant_wire(resolved_runtime_quant),

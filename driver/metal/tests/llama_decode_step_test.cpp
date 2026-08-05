@@ -575,7 +575,7 @@ void check_pool_counts_the_slots() {
 // plausible tokens from the wrong arithmetic. That is the failure mode a
 // refusal exists to prevent, so it is worth pinning that each one still fires.
 // (The shared-expert/per-expert refusal that lived here is pinned in Rust
-// now — `model/src/common/mlx.rs::routed_banks_map_and_unservable_experts_are_refused` —
+// now — `model/common/src/mlx.rs::routed_banks_map_and_unservable_experts_are_refused` —
 // beside the `routed_expert_member` rule it checks, which is where the name
 // normalisation went when the C++ author died.)
 
@@ -754,7 +754,7 @@ void check_refusals() {
 /// is a residency decision and a model that copies everything still answers.
 ///
 /// Stated against the names the CONTRACT publishes, not against invented ones:
-/// the author (`model/src/common/mlx.rs`) normalises both `mlp.switch_mlp.` and the fused HF form
+/// the author (`model/common/src/mlx.rs`) normalises both `mlp.switch_mlp.` and the fused HF form
 /// onto `mlp.experts.`, and `heap_bind.cpp` hands this predicate the finalized
 /// runtime name.
 void check_streaming_covers_both_ffn_shapes() {

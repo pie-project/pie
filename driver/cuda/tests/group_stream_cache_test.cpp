@@ -160,16 +160,20 @@ pie_loader::LoadPlan compile_dsv4(
     // under test is unchanged -- stacked and streamed are two answers to one
     // request, differing only in `stream_routed_experts`.
     namespace model = pie_cuda_driver::model;
-    const model::ModelFacts facts{
-        .model_type = "deepseek_v4",
-        .quant_method = "",
-        .num_hidden_layers = static_cast<std::uint32_t>(kLayers),
-        .num_experts = static_cast<std::uint32_t>(kExperts),
-        .head_dim = 0,
-        .mamba_groups = 0,
-    };
+    // The facts this test states, in the form the request carries them: a
+    // `pie.model/1` document. It used to build a `ModelFacts` struct, which
+    // stopped crossing the ABI — `ModelFacts::from_descriptor` projects these
+    // names on the far side, so writing them here is writing the same fields
+    // one layer out.
+    const std::string descriptor = std::string(R"({"version":"pie.model/1",)") +
+                                   R"("model_type":"deepseek_v4",)" +
+                                   R"("quant_method":"",)" +
+                                   R"("num_hidden_layers":)" +
+                                   std::to_string(kLayers) + R"(,)" +
+                                   R"("num_experts":)" +
+                                   std::to_string(kExperts) + R"(})";
     return pie_cuda_driver::prepare_load_plan_rust_author(
-               checkpoint, facts, target, "", model::Mxfp4MoeRequest::Auto,
+               checkpoint, descriptor, target, "", model::Mxfp4MoeRequest::Auto,
                model::Component::Full, streamed, nullptr)
         .plan;
 }

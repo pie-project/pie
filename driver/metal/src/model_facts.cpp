@@ -496,14 +496,15 @@ void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts&
 // `HfConfig` field names, `gemma4_*`, because the schema is generated from
 // that struct.
 std::optional<ModelFacts> read_model_facts_from_descriptor(
-    const std::string& descriptor_path) {
-    if (descriptor_path.empty()) return std::nullopt;
-    std::ifstream f(descriptor_path);
-    if (!f) return std::nullopt;
+    std::string_view descriptor_json) {
+    if (descriptor_json.empty()) return std::nullopt;
 
+    // Text in, not a path: the caller reads the file, because it keeps the
+    // document anyway — the compile request carries it whole, and opening it
+    // twice would be two chances to read two different things.
     nlohmann::json j;
     try {
-        f >> j;
+        j = nlohmann::json::parse(descriptor_json);
     } catch (const std::exception&) {
         return std::nullopt;
     }
@@ -531,6 +532,18 @@ std::optional<ModelFacts> read_model_facts_from_descriptor(
     u32_of("max_position_embeddings", facts.max_model_len);
     f32_of("rope_theta", facts.rope_theta);
     f32_of("partial_rotary_factor", facts.partial_rotary_factor);
+
+    // The declared quantization width. `read_model_facts` took these from
+    // `mlx_lm`'s bare `quantization` block, and the descriptor now carries
+    // them under the `quant_*` names the schema uses -- the normalizer reads
+    // that spelling as well as `quantization_config`.
+    //
+    // Not optional detail: zero here means "undeclared", and both the load
+    // contract (`push_mlx_affine_declared`) and the forward geometry
+    // (`batch/forward.cpp`) answer undeclared with 4 bits. An 8-bit
+    // checkpoint read as 4-bit is not a refusal, it is wrong numbers.
+    u32_of("quant_bits", facts.quant_bits);
+    u32_of("quant_group_size", facts.quant_group_size);
 
     // `arch_name` is `architectures[0]` verbatim in the descriptor; this driver
     // keys on the lowercased stem, so apply the same reduction it applies to

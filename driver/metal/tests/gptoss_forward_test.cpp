@@ -252,8 +252,8 @@ int main(int argc, char** argv) {
 
     pie_loader::LoadPlan plan;
     try {
-        plan = compile_load_plan(ckpt, metal_device_target(), "gpt_oss",
-                                 pie::metal::model::ContractFacts{});
+        plan = compile_load_plan(ckpt, metal_device_target(),
+                                 descriptor_for_testing("gpt_oss"));
     } catch (const std::exception& e) {
         std::printf("  FAIL  compile_load_plan: %s\n", e.what());
         return 1;

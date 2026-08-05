@@ -709,29 +709,6 @@ struct PieLoaderTargetSpec {
   uint32_t block_scale_rows;
 };
 
-/// The config facts a family needs beyond the checkpoint itself. Mirrors
-/// [`ModelFacts`]; strings are borrowed for the call.
-struct PieLoaderModelFactsView {
-  /// `model_type` from `config.json` — the key the author registry
-  /// dispatches on.
-  PieLoaderBytes model_type;
-  /// `quantization_config.quant_method`, empty for an unquantized
-  /// checkpoint.
-  PieLoaderBytes quant_method;
-  uint32_t num_hidden_layers;
-  uint32_t num_experts;
-  uint32_t head_dim;
-  uint32_t mamba_groups;
-  /// `tie_word_embeddings`, as the config states it (HF defaults it true).
-  bool tied_embeddings;
-  /// `quantization.bits` from an mlx-converted checkpoint, 0 if undeclared.
-  uint32_t mlx_quant_bits;
-  /// `quantization.group_size` beside it, 0 if undeclared.
-  uint32_t mlx_quant_group_size;
-  /// Gemma-4's `num_kv_shared_layers`, 0 for families without KV sharing.
-  uint32_t num_kv_shared_layers;
-};
-
 /// The per-family switches, wire form. Mirrors [`FamilyKnobs`] field for
 /// field; the caller reads its environment and fills these, so an author
 /// never consults the environment and equal requests author equal contracts.
@@ -752,7 +729,17 @@ struct PieLoaderModelRequest {
   /// provably about one parse.
   const PieLoaderCheckpoint *checkpoint;
   PieLoaderTargetSpec target;
-  PieLoaderModelFactsView facts;
+  /// The `pie.model/1` descriptor, as the JSON bytes the caller read.
+  ///
+  /// This used to be ten scalars in a `PieLoaderModelFactsView` — the
+  /// caller parsed `config.json`, picked out what it thought the loader
+  /// needed, and sent that. The document is the request now: the facts are
+  /// projected from it by `pie_model::ModelFacts::from_descriptor`, so
+  /// which fields matter is a question answered where the authors live
+  /// rather than in each driver, and a new fact needs no ABI change.
+  ///
+  /// Borrowed for the call, like every other pointer here.
+  PieLoaderBytes descriptor;
   /// `Projections` wire value: 0 fused, 1 in-place.
   uint32_t projections;
   /// `Naming` wire value: 0 HF, 1 MLX.

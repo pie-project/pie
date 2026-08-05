@@ -357,9 +357,10 @@ struct LoadedModelDrivers {
     encode_identity: pie_driver_abi::ModelIdentity,
     kv_handle: Option<pie_driver_abi::KvHandle>,
     drivers: ModelDrivers,
-    /// The artifact's compiled metadata, read once while resolving the model.
-    /// `None` for a legacy snapshot.
-    artifact: Option<pie_model::ArtifactMetadata>,
+    /// The model's compiled metadata, read once while resolving it. Present
+    /// for either input form: an artifact carries the descriptor, a snapshot's
+    /// `config.json` is normalized into one.
+    metadata: pie_model::ModelMetadata,
 }
 
 struct LoadedPartnerMetadata {
@@ -525,7 +526,7 @@ fn load_model_drivers(
     };
     crate::embedded_driver::set_weight_cache_dir(weight_cache_dir);
 
-    let mut artifact: Option<pie_model::ArtifactMetadata> = None;
+    let mut metadata: Option<pie_model::ModelMetadata> = None;
     let (driver_groups, snapshot_dir) = {
         let m = &user_cfg.model;
         let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;
@@ -557,12 +558,16 @@ fn load_model_drivers(
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
         let resolved_model = weights::resolve(&m.model)
             .with_context(|| format!("resolving the model for {:?}", m.name))?;
-        // Opened once, here. The drivers get the compiled model config beside
-        // their startup TOML; the runtime gets the whole of it. Neither
-        // re-opens the artifact, and neither re-decides what it is.
-        artifact = resolved_model
+        // Lifted once, here, in one open. The drivers get the compiled model
+        // config beside their startup TOML; the runtime gets the whole of it.
+        // Nobody downstream re-opens the artifact or re-decides what it is —
+        // and for a snapshot, nobody re-parses `config.json`, which is what
+        // this one call replaced on both sides.
+        let lifted = resolved_model
             .metadata()
-            .with_context(|| format!("reading the artifact for {:?}", m.name))?;
+            .with_context(|| format!("reading the model metadata for {:?}", m.name))?;
+        let descriptor = lifted.descriptor.clone();
+        metadata = Some(lifted);
         let snapshot_dir = resolved_model.path().to_path_buf();
         let mut group_drivers: Vec<GroupDriver> = Vec::with_capacity(topology.len());
         for (group_idx, group) in topology.iter().enumerate() {
@@ -573,7 +578,7 @@ fn load_model_drivers(
                 flavor,
                 &embedded_base_opts,
                 &snapshot_dir,
-                artifact.as_ref().map(|a| a.descriptor.as_slice()),
+                &descriptor,
                 tp_degree,
                 component,
             )?);
@@ -601,7 +606,9 @@ fn load_model_drivers(
         *blake3::hash(user_cfg.model.model.as_bytes()).as_bytes()
     };
     Ok(LoadedModelDrivers {
-        artifact,
+        // Set in the block above, which is the only path that reaches here:
+        // a model that could not be resolved never got as far as a driver.
+        metadata: metadata.expect("the model was resolved before its drivers were created"),
         model: user_cfg.model.name.clone(),
         full_identity: model_identity(
             user_cfg,
@@ -636,10 +643,10 @@ async fn boot_engine(
         encode_identity,
         kv_handle,
         drivers,
-        artifact,
+        metadata,
     } = load_model_drivers(user_cfg, pie_driver_abi::ModelComponent::Full)?;
 
-    let boot_cfg = translate::build(user_cfg, drivers, artifact)
+    let boot_cfg = translate::build(user_cfg, drivers, metadata)
         .context("translating to bootstrap::Config")?;
 
     let boot = pie_engine::bootstrap::bootstrap(boot_cfg)
@@ -985,7 +992,7 @@ fn create_driver_group(
     flavor: Flavor,
     base_opts: &DriverOptions,
     snapshot_dir: &Path,
-    descriptor: Option<&[u8]>,
+    descriptor: &[u8],
     tp_degree: usize,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<GroupDriver> {
