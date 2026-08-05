@@ -2820,20 +2820,28 @@ void llama_like_forward_paged(
         // the hook-free-prefix word via fast_rows... the mask split is
         // the v0 anchor; hooked+depth composition keeps m_start = the
         // mask word since hooked lanes sort between).
-        // AC-5 anchor refinement: the middle ends at the HOOKED block
-        // when hooks are present (hook_free_prefix_rows — pure decode,
-        // row == lane), else at the MASKED block; with both, the
-        // earlier (order [plain | truncated | hooked | masked]).
-        const int m_start =
-            hooks != nullptr
-                ? std::min<int>(
-                      static_cast<int>(
-                          hooks->hook_free_prefix_rows),
-                      has_custom_mask
-                          ? plan_state.spatial_mask_split
-                          : R)
-                : (has_custom_mask ? plan_state.spatial_mask_split
-                                   : R);
+        // AC-5 anchor refinement: the middle ends at the first
+        // mask/hook block AFTER the truncated rows — the TRAILING
+        // tail. The seriation may place hook (or masked) FULL-DEPTH
+        // rows in the prefix, before the truncated block; those rows
+        // are part of [0, t_start) and must not drag m_start below it
+        // (the derivation already counted them into the split — see
+        // region_plans.hpp block_ok). A marker at or before t_start
+        // is a prefix block, not the tail.
+        int m_start = R;
+        if (has_custom_mask && plan_state.spatial_mask_split >= 0 &&
+            plan_state.spatial_mask_split > t_start) {
+            m_start =
+                std::min<int>(m_start, plan_state.spatial_mask_split);
+        }
+        if (hooks != nullptr) {
+            const int hook_start =
+                static_cast<int>(hooks->hook_free_prefix_rows);
+            if (hook_start >= 0 && hook_start <= R &&
+                hook_start > t_start) {
+                m_start = std::min<int>(m_start, hook_start);
+            }
+        }
         // t_start == 0 is legal: no plain block, the truncated middle
         // starts at row 0 ([truncated | masked]).
         if (layer_bound >= cfg.num_hidden_layers || t_start < 0 ||
