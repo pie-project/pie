@@ -1865,12 +1865,16 @@ static void apply_commit_feedback(const RawMetalContext& ctx,
     // asynchronously. Normal inference does not put that CPU scheduling delay
     // on every token: the handler logs an error immediately, and run_steps
     // promotes a late error to a sticky failure before the next submission.
-    // Tracing and the GPU meter do wait because their output specifically asks
-    // for this event's calibrated GPU timestamps.
+    // Tracing and the sync-feedback probe do wait because their output
+    // specifically asks for this event's calibrated GPU timestamps.
+    //
+    // `PIE_METAL_GPU_METER` used to be a third reason and is not one any more:
+    // all three of the meters it fed are `if constexpr (false)` in
+    // `forward.cpp`, so arming it here bought a spin of up to 200 x 50us per
+    // fire for output that cannot be printed.
     GpuCommitFeedback fb = ctx.last_commit_feedback();
     const bool synchronous =
-        dispatch_trace_every() > 0 || getenv("PIE_METAL_GPU_METER") != nullptr ||
-        getenv("PIE_METAL_SYNC_FEEDBACK") != nullptr;
+        dispatch_trace_every() > 0 || getenv("PIE_METAL_SYNC_FEEDBACK") != nullptr;
     if (synchronous) {
         for (int spin = 0; fb.event_value != event_value && spin < 200; ++spin) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
