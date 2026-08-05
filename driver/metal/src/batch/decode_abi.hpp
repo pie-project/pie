@@ -179,8 +179,8 @@ enum class SdpaPaged : uint8_t {
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
-// RmsParams{eps, axis_size, w_stride, plus_one}. qwen3.5 sets plus_one=1 for ALL
-// norms (attn_norm/q_norm/k_norm/ffn_norm/final_norm) → effective gain (1+weight).
+// RmsParams{eps, axis_size, w_stride, plus_one, gain}. qwen3.5 sets plus_one=1
+// for every norm; Gemma 4's router uses gain=hidden^-0.5.
 enum class Rms : uint8_t { X = 0, W = 1, Out = 2, Params = 3 };
 
 // residual add (golden `attn_resid`, `layer_out`): Out = X + Residual, elementwise.

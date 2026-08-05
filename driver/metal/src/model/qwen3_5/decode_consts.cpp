@@ -19,13 +19,10 @@ namespace {
 
 // ── Kernel param structs, replicated EXACTLY from the .metal sources ──
 using shared_kernels::ExpertCombineParams;
+using shared_kernels::GatedRmsParams;
 using shared_kernels::MoeRouteParams;
 using shared_kernels::RmsParams;
 using shared_kernels::RouterParams;
-struct GatedRmsParams {  // gated_rms.metal:20  (buffer 4)
-    float eps;
-    uint32_t vd;         // value-head dim (reduction axis)
-};
 static_assert(sizeof(GdnCoreParams) == 44);
 
 GdnCoreParams gdn_core_params(const DecodeGeometry& g) {
@@ -231,12 +228,14 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kernel::FfnRms:
             case Kernel::FinalRms:
                 bind_const<RmsParams>(ctx, ord, (uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, (uint32_t)g.hidden, 1u, 0u}, &count);
+                                      RmsParams{g.eps, (uint32_t)g.hidden, 1u, 0u, 1.0f},
+                                      &count);
                 break;
             case Kernel::QNorm:
             case Kernel::KNorm:
                 bind_const<RmsParams>(ctx, ord, (uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, (uint32_t)g.head_dim, 1u, 0u}, &count);
+                                      RmsParams{g.eps, (uint32_t)g.head_dim, 1u, 0u, 1.0f},
+                                      &count);
                 break;
 
             case Kernel::GdnPrep: {

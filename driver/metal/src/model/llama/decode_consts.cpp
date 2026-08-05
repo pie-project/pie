@@ -48,7 +48,7 @@ RmsParams rms_params(const LlamaGeometry& g, int axis) {
     // `plus_one` is 0: llama's RMSNorm applies the learned gain directly, where
     // gemma stores `w - 1` and applies `(1 + w)`. Getting this wrong is not a
     // crash -- it is every norm off by one, which still produces text.
-    return RmsParams{g.eps, std::uint32_t(axis), 1u, 0u};
+    return RmsParams{g.eps, std::uint32_t(axis), 1u, 0u, 1.0f};
 }
 
 /// The contiguous KV cache's layout, [n_kv_heads, max_ctx, head_dim].

@@ -109,7 +109,9 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kind::FfnNorm:
             case Kind::FinalRms:
                 bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, std::uint32_t(g.hidden), 1u, 0u}, &count);
+                                      RmsParams{
+                                          g.eps, std::uint32_t(g.hidden), 1u, 0u, 1.0f},
+                                      &count);
                 break;
 
             case Kind::RopeQ:
