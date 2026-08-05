@@ -15,7 +15,14 @@ int main(int argc, char** argv) {
         facts.num_kv_shared_layers = argc > 3 ? std::atoi(argv[3]) : 0;
         auto plan = pie::metal::compile_load_plan(
             dir, pie::metal::metal_device_target(), "gemma4", facts);
-        std::printf("OK: load plan compiled and verified\n");
+        // The plan's size, not just its success: the KV-sharing facts are only
+        // observable as tensors the author declined to declare, so a probe that
+        // printed OK either way could not tell whether they arrived.
+        const auto& view = plan.view();
+        std::printf("OK: load plan compiled and verified"
+                    " (tensors %zu, buffers %zu, instrs %zu, sources %zu)\n",
+                    view.tensors.len, view.buffers.len, view.instrs.len,
+                    view.sources.len);
     } catch (const std::exception& e) {
         std::printf("FAIL: %s\n", e.what());
         return 1;

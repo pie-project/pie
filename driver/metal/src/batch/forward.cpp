@@ -2446,6 +2446,24 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
                 : cfg.llama.tied_embeddings;
         contract_facts.quant_bits = cfg.quant_bits;
         contract_facts.quant_group_size = cfg.quant_group_size;
+        // Gemma4's KV sharing, which the author asks for and this path was
+        // sending as zeros. A layer past `n_layers - num_kv_shared_layers`
+        // attends the KV an earlier layer wrote, so the author declines to
+        // declare its k/v/k_norm.
+        //
+        // Measured, so the change is not mistaken for a saving: the MLX
+        // conversions we gate already ship only the KV-OWNING layers' k/v
+        // (e2b has `self_attn.k_proj` for layers 0-14 and nothing for 15-34),
+        // so the authored plan is byte-identical either way -- 1096 tensors
+        // with the truthful 35/20 and with 0/0 -- and resident weights stay
+        // 2.43 GiB. What this fixes is the request, not the plan: a conversion
+        // that does ship the dead tensors would have them staged and never
+        // bound, because the skip branch it is asking about was unreachable.
+        if (model::model_family_of(cfg.model_type) == model::ModelFamily::Gemma4) {
+            contract_facts.num_hidden_layers = std::uint32_t(cfg.gemma4.n_layers);
+            contract_facts.num_kv_shared_layers =
+                std::uint32_t(cfg.gemma4.num_kv_shared_layers);
+        }
         load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type,
                                       contract_facts);
     } catch (const std::exception& error) {
