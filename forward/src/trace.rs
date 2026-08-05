@@ -639,29 +639,6 @@ pub struct Op {
     pub outputs: Vec<ValueId>,
     /// The layer this op belongs to, or `None` for prologue/epilogue.
     pub layer: Option<u32>,
-    /// STRUCTURAL S-3, promoted (the review's depth-IR gap): this op's
-    /// role under the DEPTH axis, stated as VOCABULARY the goldens pin
-    /// rather than a membership rule three walkers re-derive from the
-    /// layer tag. `None` = outside the axis (prologue/epilogue — the
-    /// unchanged tail is the logit-lens head by construction).
-    /// The split point `k` remains a runtime input; the role says WHAT
-    /// this op does when its layer falls in the truncated range.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub depth_role: Option<DepthRole>,
-}
-
-/// An op's behavior under the depth axis ([`Op::depth_role`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DepthRole {
-    /// Skipped on a uniform truncated fire when `layer >= k`; runs over
-    /// the full-depth prefix rows on a union fire.
-    Windowed,
-    /// `Windowed`, and additionally the attention dispatch pairs the
-    /// depth PREFIX plan with the dedicated workspace on union tail
-    /// layers (the plan/workspace pairing rule) instead of the fire's
-    /// decode plan.
-    PrefixPlanSwap,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -708,6 +685,40 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl ForwardPlan {
+    /// DEPTH HAS NO SYNTAX (`.wiki/tart/dsl.md` ③, migration step 5).
+    ///
+    /// Every statement tagged with a layer is implicitly `rows(depth >
+    /// l)`: it is skipped on a uniform truncated fire once its layer
+    /// reaches `k`, and runs over the full-depth prefix rows on a union
+    /// fire. The author writes nothing, and the IR carries no word —
+    /// membership is the LAYER TAG plus the declaration's axis, which
+    /// is what an `Op` already has.
+    ///
+    /// This replaces a per-op `DepthRole` enum whose `Windowed` variant
+    /// was exactly this predicate, restated on every layer-tagged op of
+    /// every trace.
+    pub fn depth_windowed(&self, op: &Op) -> bool {
+        self.depth_window && op.layer.is_some()
+    }
+
+    /// Does this op's kernel pair the depth PREFIX plan (and its
+    /// dedicated workspace) on union tail layers, instead of the fire's
+    /// own decode plan?
+    ///
+    /// The other half of the retired `DepthRole`, and it was never a
+    /// property of the OP: it is a property of the KERNEL, so it lives
+    /// in the kernel table beside `whole` and `needs`
+    /// ([`crate::kernels::KernelSig::depth_prefix_plan`]).
+    pub fn depth_prefix_plan(&self, op: &Op) -> bool {
+        if !self.depth_windowed(op) {
+            return false;
+        }
+        let OpKind::Launch { kernel, .. } = &op.kind else {
+            return false;
+        };
+        crate::kernels::sig(kernel).is_some_and(|k| k.depth_prefix_plan)
+    }
+
     /// Ops belonging to layer `l`, in execution order.
     pub fn layer_ops(&self, l: u32) -> impl Iterator<Item = &Op> {
         self.ops.iter().filter(move |op| op.layer == Some(l))
@@ -972,24 +983,11 @@ impl TraceBuilder {
             .into_iter()
             .map(|(shape, dtype)| self.value(shape, dtype))
             .collect();
-        let depth_role = if self.depth_axis && self.layer.is_some() {
-            Some(match &kind {
-                OpKind::Launch { kernel, .. }
-                    if kernel == "dispatch_attention_flashinfer_decode" =>
-                {
-                    DepthRole::PrefixPlanSwap
-                }
-                _ => DepthRole::Windowed,
-            })
-        } else {
-            None
-        };
         self.ops.push(Op {
             kind,
             inputs,
             outputs: outputs.clone(),
             layer: self.layer,
-            depth_role,
         });
         outputs
     }

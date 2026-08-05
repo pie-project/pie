@@ -520,7 +520,7 @@ fn emit_range_scoped(
             if cur_layer.is_some() {
                 close_scope(b);
             }
-            if let Some(l) = op.layer.filter(|_| op.depth_role.is_some()) {
+            if let Some(l) = op.layer.filter(|_| plan.depth_windowed(op)) {
                 b.stmt("{");
                 b.stmt(&format!(
                     "const bool depth_tail = depth_k <= {l};"
@@ -1633,12 +1633,13 @@ fn emit_launch(
             // (per_layer_window_left / sliding_window) — placement-
             // independent, so post-norm deployments emit it unchanged.
             if depth_active
-                && op.depth_role
-                    == Some(crate::trace::DepthRole::PrefixPlanSwap)
+                && op.layer.is_some()
+                && crate::kernels::sig(kernel).is_some_and(|k| k.depth_prefix_plan)
             {
-                // STRUCTURAL S-4 (role-stated): the trace SAYS this
-                // launch swaps to the prefix plan on union tail layers
-                // — the emitter spells what the vocabulary states.
+                // The KERNEL says this launch swaps to the prefix plan
+                // on union tail layers (migration step 5: the fact left
+                // the per-op wire word and joined the kernel table,
+                // where it was always a property of).
                 b.stmt("const ops::DecodePlanCache* depth_dp = band_j >= 0");
                 b.stmt("    ? plan_state.depth_band_plans[band_j].get()");
                 b.stmt("    : depth_tail");

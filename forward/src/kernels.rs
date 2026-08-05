@@ -78,6 +78,14 @@ pub struct KernelSig {
     /// Where a sink-writing seam's output lands, if this kernel accepts
     /// one (`sink pages -> kv.pages`).
     pub sink: Option<&'static str>,
+    /// On a union tail layer this dispatch pairs the DEPTH PREFIX plan
+    /// (and its dedicated workspace) instead of the fire's own plan.
+    ///
+    /// This was the `PrefixPlanSwap` half of the retired per-op
+    /// `DepthRole` — a word the IR carried on one launch per layer of
+    /// every depth-declaring trace, restating a fact about the KERNEL.
+    /// Migration step 5 moved it here.
+    pub depth_prefix_plan: bool,
 }
 
 /// Declare one kernel. The syntax is `.wiki/tart/dsl.md` ②'s, minus the
@@ -97,6 +105,7 @@ macro_rules! kernel {
                 needs: Prepare::None,
                 lacks: &[],
                 sink: None,
+                depth_prefix_plan: false,
             }
         }
     };
@@ -106,7 +115,8 @@ macro_rules! kernel {
 pub static KERNELS: &[KernelSig] = &[
     // ── attention ──────────────────────────────────────────────────
     kernel!(flashinfer_decode "dispatch_attention_flashinfer_decode",
-        needs = Prepare::DecodePlan, sink = Some("kv.pages")),
+        needs = Prepare::DecodePlan, sink = Some("kv.pages"),
+        depth_prefix_plan = true),
     kernel!(flashinfer_decode_capture "dispatch_attention_flashinfer_decode_capture",
         needs = Prepare::DecodePlan, sink = Some("kv.pages")),
     kernel!(flashinfer_prefill "dispatch_attention_flashinfer_prefill_bf16",
@@ -228,7 +238,6 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             layer: Some(0),
-            depth_role: None,
         }
     }
 
@@ -261,7 +270,6 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             layer: Some(0),
-            depth_role: None,
         };
         let xqa = "launch_attention_xqa_decode_bf16_prepared";
         let problems = check_plan(&plan_of(vec![
@@ -307,6 +315,58 @@ mod tests {
             stated, declared,
             "the kernel! table and dsl::cuda's stated symbols have drifted"
         );
+    }
+
+    /// The retired `DepthRole`'s two facts, DERIVED, on a live
+    /// depth-declaring trace: membership is the layer tag, and exactly
+    /// one launch per layer swaps to the prefix plan.
+    ///
+    /// The wire word `ffi::arena` writes is computed from these two, so
+    /// this pins the C ABI's `depth_role` byte without the IR carrying
+    /// it. (The one-off proof that the derivation reproduced the stored
+    /// word was 11,399 ops across all 23 goldens, zero mismatches.)
+    #[test]
+    fn the_depth_axis_derives_from_the_layer_tag() {
+        let facts = LlamaLikeFacts::qwen3_0_6b();
+        let plan = family::llama_like_cuda(
+            &facts,
+            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            FireClass::Decode,
+        );
+        assert!(plan.depth_window, "this deployment declares the axis");
+
+        let windowed = plan.ops.iter().filter(|op| plan.depth_windowed(op)).count();
+        let layered = plan.ops.iter().filter(|op| op.layer.is_some()).count();
+        assert_eq!(windowed, layered, "every layer-tagged op is on the axis");
+        assert!(
+            plan.ops
+                .iter()
+                .all(|op| op.layer.is_some() || !plan.depth_windowed(op)),
+            "the prologue/epilogue are outside it"
+        );
+
+        // Three planned-decode dispatches per layer take the swap: the
+        // mask arm's unmasked-prefix rows, and the plain body's
+        // score-capturing and plain arms.
+        let swaps = plan.ops.iter().filter(|op| plan.depth_prefix_plan(op)).count();
+        assert_eq!(swaps, 3 * facts.layers as usize);
+        assert!(
+            plan.ops.iter().filter(|op| plan.depth_prefix_plan(op)).all(|op| matches!(
+                &op.kind,
+                OpKind::Launch { kernel, .. }
+                    if kernel == "dispatch_attention_flashinfer_decode"
+            )),
+            "only the planned decode dispatch swaps"
+        );
+
+        // A trace that does NOT declare the axis puts nothing on it.
+        let prefill = family::llama_like_cuda(
+            &facts,
+            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            FireClass::Prefill,
+        );
+        assert!(!prefill.depth_window);
+        assert!(prefill.ops.iter().all(|op| !prefill.depth_windowed(op)));
     }
 
     /// No symbol is declared twice, and no dsl-side name is either.

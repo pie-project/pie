@@ -1732,7 +1732,6 @@ mod seam_tests {
             inputs,
             outputs,
             layer: Some(0),
-            depth_role: None,
         }
     }
 

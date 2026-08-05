@@ -403,7 +403,12 @@ fn store_ids(arena: &mut PlanArena, ids: &[u32]) -> PieForwardIdRange {
     }
 }
 
-fn flatten_op(arena: &mut PlanArena, interner: &mut Interner, op: &Op) -> PieForwardOp {
+fn flatten_op(
+    arena: &mut PlanArena,
+    interner: &mut Interner,
+    plan: &crate::trace::ForwardPlan,
+    op: &Op,
+) -> PieForwardOp {
     let parts = flatten_kind(arena, interner, &op.kind);
     let inputs = store_ids(arena, &op.inputs);
     let outputs = store_ids(arena, &op.outputs);
@@ -415,10 +420,16 @@ fn flatten_op(arena: &mut PlanArena, interner: &mut Interner, op: &Op) -> PieFor
         param1: parts.param1,
         selector: parts.selector,
         aux_names: parts.aux_names,
-        depth_role: match op.depth_role {
-            None => 0,
-            Some(crate::trace::DepthRole::Windowed) => 1,
-            Some(crate::trace::DepthRole::PrefixPlanSwap) => 2,
+        // Derived at the boundary now (migration step 5): the wire word
+        // is unchanged, but it is no longer IR vocabulary — 2 is the
+        // kernel table's `depth_prefix_plan`, 1 is "layer-tagged under a
+        // depth-declaring trace", 0 is outside the axis.
+        depth_role: if plan.depth_prefix_plan(op) {
+            2
+        } else if plan.depth_windowed(op) {
+            1
+        } else {
+            0
         },
         inputs,
         outputs,
@@ -444,7 +455,7 @@ pub fn build(plan: &ForwardPlan) -> PieForwardPlan {
 
     arena.ops.reserve(plan.ops.len());
     for op in &plan.ops {
-        let flat = flatten_op(&mut arena, &mut interner, op);
+        let flat = flatten_op(&mut arena, &mut interner, plan, op);
         arena.ops.push(flat);
     }
 
