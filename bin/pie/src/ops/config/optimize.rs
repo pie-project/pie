@@ -107,6 +107,8 @@ pub struct Args {
     pub tokens: Option<usize>,
     pub budget: Option<usize>,
     pub write: bool,
+    /// Skip stage one on a machine whose planner has already been measured.
+    pub skip_planner: bool,
 }
 
 impl Args {
@@ -120,30 +122,6 @@ impl Args {
             repeats: self.repeats.unwrap_or(base.repeats),
         }
     }
-}
-
-/// Refuse to sweep on a boot that is also calibrating the memory planner.
-///
-/// The two tuning stages measure different things and must not be stacked. A
-/// calibration boot makes `plan_cuda_memory` abandon its score and build the
-/// LARGEST forward shape in the feasible region — deliberately, so the driver's
-/// own ladder has room to sweep downward, and deliberately accepting the
-/// starved KV pool that leaves. Frame knobs measured against that arena are
-/// measured against a machine nobody serves from, and `--write` would then put
-/// them in the config as if they described this one.
-///
-/// An error rather than a warning: the numbers would look completely ordinary.
-pub fn refuse_stacked_calibration(configured: bool) -> Result<()> {
-    if configured {
-        bail!(
-            "`[driver] calibrate_planner` is on, so this boot would build the \
-             planner's calibration arena — the largest forward shape it can fit, \
-             with the small KV pool that implies — and the sweep would measure \
-             the frame knobs against that instead of against the arena you serve \
-             from. Let the calibration boot finish, unset the flag, then run this."
-        );
-    }
-    Ok(())
 }
 
 /// Resolve the objective from the flag and the config, refusing when neither
@@ -348,7 +326,38 @@ pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
     Ok(content)
 }
 
-/// Boot once, sweep, report.
+/// Measure the memory planner on this device, in its own boot.
+///
+/// **This is why `calibrate_planner` is not a config key.** It is one run of a
+/// measurement, and the only thing that ever needs it is right here: the flag
+/// is set on a config this process derived in memory, the boot that reads it
+/// ends when this function returns, and nothing about it is written down. There
+/// is no state for an operator to leave behind, because there is no state.
+///
+/// It has to be its own boot rather than a stage of the sweep's. A calibrating
+/// planner abandons its score and builds the largest forward shape that fits —
+/// the arena the ladder needs room to sweep inside — and accepts the starved KV
+/// pool that leaves. That is the right arena to measure the forward step in and
+/// the wrong one to measure anything else in, so it goes away before stage two
+/// opens a fresh one from the profile it just wrote.
+async fn calibrate_planner(content: &str) -> Result<()> {
+    let (controller, gateway, mut worker) = crate::derive::derive_standalone(content)?;
+    worker.server.calibrate_planner = true;
+    // Bind an ephemeral port. The sweep boot that follows wants the configured
+    // one, and a calibration boot serves nothing that needs a stable address.
+    worker.server.port = 0;
+
+    let pie = crate::compose::run_standalone(controller, gateway, worker)
+        .await
+        .context("boot the engine to calibrate the planner")?;
+    // Calibration runs inside the driver's own startup, so by the time the boot
+    // returns the sweep is done and the profile is written. Nothing to drive.
+    pie.shutdown().await;
+    Ok(())
+}
+
+/// Calibrate the planner, then sweep the frame knobs inside the arena that
+/// produced.
 pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
     let (cfg_path, origin) = startup::cli_config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
@@ -365,11 +374,6 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
         pie_worker::config_schema::lookup(&file, "driver.memory_profile")
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "auto".to_string());
-    refuse_stacked_calibration(
-        pie_worker::config_schema::lookup(&file, "driver.calibrate_planner")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-    )?;
     let objective = resolve_objective(args.objective, &configured_profile)?;
 
     // The objective is a config value, not just a flag: measuring for one shape
@@ -408,13 +412,34 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
     println!("  This holds the whole device. Do not run it against a machine that is serving.");
     println!();
 
+    // Stage one, and it has to come first: it decides the forward shape, and
+    // the frame knobs are measured INSIDE whatever arena that shape produces.
+    // Sweeping first would rank candidates against an arena the next boot
+    // replaces.
+    if args.skip_planner {
+        println!("Stage 1/2  planner calibration skipped (--skip-planner)");
+        println!("  The sweep runs against whatever shape the planner picks for this boot --");
+        println!("  a cached measurement if one applies, the analytic score otherwise.");
+    } else {
+        println!("Stage 1/2  calibrating the memory planner (one boot, serves nothing)");
+        calibrate_planner(&content).await?;
+        println!(
+            "  written to {}",
+            crate::ui::short_path(&pie_worker::state::planner_profile_path())
+        );
+    }
+    println!();
+    println!("Stage 2/2  sweeping the frame knobs inside that arena");
+
     let inputs = lane_inputs(workload.fleet, workload.tokens);
     // The CLI's `#[tokio::main]` owns the one runtime (see main.rs's "Model A"
     // note), so this borrows it rather than building a second one -- nesting
     // runtimes panics outright.
     let rounds = async {
-        // ONE boot. Everything after it is cheap, which is the whole reason
-        // the knobs were made swappable.
+        // ONE boot for the whole sweep. Everything after it is cheap, which is
+        // the whole reason the knobs were made swappable. This is a different
+        // boot from stage one's on purpose -- it reads the profile that one
+        // wrote, and plans the arena it will actually serve from.
         let pie = crate::compose::run_standalone(controller, gateway, worker)
             .await
             .context("boot the engine (is something already serving on this port?)")?;
@@ -503,19 +528,37 @@ mod tests {
     }
 
     #[test]
-    fn a_calibration_boot_is_not_also_a_sweep() {
-        // Stacked, the sweep would rank frame knobs against the arena the
-        // planner builds to be MEASURED -- largest forward shape, smallest KV
-        // pool -- and `--write` would record that as this machine's answer.
-        // The rounds would look entirely normal, which is why this is an error
-        // and not a warning.
-        let error = refuse_stacked_calibration(true).unwrap_err().to_string();
-        assert!(error.contains("calibrate_planner"), "got: {error}");
+    fn a_calibration_request_cannot_be_written_down() {
+        // The whole reason calibration became a stage rather than a key. A
+        // config that asks for it is refused at parse, so there is no state an
+        // operator can leave behind -- and the sweep can never be ranked
+        // against the arena calibration builds, which is sized to be measured
+        // rather than to serve.
+        let asked = "\
+[model]
+name = \"Qwen/Qwen3-0.6B\"
+hf_repo = \"Qwen/Qwen3-0.6B\"
+
+[driver]
+type = \"cuda_native\"
+device = [\"cuda:0\"]
+calibrate_planner = true
+";
+        let error = pie_worker::Config::parse(asked)
+            .expect_err("a config cannot request a measurement")
+            .to_string();
         assert!(
-            error.contains("unset"),
-            "the error has to say how to get out of it: {error}"
+            error.contains("calibrate_planner"),
+            "the refusal has to name the key: {error}"
         );
-        assert!(refuse_stacked_calibration(false).is_ok());
+        // And it is not a settable key either, so `pie config set` cannot
+        // produce the document above in the first place.
+        assert!(
+            !pie_worker::config_schema::fields(pie_worker::config::DriverKind::CudaNative)
+                .iter()
+                .any(|f| f.key.ends_with("calibrate_planner")),
+            "a measurement is not a setting"
+        );
     }
 
     #[test]
@@ -670,6 +713,7 @@ mod tests {
             tokens: None,
             budget: None,
             write: false,
+            skip_planner: false,
         };
         let resolved = args.workload(Objective::Latency);
         assert_eq!(resolved.fleet, 7, "an explicit flag wins");

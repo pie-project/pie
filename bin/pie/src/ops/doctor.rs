@@ -329,9 +329,14 @@ fn check_gpus() -> Vec<(String, String, Status)> {
 /// until now -- but it is not one an operator should have to infer from the
 /// absence of keys in a file.
 ///
-/// Warnings for what has not been measured -- an unmeasured machine serves.
-/// The one exception is `calibrate_planner`, which is not a description of the
-/// machine but an instruction that has outlived its boot; see below.
+/// Warnings, never failures. An unmeasured machine serves.
+///
+/// This briefly grew a blocking check for a `calibrate_planner` left on in the
+/// config. The check is gone because what it guarded is gone: calibration is a
+/// stage of `pie config optimize` now, set on a config derived in memory, and
+/// the key is `#[serde(skip)]` — a file cannot carry it, so it cannot be left
+/// on. Guarding a state that no longer exists is how a checklist grows a step
+/// nobody can explain.
 fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> {
     let file: toml::Value = std::fs::read_to_string(config_path)
         .ok()
@@ -342,33 +347,6 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
     };
 
     let mut checks = Vec::new();
-
-    // The only blocking check in this section, and the only one that is about
-    // the config rather than about the machine.
-    //
-    // `calibrate_planner` is an action wearing a setting's clothes: "turn it
-    // on, boot once, turn it off". Left on, every boot re-runs the sweep AND --
-    // the part that does real damage -- the planner deliberately abandons its
-    // score to build the largest arena in the feasible region, accepting a
-    // starved KV pool on the reasoning that "a calibration boot serves
-    // nothing". Nothing enforced that. The process calibrates and then serves,
-    // from an arena chosen to be swept rather than to serve.
-    //
-    // Blocking rather than warning because there is no deployment for which
-    // this is the right state, and because the symptom -- a small KV pool, and
-    // seconds added to every start -- looks like a hardware limit rather than
-    // like a flag someone forgot.
-    if set("driver.calibrate_planner").as_deref() == Some("true") {
-        checks.push((
-            "planner calibration".to_string(),
-            "`[driver] calibrate_planner` is still on: this boot will re-run the \
-             sweep and then SERVE from the calibration arena, which is sized to \
-             be measured (largest forward shape, smallest KV pool) rather than \
-             to serve. Unset it now that the measurement is cached."
-                .to_string(),
-            Status::Fail,
-        ));
-    }
 
     match (set("driver.max_forward_tokens"), set("driver.max_forward_requests")) {
         (Some(tokens), Some(requests)) => checks.push((
@@ -454,41 +432,15 @@ mod tests {
     }
 
     #[test]
-    fn a_calibration_flag_left_on_blocks_the_boot() {
-        // The one blocking check in this section. `calibrate_planner` is an
-        // action, not a setting: left on, the planner throws away its score to
-        // build the largest arena it can fit -- accepting the smallest KV pool
-        // -- on the stated reasoning that a calibration boot serves nothing.
-        // Nothing makes that true, so this is what makes it visible.
-        let checks = tuning_of("[driver]\ncalibrate_planner = true\n");
-        let flagged = checks
-            .iter()
-            .find(|(name, _, _)| name == "planner calibration")
-            .expect("a left-on calibration flag is reported");
-        assert_eq!(flagged.2, Status::Fail, "warning is not enough: {flagged:?}");
-        assert!(
-            flagged.1.contains("serve"),
-            "the finding must say what it costs, not just that a flag is set: {}",
-            flagged.1
-        );
-    }
-
-    #[test]
-    fn the_ordinary_unmeasured_machine_still_serves() {
-        // Everything else in this section describes the machine rather than
-        // faulting the config, and an unmeasured machine is a perfectly
-        // serviceable one -- it is what every deployment had until now.
-        for config in ["", "[driver]\ncalibrate_planner = false\n"] {
+    fn the_unmeasured_machine_still_serves() {
+        // This section describes the machine rather than faulting the config,
+        // and an unmeasured machine is a perfectly serviceable one -- it is
+        // what every deployment had until now. Nothing here may block a boot.
+        for config in ["", "[driver]\nmemory_profile = \"latency\"\n"] {
             let checks = tuning_of(config);
             assert!(
                 !checks.iter().any(|(_, _, status)| *status == Status::Fail),
                 "nothing here blocks a boot: {checks:?}"
-            );
-            assert!(
-                !checks
-                    .iter()
-                    .any(|(name, _, _)| name == "planner calibration"),
-                "a flag that is off is not a finding: {checks:?}"
             );
         }
     }

@@ -67,8 +67,14 @@ pub enum ConfigCmd {
 
     /// Measure this machine and report the batching knobs that suit it.
     ///
-    /// Boots the model once and runs a synthetic fleet against each candidate,
-    /// so it holds the whole device: this is a provisioning command, not one to
+    /// Two stages, two boots. The first measures the forward step on this
+    /// device and caches the shape the memory planner should build
+    /// (`--skip-planner` skips it on a machine already measured). The second
+    /// boots into that shape and runs a synthetic fleet against each frame-knob
+    /// candidate. The order is not a preference: the planner decides the arena,
+    /// and the knobs are only meaningful inside it.
+    ///
+    /// Holds the whole device throughout -- a provisioning command, not one to
     /// run against a machine that is serving. Reports by default; `--write`
     /// applies.
     Optimize {
@@ -108,6 +114,16 @@ pub enum ConfigCmd {
         /// Apply the winner to the config file.
         #[arg(long)]
         write: bool,
+
+        /// Skip stage one, the memory-planner calibration.
+        ///
+        /// Stage one costs a boot and measures the forward step on this device;
+        /// its result is cached, so a machine that has already been measured
+        /// does not need it again. Nothing else changes -- the sweep then runs
+        /// against whatever shape the planner picks, which is that cached
+        /// measurement if it still applies and the analytic score otherwise.
+        #[arg(long)]
+        skip_planner: bool,
     },
 }
 
@@ -127,19 +143,21 @@ pub async fn run(cmd: ConfigCmd, global: &startup::GlobalArgs) -> Result<()> {
             tokens,
             budget,
             write,
+            skip_planner,
         } => {
             optimize::run(
-            global,
-            optimize::Args {
-                objective,
-                program,
-                fleet,
-                repeats,
-                tokens,
-                budget,
-                write,
-            },
-        )
+                global,
+                optimize::Args {
+                    objective,
+                    program,
+                    fleet,
+                    repeats,
+                    tokens,
+                    budget,
+                    write,
+                    skip_planner,
+                },
+            )
             .await
         }
     }
