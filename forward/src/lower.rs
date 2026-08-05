@@ -216,7 +216,8 @@ impl Lowerer<'_> {
                     i = next;
                 }
                 OpKind::Launch { kernel, .. } => {
-                    self.emit(i, kernel, op, &window)?;
+                    let live = self.depth_window(op, &window, i)?;
+                    self.emit(i, kernel, op, &live)?;
                     i += 1;
                 }
                 // A semantic op is a statement the backend has not
@@ -276,6 +277,51 @@ impl Lowerer<'_> {
             args: at as u32,
         });
         Ok(())
+    }
+
+    /// DEPTH, with no syntax (`.wiki/tart/dsl.md` ③): a statement
+    /// tagged with layer `l` covers the rows still live at that depth,
+    /// and nothing states it — membership is the layer tag.
+    ///
+    /// This is where the driver's BAND FORMATION goes away. Today the
+    /// driver derives up to three bands from the region table and
+    /// refuses a fourth (`derive_depth_bands`'s `if (count == 3) return
+    /// 0`), because its walk carries per-band plans. Here a layer's live
+    /// row count is just a number, so a fire with four distinct
+    /// truncations lowers exactly like one with two — the ceiling is not
+    /// raised, it has nowhere to live.
+    ///
+    /// The seriation orders truncated rows deepest-first after the
+    /// full-depth ones, so the live rows at any layer are a PREFIX of
+    /// the window. That is checked, not assumed: an order that breaks it
+    /// is `Uncovered`, which is an admission answer.
+    fn depth_window(
+        &self,
+        op: &Op,
+        window: &Range<u32>,
+        at: usize,
+    ) -> Result<Range<u32>, Uncovered> {
+        // A declaration that does not state the axis cannot window (the
+        // XQA and padded-head deployments), and an untagged op is
+        // prologue/epilogue.
+        if !self.plan.depth_windowed(op) {
+            return Ok(window.clone());
+        }
+        let layer = op.layer.unwrap_or(0);
+        let alive = |r: &Row| r.depth_k.is_none_or(|k| layer < k);
+        let mut end = window.start;
+        for i in window.clone() {
+            if alive(&self.rows[i as usize]) {
+                if end != i {
+                    return Err(Uncovered::Discontiguous {
+                        at_op: at,
+                        axis: "depth",
+                    });
+                }
+                end = i + 1;
+            }
+        }
+        Ok(window.start..end)
     }
 
     /// The rows in `window` satisfying `pred`, as a contiguous range.
@@ -658,6 +704,64 @@ mod tests {
             !buffers.pinned.is_empty(),
             "this text states observation seams, so some values are exposed"
         );
+    }
+
+    /// FOUR distinct truncations lower fine. The driver's
+    /// `derive_depth_bands` refuses a fourth band (`if (count == 3)
+    /// return 0`) because its walk carries per-band plans; here a
+    /// layer's live row count is a number, so the ceiling has nowhere to
+    /// live. This is step 5's driver half, on the host side.
+    #[test]
+    fn depth_has_no_band_ceiling() {
+        let plan = decode_plan();
+        // Seriation order: full-depth first, then truncated deepest-first.
+        let mut rows = plain(10);
+        for (i, k) in [(2usize, 24u32), (4, 20), (6, 16), (8, 8)] {
+            for r in &mut rows[i..] {
+                r.depth_k = Some(k);
+            }
+        }
+        let out = lower(&plan, &rows).expect("four bands is not a special case");
+        // Layer 0 runs over everybody; layer 23 only over the rows whose
+        // k is past it (the full-depth prefix plus the k=24 block).
+        let at = |l: u16| {
+            out.launches
+                .iter()
+                .filter(|x| x.layers.start == l)
+                .map(|x| x.rows.end)
+                .max()
+                .unwrap_or(0)
+        };
+        // rows 0-1 full depth, 2-3 k=24, 4-5 k=20, 6-7 k=16, 8-9 k=8;
+        // a row is live at layer l while l < k, so it dies AT l == k.
+        assert_eq!(at(0), 10);
+        assert_eq!(at(7), 10);
+        assert_eq!(at(8), 8, "the k=8 pair dies at layer 8");
+        assert_eq!(at(16), 6);
+        assert_eq!(at(20), 4);
+        assert_eq!(at(23), 4);
+        assert_eq!(at(24), 2, "only the full-depth rows are left");
+        assert_eq!(at(27), 2);
+    }
+
+    /// A uniform truncation SKIPS the tail layers entirely — no launch
+    /// is emitted where nothing is live.
+    #[test]
+    fn a_uniform_truncation_skips_the_tail() {
+        let plan = decode_plan();
+        let rows = vec![
+            Row {
+                depth_k: Some(12),
+                ..Row::default()
+            };
+            4
+        ];
+        let out = lower(&plan, &rows).unwrap();
+        assert!(out.launches.iter().all(|l| l.layers.start < 12
+            || l.layers.start >= 28
+            || l.rows.is_empty()));
+        let full = lower(&plan, &plain(4)).unwrap();
+        assert!(out.rectangles < full.rectangles, "truncation costs less");
     }
 
     /// The arena is DETERMINISTIC in ask order — the property a replayed
