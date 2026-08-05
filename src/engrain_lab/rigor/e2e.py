@@ -81,7 +81,7 @@ SCHEMAS = [
 SUBJECTS = ["person", "book", "city"]
 
 
-def _agreed_schemas() -> list[dict]:
+def _agreed_schemas(corpus: str) -> list[dict]:
     """Corpus schemas every engine will take, checked here rather than assumed.
 
     A coverage sweep run against each library directly is not the same set vLLM
@@ -115,9 +115,7 @@ def _agreed_schemas() -> list[dict]:
     xgc = xg.GrammarCompiler(info)
     llt = llguidance.hf.from_tokenizer(tokenizer)
 
-    instances = json.loads(
-        (RESULTS / "jsonschemabench-instances.json").read_text()
-    )["instances"]
+    instances = json.loads(Path(corpus).read_text())["instances"]
     kept: list[dict] = []
     refused = {"engrain": 0, "xgrammar": 0, "guidance": 0, "not json": 0}
     for instance in instances:
@@ -210,6 +208,13 @@ def main() -> int:
         "what finds the count at which sharing stops paying for residency.",
     )
     parser.add_argument("--memory", type=float, default=0.45)
+    parser.add_argument(
+        "--corpus",
+        default=str(RESULTS / "jsonschemabench-instances.json"),
+        help="which corpus `--unique` draws from. `results/corpus-exact.json` "
+        "is the fragment this engine enforces with nothing left over, so on it "
+        "a validity number is not confounded by a widened mask.",
+    )
     arguments = parser.parse_args()
 
     import jsonschema
@@ -236,7 +241,7 @@ def main() -> int:
     if arguments.unique:
         # Only schemas every engine compiles, so no arm is measured on a set
         # another could not have run. The list comes from the coverage sweep.
-        corpus = _agreed_schemas()
+        corpus = _agreed_schemas(arguments.corpus)
 
     report = {
         "backend": arguments.backend,
@@ -351,6 +356,8 @@ def main() -> int:
 
     RESULTS.mkdir(exist_ok=True)
     tag = "-unique" if arguments.unique else ""
+    if "exact" in arguments.corpus:
+        tag = f"{tag}-exact"
     if arguments.schemas:
         tag = f"{tag}-{arguments.schemas}schema"
     out = RESULTS / f"e2e-{arguments.backend}{tag}.json"

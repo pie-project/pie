@@ -1,0 +1,31 @@
+{
+  "backend": "engrain",
+  "model": "Qwen/Qwen3-0.6B",
+  "unique": true,
+  "schemas": 409,
+  "rows": [
+    {
+      "batch": 512,
+      "distinct_schemas": 409,
+      "seconds": {
+        "min": 3.3304793988354504,
+        "p25": 3.349337875843048,
+        "p50": 3.360275747952983,
+        "p75": 3.4473870182409883,
+        "max": 3.569978553801775
+      },
+      "tokens_per_second": {
+        "min": 10497.147241118697,
+        "p25": 10506.505693166317,
+        "p50": 11152.963997792378,
+        "p75": 11177.464511017855,
+        "max": 11254.235655415288
+      },
+      "tokens_generated_p50": 37490.0,
+      "longest_request_p50": 96.0,
+      "hit_the_cap_p50": 325.0,
+      "valid_last_run": 200,
+      "requests": 512
+    }
+  ]
+}
