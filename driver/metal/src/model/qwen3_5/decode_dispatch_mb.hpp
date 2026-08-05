@@ -185,7 +185,7 @@ inline constexpr int kQmmBnCrossoverTg = 160;
 /// sum is.
 inline int qmm_bn_unsplit(int out_vec, int N) {
     const int bm = qmm_bm(N);
-    if (N < kQmmMinBatch || N % bm != 0 || out_vec % 16 != 0) return 0;
+    if (N < qmm_min_batch() || N % bm != 0 || out_vec % 16 != 0) return 0;
     const int row_tiles = N / bm;
     if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= kQmmBnCrossoverTg) return 32;
     return 16;
