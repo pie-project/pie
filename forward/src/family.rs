@@ -47,6 +47,7 @@ use crate::trace::{
 ///   gemm → `launch_rmsnorm_bf16` → `launch_residual_add_bf16` triplet.
 pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
     dsl::trace_semantic(facts, |m| {
+        dsl::seam(m.trace(), &dsl::seam::IN, &[], None);
         let f = m.facts().clone();
         let q_w = f.q_width();
         let kv_w = f.kv_width();
@@ -112,7 +113,8 @@ pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
             }
         }
 
-        m.logits(&rmsnorm(&y, &m.final_norm()));
+        let logits = m.logits(&rmsnorm(&y, &m.final_norm()));
+        dsl::seam(m.trace(), &dsl::seam::OUT, &[&logits], None);
     })
 }
 
@@ -143,6 +145,7 @@ fn llama_like_cuda_text(
     class: FireClass,
 ) -> ForwardPlan {
     dsl::trace_cuda(facts, class, |m| {
+        dsl::seam(m.trace(), &dsl::seam::IN, &[], None);
         let f = m.facts().clone();
         let q_w = f.q_width();
         let kv_w = f.kv_width();
@@ -219,7 +222,7 @@ fn llama_like_cuda_text(
                     // bug the first live A/B caught). Rung-① lowering is
                     // the HasLora guard with an EMPTY else: a fire with
                     // no usable lanes launches nothing.
-                    dsl::seam_adapter_qv(m, &q, &v, l);
+                    dsl::seam(m.trace(), &dsl::seam::ATTN_QV, &[&q, &v], Some(l));
                 }
                 // Qwen-2 family qkv biases: on the raw projections, after
                 // the lora correction and before norms/rope — the
@@ -368,7 +371,7 @@ fn llama_like_cuda_text(
                         }
                     };
                     let attn_with_sites = |q: &Val| {
-                        dsl::seam_observe(&dsl::seam::ATTN_Q, q, l);
+                        dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[q], Some(l));
                         if !window_one {
                             // Ragged fires are row-uniform: dequant,
                             // then the score-guarded causal dispatch.
@@ -394,7 +397,7 @@ fn llama_like_cuda_text(
                                     cuda::attention_flashinfer_decode(q, &w.kv);
                                 });
                         }
-                        dsl::seam_observe(&dsl::seam::ATTN_OUT, q, l);
+                        dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[q], Some(l));
                     };
                     if fused_post {
                         g.arm(GuardPred::HasCustomMask, || {
@@ -407,9 +410,9 @@ fn llama_like_cuda_text(
                             // the programs a null scores pointer (the
                             // publish-gated contract).
                             let q = general_qkv();
-                            dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
+                            dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
                             masked_attention(&q);
-                            dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
+                            dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[&q], Some(l));
                         })
                         // The lora arm: the fused epilogue writes V
                         // straight to the paged cache — nothing exists to
@@ -466,9 +469,9 @@ fn llama_like_cuda_text(
                         let q = hoisted_q.as_ref().expect("hoisted for the non-fused arms");
                         g.arm(GuardPred::HasCustomMask, || {
                             // Masked+hooked (the fused arm's comment).
-                            dsl::seam_observe(&dsl::seam::ATTN_Q, q, l);
+                            dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[q], Some(l));
                             masked_attention(q);
-                            dsl::seam_observe(&dsl::seam::ATTN_OUT, q, l);
+                            dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[q], Some(l));
                         })
                         .otherwise(|| attn_with_sites(q));
                     }
@@ -493,7 +496,8 @@ fn llama_like_cuda_text(
             }
         }
 
-        m.logits(&rmsnorm(&y, &m.final_norm()));
+        let logits = m.logits(&rmsnorm(&y, &m.final_norm()));
+        dsl::seam(m.trace(), &dsl::seam::OUT, &[&logits], None);
     })
 }
 
@@ -866,7 +870,7 @@ fn gdn_attn_body_cuda(
     // (The hand-written invoke sits after the cached family's GQA
     // repeats; the repeats read q_pre and never write it, so observing
     // before the recurrence guard sees the same bytes.)
-    dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
+    dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
     // GQA (value heads sharing fewer key heads) picks the `_gqa` decode
     // step; the prefill kernels state their own layout handling.
     let gqa = facts.value_heads != facts.key_heads;
@@ -918,7 +922,7 @@ fn gdn_attn_body_cuda(
     };
     // The OnAttn site: after the recurrence core, before the gated norm
     // — the hand-written invoke's position (observing q_pre again).
-    dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
+    dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[&q], Some(l));
 
     // Gated norm (z-gated, per-head, plain fold) → o_proj landed on
     // the residual (`+=` of a fresh matmul IS the beta=1 fold).
@@ -1126,7 +1130,7 @@ fn full_attn_body_cuda(
     // The OnAttnProj site (A4): post-rope, pre-KV-write — the
     // hand-written full-attn invoke's position, observing the roped q
     // (bf16). Observation-only, like the GDN sites.
-    dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
+    dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
 
     // The KV-write mechanism is a per-fire runtime input (explicit
     // descriptors when the fire steers a graph replay, page-derived
@@ -1159,7 +1163,7 @@ fn full_attn_body_cuda(
     let gated = sigmoid_gate_mul(&attn, &gate);
     // The OnAttn site: after the output gate, before the o_proj — the
     // hand-written invoke's position (observing q).
-    dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
+    dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[&q], Some(l));
     y += matmul(&gated, &w.o_proj);
     y
 }
@@ -1236,6 +1240,7 @@ fn dense_mlp_body(
 pub fn qwen3_5_hybrid(facts: &Qwen35HybridFacts) -> ForwardPlan {
     let hidden = hybrid_hidden(facts);
     dsl::trace_named("qwen3_5_hybrid", |t| {
+        dsl::seam(t, &dsl::seam::IN, &[], None);
         let mut y = dsl::embed_with(t, "embed", hidden);
 
         for l in 0..facts.layers {
@@ -1283,6 +1288,7 @@ pub fn qwen3_5_hybrid_cuda(
         }
     );
     dsl::trace_named(&family, |t| {
+        dsl::seam(t, &dsl::seam::IN, &[], None);
         // CommitAdvance changes WHICH OPS RUN so radically — only the
         // linear layers' conv+prep+recurrence, no embed/attention/MLP,
         // nothing after — that it is not a variant of the walk below but
@@ -1349,7 +1355,8 @@ fn hybrid_epilogue(t: &Trace, facts: &Qwen35HybridFacts, y: &Val) {
         layer: None,
     };
     let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
-    dsl::lm_head_at(t, &rmsnorm(y, &final_norm), lm_head, facts.vocab);
+    let logits = dsl::lm_head_at(t, &rmsnorm(y, &final_norm), lm_head, facts.vocab);
+    dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
 }
 
 /// The CommitAdvance pass (north-star-dsl.md 4b, rung 4c-iv): the
@@ -1408,9 +1415,9 @@ fn commit_advance_body(t: &Trace, facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFa
         // invokes (they precede its early return), so the commit trace
         // mirrors them (A4) — argument no-ops on every commit fire
         // today, stated because the contract is the body's.
-        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
+        dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
         cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, cuda.state_bf16);
-        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
+        dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[&q], Some(l));
     }
     // Nothing after the loop: no final norm, no lm_head — the pass ends
     // with the last linear layer's recurrence.

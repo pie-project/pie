@@ -170,6 +170,14 @@ pub struct M {
     f: LlamaLikeFacts,
 }
 
+impl Val {
+    /// The tape this value was recorded on — what a seam statement
+    /// needs when the text has no [`M`] or bare [`Trace`] in hand.
+    pub fn trace(&self) -> &Trace {
+        &self.t
+    }
+}
+
 impl M {
     pub fn facts(&self) -> &LlamaLikeFacts {
         &self.f
@@ -257,14 +265,20 @@ impl M {
     }
 
     /// The epilogue: gather the sampled rows and project to logits
-    /// (`OpKind::LmHead`, resolving the tied-embedding fact).
-    pub fn logits(&self, x: &Val) {
+    /// (`OpKind::LmHead`, resolving the tied-embedding fact). Returns
+    /// the logits — what the `out` seam sees.
+    pub fn logits(&self, x: &Val) -> Val {
         let name = if self.f.tied_embeddings {
             "embed"
         } else {
             "lm_head"
         };
-        self.t.with(None, |b| b.lm_head(x.id, name, self.f.vocab));
+        let id = self.t.with(None, |b| b.lm_head(x.id, name, self.f.vocab));
+        Val {
+            t: self.t.clone(),
+            id,
+            layer: None,
+        }
     }
 }
 
@@ -360,10 +374,13 @@ pub fn embed_with(t: &Trace, weight: &str, hidden: u32) -> Val {
 /// The epilogue under an explicit weight name — [`M::logits`] for traces
 /// that run without an [`M`] (the caller resolves the tied-embedding
 /// fact to a name).
-pub fn lm_head_at(t: &Trace, x: &Val, weight: &str, vocab: u32) {
-    t.with(None, |b| {
-        b.lm_head(x.id, weight, vocab);
-    });
+pub fn lm_head_at(t: &Trace, x: &Val, weight: &str, vocab: u32) -> Val {
+    let id = t.with(None, |b| b.lm_head(x.id, weight, vocab));
+    Val {
+        t: t.clone(),
+        id,
+        layer: None,
+    }
 }
 
 // ── The semantic vocabulary, as free functions ─────────────────────────
@@ -911,11 +928,37 @@ pub mod seam {
         Emit,
     }
 
-    /// A seam's definition: the stable NAME the request surface keys on
-    /// (`fwd.adapter("attn.qv", ..)`, `fwd.attach(..)`) and its caps.
+    /// A seam's SIGNATURE (`.wiki/tart/dsl.md` ①): the stable NAME the
+    /// request surface keys on (`fwd.adapter("attn.qv", ..)`,
+    /// `fwd.attach(..)`), what an attachment SEES, what it MAY do, and —
+    /// for the seams that have one — where it sits and where its output
+    /// lands.
+    ///
+    /// `after` / `before` and `sink` are the two lines the doc singles
+    /// out as carrying what is today only a comment. They are not
+    /// documentation here: [`check_plan`] reads `after` / `before`.
     pub struct Def {
         pub name: &'static str,
+        /// The value roles an attachment observes or rewrites, in
+        /// operand order.
+        pub sees: &'static [&'static str],
         pub caps: &'static [Cap],
+        /// The seam's POSITION rule, for seams whose arithmetic depends
+        /// on it. `after` names the op kinds that must have produced the
+        /// values it sees; `before` names the op kinds that must not yet
+        /// have consumed them.
+        pub position: Option<Position>,
+        /// Where a sink-writing attachment's output lands.
+        pub sink: Option<&'static str>,
+    }
+
+    /// A seam's position rule, stated as op-kind names
+    /// ([`crate::trace::OpKind`]'s discriminants, plus `"Launch:<symbol>"`
+    /// for stated kernels).
+    #[derive(Debug, Clone, Copy)]
+    pub struct Position {
+        pub after: &'static [&'static str],
+        pub before: &'static [&'static str],
     }
 
     /// Pre-attention observation seam: sees the just-projected q; a
@@ -924,7 +967,13 @@ pub mod seam {
     /// `OnAttnProj`).
     pub const ATTN_Q: Def = Def {
         name: "attn.q",
+        sees: &["q"],
         caps: &[Cap::Observe, Cap::PageMaskSink],
+        position: None,
+        // Where Quest's `attn_page_mask` lands. Hardcoded in
+        // `emit_cuda::emit_masked_pages_bracket` today; declared here,
+        // consumed when the launch ABI flattens (migration step 6).
+        sink: Some("attention.pages"),
     };
 
     /// Post-attention observation seam: sees the scores the (possibly
@@ -932,15 +981,28 @@ pub mod seam {
     /// `OnAttn`).
     pub const ATTN_OUT: Def = Def {
         name: "attn.out",
+        sees: &["a"],
         caps: &[Cap::Observe, Cap::Scores],
+        position: None,
+        sink: None,
     };
 
     /// The adapter value seam over the raw q/v projections — pure
     /// expressions of `(x, y)`, `fwd.adapter`'s site family (today's
     /// `HasLora` guard arm).
+    /// THE POSITION RULE IS THE POINT: the correction lands on the raw
+    /// projections, before bias, norms, rope and the KV append. Applying
+    /// it after rope is DIFFERENT ARITHMETIC — the bug the first live
+    /// A/B caught. It was a comment until now.
     pub const ATTN_QV: Def = Def {
         name: "attn.qv",
+        sees: &["q", "v"],
         caps: &[Cap::Transform],
+        position: Some(Position {
+            after: &["Matmul", "SplitQkv"],
+            before: &["AddBias", "Rmsnorm", "Rope", "KvAppend", "Launch"],
+        }),
+        sink: None,
     };
 
     /// Entry boundary seam (prologue's home). Boundary attachments
@@ -948,41 +1010,178 @@ pub mod seam {
     /// why their dispatch-side lowering needs no trace op at any rung.
     pub const IN: Def = Def {
         name: "in",
+        sees: &[],
         caps: &[Cap::Put, Cap::Emit],
+        position: None,
+        sink: None,
     };
 
     /// Exit boundary seam (epilogue's home).
     pub const OUT: Def = Def {
         name: "out",
+        sees: &["logits"],
         caps: &[Cap::Observe, Cap::Sample, Cap::Put, Cap::Emit],
+        position: None,
+        sink: None,
     };
+
+    /// LOAD-TIME check of the seams a text stated.
+    ///
+    /// One rule today, and it is the one whose violation is silent:
+    /// [`ATTN_QV`]'s position. The adapter's delta must land on the base
+    /// projection, not on base + bias, and not after rope — so between
+    /// the ops that PRODUCE the values the seam sees and the seam's own
+    /// statement, nothing may consume them. A live A/B caught exactly
+    /// this once; the rule stops being a comment here.
+    pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
+        let mut problems = Vec::new();
+        for stmt in &plan.seams {
+            let Some(def) = by_name(&stmt.seam) else {
+                problems.push(format!(
+                    "{}: states seam `{}`, which no seam! signature declares",
+                    plan.family, stmt.seam
+                ));
+                continue;
+            };
+            let (Some(pos), Some(at)) = (def.position, stmt.op) else {
+                continue;
+            };
+            let at = at as usize;
+            // The values this statement sees are the inputs of the op
+            // it carries (the adapter's guard opens at `at`; its
+            // correction launch is the next op and names q and v).
+            let Some(seen) = plan.ops.get(at + 1).map(|op| op.inputs.clone()) else {
+                continue;
+            };
+            for &v in &seen {
+                let produced_at = plan
+                    .ops
+                    .iter()
+                    .position(|op| op.outputs.contains(&v));
+                match produced_at {
+                    None => problems.push(format!(
+                        "{}: seam `{}` sees value {v}, which no op produces",
+                        plan.family, def.name
+                    )),
+                    Some(from) => {
+                        let producer = kind_name(&plan.ops[from].kind);
+                        if !pos.after.contains(&producer) {
+                            problems.push(format!(
+                                "{}: seam `{}` must sit after {:?}, but value {v} \
+                                 comes from {producer}",
+                                plan.family, def.name, pos.after
+                            ));
+                        }
+                        for (i, op) in plan.ops.iter().enumerate().take(at).skip(from + 1) {
+                            if !op.inputs.contains(&v) {
+                                continue;
+                            }
+                            let consumer = kind_name(&op.kind);
+                            if pos.before.contains(&consumer) {
+                                problems.push(format!(
+                                    "{}: seam `{}` must sit before {consumer}, but op \
+                                     {i} consumes value {v} first — different \
+                                     arithmetic, not a reordering",
+                                    plan.family, def.name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        problems
+    }
+
+    /// Every seam a model text may state.
+    pub const ALL: &[&Def] = &[&IN, &ATTN_QV, &ATTN_Q, &ATTN_OUT, &OUT];
+
+    pub fn by_name(name: &str) -> Option<&'static Def> {
+        ALL.iter().copied().find(|d| d.name == name)
+    }
+
+    fn kind_name(kind: &crate::trace::OpKind) -> &'static str {
+        use crate::trace::OpKind as K;
+        match kind {
+            K::Embed { .. } => "Embed",
+            K::Matmul { .. } => "Matmul",
+            K::SplitQkv { .. } => "SplitQkv",
+            K::Rope { .. } => "Rope",
+            K::Rmsnorm { .. } => "Rmsnorm",
+            K::AddBias { .. } => "AddBias",
+            K::KvAppend { .. } => "KvAppend",
+            K::Launch { .. } => "Launch",
+            K::Guard { .. } => "Guard",
+            K::Peel { .. } => "Peel",
+            K::HookSite { .. } => "HookSite",
+            _ => "other",
+        }
+    }
 }
 
-/// An observation seam at `def`, watching `v` at `layer` — rung-①
-/// lowering: exactly the [`OpKind::HookSite`] op the pre-seam text
-/// recorded, so the traced form is byte-identical.
+/// THE SEAM STATEMENT — one construct for all five extension points
+/// (`.wiki/tart/dsl.md` ①, migration step 4).
+///
+/// Until now three of the five lowered to ops through two different
+/// functions and the other two lowered to NOTHING: the traced form did
+/// not record that a text has a prologue or an epilogue at all, which is
+/// what put those two stages in a different world from the rest. Every
+/// seam is stated the same way here, and every statement is recorded
+/// ([`crate::trace::SeamStatement`]) whichever way it lowers.
+///
+/// The LOWERINGS are unchanged, which is what keeps the goldens'
+/// op streams byte-identical:
+///
+/// * `attn.q` / `attn.out` — one [`OpKind::HookSite`];
+/// * `attn.qv` — the `HasLora` guard with the correction arm and an
+///   EMPTY else (a fire with no usable lanes launches nothing);
+/// * `in` / `out` — no op. A boundary attachment causes no divergence,
+///   so it enters no row signature; what it needed was a DECLARATION,
+///   and that is what the statement list now carries.
 ///
 /// [`OpKind::HookSite`]: crate::trace::OpKind::HookSite
-pub fn seam_observe(def: &seam::Def, v: &Val, layer: u32) {
-    let stage = match def.name {
-        "attn.q" => crate::trace::HookStage::OnAttnProj,
-        "attn.out" => crate::trace::HookStage::OnAttn,
-        other => unreachable!("no observation seam named {other}"),
-    };
-    hook_site(stage, v, layer);
-}
-
-/// The adapter value seam ([`seam::ATTN_QV`]) over the raw q/v
-/// projections — rung-① lowering: exactly the `HasLora` guard with the
-/// span-grouped correction arm and the EMPTY else (a fire with no
-/// usable lanes launches nothing), byte-identical to the pre-seam text.
-pub fn seam_adapter_qv(m: &M, q: &Val, v: &Val, layer: u32) {
-    guard(
-        m,
-        crate::trace::GuardPred::HasLora,
-        || cuda::lora_qkv_correction(q, v, layer),
-        || {},
+pub fn seam(t: &Trace, def: &seam::Def, sees: &[&Val], layer: Option<u32>) {
+    assert_eq!(
+        sees.len(),
+        def.sees.len(),
+        "seam `{}` sees {:?}",
+        def.name,
+        def.sees
     );
+    match def.name {
+        "attn.q" | "attn.out" => {
+            let stage = if def.name == "attn.q" {
+                crate::trace::HookStage::OnAttnProj
+            } else {
+                crate::trace::HookStage::OnAttn
+            };
+            let l = layer.expect("a body seam states its layer");
+            hook_site(stage, sees[0], l);
+            let at = t.inner.borrow().op_count_now() - 1;
+            t.inner
+                .borrow_mut()
+                .push_seam(def.name, layer, Some(at as u32));
+        }
+        "attn.qv" => {
+            let l = layer.expect("a body seam states its layer");
+            // The index the guard is about to take, captured before it
+            // opens: the statement points at the CONSTRUCT, and the
+            // position check reads the correction's operands from
+            // inside it.
+            let at = t.inner.borrow().op_count_now() as u32;
+            guard_on(
+                t,
+                crate::trace::GuardPred::HasLora,
+                || cuda::lora_qkv_correction(sees[0], sees[1], l),
+                || {},
+            );
+            t.inner.borrow_mut().push_seam(def.name, layer, Some(at));
+        }
+        "in" | "out" => {
+            t.inner.borrow_mut().push_seam(def.name, layer, None);
+        }
+        other => unreachable!("no seam named {other}"),
+    }
 }
 
 // ── Raw kernel signatures ──────────────────────────────────────────────
@@ -1520,4 +1719,123 @@ pub mod cuda {
         )
     }
 
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::seam;
+    use crate::trace::{ForwardPlan, GuardArm, GuardPred, Op, OpKind, SeamStatement};
+
+    fn op(kind: OpKind, inputs: Vec<u32>, outputs: Vec<u32>) -> Op {
+        Op {
+            kind,
+            inputs,
+            outputs,
+            layer: Some(0),
+            depth_role: None,
+        }
+    }
+
+    fn matmul() -> OpKind {
+        OpKind::Matmul {
+            weight: "layer.0.q_proj".to_string(),
+            beta_one: false,
+            selector: None,
+        }
+    }
+
+    fn lora() -> OpKind {
+        OpKind::Launch {
+            kernel: "pie_lora_qkv_correction".to_string(),
+            weights: vec![],
+            state: None,
+        }
+    }
+
+    fn guard() -> OpKind {
+        OpKind::Guard {
+            arms: vec![GuardArm {
+                pred: GuardPred::HasLora,
+                ops: 1,
+            }],
+            else_ops: 0,
+        }
+    }
+
+    /// `q` and `v` from projections, seam immediately after: the shape
+    /// every live text has.
+    fn well_placed() -> Vec<Op> {
+        vec![
+            op(matmul(), vec![], vec![1]),
+            op(matmul(), vec![], vec![2]),
+            op(guard(), vec![], vec![]),
+            op(lora(), vec![1, 2], vec![]),
+        ]
+    }
+
+    fn plan(ops: Vec<Op>) -> ForwardPlan {
+        ForwardPlan {
+            family: "test".to_string(),
+            values: vec![],
+            ops,
+            depth_window: false,
+            seams: vec![SeamStatement {
+                seam: "attn.qv".to_string(),
+                layer: Some(0),
+                op: Some(2),
+            }],
+        }
+    }
+
+    /// The adapter's position rule FIRES. Without this the live traces'
+    /// clean check proves only that the walk found nothing to look at.
+    #[test]
+    fn the_adapter_position_rule_is_not_vacuous() {
+        assert!(seam::check_plan(&plan(well_placed())).is_empty());
+
+        // A bias consuming q BEFORE the seam: the delta would land on
+        // base + bias. This is the shape the live A/B caught.
+        let mut ops = well_placed();
+        ops.insert(
+            2,
+            op(
+                OpKind::AddBias {
+                    weight: "layer.0.q_bias".to_string(),
+                },
+                vec![1],
+                vec![3],
+            ),
+        );
+        let mut p = plan(ops);
+        p.seams[0].op = Some(3);
+        let problems = seam::check_plan(&p);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(problems[0].contains("AddBias"), "{}", problems[0]);
+
+        // A seam placed after rope: different arithmetic, and the
+        // producer is no longer a projection.
+        let ops = vec![
+            op(matmul(), vec![], vec![1]),
+            op(matmul(), vec![], vec![2]),
+            op(OpKind::Rope { kind: crate::trace::RopeKind::Standard, partial: None }, vec![1], vec![3]),
+            op(guard(), vec![], vec![]),
+            op(lora(), vec![3, 2], vec![]),
+        ];
+        let mut p = plan(ops);
+        p.seams[0].op = Some(3);
+        let problems = seam::check_plan(&p);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(problems[0].contains("Rope"), "{}", problems[0]);
+    }
+
+    /// Every seam a text may state is declared, and its `sees` arity is
+    /// what the statement passes.
+    #[test]
+    fn the_seam_table_is_complete() {
+        for d in seam::ALL {
+            assert_eq!(seam::by_name(d.name).map(|x| x.name), Some(d.name));
+        }
+        assert_eq!(seam::ATTN_QV.sees, &["q", "v"]);
+        assert!(seam::ATTN_Q.sink.is_some(), "the page-mask sink is declared");
+    }
 }

@@ -265,6 +265,28 @@ pub struct GuardArm {
     pub ops: u32,
 }
 
+/// ONE SEAM STATEMENT the model text made, in text order
+/// (`.wiki/tart/dsl.md` ①, migration step 4).
+///
+/// Three of the five seams lower to ops today (two `HookSite`s and the
+/// adapter's `HasLora` guard); the two BOUNDARY seams lower to nothing
+/// at all, which is why prologue and epilogue live in a different world
+/// from the rest — the traced form does not record that the text has
+/// them. This list records every seam the text stated, whichever way it
+/// lowered, so "what does this declaration expose?" has one answer.
+///
+/// `op` is the index of the op carrying the seam when one does. A
+/// boundary seam has none: it is a statement about the trace, not a
+/// point inside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeamStatement {
+    pub seam: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<u32>,
+}
+
 /// One operation of the traced form.
 ///
 /// Weights are referenced by name; `layer` tags the ops that address
@@ -676,6 +698,9 @@ pub struct ForwardPlan {
     /// (XQA-deployment, padded head dims, prefill shapes).
     #[serde(default, skip_serializing_if = "is_false")]
     pub depth_window: bool,
+    /// Every seam the text stated ([`SeamStatement`]), in text order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seams: Vec<SeamStatement>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -697,6 +722,8 @@ pub struct TraceBuilder {
     values: Vec<ValueInfo>,
     ops: Vec<Op>,
     layer: Option<u32>,
+    /// Seam statements in text order ([`SeamStatement`]).
+    seams: Vec<SeamStatement>,
     /// Open [`Self::open_guard`] depth. Nesting is part of the
     /// vocabulary since A1 (north-star-dsl.md, the class-collapse
     /// amendment): a nested guard is an ordinary op inside a region —
@@ -730,6 +757,7 @@ impl TraceBuilder {
             values: Vec::new(),
             ops: Vec::new(),
             layer: None,
+            seams: Vec::new(),
             guard_depth: 0,
             value_region_depth: 0,
             depth_axis: false,
@@ -854,6 +882,16 @@ impl TraceBuilder {
 
     pub(crate) fn push_hook_site(&mut self, stage: HookStage, layer: u32, q: ValueId) {
         self.push(OpKind::HookSite { stage, layer }, vec![q], vec![]);
+    }
+
+    /// Record that the text stated a seam, with the index of the op
+    /// carrying it when one does.
+    pub(crate) fn push_seam(&mut self, seam: &str, layer: Option<u32>, op: Option<u32>) {
+        self.seams.push(SeamStatement {
+            seam: seam.to_string(),
+            layer,
+            op,
+        });
     }
 
     pub(crate) fn close_guard(&mut self, guard_idx: usize, arms: Vec<GuardArm>, else_ops: u32) {
@@ -1445,16 +1483,18 @@ impl TraceBuilder {
             values: self.values,
             ops: self.ops,
             depth_window: self.depth_axis,
+            seams: self.seams,
         };
         // ② The kernel signatures, checked (`.wiki/tart/dsl.md` ②,
         // migration step 3). A declaration is traced when the model
         // LOADS, so this is the load-time check the design asks for:
         // `whole` and the table's own coverage stop being rules a
         // reader has to know and become rules a build cannot violate.
-        let problems = crate::kernels::check_plan(&plan);
+        let mut problems = crate::kernels::check_plan(&plan);
+        problems.extend(crate::dsl::seam::check_plan(&plan));
         assert!(
             problems.is_empty(),
-            "kernel! signature violations in this declaration:\n  {}",
+            "signature violations in this declaration:\n  {}",
             problems.join("\n  ")
         );
         plan

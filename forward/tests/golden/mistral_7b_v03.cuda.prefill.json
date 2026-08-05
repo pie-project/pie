@@ -16871,5 +16871,813 @@
       ],
       "layer": null
     }
+  ],
+  "seams": [
+    {
+      "seam": "in"
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 0,
+      "op": 4
+    },
+    {
+      "seam": "attn.q",
+      "layer": 0,
+      "op": 11
+    },
+    {
+      "seam": "attn.out",
+      "layer": 0,
+      "op": 16
+    },
+    {
+      "seam": "attn.q",
+      "layer": 0,
+      "op": 17
+    },
+    {
+      "seam": "attn.out",
+      "layer": 0,
+      "op": 22
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 1,
+      "op": 31
+    },
+    {
+      "seam": "attn.q",
+      "layer": 1,
+      "op": 38
+    },
+    {
+      "seam": "attn.out",
+      "layer": 1,
+      "op": 43
+    },
+    {
+      "seam": "attn.q",
+      "layer": 1,
+      "op": 44
+    },
+    {
+      "seam": "attn.out",
+      "layer": 1,
+      "op": 49
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 2,
+      "op": 58
+    },
+    {
+      "seam": "attn.q",
+      "layer": 2,
+      "op": 65
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 70
+    },
+    {
+      "seam": "attn.q",
+      "layer": 2,
+      "op": 71
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 76
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 3,
+      "op": 85
+    },
+    {
+      "seam": "attn.q",
+      "layer": 3,
+      "op": 92
+    },
+    {
+      "seam": "attn.out",
+      "layer": 3,
+      "op": 97
+    },
+    {
+      "seam": "attn.q",
+      "layer": 3,
+      "op": 98
+    },
+    {
+      "seam": "attn.out",
+      "layer": 3,
+      "op": 103
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 4,
+      "op": 112
+    },
+    {
+      "seam": "attn.q",
+      "layer": 4,
+      "op": 119
+    },
+    {
+      "seam": "attn.out",
+      "layer": 4,
+      "op": 124
+    },
+    {
+      "seam": "attn.q",
+      "layer": 4,
+      "op": 125
+    },
+    {
+      "seam": "attn.out",
+      "layer": 4,
+      "op": 130
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 5,
+      "op": 139
+    },
+    {
+      "seam": "attn.q",
+      "layer": 5,
+      "op": 146
+    },
+    {
+      "seam": "attn.out",
+      "layer": 5,
+      "op": 151
+    },
+    {
+      "seam": "attn.q",
+      "layer": 5,
+      "op": 152
+    },
+    {
+      "seam": "attn.out",
+      "layer": 5,
+      "op": 157
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 6,
+      "op": 166
+    },
+    {
+      "seam": "attn.q",
+      "layer": 6,
+      "op": 173
+    },
+    {
+      "seam": "attn.out",
+      "layer": 6,
+      "op": 178
+    },
+    {
+      "seam": "attn.q",
+      "layer": 6,
+      "op": 179
+    },
+    {
+      "seam": "attn.out",
+      "layer": 6,
+      "op": 184
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 7,
+      "op": 193
+    },
+    {
+      "seam": "attn.q",
+      "layer": 7,
+      "op": 200
+    },
+    {
+      "seam": "attn.out",
+      "layer": 7,
+      "op": 205
+    },
+    {
+      "seam": "attn.q",
+      "layer": 7,
+      "op": 206
+    },
+    {
+      "seam": "attn.out",
+      "layer": 7,
+      "op": 211
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 8,
+      "op": 220
+    },
+    {
+      "seam": "attn.q",
+      "layer": 8,
+      "op": 227
+    },
+    {
+      "seam": "attn.out",
+      "layer": 8,
+      "op": 232
+    },
+    {
+      "seam": "attn.q",
+      "layer": 8,
+      "op": 233
+    },
+    {
+      "seam": "attn.out",
+      "layer": 8,
+      "op": 238
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 9,
+      "op": 247
+    },
+    {
+      "seam": "attn.q",
+      "layer": 9,
+      "op": 254
+    },
+    {
+      "seam": "attn.out",
+      "layer": 9,
+      "op": 259
+    },
+    {
+      "seam": "attn.q",
+      "layer": 9,
+      "op": 260
+    },
+    {
+      "seam": "attn.out",
+      "layer": 9,
+      "op": 265
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 10,
+      "op": 274
+    },
+    {
+      "seam": "attn.q",
+      "layer": 10,
+      "op": 281
+    },
+    {
+      "seam": "attn.out",
+      "layer": 10,
+      "op": 286
+    },
+    {
+      "seam": "attn.q",
+      "layer": 10,
+      "op": 287
+    },
+    {
+      "seam": "attn.out",
+      "layer": 10,
+      "op": 292
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 11,
+      "op": 301
+    },
+    {
+      "seam": "attn.q",
+      "layer": 11,
+      "op": 308
+    },
+    {
+      "seam": "attn.out",
+      "layer": 11,
+      "op": 313
+    },
+    {
+      "seam": "attn.q",
+      "layer": 11,
+      "op": 314
+    },
+    {
+      "seam": "attn.out",
+      "layer": 11,
+      "op": 319
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 12,
+      "op": 328
+    },
+    {
+      "seam": "attn.q",
+      "layer": 12,
+      "op": 335
+    },
+    {
+      "seam": "attn.out",
+      "layer": 12,
+      "op": 340
+    },
+    {
+      "seam": "attn.q",
+      "layer": 12,
+      "op": 341
+    },
+    {
+      "seam": "attn.out",
+      "layer": 12,
+      "op": 346
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 13,
+      "op": 355
+    },
+    {
+      "seam": "attn.q",
+      "layer": 13,
+      "op": 362
+    },
+    {
+      "seam": "attn.out",
+      "layer": 13,
+      "op": 367
+    },
+    {
+      "seam": "attn.q",
+      "layer": 13,
+      "op": 368
+    },
+    {
+      "seam": "attn.out",
+      "layer": 13,
+      "op": 373
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 14,
+      "op": 382
+    },
+    {
+      "seam": "attn.q",
+      "layer": 14,
+      "op": 389
+    },
+    {
+      "seam": "attn.out",
+      "layer": 14,
+      "op": 394
+    },
+    {
+      "seam": "attn.q",
+      "layer": 14,
+      "op": 395
+    },
+    {
+      "seam": "attn.out",
+      "layer": 14,
+      "op": 400
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 15,
+      "op": 409
+    },
+    {
+      "seam": "attn.q",
+      "layer": 15,
+      "op": 416
+    },
+    {
+      "seam": "attn.out",
+      "layer": 15,
+      "op": 421
+    },
+    {
+      "seam": "attn.q",
+      "layer": 15,
+      "op": 422
+    },
+    {
+      "seam": "attn.out",
+      "layer": 15,
+      "op": 427
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 16,
+      "op": 436
+    },
+    {
+      "seam": "attn.q",
+      "layer": 16,
+      "op": 443
+    },
+    {
+      "seam": "attn.out",
+      "layer": 16,
+      "op": 448
+    },
+    {
+      "seam": "attn.q",
+      "layer": 16,
+      "op": 449
+    },
+    {
+      "seam": "attn.out",
+      "layer": 16,
+      "op": 454
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 17,
+      "op": 463
+    },
+    {
+      "seam": "attn.q",
+      "layer": 17,
+      "op": 470
+    },
+    {
+      "seam": "attn.out",
+      "layer": 17,
+      "op": 475
+    },
+    {
+      "seam": "attn.q",
+      "layer": 17,
+      "op": 476
+    },
+    {
+      "seam": "attn.out",
+      "layer": 17,
+      "op": 481
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 18,
+      "op": 490
+    },
+    {
+      "seam": "attn.q",
+      "layer": 18,
+      "op": 497
+    },
+    {
+      "seam": "attn.out",
+      "layer": 18,
+      "op": 502
+    },
+    {
+      "seam": "attn.q",
+      "layer": 18,
+      "op": 503
+    },
+    {
+      "seam": "attn.out",
+      "layer": 18,
+      "op": 508
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 19,
+      "op": 517
+    },
+    {
+      "seam": "attn.q",
+      "layer": 19,
+      "op": 524
+    },
+    {
+      "seam": "attn.out",
+      "layer": 19,
+      "op": 529
+    },
+    {
+      "seam": "attn.q",
+      "layer": 19,
+      "op": 530
+    },
+    {
+      "seam": "attn.out",
+      "layer": 19,
+      "op": 535
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 20,
+      "op": 544
+    },
+    {
+      "seam": "attn.q",
+      "layer": 20,
+      "op": 551
+    },
+    {
+      "seam": "attn.out",
+      "layer": 20,
+      "op": 556
+    },
+    {
+      "seam": "attn.q",
+      "layer": 20,
+      "op": 557
+    },
+    {
+      "seam": "attn.out",
+      "layer": 20,
+      "op": 562
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 21,
+      "op": 571
+    },
+    {
+      "seam": "attn.q",
+      "layer": 21,
+      "op": 578
+    },
+    {
+      "seam": "attn.out",
+      "layer": 21,
+      "op": 583
+    },
+    {
+      "seam": "attn.q",
+      "layer": 21,
+      "op": 584
+    },
+    {
+      "seam": "attn.out",
+      "layer": 21,
+      "op": 589
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 22,
+      "op": 598
+    },
+    {
+      "seam": "attn.q",
+      "layer": 22,
+      "op": 605
+    },
+    {
+      "seam": "attn.out",
+      "layer": 22,
+      "op": 610
+    },
+    {
+      "seam": "attn.q",
+      "layer": 22,
+      "op": 611
+    },
+    {
+      "seam": "attn.out",
+      "layer": 22,
+      "op": 616
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 23,
+      "op": 625
+    },
+    {
+      "seam": "attn.q",
+      "layer": 23,
+      "op": 632
+    },
+    {
+      "seam": "attn.out",
+      "layer": 23,
+      "op": 637
+    },
+    {
+      "seam": "attn.q",
+      "layer": 23,
+      "op": 638
+    },
+    {
+      "seam": "attn.out",
+      "layer": 23,
+      "op": 643
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 24,
+      "op": 652
+    },
+    {
+      "seam": "attn.q",
+      "layer": 24,
+      "op": 659
+    },
+    {
+      "seam": "attn.out",
+      "layer": 24,
+      "op": 664
+    },
+    {
+      "seam": "attn.q",
+      "layer": 24,
+      "op": 665
+    },
+    {
+      "seam": "attn.out",
+      "layer": 24,
+      "op": 670
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 25,
+      "op": 679
+    },
+    {
+      "seam": "attn.q",
+      "layer": 25,
+      "op": 686
+    },
+    {
+      "seam": "attn.out",
+      "layer": 25,
+      "op": 691
+    },
+    {
+      "seam": "attn.q",
+      "layer": 25,
+      "op": 692
+    },
+    {
+      "seam": "attn.out",
+      "layer": 25,
+      "op": 697
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 26,
+      "op": 706
+    },
+    {
+      "seam": "attn.q",
+      "layer": 26,
+      "op": 713
+    },
+    {
+      "seam": "attn.out",
+      "layer": 26,
+      "op": 718
+    },
+    {
+      "seam": "attn.q",
+      "layer": 26,
+      "op": 719
+    },
+    {
+      "seam": "attn.out",
+      "layer": 26,
+      "op": 724
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 27,
+      "op": 733
+    },
+    {
+      "seam": "attn.q",
+      "layer": 27,
+      "op": 740
+    },
+    {
+      "seam": "attn.out",
+      "layer": 27,
+      "op": 745
+    },
+    {
+      "seam": "attn.q",
+      "layer": 27,
+      "op": 746
+    },
+    {
+      "seam": "attn.out",
+      "layer": 27,
+      "op": 751
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 28,
+      "op": 760
+    },
+    {
+      "seam": "attn.q",
+      "layer": 28,
+      "op": 767
+    },
+    {
+      "seam": "attn.out",
+      "layer": 28,
+      "op": 772
+    },
+    {
+      "seam": "attn.q",
+      "layer": 28,
+      "op": 773
+    },
+    {
+      "seam": "attn.out",
+      "layer": 28,
+      "op": 778
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 29,
+      "op": 787
+    },
+    {
+      "seam": "attn.q",
+      "layer": 29,
+      "op": 794
+    },
+    {
+      "seam": "attn.out",
+      "layer": 29,
+      "op": 799
+    },
+    {
+      "seam": "attn.q",
+      "layer": 29,
+      "op": 800
+    },
+    {
+      "seam": "attn.out",
+      "layer": 29,
+      "op": 805
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 30,
+      "op": 814
+    },
+    {
+      "seam": "attn.q",
+      "layer": 30,
+      "op": 821
+    },
+    {
+      "seam": "attn.out",
+      "layer": 30,
+      "op": 826
+    },
+    {
+      "seam": "attn.q",
+      "layer": 30,
+      "op": 827
+    },
+    {
+      "seam": "attn.out",
+      "layer": 30,
+      "op": 832
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 31,
+      "op": 841
+    },
+    {
+      "seam": "attn.q",
+      "layer": 31,
+      "op": 848
+    },
+    {
+      "seam": "attn.out",
+      "layer": 31,
+      "op": 853
+    },
+    {
+      "seam": "attn.q",
+      "layer": 31,
+      "op": 854
+    },
+    {
+      "seam": "attn.out",
+      "layer": 31,
+      "op": 859
+    },
+    {
+      "seam": "out"
+    }
   ]
 }

@@ -238,6 +238,7 @@ mod tests {
             values: vec![],
             ops,
             depth_window: false,
+            seams: vec![],
         }
     }
 
