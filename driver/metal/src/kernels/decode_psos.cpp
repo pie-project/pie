@@ -292,6 +292,12 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     if (features.d512)
         want("sdpa_paged.metal", "sdpa_paged_decode_bfloat16_d_512",
              &out.sdpa_paged_d512);
+    if (features.sdpa_d256)
+        want("sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_256",
+             &out.sdpa_paged_tiled);
+    if (features.d512)
+        want("sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_512",
+             &out.sdpa_paged_tiled_d512);
     if (features.gdn) {
         want("gdn_prep.metal", "gdn_prep_slotted_bfloat16",
              &out.gdn_prep_slotted);

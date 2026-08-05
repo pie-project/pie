@@ -45,14 +45,17 @@ int gemma4_qmm_pool_rows(int max_rows);
 
 /// `head_rows` is how many rows the fire SAMPLES -- what `Kind::RowGather`
 /// compacts, and what the tail after it runs on. 0 means every row.
+/// `requests` is the fire's request count. With `rows` it decides the
+/// attention's shape; 0 means the caller does not know, which keeps the
+/// per-row kernel. `pso_for_mb` must be asked the SAME number.
 void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
-                     Threadgroup& tg, int head_rows = 0);
+                     Threadgroup& tg, int head_rows = 0, int requests = 0);
 
 /// The pipeline a dispatch runs on at M>1. Differs from `pso_for` only where the
 /// kernel itself changes with the batch; everything else falls through.
 Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
                const DecodeStepPsos& base, const MultiBatchPsos& mb,
-               const Gemma4Psos& g4, int head_rows = 0);
+               const Gemma4Psos& g4, int head_rows = 0, int requests = 0);
 
 /// Encode the step for a batch of `rows` tokens. Same walk as
 /// `encode_gemma4_step` -- the DAG, its order and its concurrency runs belong to
@@ -72,6 +75,11 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            /// has a second affine format. Null means it has one.
                            const DecodeStepPsos* base_alt = nullptr,
                            const MultiBatchPsos* mb_alt = nullptr,
+                           /// The fire's request count, which with `rows` is
+                           /// what decides the attention's shape. 0 means the
+                           /// caller does not know, and an unknown fire keeps
+                           /// the per-row kernel.
+                           int requests = 0,
                            /// The half-open slice of the DAG to encode. The
                            /// default is the whole of it; a paging engine asks
                            /// for one segment at a time so the host can refill

@@ -209,6 +209,17 @@ Kernel pso_kind(Kind k) {
     }
 }
 
+/// Whether this fire's attention runs the tiled pipeline.
+///
+/// One predicate, read by `pso_for_mb` and `launch_shape_mb` both: they must
+/// agree or the grid describes a different kernel than the one that runs, and
+/// that is wrong numbers rather than a crash. `requests == 0` is a caller that
+/// did not say, and an unknown fire does not tile -- the tiled kernel loses
+/// badly on a fleet of decodes, so the safe default is the per-row shape.
+bool sdpa_tile_this_fire(int rows, int requests) {
+    return requests > 0 && sdpa_should_tile(rows, requests);
+}
+
 /// The pipeline a gemma4 dispatch runs on at M>1.
 ///
 /// Distinct from `pso_for` for exactly the kinds whose KERNEL changes with the
@@ -222,7 +233,7 @@ Kernel pso_kind(Kind k) {
 /// is wrong numbers.
 Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
                const DecodeStepPsos& base, const MultiBatchPsos& mb,
-               const Gemma4Psos& g4, int head_rows) {
+               const Gemma4Psos& g4, int head_rows, int requests) {
     const int N = rows < 1 ? 1 : rows;
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
 
@@ -270,6 +281,8 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
         // Paged, and windowed by the same slot for both attention types -- the
         // head width is still what picks the instantiation.
         case Kind::Sdpa:
+            if (sdpa_tile_this_fire(N, requests))
+                return d.sliding ? mb.sdpa_paged_tiled : mb.sdpa_paged_tiled_d512;
             return d.sliding ? mb.sdpa_paged : mb.sdpa_paged_d512;
         default:
             return pso_for(d, g, base, g4);
@@ -357,7 +370,7 @@ Pso pso_for(const Dispatch& d, const Gemma4Geometry& g, const DecodeStepPsos& ba
 /// `rows` is the token count in the batch. At rows==1 each case reduces to
 /// `launch_shape`'s, which the test asserts rather than assuming.
 void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
-                     Threadgroup& tg, int head_rows) {
+                     Threadgroup& tg, int head_rows, int requests) {
     const int L = d.layer;
     const int hd = L >= 0 ? g.head_dim_of(L) : g.head_dim;
     const int N = rows < 1 ? 1 : rows;
@@ -490,7 +503,11 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
             kv_append_mb_dispatch(hd, g.n_kv_heads_of(L), N, grid, tg);
             return;
         case Kind::Sdpa:
-            sdpa_sliding_dispatch(g.n_q_heads, grid, tg, N);
+            // Same predicate as `pso_for_mb`, for the same reason.
+            if (sdpa_tile_this_fire(N, requests))
+                sdpa_paged_tiled_dispatch(g.n_q_heads, N, grid, tg);
+            else
+                sdpa_sliding_dispatch(g.n_q_heads, grid, tg, N);
             return;
         case Kind::LayerScalar:
             elementwise_mb_dispatch(g.hidden, N, grid, tg);
@@ -682,7 +699,7 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base, const MultiBatchPsos& mb,
                            const Gemma4Psos& g4, int ordinal_base, int head_rows,
                            const DecodeStepPsos* base_alt, const MultiBatchPsos* mb_alt,
-                           std::size_t begin, std::size_t end) {
+                           int requests, std::size_t begin, std::size_t end) {
     // Deliberately the same walk as `encode_gemma4_step`, differing only in
     // which shape and which pipeline each dispatch gets. The DAG, the ordering
     // and the concurrency runs are properties of the MODEL, not of the batch
@@ -696,11 +713,11 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
         const Dispatch& d = dag[i];
         Grid grid;
         Threadgroup tg;
-        launch_shape_mb(d, g, rows, grid, tg, head_rows);
+        launch_shape_mb(d, g, rows, grid, tg, head_rows, requests);
         const bool alt = base_alt != nullptr && mb_alt != nullptr &&
                          gemma4_uses_alt_quant(d.kind);
         se.set_pso(pso_for_mb(d, g, rows, alt ? *base_alt : base, alt ? *mb_alt : mb, g4,
-                              head_rows));
+                              head_rows, requests));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
         if (i + 1 >= end || run_ends[i] == static_cast<int>(i)) se.barrier();

@@ -230,6 +230,14 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                     bind_const<float>(ctx, ord, (std::uint8_t)P::Scale, 1.0f, &count);
                     bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Window,
                                              d.sliding ? g.sliding_window : 0, &count);
+                    // N, for the tiled pipeline's partial last tile. Bound
+                    // whether or not this fire tiles: the bind table is per
+                    // Kind and the pipeline choice is per row count. Unbound,
+                    // the tiled kernel reads a stale ordinal for N and decides
+                    // which of its rows exist from it -- wrong attention, not
+                    // a crash.
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Rows,
+                                             std::int32_t(R), &count);
                     break;
                 }
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Sdpa::GqaFactor, gqa,

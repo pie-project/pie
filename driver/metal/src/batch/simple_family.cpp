@@ -547,14 +547,20 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
-        const auto walk = [this, rows, head_rows, &pre, &post](StepEncoder& se,
-                                                               std::size_t begin,
-                                                               std::size_t end) {
+        // Rows alone cannot tell a prefill from a fleet of decodes -- both can
+        // be 32 rows. The CSR can: `qo_indptr` is one entry per request plus a
+        // terminator.
+        const int requests =
+            csr.qo_indptr.empty() ? 0 : int(csr.qo_indptr.size()) - 1;
+        const auto walk = [this, rows, head_rows, requests, &pre, &post](StepEncoder& se,
+                                                                        std::size_t begin,
+                                                                        std::size_t end) {
             if (begin == 0 && pre) pre(se);
             gemma4::encode_gemma4_step_mb(se, dag_, g_, rows, base_, mb_, psos_,
                                           /*ordinal_base=*/0, head_rows,
                                           g_.has_alt_quant() ? &base_alt_ : nullptr,
-                                          g_.has_alt_quant() ? &mb_alt_ : nullptr, begin, end);
+                                          g_.has_alt_quant() ? &mb_alt_ : nullptr,
+                                          requests, begin, end);
             if (end == dag_.size() && post) post(se);
         };
         if (paging_.active()) return paging_.fire(ctx, rows, walk);
