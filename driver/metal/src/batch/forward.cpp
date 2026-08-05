@@ -736,10 +736,21 @@ void write_u32(const SlotHandle& s, uint32_t v) {
 // and still exhaust the machine. The bar is a ceiling, not a promise, and this
 // refusal is written to catch the models that are plainly over it rather than
 // to predict the ones that are close.
+// The elastic budget's four addends, kept apart so a refusal can name the one
+// that is large. Assembled by the caller because only it knows the scratch
+// pool, which the heap plan does not carry.
+struct ElasticBreakdown {
+    std::size_t kv_ring = 0;
+    std::size_t kv_pool = 0;
+    std::size_t state = 0;
+    std::size_t scratch = 0;
+};
+
 bool fits_on_this_gpu(std::size_t heap_bytes,
                       std::size_t elastic_bytes,
                       std::size_t resident_weights,
-                      std::string* err) {
+                      std::string* err,
+                      const ElasticBreakdown* parts = nullptr) {
     const std::size_t limit = RawMetalContext::device_working_set_bytes();
     if (limit == 0) return true;  // the device would not say; do not invent one
     const std::size_t want = heap_bytes + elastic_bytes;
@@ -751,8 +762,26 @@ bool fits_on_this_gpu(std::size_t heap_bytes,
         *err = "this model does not fit this GPU: it needs " + gib(want) +
                " GiB resident (" + gib(resident_weights) + " GiB of weights, " +
                gib(elastic_bytes) + " GiB of KV, state and scratch) and the device "
-               "will hold " + gib(limit) + " GiB. A shorter context shrinks the KV; "
-               "the weights do not shrink.";
+               "will hold " + gib(limit) + " GiB.";
+        // Which region to shrink, and with which knob. "A shorter context
+        // shrinks the KV" was the whole of the old advice, and on a paged
+        // family it is wrong twice: the operator reaches for `total_pages`,
+        // the number does not move, and nothing says why. It does not move
+        // because a paged model allocates BOTH the paged pool that
+        // `total_pages` sizes AND the M=1 contiguous ring that `max_ctx`
+        // sizes -- two KV regions, one knob each. Naming them separately is
+        // the difference between a refusal an operator can act on and one
+        // they can only read.
+        if (parts != nullptr) {
+            *err += " Of that: " + gib(parts->kv_ring) +
+                    " GiB M=1 KV ring (from max_model_len), " +
+                    gib(parts->kv_pool) +
+                    " GiB paged KV pool (total_pages x kv_page_size), " +
+                    gib(parts->state) +
+                    " GiB recurrent state (max_forward_requests), " +
+                    gib(parts->scratch) + " GiB scratch.";
+        }
+        *err += " The weights do not shrink.";
     }
     return false;
 }
@@ -999,7 +1028,11 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
 
     // Heap plus mapping: see `setup_simple`. What leaves the heap does not
     // leave the working set.
-    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err))
+    const ElasticBreakdown elastic_parts{
+        plan_.kv_bytes, plan_.kv_pool_bytes, plan_.state_bytes,
+        plan_.scratch_bytes + (taps ? 0u : scratch_pool_bytes)};
+    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err,
+                          &elastic_parts))
         return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
