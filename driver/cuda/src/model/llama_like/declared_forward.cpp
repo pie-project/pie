@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 
+#include "model/declared/depth_window.hpp"
 #include "model/declared/weights.hpp"
 #include "batch/supergraph.hpp"
 #include "kernels/add_bias.hpp"
@@ -577,6 +578,18 @@ void llama_like_forward_declared(
         }
     }
     int depth_band_index = -1;
+    declared::DepthWindow depth(
+        declared::DepthFacts{
+            .stated = depth_stated,
+            .k = depth_k,
+            .union_fire = depth_union,
+            .split = depth_split,
+            .band_count = depth_banded
+                ? static_cast<std::uint32_t>(band_count) : 0u,
+            .band_k = plan_state.depth_band_k.data(),
+            .band_rows = plan_state.depth_band_rows.data(),
+        },
+        N_fire, R_fire);
     // The Peel split (A3): the hook-free prefix row count — the
     // hand-written `fast_rows` derivation verbatim. A runtime INPUT of
     // the stated Peel op, not a choice: with no hooks every row is the
@@ -779,41 +792,15 @@ void llama_like_forward_declared(
         // tail-layer ops are SKIPPED (the unchanged epilogue, layer -1,
         // is the logit-lens head). Union fire: tail-layer ops run over
         // the full-depth prefix rows.
-        if (depth_banded) {
-            depth_band_index = -1;
-            int live = N_fire;
-            if (op.depth_role != 0) {
-                // Deepest-first: the first band whose k the layer has
-                // reached is the deepest containing interval.
-                for (int j = 0; j < band_count; ++j) {
-                    if (op.layer >= static_cast<std::int32_t>(
-                                        plan_state.depth_band_k
-                                            [static_cast<std::size_t>(j)])) {
-                        live = static_cast<int>(
-                            plan_state.depth_band_rows
-                                [static_cast<std::size_t>(j)]);
-                        depth_band_index = j;
-                        break;
-                    }
-                }
-            }
-            if (live == 0) continue;
-            N = live;
-            R = live;
-            if (depth_band_index >= 0 && live == N_fire) {
-                depth_band_index = -1;  // degenerate: every row lives
-            }
-        } else if (depth_k >= 0) {
-            // PROMOTED: membership comes from the op's STATED role
-            // (depth_role != 0), not a re-derived layer-tag rule — the
-            // one function all walkers share is now the trace itself.
-            const bool tail_op = op.depth_role != 0 &&
-                op.layer >= depth_k;
-            if (tail_op && !depth_union) continue;
-            depth_tail_active = depth_union && tail_op;
-            N = depth_tail_active ? depth_split : N_fire;
-            R = depth_tail_active ? depth_split : R_fire;
-        }
+        // The window is `model/declared/depth_window.hpp`'s — it reads the
+        // op's STATED role and the prepare's bands, so it is the same
+        // component for every family (this one carried it because the
+        // depth axis landed here first).
+        if (!depth.enter(op)) continue;
+        N = depth.n();
+        R = depth.r();
+        depth_band_index = depth.band_index();
+        depth_tail_active = depth.tail_active();
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
