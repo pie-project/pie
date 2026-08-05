@@ -344,6 +344,11 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
 /// projections the published checkpoint left in BF16 — quantize into the
 /// affine layout at load, because every matvec here is a quantized one.
 pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
+    // This family encodes its BF16 projections whatever the request says --
+    // its matvecs have no unquantized path -- so the answer is discarded and
+    // only the refusal is wanted: a request this lowering cannot serve must
+    // not be silently ignored here when the other three refuse it.
+    mlx::int4_requested(b, "GptOss")?;
     let mut declared = 0usize;
     for raw in b.tensors().to_vec() {
         // The published checkpoint's MXFP4 experts are consumed as a pair

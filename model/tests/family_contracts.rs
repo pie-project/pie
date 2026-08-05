@@ -942,20 +942,74 @@ fn llama_mlx_metal_int4() {
 #[test]
 fn metal_refuses_a_requantization_it_cannot_encode() {
     for quant in [RuntimeQuant::Int8, RuntimeQuant::Mxfp4, RuntimeQuant::Fp8] {
-        let err = author(
-            &facts("llama3", 1),
-            &llama_bf16_checkpoint(),
-            &metal_target(),
-            &Policy {
-                runtime_quant: quant,
-                ..mlx_policy()
-            },
-        )
-        .expect_err(&format!("runtime_quant={quant:?} should be refused"));
-        let text = err.to_string();
-        assert!(text.contains("no encoder here"), "{quant:?}: {text}");
-        assert!(text.contains("int4"), "{quant:?} refusal names the alternative: {text}");
+        // gpt-oss is in the list because its lowering encodes whatever the
+        // request says -- so the refusal is the only thing the request can do
+        // there, and an author that ignored it would be the odd one out.
+        for (family, checkpoint) in [
+            ("llama3", llama_bf16_checkpoint()),
+            ("gpt_oss", gptoss_mlx_checkpoint()),
+        ] {
+            let err = author(
+                &facts(family, 1),
+                &checkpoint,
+                &metal_target(),
+                &Policy {
+                    runtime_quant: quant,
+                    ..mlx_policy()
+                },
+            )
+            .expect_err(&format!("{family} runtime_quant={quant:?} should be refused"));
+            let text = err.to_string();
+            assert!(text.contains("no encoder here"), "{family} {quant:?}: {text}");
+            assert!(
+                text.contains("int4"),
+                "{family} {quant:?} refusal names the alternative: {text}"
+            );
+        }
     }
+}
+
+/// The same decoder again, in F16 — the width many older releases ship.
+///
+/// Not a cosmetic variant: the driver's `encode_mlx_affine_u4` is handed a byte
+/// width, not a dtype, so it reads every 2-byte element as BF16. Encoding an
+/// F16 weight where it lies would quantize correct values offline and misread
+/// bits at load, which is the one thing this feature must not do. The contract
+/// casts first, and the golden is where that stays true.
+fn llama_f16_checkpoint() -> CheckpointMetadata {
+    let (hidden, intermediate, vocab) = (64, 128, 128);
+    let mut ck = Checkpoint::new();
+    ck.push("model.embed_tokens.weight", &[vocab, hidden], f16enc());
+    let p = "model.layers.0.";
+    ck.push(&format!("{p}input_layernorm.weight"), &[hidden], f16enc());
+    for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+        ck.push(
+            &format!("{p}self_attn.{proj}.weight"),
+            &[hidden, hidden],
+            f16enc(),
+        );
+    }
+    ck.push(
+        &format!("{p}mlp.down_proj.weight"),
+        &[hidden, intermediate],
+        f16enc(),
+    );
+    ck.push("model.norm.weight", &[hidden], f16enc());
+    ck.finish("llama_f16")
+}
+
+#[test]
+fn llama_mlx_metal_int4_from_f16() {
+    check(
+        "llama_mlx_metal_int4_from_f16",
+        &llama_f16_checkpoint(),
+        &facts("llama3", 1),
+        &metal_target(),
+        &Policy {
+            runtime_quant: RuntimeQuant::Int4,
+            ..mlx_policy()
+        },
+    );
 }
 
 fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {
