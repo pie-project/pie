@@ -45,11 +45,13 @@ Qwen35Model::Qwen35Model(
     // `declared_` empty with the reason logged once and body() keeps the
     // hand-written path; a validated plan is consumed by body()'s
     // eligibility gate below.
-    // MERGE 2026-08-04: the tart qwen3_5 declared walker is DORMANT this
-    // era — its gate helpers live in the tart qwen3_5_forward.cpp this
-    // merge did not take (upstream's RS-read generation owns the file).
-    // `declared_` stays empty; body() keeps the hand-written path.
-    // Re-port together with the qwen3_5 hook re-graft.
+    // (0.3 re-port 2026-08-05: the gate helpers moved into
+    // declared_facts.cpp during the split, so the merge-era dormancy —
+    // "helpers live in the tart qwen3_5_forward.cpp" — no longer holds;
+    // the walker is live again.)
+    if (qwen35_declared_forward_enabled()) {
+        declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
+    }
 }
 
 void Qwen35Model::prepare(AttentionWorkspace& attn_ws,
@@ -76,7 +78,6 @@ void Qwen35Model::body(Workspace& ws,
     // `fallback_reason` keeps the exclusion honest in the trace log (a
     // silent fallback would be indistinguishable from a passing A/B run).
     const char* fallback_reason = nullptr;
-#if 0  // MERGE 2026-08-04: qwen3_5 declared walker dormant (see ctor note)
     if (static_cast<bool>(declared_)) {
         const int qgkv_dim =
             2 * hf_config_.num_attention_heads * hf_config_.head_dim +
@@ -152,7 +153,6 @@ void Qwen35Model::body(Workspace& ws,
                          in.is_pure_decode ? 1 : 0, fallback_reason);
         }
     }
-#endif
 
     qwen3_5_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_state_,

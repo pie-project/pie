@@ -20,6 +20,35 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
+// Local mirrors of the GDN tunables (post-merge, qwen3_5_forward.cpp keeps
+// its copies inside that TU's anonymous namespace — the ENV VARS are the
+// shared contract, and every reader caches the same parse):
+int qwen35_gdn_cached_prefill_max_tokens() {
+    static const int max_tokens = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return std::max(0, std::atoi(v));
+    }();
+    return max_tokens;
+}
+
+int qwen35_gdn_warp_tiled_max_tokens() {
+    static const int max_tokens = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_MAX_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 64;
+        return std::max(0, std::atoi(v));
+    }();
+    return max_tokens;
+}
+
+bool qwen35_gdn_warp_tiled_state_persist_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
 using pie_forward::ForwardPlan;
 using pie_forward::PieForwardNormVariant;
 using pie_forward::PieForwardOp;
