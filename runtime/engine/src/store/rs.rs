@@ -286,6 +286,16 @@ pub struct RsStore {
     /// sequence below it has completed on the device, so anything freed at or
     /// before that epoch can no longer be referenced.
     outstanding: BTreeSet<u64>,
+    /// The newest sequence that named each slot, whether as a write target, a
+    /// copy source, or part of the working set a fire reads.
+    ///
+    /// This is what makes the retirement bound tight rather than merely
+    /// correct. Tagging a free with the newest sequence ever ISSUED is sound
+    /// but pins the slot behind fires that never touched it, so one long
+    /// prefill on an unrelated working set holds up every slot freed while it
+    /// runs. A slot last named at sequence 3 is releasable as soon as 3
+    /// completes, no matter how much has been submitted since.
+    touch: HashMap<RsSlotId, u64>,
 }
 
 impl RsStore {
@@ -296,6 +306,7 @@ impl RsStore {
             working_sets: GenMap::new(),
             seq: 0,
             outstanding: BTreeSet::new(),
+            touch: HashMap::new(),
         }
     }
 
@@ -306,11 +317,10 @@ impl RsStore {
 
     /// Retire every free whose epoch is provably complete on the device.
     ///
-    /// A slot is recycled with the epoch of the free, and `decref` pins that
-    /// epoch to `self.seq` — the newest sequence ever issued — so no device
-    /// operation referencing the slot can carry a sequence ABOVE its tag.
-    /// Retiring through the newest completed sequence therefore hands out only
-    /// slots nothing can still be reading or writing.
+    /// A slot is recycled with the epoch of the newest fire that NAMED it (see
+    /// `decref`), so no device operation referencing the slot can carry a
+    /// sequence above its tag. Retiring through the newest completed sequence
+    /// therefore hands out only slots nothing can still be reading or writing.
     ///
     /// "Newest completed" is the smallest outstanding sequence minus one, not
     /// the newest settled one: fires settle out of order, so a young fire
@@ -391,6 +401,9 @@ impl RsStore {
         for id in entry.buffer.into_iter().flatten() {
             self.decref(id, epoch);
         }
+        // Make the frees visible now rather than at the next settle: a request
+        // that just finished is exactly when the pool is most contended.
+        self.retire_idle();
     }
 
     // ------------------------------------------------------------------
@@ -852,6 +865,21 @@ impl RsStore {
 
         self.seq += 1;
         self.outstanding.insert(self.seq);
+        // Everything this fire can name: the slots it writes, the slots it
+        // copies from, and the working set it reads (a fire reads the folded
+        // state and the buffered pages it is not writing).
+        let mut named: Vec<RsSlotId> = allocated.clone();
+        if let Some(target) = &state {
+            named.push(target.slot);
+            named.extend(target.copy_from);
+        }
+        if let Ok(entry) = self.entry(ws) {
+            named.extend(entry.folded);
+            named.extend(entry.buffer.iter().flatten().copied());
+        }
+        for id in named {
+            self.touch.insert(id, self.seq);
+        }
         Ok(RsPreparedWrite {
             fold_len_is_bound: false,
             ws,
@@ -1016,6 +1044,9 @@ impl RsStore {
     /// failure between `prepare` and `publish_batch`. The committed mapping
     /// was never touched, so only the allocation is returned.
     pub fn cancel_prepared(&mut self, prepared: RsPreparedWrite) {
+        for id in &prepared.allocated {
+            self.touch.remove(id);
+        }
         self.pool
             .recycle_after_epoch(prepared.allocated, prepared.seq);
         self.outstanding.remove(&prepared.seq);
@@ -1184,21 +1215,18 @@ impl RsStore {
         self.refs.get(&id).copied().unwrap_or(1)
     }
 
-    fn decref(&mut self, id: RsSlotId, epoch: u64) {
+    /// Release one reference. `epoch` is the caller's notion of when the free
+    /// happened and is deliberately ignored: the store's own per-slot record
+    /// of the newest fire that named the slot is both tighter and impossible
+    /// to hold stale.
+    fn decref(&mut self, id: RsSlotId, _epoch: u64) {
         let count = self.refs.entry(id).or_insert(1);
         *count -= 1;
         if *count == 0 {
             self.refs.remove(&id);
-            // Pin the tag to the newest sequence ever issued rather than
-            // trusting the caller's. Sequences are monotonic, so every write
-            // that could still reference this slot has a sequence at or below
-            // `self.seq`, and nothing prepared later can reach it: the slot is
-            // unreferenced and stays unallocatable until it retires. A caller
-            // holding a stale epoch would otherwise tag the free BELOW a write
-            // still in flight against it, which is the aliasing `retire_idle`
-            // documents.
-            let epoch = epoch.max(self.seq);
-            self.pool.recycle_after_epoch(vec![id], epoch);
+            // A slot no fire ever named carries 0 and retires at once.
+            let tag = self.touch.remove(&id).unwrap_or(0);
+            self.pool.recycle_after_epoch(vec![id], tag);
         }
     }
 }
