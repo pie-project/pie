@@ -22,7 +22,15 @@ namespace {
 
 // Bump whenever the meaning of a stored field changes. A document that does
 // not carry this exact version is refused rather than partially interpreted.
-constexpr int kSchemaVersion = 1;
+//
+// 2: entries record `budget_bytes`, the planner budget the sweep ran inside.
+//    A version-1 entry cannot be read forward, because its absence of a budget
+//    is indistinguishable from "any budget" — and the whole point of the field
+//    is that a shape measured under one budget does not apply under another.
+constexpr int kSchemaVersion = 2;
+
+// See the header: published by `plan_cuda_memory`, read by the calibrator.
+std::size_t g_planner_budget_bytes = 0;
 
 // Exclusive advisory lock over the cache's read -> merge -> rename, held on a
 // sibling file so it survives the rename that replaces the cache itself.
@@ -130,6 +138,12 @@ nlohmann::json read_document(const std::filesystem::path& path,
 
 }  // namespace
 
+void set_planner_budget_bytes(std::size_t budget) {
+    g_planner_budget_bytes = budget;
+}
+
+std::size_t planner_budget_bytes() { return g_planner_budget_bytes; }
+
 std::filesystem::path planner_profile_cache_path() {
     // Same derivation as the module and tuning caches
     // (`pipeline/generated/module_cache.hpp`, `ops/tuning_cache.hpp`):
@@ -208,6 +222,7 @@ std::optional<PlannerProfileShape> planner_profile_cache_lookup(
             stored_plan->value("max_forward_tokens", 0);
         shape.max_forward_requests =
             stored_plan->value("max_forward_requests", 0);
+        shape.budget_bytes = stored_plan->value<std::size_t>("budget_bytes", 0);
         return shape;
     }
     return std::nullopt;
@@ -261,6 +276,7 @@ bool planner_profile_cache_store(
     if (shape.max_forward_requests > 0) {
         plan["max_forward_requests"] = shape.max_forward_requests;
     }
+    if (shape.budget_bytes > 0) plan["budget_bytes"] = shape.budget_bytes;
 
     nlohmann::json measured = nlohmann::json::array();
     for (const auto& s : samples) {

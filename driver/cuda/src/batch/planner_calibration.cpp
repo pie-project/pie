@@ -462,6 +462,11 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
     // subject of the measurement, and writing it here would silently clamp the
     // planner's request cap to whichever row happened to win.
     shape.max_forward_tokens = chosen_budget;
+    // What the sweep ran inside, so a later boot can tell that it no longer
+    // does. The key pins the device and the model and would happily match a
+    // machine with 9 GB less to give -- which is exactly the state a leaked
+    // process leaves, and exactly the state that changed the planner's pick.
+    shape.budget_bytes = planner_budget_bytes();
 
     const auto key = make_planner_profile_key(
         prop, engine.loaded_model.hf_config(), tp_size, engine.kv_cache.format());

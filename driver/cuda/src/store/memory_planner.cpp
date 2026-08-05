@@ -322,6 +322,9 @@ CudaMemoryPlan plan_cuda_memory(
             std::to_string(safety / (1024 * 1024)) + " MiB");
     }
     const std::size_t budget = usable - current_used - safety;
+    // Published before anything reads it, so a calibration sweep can record the
+    // budget it ran inside alongside the shape it chose.
+    set_planner_budget_bytes(budget);
 
     const int tp_size = std::max(1, cfg.distributed.tp_size);
     const bool auto_profile = is_auto_memory_profile(cfg.batching.memory_profile);
@@ -899,7 +902,7 @@ CudaMemoryPlan plan_cuda_memory(
         auto_profile && forced_prefill == 0 && !planner_calibration_requested();
     if (use_profile_cache) {
         std::string cache_error;
-        const auto measured =
+        auto measured =
             planner_profile_cache_lookup(
                 make_planner_profile_key(prop, hf, tp_size, kv_format),
                 &cache_error);
@@ -907,6 +910,32 @@ CudaMemoryPlan plan_cuda_memory(
             std::cerr << "[pie-driver-cuda] memory planner: ignored profile "
                       << "cache " << planner_profile_cache_path().string()
                       << ": " << cache_error << "\n";
+        }
+        // A shape is only an answer to the budget it was measured under. The
+        // key pins the device and the model, and neither notices that this boot
+        // has materially more or less memory to give than the sweep did --
+        // another process holding VRAM, or a checkpoint requantized offline by
+        // `pie model optimize`. Left unchecked this fails in the quiet
+        // direction: with a LARGER budget the measured shape is still feasible,
+        // so it is selected, and the extra memory is simply never used.
+        if (measured.has_value() && measured->budget_bytes > 0) {
+            const double drift =
+                std::abs(static_cast<double>(budget) -
+                         static_cast<double>(measured->budget_bytes)) /
+                static_cast<double>(measured->budget_bytes);
+            if (drift > kPlannerBudgetTolerance) {
+                std::cerr << "[pie-driver-cuda] memory planner: profile cache "
+                          << "was measured against a "
+                          << (measured->budget_bytes / (1024 * 1024))
+                          << " MiB budget and this boot has "
+                          << (budget / (1024 * 1024)) << " MiB ("
+                          << static_cast<int>(drift * 100.0)
+                          << "% apart); the measurement does not describe this "
+                          << "machine, so the scored rule decides. Re-run with "
+                          << "[driver] calibrate_planner if the change is "
+                          << "permanent, or free the device if it is not.\n";
+                measured.reset();
+            }
         }
         if (measured.has_value()) {
             for (auto it = candidates.begin(); it != candidates.end(); ++it) {                if (!measured->policy_profile.empty() &&
@@ -985,6 +1014,16 @@ CudaMemoryPlan plan_cuda_memory(
                              return a.score < b.score;
                          })->plan.max_workspace_tokens
                   << ")\n";
+        // The paragraph above justifies the starved KV pool with "a
+        // calibration boot serves nothing" -- and nothing in this process
+        // enforces that. Calibration does not exit; when it is done this
+        // arena is what serves. Say so here, because the symptom on the far
+        // side (a small page pool, and the sweep's seconds on every start)
+        // reads as a hardware limit rather than as a flag left on.
+        std::cerr << "[pie-driver-cuda] memory planner: this arena is built to "
+                     "be MEASURED, not to serve -- its KV pool is the smallest "
+                     "the largest forward shape leaves. Unset [driver] "
+                     "calibrate_planner before serving from this config.\n";
     }
     if (best_it == candidates.end()) {
         if (prefer_qwen3_8b_prefill_shape) {

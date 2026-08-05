@@ -122,6 +122,30 @@ impl Args {
     }
 }
 
+/// Refuse to sweep on a boot that is also calibrating the memory planner.
+///
+/// The two tuning stages measure different things and must not be stacked. A
+/// calibration boot makes `plan_cuda_memory` abandon its score and build the
+/// LARGEST forward shape in the feasible region — deliberately, so the driver's
+/// own ladder has room to sweep downward, and deliberately accepting the
+/// starved KV pool that leaves. Frame knobs measured against that arena are
+/// measured against a machine nobody serves from, and `--write` would then put
+/// them in the config as if they described this one.
+///
+/// An error rather than a warning: the numbers would look completely ordinary.
+pub fn refuse_stacked_calibration(configured: bool) -> Result<()> {
+    if configured {
+        bail!(
+            "`[driver] calibrate_planner` is on, so this boot would build the \
+             planner's calibration arena — the largest forward shape it can fit, \
+             with the small KV pool that implies — and the sweep would measure \
+             the frame knobs against that instead of against the arena you serve \
+             from. Let the calibration boot finish, unset the flag, then run this."
+        );
+    }
+    Ok(())
+}
+
 /// Resolve the objective from the flag and the config, refusing when neither
 /// states one.
 ///
@@ -335,12 +359,17 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
         )
     })?;
 
-    let configured_profile = pie_worker::config_schema::lookup(
-        &toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?,
-        "driver.memory_profile",
-    )
-    .and_then(|v| v.as_str().map(str::to_string))
-    .unwrap_or_else(|| "auto".to_string());
+    let file: toml::Value =
+        toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
+    let configured_profile =
+        pie_worker::config_schema::lookup(&file, "driver.memory_profile")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "auto".to_string());
+    refuse_stacked_calibration(
+        pie_worker::config_schema::lookup(&file, "driver.calibrate_planner")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    )?;
     let objective = resolve_objective(args.objective, &configured_profile)?;
 
     // The objective is a config value, not just a flag: measuring for one shape
@@ -471,6 +500,22 @@ mod tests {
             resolve_objective(Some(Objective::Latency), "throughput").unwrap(),
             Objective::Latency
         );
+    }
+
+    #[test]
+    fn a_calibration_boot_is_not_also_a_sweep() {
+        // Stacked, the sweep would rank frame knobs against the arena the
+        // planner builds to be MEASURED -- largest forward shape, smallest KV
+        // pool -- and `--write` would record that as this machine's answer.
+        // The rounds would look entirely normal, which is why this is an error
+        // and not a warning.
+        let error = refuse_stacked_calibration(true).unwrap_err().to_string();
+        assert!(error.contains("calibrate_planner"), "got: {error}");
+        assert!(
+            error.contains("unset"),
+            "the error has to say how to get out of it: {error}"
+        );
+        assert!(refuse_stacked_calibration(false).is_ok());
     }
 
     #[test]
