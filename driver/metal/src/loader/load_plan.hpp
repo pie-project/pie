@@ -87,7 +87,7 @@ inline pie_loader::DeviceTarget metal_device_target() {
 /// `runtime_quant` is zero for a reason of its own. The MLX authors DO read it
 /// now (`RuntimeQuant::Int4` encodes a float weight to affine-U4), but this
 /// driver binds what the checkpoint holds: a requantization is a decision about
-/// an artifact, made once by `pie model optimize --quant int4` and written
+/// an artifact, made once by `pie model build --quant int4` and written
 /// down, not one to re-run over every weight on each boot.
 inline LoadPlan compile_load_plan(
     std::string_view snapshot_dir,
