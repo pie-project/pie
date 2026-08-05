@@ -26,6 +26,10 @@ use std::io::IsTerminal;
 pub enum Stream {
     Stdout,
     Stderr,
+    /// Only ever asked about interactivity — there is nothing to colour on the
+    /// way in. [`confirm`] uses it to tell "the user is here" from "this is a
+    /// script".
+    Stdin,
 }
 
 /// Whether to colour, honouring the conventions a user expects to work.
@@ -45,14 +49,22 @@ pub fn colour_enabled(stream: Stream) -> bool {
     match stream {
         Stream::Stdout => std::io::stdout().is_terminal(),
         Stream::Stderr => std::io::stderr().is_terminal(),
+        // Nothing is ever written to stdin, so there is nothing to colour.
+        Stream::Stdin => false,
     }
 }
 
 /// Styling that renders to nothing when colour is off.
 ///
-/// Returning empty strings rather than branching at each call site is what
-/// keeps a format string readable and keeps the no-colour path from being the
-/// one nobody looks at.
+/// Every method takes the text it styles and hands back something that knows
+/// how to end itself. The previous shape handed out the escape sequences
+/// themselves -- `palette.dim()` was a `&'static str` and the caller wrote the
+/// matching `palette.reset()` -- which made "never emit an escape yourself" a
+/// rule ops could only follow voluntarily. Two of them stopped following it and
+/// went back to `\x1b[2m` and a bare `is_terminal()` check, so `NO_COLOR` did
+/// nothing in `pie config show` or `pie model list`. There is no longer a way
+/// to ask this type for an escape, so there is no longer a way to leak one or
+/// to forget its reset.
 #[derive(Clone, Copy)]
 pub struct Palette {
     on: bool,
@@ -77,29 +89,60 @@ impl Palette {
         self.on
     }
 
-    fn code(&self, escape: &'static str) -> &'static str {
-        if self.on { escape } else { "" }
+    fn wrap<T: std::fmt::Display>(&self, code: &'static str, text: T) -> Styled<T> {
+        Styled {
+            text,
+            code,
+            on: self.on,
+        }
     }
 
     /// Secondary text: paths, notes, descriptions. Never the answer itself.
-    pub fn dim(&self) -> &'static str {
-        self.code("\x1b[2m")
+    pub fn dim<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
+        self.wrap("2", text)
     }
     /// Headings and section labels.
-    pub fn bold(&self) -> &'static str {
-        self.code("\x1b[1m")
+    pub fn bold<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
+        self.wrap("1", text)
     }
-    pub fn green(&self) -> &'static str {
-        self.code("\x1b[32m")
+    pub fn green<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
+        self.wrap("32", text)
     }
-    pub fn yellow(&self) -> &'static str {
-        self.code("\x1b[33m")
+    pub fn yellow<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
+        self.wrap("33", text)
     }
-    pub fn red(&self) -> &'static str {
-        self.code("\x1b[31m")
+    pub fn red<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
+        self.wrap("31", text)
     }
-    pub fn reset(&self) -> &'static str {
-        self.code("\x1b[0m")
+    /// A screen's own accent, for a role the shared vocabulary does not name.
+    ///
+    /// `pie inferlet info` colours parameter names, which is one screen's
+    /// business and not a meaning any other command needs. It reached for a
+    /// literal `\x1b[36m` to do it. The escape still does not belong to the
+    /// caller -- what belongs to the caller is the choice of hue.
+    pub fn accent<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
+        self.wrap("36", text)
+    }
+}
+
+/// Text that renders with its styling, or plainly when colour is off.
+///
+/// `Display`, so it drops into a format string like the string it wraps, and
+/// it closes what it opens. Width is the width of the text: nothing here is
+/// visible to a column count, which is what lets [`Table`] pad a styled cell.
+pub struct Styled<T> {
+    text: T,
+    code: &'static str,
+    on: bool,
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for Styled<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.on {
+            write!(f, "\x1b[{}m{}\x1b[0m", self.code, self.text)
+        } else {
+            write!(f, "{}", self.text)
+        }
     }
 }
 
@@ -146,17 +189,13 @@ impl Mark {
     /// The glyph in its colour, or bare when colour is off. Width is always
     /// one column either way, so a table stays aligned.
     pub fn render(self, p: &Palette) -> String {
-        let colour = match self {
-            Mark::Did => p.green(),
-            Mark::Warn => p.yellow(),
-            Mark::Blocked => p.red(),
-            Mark::Chosen | Mark::Plain => "",
-            Mark::Absent => p.dim(),
-        };
-        if colour.is_empty() {
-            self.glyph().to_string()
-        } else {
-            format!("{colour}{}{}", self.glyph(), p.reset())
+        let glyph = self.glyph();
+        match self {
+            Mark::Did => p.green(glyph).to_string(),
+            Mark::Warn => p.yellow(glyph).to_string(),
+            Mark::Blocked => p.red(glyph).to_string(),
+            Mark::Absent => p.dim(glyph).to_string(),
+            Mark::Chosen | Mark::Plain => glyph.to_string(),
         }
     }
 }
@@ -320,29 +359,247 @@ impl Table {
                 let last = i + 1 == columns;
                 let text = if last { clip(raw, last_room) } else { raw.to_string() };
                 let pad = width.saturating_sub(text.chars().count());
-                if i >= self.dim_from {
-                    line.push_str(p.dim());
-                }
-                match self.aligns.get(i).copied().unwrap_or(Align::Left) {
-                    Align::Left => {
-                        line.push_str(&text);
-                        if !last {
-                            line.push_str(&" ".repeat(pad));
-                        }
-                    }
-                    Align::Right => {
-                        line.push_str(&" ".repeat(pad));
-                        line.push_str(&text);
-                    }
-                }
-                if i >= self.dim_from {
-                    line.push_str(p.reset());
+                // Pad first, style second. The padding is inside the styling
+                // and the styling closes itself, so a dimmed column cannot
+                // leave the rest of the line dim -- which is what an
+                // empty-note row used to do.
+                let cell = match self.aligns.get(i).copied().unwrap_or(Align::Left) {
+                    Align::Left if last => text,
+                    Align::Left => format!("{text}{}", " ".repeat(pad)),
+                    Align::Right => format!("{}{text}", " ".repeat(pad)),
+                };
+                // An empty cell gets no styling at all: wrapping nothing still
+                // wrote `\x1b[2m\x1b[0m`, so every `cache list` row with no
+                // note carried four invisible bytes that `trim_end` could not
+                // see and a `| cat -v` reader could.
+                if i >= self.dim_from && !cell.is_empty() {
+                    line.push_str(&p.dim(cell).to_string());
+                } else {
+                    line.push_str(&cell);
                 }
                 if !last {
                     line.push_str(&" ".repeat(GAP));
                 }
             }
             println!("{}", line.trim_end());
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// TOML highlighting
+// -----------------------------------------------------------------------------
+
+/// One line of TOML, coloured the way `pie config show` prints a config file.
+///
+/// Here rather than in `ops/config.rs` because it is presentation and this is
+/// where the colour policy lives. It was six `\x1b[..m` constants and its own
+/// `is_terminal()` check inside the op, which is how `NO_COLOR=1 pie config
+/// show` came to print escapes at a user who had asked it not to. It now goes
+/// through the same [`Palette`] as everything else and answers to the same
+/// three signals.
+///
+/// A tiny state machine over the line rather than a TOML parser: the input is
+/// one line at a time and the grammar of a line is `#comment`, `[header]`, or
+/// `key = value`. Mirrors the "monokai"-ish palette `rich.Syntax(lexer="toml")`
+/// produced, which is what this output looked like before.
+pub fn toml_line(line: &str, p: &Palette) -> String {
+    let comment = |text: &str| p.wrap("2;37", text.to_string()).to_string();
+    let header = |text: &str| p.wrap("1;34", text.to_string()).to_string();
+    let key = |text: &str| p.wrap("36", text.to_string()).to_string();
+
+    let trimmed_start = line.trim_start();
+    let leading = &line[..line.len() - trimmed_start.len()];
+
+    // Whole-line comment.
+    if trimmed_start.starts_with('#') {
+        return format!("{leading}{}", comment(trimmed_start));
+    }
+    // Section header: [foo] / [[foo]].
+    if trimmed_start.starts_with('[') {
+        // Split off any trailing comment so it gets its own colour.
+        let (head, tail) = split_trailing_comment(trimmed_start);
+        let mut out = format!("{leading}{}", header(head));
+        if let Some(c) = tail {
+            out.push(' ');
+            out.push_str(&comment(c));
+        }
+        return out;
+    }
+    // key = value [# comment]
+    let Some(eq) = trimmed_start.find('=') else {
+        // No `=`: blank line or unrecognized — return as-is.
+        return line.to_string();
+    };
+    let (key_part, rest) = trimmed_start.split_at(eq);
+    let (value, trailing) = split_trailing_comment(&rest[1..]);
+
+    let mut out = format!(
+        "{leading}{} = {}",
+        key(key_part.trim_end()),
+        toml_value(value.trim_start(), p)
+    );
+    if let Some(c) = trailing {
+        out.push(' ');
+        out.push_str(&comment(c));
+    }
+    out
+}
+
+/// Split off a `#`-prefixed trailing comment, respecting `#` characters
+/// inside double-quoted strings. Returns `(value, Option<comment>)`.
+fn split_trailing_comment(s: &str) -> (&str, Option<&str>) {
+    let mut in_string = false;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '"' => in_string = !in_string,
+            '#' if !in_string => return (s[..i].trim_end(), Some(s[i..].trim_end())),
+            _ => {}
+        }
+    }
+    (s.trim_end(), None)
+}
+
+fn toml_value(v: &str, p: &Palette) -> String {
+    let trimmed = v.trim();
+    if trimmed == "true" || trimmed == "false" {
+        return p.wrap("35", trimmed).to_string();
+    }
+    if trimmed.starts_with('"') {
+        return p.wrap("32", trimmed).to_string();
+    }
+    if trimmed.starts_with('[') {
+        // Arrays: highlight individual elements, leaving brackets/commas
+        // un-coloured. Cheap and good enough for typical config arrays.
+        let inner = &trimmed[1..trimmed.len().saturating_sub(1)];
+        let elements: Vec<String> = inner.split(',').map(|e| toml_value(e.trim(), p)).collect();
+        return format!("[{}]", elements.join(", "));
+    }
+    if trimmed.parse::<f64>().is_ok() {
+        return p.wrap("33", trimmed).to_string();
+    }
+    trimmed.to_string()
+}
+
+// -----------------------------------------------------------------------------
+// Asking
+// -----------------------------------------------------------------------------
+
+/// Ask before doing something irreversible. `Ok(false)` means "they said no".
+///
+/// The rule that matters is the one about a missing terminal: there is nobody
+/// to ask, so this refuses rather than assuming consent for a delete. It was
+/// written out twice, in `pie cache clear` and `pie model remove`, with the
+/// same logic and two different wordings; the second copy is how a rule gets
+/// half-changed later.
+///
+/// `escape_hatch` is the flag that skips the question, named so the refusal can
+/// say which one to pass.
+pub fn confirm(question: &str, escape_hatch: &str) -> anyhow::Result<bool> {
+    use std::io::Write;
+    if !is_interactive(Stream::Stdin) {
+        anyhow::bail!("this needs confirmation and there is no terminal to ask; rerun with `{escape_hatch}`");
+    }
+    // The prompt goes to stderr so that `pie cache clear > log` still shows it
+    // to the person being asked.
+    eprint!("{question} [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| anyhow::anyhow!("read stdin: {e}"))?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+// -----------------------------------------------------------------------------
+// Progress
+// -----------------------------------------------------------------------------
+
+/// Whether a stream is something a redraw makes sense on.
+///
+/// Distinct from [`colour_enabled`]: `NO_COLOR` is a statement about colour and
+/// says nothing about whether `\r` will land somewhere useful. A bar checks
+/// this; a colour checks that.
+pub fn is_interactive(stream: Stream) -> bool {
+    match stream {
+        Stream::Stdout => std::io::stdout().is_terminal(),
+        Stream::Stderr => std::io::stderr().is_terminal(),
+        Stream::Stdin => std::io::stdin().is_terminal(),
+    }
+}
+
+/// A one-line progress bar redrawn in place on stderr.
+///
+/// Here rather than in the op that draws it, for the reason this module
+/// exists. Its previous home was `pie model import`, where it reported bytes as
+/// `read as f64 / 1e9` -- decimal GB, against the binary GiB every other line
+/// pie prints, so the same file read 7% larger in the bar than in `pie model
+/// list` right after. It also drew a fixed 20-cell bar and clipped names at a
+/// fixed 48 columns, which is where the wrapping-and-smearing on a narrow
+/// terminal came from.
+///
+/// Nothing is drawn when stderr is not a terminal: a log file collects the
+/// finished lines, not an animation.
+pub struct Bar {
+    interactive: bool,
+    last_draw: std::time::Instant,
+    drew: bool,
+}
+
+impl Default for Bar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Bar {
+    pub fn new() -> Self {
+        Self {
+            interactive: is_interactive(Stream::Stderr),
+            last_draw: std::time::Instant::now(),
+            drew: false,
+        }
+    }
+
+    /// Redraw, at most ten times a second. The final frame always draws, so
+    /// the bar ends full rather than wherever the throttle last let it stop.
+    pub fn draw(&mut self, done: u64, total: u64, label: &str) {
+        if !self.interactive {
+            return;
+        }
+        let complete = done >= total;
+        if !complete && self.last_draw.elapsed() < std::time::Duration::from_millis(100) {
+            return;
+        }
+        self.last_draw = std::time::Instant::now();
+        self.drew = true;
+
+        let percent = if total == 0 {
+            100
+        } else {
+            (done * 100 / total).min(100)
+        };
+        let quantity = format!("{}/{}", bytes(done), bytes(total));
+        // Everything but the label is fixed-width; the label gets what is left
+        // and is padded to it, because a redraw that shrinks the line leaves
+        // the tail of the previous one on screen.
+        const CELLS: usize = 20;
+        let fixed = 2 + CELLS + 3 + 4 + 2 + quantity.chars().count() + 2;
+        let room = width().saturating_sub(fixed).max(8);
+        let label = clip(label, room);
+        let filled = (percent as usize * CELLS) / 100;
+        eprint!(
+            "\r  [{}{}] {percent:3}%  {quantity}  {label:<room$}",
+            "#".repeat(filled),
+            "-".repeat(CELLS - filled),
+        );
+    }
+
+    /// End the line, if anything was ever drawn on it.
+    pub fn finish(&mut self) {
+        if self.drew {
+            eprintln!();
+            self.drew = false;
         }
     }
 }
@@ -432,8 +689,8 @@ mod tests {
     #[test]
     fn no_colour_leaves_no_escapes() {
         let plain = Palette::forced(false);
-        assert_eq!(plain.dim(), "");
-        assert_eq!(plain.reset(), "");
+        assert_eq!(plain.dim("path/to/thing").to_string(), "path/to/thing");
+        assert_eq!(plain.bold(42).to_string(), "42");
         assert_eq!(Mark::Did.render(&plain), "✓");
         // And every glyph is one column wide, so a table built without colour
         // lines up with the same table built with it.
@@ -455,6 +712,54 @@ mod tests {
         let rendered = Mark::Blocked.render(&colour);
         assert!(rendered.starts_with("\x1b[31m"));
         assert!(rendered.ends_with("\x1b[0m"));
+        // Styling closes itself. This is the whole reason the palette hands
+        // back a `Styled` rather than an escape: a caller cannot open one and
+        // forget the reset, because a caller never opens one.
+        assert_eq!(colour.dim("x").to_string(), "\x1b[2mx\x1b[0m");
+    }
+
+    #[test]
+    fn the_toml_highlighter_answers_to_the_palette() {
+        // `NO_COLOR=1 pie config show` printed escapes because this rendering
+        // asked `is_terminal()` instead of the palette. Every branch of it --
+        // comment, header, key/value, trailing comment -- must come back bare.
+        let plain = Palette::forced(false);
+        for line in [
+            "# a comment",
+            "[section]  # with a trailing comment",
+            "key = \"value\"  # and here",
+            "number = 8080",
+            "flag = true",
+            "list = [1, 2]",
+            "",
+        ] {
+            let rendered = toml_line(line, &plain);
+            assert!(
+                !rendered.contains('\x1b'),
+                "{line:?} rendered with escapes: {rendered:?}"
+            );
+        }
+        // And with colour on it actually colours, so the test above is not
+        // passing because the highlighter does nothing.
+        let colour = Palette::forced(true);
+        assert!(toml_line("[section]", &colour).contains('\x1b'));
+    }
+
+    #[test]
+    fn a_bar_measures_in_the_same_units_as_everything_else() {
+        // The bar reported `bytes / 1e9` -- decimal GB against pie's binary
+        // GiB everywhere else, so the same file read 7% larger here than in
+        // the listing printed right after it. Both go through `bytes` now.
+        assert_eq!(bytes(3 << 30), "3.0GiB");
+        // A non-interactive stderr draws nothing at all, which is what keeps
+        // an animation out of a log file.
+        let mut bar = Bar {
+            interactive: false,
+            last_draw: std::time::Instant::now(),
+            drew: false,
+        };
+        bar.draw(1, 2, "anything");
+        assert!(!bar.drew, "a bar drew to a non-terminal");
     }
 
     #[test]

@@ -188,12 +188,8 @@ fn list(json: bool) -> Result<()> {
                 .collect::<Vec<_>>(),
         }));
     }
-    let colorize = std::io::stdout().is_terminal();
-    let (green, dim, reset) = if colorize {
-        ("\x1b[32m", "\x1b[2m", "\x1b[0m")
-    } else {
-        ("", "", "")
-    };
+    use crate::ui::{Align, Mark, Palette, Row, Stream, Table};
+    let palette = Palette::for_stream(Stream::Stdout);
 
     // What pie can serve. This is the store, and it comes first because it is
     // the answer to "what models do I have" — the HF cache below it is where
@@ -201,8 +197,12 @@ fn list(json: bool) -> Result<()> {
     let artifacts = crate::local::store::entries()?;
     println!("Artifacts ({}):", crate::local::store::dir().display());
     if artifacts.is_empty() {
-        println!("  {dim}(none — `pie model import <org>/<name>`){reset}");
+        println!(
+            "  {}",
+            palette.dim("(none — `pie model import <org>/<name>`)")
+        );
     }
+    let mut table = Table::new([Align::Left, Align::Right, Align::Left], 1);
     for entry in &artifacts {
         let shards = match entry.shards() {
             0 => String::new(),
@@ -211,20 +211,25 @@ fn list(json: bool) -> Result<()> {
         let from = entry
             .source
             .as_deref()
-            .map(|s| format!(" ← {s}"))
+            .map(|s| format!("← {s},"))
             .unwrap_or_default();
         let by = entry
             .written_by
             .as_deref()
-            .map(|v| format!(" pie {v}"))
-            .unwrap_or_else(|| " provenance missing".to_string());
-        println!(
-            "  {green}●{reset} {} {dim}({}, {} tensors{shards}){reset}{dim}{from},{by}{reset}",
-            entry.name,
-            crate::local::store::format_bytes(entry.bytes),
-            entry.tensors,
-        );
+            .map(|v| format!("pie {v}"))
+            .unwrap_or_else(|| "provenance missing".to_string());
+        table.push(Row::new(
+            // `●` here and `○`/`×` below were this command's private glyph
+            // vocabulary, three spellings that meant what `Mark` already names.
+            Mark::Plain,
+            [
+                entry.name.clone(),
+                crate::ui::bytes(entry.bytes),
+                format!("{} tensors{shards}  {from}{by}", entry.tensors),
+            ],
+        ));
     }
+    table.print(&palette);
 
     // Raw snapshots, marked as what they now are: staging for conversion,
     // and disk that `--clean` or `pie model remove --staging` reclaims.
@@ -250,15 +255,22 @@ fn list(json: bool) -> Result<()> {
         println!(
             "\nRaw snapshots ({}, {}):",
             hub.display(),
-            crate::local::store::format_bytes(total)
+            crate::ui::bytes(total)
         );
+        let mut table = Table::new([Align::Left, Align::Right, Align::Left], 1);
         for (repo_id, ok, info, bytes) in &staged {
-            let mark = if *ok { "○" } else { "×" };
-            println!(
-                "  {dim}{mark} {repo_id} ({}, {info}){reset}",
-                crate::local::store::format_bytes(*bytes)
-            );
+            table.push(Row::new(
+                // "pie cannot serve this family" is the same answer as every
+                // other absence, and gets the same glyph.
+                if *ok { Mark::Plain } else { Mark::Absent },
+                [
+                    repo_id.clone(),
+                    crate::ui::bytes(*bytes),
+                    info.clone(),
+                ],
+            ));
         }
+        table.print(&palette);
     }
     Ok(())
 }
@@ -290,8 +302,7 @@ fn info(name: String, json: bool) -> Result<()> {
     }
 
     let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
-    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
-    println!("{bold}{}{reset}", entry.name);
+    println!("{}", palette.bold(&entry.name));
     let mut table =
         crate::ui::Table::new([crate::ui::Align::Left, crate::ui::Align::Left], 1);
     let mut row = |k: &str, v: String| {
@@ -317,7 +328,10 @@ fn info(name: String, json: bool) -> Result<()> {
     }
     row("path", crate::ui::short_path(&entry.root));
     table.print(&palette);
-    println!("\n{dim}[model]\nmodel = \"{}\"{reset}", entry.name);
+    println!(
+        "\n{}",
+        palette.dim(format!("[model]\nmodel = \"{}\"", entry.name))
+    );
     Ok(())
 }
 
@@ -579,24 +593,18 @@ fn remove(name: String, skip_confirm: bool) -> Result<()> {
     let bytes = entry.bytes;
     let what = format!(
         "artifact {name} ({}, {} file(s))",
-        crate::local::store::format_bytes(bytes),
+        crate::ui::bytes(bytes),
         entry.files.len()
     );
 
-    if !skip_confirm {
-        if !std::io::stdin().is_terminal() {
-            bail!("remove requires confirmation; rerun with `pie model remove {name} --yes`");
-        }
-        eprint!("Remove {what}? [y/N] ");
-        let _ = std::io::stderr().flush();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .map_err(|e| anyhow!("read stdin: {e}"))?;
-        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
-            println!("(aborted)");
-            return Ok(());
-        }
+    if !skip_confirm
+        && !crate::ui::confirm(
+            &format!("Remove {what}?"),
+            &format!("pie model remove {name} --yes"),
+        )?
+    {
+        println!("(aborted)");
+        return Ok(());
     }
 
     crate::local::store::remove(&entry)?;

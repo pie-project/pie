@@ -3,7 +3,6 @@
 //! `list` and `clear` both read `pie_worker::state`, which is the point of the
 //! registry: describing and reclaiming cannot disagree about what exists.
 
-use std::io::{IsTerminal, Write};
 
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
@@ -96,9 +95,11 @@ fn list(json: bool) -> Result<()> {
     }
 
     let palette = Palette::for_stream(Stream::Stdout);
-    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
-
-    println!("{dim}pie writes under{reset} {bold}{}{reset}", ui::short_path(&home));
+    println!(
+        "{} {}",
+        palette.dim("pie writes under"),
+        palette.bold(ui::short_path(&home))
+    );
     let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
     for (entry, exists, size) in &measured {
         // An absent entry is reported rather than hidden: "pie has not written
@@ -197,18 +198,12 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
     println!();
 
     if !skip_confirm {
-        // Same rule as `pie model remove`: without a terminal there is nobody
-        // to ask, so refuse rather than assume consent for a delete.
-        if !std::io::stdin().is_terminal() {
-            bail!("clear requires confirmation; rerun with `pie cache clear --yes`");
-        }
-        eprint!("Delete {} from {} entries? [y/N] ", ui::bytes(total), present.len());
-        let _ = std::io::stderr().flush();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .map_err(|e| anyhow!("read stdin: {e}"))?;
-        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+        let question = format!(
+            "Delete {} from {} entries?",
+            ui::bytes(total),
+            present.len()
+        );
+        if !ui::confirm(&question, "pie cache clear --yes")? {
             println!("(aborted)");
             return Ok(());
         }

@@ -108,7 +108,7 @@ fn report(error: &anyhow::Error) {
         // carries its own snippet, and letting those start at column 0 put the
         // detail outside the block it belongs to.
         for line in cause.to_string().lines() {
-            eprintln!("  {}{line}{}", palette.dim(), palette.reset());
+            eprintln!("  {}", palette.dim(line));
         }
     }
 }

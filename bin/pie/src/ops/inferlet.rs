@@ -348,30 +348,21 @@ fn validate_bare_inferlet_name(name: &str) -> Result<()> {
 
 fn print_manifest(program: &ProgramName, manifest: &Manifest) {
     let palette = Palette::for_stream(Stream::Stdout);
-    let (bold, dim, cyan, green, reset) = (
-        palette.bold(),
-        palette.dim(),
-        // Cyan is this one screen's own accent for parameter names; the shared
-        // palette carries the roles every command uses, not every colour.
-        if palette.enabled() { "\x1b[36m" } else { "" },
-        palette.green(),
-        palette.reset(),
-    );
 
-    println!("{bold}{program}{reset}");
+    println!("{}", palette.bold(program));
     if let Some(description) = &manifest.package.description {
         println!("{description}");
     }
     if let Some(repository) = &manifest.package.repository {
-        println!("{dim}{repository}{reset}");
+        println!("{}", palette.dim(repository));
     }
 
     if manifest.parameters.is_empty() {
-        println!("\n{dim}(no parameters){reset}");
+        println!("\n{}", palette.dim("(no parameters)"));
         return;
     }
 
-    println!("\n{bold}Parameters{reset}");
+    println!("\n{}", palette.bold("Parameters"));
     let name_width = manifest
         .parameters
         .keys()
@@ -382,28 +373,38 @@ fn print_manifest(program: &ProgramName, manifest: &Manifest) {
     let type_width = manifest
         .parameters
         .values()
-        .map(|param| parameter_type_name(&param.param_type).len())
+        .map(|param| parameter_type_name(&param.param_type).chars().count())
         .max()
         .unwrap_or(4)
         .max("type".len());
 
     println!(
-        "{dim}{:<name_width$}  {:<type_width$}  required  description{reset}",
-        "name", "type"
+        "{}",
+        palette.dim(format!(
+            "{:<name_width$}  {:<type_width$}  required  description",
+            "name", "type"
+        ))
     );
     for (name, param) in &manifest.parameters {
+        // Pad first, colour second. `{:<8}` counts what is in the string, and
+        // what was in the string was `\x1b[2moptional\x1b[0m` -- so the width
+        // it padded to was the byte count of the escapes, not the eight columns
+        // a reader sees. Every row of this table was misaligned with colour on
+        // and aligned with it off.
+        let required = format!("{:<8}", if param.optional { "optional" } else { "yes" });
         let required = if param.optional {
-            format!("{dim}optional{reset}")
+            palette.dim(required).to_string()
         } else {
-            format!("{green}yes{reset}")
+            palette.green(required).to_string()
         };
-        let description = param.description.as_deref().unwrap_or("");
         println!(
-            "{cyan}{:<name_width$}{reset}  {:<type_width$}  {:<8}  {}",
-            name,
+            "{}  {:<type_width$}  {required}  {}",
+            // Cyan is this one screen's own accent for parameter names; the
+            // shared vocabulary carries the roles every command uses, not
+            // every colour.
+            palette.accent(format!("{name:<name_width$}")),
             parameter_type_name(&param.param_type),
-            required,
-            description
+            palette.dim(param.description.as_deref().unwrap_or("")),
         );
     }
 }

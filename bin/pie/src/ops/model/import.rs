@@ -483,58 +483,35 @@ impl TensorSink for Spool {
 ///
 /// Renders to stderr only when stderr is a terminal, throttled so the redraw
 /// never becomes the work. The name shown is the last tensor published.
+/// The import progress bar: [`crate::ui::Bar`], fed from the loader's own
+/// `Progress`.
+///
+/// The adapter is here rather than in `ui` so the presentation module stays
+/// free of `pie_loader` -- what it needs to draw a bar is two numbers and a
+/// label, and `Progress` is where those two numbers happen to live today.
 pub(crate) struct ProgressLine {
-    terminal: bool,
-    last_draw: std::time::Instant,
+    bar: crate::ui::Bar,
     current: String,
-    drew: bool,
 }
 
 impl ProgressLine {
     pub(crate) fn new() -> Self {
-        use std::io::IsTerminal;
         Self {
-            terminal: std::io::stderr().is_terminal(),
-            last_draw: std::time::Instant::now(),
+            bar: crate::ui::Bar::new(),
             current: String::new(),
-            drew: false,
         }
     }
 
     pub(crate) fn render(&mut self, progress: &Progress<'_>) {
-        if !self.terminal {
-            return;
-        }
         if let Some(name) = progress.finalized {
             self.current = name.to_string();
         }
-        let done = progress.read_bytes >= progress.total_read_bytes;
-        if !done && self.last_draw.elapsed() < std::time::Duration::from_millis(100) {
-            return;
-        }
-        self.last_draw = std::time::Instant::now();
-        self.drew = true;
-        let percent = if progress.total_read_bytes == 0 {
-            100
-        } else {
-            (progress.read_bytes * 100 / progress.total_read_bytes).min(100)
-        };
-        let filled = (percent / 5) as usize;
-        let gb = |bytes: u64| bytes as f64 / 1e9;
-        eprint!(
-            "\r  [{}{}] {percent:3}%  {:.2}/{:.2} GB  {:<48.48}",
-            "#".repeat(filled),
-            "-".repeat(20 - filled),
-            gb(progress.read_bytes),
-            gb(progress.total_read_bytes),
-            self.current
-        );
+        self.bar
+            .draw(progress.read_bytes, progress.total_read_bytes, &self.current);
     }
 
     pub(crate) fn finish(&mut self) {
-        if self.drew {
-            eprintln!();
-        }
+        self.bar.finish();
     }
 }
 

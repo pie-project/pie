@@ -10,7 +10,6 @@
 //! nested TOML tables, and types the value by the schema rather than by how it
 //! looks.
 
-use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -205,7 +204,6 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
     }
 
     let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
-    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
 
     // Column widths from the rows actually being printed, so a filtered
     // listing is not padded out to the width of the ones it excluded.
@@ -236,7 +234,7 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
         if index > 0 {
             println!();
         }
-        println!("{bold}[{section}]{reset}");
+        println!("{}", palette.bold(format!("[{section}]")));
         let mut table = crate::ui::Table::new(
             [
                 crate::ui::Align::Left,
@@ -265,7 +263,10 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
         }
         table.print(&palette);
     }
-    println!("\n{dim}• set in {}{reset}", crate::ui::short_path(&cfg_path));
+    println!(
+        "\n{}",
+        palette.dim(format!("• set in {}", crate::ui::short_path(&cfg_path)))
+    );
     Ok(())
 }
 
@@ -383,118 +384,30 @@ fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
         .and_then(|c| cfg_path.strip_prefix(c).ok())
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| cfg_path.display().to_string());
-    let colorize = std::io::stdout().is_terminal();
-    if colorize {
-        // Mimic the Python pie's `rich.Syntax(... title=path)` framing:
-        // a thin separator line above and below labelled with the path.
-        let dim = "\x1b[2m";
-        let reset = "\x1b[0m";
-        println!("{dim}── {display} ──{reset}");
-        // Only when something redirected us. On the default path the origin is
-        // the answer to a question nobody asked; on the other two it is the
-        // answer to "why am I not seeing my edits?".
-        if origin != startup::Origin::Default {
-            println!("{dim}   from {}{reset}", origin.describe());
-        }
-        for line in content.lines() {
-            println!("{}", colorize_toml_line(line));
-        }
-        println!("{dim}{}{reset}", "─".repeat(display.chars().count() + 6));
-    } else {
+    // `Palette`, not `is_terminal()`. Asking the file descriptor directly is
+    // what made this screen ignore `NO_COLOR` and `TERM=dumb`: both are the
+    // user saying so, and a TTY check is only a guess about what they want.
+    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
+    if !palette.enabled() {
         print!("{content}");
+        return Ok(());
     }
+    // A thin separator line above and below, labelled with the path.
+    println!("{}", palette.dim(format!("── {display} ──")));
+    // Only when something redirected us. On the default path the origin is
+    // the answer to a question nobody asked; on the other two it is the
+    // answer to "why am I not seeing my edits?".
+    if origin != startup::Origin::Default {
+        println!("{}", palette.dim(format!("   from {}", origin.describe())));
+    }
+    for line in content.lines() {
+        println!("{}", crate::ui::toml_line(line, &palette));
+    }
+    println!(
+        "{}",
+        palette.dim("─".repeat(display.chars().count() + 6))
+    );
     Ok(())
-}
-
-/// Colorize one line of TOML for an ANSI terminal. Mirrors the
-/// "monokai"-ish palette `rich.Syntax(lexer="toml")` produces in the
-/// Python pie's `pie config show`. Dependency-free — a tiny state
-/// machine over the line characters is plenty for TOML's grammar.
-fn colorize_toml_line(line: &str) -> String {
-    const RESET: &str = "\x1b[0m";
-    const COMMENT: &str = "\x1b[2;37m"; // dim grey
-    const HEADER: &str = "\x1b[1;34m"; // bold blue
-    const KEY: &str = "\x1b[36m"; // cyan
-    const STRING: &str = "\x1b[32m"; // green
-    const NUMBER: &str = "\x1b[33m"; // yellow
-    const BOOL: &str = "\x1b[35m"; // magenta
-
-    let trimmed_start = line.trim_start();
-    let leading: String = line[..line.len() - trimmed_start.len()].to_string();
-
-    // Whole-line comment.
-    if trimmed_start.starts_with('#') {
-        return format!("{leading}{COMMENT}{trimmed_start}{RESET}");
-    }
-    // Section header: [foo] / [[foo]].
-    if trimmed_start.starts_with('[') {
-        // Split off any trailing comment so it gets its own colour.
-        let (head, tail) = split_trailing_comment(trimmed_start);
-        let mut out = format!("{leading}{HEADER}{head}{RESET}");
-        if let Some(c) = tail {
-            out.push_str(&format!(" {COMMENT}{c}{RESET}"));
-        }
-        return out;
-    }
-    // key = value [# comment]
-    let Some(eq) = trimmed_start.find('=') else {
-        // No `=`: blank line or unrecognized — return as-is.
-        return line.to_string();
-    };
-    let (key_part, rest) = trimmed_start.split_at(eq);
-    let value_part = &rest[1..]; // drop '='
-    let (value, comment) = split_trailing_comment(value_part);
-
-    let mut out = String::new();
-    out.push_str(&leading);
-    out.push_str(KEY);
-    out.push_str(key_part.trim_end());
-    out.push_str(RESET);
-    out.push_str(" = ");
-    out.push_str(&colorize_value(value.trim_start(), STRING, NUMBER, BOOL));
-    if let Some(c) = comment {
-        out.push_str(&format!(" {COMMENT}{c}{RESET}"));
-    }
-    out
-}
-
-/// Split off a `#`-prefixed trailing comment, respecting `#` characters
-/// inside double-quoted strings. Returns `(value, Option<comment>)`.
-fn split_trailing_comment(s: &str) -> (&str, Option<&str>) {
-    let mut in_string = false;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '"' => in_string = !in_string,
-            '#' if !in_string => return (s[..i].trim_end(), Some(s[i..].trim_end())),
-            _ => {}
-        }
-    }
-    (s.trim_end(), None)
-}
-
-fn colorize_value(v: &str, string: &str, number: &str, boolean: &str) -> String {
-    const RESET: &str = "\x1b[0m";
-    let trimmed = v.trim();
-    if trimmed == "true" || trimmed == "false" {
-        return format!("{boolean}{trimmed}{RESET}");
-    }
-    if trimmed.starts_with('"') {
-        return format!("{string}{trimmed}{RESET}");
-    }
-    if trimmed.starts_with('[') {
-        // Arrays: highlight individual elements, leaving brackets/commas
-        // un-coloured. Cheap and good enough for typical config arrays.
-        let inner = &trimmed[1..trimmed.len().saturating_sub(1)];
-        let elems: Vec<String> = inner
-            .split(',')
-            .map(|e| colorize_value(e.trim(), string, number, boolean))
-            .collect();
-        return format!("[{}]", elems.join(", "));
-    }
-    if trimmed.parse::<f64>().is_ok() {
-        return format!("{number}{trimmed}{RESET}");
-    }
-    trimmed.to_string()
 }
 
 fn set(global: &startup::GlobalArgs, key: String, value: String) -> Result<()> {

@@ -116,7 +116,7 @@ pub fn doctor(global: &startup::GlobalArgs, json: bool) -> Result<bool> {
 
     let palette = Palette::for_stream(Stream::Stdout);
     for (name, checks) in &sections {
-        println!("\n{}[{name}]{}", palette.bold(), palette.reset());
+        println!("\n{}", palette.bold(format!("[{name}]")));
         let mut table = crate::ui::Table::new(
             [crate::ui::Align::Left, crate::ui::Align::Left],
             1,

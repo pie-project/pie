@@ -135,20 +135,6 @@ pub fn remove(entry: &Entry) -> Result<()> {
     Ok(())
 }
 
-/// Human-readable bytes, in the units the store's sizes actually land in.
-pub fn format_bytes(n: u64) -> String {
-    const GIB: f64 = (1u64 << 30) as f64;
-    const MIB: f64 = (1u64 << 20) as f64;
-    let n = n as f64;
-    if n >= GIB {
-        format!("{:.1} GiB", n / GIB)
-    } else if n >= MIB {
-        format!("{:.0} MiB", n / MIB)
-    } else {
-        format!("{n:.0} B")
-    }
-}
-
 /// The HF staging snapshot for a repo, when one is present.
 ///
 /// The cache demotes to a staging area once artifacts exist: it is what
@@ -246,12 +232,5 @@ mod tests {
         assert_eq!(found[1].tensors, 3);
         // The reported size is the whole set, not just the root.
         assert!(found[1].bytes > 3 * 32_000);
-    }
-
-    #[test]
-    fn sizes_read_in_the_units_they_land_in() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(3 << 20), "3 MiB");
-        assert_eq!(format_bytes(3 << 30), "3.0 GiB");
     }
 }
