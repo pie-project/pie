@@ -18,6 +18,9 @@ use serde_json;
 /// The raw WIT context resource, re-exported for power users.
 pub use crate::pie::core::context::Context as RawContext;
 
+/// What opening a snapshot cost — see [`Context::open_with_report`].
+pub use crate::pie::core::context::OpenReport;
+
 // Instruct WIT bindings.
 use crate::pie::instruct::chat;
 
@@ -113,10 +116,31 @@ impl Context {
         Ok(Self::wrap(inner))
     }
 
+    /// Open a saved snapshot, and learn what the open cost.
+    ///
+    /// `open` cannot distinguish a resident snapshot from an evicted one:
+    /// eviction *suspends* rather than deletes, so the name still resolves and
+    /// the runtime silently replays the missing prefix through real forward
+    /// passes. Both cases return `Ok`. Use this when you need to know which
+    /// happened — a non-zero [`OpenReport::replayed_pages`] means the open paid
+    /// a prefill that a plain `open` would have hidden.
+    pub fn open_with_report(model: &Model, name: &str) -> Result<(Self, OpenReport)> {
+        let (inner, report) = RawContext::open_with_report(model, name)?;
+        Ok((Self::wrap(inner), report))
+    }
+
     /// Take ownership of a saved snapshot (snapshot is deleted).
     pub fn take(model: &Model, name: &str) -> Result<Self> {
         let inner = RawContext::take(model, name)?;
         Ok(Self::wrap(inner))
+    }
+
+    /// Take ownership of a saved snapshot, and learn what it cost.
+    ///
+    /// See [`Context::open_with_report`].
+    pub fn take_with_report(model: &Model, name: &str) -> Result<(Self, OpenReport)> {
+        let (inner, report) = RawContext::take_with_report(model, name)?;
+        Ok((Self::wrap(inner), report))
     }
 
     /// Delete a saved snapshot by name (static — no context needed).
