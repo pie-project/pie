@@ -40,6 +40,7 @@
 #include "batch/forward.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"
 #include "batch/simple_family.hpp"
+#include "batch/wire_mask.hpp"
 #include "batch/scratch.hpp"
 #include "batch/worker.hpp"
 #include "decode_abi.hpp"
@@ -940,12 +941,51 @@ class Context::Impl {
                 return PIE_STATUS_UNSUPPORTED;
             }
         }
+        std::vector<std::uint32_t> causal_kv_lengths;
         if (launch.has_user_mask != 0) {
-            std::cerr
-                << "[pie-driver-metal] launch: user-provided wire masks "
-                   "require BRLE decoding, which Metal does not support; "
-                   "refusing to run unmasked\n";
-            return PIE_STATUS_UNSUPPORTED;
+            // A prefill's mask is the causal pattern, which is the bound
+            // `sdpa_paged` applies from `qo_indptr` and the page CSR anyway --
+            // EXCEPT that the CSR it would apply it against counts pages
+            // reserved for the decode still to come. So take the length the
+            // mask states, trim the CSR to it below, and the kernel's own
+            // predicate becomes the mask's predicate exactly.
+            //
+            // Anything with a shape of its own -- a window, a sink, a hole in
+            // the middle -- has nowhere to go: the dense buffers the kernels
+            // read are filled from a descriptor channel (`read_mask_cell`) and
+            // this launch resolves no descriptors.
+            const bool causal = wire_mask::causal_prefix_lengths(
+                launch.masks, launch.qo_indptr, causal_kv_lengths);
+            if (std::getenv("PIE_METAL_MASK_TRACE") != nullptr) {
+                std::cerr << "[pie-metal] mask trace: words=" << launch.masks.words.len
+                          << " rows=" << launch.masks.word_indptr.len
+                          << " requests=" << (launch.qo_indptr.len - 1)
+                          << " causal=" << (causal ? 1 : 0) << " lengths=";
+                for (std::uint32_t len : causal_kv_lengths) std::cerr << len << " ";
+                std::cerr << " | tokens=" << launch.token_ids.len << " readout=";
+                for (std::size_t i = 0; i < launch.sampling_indices.len; ++i) {
+                    std::cerr << launch.sampling_indices.ptr[i] << " ";
+                }
+                std::cerr << "csr=";
+                for (std::size_t r = 0; r + 1 < launch.qo_indptr.len; ++r) {
+                    const std::uint32_t pages =
+                        launch.kv_page_indptr.ptr[r + 1] - launch.kv_page_indptr.ptr[r];
+                    const std::uint32_t kv = pages == 0
+                        ? 0u
+                        : (pages - 1) * cfg_.batching.kv_page_size +
+                              launch.kv_last_page_lens.ptr[r];
+                    std::cerr << pages << "p/" << kv << "k ";
+                }
+                std::cerr << "\n";
+            }
+            if (!causal) {
+                std::cerr
+                    << "[pie-driver-metal] launch: this wire attention mask is "
+                       "not a causal prefix, and Metal has no path from the "
+                       "wire form to the dense mask its kernels read; refusing "
+                       "rather than attending to keys the mask excluded\n";
+                return PIE_STATUS_UNSUPPORTED;
+            }
         }
         // Phase 2 (C3): at most one device-geometry program per launch batch
         // — the same structural constraint the runtime's scheduler already
@@ -988,6 +1028,31 @@ class Context::Impl {
         auto job = std::make_shared<LaunchJobData>();
         job->completion = completion;
         job->launch = executor::OwnedLaunchView::capture(launch);
+        if (!causal_kv_lengths.empty()) {
+            // The mask and the page CSR state the same number, and if they
+            // disagree the driver cannot tell which one the KV write used. Say
+            // which two differ and stop, rather than attend to whichever the
+            // geometry happens to reach.
+            std::uint32_t claimed = 0;
+            const int bad = wire_mask::first_kv_len_disagreement(
+                causal_kv_lengths, launch.kv_page_indptr, launch.kv_last_page_lens,
+                cfg_.batching.kv_page_size, claimed);
+            if (bad >= 0) {
+                std::cerr << "[pie-driver-metal] launch: request " << bad
+                          << "'s causal mask covers " << causal_kv_lengths[bad]
+                          << " keys but its page CSR claims " << claimed
+                          << " at kv_page_size=" << cfg_.batching.kv_page_size
+                          << "; the two must agree (an inferlet paging at a "
+                             "different size than the driver is the usual cause)\n";
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            // Agreed: the mask restates the bound `sdpa_paged` already applies,
+            // so it has nothing left to say.
+            job->launch.has_user_mask = false;
+            job->launch.mask_request_indptr.clear();
+            job->launch.mask_word_indptr.clear();
+            job->launch.mask_words.clear();
+        }
         job->members.resize(members.size());
         for (std::size_t m = 0; m < members.size(); ++m) {
             LaunchMember& lm = job->members[m];

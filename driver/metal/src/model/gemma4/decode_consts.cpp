@@ -136,7 +136,7 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             // The padded row count, matching `launch_shape_mb`: the GEMM is
             // dispatched over whole tiles, and M is what bounds its inner loop.
             const std::uint32_t m = std::uint32_t(
-                gemma4_qmm_rows(int(d.kind == Kind::LmHead ? S : R)));
+                gemma4_qmm_rows(g, int(d.kind == Kind::LmHead ? S : R)));
             // The GEMM shares Qmv's ordinals 0-6 and appends M. Bound
             // unconditionally: at rows==1 the matvec simply never reads slot 7,
             // and an unbound slot on the prefill path is a row count read out of
@@ -439,7 +439,7 @@ int bind_gemma4_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
     for (const Dispatch& d : dag) {
         const int m = d.kind == Kind::LmHead ? S : R;
         if (!gemma4_fp16_qmm(g, d, m)) continue;
-        const std::int32_t elems = std::int32_t(gemma4_qmm_rows(m)) *
+        const std::int32_t elems = std::int32_t(gemma4_qmm_rows(g, m)) *
                                    std::int32_t(qmv_kn(d.kind, g, d.layer).K);
         SlotHandle count;
         for (const auto& entry : counts) {
