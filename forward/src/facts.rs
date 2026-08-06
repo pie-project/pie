@@ -892,4 +892,58 @@ impl Qwen35HybridFacts {
             mlp: Qwen35MlpKind::Dense { intermediate: 3584 },
         }
     }
+
+    /// Qwen3.6-27B — the DENSE hybrid, read from the checkpoint's own
+    /// `config.json` (`text_config`), not inferred from the family name.
+    ///
+    /// Every value here is a field of that file or the driver's stated
+    /// derivation from one: 64 layers, `full_attention_interval` 4,
+    /// `vocab_size` 248320, `tie_word_embeddings` false,
+    /// `intermediate_size` 17408 (no `num_experts` — this checkpoint
+    /// takes the `Dense` arm, see [`Qwen35MlpKind`]), hidden 5120,
+    /// 24 q heads over 4 kv heads at `head_dim` 256, and
+    /// `partial_rotary_factor` 0.25 → `rotary_dim` 64 by the driver's
+    /// `max(2, 2 * int(0.5 * f * head_dim))`. The GDN half is the
+    /// `linear_*` block: 16 key heads, 48 value heads (a GQA ratio of 3,
+    /// which `family.rs`'s gdn body already branches on), 128/128 head
+    /// dims, `linear_conv_kernel_dim` 4.
+    ///
+    /// `fused_in_proj` / `fused_qkv` are false because both joins are
+    /// env-gated default-off, the same as 0.8B's.
+    ///
+    /// NOT reachable on an L40S at bf16 — 27B is ~55 GB against 46. An
+    /// FP8 checkpoint of the same geometry is what would boot here; the
+    /// traced form is identical either way, which is why the fixture is
+    /// worth having before the hardware is.
+    pub fn qwen3_6_27b() -> Self {
+        Self {
+            layers: 64,
+            full_attn_interval: 4,
+            vocab: 248_320,
+            tied_embeddings: false,
+            norm_variant: NormVariant::Gemma,
+            attn: Qwen35FullAttnFacts {
+                hidden: 5120,
+                q_heads: 24,
+                kv_heads: 4,
+                head_dim: 256,
+                rotary_dim: 64,
+                fused_qkv: false,
+                norm_variant: NormVariant::Gemma,
+            },
+            gdn: Qwen35GdnFacts {
+                hidden: 5120,
+                key_heads: 16,
+                value_heads: 48,
+                key_head_dim: 128,
+                value_head_dim: 128,
+                conv_kernel: 4,
+                fused_in_proj: false,
+                norm_variant: NormVariant::Gemma,
+            },
+            mlp: Qwen35MlpKind::Dense {
+                intermediate: 17_408,
+            },
+        }
+    }
 }

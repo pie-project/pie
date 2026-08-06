@@ -1079,6 +1079,42 @@ mod tests {
         out
     }
 
+    /// Qwen3.6-27B owes NOTHING that Qwen3.5-0.8B does not already owe.
+    ///
+    /// The qwen3_5 family's flat list does not cover itself yet — its
+    /// executor still walks, and both geometries carry the same large
+    /// residue (the Gemma norms, the GDN prep/gated-norm pair, the
+    /// swiglu binding fact). So the claim worth pinning is not coverage
+    /// but CONTAINMENT: the 27B checkpoint needs its dims and no new
+    /// vocabulary, which is exactly "its residue is a subset of the one
+    /// already being worked".
+    ///
+    /// It is the first geometry whose GDN half is GQA (48 value heads
+    /// over 16 key heads), so a NEW `why` here would most likely be the
+    /// head-repeat or the `_gqa` recurrence — something 0.8B cannot
+    /// prove either way. That is the case this test exists to catch.
+    #[test]
+    fn qwen3_6_27b_owes_nothing_new() {
+        let cuda = crate::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+        let whys = |facts: &crate::facts::Qwen35HybridFacts, class| {
+            let plan = family::qwen3_5_hybrid_cuda(facts, &cuda, class);
+            let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
+            out.residue
+                .into_iter()
+                .map(|u| format!("{}: {}", u.kind, u.why))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            let known = whys(&crate::facts::Qwen35HybridFacts::qwen3_5_0_8b(), class);
+            let fresh = whys(&crate::facts::Qwen35HybridFacts::qwen3_6_27b(), class);
+            let novel: Vec<_> = fresh.difference(&known).collect();
+            assert!(
+                novel.is_empty(),
+                "{class:?}: Qwen3.6-27B owes something 0.8B does not: {novel:#?}"
+            );
+        }
+    }
+
     /// The MoE block's own ledger, and the argument for the fused leg.
     ///
     /// The SEMANTIC reading is residue — a selector, a combine and a

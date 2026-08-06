@@ -620,6 +620,13 @@ mod tests {
                 &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
                 class,
             ));
+            // Qwen3.6-27B: the same text at a different geometry, and
+            // the first one whose GDN half is GQA.
+            plans.push(family::qwen3_5_hybrid_cuda(
+                &Qwen35HybridFacts::qwen3_6_27b(),
+                &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+                class,
+            ));
         }
         for plan in &plans {
             let problems = check_plan(plan);
