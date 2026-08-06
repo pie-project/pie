@@ -21,6 +21,13 @@ MixtralModel::MixtralModel(MixtralWeights weights,
     // lets the family use device composition; CUDA-graph capture is a
     // separate, stronger claim the host-side MoE routing cannot make.
     caps_.graph_padding_kv_write_safe = true;
+    // Trace and VALIDATE the declaration at load, the tree-wide polarity.
+    // A refusal is a fallback: `usable` stays false and every fire takes
+    // the hand-written pass.
+    if (gpt_oss_declared_forward_enabled()) {
+        declared_ = build_gpt_oss_declared_plan(hf_config_, weights_, fwd_cfg_,
+                                                num_experts_, top_k_);
+    }
 }
 
 void MixtralModel::body(Workspace& ws,
@@ -28,6 +35,24 @@ void MixtralModel::body(Workspace& ws,
                         AttentionWorkspace& attn_ws,
                         ops::CublasHandle& cublas,
                         const ForwardFn::ForwardInputs& in) {
+    // The declared drive gets the fire first. It answers false for
+    // anything outside the decode class — a prefill, a masked or hooked
+    // fire, a fire past the fused leg's route cap — and the hand-written
+    // pass runs it unchanged.
+    const bool declared_eligible =
+        gpt_oss_declared_drive_enabled() && declared_.usable &&
+        in.custom_mask_d == nullptr && in.stage_hooks == nullptr &&
+        fwd_cfg_.tp_size == 1;
+    if (declared_eligible &&
+        gpt_oss_forward_declared(
+            declared_, weights_, hf_config_, fwd_cfg_, num_experts_, top_k_,
+            ws, kv, attn_ws, cublas, in.token_ids, in.positions,
+            in.qo_indptr_d, in.kv_page_indices_d, in.kv_page_indptr_d,
+            in.kv_last_page_lens_d, in.kv_page_indptr_h,
+            in.total_tokens, in.num_requests, in.is_pure_decode,
+            in.row_valid_d, in.logit_row_indices_d, in.num_logit_rows)) {
+        return;
+    }
     mixtral_forward_paged(
         weights_, hf_config_, fwd_cfg_,
         num_experts_, top_k_,

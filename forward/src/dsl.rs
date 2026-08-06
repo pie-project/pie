@@ -2397,7 +2397,14 @@ pub mod cuda {
     /// decided at load and erases here. Reading it as a runtime scalar
     /// would put a branch in every fire for an answer that never
     /// changes.
-    pub fn gpt_oss_glu(gate: &Val, up: &Val, width: u32) -> Val {
+    /// Its extent is the ROUTED one — `[Tokens, k, intermediate]`, the
+    /// shape of the operands it consumes, not `[Tokens, intermediate]`.
+    /// Declaring the collapsed shape made the two `bf16_to_fp16` sites
+    /// indistinguishable to anything reading the trace, and the second
+    /// one re-cast the block input while the routed activations were
+    /// never written — a live defect the ledger, the golden and the
+    /// registry all passed.
+    pub fn gpt_oss_glu(gate: &Val, up: &Val, top_k: u32, intermediate: u32) -> Val {
         record(
             &gate.t,
             gate.layer,
@@ -2406,7 +2413,11 @@ pub mod cuda {
             None,
             vec![gate.id, up.id],
             Some((
-                Shape(vec![Dim::Tokens, Dim::Const(width)]),
+                Shape(vec![
+                    Dim::Tokens,
+                    Dim::Const(top_k),
+                    Dim::Const(intermediate),
+                ]),
                 DType::BF16,
             )),
         )

@@ -182,6 +182,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -190,6 +193,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -398,6 +404,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -406,6 +415,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -614,6 +626,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -622,6 +637,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -830,6 +848,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -838,6 +859,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -1046,6 +1070,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -1054,6 +1081,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -1262,6 +1292,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -1270,6 +1303,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -1478,6 +1514,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -1486,6 +1525,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -1694,6 +1736,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -1702,6 +1747,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -1910,6 +1958,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -1918,6 +1969,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -2126,6 +2180,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -2134,6 +2191,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -2342,6 +2402,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -2350,6 +2413,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -2558,6 +2624,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -2566,6 +2635,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -2774,6 +2846,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -2782,6 +2857,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -2990,6 +3068,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -2998,6 +3079,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -3206,6 +3290,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -3214,6 +3301,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -3422,6 +3512,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -3430,6 +3523,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -3638,6 +3734,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -3646,6 +3745,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -3854,6 +3956,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -3862,6 +3967,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -4070,6 +4178,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -4078,6 +4189,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -4286,6 +4400,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -4294,6 +4411,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -4502,6 +4622,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -4510,6 +4633,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -4718,6 +4844,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -4726,6 +4855,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -4934,6 +5066,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -4942,6 +5077,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -5150,6 +5288,9 @@
       "shape": [
         "Tokens",
         {
+          "Const": 4
+        },
+        {
           "Const": 2880
         }
       ],
@@ -5158,6 +5299,9 @@
     {
       "shape": [
         "Tokens",
+        {
+          "Const": 4
+        },
         {
           "Const": 2880
         }
@@ -5229,7 +5373,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.0.attn_norm",
           "variant": "Plain"
         }
       },
@@ -5246,8 +5390,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.0.q_proj",
+            "layer.0.q_bias"
           ]
         }
       },
@@ -5264,8 +5408,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.0.k_proj",
+            "layer.0.k_bias"
           ]
         }
       },
@@ -5282,8 +5426,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.0.v_proj",
+            "layer.0.v_bias"
           ]
         }
       },
@@ -5352,7 +5496,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.0.attn_sinks"
           ]
         }
       },
@@ -5368,7 +5512,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.0.o_proj",
           "beta_one": true
         }
       },
@@ -5384,7 +5528,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.0.o_bias"
         }
       },
       "inputs": [
@@ -5398,7 +5542,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.0.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -5415,8 +5559,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.0.router",
+            "layer.0.router_bias"
           ]
         }
       },
@@ -5462,7 +5606,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.0.expert_gate_up_bank"
           ]
         }
       },
@@ -5510,7 +5654,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.0.expert_down_bank"
           ]
         }
       },
@@ -5556,7 +5700,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.1.attn_norm",
           "variant": "Plain"
         }
       },
@@ -5573,8 +5717,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.1.q_proj",
+            "layer.1.q_bias"
           ]
         }
       },
@@ -5591,8 +5735,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.1.k_proj",
+            "layer.1.k_bias"
           ]
         }
       },
@@ -5609,8 +5753,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.1.v_proj",
+            "layer.1.v_bias"
           ]
         }
       },
@@ -5679,7 +5823,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.1.attn_sinks"
           ]
         }
       },
@@ -5695,7 +5839,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.1.o_proj",
           "beta_one": true
         }
       },
@@ -5711,7 +5855,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.1.o_bias"
         }
       },
       "inputs": [
@@ -5725,7 +5869,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.1.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -5742,8 +5886,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.1.router",
+            "layer.1.router_bias"
           ]
         }
       },
@@ -5789,7 +5933,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.1.expert_gate_up_bank"
           ]
         }
       },
@@ -5837,7 +5981,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.1.expert_down_bank"
           ]
         }
       },
@@ -5883,7 +6027,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.2.attn_norm",
           "variant": "Plain"
         }
       },
@@ -5900,8 +6044,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.2.q_proj",
+            "layer.2.q_bias"
           ]
         }
       },
@@ -5918,8 +6062,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.2.k_proj",
+            "layer.2.k_bias"
           ]
         }
       },
@@ -5936,8 +6080,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.2.v_proj",
+            "layer.2.v_bias"
           ]
         }
       },
@@ -6006,7 +6150,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.2.attn_sinks"
           ]
         }
       },
@@ -6022,7 +6166,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.2.o_proj",
           "beta_one": true
         }
       },
@@ -6038,7 +6182,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.2.o_bias"
         }
       },
       "inputs": [
@@ -6052,7 +6196,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.2.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -6069,8 +6213,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.2.router",
+            "layer.2.router_bias"
           ]
         }
       },
@@ -6116,7 +6260,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.2.expert_gate_up_bank"
           ]
         }
       },
@@ -6164,7 +6308,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.2.expert_down_bank"
           ]
         }
       },
@@ -6210,7 +6354,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.3.attn_norm",
           "variant": "Plain"
         }
       },
@@ -6227,8 +6371,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.3.q_proj",
+            "layer.3.q_bias"
           ]
         }
       },
@@ -6245,8 +6389,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.3.k_proj",
+            "layer.3.k_bias"
           ]
         }
       },
@@ -6263,8 +6407,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.3.v_proj",
+            "layer.3.v_bias"
           ]
         }
       },
@@ -6333,7 +6477,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.3.attn_sinks"
           ]
         }
       },
@@ -6349,7 +6493,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.3.o_proj",
           "beta_one": true
         }
       },
@@ -6365,7 +6509,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.3.o_bias"
         }
       },
       "inputs": [
@@ -6379,7 +6523,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.3.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -6396,8 +6540,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.3.router",
+            "layer.3.router_bias"
           ]
         }
       },
@@ -6443,7 +6587,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.3.expert_gate_up_bank"
           ]
         }
       },
@@ -6491,7 +6635,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.3.expert_down_bank"
           ]
         }
       },
@@ -6537,7 +6681,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.4.attn_norm",
           "variant": "Plain"
         }
       },
@@ -6554,8 +6698,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.4.q_proj",
+            "layer.4.q_bias"
           ]
         }
       },
@@ -6572,8 +6716,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.4.k_proj",
+            "layer.4.k_bias"
           ]
         }
       },
@@ -6590,8 +6734,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.4.v_proj",
+            "layer.4.v_bias"
           ]
         }
       },
@@ -6660,7 +6804,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.4.attn_sinks"
           ]
         }
       },
@@ -6676,7 +6820,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.4.o_proj",
           "beta_one": true
         }
       },
@@ -6692,7 +6836,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.4.o_bias"
         }
       },
       "inputs": [
@@ -6706,7 +6850,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.4.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -6723,8 +6867,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.4.router",
+            "layer.4.router_bias"
           ]
         }
       },
@@ -6770,7 +6914,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.4.expert_gate_up_bank"
           ]
         }
       },
@@ -6818,7 +6962,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.4.expert_down_bank"
           ]
         }
       },
@@ -6864,7 +7008,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.5.attn_norm",
           "variant": "Plain"
         }
       },
@@ -6881,8 +7025,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.5.q_proj",
+            "layer.5.q_bias"
           ]
         }
       },
@@ -6899,8 +7043,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.5.k_proj",
+            "layer.5.k_bias"
           ]
         }
       },
@@ -6917,8 +7061,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.5.v_proj",
+            "layer.5.v_bias"
           ]
         }
       },
@@ -6987,7 +7131,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.5.attn_sinks"
           ]
         }
       },
@@ -7003,7 +7147,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.5.o_proj",
           "beta_one": true
         }
       },
@@ -7019,7 +7163,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.5.o_bias"
         }
       },
       "inputs": [
@@ -7033,7 +7177,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.5.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -7050,8 +7194,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.5.router",
+            "layer.5.router_bias"
           ]
         }
       },
@@ -7097,7 +7241,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.5.expert_gate_up_bank"
           ]
         }
       },
@@ -7145,7 +7289,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.5.expert_down_bank"
           ]
         }
       },
@@ -7191,7 +7335,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.6.attn_norm",
           "variant": "Plain"
         }
       },
@@ -7208,8 +7352,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.6.q_proj",
+            "layer.6.q_bias"
           ]
         }
       },
@@ -7226,8 +7370,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.6.k_proj",
+            "layer.6.k_bias"
           ]
         }
       },
@@ -7244,8 +7388,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.6.v_proj",
+            "layer.6.v_bias"
           ]
         }
       },
@@ -7314,7 +7458,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.6.attn_sinks"
           ]
         }
       },
@@ -7330,7 +7474,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.6.o_proj",
           "beta_one": true
         }
       },
@@ -7346,7 +7490,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.6.o_bias"
         }
       },
       "inputs": [
@@ -7360,7 +7504,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.6.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -7377,8 +7521,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.6.router",
+            "layer.6.router_bias"
           ]
         }
       },
@@ -7424,7 +7568,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.6.expert_gate_up_bank"
           ]
         }
       },
@@ -7472,7 +7616,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.6.expert_down_bank"
           ]
         }
       },
@@ -7518,7 +7662,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.7.attn_norm",
           "variant": "Plain"
         }
       },
@@ -7535,8 +7679,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.7.q_proj",
+            "layer.7.q_bias"
           ]
         }
       },
@@ -7553,8 +7697,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.7.k_proj",
+            "layer.7.k_bias"
           ]
         }
       },
@@ -7571,8 +7715,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.7.v_proj",
+            "layer.7.v_bias"
           ]
         }
       },
@@ -7641,7 +7785,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.7.attn_sinks"
           ]
         }
       },
@@ -7657,7 +7801,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.7.o_proj",
           "beta_one": true
         }
       },
@@ -7673,7 +7817,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.7.o_bias"
         }
       },
       "inputs": [
@@ -7687,7 +7831,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.7.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -7704,8 +7848,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.7.router",
+            "layer.7.router_bias"
           ]
         }
       },
@@ -7751,7 +7895,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.7.expert_gate_up_bank"
           ]
         }
       },
@@ -7799,7 +7943,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.7.expert_down_bank"
           ]
         }
       },
@@ -7845,7 +7989,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.8.attn_norm",
           "variant": "Plain"
         }
       },
@@ -7862,8 +8006,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.8.q_proj",
+            "layer.8.q_bias"
           ]
         }
       },
@@ -7880,8 +8024,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.8.k_proj",
+            "layer.8.k_bias"
           ]
         }
       },
@@ -7898,8 +8042,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.8.v_proj",
+            "layer.8.v_bias"
           ]
         }
       },
@@ -7968,7 +8112,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.8.attn_sinks"
           ]
         }
       },
@@ -7984,7 +8128,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.8.o_proj",
           "beta_one": true
         }
       },
@@ -8000,7 +8144,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.8.o_bias"
         }
       },
       "inputs": [
@@ -8014,7 +8158,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.8.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -8031,8 +8175,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.8.router",
+            "layer.8.router_bias"
           ]
         }
       },
@@ -8078,7 +8222,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.8.expert_gate_up_bank"
           ]
         }
       },
@@ -8126,7 +8270,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.8.expert_down_bank"
           ]
         }
       },
@@ -8172,7 +8316,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.9.attn_norm",
           "variant": "Plain"
         }
       },
@@ -8189,8 +8333,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.9.q_proj",
+            "layer.9.q_bias"
           ]
         }
       },
@@ -8207,8 +8351,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.9.k_proj",
+            "layer.9.k_bias"
           ]
         }
       },
@@ -8225,8 +8369,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.9.v_proj",
+            "layer.9.v_bias"
           ]
         }
       },
@@ -8295,7 +8439,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.9.attn_sinks"
           ]
         }
       },
@@ -8311,7 +8455,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.9.o_proj",
           "beta_one": true
         }
       },
@@ -8327,7 +8471,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.9.o_bias"
         }
       },
       "inputs": [
@@ -8341,7 +8485,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.9.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -8358,8 +8502,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.9.router",
+            "layer.9.router_bias"
           ]
         }
       },
@@ -8405,7 +8549,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.9.expert_gate_up_bank"
           ]
         }
       },
@@ -8453,7 +8597,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.9.expert_down_bank"
           ]
         }
       },
@@ -8499,7 +8643,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.10.attn_norm",
           "variant": "Plain"
         }
       },
@@ -8516,8 +8660,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.10.q_proj",
+            "layer.10.q_bias"
           ]
         }
       },
@@ -8534,8 +8678,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.10.k_proj",
+            "layer.10.k_bias"
           ]
         }
       },
@@ -8552,8 +8696,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.10.v_proj",
+            "layer.10.v_bias"
           ]
         }
       },
@@ -8622,7 +8766,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.10.attn_sinks"
           ]
         }
       },
@@ -8638,7 +8782,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.10.o_proj",
           "beta_one": true
         }
       },
@@ -8654,7 +8798,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.10.o_bias"
         }
       },
       "inputs": [
@@ -8668,7 +8812,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.10.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -8685,8 +8829,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.10.router",
+            "layer.10.router_bias"
           ]
         }
       },
@@ -8732,7 +8876,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.10.expert_gate_up_bank"
           ]
         }
       },
@@ -8780,7 +8924,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.10.expert_down_bank"
           ]
         }
       },
@@ -8826,7 +8970,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.11.attn_norm",
           "variant": "Plain"
         }
       },
@@ -8843,8 +8987,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.11.q_proj",
+            "layer.11.q_bias"
           ]
         }
       },
@@ -8861,8 +9005,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.11.k_proj",
+            "layer.11.k_bias"
           ]
         }
       },
@@ -8879,8 +9023,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.11.v_proj",
+            "layer.11.v_bias"
           ]
         }
       },
@@ -8949,7 +9093,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.11.attn_sinks"
           ]
         }
       },
@@ -8965,7 +9109,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.11.o_proj",
           "beta_one": true
         }
       },
@@ -8981,7 +9125,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.11.o_bias"
         }
       },
       "inputs": [
@@ -8995,7 +9139,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.11.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -9012,8 +9156,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.11.router",
+            "layer.11.router_bias"
           ]
         }
       },
@@ -9059,7 +9203,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.11.expert_gate_up_bank"
           ]
         }
       },
@@ -9107,7 +9251,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.11.expert_down_bank"
           ]
         }
       },
@@ -9153,7 +9297,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.12.attn_norm",
           "variant": "Plain"
         }
       },
@@ -9170,8 +9314,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.12.q_proj",
+            "layer.12.q_bias"
           ]
         }
       },
@@ -9188,8 +9332,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.12.k_proj",
+            "layer.12.k_bias"
           ]
         }
       },
@@ -9206,8 +9350,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.12.v_proj",
+            "layer.12.v_bias"
           ]
         }
       },
@@ -9276,7 +9420,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.12.attn_sinks"
           ]
         }
       },
@@ -9292,7 +9436,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.12.o_proj",
           "beta_one": true
         }
       },
@@ -9308,7 +9452,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.12.o_bias"
         }
       },
       "inputs": [
@@ -9322,7 +9466,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.12.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -9339,8 +9483,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.12.router",
+            "layer.12.router_bias"
           ]
         }
       },
@@ -9386,7 +9530,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.12.expert_gate_up_bank"
           ]
         }
       },
@@ -9434,7 +9578,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.12.expert_down_bank"
           ]
         }
       },
@@ -9480,7 +9624,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.13.attn_norm",
           "variant": "Plain"
         }
       },
@@ -9497,8 +9641,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.13.q_proj",
+            "layer.13.q_bias"
           ]
         }
       },
@@ -9515,8 +9659,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.13.k_proj",
+            "layer.13.k_bias"
           ]
         }
       },
@@ -9533,8 +9677,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.13.v_proj",
+            "layer.13.v_bias"
           ]
         }
       },
@@ -9603,7 +9747,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.13.attn_sinks"
           ]
         }
       },
@@ -9619,7 +9763,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.13.o_proj",
           "beta_one": true
         }
       },
@@ -9635,7 +9779,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.13.o_bias"
         }
       },
       "inputs": [
@@ -9649,7 +9793,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.13.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -9666,8 +9810,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.13.router",
+            "layer.13.router_bias"
           ]
         }
       },
@@ -9713,7 +9857,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.13.expert_gate_up_bank"
           ]
         }
       },
@@ -9761,7 +9905,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.13.expert_down_bank"
           ]
         }
       },
@@ -9807,7 +9951,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.14.attn_norm",
           "variant": "Plain"
         }
       },
@@ -9824,8 +9968,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.14.q_proj",
+            "layer.14.q_bias"
           ]
         }
       },
@@ -9842,8 +9986,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.14.k_proj",
+            "layer.14.k_bias"
           ]
         }
       },
@@ -9860,8 +10004,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.14.v_proj",
+            "layer.14.v_bias"
           ]
         }
       },
@@ -9930,7 +10074,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.14.attn_sinks"
           ]
         }
       },
@@ -9946,7 +10090,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.14.o_proj",
           "beta_one": true
         }
       },
@@ -9962,7 +10106,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.14.o_bias"
         }
       },
       "inputs": [
@@ -9976,7 +10120,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.14.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -9993,8 +10137,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.14.router",
+            "layer.14.router_bias"
           ]
         }
       },
@@ -10040,7 +10184,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.14.expert_gate_up_bank"
           ]
         }
       },
@@ -10088,7 +10232,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.14.expert_down_bank"
           ]
         }
       },
@@ -10134,7 +10278,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.15.attn_norm",
           "variant": "Plain"
         }
       },
@@ -10151,8 +10295,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.15.q_proj",
+            "layer.15.q_bias"
           ]
         }
       },
@@ -10169,8 +10313,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.15.k_proj",
+            "layer.15.k_bias"
           ]
         }
       },
@@ -10187,8 +10331,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.15.v_proj",
+            "layer.15.v_bias"
           ]
         }
       },
@@ -10257,7 +10401,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.15.attn_sinks"
           ]
         }
       },
@@ -10273,7 +10417,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.15.o_proj",
           "beta_one": true
         }
       },
@@ -10289,7 +10433,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.15.o_bias"
         }
       },
       "inputs": [
@@ -10303,7 +10447,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.15.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -10320,8 +10464,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.15.router",
+            "layer.15.router_bias"
           ]
         }
       },
@@ -10367,7 +10511,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.15.expert_gate_up_bank"
           ]
         }
       },
@@ -10415,7 +10559,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.15.expert_down_bank"
           ]
         }
       },
@@ -10461,7 +10605,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.16.attn_norm",
           "variant": "Plain"
         }
       },
@@ -10478,8 +10622,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.16.q_proj",
+            "layer.16.q_bias"
           ]
         }
       },
@@ -10496,8 +10640,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.16.k_proj",
+            "layer.16.k_bias"
           ]
         }
       },
@@ -10514,8 +10658,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.16.v_proj",
+            "layer.16.v_bias"
           ]
         }
       },
@@ -10584,7 +10728,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.16.attn_sinks"
           ]
         }
       },
@@ -10600,7 +10744,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.16.o_proj",
           "beta_one": true
         }
       },
@@ -10616,7 +10760,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.16.o_bias"
         }
       },
       "inputs": [
@@ -10630,7 +10774,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.16.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -10647,8 +10791,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.16.router",
+            "layer.16.router_bias"
           ]
         }
       },
@@ -10694,7 +10838,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.16.expert_gate_up_bank"
           ]
         }
       },
@@ -10742,7 +10886,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.16.expert_down_bank"
           ]
         }
       },
@@ -10788,7 +10932,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.17.attn_norm",
           "variant": "Plain"
         }
       },
@@ -10805,8 +10949,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.17.q_proj",
+            "layer.17.q_bias"
           ]
         }
       },
@@ -10823,8 +10967,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.17.k_proj",
+            "layer.17.k_bias"
           ]
         }
       },
@@ -10841,8 +10985,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.17.v_proj",
+            "layer.17.v_bias"
           ]
         }
       },
@@ -10911,7 +11055,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.17.attn_sinks"
           ]
         }
       },
@@ -10927,7 +11071,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.17.o_proj",
           "beta_one": true
         }
       },
@@ -10943,7 +11087,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.17.o_bias"
         }
       },
       "inputs": [
@@ -10957,7 +11101,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.17.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -10974,8 +11118,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.17.router",
+            "layer.17.router_bias"
           ]
         }
       },
@@ -11021,7 +11165,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.17.expert_gate_up_bank"
           ]
         }
       },
@@ -11069,7 +11213,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.17.expert_down_bank"
           ]
         }
       },
@@ -11115,7 +11259,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.18.attn_norm",
           "variant": "Plain"
         }
       },
@@ -11132,8 +11276,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.18.q_proj",
+            "layer.18.q_bias"
           ]
         }
       },
@@ -11150,8 +11294,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.18.k_proj",
+            "layer.18.k_bias"
           ]
         }
       },
@@ -11168,8 +11312,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.18.v_proj",
+            "layer.18.v_bias"
           ]
         }
       },
@@ -11238,7 +11382,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.18.attn_sinks"
           ]
         }
       },
@@ -11254,7 +11398,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.18.o_proj",
           "beta_one": true
         }
       },
@@ -11270,7 +11414,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.18.o_bias"
         }
       },
       "inputs": [
@@ -11284,7 +11428,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.18.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -11301,8 +11445,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.18.router",
+            "layer.18.router_bias"
           ]
         }
       },
@@ -11348,7 +11492,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.18.expert_gate_up_bank"
           ]
         }
       },
@@ -11396,7 +11540,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.18.expert_down_bank"
           ]
         }
       },
@@ -11442,7 +11586,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.19.attn_norm",
           "variant": "Plain"
         }
       },
@@ -11459,8 +11603,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.19.q_proj",
+            "layer.19.q_bias"
           ]
         }
       },
@@ -11477,8 +11621,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.19.k_proj",
+            "layer.19.k_bias"
           ]
         }
       },
@@ -11495,8 +11639,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.19.v_proj",
+            "layer.19.v_bias"
           ]
         }
       },
@@ -11565,7 +11709,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.19.attn_sinks"
           ]
         }
       },
@@ -11581,7 +11725,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.19.o_proj",
           "beta_one": true
         }
       },
@@ -11597,7 +11741,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.19.o_bias"
         }
       },
       "inputs": [
@@ -11611,7 +11755,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.19.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -11628,8 +11772,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.19.router",
+            "layer.19.router_bias"
           ]
         }
       },
@@ -11675,7 +11819,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.19.expert_gate_up_bank"
           ]
         }
       },
@@ -11723,7 +11867,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.19.expert_down_bank"
           ]
         }
       },
@@ -11769,7 +11913,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.20.attn_norm",
           "variant": "Plain"
         }
       },
@@ -11786,8 +11930,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.20.q_proj",
+            "layer.20.q_bias"
           ]
         }
       },
@@ -11804,8 +11948,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.20.k_proj",
+            "layer.20.k_bias"
           ]
         }
       },
@@ -11822,8 +11966,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.20.v_proj",
+            "layer.20.v_bias"
           ]
         }
       },
@@ -11892,7 +12036,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.20.attn_sinks"
           ]
         }
       },
@@ -11908,7 +12052,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.20.o_proj",
           "beta_one": true
         }
       },
@@ -11924,7 +12068,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.20.o_bias"
         }
       },
       "inputs": [
@@ -11938,7 +12082,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.20.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -11955,8 +12099,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.20.router",
+            "layer.20.router_bias"
           ]
         }
       },
@@ -12002,7 +12146,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.20.expert_gate_up_bank"
           ]
         }
       },
@@ -12050,7 +12194,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.20.expert_down_bank"
           ]
         }
       },
@@ -12096,7 +12240,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.21.attn_norm",
           "variant": "Plain"
         }
       },
@@ -12113,8 +12257,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.21.q_proj",
+            "layer.21.q_bias"
           ]
         }
       },
@@ -12131,8 +12275,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.21.k_proj",
+            "layer.21.k_bias"
           ]
         }
       },
@@ -12149,8 +12293,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.21.v_proj",
+            "layer.21.v_bias"
           ]
         }
       },
@@ -12219,7 +12363,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.21.attn_sinks"
           ]
         }
       },
@@ -12235,7 +12379,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.21.o_proj",
           "beta_one": true
         }
       },
@@ -12251,7 +12395,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.21.o_bias"
         }
       },
       "inputs": [
@@ -12265,7 +12409,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.21.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -12282,8 +12426,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.21.router",
+            "layer.21.router_bias"
           ]
         }
       },
@@ -12329,7 +12473,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.21.expert_gate_up_bank"
           ]
         }
       },
@@ -12377,7 +12521,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.21.expert_down_bank"
           ]
         }
       },
@@ -12423,7 +12567,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.22.attn_norm",
           "variant": "Plain"
         }
       },
@@ -12440,8 +12584,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.22.q_proj",
+            "layer.22.q_bias"
           ]
         }
       },
@@ -12458,8 +12602,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.22.k_proj",
+            "layer.22.k_bias"
           ]
         }
       },
@@ -12476,8 +12620,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.22.v_proj",
+            "layer.22.v_bias"
           ]
         }
       },
@@ -12546,7 +12690,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.22.attn_sinks"
           ]
         }
       },
@@ -12562,7 +12706,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.22.o_proj",
           "beta_one": true
         }
       },
@@ -12578,7 +12722,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.22.o_bias"
         }
       },
       "inputs": [
@@ -12592,7 +12736,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.22.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -12609,8 +12753,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.22.router",
+            "layer.22.router_bias"
           ]
         }
       },
@@ -12656,7 +12800,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.22.expert_gate_up_bank"
           ]
         }
       },
@@ -12704,7 +12848,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.22.expert_down_bank"
           ]
         }
       },
@@ -12750,7 +12894,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "attn_norm",
+          "weight": "layer.23.attn_norm",
           "variant": "Plain"
         }
       },
@@ -12767,8 +12911,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "q_proj",
-            "q_bias"
+            "layer.23.q_proj",
+            "layer.23.q_bias"
           ]
         }
       },
@@ -12785,8 +12929,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "k_proj",
-            "k_bias"
+            "layer.23.k_proj",
+            "layer.23.k_bias"
           ]
         }
       },
@@ -12803,8 +12947,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "v_proj",
-            "v_bias"
+            "layer.23.v_proj",
+            "layer.23.v_bias"
           ]
         }
       },
@@ -12873,7 +13017,7 @@
         "Launch": {
           "kernel": "launch_attention_sink_rescale_bf16",
           "weights": [
-            "attn_sinks"
+            "layer.23.attn_sinks"
           ]
         }
       },
@@ -12889,7 +13033,7 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "o_proj",
+          "weight": "layer.23.o_proj",
           "beta_one": true
         }
       },
@@ -12905,7 +13049,7 @@
     {
       "kind": {
         "AddBias": {
-          "weight": "o_bias"
+          "weight": "layer.23.o_bias"
         }
       },
       "inputs": [
@@ -12919,7 +13063,7 @@
     {
       "kind": {
         "Rmsnorm": {
-          "weight": "mlp_norm",
+          "weight": "layer.23.mlp_norm",
           "variant": "Plain"
         }
       },
@@ -12936,8 +13080,8 @@
         "Launch": {
           "kernel": "ops::gemm_act_x_wt_bias_bf16",
           "weights": [
-            "router",
-            "router_bias"
+            "layer.23.router",
+            "layer.23.router_bias"
           ]
         }
       },
@@ -12983,7 +13127,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
           "weights": [
-            "expert_gate_up_bank"
+            "layer.23.expert_gate_up_bank"
           ]
         }
       },
@@ -13031,7 +13175,7 @@
         "Launch": {
           "kernel": "launch_mxfp4_moe_down_decode_bf16",
           "weights": [
-            "expert_down_bank"
+            "layer.23.expert_down_bank"
           ]
         }
       },

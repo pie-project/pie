@@ -626,6 +626,45 @@ struct PieForwardGemma4CudaFacts {
   uint8_t kv_native_bf16;
 };
 
+/// gpt-oss's shape, as C states it. Mirrors [`crate::facts::GptOssFacts`]
+/// field for field.
+struct PieForwardGptOssFacts {
+  uint32_t hidden;
+  uint32_t layers;
+  uint32_t q_heads;
+  uint32_t kv_heads;
+  uint32_t head_dim;
+  /// One expert's MLP width.
+  uint32_t intermediate;
+  uint32_t experts;
+  uint32_t top_k;
+  uint32_t vocab;
+  uint8_t tied_embeddings;
+  /// The checkpoint biases q/k/v/o and the router.
+  uint8_t attention_bias;
+  /// Every layer carries `attn_sinks`, so attention is asked for its
+  /// LSE and produces two values.
+  uint8_t attn_sinks;
+  uint8_t _pad[1];
+  /// `swiglu_limit`; 0 means the unclamped SwiGLU, which this family
+  /// does not state.
+  float swiglu_limit;
+};
+
+/// gpt-oss's CUDA backend facts — the MXFP4 leg's three answers.
+struct PieForwardGptOssCudaFacts {
+  /// The layer bank carries the per-expert POINTER ARRAYS the fused
+  /// decode GEMV indexes.
+  uint8_t mxfp4_decode_gemv;
+  /// The experts are streamed through a slab cache — a host
+  /// round-trip this declaration does not state.
+  uint8_t streamed_experts;
+  uint8_t _pad[2];
+  /// `mxfp4_decode_max_routes`: the fused leg's admission threshold in
+  /// ROUTES (`N * top_k`).
+  uint32_t mxfp4_decode_max_routes;
+};
+
 /// The CUDA backend facts for a LOWERED qwen3_5 hybrid trace, as C
 /// states them. Mirrors [`crate::facts::Qwen35CudaFacts`] field for
 /// field; same input-side rules as [`PieForwardLlamaLikeFacts`] (the
@@ -876,6 +915,22 @@ PieForwardStatus pie_forward_trace_gemma4_cuda(const PieForwardGemma4Facts *fact
                                                const PieForwardGemma4CudaFacts *cuda,
                                                uint32_t class_,
                                                PieForwardPlan *out_plan);
+
+/// Trace one gpt-oss CLASS — the fourth family's entry point.
+///
+/// Decode only today: the prefill path materializes its experts through
+/// a host-routed walk, and the text refuses that leg by name rather than
+/// stating it.
+///
+/// # Safety
+///
+/// `facts` / `cuda` are null or point at readable
+/// [`PieForwardGptOssFacts`] / [`PieForwardGptOssCudaFacts`]; `out_plan`
+/// is null or a writable slot.
+PieForwardStatus pie_forward_trace_gpt_oss_cuda(const PieForwardGptOssFacts *facts,
+                                                const PieForwardGptOssCudaFacts *cuda,
+                                                uint32_t class_,
+                                                PieForwardPlan *out_plan);
 
 PieForwardStatus pie_forward_trace_qwen3_5_hybrid_cuda(const PieForwardQwen35HybridFacts *facts,
                                                        const PieForwardQwen35CudaFacts *cuda,

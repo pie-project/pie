@@ -132,6 +132,24 @@ class ForwardPlan {
         return ForwardPlan(raw);
     }
 
+    /// Trace one gpt-oss CLASS. Decode only: the prefill path
+    /// materializes its experts through a host-routed walk whose launch
+    /// count depends on the router, and the text refuses that leg.
+    static ForwardPlan trace_gpt_oss_cuda(
+        const PieForwardGptOssFacts& facts,
+        const PieForwardGptOssCudaFacts& cuda,
+        PieForwardFireClass fire_class) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_gpt_oss_cuda(
+            &facts, &cuda, static_cast<std::uint32_t>(fire_class), &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: gpt_oss trace failed (" +
+                status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
     /// Trace the qwen3_5_moe MoE MLP-block FRAGMENT — the first traced form
     /// carrying `dyn` ops (`TopK`, selector-carrying `Matmul`s,
     /// `WeightedSum`, `SigmoidGateAdd`).

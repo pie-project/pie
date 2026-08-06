@@ -2,6 +2,7 @@
 
 #include "model/imodel.hpp"
 #include "model/llama_like/llama_like.hpp"
+#include "model/mixtral/declared_forward.hpp"
 #include "model/mixtral/mixtral.hpp"
 
 namespace pie_cuda_driver::model {
@@ -32,6 +33,7 @@ private:
     LlamaLikeForwardCfg fwd_cfg_;
     int num_experts_;
     int top_k_;
+    GptOssDeclaredPlan declared_;
     ModelCapabilities caps_{};
 };
 

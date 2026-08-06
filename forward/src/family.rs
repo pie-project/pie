@@ -3515,15 +3515,19 @@ struct GptOssLayerW {
 
 impl GptOssLayerW {
     fn new(l: u32, f: &GptOssFacts) -> Self {
+        // `layer.{l}.{field}` — the tree-wide convention every executor's
+        // `parse_name` reads. Naming them bare made the drive's first live
+        // fire throw on the very first weight it looked up.
+        let w = |name: &str| format!("layer.{l}.{name}");
         let m = |name: &str, width: u32| MatW {
-            name: name.into(),
+            name: w(name),
             width,
             layer: Some(l),
         };
         let d = f.head_dim;
         Self {
             attn_norm: NormW {
-                name: "attn_norm".into(),
+                name: w("attn_norm"),
                 variant: NormVariant::Plain,
                 per_head: None,
                 layer: Some(l),
@@ -3538,7 +3542,7 @@ impl GptOssLayerW {
             o_bias: m("o_bias", f.hidden),
             sinks: m("attn_sinks", f.q_heads),
             mlp_norm: NormW {
-                name: "mlp_norm".into(),
+                name: w("mlp_norm"),
                 variant: NormVariant::Plain,
                 per_head: None,
                 layer: Some(l),
@@ -3679,7 +3683,8 @@ pub fn gpt_oss_cuda(
                 facts.swiglu_limit > 0.0,
                 "gpt_oss without a swiglu limit states no activation yet"
             );
-            let routed = dsl::cuda::gpt_oss_glu(&gate, &up, facts.intermediate);
+            let routed =
+                dsl::cuda::gpt_oss_glu(&gate, &up, facts.top_k, facts.intermediate);
             let routed = dsl::cuda::bf16_to_fp16(&routed);
             let out = dsl::cuda::mxfp4_moe_down_decode(
                 &routed,
