@@ -2887,6 +2887,23 @@ std::uint64_t MetalExecutor::rs_slot_bytes() const {
     return ready() ? impl_->rs_slot_bytes() : 0u;
 }
 
+std::uint32_t MetalExecutor::max_forward_tokens() const {
+    if (!ready()) return 0u;
+    // The paged qwen3.5 path binds its rows at setup and refuses a wider fire.
+    // The simple families replay a prompt internally and carry no such cap --
+    // their `DecodeGeometry::max_tokens` is the field's default 1, which is not
+    // a fire width, and reporting it would make a caller chunk a prompt one
+    // token at a time (measured: gpt-oss's 2048-token prefill fell from 755 to
+    // 89 tok/s).  0 means "no cap to respect", which is the truth for them.
+    if (impl_->is_simple()) {
+        const int rows = impl_->simple_engine()->paged()
+                             ? impl_->simple_engine()->max_rows()
+                             : 0;
+        return rows > 0 ? static_cast<std::uint32_t>(rows) : 0u;
+    }
+    return static_cast<std::uint32_t>(impl_->geometry().max_tokens);
+}
+
 std::uint64_t MetalExecutor::elastic_page_bytes() const {
     return ready() ? impl_->ctx_->elastic_page_bytes() : 0u;
 }
@@ -4055,6 +4072,8 @@ bool MetalExecutor::ready() const { return false; }
 std::uint32_t MetalExecutor::vocab() const { return 0; }
 
 std::uint32_t MetalExecutor::rs_slots() const { return 0; }
+
+std::uint32_t MetalExecutor::max_forward_tokens() const { return 0; }
 
 std::uint64_t MetalExecutor::rs_slot_bytes() const { return 0; }
 std::uint64_t MetalExecutor::elastic_page_bytes() const { return 0; }
