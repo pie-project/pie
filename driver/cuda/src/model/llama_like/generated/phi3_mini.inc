@@ -245,7 +245,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -283,7 +283,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -484,7 +484,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -522,7 +522,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -723,7 +723,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -761,7 +761,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -962,7 +962,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1000,7 +1000,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1201,7 +1201,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1239,7 +1239,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1440,7 +1440,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1478,7 +1478,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1679,7 +1679,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1717,7 +1717,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1918,7 +1918,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1956,7 +1956,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2157,7 +2157,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2195,7 +2195,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2396,7 +2396,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2434,7 +2434,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2635,7 +2635,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2673,7 +2673,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2874,7 +2874,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2912,7 +2912,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3113,7 +3113,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3151,7 +3151,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3352,7 +3352,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3390,7 +3390,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3591,7 +3591,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3629,7 +3629,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3830,7 +3830,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3868,7 +3868,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4069,7 +4069,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4107,7 +4107,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4308,7 +4308,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4346,7 +4346,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4547,7 +4547,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4585,7 +4585,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4786,7 +4786,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4824,7 +4824,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5025,7 +5025,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5063,7 +5063,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5264,7 +5264,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5302,7 +5302,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5503,7 +5503,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5541,7 +5541,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5742,7 +5742,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5780,7 +5780,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5981,7 +5981,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6019,7 +6019,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6220,7 +6220,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6258,7 +6258,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6459,7 +6459,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6497,7 +6497,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6698,7 +6698,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6736,7 +6736,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6937,7 +6937,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6975,7 +6975,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -7176,7 +7176,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -7214,7 +7214,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -7415,7 +7415,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -7453,7 +7453,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -7654,7 +7654,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -7692,7 +7692,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -17824,7 +17824,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -17941,7 +17941,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -18058,7 +18058,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -18175,7 +18175,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -18292,7 +18292,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -18409,7 +18409,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -18526,7 +18526,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -18643,7 +18643,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -18760,7 +18760,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -18877,7 +18877,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -18994,7 +18994,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -19111,7 +19111,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -19228,7 +19228,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -19345,7 +19345,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -19462,7 +19462,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -19579,7 +19579,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -19696,7 +19696,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -19813,7 +19813,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -19930,7 +19930,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -20047,7 +20047,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -20164,7 +20164,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -20281,7 +20281,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -20398,7 +20398,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -20515,7 +20515,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -20632,7 +20632,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -20749,7 +20749,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -20866,7 +20866,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -20983,7 +20983,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -21100,7 +21100,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -21217,7 +21217,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -21334,7 +21334,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -21451,7 +21451,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();

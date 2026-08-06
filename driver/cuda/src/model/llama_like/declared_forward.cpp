@@ -1261,9 +1261,21 @@ void llama_like_forward_declared(
                         "attn_page_mask requires a page-count-independent "
                         "decode plan; this fire planned split-KV");
                 }
+                // R_fire, NOT the walk's depth-windowed `R`. The mask
+                // sink is carved ONCE for the fire (`sink_.num_requests`
+                // is the fire's request count), so the compaction that
+                // consumes it is a fire-wide operation; handing it a
+                // tail layer's live-row count made the two disagree and
+                // `FirePageMask::compact` refused — which is the right
+                // refusal against the wrong argument.
+                //
+                // Reading a prefix of the compacted CSR is exactly what a
+                // narrowed layer wants: the seriation keeps live rows
+                // first, and `indptr` is prefix-summed from row 0, so the
+                // first `R` entries describe precisely those rows.
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(R_fire), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();

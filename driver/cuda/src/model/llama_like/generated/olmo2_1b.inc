@@ -286,44 +286,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(0u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(0);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[0]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(0u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(0);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(0u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(0);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[0]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -407,7 +453,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -442,7 +488,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -663,44 +709,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(1u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(1);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[1]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(1u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(1);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(1u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(1);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[1]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -784,7 +876,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -819,7 +911,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1040,44 +1132,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(2u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(2);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[2]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(2u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(2);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(2u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(2);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[2]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -1161,7 +1299,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1196,7 +1334,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1417,44 +1555,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(3u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(3);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[3]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(3u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(3);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(3u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(3);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[3]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -1538,7 +1722,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1573,7 +1757,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1794,44 +1978,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(4u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(4);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[4]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(4u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(4);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(4u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(4);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[4]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -1915,7 +2145,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1950,7 +2180,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2171,44 +2401,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(5u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(5);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[5]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(5u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(5);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(5u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(5);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[5]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -2292,7 +2568,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2327,7 +2603,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2548,44 +2824,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(6u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(6);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[6]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(6u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(6);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(6u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(6);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[6]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -2669,7 +2991,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2704,7 +3026,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2925,44 +3247,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(7u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(7);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[7]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(7u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(7);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(7u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(7);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[7]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -3046,7 +3414,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3081,7 +3449,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3302,44 +3670,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(8u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(8);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[8]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(8u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(8);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(8u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(8);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[8]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -3423,7 +3837,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3458,7 +3872,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3679,44 +4093,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(9u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(9);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[9]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(9u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(9);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(9u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(9);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[9]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -3800,7 +4260,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3835,7 +4295,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4056,44 +4516,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(10u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(10);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[10]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(10u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(10);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(10u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(10);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[10]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -4177,7 +4683,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4212,7 +4718,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4433,44 +4939,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(11u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(11);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[11]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(11u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(11);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(11u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(11);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[11]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -4554,7 +5106,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4589,7 +5141,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4810,44 +5362,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(12u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(12);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[12]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(12u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(12);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(12u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(12);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[12]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -4931,7 +5529,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4966,7 +5564,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5187,44 +5785,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(13u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(13);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[13]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(13u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(13);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(13u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(13);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[13]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -5308,7 +5952,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5343,7 +5987,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5564,44 +6208,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(14u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(14);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[14]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(14u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(14);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(14u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(14);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[14]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -5685,7 +6375,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5720,7 +6410,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5941,44 +6631,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(15u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(15);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[15]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(15u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(15);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(15u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(15);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[15]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -6062,7 +6798,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6097,7 +6833,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -12548,7 +13284,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -12668,7 +13404,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -12788,7 +13524,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -12908,7 +13644,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -13028,7 +13764,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -13148,7 +13884,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -13268,7 +14004,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -13388,7 +14124,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -13508,7 +14244,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -13628,7 +14364,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -13748,7 +14484,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -13868,7 +14604,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -13988,7 +14724,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -14108,7 +14844,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -14228,7 +14964,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -14348,7 +15084,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();

@@ -3934,7 +3934,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -3962,12 +3962,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        6
+      ],
       "outputs": [],
       "layer": 0
     },
@@ -4314,7 +4346,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -4342,12 +4374,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        19
+      ],
       "outputs": [],
       "layer": 1
     },
@@ -4694,7 +4758,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -4722,12 +4786,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        32
+      ],
       "outputs": [],
       "layer": 2
     },
@@ -5074,7 +5170,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -5102,12 +5198,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        45
+      ],
       "outputs": [],
       "layer": 3
     },
@@ -5454,7 +5582,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -5482,12 +5610,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        58
+      ],
       "outputs": [],
       "layer": 4
     },
@@ -5834,7 +5994,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -5862,12 +6022,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        71
+      ],
       "outputs": [],
       "layer": 5
     },
@@ -6214,7 +6406,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -6242,12 +6434,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        84
+      ],
       "outputs": [],
       "layer": 6
     },
@@ -6594,7 +6818,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -6622,12 +6846,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
+        }
+      },
+      "inputs": [
+        97
+      ],
       "outputs": [],
       "layer": 7
     },
@@ -6974,7 +7230,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -7002,12 +7258,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [
+        110
+      ],
       "outputs": [],
       "layer": 8
     },
@@ -7354,7 +7642,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -7382,12 +7670,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [
+        123
+      ],
       "outputs": [],
       "layer": 9
     },
@@ -7734,7 +8054,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -7762,12 +8082,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [
+        136
+      ],
       "outputs": [],
       "layer": 10
     },
@@ -8114,7 +8466,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -8142,12 +8494,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
+        }
+      },
+      "inputs": [
+        149
+      ],
       "outputs": [],
       "layer": 11
     },
@@ -8494,7 +8878,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -8522,12 +8906,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [
+        162
+      ],
       "outputs": [],
       "layer": 12
     },
@@ -8874,7 +9290,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -8902,12 +9318,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [
+        175
+      ],
       "outputs": [],
       "layer": 13
     },
@@ -9254,7 +9702,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -9282,12 +9730,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [
+        188
+      ],
       "outputs": [],
       "layer": 14
     },
@@ -9634,7 +10114,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -9662,12 +10142,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
+        }
+      },
+      "inputs": [
+        201
+      ],
       "outputs": [],
       "layer": 15
     },
@@ -10014,7 +10526,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -10042,12 +10554,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [
+        214
+      ],
       "outputs": [],
       "layer": 16
     },
@@ -10394,7 +10938,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -10422,12 +10966,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [
+        227
+      ],
       "outputs": [],
       "layer": 17
     },
@@ -10774,7 +11350,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -10802,12 +11378,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [
+        240
+      ],
       "outputs": [],
       "layer": 18
     },
@@ -11154,7 +11762,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -11182,12 +11790,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
+        }
+      },
+      "inputs": [
+        253
+      ],
       "outputs": [],
       "layer": 19
     },
@@ -11534,7 +12174,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -11562,12 +12202,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [
+        266
+      ],
       "outputs": [],
       "layer": 20
     },
@@ -11914,7 +12586,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -11942,12 +12614,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [
+        279
+      ],
       "outputs": [],
       "layer": 21
     },
@@ -12294,7 +12998,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -12322,12 +13026,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [
+        292
+      ],
       "outputs": [],
       "layer": 22
     },
@@ -12674,7 +13410,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -12702,12 +13438,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
+        }
+      },
+      "inputs": [
+        305
+      ],
       "outputs": [],
       "layer": 23
     },
@@ -13054,7 +13822,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -13082,12 +13850,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
+        }
+      },
+      "inputs": [
+        318
+      ],
       "outputs": [],
       "layer": 24
     },
@@ -13434,7 +14234,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -13462,12 +14262,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
+        }
+      },
+      "inputs": [
+        331
+      ],
       "outputs": [],
       "layer": 25
     },
@@ -13814,7 +14646,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -13842,12 +14674,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
+        }
+      },
+      "inputs": [
+        344
+      ],
       "outputs": [],
       "layer": 26
     },
@@ -14194,7 +15058,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -14222,12 +15086,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
+        }
+      },
+      "inputs": [
+        357
+      ],
       "outputs": [],
       "layer": 27
     },
@@ -14574,7 +15470,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -14602,12 +15498,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 28
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 28
+          }
+        }
+      },
+      "inputs": [
+        370
+      ],
       "outputs": [],
       "layer": 28
     },
@@ -14954,7 +15882,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -14982,12 +15910,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 29
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 29
+          }
+        }
+      },
+      "inputs": [
+        383
+      ],
       "outputs": [],
       "layer": 29
     },
@@ -15334,7 +16294,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -15362,12 +16322,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 30
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 30
+          }
+        }
+      },
+      "inputs": [
+        396
+      ],
       "outputs": [],
       "layer": 30
     },
@@ -15714,7 +16706,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 5
+              "ops": 7
             }
           ],
           "else_ops": 5
@@ -15742,12 +16734,44 @@
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 1,
+          "prefix_ops": 3,
           "tail_ops": 1,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
+      "outputs": [],
+      "layer": 31
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "state": {
+            "store": "KvCache",
+            "layer": 31
+          }
+        }
+      },
+      "inputs": [
+        409
+      ],
       "outputs": [],
       "layer": 31
     },
@@ -15994,792 +17018,792 @@
     {
       "seam": "attn.out",
       "layer": 0,
-      "op": 15
+      "op": 17
     },
     {
       "seam": "attn.q",
       "layer": 0,
-      "op": 16
+      "op": 18
     },
     {
       "seam": "attn.out",
       "layer": 0,
-      "op": 20
+      "op": 22
     },
     {
       "seam": "attn.qv",
       "layer": 1,
-      "op": 29
+      "op": 31
     },
     {
       "seam": "attn.q",
       "layer": 1,
-      "op": 36
+      "op": 38
     },
     {
       "seam": "attn.out",
       "layer": 1,
-      "op": 40
+      "op": 44
     },
     {
       "seam": "attn.q",
-      "layer": 1,
-      "op": 41
-    },
-    {
-      "seam": "attn.out",
       "layer": 1,
       "op": 45
     },
     {
+      "seam": "attn.out",
+      "layer": 1,
+      "op": 49
+    },
+    {
       "seam": "attn.qv",
       "layer": 2,
-      "op": 54
+      "op": 58
     },
     {
       "seam": "attn.q",
-      "layer": 2,
-      "op": 61
-    },
-    {
-      "seam": "attn.out",
       "layer": 2,
       "op": 65
     },
     {
-      "seam": "attn.q",
-      "layer": 2,
-      "op": 66
-    },
-    {
       "seam": "attn.out",
       "layer": 2,
-      "op": 70
+      "op": 71
+    },
+    {
+      "seam": "attn.q",
+      "layer": 2,
+      "op": 72
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 76
     },
     {
       "seam": "attn.qv",
       "layer": 3,
-      "op": 79
+      "op": 85
     },
     {
       "seam": "attn.q",
       "layer": 3,
-      "op": 86
+      "op": 92
     },
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 90
+      "op": 98
     },
     {
       "seam": "attn.q",
       "layer": 3,
-      "op": 91
+      "op": 99
     },
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 95
+      "op": 103
     },
     {
       "seam": "attn.qv",
       "layer": 4,
-      "op": 104
+      "op": 112
     },
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 111
+      "op": 119
     },
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 115
+      "op": 125
     },
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 116
+      "op": 126
     },
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 120
+      "op": 130
     },
     {
       "seam": "attn.qv",
       "layer": 5,
-      "op": 129
+      "op": 139
     },
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 136
+      "op": 146
     },
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 140
+      "op": 152
     },
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 141
+      "op": 153
     },
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 145
+      "op": 157
     },
     {
       "seam": "attn.qv",
-      "layer": 6,
-      "op": 154
-    },
-    {
-      "seam": "attn.q",
-      "layer": 6,
-      "op": 161
-    },
-    {
-      "seam": "attn.out",
-      "layer": 6,
-      "op": 165
-    },
-    {
-      "seam": "attn.q",
       "layer": 6,
       "op": 166
     },
     {
-      "seam": "attn.out",
+      "seam": "attn.q",
       "layer": 6,
-      "op": 170
+      "op": 173
     },
     {
-      "seam": "attn.qv",
-      "layer": 7,
+      "seam": "attn.out",
+      "layer": 6,
       "op": 179
     },
     {
       "seam": "attn.q",
-      "layer": 7,
-      "op": 186
+      "layer": 6,
+      "op": 180
     },
     {
       "seam": "attn.out",
-      "layer": 7,
-      "op": 190
-    },
-    {
-      "seam": "attn.q",
-      "layer": 7,
-      "op": 191
-    },
-    {
-      "seam": "attn.out",
-      "layer": 7,
-      "op": 195
+      "layer": 6,
+      "op": 184
     },
     {
       "seam": "attn.qv",
-      "layer": 8,
-      "op": 204
+      "layer": 7,
+      "op": 193
     },
     {
       "seam": "attn.q",
-      "layer": 8,
+      "layer": 7,
+      "op": 200
+    },
+    {
+      "seam": "attn.out",
+      "layer": 7,
+      "op": 206
+    },
+    {
+      "seam": "attn.q",
+      "layer": 7,
+      "op": 207
+    },
+    {
+      "seam": "attn.out",
+      "layer": 7,
       "op": 211
     },
     {
-      "seam": "attn.out",
-      "layer": 8,
-      "op": 215
-    },
-    {
-      "seam": "attn.q",
-      "layer": 8,
-      "op": 216
-    },
-    {
-      "seam": "attn.out",
+      "seam": "attn.qv",
       "layer": 8,
       "op": 220
     },
     {
+      "seam": "attn.q",
+      "layer": 8,
+      "op": 227
+    },
+    {
+      "seam": "attn.out",
+      "layer": 8,
+      "op": 233
+    },
+    {
+      "seam": "attn.q",
+      "layer": 8,
+      "op": 234
+    },
+    {
+      "seam": "attn.out",
+      "layer": 8,
+      "op": 238
+    },
+    {
       "seam": "attn.qv",
       "layer": 9,
-      "op": 229
+      "op": 247
     },
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 236
-    },
-    {
-      "seam": "attn.out",
-      "layer": 9,
-      "op": 240
-    },
-    {
-      "seam": "attn.q",
-      "layer": 9,
-      "op": 241
-    },
-    {
-      "seam": "attn.out",
-      "layer": 9,
-      "op": 245
-    },
-    {
-      "seam": "attn.qv",
-      "layer": 10,
       "op": 254
     },
     {
+      "seam": "attn.out",
+      "layer": 9,
+      "op": 260
+    },
+    {
       "seam": "attn.q",
-      "layer": 10,
+      "layer": 9,
       "op": 261
     },
     {
       "seam": "attn.out",
-      "layer": 10,
+      "layer": 9,
       "op": 265
     },
     {
+      "seam": "attn.qv",
+      "layer": 10,
+      "op": 274
+    },
+    {
       "seam": "attn.q",
       "layer": 10,
-      "op": 266
+      "op": 281
     },
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 270
+      "op": 287
+    },
+    {
+      "seam": "attn.q",
+      "layer": 10,
+      "op": 288
+    },
+    {
+      "seam": "attn.out",
+      "layer": 10,
+      "op": 292
     },
     {
       "seam": "attn.qv",
       "layer": 11,
-      "op": 279
+      "op": 301
     },
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 286
+      "op": 308
     },
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 290
+      "op": 314
     },
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 291
-    },
-    {
-      "seam": "attn.out",
-      "layer": 11,
-      "op": 295
-    },
-    {
-      "seam": "attn.qv",
-      "layer": 12,
-      "op": 304
-    },
-    {
-      "seam": "attn.q",
-      "layer": 12,
-      "op": 311
-    },
-    {
-      "seam": "attn.out",
-      "layer": 12,
       "op": 315
     },
     {
-      "seam": "attn.q",
-      "layer": 12,
-      "op": 316
-    },
-    {
       "seam": "attn.out",
-      "layer": 12,
-      "op": 320
+      "layer": 11,
+      "op": 319
     },
     {
       "seam": "attn.qv",
-      "layer": 13,
-      "op": 329
+      "layer": 12,
+      "op": 328
     },
     {
       "seam": "attn.q",
-      "layer": 13,
-      "op": 336
+      "layer": 12,
+      "op": 335
     },
     {
       "seam": "attn.out",
-      "layer": 13,
-      "op": 340
-    },
-    {
-      "seam": "attn.q",
-      "layer": 13,
+      "layer": 12,
       "op": 341
     },
     {
+      "seam": "attn.q",
+      "layer": 12,
+      "op": 342
+    },
+    {
+      "seam": "attn.out",
+      "layer": 12,
+      "op": 346
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 13,
+      "op": 355
+    },
+    {
+      "seam": "attn.q",
+      "layer": 13,
+      "op": 362
+    },
+    {
       "seam": "attn.out",
       "layer": 13,
-      "op": 345
+      "op": 368
+    },
+    {
+      "seam": "attn.q",
+      "layer": 13,
+      "op": 369
+    },
+    {
+      "seam": "attn.out",
+      "layer": 13,
+      "op": 373
     },
     {
       "seam": "attn.qv",
       "layer": 14,
-      "op": 354
+      "op": 382
     },
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 361
+      "op": 389
     },
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 365
-    },
-    {
-      "seam": "attn.q",
-      "layer": 14,
-      "op": 366
-    },
-    {
-      "seam": "attn.out",
-      "layer": 14,
-      "op": 370
-    },
-    {
-      "seam": "attn.qv",
-      "layer": 15,
-      "op": 379
-    },
-    {
-      "seam": "attn.q",
-      "layer": 15,
-      "op": 386
-    },
-    {
-      "seam": "attn.out",
-      "layer": 15,
-      "op": 390
-    },
-    {
-      "seam": "attn.q",
-      "layer": 15,
-      "op": 391
-    },
-    {
-      "seam": "attn.out",
-      "layer": 15,
       "op": 395
     },
     {
-      "seam": "attn.qv",
-      "layer": 16,
-      "op": 404
-    },
-    {
       "seam": "attn.q",
-      "layer": 16,
-      "op": 411
+      "layer": 14,
+      "op": 396
     },
     {
       "seam": "attn.out",
-      "layer": 16,
-      "op": 415
+      "layer": 14,
+      "op": 400
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 15,
+      "op": 409
     },
     {
       "seam": "attn.q",
-      "layer": 16,
+      "layer": 15,
       "op": 416
     },
     {
       "seam": "attn.out",
-      "layer": 16,
-      "op": 420
-    },
-    {
-      "seam": "attn.qv",
-      "layer": 17,
-      "op": 429
+      "layer": 15,
+      "op": 422
     },
     {
       "seam": "attn.q",
-      "layer": 17,
+      "layer": 15,
+      "op": 423
+    },
+    {
+      "seam": "attn.out",
+      "layer": 15,
+      "op": 427
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 16,
       "op": 436
     },
     {
+      "seam": "attn.q",
+      "layer": 16,
+      "op": 443
+    },
+    {
       "seam": "attn.out",
-      "layer": 17,
-      "op": 440
+      "layer": 16,
+      "op": 449
     },
     {
       "seam": "attn.q",
-      "layer": 17,
-      "op": 441
+      "layer": 16,
+      "op": 450
     },
     {
       "seam": "attn.out",
-      "layer": 17,
-      "op": 445
-    },
-    {
-      "seam": "attn.qv",
-      "layer": 18,
+      "layer": 16,
       "op": 454
     },
     {
-      "seam": "attn.q",
-      "layer": 18,
-      "op": 461
-    },
-    {
-      "seam": "attn.out",
-      "layer": 18,
-      "op": 465
+      "seam": "attn.qv",
+      "layer": 17,
+      "op": 463
     },
     {
       "seam": "attn.q",
-      "layer": 18,
-      "op": 466
-    },
-    {
-      "seam": "attn.out",
-      "layer": 18,
+      "layer": 17,
       "op": 470
     },
     {
-      "seam": "attn.qv",
-      "layer": 19,
-      "op": 479
+      "seam": "attn.out",
+      "layer": 17,
+      "op": 476
     },
     {
       "seam": "attn.q",
-      "layer": 19,
-      "op": 486
+      "layer": 17,
+      "op": 477
     },
     {
       "seam": "attn.out",
-      "layer": 19,
+      "layer": 17,
+      "op": 481
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 18,
       "op": 490
     },
     {
       "seam": "attn.q",
-      "layer": 19,
-      "op": 491
+      "layer": 18,
+      "op": 497
     },
     {
       "seam": "attn.out",
-      "layer": 19,
-      "op": 495
+      "layer": 18,
+      "op": 503
     },
     {
-      "seam": "attn.qv",
-      "layer": 20,
+      "seam": "attn.q",
+      "layer": 18,
       "op": 504
     },
     {
+      "seam": "attn.out",
+      "layer": 18,
+      "op": 508
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 19,
+      "op": 517
+    },
+    {
+      "seam": "attn.q",
+      "layer": 19,
+      "op": 524
+    },
+    {
+      "seam": "attn.out",
+      "layer": 19,
+      "op": 530
+    },
+    {
+      "seam": "attn.q",
+      "layer": 19,
+      "op": 531
+    },
+    {
+      "seam": "attn.out",
+      "layer": 19,
+      "op": 535
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 20,
+      "op": 544
+    },
+    {
       "seam": "attn.q",
       "layer": 20,
-      "op": 511
+      "op": 551
     },
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 515
+      "op": 557
     },
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 516
+      "op": 558
     },
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 520
+      "op": 562
     },
     {
       "seam": "attn.qv",
       "layer": 21,
-      "op": 529
+      "op": 571
     },
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 536
+      "op": 578
     },
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 540
+      "op": 584
     },
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 541
+      "op": 585
     },
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 545
+      "op": 589
     },
     {
       "seam": "attn.qv",
       "layer": 22,
-      "op": 554
+      "op": 598
     },
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 561
+      "op": 605
     },
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 565
-    },
-    {
-      "seam": "attn.q",
-      "layer": 22,
-      "op": 566
-    },
-    {
-      "seam": "attn.out",
-      "layer": 22,
-      "op": 570
-    },
-    {
-      "seam": "attn.qv",
-      "layer": 23,
-      "op": 579
-    },
-    {
-      "seam": "attn.q",
-      "layer": 23,
-      "op": 586
-    },
-    {
-      "seam": "attn.out",
-      "layer": 23,
-      "op": 590
-    },
-    {
-      "seam": "attn.q",
-      "layer": 23,
-      "op": 591
-    },
-    {
-      "seam": "attn.out",
-      "layer": 23,
-      "op": 595
-    },
-    {
-      "seam": "attn.qv",
-      "layer": 24,
-      "op": 604
-    },
-    {
-      "seam": "attn.q",
-      "layer": 24,
       "op": 611
     },
     {
-      "seam": "attn.out",
-      "layer": 24,
-      "op": 615
+      "seam": "attn.q",
+      "layer": 22,
+      "op": 612
     },
     {
-      "seam": "attn.q",
-      "layer": 24,
+      "seam": "attn.out",
+      "layer": 22,
       "op": 616
     },
     {
+      "seam": "attn.qv",
+      "layer": 23,
+      "op": 625
+    },
+    {
+      "seam": "attn.q",
+      "layer": 23,
+      "op": 632
+    },
+    {
+      "seam": "attn.out",
+      "layer": 23,
+      "op": 638
+    },
+    {
+      "seam": "attn.q",
+      "layer": 23,
+      "op": 639
+    },
+    {
+      "seam": "attn.out",
+      "layer": 23,
+      "op": 643
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 24,
+      "op": 652
+    },
+    {
+      "seam": "attn.q",
+      "layer": 24,
+      "op": 659
+    },
+    {
       "seam": "attn.out",
       "layer": 24,
-      "op": 620
-    },
-    {
-      "seam": "attn.qv",
-      "layer": 25,
-      "op": 629
-    },
-    {
-      "seam": "attn.q",
-      "layer": 25,
-      "op": 636
-    },
-    {
-      "seam": "attn.out",
-      "layer": 25,
-      "op": 640
-    },
-    {
-      "seam": "attn.q",
-      "layer": 25,
-      "op": 641
-    },
-    {
-      "seam": "attn.out",
-      "layer": 25,
-      "op": 645
-    },
-    {
-      "seam": "attn.qv",
-      "layer": 26,
-      "op": 654
-    },
-    {
-      "seam": "attn.q",
-      "layer": 26,
-      "op": 661
-    },
-    {
-      "seam": "attn.out",
-      "layer": 26,
       "op": 665
     },
     {
       "seam": "attn.q",
-      "layer": 26,
+      "layer": 24,
       "op": 666
     },
     {
       "seam": "attn.out",
-      "layer": 26,
+      "layer": 24,
       "op": 670
     },
     {
       "seam": "attn.qv",
-      "layer": 27,
+      "layer": 25,
       "op": 679
     },
     {
       "seam": "attn.q",
-      "layer": 27,
+      "layer": 25,
       "op": 686
     },
     {
       "seam": "attn.out",
-      "layer": 27,
-      "op": 690
+      "layer": 25,
+      "op": 692
     },
     {
       "seam": "attn.q",
-      "layer": 27,
-      "op": 691
+      "layer": 25,
+      "op": 693
     },
     {
       "seam": "attn.out",
-      "layer": 27,
-      "op": 695
+      "layer": 25,
+      "op": 697
     },
     {
       "seam": "attn.qv",
-      "layer": 28,
-      "op": 704
+      "layer": 26,
+      "op": 706
     },
     {
       "seam": "attn.q",
-      "layer": 28,
-      "op": 711
+      "layer": 26,
+      "op": 713
     },
     {
       "seam": "attn.out",
-      "layer": 28,
-      "op": 715
+      "layer": 26,
+      "op": 719
     },
     {
       "seam": "attn.q",
-      "layer": 28,
-      "op": 716
-    },
-    {
-      "seam": "attn.out",
-      "layer": 28,
+      "layer": 26,
       "op": 720
     },
     {
+      "seam": "attn.out",
+      "layer": 26,
+      "op": 724
+    },
+    {
       "seam": "attn.qv",
-      "layer": 29,
-      "op": 729
+      "layer": 27,
+      "op": 733
     },
     {
       "seam": "attn.q",
-      "layer": 29,
-      "op": 736
-    },
-    {
-      "seam": "attn.out",
-      "layer": 29,
+      "layer": 27,
       "op": 740
     },
     {
+      "seam": "attn.out",
+      "layer": 27,
+      "op": 746
+    },
+    {
+      "seam": "attn.q",
+      "layer": 27,
+      "op": 747
+    },
+    {
+      "seam": "attn.out",
+      "layer": 27,
+      "op": 751
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 28,
+      "op": 760
+    },
+    {
+      "seam": "attn.q",
+      "layer": 28,
+      "op": 767
+    },
+    {
+      "seam": "attn.out",
+      "layer": 28,
+      "op": 773
+    },
+    {
+      "seam": "attn.q",
+      "layer": 28,
+      "op": 774
+    },
+    {
+      "seam": "attn.out",
+      "layer": 28,
+      "op": 778
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 29,
+      "op": 787
+    },
+    {
       "seam": "attn.q",
       "layer": 29,
-      "op": 741
+      "op": 794
     },
     {
       "seam": "attn.out",
       "layer": 29,
-      "op": 745
+      "op": 800
+    },
+    {
+      "seam": "attn.q",
+      "layer": 29,
+      "op": 801
+    },
+    {
+      "seam": "attn.out",
+      "layer": 29,
+      "op": 805
     },
     {
       "seam": "attn.qv",
       "layer": 30,
-      "op": 754
+      "op": 814
     },
     {
       "seam": "attn.q",
       "layer": 30,
-      "op": 761
+      "op": 821
     },
     {
       "seam": "attn.out",
       "layer": 30,
-      "op": 765
+      "op": 827
     },
     {
       "seam": "attn.q",
       "layer": 30,
-      "op": 766
+      "op": 828
     },
     {
       "seam": "attn.out",
       "layer": 30,
-      "op": 770
+      "op": 832
     },
     {
       "seam": "attn.qv",
       "layer": 31,
-      "op": 779
+      "op": 841
     },
     {
       "seam": "attn.q",
       "layer": 31,
-      "op": 786
+      "op": 848
     },
     {
       "seam": "attn.out",
       "layer": 31,
-      "op": 790
+      "op": 854
     },
     {
       "seam": "attn.q",
       "layer": 31,
-      "op": 791
+      "op": 855
     },
     {
       "seam": "attn.out",
       "layer": 31,
-      "op": 795
+      "op": 859
     },
     {
       "seam": "out"

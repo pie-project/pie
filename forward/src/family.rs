@@ -493,9 +493,29 @@ fn llama_like_cuda_text(
                                     // fires: any mix of prefill and
                                     // plain-decode requests, ragged qo.
                                     if window_one && !c.force_prefill_path {
-                                        cuda::attention_flashinfer_decode(
-                                            q, &w.kv,
-                                        );
+                                        // hook×mask: the prefix decode IS
+                                        // the paged decode path and the
+                                        // hooked rows live in it (the
+                                        // seriation puts masked rows in
+                                        // the suffix, so the prefix
+                                        // starts at row 0 and the request
+                                        // ordinals are the unsplit ones).
+                                        // So the score capture rides here
+                                        // exactly as in the unsplit arm —
+                                        // the hand-written body's
+                                        // `if (score_capture.active())`
+                                        // on this same branch.
+                                        dsl::guarded(m)
+                                            .arm(GuardPred::WantsAttnScore, || {
+                                                cuda::attention_flashinfer_decode_capture(
+                                                    q, &w.kv,
+                                                );
+                                            })
+                                            .otherwise(|| {
+                                                cuda::attention_flashinfer_decode(
+                                                    q, &w.kv,
+                                                );
+                                            });
                                     } else {
                                         cuda::dequant_only(&w.kv);
                                         cuda::attention_flashinfer_prefill(
@@ -542,12 +562,13 @@ fn llama_like_cuda_text(
                         g.arm(GuardPred::HasCustomMask, || {
                             // Masked+hooked composes here: the sites run
                             // around the custom dispatch exactly as the
-                            // hand-written unconditional invokes do. No
-                            // WantsAttnScore guard — the custom dispatch
-                            // has no capture variant, so nothing
-                            // publishes and the OnAttn sideband hands
-                            // the programs a null scores pointer (the
-                            // publish-gated contract).
+                            // hand-written unconditional invokes do. The
+                            // SPLIT's unmasked prefix carries the score
+                            // capture (see `masked_attention`); only the
+                            // masked suffix's custom dispatch has no
+                            // capture variant, and a fire that is masked
+                            // all the way down publishes nothing, which
+                            // is the publish-gated contract.
                             let q = general_qkv();
                             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
                             masked_attention(&q);

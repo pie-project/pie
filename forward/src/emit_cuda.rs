@@ -1170,9 +1170,15 @@ fn emit_masked_pages_bracket(b: &mut Body, layer: u32, takes_paged_decode: bool)
         b.stmt("            \"attn_page_mask requires a page-count-independent \"");
         b.stmt("            \"decode plan; this fire planned split-KV\");");
         b.stmt("    }");
+        // `num_requests`, NOT the layer scope's depth-narrowed `R`: the
+        // mask sink is carved once for the FIRE, so its compaction is a
+        // fire-wide operation and a tail layer's live-row count makes
+        // `FirePageMask::compact` refuse. A narrowed layer then reads a
+        // PREFIX of the compacted CSR, which is exactly its rows — the
+        // seriation keeps live rows first and `indptr` is prefix-summed.
         b.stmt("    page_mask.compact(");
         b.stmt("        kv_page_indices, kv_page_indptr, kv_last_page_lens,");
-        b.stmt("        static_cast<std::uint32_t>(R), stream);");
+        b.stmt("        static_cast<std::uint32_t>(num_requests), stream);");
         b.stmt("    attn_page_indices = page_mask.page_indices();");
         b.stmt("    attn_page_indptr = page_mask.page_indptr();");
         b.stmt("    attn_last_page_lens = page_mask.last_page_lens();");
