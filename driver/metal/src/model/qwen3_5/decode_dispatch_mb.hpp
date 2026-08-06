@@ -144,7 +144,12 @@ inline int qmm_bn(int out_vec, int N) {
 /// (where 16 still wins) and 192 (where 32 does); the machine saturates higher
 /// than that, and using the saturation number here cost up to 12% because it
 /// let the choice run past 32 to 64.
-inline constexpr int kQmmBnCrossoverTg = 160;
+///
+/// It is a property of the machine and not of the kernel -- how many
+/// threadgroups it takes to fill a GPU is what the core count means -- so the
+/// number lives in `device_tuning` and this is the M1 Max value it defaults
+/// to. The M4 Pro re-measurement, and why it lands lower, is there.
+/// `qmm_bn_crossover_tg()` is declared in `device_tuning.hpp`.
 
 /// `qmm_bn` for a family whose GEMM has no split-K behind it.
 ///
@@ -187,7 +192,7 @@ inline int qmm_bn_unsplit(int out_vec, int N) {
     const int bm = qmm_bm(N);
     if (N < qmm_min_batch() || N % bm != 0 || out_vec % 16 != 0) return 0;
     const int row_tiles = N / bm;
-    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= kQmmBnCrossoverTg) return 32;
+    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= qmm_bn_crossover_tg()) return 32;
     return 16;
 }
 

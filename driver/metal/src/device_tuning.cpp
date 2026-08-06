@@ -35,11 +35,18 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
             // crossover is set by per-core matrix throughput, which the
             // family names and the core count does not.
             t.qmm_min_batch = 8;
+            // Same machine, same reasoning, a different constant: with 20
+            // cores rather than 32 the wide tile's smaller grid fills the
+            // machine sooner, so the tile crossover moves down. Measured with
+            // `roofline_probe`; the table is in `device_tuning.hpp`.
+            t.qmm_bn_crossover_tg = 96;
             break;
         default:
             break;
     }
     t.qmm_min_batch = env_int("PIE_METAL_QMM_MIN_BATCH", t.qmm_min_batch);
+    t.qmm_bn_crossover_tg =
+        env_int("PIE_METAL_QMM_BN_CROSSOVER_TG", t.qmm_bn_crossover_tg);
     return t;
 }
 
@@ -62,5 +69,7 @@ const DeviceTuning& device_tuning() {
 }
 
 int qmm_min_batch() { return device_tuning().qmm_min_batch; }
+
+int qmm_bn_crossover_tg() { return device_tuning().qmm_bn_crossover_tg; }
 
 }  // namespace pie::metal
