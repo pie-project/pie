@@ -1,0 +1,730 @@
+{
+  "regex": [
+    {
+      "name": "date",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "datetime",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "uuid",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "ipv4",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "semver",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "hex colour",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "identifier",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "currency",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "percent",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "3/3",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "3/3",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "phone",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "mac",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "http line",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "csv field",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "bounded repeat",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "nested group",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "optional chain",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "3/3",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "3/3",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "class union",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "digits bounded",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "escaped meta",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "anchored",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "repeat 1..64",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "repeat 200",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "wide class",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "1/1",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/19"
+    },
+    {
+      "name": "alternation of 256",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "nested quantifier",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "backtrack bait",
+      "kind": "regex",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    }
+  ],
+  "ebnf": [
+    {
+      "name": "list",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "nested parens",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "3/3",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "3/3",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "arithmetic",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "3/3",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "3/3",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "key value",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "choice of shapes",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "3/3",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "3/3",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "recursion, self",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "recursion, 64 rules",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "3/3",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "3/3",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "ambiguous tail",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "common long prefix",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "alternation of 512",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "left recursion",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "2/2",
+        "rejects invalid": "1/1",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    },
+    {
+      "name": "balanced pairs",
+      "kind": "ebnf",
+      "engrain": {
+        "accepts valid": "3/3",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar": {
+        "accepts valid": "3/3",
+        "rejects invalid": "2/2",
+        "walked": 20,
+        "over-accepted": 0
+      },
+      "xgrammar refuses engrain's": "0/20",
+      "engrain refuses xgrammar's": "0/20"
+    }
+  ],
+  "compile_ms": {
+    "engrain": {
+      "n": 38,
+      "p50": 0.44474867172539234,
+      "max": 18.36011791601777
+    },
+    "xgrammar": {
+      "n": 38,
+      "p50": 0.6207691039890051,
+      "max": 2.5650658644735813
+    }
+  },
+  "utf8_wrong": {
+    "engrain": [],
+    "xgrammar": [
+      "overlong U+0101"
+    ]
+  },
+  "timing": [
+    {
+      "batch": 8,
+      "engrain_us": 587.23334223032,
+      "xgrammar_us": 232.62714967131615
+    },
+    {
+      "batch": 32,
+      "engrain_us": 594.5172160863876,
+      "xgrammar_us": 510.23904234170914
+    },
+    {
+      "batch": 128,
+      "engrain_us": 619.8347546160221,
+      "xgrammar_us": 1904.0871411561966
+    },
+    {
+      "batch": 512,
+      "engrain_us": 644.5902399718761,
+      "xgrammar_us": 7365.095894783735
+    }
+  ]
+}

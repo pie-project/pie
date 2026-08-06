@@ -953,3 +953,39 @@ class AnUntypedSchemaIsStillAShape(unittest.TestCase):
         grammar = self.engine.compile_json_schema(schema)
         [note] = [n for n in grammar.relaxations if n["keyword"] == "required"]
         self.assertIn("9 ", note["effect"])
+
+
+class ByteLevelWellFormedness(unittest.TestCase):
+    """A mask over bytes has to enforce UTF-8, not merely the codepoint range.
+
+    An overlong encoding is a valid codepoint spelled in more bytes than it
+    needs, and RFC 3629 forbids it - it is the classic way past a filter that
+    checks the decoded string. Found while comparing regex front ends: the
+    other engine admits one.
+    """
+
+    def setUp(self):
+        self.engine = _Engine([bytes([b]) for b in range(256)])
+
+    def accepts(self, grammar, raw: bytes) -> bool:
+        matcher = grammar.matcher()
+        for byte in raw:
+            if byte not in matcher.allowed_tokens():
+                return False
+            matcher.accept_token(byte)
+        return matcher.can_terminate()
+
+    def test_a_wide_class_takes_only_well_formed_utf8(self):
+        grammar = self.engine.compile_regex(r"[\u0100-\u2000]+")
+        self.assertTrue(self.accepts(grammar, "\u0101".encode()))
+        self.assertTrue(self.accepts(grammar, "\u1fff".encode()))
+        for name, raw in (
+            ("truncated three-byte", b"\xe1\x80"),
+            ("lone continuation", b"\x80"),
+            ("overlong U+0101", b"\xe0\x84\x81"),
+            ("three-byte with a bad tail", b"\xe1\x80\x41"),
+            ("surrogate U+D800", b"\xed\xa0\x80"),
+            ("outside the class", "\u2001".encode()),
+        ):
+            with self.subTest(name):
+                self.assertFalse(self.accepts(grammar, raw))
