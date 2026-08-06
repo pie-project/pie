@@ -3315,9 +3315,9 @@ pub fn gemma4_cuda(
                 layer: None,
             },
         );
-        let ple = dsl::cuda::scalar_mul(&ple, "rsqrt_hidden");
-        let ple = rmsnorm(
-            &ple,
+        let scaled = dsl::cuda::scalar_mul(&ple, "rsqrt_hidden");
+        let normed_ple = rmsnorm(
+            &scaled,
             &NormW {
                 name: "ple_model_norm".into(),
                 variant: NormVariant::Gemma,
@@ -3325,6 +3325,12 @@ pub fn gemma4_cuda(
                 layer: None,
             },
         );
+        // The projection lands back on the SCALED TABLE, not on nothing:
+        // `(proj + table) / sqrt(2)`. The residual add was missing from
+        // this prologue until an executor arm went looking for the value
+        // its scale consumes and found two producers where the trace had
+        // one.
+        let ple = dsl::cuda::residual_add(&normed_ple, &scaled, ple_total);
         let ple = dsl::cuda::scalar_mul(&ple, "rsqrt_2");
         let ple_table = dsl::cuda::transpose_nld_to_lnd(&ple, facts.layers, facts.ple_dim);
 

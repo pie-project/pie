@@ -35,6 +35,31 @@ bool gemma4_declared_forward_enabled();
 Gemma4DeclaredPlan build_gemma4_declared_plan(
     const HfConfig& cfg, const Gemma4Weights& w, int tp_size);
 
+// Drive the DECODE class's flat launch list. Returns false when this
+// fire is outside what the declaration states, leaving the hand-written
+// pass to run it — the eligibility answer, not an error.
+bool gemma4_forward_declared(
+    const Gemma4DeclaredPlan& declared,
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    Workspace& ws,
+    Gemma4MoeMlpWorkspace& moe_ws,
+    KvCache& cache,
+    AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    const std::uint8_t* row_valid_d,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows);
+
 // Every kernel the plan states must be in this executor's registry. A
 // symbol outside it means the trace and the driver drifted, and saying
 // so at LOAD is what keeps a drift from becoming a wrong number.
