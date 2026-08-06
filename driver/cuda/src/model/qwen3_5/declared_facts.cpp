@@ -664,6 +664,21 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
 
 }  // namespace
 
+// SAME env name as llama_like's gate, DELIBERATELY OPPOSITE DEFAULT,
+// and that is worth a warning rather than a tidy-up.
+//
+// llama_like flipped to default-on at cutover step 4(a). This family did
+// not, because it cannot currently be validated end to end: qwen3.5 CUDA
+// serving emits garbage at the upstream dev head (reproduced
+// byte-identically on pure dev; `.wiki/tart/upstream_findings.md` entry
+// 5), so a default-on declared path here would be an unmeasured path on
+// by default. It goes on when that is fixed and the family's own parity
+// bar runs green — not before, and not for symmetry.
+//
+// The consequence to remember: an unset `PIE_DECLARED_FORWARD` means
+// DECLARED for llama_like and HAND-WRITTEN here, so any test reading the
+// env to label its run must know which family it is testing
+// (`cuda_gdn_site_summary_parity` reads it for this one).
 bool qwen35_declared_forward_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_DECLARED_FORWARD");

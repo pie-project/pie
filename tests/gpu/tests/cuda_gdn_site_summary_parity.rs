@@ -81,6 +81,12 @@ fn parse_generated_tokens(result: &str) -> Option<Vec<u32>> {
 #[ignore = "needs a CUDA GPU + qwen3.5-0.8b-base; run gate-OFF then gate-ON"]
 async fn gdn_site_summary_parity() -> Result<()> {
     common::init_trace();
+    // `unwrap_or(false)` is CORRECT HERE and must not be "fixed" to match
+    // `cuda_declared_forward_parity`. The two tests read the same env for
+    // different families: llama_like's declared path is default-ON since
+    // cutover step 4(a), qwen3_5's is still default-OFF (upstream finding
+    // 5 blocks its end-to-end validation). This test drives qwen3_5, so
+    // an unset env means the HAND-WRITTEN body ran.
     let declared = std::env::var("PIE_DECLARED_FORWARD")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);

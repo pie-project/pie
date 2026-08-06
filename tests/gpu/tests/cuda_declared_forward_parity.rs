@@ -22,10 +22,12 @@
 //!   of that override is the proof the peephole matched — parity now holds
 //!   with both sides fused, under the environment's default gates.
 //!
-//! `#[ignore]`, driver-cuda. Run OFF then ON, the second invocation gates:
+//! `#[ignore]`, driver-cuda. Run both polarities; the second invocation
+//! gates. Since cutover step 4(a) the DEFAULT is the declared executor,
+//! so the disarmed run is the one that needs the env:
 //!   cargo test -p pie-gpu-tests --no-default-features --features driver-cuda \
 //!     --test cuda_declared_forward_parity -- --ignored --nocapture
-//!   PIE_DECLARED_FORWARD=1 cargo test ... --test cuda_declared_forward_parity ...
+//!   PIE_DECLARED_FORWARD=0 cargo test ... --test cuda_declared_forward_parity ...
 
 mod common;
 
@@ -82,9 +84,16 @@ fn parse_text(result: &str) -> Option<String> {
 #[ignore = "needs a CUDA GPU + qwen-3-0.6b; run gate-OFF then gate-ON"]
 async fn declared_forward_token_parity() -> Result<()> {
     common::init_trace();
+    // MIRROR the driver's polarity exactly (`llama_like_model.cpp`'s
+    // `declared_forward_enabled`): unset means ON since cutover step
+    // 4(a), and only a value starting with '0' disarms. Reading it the
+    // old way after the flip would file an unset run under the
+    // hand-written slot and compare declared against declared — a gate
+    // that passes because it stopped asking anything, which is the
+    // failure mode this harness has already had once.
     let declared = std::env::var("PIE_DECLARED_FORWARD")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
+        .map(|v| !v.starts_with('0'))
+        .unwrap_or(true);
 
     let pie = common::boot_4090().await?;
     eprintln!(

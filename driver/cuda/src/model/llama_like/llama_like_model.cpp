@@ -10,13 +10,27 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-// Stage 3 opt-in: run the declared-plan executor (declared_forward.cpp) on
-// eligible fires instead of the hand-written body. Default off; cached like
-// `decode_fused_post_enabled` in llama_like.cpp so the gate costs one load.
+// Eligible fires run the DECLARED executor (`declared_forward.cpp`),
+// which builds the fire's rows, lowers them against the traced plan and
+// executes the resulting launch list. `PIE_DECLARED_FORWARD=0` disarms
+// it back onto the hand-written body below.
+//
+// The flip is `.wiki/tart/dsl.md` cutover step 4(a), and it is smaller
+// than it sounds in both directions. It does NOT make this the only
+// path: a deployment the DSL cannot express never traces at all
+// (`declared_` stays empty for TP, quantized projections, non-standard
+// rope), and an expressible deployment still falls back PER FIRE
+// wherever `declared_eligible` below refuses. So this changes nothing
+// for the excluded and everything for the included, and the
+// hand-written body stays where it is until each of those refusals has
+// been closed on its own.
+//
+// Cached like `decode_fused_post_enabled` in llama_like.cpp so the gate
+// costs one load.
 bool declared_forward_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_DECLARED_FORWARD");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return enabled;
 }
