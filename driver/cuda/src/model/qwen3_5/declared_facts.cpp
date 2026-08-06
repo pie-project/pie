@@ -765,9 +765,13 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
 // env to label its run must know which family it is testing
 // (`cuda_gdn_site_summary_parity` reads it for this one).
 bool qwen35_declared_forward_enabled() {
+    // DEFAULT ON, llama_like's polarity verbatim — one env var meaning
+    // the same thing in both families, which it did not while this one
+    // was opt-in. `PIE_DECLARED_FORWARD=0` disarms onto the hand-written
+    // pass.
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_DECLARED_FORWARD");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return enabled;
 }
