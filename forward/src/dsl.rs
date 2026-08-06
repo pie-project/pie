@@ -1569,20 +1569,6 @@ pub mod cuda {
         .expect("fused post produces q")
     }
 
-    /// The MLP activation, stating which of the two swiglu kernels runs.
-    ///
-    /// `packed` is [`crate::facts::LlamaLikeCudaFacts::gate_up_fused`]: a
-    /// checkpoint that bound the packed gate‖up bank lands the projection
-    /// in one buffer and takes the CHUNKED kernel; one that did not lands
-    /// two and takes the pair form. Same arithmetic, different addressing
-    /// — which is exactly the kind of choice that used to sit in the
-    /// executor (`declared::arm_swiglu`) and in the generated file (a
-    /// per-layer `if (gate_up_fused_N)`), reading a workspace to decide
-    /// what the binding had already decided at load.
-    ///
-    /// One value either way: the trace declares ONE packed matmul before
-    /// this, and whether the binding materialised it as one buffer or two
-    /// is a BUFFER question, which is `lower::Buffers`'.
     /// `kernels::launch_topk_softmax_bf16`: the router's top-k + softmax +
     /// renormalize, one launch, two results — expert indices
     /// (`[Tokens, k]` i32, the `dyn` value every expert-indexed statement
@@ -1613,6 +1599,127 @@ pub mod cuda {
         (mk(ids[0]), mk(ids[1]))
     }
 
+    /// `kernels::launch_moe_gate_up_decode_gemv_bf16` /
+    /// `..._moe_down_decode_gemv_bf16`: the routed projections of the
+    /// decode GEMV leg, one launch each over the fire's `N * k` routes.
+    ///
+    /// The expert axis is INSIDE the value, not outside it: one launch
+    /// reads `experts` and strides the stacked bank itself, so the
+    /// declaration stays a rectangle even though the arithmetic is
+    /// per-token-per-expert. That is why this leg is the one the CUDA
+    /// text can state — see [`super::matmul_per_token`]'s other legs,
+    /// which reach the same numbers by *host* routing (the general path)
+    /// or by an aligned padding that gives the intermediate an extent no
+    /// [`Dim`] spells (the grouped-GEMM path).
+    ///
+    /// Both projections carry the routed extent as a third dim: `k` is a
+    /// load-time constant, so `[Tokens, k, width]` is exactly the
+    /// `N * k`-row buffer the kernel writes, said without inventing a
+    /// row space.
+    pub fn moe_gate_up_gemv(x: &Val, w: &MatW, experts: &Val, top_k: u32) -> Val {
+        moe_routed_gemv(
+            "launch_moe_gate_up_decode_gemv_bf16",
+            x,
+            w,
+            experts,
+            top_k,
+        )
+    }
+
+    pub fn moe_down_gemv(x: &Val, w: &MatW, experts: &Val, top_k: u32) -> Val {
+        moe_routed_gemv("launch_moe_down_decode_gemv_bf16", x, w, experts, top_k)
+    }
+
+    fn moe_routed_gemv(kernel: &str, x: &Val, w: &MatW, experts: &Val, top_k: u32) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            kernel,
+            vec![w.name.clone()],
+            None,
+            vec![experts.id, x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(top_k), Dim::Const(w.width)]),
+                DType::BF16,
+            )),
+        )
+        .expect("a routed projection produces its value")
+    }
+
+    /// `kernels::launch_chunked_swiglu_bf16` over the routed rows — the
+    /// same kernel [`swiglu`]'s packed arm names, launched with `N * k`
+    /// rows instead of `N`. A separate statement because the SHAPE
+    /// differs, not the kernel: the routed value keeps its expert dim.
+    pub fn swiglu_routed(x: &Val, top_k: u32, intermediate: u32) -> Val {
+        record(
+            &x.t,
+            x.layer,
+            "launch_chunked_swiglu_bf16",
+            vec![],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![
+                    Dim::Tokens,
+                    Dim::Const(top_k),
+                    Dim::Const(intermediate),
+                ]),
+                DType::BF16,
+            )),
+        )
+        .expect("the routed activation produces its value")
+    }
+
+    /// `kernels::launch_token_batched_weighted_sum_bf16`, or the
+    /// `..._add_bf16` form when the residual folds into the same launch.
+    ///
+    /// The combine collapses `[Tokens, k, H]` to `[Tokens, H]` under the
+    /// router's weights. `fold_residual` is the hand-written pass's
+    /// `add_to_residual`: at tp=1 the MoE output lands straight on the
+    /// residual stream, so the add is not a second launch. Stating it
+    /// here is what lets the body emit ONE op where the semantic text
+    /// emits a WeightedSum and a ResidualAdd — the fusion is a kernel
+    /// fact, so it belongs in the CUDA reading, not in the trace shape.
+    ///
+    /// The per-expert `launch_scatter_add_weighted_bf16` loop is the
+    /// OTHER combine, and it is not stated here: it runs once per expert
+    /// with a row count the host learned from a device readback, which
+    /// is a launch count no declaration fixes.
+    pub fn weighted_sum(weights: &Val, x: &Val, hidden: u32, residual: Option<&Val>) -> Val {
+        let mut inputs = vec![x.id, weights.id];
+        if let Some(r) = residual {
+            inputs.push(r.id);
+        }
+        record(
+            &weights.t,
+            weights.layer,
+            if residual.is_some() {
+                "launch_token_batched_weighted_sum_add_bf16"
+            } else {
+                "launch_token_batched_weighted_sum_bf16"
+            },
+            vec![],
+            None,
+            inputs,
+            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
+        )
+        .expect("the combine produces its value")
+    }
+
+    /// The MLP activation, stating which of the two swiglu kernels runs.
+    ///
+    /// `packed` is [`crate::facts::LlamaLikeCudaFacts::gate_up_fused`]: a
+    /// checkpoint that bound the packed gate‖up bank lands the projection
+    /// in one buffer and takes the CHUNKED kernel; one that did not lands
+    /// two and takes the pair form. Same arithmetic, different addressing
+    /// — which is exactly the kind of choice that used to sit in the
+    /// executor (`declared::arm_swiglu`) and in the generated file (a
+    /// per-layer `if (gate_up_fused_N)`), reading a workspace to decide
+    /// what the binding had already decided at load.
+    ///
+    /// One value either way: the trace declares ONE packed matmul before
+    /// this, and whether the binding materialised it as one buffer or two
+    /// is a BUFFER question, which is `lower::Buffers`'.
     pub fn swiglu(x: &Val, intermediate: u32, packed: bool) -> Val {
         record(
             &x.t,

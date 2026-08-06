@@ -182,10 +182,19 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(swiglu "launch_swiglu_bf16"),
 
     // ── MoE ────────────────────────────────────────────────────────
-    // The router's top-k. The rest of the expert branch (the grouped
-    // GEMM and the two combine forms) joins as `moe_mlp_body_cuda`
-    // states them.
+    // The router's top-k, then the decode GEMV leg's two routed
+    // projections and its combine. The expert axis rides INSIDE the
+    // value on this leg, so the whole branch stays a list of rectangles;
+    // the grouped-GEMM and host-routed legs reach the same numbers by
+    // shapes no `Dim` spells, and are named refusals, not entries.
     kernel!(topk_softmax "launch_topk_softmax_bf16"),
+    kernel!(moe_gate_up_gemv "launch_moe_gate_up_decode_gemv_bf16"),
+    kernel!(moe_down_gemv "launch_moe_down_decode_gemv_bf16"),
+    // The combine folds the residual when the MoE output lands straight
+    // on the stream (tp=1) — one launch where the semantic text has a
+    // WeightedSum and a ResidualAdd.
+    kernel!(moe_weighted_sum "launch_token_batched_weighted_sum_bf16"),
+    kernel!(moe_weighted_sum_add "launch_token_batched_weighted_sum_add_bf16"),
 
     // ── adapters ───────────────────────────────────────────────────
     kernel!(lora_qkv_correction "pie_lora_qkv_correction"),
