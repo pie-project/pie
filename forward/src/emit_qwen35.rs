@@ -122,6 +122,7 @@ pub fn emit_qwen35_cuda_inc(
     out.push_str(&emit_class_fn(
         &decode,
         facts,
+        cuda,
         &format!("generated_qwen35_decode_{tag}"),
         true,
     ));
@@ -129,6 +130,7 @@ pub fn emit_qwen35_cuda_inc(
     out.push_str(&emit_class_fn(
         &prefill,
         facts,
+        cuda,
         &format!("generated_qwen35_prefill_{tag}"),
         false,
     ));
@@ -136,6 +138,7 @@ pub fn emit_qwen35_cuda_inc(
     out.push_str(&emit_class_fn(
         &state_only,
         facts,
+        cuda,
         &format!("generated_qwen35_state_only_{tag}"),
         false,
     ));
@@ -143,6 +146,7 @@ pub fn emit_qwen35_cuda_inc(
     out.push_str(&emit_class_fn(
         &frozen,
         facts,
+        cuda,
         &format!("generated_qwen35_frozen_verify_{tag}"),
         false,
     ));
@@ -150,6 +154,7 @@ pub fn emit_qwen35_cuda_inc(
     out.push_str(&emit_class_fn_commit(
         &commit,
         facts,
+        cuda,
         &format!("generated_qwen35_commit_advance_{tag}"),
     ));
     out
@@ -188,10 +193,11 @@ fn split_layer_weight(name: &str) -> Option<(u32, &str)> {
 fn emit_class_fn(
     plan: &ForwardPlan,
     facts: &Qwen35HybridFacts,
+    cuda: &Qwen35CudaFacts,
     fn_name: &str,
     is_decode: bool,
 ) -> String {
-    emit_class_fn_impl(plan, facts, fn_name, is_decode, false)
+    emit_class_fn_impl(plan, facts, cuda, fn_name, is_decode, false)
 }
 
 /// The commit-advance variant: the signature gains `commit_lens` and the
@@ -200,14 +206,16 @@ fn emit_class_fn(
 fn emit_class_fn_commit(
     plan: &ForwardPlan,
     facts: &Qwen35HybridFacts,
+    cuda: &Qwen35CudaFacts,
     fn_name: &str,
 ) -> String {
-    emit_class_fn_impl(plan, facts, fn_name, false, true)
+    emit_class_fn_impl(plan, facts, cuda, fn_name, false, true)
 }
 
 fn emit_class_fn_impl(
     plan: &ForwardPlan,
     facts: &Qwen35HybridFacts,
+    cuda: &Qwen35CudaFacts,
     fn_name: &str,
     is_decode: bool,
     commit: bool,
@@ -307,6 +315,7 @@ fn emit_class_fn_impl(
         &mut b,
         plan,
         facts,
+        cuda,
         is_decode,
         commit,
         0,
@@ -321,6 +330,7 @@ fn emit_range(
     b: &mut Body,
     plan: &ForwardPlan,
     facts: &Qwen35HybridFacts,
+    cuda: &Qwen35CudaFacts,
     is_decode: bool,
     commit: bool,
     start: usize,
@@ -343,7 +353,7 @@ fn emit_range(
                 b.stmt(&format!("{kw} ({}) {{", cond_of(&arm.pred)));
                 b.indent += 1;
                 emit_range(
-                    b, plan, facts, is_decode, commit,
+                    b, plan, facts, cuda, is_decode, commit,
                     region, region + arm.ops as usize,
                     repeat_next_is_k,
                 );
@@ -353,7 +363,7 @@ fn emit_range(
             b.stmt("} else {");
             b.indent += 1;
             emit_range(
-                b, plan, facts, is_decode, commit,
+                b, plan, facts, cuda, is_decode, commit,
                 region, region + *else_ops as usize,
                 repeat_next_is_k,
             );
@@ -362,7 +372,7 @@ fn emit_range(
             i = region + *else_ops as usize;
             continue;
         }
-        emit_op(b, op, plan, facts, is_decode, commit, repeat_next_is_k);
+        emit_op(b, op, plan, facts, cuda, is_decode, commit, repeat_next_is_k);
         i += 1;
     }
 }
@@ -372,6 +382,7 @@ fn emit_op(
     op: &crate::trace::Op,
     plan: &ForwardPlan,
     facts: &Qwen35HybridFacts,
+    cuda: &Qwen35CudaFacts,
     is_decode: bool,
     commit: bool,
     repeat_next_is_k: &mut bool,
@@ -473,32 +484,34 @@ fn emit_op(
                         b.stmt(&format!("    ws.y.data(), N, H, V_dim, {beta});"));
                     }
                 }
+                // The projection half of the same binding the activation
+                // reads. The trace declares ONE packed matmul either way
+                // — one buffer or two is `lower::Buffers`' question — so
+                // the emitter is where the answer belongs, and the fact
+                // is what it answers from. This used to re-derive
+                // `gate_up_proj_fused != nullptr && !ws.gate_up_fused
+                // .empty()` per layer and branch on it at runtime.
+                "gate_up" if cuda.gate_up_fused => {
+                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("    ws.norm_x.data(),");
+                    b.stmt(&format!(
+                        "    ops::WeightView(*require(w.layers[{layer}].gate_up_proj_fused, \"{weight}\")),"
+                    ));
+                    b.stmt("    ws.gate_up_fused.data(), N, 2 * I, H);");
+                }
                 "gate_up" => {
-                    b.stmt(&format!("const bool gate_up_fused_{layer} ="));
+                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("    ws.norm_x.data(),");
                     b.stmt(&format!(
-                        "    w.layers[{layer}].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();"
+                        "    make_weight_view(require(w.layers[{layer}].gate_proj, \"{weight}\"), w.layers[{layer}].gate_proj_quant),"
                     ));
-                    b.stmt(&format!("if (gate_up_fused_{layer}) {{"));
-                    b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt("        ws.norm_x.data(),");
+                    b.stmt("    ws.gate.data(), N, I, H);");
+                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("    ws.norm_x.data(),");
                     b.stmt(&format!(
-                        "        ops::WeightView(*w.layers[{layer}].gate_up_proj_fused),"
+                        "    make_weight_view(require(w.layers[{layer}].up_proj, \"{weight}\"), w.layers[{layer}].up_proj_quant),"
                     ));
-                    b.stmt("        ws.gate_up_fused.data(), N, 2 * I, H);");
-                    b.stmt("} else {");
-                    b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt("        ws.norm_x.data(),");
-                    b.stmt(&format!(
-                        "        make_weight_view(require(w.layers[{layer}].gate_proj, \"{weight}\"), w.layers[{layer}].gate_proj_quant),"
-                    ));
-                    b.stmt("        ws.gate.data(), N, I, H);");
-                    b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt("        ws.norm_x.data(),");
-                    b.stmt(&format!(
-                        "        make_weight_view(require(w.layers[{layer}].up_proj, \"{weight}\"), w.layers[{layer}].up_proj_quant),"
-                    ));
-                    b.stmt("        ws.up.data(), N, I, H);");
-                    b.stmt("}");
+                    b.stmt("    ws.up.data(), N, I, H);");
                 }
                 "down" => {
                     b.stmt("ops::gemm_act_x_w(cublas.handle(),");
