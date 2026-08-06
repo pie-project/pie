@@ -42,6 +42,13 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
+// Rows the fused CUTLASS MoE workspace is sized for. Gemma-4 routes 8 experts
+// per token against 128 experts, so the runner's permuted-activation buffer is
+// `rows * 8 * hidden` -- a prefill-wide budget would be hundreds of MiB for a
+// path that only pays off at decode-sized batches. Decode batches are bounded
+// by the scheduler's concurrency, which is what this tracks.
+constexpr int kGemma4FusedMoeMaxRows = 512;
+
 
 struct Gemma4ForwardProfile {
     bool enabled = false;
@@ -816,6 +823,27 @@ Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
     ws.b_dn_ptrs    = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
     ws.c_dn_ptrs    = DeviceBuffer<std::uint16_t*>::alloc(top_k);
     ws.batch_weights = DeviceBuffer<float>::alloc(top_k);
+
+    if (ops::flashinfer_cutlass_moe_enabled()) {
+        // Sized for decode rather than for the prefill high-water mark: the
+        // runner's workspace holds the permuted activations, so it scales
+        // with rows * top_k * hidden, and Gemma-4's top_k is 8. A prefill-wide
+        // budget would be hundreds of MiB of arena for a path that only pays
+        // off at decode-sized batches; anything larger falls back to the
+        // host-routed walk.
+        ws.cutlass_max_rows = std::min(max_tokens, kGemma4FusedMoeMaxRows);
+        const std::size_t bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
+            ops::MoeActivation::Geglu, ws.cutlass_max_rows, hidden,
+            moe_intermediate, num_experts, top_k,
+            /*tp_size=*/1, /*tp_rank=*/0);
+        if (bytes > 0) {
+            ws.cutlass_ws = DeviceBuffer<std::uint8_t>::alloc(bytes);
+            ws.cutlass_row_map = DeviceBuffer<std::int32_t>::alloc(
+                static_cast<std::size_t>(ws.cutlass_max_rows) * top_k);
+        } else {
+            ws.cutlass_max_rows = 0;
+        }
+    }
     return ws;
 }
 
@@ -862,6 +890,21 @@ void Gemma4MoeMlpWorkspace::allocate_ple(int max_tokens, int per_layer_total)
         static_cast<std::size_t>(per_layer_total);
     ple_token = DeviceBuffer<std::uint16_t>::alloc(elems);
     ple_proj  = DeviceBuffer<std::uint16_t>::alloc(elems);
+}
+
+bool gemma4_moe_gate_up_swapped() { return true; }
+
+// Force the host-routed per-expert walk even when the fused CUTLASS path is
+// available. The two paths must agree token-for-token on the same weights, and
+// without a switch there is no way to run the comparison: the fused path is
+// selected by batch size, so "same prompt, other kernel" is otherwise
+// unreachable. Mirrors `PIE_QWEN35_MOE_FORCE_GENERAL`.
+bool gemma4_moe_force_general_path() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_GEMMA4_MOE_FORCE_GENERAL");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
 }
 
 Gemma4Weights bind_gemma4(const LoadedModel& engine) {
@@ -1425,25 +1468,20 @@ void gemma4_moe_block(
         N, H, eps, stream);
 
     // ── Expert dispatch ──────────────────────────────────────────
-    // At decode widths the routed GEMMs are M=1 streaming reads with no
-    // weight reuse, so one warp per output row beats both a batched GEMM and
-    // the per-expert loop below -- and, unlike that loop, it never leaves the
-    // device. The host path costs a full `cudaStreamSynchronize` per layer
-    // plus ~6 launches per active expert (30 layers x 8 of 128 experts here),
-    // which is what put this model 3x off the pace at concurrency 1.
+    // Two device-side dispatchers, and the batch width picks between them.
+    // Neither leaves the GPU, which is what keeps this layer capturable; the
+    // host-routed walk below is only for shapes neither covers.
     const int routes = N * K;
-    // `device_dispatch_required` is the caller saying this fire is a pure
-    // decode, which is the only shape the executor captures. The host loop
-    // below cannot run inside a capture (it synchronizes), so on those fires
-    // the GEMV path is not an optimisation but the only legal choice --
-    // hence it wins regardless of width. Off the capture path the width cap
-    // applies: past M=1 the loop's batching earns back what its sync costs.
     const bool gemv_ok =
         Lw.moe_gate_up_proj != nullptr && Lw.moe_down_proj != nullptr &&
-        (device_dispatch_required ||
-         N <= ops::moe_gemv_max_tokens(kGemma4MoeGemvMaxTokens)) &&
         (H % 8) == 0 && (Im % 8) == 0;
-    if (gemv_ok) {
+    // At M=1 the routed GEMMs are streaming reads with no weight reuse, so one
+    // warp per output row beats any batched GEMM -- there is nothing for a
+    // grouped GEMM's tiling to amortise. `kGemma4MoeGemvMaxTokens` is where
+    // that stops being true.
+    const bool gemv_preferred =
+        gemv_ok && N <= ops::moe_gemv_max_tokens(kGemma4MoeGemvMaxTokens);
+    const auto dispatch_gemv = [&]() {
         kernels::launch_moe_gate_up_decode_gemv_bf16(
             moe_ws.topk_idx.data(),
             moe_ws.moe_input.data(),
@@ -1467,7 +1505,54 @@ void gemma4_moe_block(
             moe_ws.expert_out.data(),
             moe_ws.topk_weights.data(),
             N, K, H, stream);
+    };
+    if (gemv_preferred) {
+        dispatch_gemv();
         return;
+    }
+
+    // Past that width the weights are read once and used many times, so one
+    // CUTLASS grouped GEMM over every (token, expert) route wins -- still
+    // driven entirely from device memory, so still capturable. The runner
+    // declines only on a null pointer or a workspace too small for `num_rows`,
+    // both decided here, so a decline lands on the GEMV below rather than on
+    // the host walk -- which is what keeps a captured fire legal.
+    if (!moe_ws.cutlass_ws.empty() && !gemma4_moe_force_general_path() &&
+        N > 0 && N <= moe_ws.cutlass_max_rows &&
+        ops::flashinfer_cutlass_moe_bf16(
+            ops::MoeActivation::Geglu,
+            static_cast<const std::uint16_t*>(moe_ws.moe_input.data()),
+            moe_ws.topk_idx.data(),
+            moe_ws.topk_weights.data(),
+            static_cast<const std::uint16_t*>(Lw.moe_gate_up_proj->data()),
+            static_cast<const std::uint16_t*>(Lw.moe_down_proj->data()),
+            static_cast<std::uint16_t*>(moe_ws.moe_out.data()),
+            moe_ws.cutlass_ws.data(),
+            moe_ws.cutlass_ws.size(),
+            moe_ws.cutlass_row_map.data(),
+            N, H, Im, E, K,
+            /*tp_size=*/1, /*tp_rank=*/0, stream)) {
+        return;
+    }
+
+    // `device_dispatch_required` is the caller saying this fire is a pure
+    // decode, the only shape the executor captures. The host loop below
+    // synchronizes and so cannot run inside a capture; on those fires the GEMV
+    // is not an optimisation but the only legal choice, whatever the width.
+    if (device_dispatch_required) {
+        if (gemv_ok) {
+            dispatch_gemv();
+            return;
+        }
+        // Falling through would put a `cudaStreamSynchronize` inside a stream
+        // capture, which CUDA rejects with "operation not permitted when
+        // stream is capturing" (900) -- an error naming the sync, not the
+        // shape that made it unavoidable. Say which requirement failed.
+        throw std::runtime_error(
+            "gemma4: MoE decode needs a device-side dispatcher inside a graph "
+            "capture, but neither is available (fused grouped GEMM declined "
+            "and the decode GEMV requires fused gate/up + down weights with "
+            "hidden_size and intermediate_size both divisible by 8)");
     }
 
     // D2H sync the routing decisions for the prefill / multi-token
@@ -1524,7 +1609,7 @@ void gemma4_moe_block(
         kernels::launch_chunked_geglu_tanh_bf16(
             moe_ws.expert_gate_up.data(),
             moe_ws.expert_act.data(),
-            Ne, Im, stream);
+            Ne, Im, stream, /*gate_second=*/gemma4_moe_gate_up_swapped());
 
         const auto* down_w = static_cast<const std::uint16_t*>(
                                  Lw.moe_down_proj->data())

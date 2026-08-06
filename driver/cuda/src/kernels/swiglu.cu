@@ -122,6 +122,51 @@ void launch_swiglu_bf16(
         num_elements);
 }
 
+namespace {
+
+// Strided form of `gpt_oss_glu_bf16_kernel`. Marlin writes gate/up at the
+// PADDED intermediate width because the packed expert weights are aligned to
+// 128, while the activation the down projection consumes is the unpadded one,
+// so this reads at one stride and writes at another instead of forcing a
+// separate compaction pass.
+__global__ void gpt_oss_glu_strided_bf16_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ y,
+    int rows, int cols, int in_stride, int out_stride, float limit, float alpha)
+{
+    const int row = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || col >= cols) return;
+    const long long i = static_cast<long long>(row) * in_stride + col;
+    float g = __bfloat162float(gate[i]);
+    float u = __bfloat162float(up[i]);
+    if (limit > 0.f) {
+        g = fminf(g, limit);
+        u = fmaxf(fminf(u, limit), -limit);
+    }
+    const float glu = g / (1.f + __expf(-alpha * g));
+    y[static_cast<long long>(row) * out_stride + col] =
+        __float2bfloat16((u + 1.f) * glu);
+}
+
+}  // namespace
+
+void launch_gpt_oss_glu_strided_bf16(
+    const void* gate, const void* up, void* y,
+    int rows, int cols, int in_stride, int out_stride, cudaStream_t stream,
+    float limit, float alpha)
+{
+    if (rows <= 0 || cols <= 0) return;
+    constexpr int BLOCK = 256;
+    dim3 grid((cols + BLOCK - 1) / BLOCK, rows);
+    gpt_oss_glu_strided_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const __nv_bfloat16*>(up),
+        static_cast<__nv_bfloat16*>(y),
+        rows, cols, in_stride, out_stride, limit, alpha);
+}
+
 void launch_gpt_oss_glu_bf16(
     const void* gate, const void* up, void* y,
     int num_elements, cudaStream_t stream,
@@ -407,6 +452,7 @@ namespace {
 // GELU-tanh activation that Gemma-4 uses on both its dense MLP and
 // (for 26B-A4B) its routed-expert block. `gelu_tanh(x) = 0.5 * x *
 // (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))`.
+template <bool GateSecond>
 __global__ void chunked_geglu_tanh_bf16_kernel(
     const __nv_bfloat16* __restrict__ packed,
     __nv_bfloat16*       __restrict__ y,
@@ -415,8 +461,9 @@ __global__ void chunked_geglu_tanh_bf16_kernel(
     const int n = blockIdx.x;
     const int i = blockIdx.y * blockDim.x + threadIdx.x;
     if (n >= N || i >= I) return;
-    const float g = __bfloat162float(packed[(long long)n * 2 * I + i]);
-    const float u = __bfloat162float(packed[(long long)n * 2 * I + I + i]);
+    const long long packed_row = static_cast<long long>(n) * 2 * I;
+    const float g = __bfloat162float(packed[packed_row + (GateSecond ? I + i : i)]);
+    const float u = __bfloat162float(packed[packed_row + (GateSecond ? i : I + i)]);
     constexpr float kAlpha = 0.7978845608028654f;  // sqrt(2/π)
     constexpr float kBeta  = 0.044715f;
     const float inner = kAlpha * (g + kBeta * g * g * g);
@@ -427,15 +474,19 @@ __global__ void chunked_geglu_tanh_bf16_kernel(
 }  // namespace
 
 void launch_chunked_geglu_tanh_bf16(
-    const void* packed, void* y, int N, int I, cudaStream_t stream)
+    const void* packed, void* y, int N, int I, cudaStream_t stream,
+    bool gate_second)
 {
     if (N <= 0 || I <= 0) return;
     constexpr int BLOCK = 128;
     dim3 grid(N, (I + BLOCK - 1) / BLOCK);
-    chunked_geglu_tanh_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(packed),
-        static_cast<__nv_bfloat16*>(y),
-        N, I);
+    const auto* p = static_cast<const __nv_bfloat16*>(packed);
+    auto* yp = static_cast<__nv_bfloat16*>(y);
+    if (gate_second) {
+        chunked_geglu_tanh_bf16_kernel<true><<<grid, BLOCK, 0, stream>>>(p, yp, N, I);
+    } else {
+        chunked_geglu_tanh_bf16_kernel<false><<<grid, BLOCK, 0, stream>>>(p, yp, N, I);
+    }
 }
 
 namespace {

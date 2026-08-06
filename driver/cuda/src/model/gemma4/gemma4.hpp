@@ -224,6 +224,14 @@ struct Gemma4MoeMlpWorkspace {
     DeviceBuffer<std::uint16_t*>       c_dn_ptrs;
     DeviceBuffer<float>                batch_weights;
 
+    // FlashInfer CUTLASS grouped-MoE runner state. When `cutlass_ws` is
+    // allocated and the batch fits `cutlass_max_rows`, the routed experts run
+    // as one fused device-side call instead of the host-routed per-expert
+    // walk -- which is also what makes the layer graph-capturable.
+    DeviceBuffer<std::uint8_t>  cutlass_ws;       // opaque runner workspace
+    DeviceBuffer<std::int32_t>  cutlass_row_map;  // [rows*K] i32
+    int cutlass_max_rows = 0;                     // rows the ws is sized for
+
     static Gemma4MoeMlpWorkspace allocate(
         int max_tokens, int hidden, int num_experts, int top_k,
         int moe_intermediate);
@@ -253,6 +261,21 @@ struct Gemma4ForwardCfg {
 // dimensions + KV-source mapping from `HfConfig::layer_types` and
 // `num_kv_shared_layers`. Throws on missing tensors.
 Gemma4Weights bind_gemma4(const LoadedModel& engine);
+
+/// Whether the routed experts' fused `gate_up` tensor is stacked `[up|gate]`
+/// rather than the checkpoint's `[gate|up]`.
+///
+/// flashinfer's CUTLASS grouped MoE reads fc1's output as `[linear|gate]`, so
+/// the fused decode path needs the swapped order. The Rust contract
+/// (`model/gemma_4/src/contract.rs`, `fused_moe_gate_up_tp_slices`) publishes
+/// in whichever order this returns, and the two constants have to agree --
+/// flipping one alone silently swaps gate and up inside every expert.
+bool gemma4_moe_gate_up_swapped();
+
+/// Force the host-routed per-expert MoE walk (`PIE_GEMMA4_MOE_FORCE_GENERAL`).
+/// The comparison switch for the fused CUTLASS path: same weights, other
+/// kernel.
+bool gemma4_moe_force_general_path();
 
 // ── Gemma-4 vision tower (`gemma4_vision`) ──────────────────────────────────
 // A Gemma-style ViT (sandwich RMSNorms, encoder RoPE, gated gelu-tanh MLP),
