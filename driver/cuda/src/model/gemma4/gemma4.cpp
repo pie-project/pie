@@ -36,6 +36,7 @@
 #include "kernels/swiglu.hpp"
 #include "kernels/topk_softmax.hpp"
 #include "ops/attention_naive_paged.hpp"
+#include "ops/flashinfer_moe.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -210,6 +211,12 @@ constexpr const char* kPrefix = "model.language_model.";
 // slower and follows a different multi-token numerical path anyway.
 constexpr int kGemma4RowDecodeQmax = 4;
 constexpr std::size_t kGemma4RowDecodeMaxPageRefs = std::size_t{1} << 20;
+
+// Widths at which the routed experts stay on the one-warp-per-row GEMV rather
+// than the host-dispatched per-expert loop. Same value the other sparse-MoE
+// families use: at M=1 there is no weight reuse to amortise a tiled GEMM over,
+// and past that the loop's batching wins back what its sync costs.
+constexpr int kGemma4MoeGemvMaxTokens = 1;
 
 bool gemma4_dense_gate_up_fused_enabled(const HfConfig& cfg) {
     return !cfg.gemma4_enable_moe &&
@@ -1142,6 +1149,7 @@ void gemma4_moe_block(
     Workspace& ws,
     Gemma4MoeMlpWorkspace& moe_ws,
     int N,
+    bool device_dispatch_required,
     ops::CublasHandle& cublas, cudaStream_t stream)
 {
     const int H  = cfg.hidden_size;
@@ -1180,10 +1188,57 @@ void gemma4_moe_block(
         ws.y.data(), Lw.moe_norm_pre->data(), moe_ws.moe_input.data(),
         N, H, eps, stream);
 
+    // ── Expert dispatch ──────────────────────────────────────────
+    // At decode widths the routed GEMMs are M=1 streaming reads with no
+    // weight reuse, so one warp per output row beats both a batched GEMM and
+    // the per-expert loop below -- and, unlike that loop, it never leaves the
+    // device. The host path costs a full `cudaStreamSynchronize` per layer
+    // plus ~6 launches per active expert (30 layers x 8 of 128 experts here),
+    // which is what put this model 3x off the pace at concurrency 1.
+    const int routes = N * K;
+    // `device_dispatch_required` is the caller saying this fire is a pure
+    // decode, which is the only shape the executor captures. The host loop
+    // below cannot run inside a capture (it synchronizes), so on those fires
+    // the GEMV path is not an optimisation but the only legal choice --
+    // hence it wins regardless of width. Off the capture path the width cap
+    // applies: past M=1 the loop's batching earns back what its sync costs.
+    const bool gemv_ok =
+        Lw.moe_gate_up_proj != nullptr && Lw.moe_down_proj != nullptr &&
+        (device_dispatch_required ||
+         N <= ops::moe_gemv_max_tokens(kGemma4MoeGemvMaxTokens)) &&
+        (H % 8) == 0 && (Im % 8) == 0;
+    if (gemv_ok) {
+        kernels::launch_moe_gate_up_decode_gemv_bf16(
+            moe_ws.topk_idx.data(),
+            moe_ws.moe_input.data(),
+            Lw.moe_gate_up_proj->data(),
+            moe_ws.expert_gate_up.data(),
+            N, K, H, Im, stream);
+        kernels::launch_chunked_geglu_tanh_bf16(
+            moe_ws.expert_gate_up.data(),
+            moe_ws.expert_act.data(),
+            routes, Im, stream);
+        kernels::launch_moe_down_decode_gemv_bf16(
+            moe_ws.topk_idx.data(),
+            moe_ws.expert_act.data(),
+            Lw.moe_down_proj->data(),
+            moe_ws.expert_out.data(),
+            N, K, H, Im, stream);
+        // Writes (does not accumulate) the top-k weighted sum, so `moe_out`
+        // needs no zeroing on this path.
+        kernels::launch_token_batched_weighted_sum_bf16(
+            moe_ws.moe_out.data(),
+            moe_ws.expert_out.data(),
+            moe_ws.topk_weights.data(),
+            N, K, H, stream);
+        return;
+    }
+
     // D2H sync the routing decisions for the prefill / multi-token
-    // dispatch loop. The dense Gemma-4 forward is non-graph-capturable
-    // (per-layer head_dim, attention_factor lookups all run host code),
-    // so an extra sync here is in the noise.
+    // dispatch loop. Prefill is not captured and already pays a host
+    // round-trip for its plan, so the extra sync here is in the noise --
+    // but it is why `Gemma4Model` refuses graph capture whenever this
+    // block can be reached.
     std::vector<std::int32_t> topk_idx_h((std::size_t)N * K);
     std::vector<float>        topk_w_h((std::size_t)N * K);
     CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), moe_ws.topk_idx.data(),
@@ -1909,7 +1964,8 @@ void gemma4_forward_paged(
                 ws.norm_x.data(), layer.mlp_norm_post_dense->data(),
                 ws.norm_y.data(), N, H, eps, stream);
             // experts → moe_ws.moe_out (raw, no post-norm).
-            gemma4_moe_block(layer, cfg, ws, moe_ws, N, cublas, stream);
+            gemma4_moe_block(layer, cfg, ws, moe_ws, N, is_pure_decode,
+                             cublas, stream);
             // branch_2 = post_feedforward_layernorm_2(moe_out) → norm_x
             // (norm_x's prior contents — dense_out — are no longer
             // needed).
