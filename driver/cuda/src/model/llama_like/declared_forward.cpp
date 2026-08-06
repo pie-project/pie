@@ -1092,47 +1092,32 @@ void llama_like_forward_declared(
     const bool shadow = shadow_enabled();
     if (shadow) shadow_ops.reserve(op_count);
 
-    for (std::size_t i = 0; i < op_count; ++i) {
-        for (;;) {
-            if (!guard_skips.empty() && i == guard_skips.back().first) {
-                i += guard_skips.back().second;
-                guard_skips.pop_back();
-                continue;
-            }
-            if (!win_events.empty() && i == win_events.back().at) {
-                win_start = win_events.back().start;
-                win_len = win_events.back().len;
-                win_region = win_events.back().region;
-                win_events.pop_back();
-                continue;
-            }
-            if (!mask_events.empty() && i == mask_events.back().at) {
-                mask_region = mask_events.back().region;
-                mask_events.pop_back();
-                continue;
-            }
-            break;
-        }
-        if (i >= op_count) break;
-        const PieForwardOp& op = plan.op(i);
-        values.begin_op(i);
-        // STRUCTURAL S-4: the depth window, per op, keyed on the op's
-        // OWN layer tag (the declaration's stated axis — the trace is
-        // layer-unrolled while k is a runtime input, so the window is a
-        // per-op rebind, not a region op). Uniform truncated fire:
-        // tail-layer ops are SKIPPED (the unchanged epilogue, layer -1,
-        // is the logit-lens head). Union fire: tail-layer ops run over
-        // the full-depth prefix rows.
-        // The window is `model/declared/depth_window.hpp`'s — it reads the
-        // op's STATED role and the prepare's bands, so it is the same
-        // component for every family (this one carried it because the
-        // depth axis landed here first).
-        if (!depth.enter(op)) continue;
-        if (shadow) shadow_ops.push_back(static_cast<std::uint32_t>(i));
-        N = depth.n();
-        R = depth.r();
-        depth_band_index = depth.band_index();
-        depth_tail_active = depth.tail_active();
+    // ── THE ARMS, as a function of one RECTANGLE ───────────────────
+    //
+    // `.wiki/tart/dsl.md` "The cutover, sized", step 1. Everything that
+    // LAUNCHES lives here; everything that TRAVERSES — the guard chain,
+    // the row peels, the observation sites — stays in the walk below.
+    // That is the same line `lower::Semantic::Structural` draws, and
+    // drawing it in both places is what lets the second form drive
+    // these arms without them noticing.
+    //
+    // The parameters are exactly what an arm reads about WHERE it is,
+    // counted off the body before the split: a row count (N, R), a row
+    // window (win_start, win_len), which side of the mask split, and
+    // which prepared plan (the band words). They SHADOW the walk's
+    // locals of the same names, so no arm body changed — which is the
+    // argument that this refactor cannot alter a launch.
+    //
+    // A `Launch{rows, layers, peel}` rectangle carries every one of
+    // them, which is what step 2 will pass instead of the walk's state.
+    const auto execute_op = [&](const PieForwardOp& op,
+                                int N,
+                                int R,
+                                int win_start,
+                                int win_len,
+                                MaskRegion mask_region,
+                                int depth_band_index,
+                                bool depth_tail_active) {
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
@@ -2104,6 +2089,119 @@ void llama_like_forward_declared(
             }
             break;
         }
+        case PieForwardOpKind::Swiglu: {
+            // RUNG 5, again: the choice-deriving code is deleted. Every
+            // lowered trace states its activation kernel (the gate_up
+            // binding is a load-time fact), so the semantic kind reaching
+            // this walk means the trace and the executor drifted — the
+            // same refusal `Attention` and `KvAppend` make.
+            throw std::runtime_error(
+                "declared forward: semantic Swiglu in a class trace "
+                "(the declaration states the activation kernel)");
+        }
+        case PieForwardOpKind::ResidualAdd: {
+            // The post-norm landing: `y += norm_y` — the sub-layer's
+            // normed output (Rmsnorm above wrote norm_y) accumulated onto
+            // the residual stream by its own launch, exactly the
+            // hand-written `launch_residual_add_bf16` calls after the
+            // attn_norm and mlp_norm blocks.
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, stream);
+            break;
+        }
+        case PieForwardOpKind::LmHead: {
+            if (!fwd_cfg.emit_logits) break;
+            const std::string_view name = plan.weight_name(op);
+            // Tied embeddings trace the lm head as "embed"; either way the
+            // binding already aliased `w.lm_head` accordingly.
+            const DeviceTensor* lm_head =
+                name == "embed" ? &wb.require(name)
+                : name == "lm_head" ? &wb.require(name)
+                : nullptr;
+            if (lm_head == nullptr) throw_unknown_weight(name);
+            // The hand-written epilogue, copied whole (T==1, no fused-AR
+            // final norm on this path): compact-logit fires gather the
+            // sampled rows first, then final-norm just those; full emits
+            // recompute the final norm from `ws.y` for the reason
+            // llama_like.cpp's comment gives (§6.2 staleness).
+            const bool compact_logits =
+                logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+                num_logit_rows < N;
+            const void* lm_head_input = nullptr;
+            int lm_head_rows = N;
+            if (compact_logits) {
+                kernels::launch_gather_bf16_rows(
+                    static_cast<const std::uint16_t*>(ws.y.data()),
+                    logit_row_indices_d,
+                    static_cast<std::uint16_t*>(ws.norm_x.data()),
+                    num_logit_rows, H, stream);
+                kernels::launch_rmsnorm_bf16(
+                    ws.norm_x.data(), w.final_norm->data(),
+                    ws.norm_y.data(), num_logit_rows, H, eps, stream);
+                lm_head_input = ws.norm_y.data();
+                lm_head_rows = num_logit_rows;
+            } else {
+                kernels::launch_rmsnorm_bf16(
+                    ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
+                    N, H, eps, stream);
+                lm_head_input = ws.norm_y.data();
+            }
+            ops::gemm_act_x_w(cublas.handle(),
+                lm_head_input, ops::WeightView(*lm_head),
+                ws.logits.data(), lm_head_rows, V, H);
+            break;
+        }
+        default:
+            throw std::runtime_error(
+                "declared forward: op kind " +
+                std::to_string(static_cast<std::uint32_t>(op.kind)) +
+                " has no emission rule");
+        }
+    };
+
+    for (std::size_t i = 0; i < op_count; ++i) {
+        for (;;) {
+            if (!guard_skips.empty() && i == guard_skips.back().first) {
+                i += guard_skips.back().second;
+                guard_skips.pop_back();
+                continue;
+            }
+            if (!win_events.empty() && i == win_events.back().at) {
+                win_start = win_events.back().start;
+                win_len = win_events.back().len;
+                win_region = win_events.back().region;
+                win_events.pop_back();
+                continue;
+            }
+            if (!mask_events.empty() && i == mask_events.back().at) {
+                mask_region = mask_events.back().region;
+                mask_events.pop_back();
+                continue;
+            }
+            break;
+        }
+        if (i >= op_count) break;
+        const PieForwardOp& op = plan.op(i);
+        values.begin_op(i);
+        // STRUCTURAL S-4: the depth window, per op, keyed on the op's
+        // OWN layer tag (the declaration's stated axis — the trace is
+        // layer-unrolled while k is a runtime input, so the window is a
+        // per-op rebind, not a region op). Uniform truncated fire:
+        // tail-layer ops are SKIPPED (the unchanged epilogue, layer -1,
+        // is the logit-lens head). Union fire: tail-layer ops run over
+        // the full-depth prefix rows.
+        // The window is `model/declared/depth_window.hpp`'s — it reads the
+        // op's STATED role and the prepare's bands, so it is the same
+        // component for every family (this one carried it because the
+        // depth axis landed here first).
+        if (!depth.enter(op)) continue;
+        if (shadow) shadow_ops.push_back(static_cast<std::uint32_t>(i));
+        N = depth.n();
+        R = depth.r();
+        depth_band_index = depth.band_index();
+        depth_tail_active = depth.tail_active();
+        switch (op.kind) {
         case PieForwardOpKind::Peel: {
             // A3: both regions run, over complementary row ranges —
             // prefix `[0, fast_rows)`, tail `[fast_rows, N)`. An empty
@@ -2323,74 +2421,11 @@ void llama_like_forward_declared(
             i = chosen_start - 1;  // the loop's ++i lands on the region
             break;
         }
-        case PieForwardOpKind::Swiglu: {
-            // RUNG 5, again: the choice-deriving code is deleted. Every
-            // lowered trace states its activation kernel (the gate_up
-            // binding is a load-time fact), so the semantic kind reaching
-            // this walk means the trace and the executor drifted — the
-            // same refusal `Attention` and `KvAppend` make.
-            throw std::runtime_error(
-                "declared forward: semantic Swiglu in a class trace "
-                "(the declaration states the activation kernel)");
-        }
-        case PieForwardOpKind::ResidualAdd: {
-            // The post-norm landing: `y += norm_y` — the sub-layer's
-            // normed output (Rmsnorm above wrote norm_y) accumulated onto
-            // the residual stream by its own launch, exactly the
-            // hand-written `launch_residual_add_bf16` calls after the
-            // attn_norm and mlp_norm blocks.
-            kernels::launch_residual_add_bf16(
-                ws.y.data(), ws.norm_y.data(),
-                static_cast<std::size_t>(N) * H, stream);
-            break;
-        }
-        case PieForwardOpKind::LmHead: {
-            if (!fwd_cfg.emit_logits) break;
-            const std::string_view name = plan.weight_name(op);
-            // Tied embeddings trace the lm head as "embed"; either way the
-            // binding already aliased `w.lm_head` accordingly.
-            const DeviceTensor* lm_head =
-                name == "embed" ? &wb.require(name)
-                : name == "lm_head" ? &wb.require(name)
-                : nullptr;
-            if (lm_head == nullptr) throw_unknown_weight(name);
-            // The hand-written epilogue, copied whole (T==1, no fused-AR
-            // final norm on this path): compact-logit fires gather the
-            // sampled rows first, then final-norm just those; full emits
-            // recompute the final norm from `ws.y` for the reason
-            // llama_like.cpp's comment gives (§6.2 staleness).
-            const bool compact_logits =
-                logit_row_indices_d != nullptr && num_logit_rows > 0 &&
-                num_logit_rows < N;
-            const void* lm_head_input = nullptr;
-            int lm_head_rows = N;
-            if (compact_logits) {
-                kernels::launch_gather_bf16_rows(
-                    static_cast<const std::uint16_t*>(ws.y.data()),
-                    logit_row_indices_d,
-                    static_cast<std::uint16_t*>(ws.norm_x.data()),
-                    num_logit_rows, H, stream);
-                kernels::launch_rmsnorm_bf16(
-                    ws.norm_x.data(), w.final_norm->data(),
-                    ws.norm_y.data(), num_logit_rows, H, eps, stream);
-                lm_head_input = ws.norm_y.data();
-                lm_head_rows = num_logit_rows;
-            } else {
-                kernels::launch_rmsnorm_bf16(
-                    ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
-                    N, H, eps, stream);
-                lm_head_input = ws.norm_y.data();
-            }
-            ops::gemm_act_x_w(cublas.handle(),
-                lm_head_input, ops::WeightView(*lm_head),
-                ws.logits.data(), lm_head_rows, V, H);
-            break;
-        }
         default:
-            throw std::runtime_error(
-                "declared forward: op kind " +
-                std::to_string(static_cast<std::uint32_t>(op.kind)) +
-                " has no emission rule");
+            // Not a traversal statement, so it is one the arms serve.
+            execute_op(op, N, R, win_start, win_len, mask_region,
+                       depth_band_index, depth_tail_active);
+            break;
         }
     }
     if (shadow) {
