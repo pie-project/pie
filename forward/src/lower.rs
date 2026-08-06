@@ -118,6 +118,27 @@ pub enum Uncovered {
     UnknownBackend(String),
 }
 
+/// A statement the flat list does not carry yet: it runs on the device,
+/// but which kernel it runs is not derivable from the trace.
+///
+/// This is the honest name for what used to be a silent `_ => i += 1`. A
+/// launch list that omits an executed statement is worse than one that
+/// refuses, because the omission reads as coverage — so every kind is
+/// either a rectangle, structural, or listed here.
+///
+/// It is NOT an [`Uncovered`]: that answers "this group cannot be
+/// served" and goes to admission, while this answers "this trace is not
+/// finished migrating" and goes to whoever is finishing it. The cutover
+/// gate is [`Lowered::residue`] being empty, and until it is, the list
+/// says exactly which statements still owe a declaration and what they
+/// would have to say. `why` is that sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unlowered {
+    pub at_op: usize,
+    pub kind: &'static str,
+    pub why: &'static str,
+}
+
 /// What a lowering produced.
 #[derive(Debug, Clone)]
 pub struct Lowered {
@@ -130,6 +151,25 @@ pub struct Lowered {
     pub rectangles: usize,
     /// Peak activation bytes the frame needs ([`Buffers`]).
     pub arena_bytes: usize,
+    /// Statements that still run on the device without a rectangle —
+    /// see [`Unlowered`]. Empty is the cutover gate: only then is
+    /// `launches` the WHOLE of what a fire executes, and only then can
+    /// the driver stop walking.
+    pub residue: Vec<Unlowered>,
+}
+
+impl Lowered {
+    /// The fraction of executed statements the flat list carries. What
+    /// the cutover is measured against; `1.0` is the gate.
+    pub fn coverage(&self) -> f64 {
+        let covered = self.launches.len();
+        let total = covered + self.residue.len();
+        if total == 0 {
+            1.0
+        } else {
+            covered as f64 / total as f64
+        }
+    }
 }
 
 /// Lower `plan` over `rows`, in the order the engine seriated them.
@@ -143,6 +183,8 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row]) -> Result<Lowered, Uncovered> {
         launches: Vec::new(),
         kernels: Vec::new(),
         kernel_ids: BTreeMap::new(),
+        peel_tail: false,
+        residue: Vec::new(),
     };
     out.region(0..plan.ops.len(), 0..n)?;
     let buffers = Buffers::assign(plan, rows);
@@ -151,6 +193,7 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row]) -> Result<Lowered, Uncovered> {
         launches: out.launches,
         kernels: out.kernels,
         arena_bytes: buffers.bytes,
+        residue: out.residue,
     })
 }
 
@@ -161,6 +204,12 @@ struct Lowerer<'a> {
     launches: Vec<Launch>,
     kernels: Vec<String>,
     kernel_ids: BTreeMap<String, u16>,
+    /// Inside a peel's TAIL region, where the rows a statement serves sit
+    /// at absolute offsets in a full-N buffer. Two llama_like statements
+    /// take a different kernel there (`_devwin`), which is the region
+    /// asking, not the driver choosing — so the lowering knows it.
+    peel_tail: bool,
+    residue: Vec<Unlowered>,
 }
 
 impl Lowerer<'_> {
@@ -211,7 +260,10 @@ impl Lowerer<'_> {
                     }
                     let next = t.end;
                     if !tail.is_empty() {
-                        self.region(t, tail)?;
+                        let outer = std::mem::replace(&mut self.peel_tail, true);
+                        let r = self.region(t, tail);
+                        self.peel_tail = outer;
+                        r?;
                     }
                     i = next;
                 }
@@ -220,11 +272,28 @@ impl Lowerer<'_> {
                     self.emit(i, kernel, op, &live)?;
                     i += 1;
                 }
-                // A semantic op is a statement the backend has not
-                // lowered. It has no kernel to launch, so it produces no
-                // rectangle; a trace that is meant to execute states
-                // kernels (that is what `lower`'s backend is FOR).
-                _ => i += 1,
+                // Everything else is a SEMANTIC statement, and it still
+                // runs on the device. The flat list is the whole of what
+                // the driver launches or it is not a replacement for the
+                // walk, so each kind either names its kernels, declares
+                // itself structural, or refuses — never falls through.
+                kind => {
+                    match semantic(kind, self.peel_tail) {
+                        Semantic::Structural => {}
+                        Semantic::Kernels(symbols) => {
+                            let live = self.depth_window(op, &window, i)?;
+                            for symbol in symbols {
+                                self.emit(i, symbol, op, &live)?;
+                            }
+                        }
+                        Semantic::Unlowered(why) => self.residue.push(Unlowered {
+                            at_op: i,
+                            kind: kind_name(kind),
+                            why,
+                        }),
+                    }
+                    i += 1;
+                }
             }
         }
         Ok(())
@@ -377,6 +446,151 @@ impl Lowerer<'_> {
             return Err(Uncovered::Discontiguous { at_op: at, axis: name });
         }
         Ok(if tail.is_empty() { window.end } else { tail.start })
+    }
+}
+
+// ── The semantic statements ────────────────────────────────────────────
+
+/// What a statement that does NOT state its kernel lowers to.
+enum Semantic {
+    /// Launches nothing from the kernel table: a structural marker.
+    Structural,
+    /// The kernels it launches, in order. Usually one — the kinds whose
+    /// own doc comments say "one op because it is one launch".
+    Kernels(&'static [&'static str]),
+    /// It runs on the device, but the trace does not say what it runs.
+    /// The payload is what the trace would have to state.
+    Unlowered(&'static str),
+}
+
+/// The kernels a semantic statement launches, read off the executor that
+/// launches them today (`driver/cuda/src/model/llama_like/
+/// declared_forward.cpp`), not guessed.
+///
+/// Most of these arms are the ones the doc's Amendment A diagnosed: they
+/// branch, but on which BUFFER (`ws.norm_x` vs `ws.y` vs the value slot),
+/// never on which kernel. Strip the buffer question — [`Buffers`] owns it
+/// — and what is left is 1:1, which is why the flat list can carry them.
+///
+/// Where an arm genuinely picks a kernel, the pick is either a REGION
+/// question the lowering already knows (`peel_tail`) or a fact the trace
+/// does not carry, and the second is [`Semantic::Unlowered`] rather than
+/// a guess.
+fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
+    use OpKind::*;
+    match kind {
+        // The sites are argument no-ops with nothing attached, and with
+        // programs attached what they run is guest sideband plus the
+        // bracket machinery (page-view reset, score staging) — never a
+        // table kernel. Stating that bracket is what `seam!` is for.
+        HookSite { .. } => Semantic::Structural,
+
+        Embed { .. } => Semantic::Kernels(&["launch_embed_bf16"]),
+        AddBias { .. } => Semantic::Kernels(&["launch_add_bias_bf16"]),
+        ResidualAdd => Semantic::Kernels(&["launch_residual_add_bf16"]),
+
+        // Gemma folds `(1 + w)` — different arithmetic, a different
+        // kernel, and this executor refuses it outright.
+        Rmsnorm { variant, .. } | RmsnormPerHead { variant, .. } => {
+            if variant.is_plain() {
+                Semantic::Kernels(&["launch_rmsnorm_bf16"])
+            } else {
+                Semantic::Unlowered("only the Plain rmsnorm variant is emitted")
+            }
+        }
+
+        // Inside a peel's tail the split serves absolute row offsets in a
+        // full-N buffer, which is a different kernel — and the REGION is
+        // what asks for it, so the lowering states it rather than the
+        // driver deriving it from a window pointer.
+        SplitQkv { .. } => Semantic::Kernels(if peel_tail {
+            &["launch_split_qkv_bf16_devwin"]
+        } else {
+            &["launch_split_qkv_bf16"]
+        }),
+
+        Rope { kind, partial } => {
+            if partial.is_some() {
+                Semantic::Unlowered("partial rope is a different kernel")
+            } else if matches!(kind, crate::trace::RopeKind::Standard) {
+                Semantic::Kernels(&["launch_rope_bf16"])
+            } else {
+                Semantic::Unlowered("only standard rope is emitted")
+            }
+        }
+
+        // A selector makes the weight per-token, and grouped GEMM is that
+        // op's lowering — a different call with a different argument
+        // shape, chosen per fire.
+        Matmul { selector, .. } => {
+            if selector.is_none() {
+                Semantic::Kernels(&["gemm_act_x_w"])
+            } else {
+                Semantic::Unlowered("a selector lowers to grouped GEMM, which the trace does not state")
+            }
+        }
+
+        // Both of these THROW when a class trace reaches this executor
+        // with them — a lowered trace states its KV write and its
+        // attention as stated-kernel launches. So they cannot appear, and
+        // if they do the honest answer is the same refusal.
+        KvAppend { .. } => {
+            Semantic::Unlowered("a lowered trace states the KV write as a launch")
+        }
+        Attention { .. } => {
+            Semantic::Unlowered("a lowered trace states its attention kernel as a launch")
+        }
+
+        // The packed-bank form when the checkpoint materialised a fused
+        // gate_up. That is a BINDING fact, which the taxonomy puts in the
+        // facts and erases at trace time — but no fact carries it today,
+        // so the executor reads the workspace and picks. The trace has to
+        // state it before this statement can be a rectangle.
+        Swiglu { .. } => {
+            Semantic::Unlowered("the fused-gate_up binding fact is not in the facts")
+        }
+
+        // Three launches, and which three depends on whether the fire
+        // gathers a compact logit set — a ROW WINDOW, which is precisely
+        // what `Launch::rows` expresses. It lowers once the trace says so.
+        LmHead { .. } => {
+            Semantic::Unlowered("the compact-logit gather is an unstated row window")
+        }
+
+        _ => Semantic::Unlowered("no lowering rule for this kind"),
+    }
+}
+
+/// The kind's name, for a refusal a human reads.
+fn kind_name(kind: &OpKind) -> &'static str {
+    use OpKind::*;
+    match kind {
+        Embed { .. } => "Embed",
+        Matmul { .. } => "Matmul",
+        Rmsnorm { .. } => "Rmsnorm",
+        AddBias { .. } => "AddBias",
+        RmsnormPerHead { .. } => "RmsnormPerHead",
+        SplitQkv { .. } => "SplitQkv",
+        Rope { .. } => "Rope",
+        KvAppend { .. } => "KvAppend",
+        Attention { .. } => "Attention",
+        Swiglu { .. } => "Swiglu",
+        LmHead { .. } => "LmHead",
+        ResidualAdd => "ResidualAdd",
+        TopK { .. } => "TopK",
+        WeightedSum { .. } => "WeightedSum",
+        SigmoidGateAdd => "SigmoidGateAdd",
+        SplitGdn { .. } => "SplitGdn",
+        CausalConv1d { .. } => "CausalConv1d",
+        GdnPrep { .. } => "GdnPrep",
+        GatedDelta { .. } => "GatedDelta",
+        RmsnormGated { .. } => "RmsnormGated",
+        SplitQGate { .. } => "SplitQGate",
+        SigmoidGateMul => "SigmoidGateMul",
+        Launch { .. } => "Launch",
+        Guard { .. } => "Guard",
+        HookSite { .. } => "HookSite",
+        Peel { .. } => "Peel",
     }
 }
 
@@ -585,6 +799,80 @@ mod tests {
             &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
             FireClass::Decode,
         )
+    }
+
+    /// The five live-verified llama_like deployments, each class — the
+    /// same set the goldens and the committed `.inc`s cover.
+    fn live_plans() -> Vec<(String, ForwardPlan)> {
+        let cuda = LlamaLikeCudaFacts::qwen3_0_6b_l40s();
+        let deployments = [
+            ("qwen3_0_6b", LlamaLikeFacts::qwen3_0_6b()),
+            ("qwen2_5_1_5b", LlamaLikeFacts::qwen2_5_1_5b()),
+            ("phi3_mini", LlamaLikeFacts::phi3_mini()),
+            ("mistral_7b_v03", LlamaLikeFacts::mistral_7b_v03()),
+            ("olmo2_1b", LlamaLikeFacts::olmo2_1b()),
+        ];
+        let mut out = Vec::new();
+        for (name, facts) in deployments {
+            for class in [FireClass::Decode, FireClass::Prefill] {
+                out.push((
+                    format!("{name}.{class:?}"),
+                    family::llama_like_cuda(&facts, &cuda, class),
+                ));
+            }
+        }
+        out
+    }
+
+    /// THE CUTOVER LEDGER. Every statement a live fire executes is
+    /// either a rectangle in the flat list or a named entry in the
+    /// residue — and this test pins WHICH, by kind, across every
+    /// deployment the driver serves today.
+    ///
+    /// It exists to be read, not just to pass. `residue` empty is the
+    /// gate that lets the driver stop walking; until then this is the
+    /// worklist, and the count moving the wrong way is a regression in
+    /// the migration itself.
+    #[test]
+    fn the_flat_list_says_what_it_does_not_cover() {
+        let mut kinds: BTreeMap<&'static str, (&'static str, usize)> = BTreeMap::new();
+        let mut worst = 1.0f64;
+        for (name, plan) in live_plans() {
+            let out = lower(&plan, &plain(4)).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            for item in &out.residue {
+                let e = kinds.entry(item.kind).or_insert((item.why, 0));
+                e.1 += 1;
+            }
+            worst = worst.min(out.coverage());
+            // Whatever a statement is, it is accounted for exactly once.
+            assert!(
+                out.launches.len() + out.residue.len() > 0,
+                "{name}: a fire that executes nothing is not a fire"
+            );
+        }
+
+        // The inventory, as of the flat list's first coverage pass. Each
+        // line is one statement kind still owed a declaration; the `why`
+        // is what the trace would have to state for it to become a
+        // rectangle. Update this WITH the fix, never to make a red test
+        // green.
+        let inventory: Vec<&str> = kinds.keys().copied().collect();
+        assert_eq!(
+            inventory,
+            vec!["LmHead", "Swiglu"],
+            "the residue changed — kinds: {kinds:#?}"
+        );
+        // Measured 2026-08-06: 88.7% (qwen3_0_6b decode) to 93.8%
+        // (olmo2_1b prefill). The residue is one LmHead per fire plus one
+        // Swiglu PER LAYER — the MLP statement is the bulk of it, which is
+        // why closing `Swiglu` is worth more than its one line suggests.
+        // The floor is here so a regression that drops a whole layer's
+        // worth of statements cannot hide behind a passing kind list.
+        assert!(
+            worst > 0.88,
+            "the flat list covers {:.1}% of the worst deployment's statements",
+            worst * 100.0
+        );
     }
 
     /// A plain fire lowers, and every launch covers every row — the
