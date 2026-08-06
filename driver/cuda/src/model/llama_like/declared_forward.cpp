@@ -511,12 +511,16 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
 //
 // `PIE_DECLARED_SHADOW=1`. Off by default and inert when off: it computes
 // a description and prints, and never changes what runs.
-// `PIE_DECLARED_FLAT=1`: execute from `lower()`'s list instead of
-// walking the region IR. Off by default — the walk is still what runs.
+// The declared path executes `lower()`'s list. `PIE_DECLARED_FLAT=0`
+// disarms it back onto the walk below, which is still here and still
+// under the same parity gate — the flip is the LAST reversible step of
+// the cutover, and it is deliberately taken one increment before the
+// walk is deleted so that a regression found in the meantime has a
+// one-word A/B rather than a revert.
 bool flat_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_DECLARED_FLAT");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return on;
 }
@@ -2268,10 +2272,12 @@ void llama_like_forward_declared(
 
     // ── THE FLAT DRIVE (`.wiki/tart/dsl.md` cutover step 2b) ───────
     //
-    // `PIE_DECLARED_FLAT=1`. The walk below decides what runs by
+    // THIS is what a declared fire runs (`PIE_DECLARED_FLAT=0` disarms
+    // it back onto the walk). The walk below decides what runs by
     // TRAVERSING — guard chains, row peels, a depth window per op. This
-    // decides it by READING `lower()`'s list, which the shadow has been
-    // saying is the same answer on every fire.
+    // decides it by READING `lower()`'s list, which the shadow said was
+    // the same answer on every fire for two increments before the drive
+    // was written, and which has since carried every soak and census.
     //
     // Nothing about the ARMS changes. Step 1 gave them the eight words
     // they read about where they are; step 2a gave the list the sites
