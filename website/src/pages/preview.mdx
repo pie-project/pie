@@ -1,0 +1,1692 @@
+---
+title: "Pie 0.5 (preview)"
+description: "Changes in 0.5 relative to 0.4.0."
+unlisted: true
+hide_table_of_contents: true
+wrapperClassName: preview-page
+---
+
+import './preview.css';
+
+<svg width="0" height="0" style={{position: 'absolute'}} aria-hidden="true">
+  <defs>
+    <marker id="pv-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path className="arrowhead" d="M0,0 L10,5 L0,10 z" />
+    </marker>
+    <marker id="pv-am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path className="arrowhead-muted" d="M0,0 L10,5 L0,10 z" />
+    </marker>
+  </defs>
+</svg>
+
+# Pie 0.5 (preview)
+
+Unreleased. Interfaces described here may change before release.
+
+The central change is the programming model. Through 0.4, an inferlet drove
+generation from the host, one token at a time. In 0.5 an inferlet defines a
+dataflow of tensor programs, submits passes onto a pipeline, and exchanges
+values with the running dataflow through channels.
+
+Parts I–III cover that model and what it makes expressible. Part IV covers the
+rest of the release — model loading, weight streaming, the Metal driver, the
+scheduler — which is independent of it.
+
+1,206 commits since 0.4.0. 3,195 files changed, +603,268 / −244,709 lines.
+Host workspace: 3 crates → 55.
+
+<nav className="pv-index" aria-label="On this page">
+<div className="pv-index-title">On this page</div>
+
+<div className="pv-index-part">I — The programming model</div>
+
+- [Forward pass programming](#forward-pass-programming)
+- [Stages](#stages)
+- [Channels](#channels)
+
+<div className="pv-index-part">II — What it enables</div>
+
+- [Attention scores](#attention-scores)
+- [What the model enables](#what-the-model-enables)
+- [Recurrent state](#recurrent-state)
+
+<div className="pv-index-part">III — Underneath</div>
+
+- [PTIR](#ptir)
+- [The runtime–driver boundary](#the-runtimedriver-boundary)
+
+<div className="pv-index-part">IV — The rest of the release</div>
+
+- [Model loading](#model-loading)
+- [Weight streaming](#weight-streaming)
+- [Metal](#metal)
+- [Scheduler and contention](#scheduler-and-contention)
+
+<div className="pv-index-part">V — Numbers</div>
+
+- [Performance](#performance)
+- [CUDA](#cuda)
+- [Apple silicon](#apple-silicon)
+
+<div className="pv-index-part">VI — Migrating</div>
+
+- [Breaking changes](#breaking-changes)
+- [Smaller changes](#smaller-changes)
+- [Known gaps](#known-gaps)
+
+</nav>
+
+---
+
+<div className="pv-part"><span>Part I</span> The programming model</div>
+
+## Forward pass programming
+
+### What the previous model cost
+
+In the eager model the host built a pass, submitted it, waited for logits,
+sampled, checked the stop condition, and submitted again. The sampling and stop
+logic sat between forward passes, so the device idled for one host round trip
+per token.
+
+<figure>
+<svg viewBox="0 0 860 215">
+  <text className="t" x="20" y="64">host</text>
+  <text className="t" x="20" y="134">device</text>
+
+  <line className="ln" x1="300" y1="24" x2="560" y2="24" />
+  <line className="ln" x1="300" y1="24" x2="300" y2="32" />
+  <line className="ln" x1="560" y1="24" x2="560" y2="32" />
+  <text className="ts" x="430" y="16" textAnchor="middle">one token</text>
+
+  <rect className="bx" x="80" y="44" width="120" height="30" />
+  <text className="t2" x="140" y="63" textAnchor="middle">build + submit</text>
+  <rect className="bx" x="300" y="44" width="160" height="30" />
+  <text className="t2" x="380" y="63" textAnchor="middle">sample + stop check</text>
+  <rect className="bx" x="560" y="44" width="160" height="30" />
+  <text className="t2" x="640" y="63" textAnchor="middle">sample + stop check</text>
+
+  <rect className="bx" x="200" y="114" width="100" height="30" />
+  <text className="t2" x="250" y="133" textAnchor="middle">forward</text>
+  <rect className="bx" x="460" y="114" width="100" height="30" />
+  <text className="t2" x="510" y="133" textAnchor="middle">forward</text>
+  <rect className="bx" x="720" y="114" width="100" height="30" />
+  <text className="t2" x="770" y="133" textAnchor="middle">forward</text>
+
+  <line className="ln" x1="200" y1="74" x2="200" y2="112" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="300" y1="114" x2="300" y2="76" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="460" y1="74" x2="460" y2="112" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="560" y1="114" x2="560" y2="76" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="720" y1="74" x2="720" y2="112" markerEnd="url(#pv-a)" />
+
+  <line className="lnd" x1="300" y1="129" x2="458" y2="129" />
+  <line className="lnd" x1="560" y1="129" x2="718" y2="129" />
+  <text className="ts" x="380" y="168" textAnchor="middle">the device idles one round trip per token</text>
+
+  <line className="ln" x1="80" y1="196" x2="830" y2="196" markerEnd="url(#pv-a)" />
+  <text className="ts" x="828" y="188" textAnchor="end">time</text>
+</svg>
+<figcaption>
+The eager model. The gap scales with host latency, not with model size, so it
+grows in relative terms as forward passes get faster.
+</figcaption>
+</figure>
+
+Two further limits followed from the same structure. Samplers were a closed WIT
+enum, so a new sampling method meant an engine change. And an inferlet could
+only compute on the host, which put tensor-level algorithms — KV eviction driven
+by attention scores, for instance — out of reach.
+
+### The model in 0.5
+
+An inferlet defines a dataflow once, as stages of PTIR programs, and submits
+passes of it onto a pipeline. `submit()` returns immediately and the pipeline
+keeps several passes in flight. While the dataflow runs, the inferlet interacts
+with it only through channels.
+
+<figure>
+<svg viewBox="0 0 880 350">
+  <rect className="bx" x="40" y="60" width="190" height="190" />
+  <text className="tb" x="135" y="92" textAnchor="middle">inferlet</text>
+  <rect className="bx" x="95" y="120" width="80" height="18" />
+  <rect className="bx" x="95" y="144" width="80" height="18" />
+  <rect className="bx" x="95" y="168" width="80" height="18" />
+  <text className="ts" x="135" y="212" textAnchor="middle">a dataflow:</text>
+  <text className="ts" x="135" y="230" textAnchor="middle">stages of PTIR programs</text>
+
+  <line className="ln" x1="230" y1="140" x2="294" y2="140" markerEnd="url(#pv-a)" />
+  <text className="ts" x="262" y="128" textAnchor="middle">submit()</text>
+
+  <text className="ts" x="456" y="96" textAnchor="middle">pipeline</text>
+  <line className="rail" x1="300" y1="108" x2="612" y2="108" />
+  <line className="rail" x1="300" y1="172" x2="612" y2="172" />
+
+  <clipPath id="pv-rail">
+    <rect x="300" y="110" width="312" height="60" />
+  </clipPath>
+  <g clipPath="url(#pv-rail)">
+    <g className="pv-anim pv-flow">
+      <rect className="bx" x="220" y="118" width="56" height="14" />
+      <rect className="bx" x="220" y="137" width="56" height="14" />
+      <rect className="bx" x="220" y="156" width="56" height="14" />
+      <rect className="bx" x="320" y="118" width="56" height="14" />
+      <rect className="bx" x="320" y="137" width="56" height="14" />
+      <rect className="bx" x="320" y="156" width="56" height="14" />
+      <rect className="bx" x="420" y="118" width="56" height="14" />
+      <rect className="bx" x="420" y="137" width="56" height="14" />
+      <rect className="bx" x="420" y="156" width="56" height="14" />
+      <rect className="bx" x="520" y="118" width="56" height="14" />
+      <rect className="bx" x="520" y="137" width="56" height="14" />
+      <rect className="bx" x="520" y="156" width="56" height="14" />
+    </g>
+  </g>
+  <text className="ts" x="348" y="190" textAnchor="middle">t+2</text>
+  <text className="ts" x="448" y="190" textAnchor="middle">t+1</text>
+  <text className="ts" x="548" y="190" textAnchor="middle">t</text>
+
+  <line className="ln" x1="612" y1="140" x2="656" y2="140" markerEnd="url(#pv-a)" />
+
+  <rect className="bx" x="660" y="60" width="180" height="190" />
+  <text className="tb" x="750" y="92" textAnchor="middle">device</text>
+  <rect className="bx" x="710" y="120" width="80" height="18" />
+  <rect className="bx" x="710" y="144" width="80" height="18" />
+  <rect className="bx" x="710" y="168" width="80" height="18" />
+  <path className="ln" d="M756,194 C800,194 800,112 758,112" markerEnd="url(#pv-a)" />
+  <text className="ts" x="750" y="222" textAnchor="middle">runs pass after pass</text>
+
+  <text className="ts" x="440" y="278" textAnchor="middle">channels</text>
+  <rect className="bx" x="350" y="290" width="36" height="24" />
+  <rect className="bx" x="386" y="290" width="36" height="24" />
+  <rect className="bxf" x="422" y="290" width="36" height="24" />
+  <rect className="bx" x="458" y="290" width="36" height="24" />
+  <rect className="bx" x="494" y="290" width="36" height="24" />
+  <path className="ln" d="M135,250 L135,302 L346,302" markerStart="url(#pv-a)" markerEnd="url(#pv-a)" />
+  <text className="ts" x="240" y="322" textAnchor="middle">put / take / read, async</text>
+  <path className="ln" d="M750,250 L750,302 L534,302" markerStart="url(#pv-a)" markerEnd="url(#pv-a)" />
+  <text className="ts" x="642" y="322" textAnchor="middle">read / write at fire</text>
+</svg>
+<figcaption>
+Passes of one dataflow occupy the pipeline at t, t+1, t+2. The inferlet is not
+in that path; it reaches the running dataflow only through the channels below.
+</figcaption>
+</figure>
+
+Control flow resolves at trace time: a different branch is a different program.
+The host does not sequence tokens, and the device does not wait on the host.
+
+<figure>
+<svg viewBox="0 0 880 265">
+  <text className="t" x="20" y="74">0.4</text>
+  <rect className="bx" x="120" y="54" width="120" height="32" />
+  <text className="t2" x="180" y="74" textAnchor="middle">pass t</text>
+  <rect className="bxd" x="240" y="54" width="120" height="32" />
+  <text className="ts" x="300" y="74" textAnchor="middle">bubble</text>
+  <rect className="bx" x="360" y="54" width="120" height="32" />
+  <text className="t2" x="420" y="74" textAnchor="middle">pass t+1</text>
+  <rect className="bxd" x="480" y="54" width="120" height="32" />
+  <text className="ts" x="540" y="74" textAnchor="middle">bubble</text>
+  <rect className="bx" x="600" y="54" width="120" height="32" />
+  <text className="t2" x="660" y="74" textAnchor="middle">pass t+2</text>
+  <text className="ts" x="420" y="112" textAnchor="middle">the device idles while the host samples, checks the stop condition, and submits</text>
+
+  <text className="t" x="20" y="174">0.5</text>
+  <rect className="bx" x="120" y="154" width="120" height="32" />
+  <text className="t2" x="180" y="174" textAnchor="middle">pass t</text>
+  <rect className="bx" x="240" y="154" width="120" height="32" />
+  <text className="t2" x="300" y="174" textAnchor="middle">pass t+1</text>
+  <rect className="bx" x="360" y="154" width="120" height="32" />
+  <text className="t2" x="420" y="174" textAnchor="middle">pass t+2</text>
+  <rect className="bx" x="480" y="154" width="120" height="32" />
+  <text className="t2" x="540" y="174" textAnchor="middle">pass t+3</text>
+  <rect className="bx" x="600" y="154" width="120" height="32" />
+  <text className="t2" x="660" y="174" textAnchor="middle">pass t+4</text>
+  <text className="ts" x="420" y="212" textAnchor="middle">passes run back to back; sampling and stop logic run inside the pass</text>
+
+  <g className="pv-anim pv-cursor">
+    <line x1="120" y1="44" x2="120" y2="196" />
+    <circle className="pv-cursor-head" cx="120" cy="44" r="3.5" />
+  </g>
+
+  <line className="ln" x1="120" y1="243" x2="830" y2="243" markerEnd="url(#pv-a)" />
+  <text className="ts" x="828" y="235" textAnchor="end">time</text>
+</svg>
+<figcaption>
+Both rows are the device timeline. Sampling and stop logic run inside the pass;
+ordering lives in the channels.
+</figcaption>
+</figure>
+
+The one per-fire host decision that remains is resource leasing: which KV pages,
+which batch.
+
+### Side by side
+
+| | 0.4 | 0.5 |
+|---|---|---|
+| decode loop | host-driven `while` loop | on device: tok → forward → sampler → tok |
+| submission | `execute()`, await every token | `submit()` returns immediately |
+| sampling | closed WIT enum; new methods patch the engine | tensor programs authored in the epilogue |
+| overlap | speculation chain in the runtime | run-ahead: several passes in flight |
+| data plane | request frame marshaled per fire | `put` is a release-store; host reads a pinned mirror |
+| failure | error returned from `execute()` | channel poison, surfaced at `take` / `read` |
+| guest compute | host only | host and device |
+
+### Before and after: a watermarking sampler
+
+Greenlist watermarking biases a pseudorandom half of the vocabulary before
+sampling. It exists in both releases, which makes it a fair comparison.
+
+In 0.4 the only way to reach the distribution was to pull it to the host. Every
+token, the full vocabulary crossed the WebAssembly boundary so that the guest
+could add a bias and take an argmax:
+
+```rust
+// 0.4 — inferlets/demo-watermark/src/lib.rs
+for _ in 0..input.max_tokens {
+    let mut pass = ctx.forward();
+    pass.input(&pending);
+    let h = pass.probe(last_idx, Distribution { temperature: 1.0, k: 0 });
+    let out = pass.execute().await?;               // host waits here
+    let (ids, probs) = out.distribution(h)?;       // full vocab to the host
+
+    let chosen = watermark.sample_biased(ids, probs);   // bias on the host
+    if stop_tokens.contains(&chosen) { break; }
+    generated.push(chosen);
+    pending = vec![chosen];
+}
+```
+
+In 0.5 the bias and the draw are tensor operations in the epilogue, so they run
+inside the pass. Only the sampled token is published to the host:
+
+```rust
+// 0.5 — tests/inferlets/greenlist-watermarking/src/lib.rs
+fn watermarked_sample(logits: &Tensor, green: &Tensor, rng: &Tensor,
+                      delta: f32, vocab: u32) -> Tensor {
+    let bias = select(green, broadcast(delta, [vocab]), broadcast(0.0f32, [vocab]));
+    gumbel_max(logits + bias, rng)
+}
+
+decode.epilogue(move || {
+    let length = kv_len.take();
+    let green_value = green.take();
+    let rng_value = rng.take();
+    let token = watermarked_sample(&intrinsics::logits(), &green_value,
+                                   &rng_value, delta, vocab);
+
+    let next_length = &length + 1u32;
+    token_in.put(&token);                  // feed the next pass
+    kv_len.put(&next_length);              // advance the geometry
+    positions.put(&length);
+    page_indptr.put(indptr(1, &next_length.div_ceil(page_size)));
+    token_out.put(&token);                 // surface to the host
+    rng.put(&rng_value + iota(2));
+});
+```
+
+Note what did **not** change. The greenlist is keyed on the previous output
+token, so the host cannot supply the mask for pass k+1 until pass k has settled.
+This algorithm is inherently depth-1 and still round-trips once per token:
+
+```rust
+while submitted < budget {
+    green.put(green_mask(vocab, previous, input.gamma));
+    decode.submit(&pipeline)?;
+    let token = token_out.take_host::<i32>().await? as u32;
+    previous = token;
+    // ...
+}
+```
+
+The model does not remove round trips that the algorithm requires. What it
+removes is the vocabulary-sized transfer, the host-side arithmetic, and the
+round trips that were only an artifact of how generation was driven. Inferlets
+whose next input does not depend on the host — the common case — keep the
+pipeline full through `run_ahead` and never park per token.
+
+## Stages
+
+Guest tensor code attaches at four points: `prologue` once per pass,
+`on_attn_proj` and `on_attn` per layer, and `epilogue` once per pass.
+
+<figure>
+<svg viewBox="0 0 860 185">
+  <rect className="bx" x="40" y="50" width="120" height="50" />
+  <text className="t" x="100" y="80" textAnchor="middle">prologue</text>
+
+  <rect className="bxd" x="200" y="32" width="390" height="86" />
+  <text className="ts" x="395" y="52" textAnchor="middle">transformer layers × N</text>
+  <rect className="bx" x="220" y="62" width="160" height="40" />
+  <text className="t2" x="300" y="86" textAnchor="middle">on_attn_proj</text>
+  <rect className="bx" x="405" y="62" width="160" height="40" />
+  <text className="t2" x="485" y="86" textAnchor="middle">on_attn</text>
+  <line className="ln" x1="380" y1="82" x2="403" y2="82" markerEnd="url(#pv-a)" />
+
+  <rect className="bx" x="630" y="50" width="150" height="50" />
+  <text className="tb" x="705" y="74" textAnchor="middle">epilogue</text>
+  <text className="ts" x="705" y="92" textAnchor="middle">once per pass</text>
+
+  <line className="ln" x1="160" y1="75" x2="198" y2="75" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="590" y1="75" x2="628" y2="75" markerEnd="url(#pv-a)" />
+
+  <rect className="bx" x="600" y="140" width="52" height="24" />
+  <text className="t2" x="626" y="157" textAnchor="middle">tok</text>
+  <rect className="bx" x="660" y="140" width="52" height="24" />
+  <text className="t2" x="686" y="157" textAnchor="middle">rng</text>
+  <rect className="bx" x="720" y="140" width="52" height="24" />
+  <text className="t2" x="746" y="157" textAnchor="middle">out</text>
+  <line className="ln" x1="665" y1="100" x2="630" y2="138" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="705" y1="100" x2="686" y2="138" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="745" y1="100" x2="744" y2="138" markerEnd="url(#pv-a)" />
+  <text className="ts" x="560" y="157" textAnchor="end">bound channels</text>
+</svg>
+<figcaption>
+A sampler is an epilogue closure over logits. KV-eviction methods attach at the
+attention stages.
+</figcaption>
+</figure>
+
+A complete greedy sampler, from the `compiler/dsl` documentation: seeded RNG,
+argmax over noised logits, and a token that feeds itself.
+
+```rust
+let tok = Channel::new([1], dtype::i32);   // input token ring
+let indptr = Channel::from([0u32, 1]);
+let out = Channel::new([1], dtype::i32);   // host reads sampled tokens
+let rng = Channel::from([7u32, 0]);        // seeded RNG state
+tok.put([1i32]);                           // seed BOS
+
+let mut b = Builder::new(vocab, page_size);
+b.bind_port(Port::EmbedTokens, &tok);
+b.bind_port(Port::EmbedIndptr, &indptr);
+b.stage(Stage::Epilogue, || {
+    let logits = intrinsics::logits();
+    let r = rng.take();
+    let g = gumbel(&r, [intrinsics::vocab()]);
+    let t = reduce_argmax(logits + g);
+    rng.put(&r + Tensor::constant([0u32, 1]));
+    tok.put(&t);                           // feed the next step
+    out.put(t);                            // surface to the host
+});
+
+let traced = b.build()?;                   // canonical container bytes
+```
+
+The token loop — `tok`, forward, sampler, `tok` — closes on the device. Adding a
+sampling method is a new trace, not a new enum variant.
+
+## Channels
+
+A channel is a device-resident bounded queue with a full/empty bit per cell.
+
+<figure>
+<svg viewBox="0 0 860 200">
+  <rect className="bx pv-cell" x="190" y="78" width="72" height="44" style={{animationDelay: '0s'}} />
+  <rect className="bx pv-cell" x="262" y="78" width="72" height="44" style={{animationDelay: '-0.8s'}} />
+  <rect className="bx pv-cell" x="334" y="78" width="72" height="44" style={{animationDelay: '-1.6s'}} />
+  <rect className="bx pv-cell" x="406" y="78" width="72" height="44" style={{animationDelay: '-2.4s'}} />
+  <rect className="bx pv-cell" x="478" y="78" width="72" height="44" style={{animationDelay: '-3.2s'}} />
+  <rect className="bx pv-cell" x="550" y="78" width="72" height="44" style={{animationDelay: '-4s'}} />
+
+  <g className="pv-anim pv-head">
+    <line className="ln" x1="226" y1="34" x2="226" y2="76" markerEnd="url(#pv-a)" />
+  </g>
+  <text className="ts" x="300" y="24" textAnchor="middle">head: device reads at fire</text>
+
+  <g className="pv-anim pv-head" style={{animationDelay: '-2.4s'}}>
+    <line className="ln" x1="226" y1="170" x2="226" y2="124" markerEnd="url(#pv-a)" />
+  </g>
+  <text className="ts" x="300" y="190" textAnchor="middle">tail: host put, a release-store</text>
+
+  <text className="ts" x="650" y="96">capacity + 1 cells, so a</text>
+  <text className="ts" x="650" y="114">writer always has a slot</text>
+</svg>
+<figcaption>
+Head and tail move independently, so neither side waits for the other to be
+scheduled.
+</figcaption>
+</figure>
+
+- Channel effects are transactional per fire. A pass either commits all of its
+  puts or publishes none of them.
+- The host side is async: `put`, `take`, `read`. The host never sequences steps;
+  it parks on `take` when it needs a value.
+- Rings hold capacity + 1 cells, so a writer always has a free slot.
+- A fault poisons the channel. `take` and `read` surface the failing fire's
+  cause rather than hanging.
+
+Channels are the only stateful construct in the model, and the same handle binds
+into the pass and serves the host API.
+
+<div className="pv-part"><span>Part II</span> What it enables</div>
+
+An intrinsic with no 0.4 expression, the 34 inferlets in the tree, and the state
+discipline recurrent models needed.
+
+## Attention scores
+
+0.5 adds the `AttnScore` intrinsic to the PTIR ABI. Inside an `on_attn` stage an
+inferlet reads the attention weights the kernel just produced, per layer, while
+the pass is still running.
+
+<figure>
+<svg viewBox="0 0 860 268">
+  <text className="tb" x="14" y="60">0.4</text>
+  <line className="ln" x1="46" y1="55" x2="68" y2="55" markerEnd="url(#pv-a)" />
+  <rect className="bxf" x="70" y="30" width="730" height="50" />
+  <text className="t" x="435" y="53" textAnchor="middle">attention layer × N</text>
+  <text className="ts" x="435" y="70" textAnchor="middle">opaque: no attachment point, scores never leave the kernel</text>
+
+  <line className="lnd" x1="0" y1="108" x2="860" y2="108" />
+
+  <text className="tb" x="14" y="170">0.5</text>
+  <line className="ln" x1="46" y1="165" x2="68" y2="165" markerEnd="url(#pv-a)" />
+
+  <rect className="bx" x="70" y="140" width="120" height="50" />
+  <text className="t2" x="130" y="170" textAnchor="middle">QKV proj</text>
+  <line className="ln" x1="190" y1="165" x2="223" y2="165" markerEnd="url(#pv-a)" />
+
+  <rect className="bxf" x="225" y="140" width="110" height="50" />
+  <text className="t2" x="280" y="164" textAnchor="middle">on_attn_proj</text>
+  <text className="ts" x="280" y="180" textAnchor="middle">guest</text>
+  <line className="ln" x1="335" y1="165" x2="368" y2="165" markerEnd="url(#pv-a)" />
+
+  <rect className="bx" x="370" y="140" width="140" height="50" />
+  <text className="t2" x="440" y="163" textAnchor="middle">attention</text>
+  <text className="ts" x="440" y="180" textAnchor="middle">softmax → scores</text>
+  <line className="ln" x1="510" y1="165" x2="543" y2="165" markerEnd="url(#pv-a)" />
+
+  <rect className="bxf" x="545" y="140" width="100" height="50" />
+  <text className="t2" x="595" y="164" textAnchor="middle">on_attn</text>
+  <text className="ts" x="595" y="180" textAnchor="middle">guest</text>
+  <line className="ln" x1="645" y1="165" x2="678" y2="165" markerEnd="url(#pv-a)" />
+
+  <rect className="bx" x="680" y="140" width="120" height="50" />
+  <text className="t2" x="740" y="170" textAnchor="middle">out proj</text>
+
+  <path className="ln" d="M440,190 L440,222 L595,222 L595,192" markerEnd="url(#pv-a)" />
+  <text className="ts" x="517" y="240" textAnchor="middle">AttnScore — captured in the kernel, not recomputed</text>
+
+  <text className="ts" x="800" y="212" textAnchor="end">fires once per layer</text>
+</svg>
+<figcaption>
+0.4 exposed the layer stack as a single opaque step. 0.5 opens two points
+inside it, one before the kernel and one after.
+</figcaption>
+</figure>
+
+```rust
+pass.on_attn(|| {
+    let scores = intrinsics::attn_score(kv_max);
+    // select KV pages to evict
+});
+```
+
+`AttnScore` is valid at `OnAttn` and rejected at `OnAttnProj`
+(`compiler/ir/src/registry.rs`). Capture happens inside the attention kernel
+through a FlashInfer variant; scores are not recomputed afterwards. Availability
+is gated per model by `has_attn_score`.
+
+In 0.4 this had no expression at all. There was no stage between the layers to
+attach code to, and the attention weights never left the kernel.
+
+`on_attn` fires once per layer, and an inferlet cannot ask the model how many
+layers there are, so the layer loop folds into a device-carried channel that the
+epilogue publishes once per fire:
+
+```rust
+// 0.5 — tests/inferlets/tova-attention/src/lib.rs
+let acc = Channel::from(vec![0.0f32; kv_max as usize]).named("tova_acc");
+let layer_ct = Channel::from([0u32]).named("tova_layers");
+
+fwd.on_attn(move || {
+    let prev = acc.take();
+    let ct = layer_ct.take();
+    let scores = intrinsics::attn_score(kv_max);   // this layer's softmax weights
+    acc.put(&(&prev + &scores));
+    layer_ct.put(&(&ct + 1u32));
+});
+```
+
+A loop-carried channel must be taken before it is put, or the trace that infers
+the geometry sees a port that is written but never read.
+
+<figure>
+<svg viewBox="0 0 860 258">
+  <text className="ts" x="112" y="52" textAnchor="end">KV pages</text>
+  <rect className="bx" x="120" y="32" width="48" height="30" />
+  <rect className="bxd" x="172" y="32" width="48" height="30" />
+  <rect className="bx" x="224" y="32" width="48" height="30" />
+  <rect className="bxd" x="276" y="32" width="48" height="30" />
+  <rect className="bx" x="328" y="32" width="48" height="30" />
+  <rect className="bx" x="380" y="32" width="48" height="30" />
+  <rect className="bxd" x="432" y="32" width="48" height="30" />
+  <rect className="bxd" x="484" y="32" width="48" height="30" />
+  <rect className="bx" x="536" y="32" width="48" height="30" />
+  <rect className="bxd" x="588" y="32" width="48" height="30" />
+  <rect className="bxf" x="640" y="32" width="48" height="30" />
+  <rect className="bxf" x="692" y="32" width="48" height="30" />
+
+  <line className="ln" x1="112" y1="200" x2="756" y2="200" />
+  <text className="ts" x="112" y="124" textAnchor="end">accumulated</text>
+  <text className="ts" x="112" y="140" textAnchor="end">score</text>
+
+  <rect className="bxf" x="128" y="170" width="32" height="30" />
+  <rect className="bxf" x="180" y="188" width="32" height="12" />
+  <rect className="bxf" x="232" y="156" width="32" height="44" />
+  <rect className="bxf" x="284" y="192" width="32" height="8" />
+  <rect className="bxf" x="336" y="174" width="32" height="26" />
+  <rect className="bxf" x="388" y="150" width="32" height="50" />
+  <rect className="bxf" x="440" y="190" width="32" height="10" />
+  <rect className="bxf" x="492" y="182" width="32" height="18" />
+  <rect className="bxf" x="544" y="162" width="32" height="38" />
+  <rect className="bxf" x="596" y="194" width="32" height="6" />
+  <rect className="bxf" x="648" y="178" width="32" height="22" />
+  <rect className="bxf" x="700" y="186" width="32" height="14" />
+
+  <line className="lnd" x1="112" y1="175" x2="756" y2="175" />
+  <text className="ts" x="762" y="179">budget cut</text>
+
+  <line className="lnd" x1="634" y1="20" x2="634" y2="216" />
+  <text className="ts" x="694" y="228" textAnchor="middle">recent window</text>
+  <text className="ts" x="694" y="18" textAnchor="middle">most recent tokens</text>
+
+  <path className="lnd" d="M440,66 L440,140" markerStart="url(#pv-am)" />
+  <text className="ts" x="452" y="106">per-layer scores sum into a channel across the pass</text>
+
+  <rect className="bx" x="120" y="240" width="14" height="12" />
+  <text className="ts" x="142" y="250">keep</text>
+  <rect className="bxf" x="196" y="240" width="14" height="12" />
+  <text className="ts" x="218" y="250">kept regardless of score</text>
+  <rect className="bxd" x="366" y="240" width="14" height="12" />
+  <text className="ts" x="388" y="250">evict</text>
+</svg>
+<figcaption>
+The shape shared by H2O, SnapKV, Quest, and TOVA: rank KV pages, keep a budget,
+drop the rest. They differ in how the ranking is formed and when it is applied.
+</figcaption>
+</figure>
+
+KV-eviction and sparse-attention policies become expressible as inferlets on
+this basis; they are listed in
+[What the model enables](#what-the-model-enables), and their crossover points in
+[Numbers](#performance). Quest is the exception that reads no scores: it stores
+per-page key envelopes (`kmin`/`kmax`) in bf16 and ranks pages by an upper bound
+computed at `on_attn_proj`, before the pages are read.
+
+Quest and TOVA currently implement the observability half only. They compute
+their keep-sets but do not elide the unselected pages from the attention kernel,
+so neither delivers the saving its paper reports. Both are bit-identical to
+`naive-baseline` today.
+
+### Prefill chunking
+
+Not a scores feature, but the other pass-level limit that moved to the guest.
+Chunking is now selected by the inferlet (`prefill_chunk`), which removes the
+previous one-shot prefill ceiling of `max_embed_length()` — 8192 tokens on the
+tested configuration. Each chunk attends over the full prefix written so far, so
+chunking does not change results.
+
+## What the model enables
+
+`tests/inferlets/` holds 34 inferlets. All are guest code; none required an
+engine change. The stage column records where each one attaches.
+
+Each has a `README.md` with the full citation and a **faithfulness** note
+stating which parts of the method the implementation reproduces and which it
+does not. Method names below link to the source; 0.5 is on the `dev` branch
+until release.
+
+<figure>
+<svg viewBox="0 0 860 246">
+  <rect className="bxd" x="404" y="24" width="236" height="192" />
+  <text className="ts" x="522" y="18" textAnchor="middle">no counterpart in 0.4</text>
+
+  <text className="ts" x="345" y="48" textAnchor="middle">prologue</text>
+  <text className="ts" x="462" y="48" textAnchor="middle">on_attn_proj</text>
+  <text className="ts" x="582" y="48" textAnchor="middle">on_attn</text>
+  <text className="ts" x="700" y="48" textAnchor="middle">epilogue</text>
+
+  <text className="t2" x="300" y="84" textAnchor="end">Attention and KV-cache policies</text>
+  <rect className="bxf" x="454" y="70" width="16" height="16" />
+  <rect className="bxf" x="574" y="70" width="16" height="16" />
+  <rect className="bxf" x="692" y="70" width="16" height="16" />
+  <text className="ts" x="790" y="84" textAnchor="end">6</text>
+
+  <text className="t2" x="300" y="122" textAnchor="end">Samplers</text>
+  <rect className="bxf" x="692" y="108" width="16" height="16" />
+  <text className="ts" x="790" y="122" textAnchor="end">8</text>
+
+  <text className="t2" x="300" y="160" textAnchor="end">Multi-sequence algorithms</text>
+  <rect className="bxf" x="692" y="146" width="16" height="16" />
+  <text className="ts" x="790" y="160" textAnchor="end">9</text>
+
+  <text className="t2" x="300" y="198" textAnchor="end">Constrained decoding</text>
+  <rect className="bxf" x="692" y="184" width="16" height="16" />
+  <text className="ts" x="790" y="198" textAnchor="end">2</text>
+
+  <text className="ts" x="790" y="48" textAnchor="end">inferlets</text>
+  <text className="ts" x="345" y="232" textAnchor="middle">unused by the suite</text>
+  <text className="ts" x="300" y="232" textAnchor="end">stage used by at least one member</text>
+</svg>
+<figcaption>
+Read as coverage, not as effort: a family occupies a column if any of its
+members uses that stage. No inferlet in the suite uses `prologue`.
+</figcaption>
+</figure>
+
+### Attention and KV-cache policies
+
+The four with an `on_attn` or `on_attn_proj` stage were not expressible in 0.4
+at any cost: they read a quantity that never left the attention kernel.
+
+| Method | LOC | Stages | Paper |
+|---|---:|---|---|
+| [H2O — heavy-hitter oracle](https://github.com/pie-project/pie/tree/dev/tests/inferlets/trackb-h2o) | 589 | `on_attn_proj`, `on_attn`, `epilogue` | [Zhang et al. 2023](https://arxiv.org/abs/2306.14048) |
+| [SnapKV — prompt compression from an observation window](https://github.com/pie-project/pie/tree/dev/tests/inferlets/trackb-snapkv) | 565 | `on_attn_proj`, `on_attn`, `epilogue` | [Li et al. 2024](https://arxiv.org/abs/2404.14469) |
+| [Quest — query-aware page criticality](https://github.com/pie-project/pie/tree/dev/tests/inferlets/quest-attention) | 491 | `on_attn_proj`, `epilogue` | [Tang et al. 2024](https://arxiv.org/abs/2406.10774) |
+| [TOVA — token-omission via attention](https://github.com/pie-project/pie/tree/dev/tests/inferlets/tova-attention) | 412 | `on_attn`, `epilogue` | [Oren et al. 2024](https://arxiv.org/abs/2401.06104) |
+| [Attention sink](https://github.com/pie-project/pie/tree/dev/tests/inferlets/attention-sink) | 208 | `epilogue` | [Xiao et al. 2023](https://arxiv.org/abs/2309.17453) |
+| [Sliding-window attention](https://github.com/pie-project/pie/tree/dev/tests/inferlets/sliding-window-attention) | 193 | `epilogue` | [Beltagy et al. 2020](https://arxiv.org/abs/2004.05150) |
+
+### Samplers
+
+Expressible in 0.4 in principle, at the cost of moving the full vocabulary to
+the host every token and computing there. In 0.5 they are tensor programs in the
+epilogue, and the token loop stays on the device.
+
+| Method | LOC | Paper |
+|---|---:|---|
+| [SynthID-Text — keyed knockout tournament](https://github.com/pie-project/pie/tree/dev/tests/inferlets/synthid-tournament-sampling) | 583 | [Dathathri et al. 2024](https://doi.org/10.1038/s41586-024-08025-4) |
+| [Distortion-free watermarking — keyed Gumbel-max](https://github.com/pie-project/pie/tree/dev/tests/inferlets/gumbel-watermark) | 509 | [Kuditipudi et al. 2023](https://arxiv.org/abs/2307.15593) |
+| [Repetition, presence, and frequency penalties](https://github.com/pie-project/pie/tree/dev/tests/inferlets/repetition-penalty) | 421 | [Keskar et al. 2019](https://arxiv.org/abs/1909.05858) |
+| [Entropy-adaptive temperature](https://github.com/pie-project/pie/tree/dev/tests/inferlets/entropy-adaptive-temperature) | 368 | [Zhu et al. 2024](https://arxiv.org/abs/2403.14541) |
+| [Locally typical sampling](https://github.com/pie-project/pie/tree/dev/tests/inferlets/locally-typical-sampling) | 357 | [Meister et al. 2022](https://arxiv.org/abs/2202.00666) |
+| [η- and ε-truncation sampling](https://github.com/pie-project/pie/tree/dev/tests/inferlets/eta-epsilon-sampling) | 345 | [Hewitt et al. 2022](https://arxiv.org/abs/2210.15191) |
+| [Mirostat v2](https://github.com/pie-project/pie/tree/dev/tests/inferlets/mirostat-v2-sampling) | 322 | [Basu et al. 2020](https://arxiv.org/abs/2007.14966) |
+| [Greenlist watermarking](https://github.com/pie-project/pie/tree/dev/tests/inferlets/greenlist-watermarking) | 220 | [Kirchenbauer et al. 2023](https://arxiv.org/abs/2301.10226) |
+
+Five more samplers in the tree come from implementations rather than papers and
+are cited to those:
+[DRY](https://github.com/pie-project/pie/tree/dev/tests/inferlets/dry-repetition-penalty),
+[XTC](https://github.com/pie-project/pie/tree/dev/tests/inferlets/xtc-sampling),
+[tail-free sampling](https://github.com/pie-project/pie/tree/dev/tests/inferlets/tail-free-sampling),
+[top-a](https://github.com/pie-project/pie/tree/dev/tests/inferlets/top-a-sampling), and
+[token healing](https://github.com/pie-project/pie/tree/dev/tests/inferlets/token-healing).
+
+### Multi-sequence algorithms
+
+One inferlet drives several live sequences through one pipeline, rather than
+coordinating several requests from outside the engine.
+
+| Method | LOC | Paper |
+|---|---:|---|
+| [Beam search](https://github.com/pie-project/pie/tree/dev/tests/inferlets/beam-search) | 449 | [Wiseman & Rush 2016](https://arxiv.org/abs/1606.02960) |
+| [Self-consistency](https://github.com/pie-project/pie/tree/dev/tests/inferlets/consensus-decoding) | 438 | [Wang et al. 2022](https://arxiv.org/abs/2203.11171) |
+| [Speculative decoding, composed with schema constraints](https://github.com/pie-project/pie/tree/dev/tests/inferlets/constrained-speculative-decoding) | 389 | [Leviathan et al. 2023](https://arxiv.org/abs/2307.09702) |
+| [Context-aware decoding](https://github.com/pie-project/pie/tree/dev/tests/inferlets/context-aware-decoding) | 381 | [Shi et al. 2023](https://arxiv.org/abs/2305.14739) |
+| [Classifier-free guidance](https://github.com/pie-project/pie/tree/dev/tests/inferlets/classifier-free-guidance) | 367 | [Sanchez et al. 2023](https://arxiv.org/abs/2306.17806) |
+| [Contrastive decoding](https://github.com/pie-project/pie/tree/dev/tests/inferlets/contrastive-decoding) | 361 | [Li et al. 2022](https://arxiv.org/abs/2210.15097) |
+| [Multi-token prediction](https://github.com/pie-project/pie/tree/dev/tests/inferlets/mtp-speculative-decoding) | 276 | [Gloeckle et al. 2024](https://arxiv.org/abs/2404.19737) |
+| [Cacheback — speculation from cache alone](https://github.com/pie-project/pie/tree/dev/tests/inferlets/cacheback-speculative-decoding) | 250 | [Ma et al. 2025](https://arxiv.org/abs/2511.21699) |
+| [Radix-tree KV reuse](https://github.com/pie-project/pie/tree/dev/tests/inferlets/prefix-tree-kv-cache) | 218 | [Zheng et al. 2023](https://arxiv.org/abs/2312.07104) |
+
+### Constrained decoding
+
+| Method | LOC | Paper |
+|---|---:|---|
+| [ASAp — grammar-aligned decoding](https://github.com/pie-project/pie/tree/dev/tests/inferlets/asap-grammar-aligned-decoding) | 533 | [Park et al. 2024](https://arxiv.org/abs/2405.21047) |
+| [JSON-Schema constrained decoding](https://github.com/pie-project/pie/tree/dev/tests/inferlets/json-schema-constrained-decoding) | 200 | [Geng et al. 2023](https://arxiv.org/abs/2305.13971) |
+
+The tree also holds four inferlets with no published method behind them: a raw
+[sampling-primitives](https://github.com/pie-project/pie/tree/dev/tests/inferlets/sampling-primitives)
+reference, a [chat-completion](https://github.com/pie-project/pie/tree/dev/tests/inferlets/chat-completion)
+example, a [throughput harness](https://github.com/pie-project/pie/tree/dev/tests/inferlets/text-completion-bench),
+and [naive-baseline](https://github.com/pie-project/pie/tree/dev/tests/inferlets/naive-baseline) —
+temperature plus Gumbel-max and nothing else. The last is the control the others
+are measured against.
+
+### What the suite dropped
+
+The 0.4 example tree was largely agent orchestration: `agent-codeact`,
+`agent-react`, `agent-swarm`, `tree-of-thought`, `graph-of-thought`, `mcts`,
+`reflexion`, `skeleton-of-thought`, `recursion-of-thought`, `knowledge-graph`,
+along with MCP, messaging, HTTP, filesystem, and multimodal demos, and
+JavaScript and Python ports of several examples.
+
+None of those were ported. The 0.5 suite is decoding and attention algorithms in
+Rust. The Python and JavaScript SDKs still build against the same WIT, but there
+are no example inferlets for them in the tree.
+
+## Recurrent state
+
+0.4.0 had no recurrent-state interface; `recurrent` and `fold` do not occur in
+its WIT surface. 0.5 adds one.
+
+A KV cache is append-only, so forking a context is O(1). Recurrent state is
+updated in place, which does not admit the same treatment. The 0.5 model is a
+folded prefix plus a mutable buffer.
+
+<figure>
+<svg viewBox="0 0 860 210">
+  <rect className="bxf" x="60" y="60" width="300" height="44" />
+  <text className="t2" x="210" y="87" textAnchor="middle">folded prefix</text>
+  <rect className="bx" x="360" y="60" width="120" height="44" />
+  <text className="t2" x="420" y="87" textAnchor="middle">committed</text>
+  <rect className="bx" x="480" y="60" width="180" height="44" />
+  <text className="t2" x="570" y="87" textAnchor="middle">buffered</text>
+  <rect className="bxd" x="660" y="60" width="140" height="44" />
+  <text className="ts" x="730" y="87" textAnchor="middle">free</text>
+
+  <line className="ln" x1="360" y1="128" x2="360" y2="106" markerEnd="url(#pv-a)" />
+  <text className="ts" x="360" y="146" textAnchor="middle">fold boundary</text>
+  <text className="ts" x="360" y="163" textAnchor="middle">advances only, irreversible</text>
+
+  <line className="ln" x1="480" y1="128" x2="480" y2="106" markerEnd="url(#pv-a)" />
+  <text className="ts" x="500" y="146">accepted prefix</text>
+
+  <line className="ln" x1="600" y1="34" x2="660" y2="34" markerEnd="url(#pv-a)" />
+  <text className="ts" x="596" y="38" textAnchor="end">new tokens land here</text>
+
+  <line className="lnd" x1="660" y1="118" x2="480" y2="118" markerEnd="url(#pv-am)" />
+  <text className="ts" x="570" y="190" textAnchor="middle">discard: drop a rejected tail without folding it</text>
+</svg>
+<figcaption>
+Fold advances the accepted boundary and reclaims what precedes it. Only the
+buffered suffix can still be discarded.
+</figcaption>
+</figure>
+
+| Operation | Meaning |
+|---|---|
+| `fold` | Advances the folded boundary. Irreversible. Semantically a no-op; reclaims memory and compute. |
+| `buffer` | Writable suffix where new recurrent tokens land. |
+| `commit` | Advances the accepted prefix during speculative decode. |
+| `discard` | Drops a rejected buffered tail without folding it. |
+| `fork` | Copy-on-write branch. |
+
+- Speculative decoding works against recurrent models. The accepted count is
+  device-resident, so verify and commit fuse into one fire rather than
+  round-tripping through the host.
+- Rollback covers the unaccepted buffered tail. A committed `fold` cannot be
+  undone; the pre-fold state survives only via a prior `fork`.
+- RS mappings are published at prepare time, which keeps them valid under
+  run-ahead scheduling.
+- A single fire can fold one request while only buffering another.
+
+Currently exercised by hybrid models: Qwen3.5 GDN linear attention and
+Nemotron-H Mamba2 (`driver/cuda/src/kernels/gated_delta_net.cu`,
+`driver/cuda/src/model/nemotron_h/`). The pure `recurrent` pass kind exists but
+no registered model uses it.
+
+<div className="pv-part"><span>Part III</span> Underneath</div>
+
+The two sections below are the contracts the model rests on: the trace format,
+and what crosses between the runtime and a driver. Neither is needed in order to
+write an inferlet.
+
+## PTIR
+
+PTIR is the format a traced program is expressed in: a stage-tagged,
+channel-carrying container over a closed, first-party op set. Model state enters
+through intrinsics such as `logits()` and `vocab()`.
+
+<figure>
+<svg viewBox="0 0 900 110">
+  <rect className="bx" x="20" y="25" width="150" height="60" />
+  <text className="tb" x="95" y="50" textAnchor="middle">trace</text>
+  <text className="ts" x="95" y="70" textAnchor="middle">eDSL</text>
+  <rect className="bx" x="196" y="25" width="150" height="60" />
+  <text className="tb" x="271" y="50" textAnchor="middle">container bytes</text>
+  <text className="ts" x="271" y="70" textAnchor="middle">id = FNV-1a64</text>
+  <rect className="bx" x="372" y="25" width="150" height="60" />
+  <text className="tb" x="447" y="50" textAnchor="middle">validate + bind</text>
+  <text className="ts" x="447" y="70" textAnchor="middle">shapes, dtypes fixed</text>
+  <rect className="bx" x="548" y="25" width="150" height="60" />
+  <text className="tb" x="623" y="50" textAnchor="middle">codegen</text>
+  <text className="ts" x="623" y="70" textAnchor="middle">CUDA / Metal</text>
+  <rect className="bx" x="724" y="25" width="150" height="60" />
+  <text className="tb" x="799" y="50" textAnchor="middle">fused kernels</text>
+  <text className="ts" x="799" y="70" textAnchor="middle">one per stage</text>
+  <line className="ln" x1="170" y1="55" x2="194" y2="55" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="346" y1="55" x2="370" y2="55" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="522" y1="55" x2="546" y2="55" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="698" y1="55" x2="722" y2="55" markerEnd="url(#pv-a)" />
+</svg>
+<figcaption>
+Each step is determined by the previous one. The container hash identifies the
+program, so the kernels at the end are cached against it.
+</figcaption>
+</figure>
+
+The op set is closed and first-party. It was chosen so that a stage compiles to
+one fused kernel rather than a graph of small launches.
+Control flow resolves at trace time and shapes and dtypes are fixed at bind, so
+the compiler sees a straight-line, fully typed program. Emission is direct —
+there is no search and no autotuning.
+
+<figure>
+<svg viewBox="0 0 880 225">
+  <text className="tb" x="20" y="32">a general tensor compiler</text>
+  <rect className="bx" x="20" y="46" width="200" height="50" />
+  <text className="t2" x="120" y="76" textAnchor="middle">arbitrary op graph</text>
+  <line className="ln" x1="220" y1="71" x2="248" y2="71" markerEnd="url(#pv-a)" />
+  <rect className="bx" x="250" y="46" width="200" height="50" />
+  <text className="t2" x="350" y="66" textAnchor="middle">optimization search</text>
+  <text className="ts" x="350" y="84" textAnchor="middle">autotune passes</text>
+  <line className="ln" x1="450" y1="71" x2="478" y2="71" markerEnd="url(#pv-a)" />
+  <rect className="bx" x="480" y="46" width="220" height="50" />
+  <text className="t2" x="590" y="76" textAnchor="middle">kernels, hopefully fused</text>
+  <text className="ts" x="712" y="66">compile time is a search;</text>
+  <text className="ts" x="712" y="84">fusion not guaranteed</text>
+
+  <text className="tb" x="20" y="140">PTIR</text>
+  <rect className="bx" x="20" y="154" width="200" height="50" />
+  <text className="t2" x="120" y="184" textAnchor="middle">closed op-set trace</text>
+  <line className="ln" x1="220" y1="179" x2="248" y2="179" markerEnd="url(#pv-a)" />
+  <rect className="bx" x="250" y="154" width="200" height="50" />
+  <text className="t2" x="350" y="174" textAnchor="middle">direct emission</text>
+  <text className="ts" x="350" y="192" textAnchor="middle">no search</text>
+  <line className="ln" x1="450" y1="179" x2="478" y2="179" markerEnd="url(#pv-a)" />
+  <rect className="bx" x="480" y="154" width="220" height="50" />
+  <text className="t2" x="590" y="184" textAnchor="middle">fused kernels</text>
+  <text className="ts" x="712" y="174">cached by hash;</text>
+  <text className="ts" x="712" y="192">fusion by construction</text>
+</svg>
+<figcaption>
+A general compiler searches because its input is open-ended. A closed op set
+removes the search, and a stage compiles to one fused kernel.
+</figcaption>
+</figure>
+
+A program's identity is its container hash (FNV-1a64), so instances that differ
+only in seed data share one compilation and the cache hits by construction.
+Guest code runs inside the pass at its stage; it adds no kernel launches and no
+host round trips.
+
+Implementation notes:
+
+- `compiler/` contains no hand-written C++. Code generation is `Plan -> String`
+  with no device-architecture input, so it is golden-tested without a GPU.
+  NVRTC and `MTLLibrary` compilation stay in `driver/`.
+- `compiler/eval` is a tier-0 reference interpreter that pins semantics:
+  integers bit-for-bit, floats to ULP, RNG fixed to SplitMix64. Backends are
+  diffed against it. It is also on a production path — the prefix cache folds
+  the geometry prologue through it instead of pattern-matching the trace.
+- One artifact crosses every language: the Rust host, the C++ CUDA driver, and
+  the wasm SDKs.
+
+The inferlet WIT surface is split by state class into `forward` (KV only),
+`forward-recurrent`, and `forward-hybrid`, selected by `model.pass-kind()`.
+Binding an attention-only algorithm to a recurrent model is rejected at the
+interface rather than at runtime. Models also publish their own constraints:
+`frame-size`, `submit-deadline-us`, `channel-capacity`, `rs-state-size`,
+`rs-buffer-page-size`, `rs-fold-granularity`, `arena-block-size`.
+
+## The runtime–driver boundary
+
+Bind happens once. The driver hands up three addresses; the runtime hands down
+opaque wake-slot ids.
+
+<figure>
+<svg viewBox="0 0 860 270">
+  <rect className="bx" x="60" y="50" width="180" height="180" />
+  <text className="tb" x="150" y="84" textAnchor="middle">host</text>
+  <text className="ts" x="150" y="104" textAnchor="middle">runtime</text>
+  <rect className="bx" x="620" y="50" width="180" height="180" />
+  <text className="tb" x="710" y="84" textAnchor="middle">device</text>
+  <text className="ts" x="710" y="104" textAnchor="middle">driver</text>
+
+  <line className="lnd" x1="618" y1="118" x2="242" y2="118" markerEnd="url(#pv-am)" />
+  <text className="ts" x="430" y="110" textAnchor="middle">bind: frame_base, mirror_base, word_base</text>
+  <line className="lnd" x1="242" y1="142" x2="618" y2="142" markerEnd="url(#pv-am)" />
+  <text className="ts" x="430" y="160" textAnchor="middle">bind: wake-slot ids</text>
+
+  <line className="ln" x1="242" y1="190" x2="618" y2="190" markerEnd="url(#pv-a)" />
+  <text className="t2" x="430" y="182" textAnchor="middle">put = release-store, no doorbell</text>
+
+  <line className="ln" x1="618" y1="220" x2="242" y2="220" markerEnd="url(#pv-a)" />
+  <text className="t2" x="430" y="248" textAnchor="middle">commit: copy to mirror, publish words, one edge-triggered wake</text>
+</svg>
+<figcaption>
+The two directions are not symmetric. The host can park; the device cannot.
+</figcaption>
+</figure>
+
+No heap pointer crosses the boundary, and steady state allocates nothing on
+either side. The host↔driver ABI is a single declaration in `interface/driver`,
+read by both ends; the generated C headers are checked in with drift tests.
+
+<div className="pv-part"><span>Part IV</span> The rest of the release</div>
+
+These are independent of the programming model.
+
+## Model loading
+
+The loader takes a checkpoint and a `ModelContract`, compiles a load plan,
+verifies it, and replays it. Dispatch is on contracts over checkpoint bytes, not
+on model names.
+
+`pie model convert` writes a single `.zt` file carrying weights, tokenizer, and
+config. Quantization and transcoding run once at import rather than at each
+boot. `--safetensors` remains available for interchange.
+
+<figure>
+<svg viewBox="0 0 860 250">
+  <rect className="bx" x="40" y="40" width="150" height="40" />
+  <text className="t2" x="115" y="65" textAnchor="middle">safetensors</text>
+  <rect className="bx" x="40" y="90" width="150" height="40" />
+  <text className="t2" x="115" y="115" textAnchor="middle">GGUF</text>
+  <rect className="bx" x="40" y="140" width="150" height="40" />
+  <text className="t2" x="115" y="165" textAnchor="middle">tokenizer.json</text>
+  <rect className="bx" x="40" y="190" width="150" height="40" />
+  <text className="t2" x="115" y="215" textAnchor="middle">config.json</text>
+
+  <line className="ln" x1="190" y1="60" x2="268" y2="120" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="190" y1="110" x2="268" y2="128" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="190" y1="160" x2="268" y2="140" markerEnd="url(#pv-a)" />
+  <line className="ln" x1="190" y1="210" x2="268" y2="148" markerEnd="url(#pv-a)" />
+
+  <rect className="bx" x="270" y="105" width="170" height="60" />
+  <text className="tb" x="355" y="130" textAnchor="middle">pie model convert</text>
+  <text className="ts" x="355" y="150" textAnchor="middle">once, at import</text>
+
+  <line className="ln" x1="440" y1="135" x2="498" y2="135" markerEnd="url(#pv-a)" />
+
+  <rect className="bx" x="500" y="60" width="200" height="150" />
+  <text className="tb" x="600" y="86" textAnchor="middle">one .zt</text>
+  <rect className="bxf" x="520" y="100" width="160" height="26" />
+  <text className="ts" x="600" y="118" textAnchor="middle">weights, page-aligned</text>
+  <rect className="bx" x="520" y="130" width="160" height="26" />
+  <text className="ts" x="600" y="148" textAnchor="middle">tokenizer</text>
+  <rect className="bx" x="520" y="160" width="160" height="26" />
+  <text className="ts" x="600" y="178" textAnchor="middle">config</text>
+
+  <line className="ln" x1="700" y1="113" x2="756" y2="113" markerEnd="url(#pv-a)" />
+  <text className="ts" x="760" y="109">mmap / stream</text>
+  <text className="ts" x="760" y="126">in place, no copy</text>
+</svg>
+<figcaption>
+Conversion runs once, at import. What a driver receives is one container whose
+parts are individually addressable and digested.
+</figcaption>
+</figure>
+
+Tensors are page-aligned and bound where they lie; drivers mmap or stream them.
+On macOS, float-width normalization at convert time means the load path performs
+no copy.
+
+Validation is mandatory (`ztensor-v2-spec-draft.md`):
+
+- deterministic CBOR manifest with a canonical form
+- footer hash, per-part content digests
+- blob bounds and non-overlap checks
+- exact decoded lengths, tracked separately from transport lengths
+- shard identities
+- unknown layouts and logical types are errors unless only structural access is
+  exposed
+
+Relative to safetensors this adds per-part digests, decoded-vs-transport
+integrity, shard identity, and bit-identical canonical output. Relative to GGUF,
+layout and profile rules are registry-backed rather than format-internal.
+
+`loader/tests/ztensor_perf.rs` bounds parse overhead against safetensors; the
+figure is in [Numbers](#bounds-enforced-by-tests). The driver's
+materialized-weight cache uses the same format, so warm reloads go through the
+same validated path.
+
+## Weight streaming
+
+MoE experts are paged into a bounded set of device-side slots and filled from
+the checkpoint on demand. Only the active working set need be resident.
+
+<figure>
+<svg viewBox="0 0 860 215">
+  <rect className="bx" x="40" y="40" width="150" height="140" />
+  <text className="tb" x="115" y="66" textAnchor="middle">checkpoint</text>
+  <text className="ts" x="115" y="86" textAnchor="middle">16 GiB of experts</text>
+  <rect className="bxf" x="60" y="100" width="110" height="12" />
+  <rect className="bxf" x="60" y="116" width="110" height="12" />
+  <rect className="bxf" x="60" y="132" width="110" height="12" />
+  <rect className="bxf" x="60" y="148" width="110" height="12" />
+  <rect className="bxf" x="60" y="164" width="110" height="12" />
+
+  <line className="ln" x1="190" y1="110" x2="288" y2="90" markerEnd="url(#pv-a)" />
+  <text className="ts" x="240" y="76" textAnchor="middle">on demand</text>
+
+  <rect className="bx" x="290" y="40" width="200" height="140" />
+  <text className="tb" x="390" y="66" textAnchor="middle">expert slots</text>
+  <text className="ts" x="390" y="86" textAnchor="middle">bounded: 8 GiB budget</text>
+  <rect className="bxf" x="310" y="100" width="160" height="20" />
+  <text className="ts" x="390" y="115" textAnchor="middle">resident</text>
+  <rect className="bxf" x="310" y="124" width="160" height="20" />
+  <text className="ts" x="390" y="139" textAnchor="middle">resident</text>
+  <rect className="bxd" x="310" y="148" width="160" height="20" />
+  <text className="ts" x="390" y="163" textAnchor="middle">evictable</text>
+
+  <line className="ln" x1="490" y1="110" x2="548" y2="110" markerEnd="url(#pv-a)" />
+
+  <rect className="bx" x="550" y="80" width="150" height="60" />
+  <text className="t2" x="625" y="115" textAnchor="middle">same GEMMs</text>
+
+  <line className="ln" x1="700" y1="110" x2="756" y2="110" markerEnd="url(#pv-a)" />
+  <text className="ts" x="760" y="106">identical</text>
+  <text className="ts" x="760" y="123">output text</text>
+</svg>
+<figcaption>
+Slots are a fixed budget. Which experts occupy them changes per token; how many
+can be occupied does not.
+</figcaption>
+</figure>
+
+`worker/tests/cuda_moe_streaming.rs` requires a streamed run and a
+fully-resident run to produce identical text; the shapes it enforces are in
+[Numbers](#bounds-enforced-by-tests). The arithmetic is unchanged; this is
+residency management.
+
+## Metal
+
+342 commits touch `driver/metal`. Requires Metal 4.
+
+Native model families: Llama, Gemma-4, GPT-OSS, Qwen3.5.
+
+| | 0.5 |
+|---|---|
+| Batch ceiling | 4 → 16 → 32 requests |
+| Paged KV ABI | Yes, including Llama |
+| Routed FFN / MoE | Batched by sorting tokens by expert |
+| Expert streaming | Yes, bounded slots |
+| Pipeline cache | Kernel pipelines no longer rebuilt at each start |
+| KV ring | Sized for a fleet rather than one request |
+
+## Scheduler and contention
+
+<figure>
+<svg viewBox="0 0 860 250">
+  <line className="rail" x1="120" y1="34" x2="800" y2="34" />
+  <line className="lnd" x1="256" y1="24" x2="256" y2="196" />
+  <line className="lnd" x1="392" y1="24" x2="392" y2="196" />
+  <line className="lnd" x1="528" y1="24" x2="528" y2="196" />
+  <line className="lnd" x1="664" y1="24" x2="664" y2="196" />
+  <text className="ts" x="188" y="20" textAnchor="middle">wave</text>
+  <text className="ts" x="324" y="20" textAnchor="middle">wave</text>
+  <text className="ts" x="460" y="20" textAnchor="middle">wave</text>
+  <text className="ts" x="596" y="20" textAnchor="middle">wave</text>
+  <text className="ts" x="732" y="20" textAnchor="middle">wave</text>
+
+  <text className="ts" x="112" y="62" textAnchor="end">lane A</text>
+  <rect className="bxf" x="128" y="46" width="120" height="22" />
+  <rect className="bxf" x="264" y="46" width="120" height="22" />
+  <rect className="bxf" x="400" y="46" width="120" height="22" />
+  <rect className="bxf" x="536" y="46" width="120" height="22" />
+  <rect className="bxf" x="672" y="46" width="120" height="22" />
+
+  <text className="ts" x="112" y="94" textAnchor="end">lane B</text>
+  <rect className="bxf" x="128" y="78" width="120" height="22" />
+  <rect className="bxf" x="264" y="78" width="120" height="22" />
+  <rect className="bx" x="400" y="78" width="120" height="22" />
+  <text className="ts" x="460" y="94" textAnchor="middle">bubble</text>
+  <rect className="bxf" x="536" y="78" width="120" height="22" />
+  <rect className="bxf" x="672" y="78" width="120" height="22" />
+
+  <text className="ts" x="112" y="126" textAnchor="end">lane C</text>
+  <rect className="bxf" x="264" y="110" width="120" height="22" />
+  <rect className="bxf" x="400" y="110" width="120" height="22" />
+  <rect className="bxf" x="536" y="110" width="120" height="22" />
+  <rect className="bxf" x="672" y="110" width="120" height="22" />
+
+  <line className="ln" x1="120" y1="150" x2="800" y2="150" />
+  <text className="ts" x="112" y="154" textAnchor="end">device</text>
+  <text className="ts" x="188" y="172" textAnchor="middle">2</text>
+  <text className="ts" x="324" y="172" textAnchor="middle">3</text>
+  <text className="ts" x="460" y="172" textAnchor="middle">2</text>
+  <text className="ts" x="596" y="172" textAnchor="middle">3</text>
+  <text className="ts" x="732" y="172" textAnchor="middle">3</text>
+  <text className="ts" x="112" y="190" textAnchor="end">batch size</text>
+
+  <path className="lnd" d="M128,46 L128,222 L800,222" markerStart="url(#pv-am)" />
+  <text className="ts" x="464" y="240" textAnchor="middle">submitted ahead of the wave it will run in; a lane that misses its deadline leaves a bubble, and the wave runs smaller</text>
+</svg>
+<figcaption>
+Passes from independent lanes are batched into a wave. A lane submits ahead of
+the wave it will be run in, so a late submission costs batch size rather than
+stalling the device.
+</figcaption>
+</figure>
+
+- Submit-ahead and wave-based batching, with submit deadlines charged per lane.
+  Telemetry records `submit_ahead_fires`, `wave_fires`, batch-size histograms,
+  and host-side bubble latency.
+- The reclaim subsystem was rewritten around one queue and one grant; the
+  reclaim ladder was replaced by a residency planner. Five residency and
+  frame-liveness defects were fixed. Under memory pressure, reclaimed inferlets
+  are restarted rather than having their requests failed.
+- CUDA: NCCL for tensor-parallel collectives, kernel manifests for head-dim and
+  MoE variants, quantization-width fixes.
+
+How much of this shows up in measurements is the next part.
+
+<div className="pv-part"><span>Part V</span> Numbers</div>
+
+## Performance
+
+These are our own measurements on our own machines. They have not been
+reproduced independently, and the harnesses are not yet published.
+
+**CUDA.** One L40S, one small model, five widths. Tables and charts in
+[CUDA](#cuda) below.
+
+**Apple silicon.** Three machines, five models, against two single-user
+runtimes. Tables and charts in [Apple silicon](#apple-silicon) below. The
+comparison is less direct than it looks: mlx-lm and llama.cpp do not carry a
+scheduler, a paged KV cache, or a multi-tenant admission path.
+
+Neither set covers large models, long contexts, or multi-GPU.
+
+### CUDA
+
+Qwen3-0.6B on one NVIDIA L40S (46 GB, driver 550.127.05), 128 vCPU, against
+vLLM 0.26.1 and SGLang 0.5.16. Same client, same prompts, same token budget.
+Three order-alternating rounds per cell; the figure is the median. Measured
+2026-08-06 on `63627aff5`.
+
+<figure>
+<svg viewBox="0 0 860 310">
+  <line className="rail" x1="104" y1="188" x2="830" y2="188" />
+  <text className="ts" x="96" y="192" textAnchor="end">1000</text>
+  <line className="rail" x1="104" y1="125" x2="830" y2="125" />
+  <text className="ts" x="96" y="129" textAnchor="end">2000</text>
+  <line className="rail" x1="104" y1="62" x2="830" y2="62" />
+  <text className="ts" x="96" y="66" textAnchor="end">3000</text>
+  <line className="ln" x1="104" y1="250" x2="830" y2="250" />
+  <text className="ts" x="96" y="34" textAnchor="end">output tok/s</text>
+  <rect className="pv-bar1" x="228" y="223" width="34" height="27" />
+  <text className="ts" x="246" y="216" textAnchor="middle">435.4</text>
+  <rect className="pv-bar3" x="268" y="225" width="34" height="25" />
+  <text className="ts" x="286" y="218" textAnchor="middle">392.9</text>
+  <rect className="pv-bar2" x="308" y="224" width="34" height="26" />
+  <text className="ts" x="326" y="217" textAnchor="middle">416.4</text>
+  <text className="ts" x="286" y="270" textAnchor="middle">1 request</text>
+  <rect className="pv-bar1" x="592" y="58" width="34" height="192" />
+  <text className="ts" x="608" y="51" textAnchor="middle">3068</text>
+  <rect className="pv-bar3" x="632" y="81" width="34" height="169" />
+  <text className="ts" x="648" y="74" textAnchor="middle">2700</text>
+  <rect className="pv-bar2" x="672" y="72" width="34" height="178" />
+  <text className="ts" x="688" y="65" textAnchor="middle">2843</text>
+  <text className="ts" x="648" y="270" textAnchor="middle">8 concurrent</text>
+  <rect className="pv-bar1" x="104" y="284" width="16" height="11" />
+  <text className="ts" x="126" y="294">pie</text>
+  <rect className="pv-bar3" x="254" y="284" width="16" height="11" />
+  <text className="ts" x="276" y="294">vLLM 0.26.1</text>
+  <rect className="pv-bar2" x="404" y="284" width="16" height="11" />
+  <text className="ts" x="426" y="294">SGLang 0.5.16</text>
+  <text className="ts" x="830" y="294" textAnchor="end">Qwen3-0.6B, 1x L40S</text>
+</svg>
+<figcaption>
+Output tok/s at one and eight concurrent requests. Run-to-run spread is under
+0.25% in every cell here.
+</figcaption>
+</figure>
+
+<figure>
+<svg viewBox="0 0 860 310">
+  <line className="rail" x1="104" y1="208" x2="830" y2="208" />
+  <text className="ts" x="96" y="212" textAnchor="end">5000</text>
+  <line className="rail" x1="104" y1="167" x2="830" y2="167" />
+  <text className="ts" x="96" y="171" textAnchor="end">10000</text>
+  <line className="rail" x1="104" y1="125" x2="830" y2="125" />
+  <text className="ts" x="96" y="129" textAnchor="end">15000</text>
+  <line className="rail" x1="104" y1="83" x2="830" y2="83" />
+  <text className="ts" x="96" y="87" textAnchor="end">20000</text>
+  <line className="ln" x1="104" y1="250" x2="830" y2="250" />
+  <text className="ts" x="96" y="34" textAnchor="end">output tok/s</text>
+  <rect className="pv-bar1" x="168" y="172" width="34" height="78" />
+  <text className="ts" x="185" y="165" textAnchor="middle">9399</text>
+  <rect className="pv-bar3" x="208" y="175" width="34" height="75" />
+  <text className="ts" x="225" y="168" textAnchor="middle">9056</text>
+  <rect className="pv-bar2" x="248" y="174" width="34" height="76" />
+  <text className="ts" x="265" y="167" textAnchor="middle">9174</text>
+  <text className="ts" x="225" y="270" textAnchor="middle">32 concurrent</text>
+  <rect className="pv-bar1" x="410" y="131" width="34" height="119" />
+  <text className="ts" x="427" y="124" textAnchor="middle">14313</text>
+  <rect className="pv-bar3" x="450" y="134" width="34" height="116" />
+  <text className="ts" x="467" y="127" textAnchor="middle">13944</text>
+  <rect className="pv-bar2" x="490" y="133" width="34" height="117" />
+  <text className="ts" x="507" y="126" textAnchor="middle">14042</text>
+  <text className="ts" x="467" y="270" textAnchor="middle">64 concurrent</text>
+  <rect className="pv-bar1" x="652" y="55" width="34" height="195" />
+  <text className="ts" x="669" y="48" textAnchor="middle">23384</text>
+  <rect className="pv-bar3" x="692" y="53" width="34" height="197" />
+  <text className="ts" x="709" y="46" textAnchor="middle">23596</text>
+  <rect className="pv-bar2" x="732" y="66" width="34" height="184" />
+  <text className="ts" x="749" y="59" textAnchor="middle">22037</text>
+  <text className="ts" x="709" y="270" textAnchor="middle">256 concurrent</text>
+  <rect className="pv-bar1" x="104" y="284" width="16" height="11" />
+  <text className="ts" x="126" y="294">pie</text>
+  <rect className="pv-bar3" x="254" y="284" width="16" height="11" />
+  <text className="ts" x="276" y="294">vLLM 0.26.1</text>
+  <rect className="pv-bar2" x="404" y="284" width="16" height="11" />
+  <text className="ts" x="426" y="294">SGLang 0.5.16</text>
+  <text className="ts" x="830" y="294" textAnchor="end">Qwen3-0.6B, 1x L40S</text>
+</svg>
+<figcaption>
+The same three engines at 32, 64, and 256 concurrent requests. The gap closes
+as width grows, and at 256 vLLM is ahead.
+</figcaption>
+</figure>
+
+| Width | pie | vLLM | SGLang |
+|---|---:|---:|---:|
+| 1 request | **435.4** | 392.9 | 416.4 |
+| 8 concurrent | **3,068** | 2,700 | 2,843 |
+| 32 concurrent | **9,399** | 9,056 | 9,174 |
+| 64 concurrent | **14,313** | 13,944 | 14,042 |
+| 256 concurrent | 23,384 | **23,596** | 22,037 |
+
+Every cell's run-to-run spread is under half a percent, so the gaps in the
+first four rows are outside the noise. The 0.9% at 256 is only just.
+
+**The lead shrinks monotonically with width**: +10.8% against vLLM at one
+request, +13.6% at eight, +3.8% at 32, +2.6% at 64, and −0.9% at 256. That
+shape is consistent with the advantage being per-step host efficiency, which is
+worth the most when the device is not yet the bottleneck. At 256 the GPU is
+saturated, every engine's host work is hidden behind it, and the three land
+within 1%. SGLang tracks the same curve until 256, where it falls off by 5.8%.
+
+Request latency, where the harness collects it — vLLM's offline API does not
+report per-request latency in throughput mode:
+
+| Width | pie p50 / p99 ms | SGLang p50 / p99 ms |
+|---|---:|---:|
+| 1 request | **584 / 635** | 615 / 616 |
+| 8 concurrent | **1,664 / 2,669** | 1,801 / 2,870 |
+| 32 concurrent | **2,165 / 3,478** | 2,213 / 3,529 |
+| 64 concurrent | **2,837 / 4,563** | 2,887 / 4,601 |
+| 256 concurrent | **6,825** / 11,138 | 8,255 / **11,026** |
+
+#### What these runs do not settle
+
+- **One 0.6B model, one GPU, one prompt length.** Nothing here transfers to
+  larger models, longer contexts, or multi-GPU.
+- **Two earlier rounds were discarded**, both because the harness was wrong
+  rather than because an engine was. Both failures initially looked like
+  results.
+- **SGLang needs its CUDA-graph ceiling pinned or it is not being measured.**
+  It derives decode-graph capture from memory left after `mem_fraction_static`,
+  which on this box captured only to batch size 32; past that every decode step
+  fell to the eager path. Unpinned, SGLang measured 4,642 tok/s at 64
+  concurrent — 0.325× pie. Pinned, the same cell is 14,042. The published
+  numbers are the pinned ones. Any engine whose graph capture derives from
+  leftover memory will fall off it at some width, and a comparison that does
+  not pin it is measuring defaults rather than engines.
+- **A finished run holds GPU memory for up to a minute.** Starting the next
+  engine immediately makes it size its KV pool against the leftovers and
+  measure its own bad luck.
+- **TTFT and inter-token latency are not measured.** They need streaming client
+  stamps these invocations do not collect.
+- Prompt and output token counts were checked identical across all three
+  engines at every width, and every run completed every request.
+
+### Apple silicon
+
+Measured 2026-08-06, one model per process, AC power, no thermal warning
+recorded. pie and mlx-lm read the same checkpoint directory from the same
+cache, so those two arms are the same weights; llama.cpp runs GGUF and is
+matched on bytes instead. Baselines: mlx 0.32.0 / mlx-lm 0.31.3, llama.cpp
+`10270`.
+
+llama.cpp was run on the GGUF closest in size to pie's LM-only bytes. It reads
+more bytes in every row (+0.3% to +8.9%), and decode is bandwidth-bound, so its
+decode figures are if anything flattered by the arm chosen for it. Where pie
+reports two decode numbers, the lower one — host argmax in the loop — is used
+throughout.
+
+#### Latency
+
+Single stream, greedy, 64 tokens. Prefill is not charted: at a 128-token prompt
+it is a small and shrinking share of time-to-last-token, and the per-machine
+tables below carry the figures for anyone who wants them.
+
+<figure>
+<svg viewBox="0 0 860 330">
+  <line className="rail" x1="104" y1="206" x2="830" y2="206" />
+  <text className="ts" x="96" y="210" textAnchor="end">20</text>
+  <line className="rail" x1="104" y1="161" x2="830" y2="161" />
+  <text className="ts" x="96" y="165" textAnchor="end">40</text>
+  <line className="rail" x1="104" y1="117" x2="830" y2="117" />
+  <text className="ts" x="96" y="121" textAnchor="end">60</text>
+  <line className="rail" x1="104" y1="72" x2="830" y2="72" />
+  <text className="ts" x="96" y="76" textAnchor="end">80</text>
+  <line className="ln" x1="104" y1="250" x2="830" y2="250" />
+  <text className="ts" x="96" y="34" textAnchor="end">decode tok/s</text>
+  <rect className="pv-bar1" x="120" y="71" width="34" height="179" />
+  <text className="ts" x="137" y="64" textAnchor="middle">80.7</text>
+  <rect className="pv-bar3" x="160" y="124" width="34" height="126" />
+  <text className="ts" x="177" y="117" textAnchor="middle">56.7</text>
+  <rect className="pv-bar2" x="200" y="105" width="34" height="145" />
+  <text className="ts" x="217" y="98" textAnchor="middle">65.4</text>
+  <text className="ts" x="177" y="270" textAnchor="middle">gpt-oss-20b</text>
+  <rect className="pv-bar1" x="265" y="108" width="34" height="142" />
+  <text className="ts" x="282" y="101" textAnchor="middle">63.9</text>
+  <rect className="pv-bar3" x="305" y="148" width="34" height="102" />
+  <text className="ts" x="322" y="141" textAnchor="middle">46</text>
+  <rect className="pv-bar2" x="345" y="138" width="34" height="112" />
+  <text className="ts" x="362" y="131" textAnchor="middle">50.2</text>
+  <text className="ts" x="322" y="270" textAnchor="middle">gemma-4-26b-a4b</text>
+  <rect className="pv-bar1" x="410" y="106" width="34" height="144" />
+  <text className="ts" x="427" y="99" textAnchor="middle">64.7</text>
+  <rect className="pv-bar3" x="450" y="130" width="34" height="120" />
+  <text className="ts" x="467" y="123" textAnchor="middle">53.8</text>
+  <rect className="pv-bar2" x="490" y="153" width="34" height="97" />
+  <text className="ts" x="507" y="146" textAnchor="middle">43.7</text>
+  <text className="ts" x="467" y="270" textAnchor="middle">Qwen3.6-35B-A3B</text>
+  <rect className="pv-bar1" x="555" y="208" width="34" height="42" />
+  <text className="ts" x="572" y="201" textAnchor="middle">18.7</text>
+  <rect className="pv-bar3" x="595" y="218" width="34" height="32" />
+  <text className="ts" x="612" y="211" textAnchor="middle">14.2</text>
+  <rect className="pv-bar2" x="635" y="218" width="34" height="32" />
+  <text className="ts" x="652" y="211" textAnchor="middle">14.4</text>
+  <text className="ts" x="612" y="270" textAnchor="middle">Qwen3.6-27B</text>
+  <rect className="pv-bar1" x="700" y="216" width="34" height="34" />
+  <text className="ts" x="717" y="209" textAnchor="middle">15.3</text>
+  <rect className="pv-bar3" x="740" y="225" width="34" height="25" />
+  <text className="ts" x="757" y="218" textAnchor="middle">11.2</text>
+  <rect className="pv-bar2" x="780" y="216" width="34" height="34" />
+  <text className="ts" x="797" y="209" textAnchor="middle">15.5</text>
+  <text className="ts" x="757" y="270" textAnchor="middle">gemma-4-31b</text>
+  <rect className="pv-bar1" x="104" y="304" width="16" height="11" />
+  <text className="ts" x="126" y="314">pie</text>
+  <rect className="pv-bar3" x="232" y="304" width="16" height="11" />
+  <text className="ts" x="254" y="314">mlx-lm</text>
+  <rect className="pv-bar2" x="360" y="304" width="16" height="11" />
+  <text className="ts" x="382" y="314">llama.cpp</text>
+  <text className="ts" x="830" y="314" textAnchor="end">M1 Max, 64 tokens, greedy, token fed back</text>
+</svg>
+<figcaption>
+pie is ahead of mlx-lm on all five and ahead of llama.cpp on four. gemma-4-31b
+is the exception at 15.3 against 15.5. On the like-for-like pair — pie's
+no-readback figure, which synchronizes per step as llama.cpp's does — both are
+15.5, and at weights that agree to 0.3% both land on the same fraction of the
+memory roof, 68.6% and 68.8%.
+</figcaption>
+</figure>
+
+#### Throughput
+
+<figure>
+<svg viewBox="0 0 860 330">
+  <line className="rail" x1="104" y1="205" x2="830" y2="205" />
+  <text className="ts" x="96" y="209" textAnchor="end">50</text>
+  <line className="rail" x1="104" y1="159" x2="830" y2="159" />
+  <text className="ts" x="96" y="163" textAnchor="end">100</text>
+  <line className="rail" x1="104" y1="114" x2="830" y2="114" />
+  <text className="ts" x="96" y="118" textAnchor="end">150</text>
+  <line className="rail" x1="104" y1="68" x2="830" y2="68" />
+  <text className="ts" x="96" y="72" textAnchor="end">200</text>
+  <line className="ln" x1="104" y1="250" x2="830" y2="250" />
+  <text className="ts" x="96" y="34" textAnchor="end">aggregate decode tok/s</text>
+  <rect className="pv-bar1" x="120" y="101" width="34" height="149" />
+  <text className="ts" x="137" y="94" textAnchor="middle">163.4</text>
+  <rect className="pv-bar3" x="160" y="103" width="34" height="147" />
+  <text className="ts" x="177" y="96" textAnchor="middle">161.8</text>
+  <rect className="pv-bar2" x="200" y="152" width="34" height="98" />
+  <text className="ts" x="217" y="145" textAnchor="middle">108.3</text>
+  <text className="ts" x="177" y="270" textAnchor="middle">gpt-oss-20b</text>
+  <rect className="pv-bar1" x="265" y="82" width="34" height="168" />
+  <text className="ts" x="282" y="75" textAnchor="middle">184.5</text>
+  <rect className="pv-bar3" x="305" y="90" width="34" height="160" />
+  <text className="ts" x="322" y="83" textAnchor="middle">176.1</text>
+  <rect className="pv-bar2" x="345" y="160" width="34" height="90" />
+  <text className="ts" x="362" y="153" textAnchor="middle">99.1</text>
+  <text className="ts" x="322" y="270" textAnchor="middle">gemma-4-26b-a4b</text>
+  <rect className="pv-bar1" x="410" y="216" width="34" height="34" />
+  <text className="ts" x="427" y="209" textAnchor="middle">37.6</text>
+  <rect className="pv-bar3" x="450" y="216" width="34" height="34" />
+  <text className="ts" x="467" y="209" textAnchor="middle">37.3</text>
+  <rect className="pv-bar2" x="490" y="236" width="34" height="14" />
+  <text className="ts" x="507" y="229" textAnchor="middle">14.9</text>
+  <text className="ts" x="467" y="270" textAnchor="middle">gemma-4-31b</text>
+  <rect className="pv-bar1" x="555" y="221" width="34" height="29" />
+  <text className="ts" x="572" y="214" textAnchor="middle">31.4</text>
+  <rect className="pv-bar3" x="595" y="211" width="34" height="39" />
+  <text className="ts" x="612" y="204" textAnchor="middle">43.1</text>
+  <rect className="pv-bar2" x="635" y="236" width="34" height="14" />
+  <text className="ts" x="652" y="229" textAnchor="middle">15.1</text>
+  <text className="ts" x="612" y="270" textAnchor="middle">Qwen3.6-27B</text>
+  <text className="ts" x="717" y="242" textAnchor="middle">gate fail</text>
+  <rect className="pv-bar3" x="740" y="52" width="34" height="198" />
+  <text className="ts" x="757" y="45" textAnchor="middle">217.8</text>
+  <rect className="pv-bar2" x="780" y="176" width="34" height="74" />
+  <text className="ts" x="797" y="169" textAnchor="middle">81.5</text>
+  <text className="ts" x="757" y="270" textAnchor="middle">Qwen3.6-35B-A3B</text>
+  <rect className="pv-bar1" x="104" y="304" width="16" height="11" />
+  <text className="ts" x="126" y="314">pie</text>
+  <rect className="pv-bar3" x="232" y="304" width="16" height="11" />
+  <text className="ts" x="254" y="314">mlx-lm</text>
+  <rect className="pv-bar2" x="360" y="304" width="16" height="11" />
+  <text className="ts" x="382" y="314">llama.cpp</text>
+  <text className="ts" x="830" y="314" textAnchor="end">M4 Pro, 8 concurrent sequences</text>
+</svg>
+<figcaption>
+Aggregate decode over eight concurrent sequences, all three engines on one
+machine. pie leads llama.cpp on every completed row and mlx-lm on three of
+four.
+</figcaption>
+</figure>
+
+At sixteen sequences the four rows that run are pie 255.3 / 184.6 / 75.7 / 68.4
+for gemma-4-26b-a4b / gpt-oss-20b / Qwen3.6-27B / gemma-4-31b, against mlx-lm
+210.1 / 206.4 / 53.0 / 47.1 and llama.cpp 137.1 / 134.1 / 32.2 / 43.8.
+
+**Two rows go the other way.** Qwen3.6-27B at eight is 31.4 against mlx-lm's
+43.1, and gpt-oss-20b at sixteen is 184.6 against 206.4. Neither is explained.
+pie wins Qwen3.6-27B at sixteen (75.7 against 53.0) and wins gpt-oss-20b at
+eight, so the losses are width-specific rather than model-specific. Both
+reproduce on re-measurement, so they are not run-to-run noise.
+
+The mlx-lm figures come from an in-process batched forward rather than from
+mlx-lm's server, whose accept loop starves under load. Its rows share one
+prompt cache and one causal length while pie's fleet members carry their own
+pages and may sit at different lengths, so the mlx-lm column is an upper bound
+on mlx at its most favourable shape.
+
+Qwen3.6-35B-A3B has no pie bar because it fails its batched-decode correctness
+gate from two sequences. mlx-lm passes the same check on that model at every
+width, so the defect is in pie's implementation of batched decode rather than
+in the model or the shape.
+
+#### The other two machines
+
+Same protocol, same five models. The M2 Max llama.cpp build was `10280` rather
+than `10270`, so that machine's llama.cpp arm is a separate experiment and is
+not tabulated.
+
+M4 Pro — prefill / decode tok/s:
+
+| Model | mlx-lm | pie | llama.cpp |
+|---|---:|---:|---:|
+| gpt-oss-20b | 559.2 / 81.7 | **636.0 / 86.3** | 557.8 / 69.9 |
+| gemma-4-26b-a4b | 609.7 / 70.1 | **698.4 / 74.5** | 496.1 / 48.9 |
+| gemma-4-31b | 102.8 / 12.7 | **113.4 / 13.3** | 111.4 / 13.2 |
+| Qwen3.6-27B | 120.8 / 14.6 | 114.3 / **15.2** | **124.7** / 13.3 |
+| Qwen3.6-35B-A3B | **598.1** / 72.4 | 472.4 / **77.6** | 451.2 / 44.5 |
+
+M2 Max — prefill / decode tok/s:
+
+| Model | mlx-lm | pie |
+|---|---:|---:|
+| gpt-oss-20b | 410.6 / 84.2 | **651.5 / 113.7** |
+| gemma-4-26b-a4b | 445.1 / 68.5 | **629.3 / 83.9** |
+| gemma-4-31b | 89.2 / 15.5 | **164.0 / 18.0** |
+| Qwen3.6-27B | 105.7 / 19.8 | **150.3 / 21.0** |
+| Qwen3.6-35B-A3B | 430.1 / 74.6 | **430.6 / 82.2** |
+
+Across the three machines pie is ahead of mlx-lm on decode in all fifteen runs,
+and on prefill in thirteen. Both prefill losses are Qwen3.6 on the M4 Pro, and
+they have one cause: `gdn_core_recurrent_prefill` is a sequential scan, 29–35%
+of that fire, strictly linear in tokens — 0.171, 0.506, 0.532 ms/token at 128,
+448, 1024 rows. Every other engine's prefill is a GEMM there. A wider chip
+turns that row from a loss into a draw, which is consistent with the cause
+rather than a fix for it.
+
+#### Machine to machine
+
+The three chips differ in what limits them, which is why the same model moves
+by different amounts between them.
+
+| | GPU cores | Memory | Measured streaming roof |
+|---|---:|---:|---:|
+| M1 Max | 24 | 32 GiB | 389.5 GB/s |
+| M2 Max | 38 | 64 GiB | 384.9 GB/s |
+| M4 Pro | 20 | 48 GiB | 254.2 GB/s |
+
+Decode at batch 1 is bandwidth-bound, so the share of the roof it reaches is
+the ceiling on any engine:
+
+| Model | | M1 Max | M2 Max | M4 Pro |
+|---|---|---:|---:|---:|
+| gemma-4-31b | dense | 68% | 81% | 91% |
+| Qwen3.6-27B | dense | 69% | 79% | 86% |
+| gpt-oss-20b | MoE | 41% | 58% | 67% |
+| gemma-4-26b-a4b | MoE | 35% | 47% | 63% |
+| Qwen3.6-35B-A3B | MoE | 28% | 36% | 51% |
+
+M1 Max to M2 Max separates the two halves cleanly. Prefill scales 1.59–1.62×
+against a GPU core ratio of 1.58, so prefill is compute-bound. The two
+machines' roofs are within 1.2% of each other, so the decode gain over the same
+span is not bandwidth — it is utilisation, 68–69% rising to 79–81% on the dense
+rows.
+
+The dense rows are near the ceiling, and no engine can win much there: on those
+rows llama.cpp and mlx-lm land within 5% of pie. The mixtures are not near it.
+A mixture reads too few bytes per token to hide its routing and dispatch, and
+that gap is the headroom left on every machine tested.
+
+#### What these runs do not settle
+
+- **Qwen3.6-35B-A3B fails its batched-decode correctness gate from two
+  sequences**, on all three machines and two GPU families. The defect predates
+  0.5.
+- **Qwen3.6-27B fails the same gate from fifteen sequences** on the M1 Max and
+  the M2 Max, but the same configuration ran and passed at sixteen on the M4
+  Pro. That inconsistency is unexplained. On the M2 Max the boundary is
+  somewhere in 10–15 and untested.
+- In the failing case member 0 is correct and every later member returns the
+  same wrong token as the others. Reassigning slots does not move it: the
+  failure follows the request index. That is consistent with the decode DAG
+  being bound once per fire at `token_row = 0` while twelve per-token ports
+  read from that base, but the specific port has not been named.
+- **gemma-4-31b's throughput on the M1 Max is a loss**, 17.9 against
+  llama.cpp's 24.0, where the M4 Pro chart above shows a win. The cause is a
+  tuning constant rather than a kernel: `qmm_min_batch` is 12, which holds that
+  row on the GEMV path past its crossover. Overriding it to 8 gives 30.0 on the
+  same binary. It has not been changed, because the constant is a device-wide
+  default shared with checkpoints that were not on that machine.
+- **The M2 Max numbers were taken while roughly 70 GiB was downloading.** Disk
+  contention pushed pie and mlx-lm down together, so the ratio is more
+  trustworthy than the absolute values. A quiet-host re-run is owed.
+- **The gpt-oss rows on the M2 Max understate that machine.** A sweep found
+  `moe_batch_min_per_expert = 4` beats the default 8 by 47% at 32 rows there,
+  against 2.7% noise. Every number here used the default; the change is not
+  landed because it is a device-wide family case.
+- A 2048-token prefill cannot be run on either Qwen3.6 model on any machine:
+  `kPagedMaxForwardTokensCeiling` is 1024 for that family. The refusal is
+  correct behaviour.
+- One llama.cpp arm used a non-stock quant (`UD-Q4_K_S`) because the stock file
+  did not fit the disk.
+- Nothing here is reproducible from a published harness yet.
+
+### KV-policy crossover
+
+Sweeps in
+[`bench_quest.py`](https://github.com/pie-project/pie/blob/dev/tests/inferlets/bench_quest.py)
+and [`bench_trackb.py`](https://github.com/pie-project/pie/blob/dev/tests/inferlets/bench_trackb.py)
+report the context length below which each policy costs more than it saves.
+
+| Policy | Crossover | Sweep |
+|---|---|---|
+| SnapKV | ~2.3K tokens | to 16384 |
+| Quest | ~4K tokens | to 16384 |
+| H2O | ~4.1K tokens | to 16384 |
+
+{/* TODO: re-measure before release; record hardware, model, batch size. */}
+
+### Bounds enforced by tests
+
+These are test assertions rather than measurements, but they bound the cost of
+two features described above.
+
+| Bound | Test |
+|---|---|
+| `.zt` parse overhead within 8× of safetensors | `loader/tests/ztensor_perf.rs` |
+| 16 GiB MoE on an 8 GiB device, output identical to resident | `worker/tests/cuda_moe_streaming.rs` |
+
+<div className="pv-part"><span>Part VI</span> Migrating</div>
+
+## Breaking changes
+
+- **Existing inferlets must be rewritten.** The eager `execute()` loop is
+  replaced by traced dataflows and channels.
+- **Samplers are no longer a WIT enum.** A sampler is an epilogue closure over
+  logits. The constraint layer is removed in favor of the grammar interface.
+- **The inferlet WIT surface is split** into `forward`, `forward-recurrent`, and
+  `forward-hybrid`. Inferlets select via `model.pass-kind()`.
+- **The vLLM, SGLang, TensorRT-LLM, and portable drivers are removed.**
+  `driver/` now contains `cuda`, `metal`, `dummy`, and `transport`. Their
+  reference documentation is removed with them.
+- **Repository layout.** The single `runtime/` crate, `server/`, and
+  `inferlets/` are replaced by a 55-crate workspace. `interface/` is the
+  dependency floor and holds the boundary contracts; `controller`, `gateway`,
+  and `worker` do not depend on one another.
+- **SDK spelling.** Tensor math uses operators rather than function calls; a
+  `take` is a tensor and a host readback is not a `take`; channels carry their
+  own identity; dtypes have a single lowercase spelling.
+- MCP and messaging documentation is removed.
+- `CHANGELOG.md` and `Dockerfile.cuda` are removed.
+
+{/* TODO: confirm whether MCP support itself is dropped or only its docs. */}
+
+## Smaller changes
+
+**Distributed control plane.** `controller` handles pairing, roles, and health.
+`driver/transport` is a worker-to-worker P2P KV-tensor data plane over
+NIXL/RDMA. The gateway exposes `POST /v1/generate` (SSE) and `GET /v1/ws`.
+
+**Grammar matcher** gains fork, rollback, and rollback capacity. Compiled
+grammars survive forks, which constrained speculative decoding and ASAP
+grammar-aligned decoding both require.
+
+**CLI.** `pie config init|show|set` with dot-path edits and a single `[[model]]`
+default; `pie model list|download|remove`; `pie driver list|doctor`;
+`pie serve`. `pie-env` prints the resolved config path, `$PIE_HOME`, log level,
+and metrics address without starting a daemon.
+
+**Sandboxing.** Per-instance filesystem and network policy objects in
+`runtime/engine/src/inferlet/sandbox.rs`.
+
+**Observability.** Tracing and OTLP metrics, including scheduler and fire
+timing.
+
+**Test infrastructure.** Tokenizer output is checked against official Hugging
+Face and tiktoken snapshots; model-config normalization has differential
+goldens; CI runs MLX parity validation; PTIR has golden traces, container
+mutation sweeps, and generated-artifact drift checks.
+
+**Model layer.** Chat templates, reasoning parsers, tool-call templates, and
+multimodal geometry moved into `runtime/model`.
+
+## Known gaps
+
+- Writing an inferlet that computes on tensors is harder than writing one that
+  did not. Shape and dtype errors surface at bind time rather than at the call
+  site that caused them.
+- Quest and TOVA compute their keep-sets but do not yet act on them.
+- The agent-orchestration, MCP, messaging, and multimodal examples from 0.4 have
+  no 0.5 counterpart, and there are no Python or JavaScript example inferlets.
+- No documentation for recurrent state.
+- No Metal driver reference page; `website/docs/reference/drivers/` contains
+  `cuda.mdx` only.
+- Benchmark numbers are preliminary, measured by us, and not yet reproducible
+  from a published harness.
+
+{/* TODO: preview build / install instructions. */}

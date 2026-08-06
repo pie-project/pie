@@ -1,0 +1,284 @@
+/* Styles for the standalone 0.5 preview page (src/pages/preview.mdx).
+   Scoped by the wrapperClassName set in that page's front matter. */
+
+/* The page reads as a standalone document: the navbar stays, the announcement
+   bar is suppressed in src/theme/AnnouncementBar, and the footer is already
+   homepage-only in src/theme/Footer. The right-hand table of contents is off
+   (hide_table_of_contents in the front matter), so the article takes the whole
+   row; constrain the measure so it does not run the full window width. */
+.preview-page .container {
+  max-width: 1000px;
+}
+
+/* Contents index. Below the breakpoint it is an ordinary list at the top of the
+   article; above it, it moves into the left margin and sticks, so the article
+   keeps the full measure. */
+.preview-page .pv-index {
+  margin: 2rem 0;
+}
+
+.preview-page .pv-index-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ifm-color-emphasis-600);
+  margin-bottom: 0.4rem;
+}
+
+.preview-page .pv-index-part {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--ifm-color-emphasis-600);
+  margin: 1rem 0 0.15rem;
+}
+
+.preview-page .pv-index-part:first-of-type {
+  margin-top: 0.4rem;
+}
+
+/* Part dividers. A rule with the part label sitting on it. */
+.preview-page .pv-part {
+  margin: 4.5rem 0 2rem;
+  padding-top: 1.4rem;
+  border-top: 1px solid var(--ifm-color-emphasis-300);
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--ifm-color-emphasis-800);
+}
+
+.preview-page .pv-part span {
+  display: inline-block;
+  margin-right: 0.55rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ifm-color-emphasis-600);
+}
+
+.preview-page .pv-part + p {
+  margin-top: -0.6rem;
+  color: var(--ifm-color-emphasis-700);
+}
+
+.preview-page .pv-part + h2,
+.preview-page .pv-part + p + h2 {
+  margin-top: 1.4rem;
+}
+
+@media (min-width: 1400px) {
+  .preview-page .pv-index {
+    position: fixed;
+    top: 7rem;
+    left: calc(50% - 690px);
+    width: 180px;
+    max-height: calc(100vh - 10rem);
+    overflow-y: auto;
+    margin: 0;
+    font-size: 0.82rem;
+    line-height: 1.35;
+  }
+
+  .preview-page .pv-index ul {
+    list-style: none;
+    padding-left: 0;
+    margin: 0;
+  }
+
+  .preview-page .pv-index li {
+    margin: 0.34rem 0;
+  }
+
+  .preview-page .pv-index a {
+    color: var(--ifm-color-emphasis-700);
+    text-decoration: none;
+  }
+
+  .preview-page .pv-index a:hover {
+    color: var(--ifm-color-primary);
+    text-decoration: none;
+  }
+}
+
+.preview-page figure {
+  margin: 2.2rem 0;
+  padding: 0;
+}
+
+.preview-page figure svg {
+  width: 100%;
+  max-width: 860px;
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+
+.preview-page figcaption {
+  color: var(--ifm-color-emphasis-700);
+  font-size: 0.85rem;
+  line-height: 1.55;
+  margin-top: 0.9rem;
+  max-width: 46em;
+}
+
+.preview-page table {
+  display: table;
+  width: 100%;
+}
+
+.preview-page svg .bx {
+  fill: var(--ifm-background-color);
+  stroke: var(--ifm-font-color-base);
+  stroke-width: 1.3;
+}
+
+.preview-page svg .bxf {
+  fill: var(--ifm-color-emphasis-200);
+  stroke: var(--ifm-font-color-base);
+  stroke-width: 1.3;
+}
+
+.preview-page svg .bxd {
+  fill: none;
+  stroke: var(--ifm-color-emphasis-500);
+  stroke-width: 1.3;
+  stroke-dasharray: 5 4;
+}
+
+.preview-page svg .ln {
+  stroke: var(--ifm-font-color-base);
+  stroke-width: 1.3;
+  fill: none;
+}
+
+.preview-page svg .lnd {
+  stroke: var(--ifm-color-emphasis-500);
+  stroke-width: 1.2;
+  stroke-dasharray: 5 4;
+  fill: none;
+}
+
+.preview-page svg .rail {
+  stroke: var(--ifm-color-emphasis-400);
+  stroke-width: 1.2;
+  fill: none;
+}
+
+.preview-page svg .t {
+  font-size: 14px;
+  fill: var(--ifm-font-color-base);
+}
+
+.preview-page svg .t2 {
+  font-size: 13px;
+  fill: var(--ifm-font-color-base);
+}
+
+.preview-page svg .tb {
+  font-size: 14px;
+  font-weight: 600;
+  fill: var(--ifm-font-color-base);
+}
+
+.preview-page svg .ts {
+  font-size: 12px;
+  fill: var(--ifm-color-emphasis-700);
+}
+
+.preview-page svg .dot {
+  fill: var(--ifm-font-color-base);
+}
+
+.preview-page svg .arrowhead {
+  fill: var(--ifm-font-color-base);
+}
+
+.preview-page svg .arrowhead-muted {
+  fill: var(--ifm-color-emphasis-500);
+}
+
+/* ── Animation ─────────────────────────────────────────────────────────
+   Diagrams animate with CSS only, so they work without JS and stop
+   entirely under prefers-reduced-motion. */
+
+.preview-page svg .pv-anim {
+  transform-box: view-box;
+  transform-origin: 0 0;
+}
+
+/* A time cursor sweeping across a device timeline. */
+@keyframes pv-sweep {
+  from { transform: translateX(0); }
+  to   { transform: translateX(600px); }
+}
+
+.preview-page svg .pv-cursor {
+  animation: pv-sweep 7s linear infinite;
+}
+
+.preview-page svg .pv-cursor line {
+  stroke: var(--ifm-color-primary);
+  stroke-width: 1.6;
+}
+
+.preview-page svg .pv-cursor-head {
+  fill: var(--ifm-color-primary);
+}
+
+/* Passes flowing along the pipeline rail. One slot pitch per period, so
+   the loop is seamless. */
+@keyframes pv-advance {
+  from { transform: translateX(0); }
+  to   { transform: translateX(100px); }
+}
+
+.preview-page svg .pv-flow {
+  animation: pv-advance 1.9s linear infinite;
+}
+
+/* Channel cells filling and draining. */
+@keyframes pv-cell {
+  0%, 44%   { fill: var(--ifm-color-emphasis-200); }
+  50%, 94%  { fill: var(--ifm-background-color); }
+  100%      { fill: var(--ifm-color-emphasis-200); }
+}
+
+.preview-page svg .pv-cell {
+  animation: pv-cell 4.8s linear infinite;
+}
+
+@keyframes pv-shift {
+  from { transform: translateX(0); }
+  to   { transform: translateX(72px); }
+}
+
+.preview-page svg .pv-head {
+  animation: pv-shift 4.8s steps(1, end) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .preview-page svg .pv-cursor,
+  .preview-page svg .pv-flow,
+  .preview-page svg .pv-cell,
+  .preview-page svg .pv-head {
+    animation: none;
+  }
+}
+
+/* Bar series for the benchmark charts. Three steps of the same
+   emphasis ramp, so they invert with the theme. */
+.preview-page svg .pv-bar1 {
+  fill: var(--ifm-color-emphasis-800);
+}
+
+.preview-page svg .pv-bar2 {
+  fill: var(--ifm-color-emphasis-500);
+}
+
+.preview-page svg .pv-bar3 {
+  fill: var(--ifm-color-emphasis-300);
+  stroke: var(--ifm-color-emphasis-500);
+  stroke-width: 1;
+}
