@@ -1333,7 +1333,10 @@ Measured 2026-08-06, one model per process, AC power, no thermal warning
 recorded. pie and mlx-lm read the same checkpoint directory from the same
 cache, so those two arms are the same weights; llama.cpp runs GGUF and is
 matched on bytes instead. Baselines: mlx 0.32.0 / mlx-lm 0.31.3, llama.cpp
-`10270`.
+`10270`. The latency and throughput figures on the reference machine come from
+two builds — `c2e579598` and `8b4cb156c` — because two batched-decode fixes
+landed between them. Those fixes moved nothing single-stream: gpt-oss-20b
+re-measured after them gives 523.8 / 84.3 against 525.0 / 83.0.
 
 llama.cpp was run on the GGUF closest in size to pie's LM-only bytes. It reads
 more bytes in every row (+0.3% to +8.9%), and decode is bandwidth-bound, so its
@@ -1415,85 +1418,88 @@ memory roof, 68.6% and 68.8%.
 
 <figure>
 <svg viewBox="0 0 860 330">
-  <line className="rail" x1="104" y1="205" x2="830" y2="205" />
-  <text className="ts" x="96" y="209" textAnchor="end">50</text>
-  <line className="rail" x1="104" y1="159" x2="830" y2="159" />
-  <text className="ts" x="96" y="163" textAnchor="end">100</text>
-  <line className="rail" x1="104" y1="114" x2="830" y2="114" />
-  <text className="ts" x="96" y="118" textAnchor="end">150</text>
-  <line className="rail" x1="104" y1="68" x2="830" y2="68" />
-  <text className="ts" x="96" y="72" textAnchor="end">200</text>
+  <line className="rail" x1="104" y1="212" x2="830" y2="212" />
+  <text className="ts" x="96" y="216" textAnchor="end">25</text>
+  <line className="rail" x1="104" y1="173" x2="830" y2="173" />
+  <text className="ts" x="96" y="177" textAnchor="end">50</text>
+  <line className="rail" x1="104" y1="135" x2="830" y2="135" />
+  <text className="ts" x="96" y="139" textAnchor="end">75</text>
+  <line className="rail" x1="104" y1="96" x2="830" y2="96" />
+  <text className="ts" x="96" y="100" textAnchor="end">100</text>
+  <line className="rail" x1="104" y1="58" x2="830" y2="58" />
+  <text className="ts" x="96" y="62" textAnchor="end">125</text>
   <line className="ln" x1="104" y1="250" x2="830" y2="250" />
   <text className="ts" x="96" y="34" textAnchor="end">aggregate decode tok/s</text>
-  <rect className="pv-bar1" x="120" y="101" width="34" height="149" />
-  <text className="ts" x="137" y="94" textAnchor="middle">163.4</text>
-  <rect className="pv-bar3" x="160" y="103" width="34" height="147" />
-  <text className="ts" x="177" y="96" textAnchor="middle">161.8</text>
-  <rect className="pv-bar2" x="200" y="152" width="34" height="98" />
-  <text className="ts" x="217" y="145" textAnchor="middle">108.3</text>
-  <text className="ts" x="177" y="270" textAnchor="middle">gpt-oss-20b</text>
-  <rect className="pv-bar1" x="265" y="82" width="34" height="168" />
-  <text className="ts" x="282" y="75" textAnchor="middle">184.5</text>
-  <rect className="pv-bar3" x="305" y="90" width="34" height="160" />
-  <text className="ts" x="322" y="83" textAnchor="middle">176.1</text>
-  <rect className="pv-bar2" x="345" y="160" width="34" height="90" />
-  <text className="ts" x="362" y="153" textAnchor="middle">99.1</text>
-  <text className="ts" x="322" y="270" textAnchor="middle">gemma-4-26b-a4b</text>
-  <rect className="pv-bar1" x="410" y="216" width="34" height="34" />
-  <text className="ts" x="427" y="209" textAnchor="middle">37.6</text>
-  <rect className="pv-bar3" x="450" y="216" width="34" height="34" />
-  <text className="ts" x="467" y="209" textAnchor="middle">37.3</text>
-  <rect className="pv-bar2" x="490" y="236" width="34" height="14" />
-  <text className="ts" x="507" y="229" textAnchor="middle">14.9</text>
-  <text className="ts" x="467" y="270" textAnchor="middle">gemma-4-31b</text>
-  <rect className="pv-bar1" x="555" y="221" width="34" height="29" />
-  <text className="ts" x="572" y="214" textAnchor="middle">31.4</text>
-  <rect className="pv-bar3" x="595" y="211" width="34" height="39" />
-  <text className="ts" x="612" y="204" textAnchor="middle">43.1</text>
-  <rect className="pv-bar2" x="635" y="236" width="34" height="14" />
-  <text className="ts" x="652" y="229" textAnchor="middle">15.1</text>
+  <rect className="pv-bar1" x="120" y="60" width="34" height="190" />
+  <text className="ts" x="137" y="53" textAnchor="middle">123.4</text>
+  <rect className="pv-bar3" x="160" y="102" width="34" height="148" />
+  <text className="ts" x="177" y="95" textAnchor="middle">96.3</text>
+  <rect className="pv-bar2" x="200" y="126" width="34" height="124" />
+  <text className="ts" x="217" y="119" textAnchor="middle">80.6</text>
+  <text className="ts" x="177" y="270" textAnchor="middle">Qwen3.6-35B-A3B</text>
+  <rect className="pv-bar1" x="265" y="83" width="34" height="167" />
+  <text className="ts" x="282" y="76" textAnchor="middle">108.5</text>
+  <rect className="pv-bar3" x="305" y="123" width="34" height="127" />
+  <text className="ts" x="322" y="116" textAnchor="middle">82.5</text>
+  <rect className="pv-bar2" x="345" y="107" width="34" height="143" />
+  <text className="ts" x="362" y="100" textAnchor="middle">92.9</text>
+  <text className="ts" x="322" y="270" textAnchor="middle">gpt-oss-20b</text>
+  <rect className="pv-bar1" x="410" y="84" width="34" height="166" />
+  <text className="ts" x="427" y="77" textAnchor="middle">107.9</text>
+  <rect className="pv-bar3" x="450" y="128" width="34" height="122" />
+  <text className="ts" x="467" y="121" textAnchor="middle">79.1</text>
+  <rect className="pv-bar2" x="490" y="112" width="34" height="138" />
+  <text className="ts" x="507" y="105" textAnchor="middle">89.6</text>
+  <text className="ts" x="467" y="270" textAnchor="middle">gemma-4-26b-a4b</text>
+  <rect className="pv-bar1" x="555" y="215" width="34" height="35" />
+  <text className="ts" x="572" y="208" textAnchor="middle">22.9</text>
+  <rect className="pv-bar3" x="595" y="228" width="34" height="22" />
+  <text className="ts" x="612" y="221" textAnchor="middle">14.1</text>
+  <rect className="pv-bar2" x="635" y="219" width="34" height="31" />
+  <text className="ts" x="652" y="212" textAnchor="middle">20</text>
   <text className="ts" x="612" y="270" textAnchor="middle">Qwen3.6-27B</text>
-  <text className="ts" x="717" y="242" textAnchor="middle">gate fail</text>
-  <rect className="pv-bar3" x="740" y="52" width="34" height="198" />
-  <text className="ts" x="757" y="45" textAnchor="middle">217.8</text>
-  <rect className="pv-bar2" x="780" y="176" width="34" height="74" />
-  <text className="ts" x="797" y="169" textAnchor="middle">81.5</text>
-  <text className="ts" x="757" y="270" textAnchor="middle">Qwen3.6-35B-A3B</text>
+  <rect className="pv-bar1" x="700" y="222" width="34" height="28" />
+  <text className="ts" x="717" y="215" textAnchor="middle">17.9</text>
+  <rect className="pv-bar3" x="740" y="232" width="34" height="18" />
+  <text className="ts" x="757" y="225" textAnchor="middle">12</text>
+  <rect className="pv-bar2" x="780" y="213" width="34" height="37" />
+  <text className="ts" x="797" y="206" textAnchor="middle">24</text>
+  <text className="ts" x="757" y="270" textAnchor="middle">gemma-4-31b</text>
   <rect className="pv-bar1" x="104" y="304" width="16" height="11" />
   <text className="ts" x="126" y="314">pie</text>
   <rect className="pv-bar3" x="232" y="304" width="16" height="11" />
   <text className="ts" x="254" y="314">mlx-lm</text>
   <rect className="pv-bar2" x="360" y="304" width="16" height="11" />
   <text className="ts" x="382" y="314">llama.cpp</text>
-  <text className="ts" x="830" y="314" textAnchor="end">M4 Pro, 8 concurrent sequences</text>
+  <text className="ts" x="830" y="314" textAnchor="end">M1 Max, 8 concurrent sequences</text>
 </svg>
 <figcaption>
-Aggregate decode over eight concurrent sequences, all three engines on one
-machine. pie leads llama.cpp on every completed row and mlx-lm on three of
-four.
+Aggregate decode over eight concurrent sequences, all three engines on the
+reference machine. pie leads mlx-lm on all five rows and llama.cpp on four.
 </figcaption>
 </figure>
 
-At sixteen sequences the four rows that run are pie 255.3 / 184.6 / 75.7 / 68.4
-for gemma-4-26b-a4b / gpt-oss-20b / Qwen3.6-27B / gemma-4-31b, against mlx-lm
-210.1 / 206.4 / 53.0 / 47.1 and llama.cpp 137.1 / 134.1 / 32.2 / 43.8.
+The one loss is gemma-4-31b, 17.9 against llama.cpp's 24.0, and it is a tuning
+constant rather than a kernel. `qmm_min_batch` is 12, which holds that row on
+the GEMV path past its crossover; overriding it to 8 gives 30.0 on the same
+binary, which would turn the loss into a 1.25× win. It has not been changed,
+because the constant is a device-wide default shared with checkpoints that were
+not on that machine.
 
-**Two rows go the other way.** Qwen3.6-27B at eight is 31.4 against mlx-lm's
-43.1, and gpt-oss-20b at sixteen is 184.6 against 206.4. Neither is explained.
-pie wins Qwen3.6-27B at sixteen (75.7 against 53.0) and wins gpt-oss-20b at
-eight, so the losses are width-specific rather than model-specific. Both
-reproduce on re-measurement, so they are not run-to-run noise.
+On the M4 Pro at the same width pie leads llama.cpp on all four completed rows
+but loses Qwen3.6-27B to mlx-lm, 31.4 against 43.1; at sixteen sequences it
+loses gpt-oss-20b, 184.6 against 206.4, while winning the other three. Both
+losses reproduce on re-measurement, and neither is explained.
 
 The mlx-lm figures come from an in-process batched forward rather than from
 mlx-lm's server, whose accept loop starves under load. Its rows share one
 prompt cache and one causal length while pie's fleet members carry their own
 pages and may sit at different lengths, so the mlx-lm column is an upper bound
-on mlx at its most favourable shape.
-
-Qwen3.6-35B-A3B has no pie bar because it fails its batched-decode correctness
-gate from two sequences. mlx-lm passes the same check on that model at every
-width, so the defect is in pie's implementation of batched decode rather than
-in the model or the shape.
+on mlx at its most favourable shape. On this machine mlx-lm barely batches a
+dense decode at all: Qwen3.6-27B returns 14.1 tok/s across eight sequences
+against 14.2 for a single stream, and it is not monotonic — batch 4 gives 17.4.
+That is why the ratios are widest on the rows where pie's absolute numbers are
+weakest.
 
 #### The other two machines
 
@@ -1564,24 +1570,27 @@ that gap is the headroom left on every machine tested.
 
 #### What these runs do not settle
 
-- **Qwen3.6-35B-A3B fails its batched-decode correctness gate from two
-  sequences**, on all three machines and two GPU families. The defect predates
-  0.5.
-- **Qwen3.6-27B fails the same gate from fifteen sequences** on the M1 Max and
-  the M2 Max, but the same configuration ran and passed at sixteen on the M4
-  Pro. That inconsistency is unexplained. On the M2 Max the boundary is
-  somewhere in 10–15 and untested.
-- In the failing case member 0 is correct and every later member returns the
-  same wrong token as the others. Reassigning slots does not move it: the
-  failure follows the request index. That is consistent with the decode DAG
-  being bound once per fire at `token_row = 0` while twelve per-token ports
-  read from that base, but the specific port has not been named.
-- **gemma-4-31b's throughput on the M1 Max is a loss**, 17.9 against
-  llama.cpp's 24.0, where the M4 Pro chart above shows a win. The cause is a
-  tuning constant rather than a kernel: `qmm_min_batch` is 12, which holds that
-  row on the GEMV path past its crossover. Overriding it to 8 gives 30.0 on the
-  same binary. It has not been changed, because the constant is a device-wide
-  default shared with checkpoints that were not on that machine.
+- **The M4 Pro and M2 Max tables predate two correctness fixes.** Batched
+  decode was wrong on both Qwen3.6 models until `8b4cb156c`, so those two
+  machines still carry empty cells where the reference machine now has numbers.
+  They have not been re-run. The two defects were unrelated: the mixture
+  dispatched `shared_expert_combine` at a flat grid, so every thread landed on
+  row 0 and later rows kept whatever the scratch pool held; the dense model
+  aliased the linear-attention convolution state onto itself, which is a race
+  and therefore starts losing at a width that differs per machine. Neither is
+  reachable from a fire of one, which is why single-stream gates passed over
+  both for as long as they existed.
+- **Concurrency 16 is not reached on the M1 Max**, now for capacity rather than
+  correctness: Qwen3.6-27B's linear state is 170 MiB a slot, so fifteen is the
+  widest fleet that checkpoint holds on 32 GiB.
+- **The host fit check currently refuses four of the five models on the M1
+  Max**, models this document measured on that machine. It predicts a 30.18 GiB
+  peak where 25.25 GiB is measured, because it adds the load-time staging
+  transient to the elastic pools even though those fill after the staging
+  mapping is gone — two peaks at different times. The term is conservative by
+  about 20% here, but it was added in response to six kernel panics on a 48 GiB
+  machine and is not being relaxed on one counter-example. **Until this is
+  reconciled the protocol cannot be re-run on the reference machine.**
 - **The M2 Max numbers were taken while roughly 70 GiB was downloading.** Disk
   contention pushed pie and mlx-lm down together, so the ratio is more
   trustworthy than the absolute values. A quiet-host re-run is owed.
@@ -1688,5 +1697,9 @@ multimodal geometry moved into `runtime/model`.
   `cuda.mdx` only.
 - Benchmark numbers are preliminary, measured by us, and not yet reproducible
   from a published harness.
+- The Metal host fit check is conservative enough to refuse models that run.
+  It adds the load-time staging transient to pools that fill only after that
+  mapping is released, so it describes a peak that does not occur. On a 32 GiB
+  M1 Max it refuses four of five measured models.
 
 {/* TODO: preview build / install instructions. */}
