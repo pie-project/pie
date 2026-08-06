@@ -577,6 +577,72 @@ struct PieForwardQwen35CudaFacts {
   uint8_t verify_stash;
 };
 
+/// One row of a fire as the engine's seriation ordered them — the input
+/// side of `lower`.
+///
+/// Flags rather than a bitfield because the driver fills this per row per
+/// fire and a named field is what keeps a filler honest; `depth_k` is
+/// negative for a full-depth row.
+struct PieForwardRow {
+  uint8_t multi_token;
+  uint8_t custom_mask;
+  uint8_t hooked;
+  uint8_t lora;
+  uint8_t write_desc;
+  uint8_t wants_scores;
+  /// This row's logits are read (the fire's sampled set).
+  uint8_t samples;
+  uint8_t _pad;
+  /// Truncated at this layer, or negative for full depth.
+  int32_t depth_k;
+};
+
+/// One rectangle of the flat launch list.
+///
+/// `kernel_name` indexes the table handed back beside the launches, NOT
+/// the plan's name table: a lowering names launcher SYMBOLS, and the
+/// plan's names are weights.
+///
+/// `row_lo/row_hi` are read in the op's own row space — tokens for the
+/// body, requests for the epilogue.
+struct PieForwardLaunch {
+  /// The statement this rectangle came from — an index into the plan's
+  /// ops, and what a shadow comparison keys on.
+  uint32_t at_op;
+  uint32_t kernel_name;
+  uint32_t row_lo;
+  uint32_t row_hi;
+  uint16_t layer_lo;
+  uint16_t layer_hi;
+};
+
+/// Zero is a lowering; every other value is a group that should not have
+/// been formed (an ADMISSION answer, not a runtime fire split).
+enum class PieForwardUncovered : uint32_t {
+  None = 0,
+  Rows = 1,
+  WholeKernelSplit = 2,
+  Discontiguous = 3,
+  UnknownBackend = 4,
+};
+
+/// The flat launch list for one fire, pointing into storage the plan owns
+/// until the next `pie_forward_lower` on the same plan.
+struct PieForwardLowered {
+  const PieForwardLaunch *launches;
+  size_t launches_len;
+  /// The distinct launcher symbols, in first-launch order; entries
+  /// substring `kernel_name_bytes`.
+  const PieForwardName *kernel_names;
+  size_t kernel_names_len;
+  PieForwardBytes kernel_name_bytes;
+  /// Peak activation bytes the frame would need.
+  size_t arena_bytes;
+  /// Non-zero when the fire could not be lowered; `launches` is then
+  /// empty and the value says which rule refused.
+  PieForwardUncovered uncovered;
+};
+
 extern "C" {
 
 /// Trace the llama_like family against `facts` and publish the traced form
@@ -721,6 +787,29 @@ PieForwardStatus pie_forward_trace_qwen3_5_hybrid_cuda(const PieForwardQwen35Hyb
 /// `plan` is null, or points at a writable header that is empty or was
 /// filled by [`pie_forward_trace_llama_like`].
 void pie_forward_release(PieForwardPlan *plan);
+
+/// Lower a traced plan over one fire's rows — the SHADOW comparison's
+/// Rust half (`.wiki/tart/dsl.md` migration step 6).
+///
+/// The driver walks a nested region IR; `lower` produces the flat launch
+/// list meant to replace it. Calling both on the same fire and comparing
+/// is how the replacement earns the right to happen.
+///
+/// It EXECUTES NOTHING. The result describes what would run.
+///
+/// `*out` points into storage the plan owns, valid until the next call on
+/// the SAME plan (one slot). Copy or compare before calling again; do not
+/// free it — `pie_forward_release` does, with the plan.
+///
+/// # Safety
+///
+/// `plan` is null or points at a writable header built by a trace entry
+/// point and not yet released; `rows` is null or points at `rows_len`
+/// readable `PieForwardRow`s; `out` is null or a writable slot.
+PieForwardStatus pie_forward_lower(PieForwardPlan *plan,
+                                   const PieForwardRow *rows,
+                                   size_t rows_len,
+                                   PieForwardLowered *out);
 
 }  // extern "C"
 

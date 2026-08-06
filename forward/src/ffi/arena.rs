@@ -24,13 +24,28 @@ use super::types::*;
 /// The vectors are frozen once [`build`] returns: the published slices point
 /// into their heap buffers, which moving or boxing the arena does not
 /// disturb (the same property `loader/src/ffi/arena.rs` relies on).
-#[derive(Default)]
 pub struct PlanArena {
     values: Vec<PieForwardValue>,
     ops: Vec<PieForwardOp>,
     value_ids: Vec<u32>,
     names: Vec<PieForwardName>,
     name_bytes: Vec<u8>,
+    /// The TRACED form the wire arrays were flattened from, kept so the
+    /// lowering can be asked for later (`pie_forward_lower`). The wire
+    /// form is lossy on purpose — it is what the driver's walk needs —
+    /// and `lower` reads the plan, not the walk's view of it.
+    ///
+    /// Costs one plan per model, which is what the driver already holds
+    /// one of.
+    plan: ForwardPlan,
+    /// The last lowering asked for, kept alive so the launch list handed
+    /// back can point at its kernel names instead of copying them. One
+    /// slot: the shadow compares a fire and moves on, and a second ask
+    /// invalidates the first — which is stated on `pie_forward_lower`.
+    shadow: Option<crate::lower::Lowered>,
+    shadow_wire: Vec<super::types::PieForwardLaunch>,
+    shadow_names: Vec<PieForwardName>,
+    shadow_name_bytes: Vec<u8>,
 }
 
 /// Interns strings into the arena's name table during a build.
@@ -442,7 +457,18 @@ fn flatten_op(
 /// the caller (or the C caller holding the header) must hand it to
 /// [`release`].
 pub fn build(plan: &ForwardPlan) -> PieForwardPlan {
-    let mut arena = PlanArena::default();
+    let mut arena = PlanArena {
+        values: Vec::new(),
+        ops: Vec::new(),
+        value_ids: Vec::new(),
+        names: Vec::new(),
+        name_bytes: Vec::new(),
+        plan: plan.clone(),
+        shadow: None,
+        shadow_wire: Vec::new(),
+        shadow_names: Vec::new(),
+        shadow_name_bytes: Vec::new(),
+    };
     let mut interner = Interner::default();
 
     let family = interner.intern(&mut arena, &plan.family);
@@ -562,4 +588,87 @@ pub(crate) mod view {
         std::str::from_utf8(&bytes[entry.offset as usize..(entry.offset + entry.len) as usize])
             .expect("name table holds UTF-8")
     }
+}
+
+/// Lower `plan` over `rows` and publish the result in the plan's own
+/// arena, so the returned view outlives the call without copying.
+///
+/// The previous lowering is dropped: one slot, because the shadow
+/// compares a fire and moves on. A caller holding an older
+/// [`PieForwardLowered`] across a second call is reading freed storage,
+/// which is why the entry point says so.
+pub fn lower(
+    header: &mut PieForwardPlan,
+    rows: &[crate::lower::Row],
+) -> PieForwardLowered {
+    if header.owner.is_null() {
+        return PieForwardLowered::default();
+    }
+    // Borrowed, not taken: `release` still owns the box.
+    let arena = unsafe { &mut *header.owner.cast::<PlanArena>() };
+
+    let lowered = match crate::lower::lower(&arena.plan, rows) {
+        Ok(lowered) => lowered,
+        Err(why) => {
+            arena.shadow = None;
+            arena.shadow_wire.clear();
+            arena.shadow_names.clear();
+            arena.shadow_name_bytes.clear();
+            return PieForwardLowered {
+                uncovered: match why {
+                    crate::lower::Uncovered::Rows { .. } => PieForwardUncovered::Rows,
+                    crate::lower::Uncovered::WholeKernelSplit { .. } => {
+                        PieForwardUncovered::WholeKernelSplit
+                    }
+                    crate::lower::Uncovered::Discontiguous { .. } => {
+                        PieForwardUncovered::Discontiguous
+                    }
+                    crate::lower::Uncovered::UnknownBackend(_) => {
+                        PieForwardUncovered::UnknownBackend
+                    }
+                },
+                ..PieForwardLowered::default()
+            };
+        }
+    };
+
+    arena.shadow_wire.clear();
+    arena.shadow_wire.reserve(lowered.launches.len());
+    for launch in &lowered.launches {
+        arena.shadow_wire.push(PieForwardLaunch {
+            at_op: launch.args,
+            kernel_name: launch.kernel as u32,
+            row_lo: launch.rows.start,
+            row_hi: launch.rows.end,
+            layer_lo: launch.layers.start,
+            layer_hi: launch.layers.end,
+        });
+    }
+    arena.shadow_names.clear();
+    arena.shadow_name_bytes.clear();
+    for name in &lowered.kernels {
+        let offset = arena.shadow_name_bytes.len() as u32;
+        arena.shadow_name_bytes.extend_from_slice(name.as_bytes());
+        arena.shadow_names.push(PieForwardName {
+            offset,
+            len: name.len() as u32,
+        });
+    }
+
+    let view = PieForwardLowered {
+        launches: arena.shadow_wire.as_ptr(),
+        launches_len: arena.shadow_wire.len(),
+        kernel_names: arena.shadow_names.as_ptr(),
+        kernel_names_len: arena.shadow_names.len(),
+        kernel_name_bytes: PieForwardBytes {
+            ptr: arena.shadow_name_bytes.as_ptr(),
+            len: arena.shadow_name_bytes.len(),
+        },
+        arena_bytes: lowered.arena_bytes,
+        uncovered: PieForwardUncovered::None,
+    };
+    // Kept so a debugger (and any later accessor) can reach the residue
+    // and rectangle count the wire form does not carry.
+    arena.shadow = Some(lowered);
+    view
 }

@@ -10,7 +10,7 @@ use super::arena::{self, view};
 use super::entry::{
     PieForwardLlamaLikeCudaFacts, PieForwardLlamaLikeFacts, PieForwardQwen35CudaFacts,
     PieForwardQwen35FullAttnFacts, PieForwardQwen35GdnFacts, PieForwardQwen35HybridFacts,
-    PieForwardQwen35MoeMlpFacts, PieForwardStatus, pie_forward_release,
+    PieForwardQwen35MoeMlpFacts, PieForwardStatus, pie_forward_lower, pie_forward_release,
     pie_forward_trace_llama_like, pie_forward_trace_llama_like_cuda,
     pie_forward_trace_qwen3_5_full_attn, pie_forward_trace_qwen3_5_gdn,
     pie_forward_trace_qwen3_5_hybrid, pie_forward_trace_qwen3_5_hybrid_cuda,
@@ -1193,4 +1193,147 @@ fn lowered_trace_round_trips_through_the_arena() {
         unsafe { pie_forward_trace_llama_like_cuda(&facts, &cuda, 2, &mut out2) },
         PieForwardStatus::InvalidArgument
     );
+}
+
+
+// ── The lowering across the C ABI (the shadow's Rust half) ─────────────
+
+fn lowered_view(out: &PieForwardLowered) -> Vec<(String, u32, u32, u32)> {
+    if out.launches.is_null() {
+        return Vec::new();
+    }
+    let launches = unsafe { std::slice::from_raw_parts(out.launches, out.launches_len) };
+    let names = unsafe { std::slice::from_raw_parts(out.kernel_names, out.kernel_names_len) };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(out.kernel_name_bytes.ptr, out.kernel_name_bytes.len) };
+    launches
+        .iter()
+        .map(|l| {
+            let n = names[l.kernel_name as usize];
+            let name = std::str::from_utf8(
+                &bytes[n.offset as usize..n.offset as usize + n.len as usize],
+            )
+            .expect("kernel names are utf8")
+            .to_string();
+            (name, l.at_op, l.row_lo, l.row_hi)
+        })
+        .collect()
+}
+
+fn plain_c_rows(n: usize) -> Vec<PieForwardRow> {
+    vec![
+        PieForwardRow {
+            samples: 1,
+            depth_k: -1,
+            ..PieForwardRow::default()
+        };
+        n
+    ]
+}
+
+fn traced_cuda_decode() -> PieForwardPlan {
+    let facts = c_facts_qwen3();
+    let cuda = PieForwardLlamaLikeCudaFacts {
+        xqa_decode: 0,
+        decode_fused_post: 1,
+        rope_table: 1,
+        force_prefill_path: 0,
+        head_dim_padded: 0,
+        gate_up_fused: 1,
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like_cuda(&facts, &cuda, /*Decode=*/ 0, &mut out) },
+        PieForwardStatus::Ok
+    );
+    out
+}
+
+/// The flat launch list crosses the ABI, names its kernels, and covers
+/// every row of a plain fire — the shadow comparison's input.
+#[test]
+fn the_lowering_crosses_the_abi() {
+    let mut plan = traced_cuda_decode();
+    let rows = plain_c_rows(4);
+    let mut out = PieForwardLowered::default();
+    assert_eq!(
+        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), &mut out) },
+        PieForwardStatus::Ok
+    );
+    assert_eq!(out.uncovered, PieForwardUncovered::None);
+    assert!(out.arena_bytes > 0);
+
+    let view = lowered_view(&out);
+    assert!(!view.is_empty());
+    // The body's rectangles cover the whole fire; the epilogue's run in
+    // the Requests row space, which for an all-sampled fire is the same
+    // four rows.
+    assert!(view.iter().all(|(_, _, lo, hi)| *lo == 0 && *hi == 4));
+    // Both the stated kernels and the semantic statements' launchers are
+    // named — the list is what the fire RUNS, not what it states.
+    assert!(view.iter().any(|(k, ..)| k == "dispatch_attention_flashinfer_decode"));
+    assert!(view.iter().any(|(k, ..)| k == "launch_chunked_swiglu_bf16"));
+    assert!(view.iter().any(|(k, ..)| k == "gemm_act_x_w"));
+    // Every rectangle points at a real statement.
+    let ops = view::ops(&plan).len() as u32;
+    assert!(view.iter().all(|(_, at, ..)| *at < ops));
+
+    unsafe { pie_forward_release(&mut plan) };
+}
+
+/// A row order the seriation could not have produced is refused across
+/// the ABI too — and refusing leaves an EMPTY list rather than a partial
+/// one, so a caller that ignores the code cannot read half a fire.
+#[test]
+fn an_uncoverable_fire_crosses_as_a_reason() {
+    let mut plan = traced_cuda_decode();
+    let mut rows = plain_c_rows(8);
+    rows[1].custom_mask = 1;
+    rows[5].custom_mask = 1;
+    let mut out = PieForwardLowered::default();
+    assert_eq!(
+        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), &mut out) },
+        PieForwardStatus::Ok
+    );
+    assert_eq!(out.uncovered, PieForwardUncovered::Discontiguous);
+    assert_eq!(out.launches_len, 0);
+    assert!(lowered_view(&out).is_empty());
+
+    unsafe { pie_forward_release(&mut plan) };
+}
+
+/// The masked suffix reaches the driver as its own rectangles — the
+/// thing the flat ABI buys, seen from C.
+#[test]
+fn the_mask_split_crosses_as_rectangles() {
+    let mut plan = traced_cuda_decode();
+    let mut rows = plain_c_rows(8);
+    for r in &mut rows[6..] {
+        r.custom_mask = 1;
+    }
+    let mut out = PieForwardLowered::default();
+    assert_eq!(
+        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), &mut out) },
+        PieForwardStatus::Ok
+    );
+    let view = lowered_view(&out);
+    assert!(view.iter().any(|(_, _, lo, hi)| *lo == 6 && *hi == 8));
+    assert!(view.iter().any(|(_, _, lo, hi)| *lo == 0 && *hi == 6));
+
+    unsafe { pie_forward_release(&mut plan) };
+}
+
+/// A released plan is not a lowering source, and asking is a no-op
+/// rather than a dereference of freed storage.
+#[test]
+fn a_released_plan_lowers_to_nothing() {
+    let mut plan = traced_cuda_decode();
+    unsafe { pie_forward_release(&mut plan) };
+    let rows = plain_c_rows(2);
+    let mut out = PieForwardLowered::default();
+    assert_eq!(
+        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), &mut out) },
+        PieForwardStatus::Ok
+    );
+    assert_eq!(out.launches_len, 0);
 }
