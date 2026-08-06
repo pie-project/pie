@@ -110,6 +110,11 @@ pub struct TuneArgs {
 
     /// The inferlet to drive the load with, e.g. `generate@0.1.0`.
     /// `pie inferlet list` shows what is available.
+    ///
+    /// It has to accept a BARE TOKEN COUNT as its input — the sweep launches
+    /// every lane with `"256"`, not with a JSON object (see `lane_inputs`).
+    /// An inferlet whose input is a struct fails every lane with a parse
+    /// error, which the warmup now prints verbatim.
     #[arg(long)]
     pub program: String,
 
@@ -955,6 +960,7 @@ calibrate_planner = true
             budget: None,
             write: false,
             skip_planner: false,
+            calibrate_only: false,
         };
         let resolved = args.workload(Objective::Latency);
         assert_eq!(resolved.fleet, 7, "an explicit flag wins");
