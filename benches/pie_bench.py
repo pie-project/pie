@@ -415,6 +415,13 @@ def build_config(args: argparse.Namespace):
             # falls back to max_forward_requests (R), which the 4096 floor
             # already covers for any R <= 1024.
             wasm_max_instances=max(4096, (max_concurrent_processes or 0) * 4),
+            # Prepared-but-idle guest slots. The engine's default is 100, which
+            # is below the fleet width every contended cell here runs at, so a
+            # run with request turnover instantiates from cold for most of its
+            # arrivals. Exposed to measure that, not because a default is known
+            # to be wrong.
+            **({"wasm_warm_slots": args.wasm_warm_slots}
+               if getattr(args, "wasm_warm_slots", None) else {}),
             **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
         model=ModelConfig(
@@ -1347,6 +1354,9 @@ def build_parser() -> argparse.ArgumentParser:
         # guarding a block by one member silently drops the rest, which is how
         # the frame-geometry flags were added and then never appeared.
         for flag, dest, helptext in (
+            ("--wasm-warm-slots", "wasm_warm_slots",
+             "Prepared-but-idle guest slots kept for fast respawn. "
+             "Default: the engine's (100)."),
             ("--frame-size", "frame_size",
              "Waves per frame (k). Default: the engine's."),
             ("--frame-submit-depth", "frame_submit_depth",
