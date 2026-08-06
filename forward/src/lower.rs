@@ -761,13 +761,22 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
             Semantic::Unlowered("the fused-gate_up binding fact is not in the facts")
         }
 
-        // The router: one launch, two results. Stated by
-        // `dsl::cuda::topk`; the SEMANTIC `TopK` is still opaque, so a
-        // trace that has not been given a CUDA reading reaches here and
-        // is refused by name rather than covered by accident.
-        TopK { .. } => {
-            Semantic::Unlowered("the MoE branch has no CUDA text yet (dsl::cuda::topk states the kernel)")
-        }
+        // The MoE branch's three statements, each refused BY NAME until
+        // `moe_mlp_body_cuda` states its kernel. They are grouped here
+        // because they share one cause, and a residue ledger that says
+        // "no lowering rule for this kind" three times would read as
+        // three gaps instead of one missing text.
+        TopK { .. } => Semantic::Unlowered(
+            "the MoE branch has no CUDA text yet (dsl::cuda::topk states the kernel)",
+        ),
+        WeightedSum { .. } => Semantic::Unlowered(
+            "the MoE combine has two forms (token-batched vs per-expert \
+             scatter-add, and a fused +residual); the CUDA text has to \
+             state which, as the swiglu binding does",
+        ),
+        SigmoidGateAdd => Semantic::Unlowered(
+            "the shared-expert landing awaits the MoE branch's CUDA text",
+        ),
 
         // Handled by `Lowerer::epilogue`, which needs the row counts and
         // so cannot answer from the kind alone.
