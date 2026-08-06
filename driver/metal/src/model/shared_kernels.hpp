@@ -29,7 +29,7 @@ struct RowGatherParams {    // row_gather.metal       (buffer 3)
     std::uint32_t count;
 };
 #include "../kernels/moe_params.h"
-static_assert(sizeof(RouterParams) == 8);
+static_assert(sizeof(RouterParams) == 12);
 static_assert(sizeof(ExpertCombineParams) == 8);
 static_assert(sizeof(MoeRouteParams) == 24);
 
