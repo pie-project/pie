@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import tomllib
@@ -1539,8 +1540,47 @@ def run_data_parallel(args):
     return summary, merged
 
 
+def refuse_if_a_wedged_pie_is_still_dying() -> None:
+    """Abort rather than launch alongside a `pie` the kernel cannot reap.
+
+    When the Metal driver gives up waiting on an event it abandons the
+    context, because the command buffers may still be executing and
+    releasing their heaps would be unsafe. The process then blocks in the
+    kernel on GPU work forever: it shows up in state `?E`, RSS 0,
+    reparented to launchd, and `kill -9` will not touch it. Its memory is
+    never returned.
+
+    That makes a retry actively harmful. The dead run still holds its
+    share of a unified-memory machine, so the next run starts with less
+    than the last one, wedges sooner, and leaves a second corpse. Three
+    attempts can take a 48 GB box down to single-digit gigabytes. Free
+    memory reads healthy right up until it doesn't, because the pages a
+    wedged context holds are not accounted to any live process.
+
+    So we do not wait, and we do not retry — neither can work. We say
+    what is wrong and that only a reboot fixes it.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        out = subprocess.run(["ps", "-eo", "pid,stat,comm"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return
+    wedged = [line.split()[0] for line in out.splitlines()[1:]
+              if "(pie)" in line and "E" in line.split()[1]]
+    if wedged:
+        raise SystemExit(
+            f"pie_bench: refusing to start — {len(wedged)} wedged pie "
+            f"process(es) still hold GPU memory: {', '.join(wedged)}.\n"
+            "They are blocked in the kernel awaiting GPU work and cannot be "
+            "killed; their memory is unreclaimable. Retrying will only add "
+            "another. Reboot the machine.")
+
+
 def main() -> None:
     args = build_parser().parse_args()
+    refuse_if_a_wedged_pie_is_still_dying()
     if args.dp_size > 1:
         summary, results = run_data_parallel(args)
     else:
