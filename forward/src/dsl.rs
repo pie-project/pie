@@ -1569,6 +1569,140 @@ pub mod cuda {
         .expect("fused post produces q")
     }
 
+    // ── gemma-4 ────────────────────────────────────────────────────
+    //
+    // The vocabulary the third family needs and the first two did not.
+    // Every one of these is a kernel the hand-written `gemma4.cpp`
+    // already fires; what is new is that a declaration can name it.
+
+    /// `kernels::launch_{chunked_,}geglu_tanh_bf16`: gemma-4's MLP
+    /// activation. `gelu_pytorch_tanh` on the gate, not SiLU — a
+    /// different function, so a different kernel, and NOT a variant of
+    /// [`swiglu`].
+    ///
+    /// `packed` splits the same way swiglu's does: a bound gate‖up bank
+    /// lands one buffer and takes the chunked form. gemma-4 states the
+    /// binding as a fact for the same reason llama_like does.
+    pub fn geglu_tanh(x: &Val, intermediate: u32, packed: bool) -> Val {
+        record(
+            &x.t,
+            x.layer,
+            if packed {
+                "launch_chunked_geglu_tanh_bf16"
+            } else {
+                "launch_geglu_tanh_bf16"
+            },
+            vec![],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the activation produces its value")
+    }
+
+    /// `kernels::launch_rmsnorm_no_scale_bf16`: `v / rms(v)` per head,
+    /// with NO learnable weight — gemma-4's V-norm.
+    ///
+    /// Weightless, so it takes no [`NormW`]: a norm handle contributes a
+    /// name and a layer, and this kernel reads neither. That is also why
+    /// it cannot be the semantic `Rmsnorm` with a variant — there is no
+    /// gamma for a variant to describe.
+    pub fn rmsnorm_no_scale(x: &Val) -> Val {
+        let out = (x.t.inner.borrow().value_shape(x.id), DType::BF16);
+        record(
+            &x.t,
+            x.layer,
+            "launch_rmsnorm_no_scale_bf16",
+            vec![],
+            None,
+            vec![x.id],
+            Some(out),
+        )
+        .expect("the norm produces its value")
+    }
+
+    /// `kernels::launch_rmsnorm_residual_add_scale_rmsnorm_bf16`: FOUR
+    /// statements in one launch — norm `x`, add it to the stream, scale
+    /// the result, then norm THAT with the next weight.
+    ///
+    /// The last of those four is the next block's input norm, which is
+    /// why gemma-4's per-layer body appears to be missing one: the fused
+    /// kernel already produced it. A declaration that named the four
+    /// separately would be naming a shape the driver does not run.
+    ///
+    /// Returns `(hidden, norm_out)` — the landed residual and the norm
+    /// the next block consumes.
+    pub fn norm_residual_scale_norm(
+        x: &Val,
+        w: &NormW,
+        next: &NormW,
+        hidden: u32,
+    ) -> (Val, Val) {
+        let shape = (Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16);
+        let ids = x.t.with(w.layer, |b| {
+            b.launch(
+                "launch_rmsnorm_residual_add_scale_rmsnorm_bf16",
+                vec![w.name.clone(), next.name.clone()],
+                None,
+                vec![x.id],
+                vec![shape.clone(), shape],
+            )
+        });
+        let mk = |id| Val {
+            t: x.t.clone(),
+            id,
+            layer: w.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kernels::launch_rmsnorm_residual_add_bf16`: the two-statement
+    /// form — norm, then land on the stream. gemma-4's
+    /// post-feedforward norm, where no next-block norm follows to fuse.
+    pub fn norm_residual_add(x: &Val, w: &NormW, hidden: u32) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "launch_rmsnorm_residual_add_bf16",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
+        )
+        .expect("the fused norm+residual produces its value")
+    }
+
+    /// `kernels::launch_scalar_mul_bf16`: multiply by a load-time
+    /// constant. gemma-4 uses it three times in the PLE prologue and
+    /// once on the embedding (`sqrt(hidden)`), and the constants are all
+    /// derived from dims — so the SCALE is not an operand, it is part of
+    /// which statement this is.
+    pub fn scalar_mul(x: &Val) -> Val {
+        let out = (x.t.inner.borrow().value_shape(x.id), DType::BF16);
+        record(&x.t, x.layer, "launch_scalar_mul_bf16", vec![], None, vec![x.id], Some(out))
+            .expect("the scale produces its value")
+    }
+
+    /// `kernels::launch_logit_softcap_bf16`: `cap * tanh(x / cap)` over
+    /// the logits. A load-time fact decides whether it runs at all
+    /// (`final_logit_softcapping`), so its presence is a trace-time
+    /// match, not a branch.
+    pub fn logit_softcap(x: &Val, vocab: u32) -> Val {
+        record(
+            &x.t,
+            None,
+            "launch_logit_softcap_bf16",
+            vec![],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::BF16)),
+        )
+        .expect("the softcap produces its value")
+    }
+
     /// `kernels::launch_topk_softmax_bf16`: the router's top-k + softmax +
     /// renormalize, one launch, two results — expert indices
     /// (`[Tokens, k]` i32, the `dyn` value every expert-indexed statement

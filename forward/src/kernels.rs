@@ -181,6 +181,22 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(chunked_swiglu "launch_chunked_swiglu_bf16"),
     kernel!(swiglu "launch_swiglu_bf16"),
 
+    // ── gemma-4 ────────────────────────────────────────────────────
+    // GeGLU-tanh is not a swiglu variant: `gelu_pytorch_tanh` on the
+    // gate is a different function. The packed/pair split is the same
+    // binding question.
+    kernel!(geglu_tanh "launch_geglu_tanh_bf16"),
+    kernel!(chunked_geglu_tanh "launch_chunked_geglu_tanh_bf16"),
+    // Weightless per-head norm (the V-norm) — no gamma, so no variant.
+    kernel!(rmsnorm_no_scale "launch_rmsnorm_no_scale_bf16"),
+    // Four statements in one launch, and two: gemma-4 fuses the next
+    // block's input norm into the previous block's landing, which is why
+    // its layer body appears to be missing one.
+    kernel!(norm_residual_scale_norm "launch_rmsnorm_residual_add_scale_rmsnorm_bf16"),
+    kernel!(norm_residual_add "launch_rmsnorm_residual_add_bf16"),
+    kernel!(scalar_mul "launch_scalar_mul_bf16"),
+    kernel!(logit_softcap "launch_logit_softcap_bf16"),
+
     // ── MoE ────────────────────────────────────────────────────────
     // The router's top-k, then the decode GEMV leg's two routed
     // projections and its combine. The expert axis rides INSIDE the
