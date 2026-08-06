@@ -966,12 +966,15 @@ class Context::Impl {
                 for (std::size_t i = 0; i < launch.sampling_indices.len; ++i) {
                     std::cerr << launch.sampling_indices.ptr[i] << " ";
                 }
-                std::cerr << "pos=";
-                for (std::size_t i = 0; i < launch.position_ids.len && i < 4; ++i) {
-                    std::cerr << launch.position_ids.ptr[i] << " ";
-                }
-                if (launch.position_ids.len > 0) {
-                    std::cerr << "... " << launch.position_ids.ptr[launch.position_ids.len - 1];
+                std::cerr << "csr=";
+                for (std::size_t r = 0; r + 1 < launch.qo_indptr.len; ++r) {
+                    const std::uint32_t pages =
+                        launch.kv_page_indptr.ptr[r + 1] - launch.kv_page_indptr.ptr[r];
+                    const std::uint32_t kv = pages == 0
+                        ? 0u
+                        : (pages - 1) * cfg_.batching.kv_page_size +
+                              launch.kv_last_page_lens.ptr[r];
+                    std::cerr << pages << "p/" << kv << "k ";
                 }
                 std::cerr << "\n";
             }
@@ -1026,15 +1029,25 @@ class Context::Impl {
         job->completion = completion;
         job->launch = executor::OwnedLaunchView::capture(launch);
         if (!causal_kv_lengths.empty()) {
-            // The mask said the history is `causal_kv_lengths[r]` keys long and
-            // the CSR counted pages the decode has not written yet. Cut the CSR
-            // back to what the mask vouches for, then drop the mask: what is
-            // left is the plain causal attention the kernels already do, over
-            // exactly the keys that exist.
-            wire_mask::trim_kv_to_lengths(
-                job->launch.kv_page_indices, job->launch.kv_page_indptr,
-                job->launch.kv_last_page_lens, causal_kv_lengths,
-                cfg_.batching.kv_page_size);
+            // The mask and the page CSR state the same number, and if they
+            // disagree the driver cannot tell which one the KV write used. Say
+            // which two differ and stop, rather than attend to whichever the
+            // geometry happens to reach.
+            std::uint32_t claimed = 0;
+            const int bad = wire_mask::first_kv_len_disagreement(
+                causal_kv_lengths, launch.kv_page_indptr, launch.kv_last_page_lens,
+                cfg_.batching.kv_page_size, claimed);
+            if (bad >= 0) {
+                std::cerr << "[pie-driver-metal] launch: request " << bad
+                          << "'s causal mask covers " << causal_kv_lengths[bad]
+                          << " keys but its page CSR claims " << claimed
+                          << " at kv_page_size=" << cfg_.batching.kv_page_size
+                          << "; the two must agree (an inferlet paging at a "
+                             "different size than the driver is the usual cause)\n";
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            // Agreed: the mask restates the bound `sdpa_paged` already applies,
+            // so it has nothing left to say.
             job->launch.has_user_mask = false;
             job->launch.mask_request_indptr.clear();
             job->launch.mask_word_indptr.clear();
