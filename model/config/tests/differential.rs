@@ -269,6 +269,58 @@ fn the_dead_deepseek_v4_sinks_assignment_is_reproduced() {
     assert_eq!(cfg.dsv4_o_lora_rank, 32);
 }
 
+/// The one place the port deliberately does NOT reproduce the C++, with the
+/// goldens moved to match rather than an exception carved into the diff.
+///
+/// `config.cpp` read `norm_topk_prob` with a default of `false` for every
+/// model type. That is faithful for the families that inherit `qwen3_moe`'s
+/// config class, where an in-class `True` is shadowed by a `False` read. The
+/// qwen3.5/3.6/next line does not inherit it: its own class defaults to
+/// `True` (`transformers` qwen3_next, mlx-lm qwen3_5) and its released
+/// checkpoints omit the key entirely, so `false` was not a port of anything.
+///
+/// It was also load-bearing. The Metal driver's own fallback for this family
+/// has always been `true` (`model_facts.hpp`, `q35_norm_topk_prob`), so the
+/// importer and the driver disagreed about the same absent key -- and the
+/// driver refuses `false` outright rather than run a router whose weights sum
+/// to less than one. Qwen3.6-35B-A3B therefore did not load at all, refused
+/// for a value its config never contained.
+///
+/// The oracle is retired and `config.cpp` is deleted, so "change both sides
+/// together" is the goldens plus this test naming the divergence.
+#[test]
+fn qwen3_5_renormalizes_its_router_by_default_unlike_the_c_side() {
+    for name in [
+        "Qwen--Qwen3.5-35B-A3B",
+        "Qwen--Qwen3.6-27B",
+        "Qwen--Qwen3.5-0.8B",
+    ] {
+        let raw =
+            std::fs::read_to_string(oracle_dir().join(format!("corpus/{name}.json"))).unwrap();
+        let j: Value = serde_json::from_str(&raw).unwrap();
+        let text = j.get("text_config").unwrap_or(&j);
+        assert!(
+            text.get("norm_topk_prob").is_none() && j.get("norm_topk_prob").is_none(),
+            "{name} states the key, so it is not evidence about the default"
+        );
+        let cfg = pie_model_config::normalize(&j, name).unwrap();
+        assert!(
+            cfg.norm_topk_prob,
+            "{name} omits norm_topk_prob and its reference defaults it to true"
+        );
+    }
+
+    // Everything outside that family keeps the C++ default, so this is a
+    // family rule and not a flipped constant.
+    let raw =
+        std::fs::read_to_string(oracle_dir().join("corpus/dacorvo--Mixtral-tiny.json")).unwrap();
+    let cfg = pie_model_config::normalize(&serde_json::from_str(&raw).unwrap(), "mixtral").unwrap();
+    assert!(
+        !cfg.norm_topk_prob,
+        "the default outside qwen3.5/3.6/next is still the C++ side's false"
+    );
+}
+
 /// `mlx_lm`'s bare `quantization` block is read, not just `quantization_config`.
 ///
 /// The C++ oracle never read it — `parse_hf_config` served CUDA, and MLX
