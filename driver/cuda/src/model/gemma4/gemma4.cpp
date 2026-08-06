@@ -449,6 +449,52 @@ void prepare_gemma4_plan_for_layer(
         hnd_layout);
 }
 
+// FA3 decode plan for the sliding layers. One token per request, so
+// `qo_indptr` is the identity; everything else the SM90 planner needs is the
+// same page table the decode plans were built from.
+void prepare_gemma4_hopper_decode_plan(
+    Gemma4MoeMlpWorkspace& moe_ws,
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    AttentionWorkspace& attn_ws,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int num_requests,
+    int page_size)
+{
+    moe_ws.hopper_decode_plan_sliding.valid = false;
+    if (num_requests <= 0) return;
+    int sliding_idx = -1;
+    for (std::size_t i = 0; i < w.layers.size(); ++i) {
+        if (!w.layers[i].is_full) { sliding_idx = static_cast<int>(i); break; }
+    }
+    if (sliding_idx < 0) return;
+    const auto* sliding = &w.layers[sliding_idx];
+    const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+    const int q_heads = cfg.num_attention_heads / T;
+    const int kv_heads = sliding->num_kv_heads / T;
+    const int window_left = w.per_layer_window_left[sliding_idx];
+    if (!ops::hopper_prefill_supported(
+            sliding->head_dim, window_left, num_requests, num_requests)) {
+        return;
+    }
+    moe_ws.hopper_qo_indptr_h.resize(num_requests + 1);
+    for (int r = 0; r <= num_requests; ++r) {
+        moe_ws.hopper_qo_indptr_h[r] = static_cast<std::uint32_t>(r);
+    }
+    ops::plan_attention_flashinfer_prefill_sm90_bf16(
+        moe_ws.hopper_decode_plan_sliding,
+        moe_ws.hopper_qo_indptr_h.data(), kv_page_indptr_h,
+        kv_last_page_lens_h,
+        /*total_tokens=*/num_requests, num_requests,
+        q_heads, kv_heads, sliding->head_dim, page_size,
+        attn_ws, /*stream=*/nullptr,
+        /*enable_cuda_graph=*/true, /*causal=*/true, window_left,
+        // Clear of the decode plans, which start at offset 0.
+        /*int_base_bytes=*/attn_ws.int_bytes() / 2);
+}
+
 ops::DecodePlanCachePtr& select_prepared_plan(
     Gemma4MoeMlpWorkspace& moe_ws,
     bool row_decode,
@@ -532,6 +578,9 @@ void prepare_gemma4_decode_plans(
     if (is_pure_decode) {
         prepare_pair(kv_page_indptr_h, R, /*row_decode=*/false);
         moe_ws.decode_plans_prepared = true;
+        prepare_gemma4_hopper_decode_plan(
+            moe_ws, w, cfg, fwd_cfg, attn_ws, kv_page_indptr_h,
+            kv_last_page_lens_h, R, cache.page_size());
         if (log_debug) {
             std::cerr << "[pie-driver-cuda] gemma4 plan prepare"
                       << " N=" << N
@@ -1358,9 +1407,18 @@ std::uint32_t gemma4_decode_graph_layout(
         : pack(moe_ws.decode_plan_full);
     if (sliding == 0u && full == 0u) return 0u;
 
+    // The FA3 sliding-layer plan is part of the launch geometry too: unlike
+    // the decode plans its schedule is derived from the KV lengths it was
+    // built with, so a captured graph replayed against a differently-shaped
+    // plan reads the wrong work assignment and silently produces garbage.
+    // Fold its layout in so a change forces a recapture rather than a wrong
+    // answer.
+    const std::uint32_t hopper =
+        ops::hopper_prefill_graph_layout(moe_ws.hopper_decode_plan_sliding);
     return (row_decode ? 0x10000u : 0x20000u) |
            (sliding & 0xffu) |
-           ((full & 0xffu) << 8);
+           ((full & 0xffu) << 8) |
+           ((hopper & 0xffu) << 20);
 }
 
 void gemma4_forward_paged(
@@ -1815,7 +1873,22 @@ void gemma4_forward_paged(
         profile_gemma4_cuda_stage(
             profile, profile.attention_ms, stream, [&] {
                 ops::DecodePlanCachePtr decode_plan;
-                if (use_decode_path) {
+                const auto& hplan = moe_ws.hopper_decode_plan_sliding;
+                const bool use_hopper_decode =
+                    use_decode_path && hplan.valid && !layer.is_full &&
+                    hplan.head_dim == d &&
+                    hplan.num_kv_heads == num_kv_heads_local &&
+                    hplan.window_left == w.per_layer_window_left[l];
+                if (use_hopper_decode) {
+                    ops::dispatch_attention_flashinfer_prefill_sm90_bf16(
+                        hplan, ws.q.data(), kv_view.k_pages, kv_view.v_pages,
+                        ws.attn_out.data(), kv_page_indices, attn_ws, stream,
+                        // Gemma-4 folds `query_pre_attn_scalar` into Q before
+                        // attention, so the kernel must not apply the usual
+                        // 1/sqrt(head_dim) again -- the decode path beside
+                        // this one passes the same 1.0.
+                        /*logits_soft_cap=*/0.f, /*sm_scale=*/1.0f);
+                } else if (use_decode_path) {
                     ops::DecodePlanCache* plan =
                         select_prepared_plan(
                             moe_ws, /*row_decode=*/false, layer.is_full).get();
