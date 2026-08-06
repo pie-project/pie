@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <sys/sysctl.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -519,6 +520,24 @@ size_t RawMetalContext::host_reclaimable_bytes() {
     const uint64_t pages = uint64_t(vm.free_count) + vm.inactive_count +
                            vm.purgeable_count + vm.speculative_count;
     return size_t(pages * uint64_t(page));
+}
+
+std::pair<size_t, size_t> RawMetalContext::host_wired_and_installed_bytes() {
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return {0, 0};
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm),
+                          &count) != KERN_SUCCESS) {
+        return {0, 0};
+    }
+    uint64_t installed = 0;
+    size_t len = sizeof(installed);
+    if (sysctlbyname("hw.memsize", &installed, &len, nullptr, 0) != 0) {
+        return {0, 0};
+    }
+    return {size_t(uint64_t(vm.wire_count) * uint64_t(page)), size_t(installed)};
 }
 
 std::unique_ptr<RawMetalContext> RawMetalContext::create(

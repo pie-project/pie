@@ -748,11 +748,49 @@ struct ElasticBreakdown {
     std::size_t scratch = 0;
 };
 
+// Say once, before anything is allocated, that this machine is carrying GPU
+// memory nobody owns.
+//
+// A model small enough to fit alongside the leak is admitted by the check
+// below and runs fine, so nothing on the path to a successful load would
+// otherwise mention it -- and the danger is not to the run. Wired pages
+// cannot be paged out and are charged to no live process, so `ps`, Activity
+// Monitor and free-memory readings all look ordinary while the window server
+// is one composite away from being unable to allocate. When it cannot, it
+// blocks in the kernel inside its own Metal submit, misses the 120-second
+// userspace watchdog, and the desktop dies. Observed here twice: once during
+// a run, and once **ten hours after** the run that leaked the memory, with no
+// pie process alive to connect it to.
+//
+// So this warns rather than refuses. The load is not what is unsafe; leaving
+// the machine up is. The threshold is half of RAM because a healthy idle Mac
+// sits near 3%, and the leaks seen here were 59% -- there is no ambiguous
+// middle to tune against.
+void warn_once_if_the_gpu_leaked_memory_before_this_run() {
+    [[maybe_unused]] static const bool said = [] {
+        const auto [wired, installed] =
+            RawMetalContext::host_wired_and_installed_bytes();
+        if (installed == 0 || wired * 2 <= installed) return true;
+        const auto gib = [](std::size_t b) { return double(b) / (1024.0 * 1024.0 * 1024.0); };
+        std::fprintf(stderr,
+                     "[pie-metal] warning: %.2f GiB of this machine's %.2f GiB is wired "
+                     "before this model is loaded. No process has to be holding it: a GPU "
+                     "context whose command buffer never signalled is abandoned rather "
+                     "than released, and its pages stay wired until reboot. They cannot "
+                     "be paged out, so the window server can be starved of memory hours "
+                     "later and take the desktop down with it. Reboot before leaving this "
+                     "machine unattended.\n",
+                     gib(wired), gib(installed));
+        return true;
+    }();
+}
+
 bool fits_on_this_gpu(std::size_t heap_bytes,
                       std::size_t elastic_bytes,
                       std::size_t resident_weights,
                       std::string* err,
                       const ElasticBreakdown* parts = nullptr) {
+    warn_once_if_the_gpu_leaked_memory_before_this_run();
     const std::size_t limit = RawMetalContext::device_working_set_bytes();
     if (limit == 0) return true;  // the device would not say; do not invent one
     const std::size_t want = heap_bytes + elastic_bytes;
