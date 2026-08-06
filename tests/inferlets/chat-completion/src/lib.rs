@@ -11,7 +11,6 @@ use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
 use serde::Deserialize;
 
-const PAGE_T: u32 = 16; // tokens per pool page
 // Qwen3-0.6B
 
 #[derive(Deserialize)]
@@ -86,9 +85,16 @@ async fn main(input: Input) -> Result<String> {
     let n = prompt_tokens.len() as u32;
     let stop = chat::stop_tokens();
 
+    // Tokens per pool page. Taken from the driver, never assumed: this pass
+    // builds its own write descriptors (`cell c -> pool_ids[c/page_t] @
+    // c%page_t`) and its own page CSR, and the driver reads both back at ITS
+    // page size. A constant here that disagreed would put the tokens somewhere
+    // other than where the CSR says they are -- and with no mask on the wire
+    // any more, nothing downstream would notice.
+    let page_t = kv_page_size();
+
     // Shared logical page pool: prompt + decode headroom, page-rounded.
-    let pool_pages = (n + max_tokens as u32 + 2).div_ceil(PAGE_T);
-    let pool = pool_pages * PAGE_T;
+    let pool_pages = (n + max_tokens as u32 + 2).div_ceil(page_t);
 
     let ws = WorkingSet::new();
     let slots = ws.reserve(pool_pages).context("ws.reserve")?;
@@ -105,24 +111,31 @@ async fn main(input: Input) -> Result<String> {
         let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
         let positions_p = Channel::from_iter(0..n).named("positions_p");
 
-        // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
-        let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
-        let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
+        // Explicit N-cell write descriptor: cell c → pool_ids[c/page_t] @ c%page_t.
+        let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / page_t) as usize]).collect();
+        let w_off_pv: Vec<u32> = (0..n).map(|c| c % page_t).collect();
         let w_slot_p = Channel::from(w_slot_pv).named("w_slot_p");
         let w_off_p = Channel::from(w_off_pv).named("w_off_p");
         let klen_p = Channel::from([n]).named("klen_p");
         let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
         // The page CSR is the SOURCE OF TRUTH for kv_len on the wire: the driver
-        // derives `kv_len = (page_count-1)*PAGE_T + last_page_len`. Declaring the
+        // derives `kv_len = (page_count-1)*page_t + last_page_len`. Declaring the
         // whole pool here would claim a kv length the pass does not have and
         // silently corrupt attention — the count must track `kv_len` exactly.
-        let page_indptr_p = Channel::from([0u32, n.div_ceil(PAGE_T)]).named("pidx_p");
+        let page_indptr_p = Channel::from([0u32, n.div_ceil(page_t)]).named("pidx_p");
 
-        // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
-        let mask_pv: Vec<bool> = (0..n)
-            .flat_map(|i| (0..pool).map(move |j| j <= i))
-            .collect();
-        let mask_p = Channel::from_shaped([n, pool], mask_pv).named("mask_p");
+        // No AttnMask port. A prefill query attends every key up to its own
+        // position, which is the bound the driver already derives from
+        // `qo_indptr` and the page CSR — so a causal mask here only restates
+        // the CSR two lines up, in `[N, POOL]` bools, over the wire, every
+        // fire. The decode fire below has always said this; the prefill was
+        // paying for the same statement twice.
+        //
+        // It was not free, either. A driver that cannot decode the wire form
+        // has to refuse the launch or find the dense buffer some other way,
+        // and the mask's length is a second claim about `kv_len` that can
+        // disagree with the CSR's — which is a silent wrong answer when the
+        // two are computed at different page sizes.
         let rng_p = Channel::from([0x51ed_u32, 0]).named("rng_p");
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
@@ -139,7 +152,7 @@ async fn main(input: Input) -> Result<String> {
                 w_slot: &w_slot_p,
                 w_off: &w_off_p,
                 positions: &positions_p,
-                mask: Some(&mask_p),
+                mask: None,
             },
         )?;
         fwd_p.epilogue(move || {
@@ -174,13 +187,13 @@ async fn main(input: Input) -> Result<String> {
     }
 
     // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
-    let slot_n = pool_ids[(n / PAGE_T) as usize];
+    let slot_n = pool_ids[(n / page_t) as usize];
     let tok_in = Channel::from([g0]).named("tok_in");
     let pos = Channel::from([n]).named("pos");
     let fill = Channel::from([n + 1]).named("fill");
     let klen = Channel::from([n + 1]).named("klen");
     let w_slot = Channel::from([slot_n]).named("w_slot");
-    let w_off = Channel::from([n % PAGE_T]).named("w_off");
+    let w_off = Channel::from([n % page_t]).named("w_off");
     // No AttnMask port: a decode query attends every key up to `klen`, which
     // this pass already carries on device, so a causal mask would only restate
     // it. Binding one would also cost the whole run-ahead: the mask port is a
@@ -189,7 +202,7 @@ async fn main(input: Input) -> Result<String> {
     // does not advertise — the pass would fall out of the decode-envelope class
     // and lose the only descriptor resolver that works inside one frame.
     let pages = Channel::from(pool_ids.clone()).named("pages");
-    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]).named("page_indptr");
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_t)]).named("page_indptr");
     let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
@@ -203,7 +216,7 @@ async fn main(input: Input) -> Result<String> {
         &ws,
         KvGeometry {
             readable_pages: ..,
-            writable_pages: (n / kv_page_size())..,
+            writable_pages: (n / page_t)..,
             kv_len: &klen,
             pages: &pages,
             page_indptr: &page_indptr,
@@ -222,14 +235,14 @@ async fn main(input: Input) -> Result<String> {
         let tok = sample_token(&r, temperature, top_p, vocab); // [1] i32
         let r_next = &r + iota(2);
 
-        let logical_slot = &base / PAGE_T;
+        let logical_slot = &base / page_t;
         let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = &base % PAGE_T;
+        let w_off_v = &base % page_t;
         let klen_v = &base + 1u32;
         let next_free = &base + 1u32;
         let pages_v = reshape(&pids, [pool_pages]);
         // Page count tracks the new kv length, never the pool size.
-        let page_count = klen_v.div_ceil(PAGE_T);
+        let page_count = klen_v.div_ceil(page_t);
         let pidx_v = indptr(1, &page_count);
 
         // Device-resolved geometry is loop-carried: the host never drains
