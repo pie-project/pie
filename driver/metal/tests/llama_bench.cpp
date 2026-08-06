@@ -1158,6 +1158,13 @@ int main(int argc, char** argv) {
         }
         if (!bad) {
             std::vector<int> fleet_diverged(nf, -1);
+            // The argmax check above answers "do the members agree", which is
+            // the question a wrong number is asked. It cannot say WHEN they
+            // stopped being the same arithmetic: two rows can differ in the low
+            // bits for twenty steps and pick the same token every time. The
+            // first step whose bf16 rows are not byte-identical is the step the
+            // divergence was CREATED, and that is the one a bisect needs.
+            std::vector<int> first_bitdiff(nf, -1);
             const double t3 = now_s();
             for (int step = 0; step < n_decode && !bad; ++step) {
                 std::vector<MemberForwardDesc> descs;
@@ -1187,11 +1194,21 @@ int main(int argc, char** argv) {
                     if (i == 0) {
                         first_tok = t;
                     } else if (t != first_tok) {
+                        const std::size_t r = std::size_t(n_prompt + 1 + step);
                         std::printf("  FAIL  members of one fire disagree at step %d: "
-                                    "member %d says %d, member 0 says %d\n",
-                                    step, i, t, first_tok);
+                                    "member %d says %d, member 0 says %d"
+                                    " (the same prompt alone said %d)\n",
+                                    step, i, t, first_tok,
+                                    r < s.tokens.size() ? int(s.tokens[r]) : -1);
                         bad = true;
                         break;
+                    }
+                    if (i > 0 && outs[0].device_contents != nullptr &&
+                        outs[std::size_t(i)].device_contents != nullptr &&
+                        std::memcmp(bf16_row(outs[0], 0), bf16_row(outs[std::size_t(i)], 0),
+                                    std::size_t(outs[0].vocab) * 2) != 0 &&
+                        first_bitdiff[std::size_t(i)] < 0) {
+                        first_bitdiff[std::size_t(i)] = step;
                     }
                     // Every member was given the SAME prompt, so the fleet is n
                     // copies of the sequence the latency loop above already
@@ -1210,6 +1227,22 @@ int main(int argc, char** argv) {
                     }
                     m.next_position += 1;
                     if (m.next_position < m.tokens.size()) m.tokens[m.next_position] = std::uint32_t(t);
+                }
+            }
+            {
+                int earliest = -1;
+                int earliest_member = -1;
+                int diverged_members = 0;
+                for (int i = 1; i < n_seqs; ++i) {
+                    const int d = first_bitdiff[std::size_t(i)];
+                    if (d < 0) continue;
+                    ++diverged_members;
+                    if (earliest < 0 || d < earliest) { earliest = d; earliest_member = i; }
+                }
+                if (earliest >= 0) {
+                    std::printf("  ....  %d of %d members leave member 0's arithmetic; the "
+                                "first is member %d at step %d\n",
+                                diverged_members, n_seqs - 1, earliest_member, earliest);
                 }
             }
             if (!bad) {
