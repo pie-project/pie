@@ -434,6 +434,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             loop {
                 interval.tick().await;
                 let d = planner.diagnostics();
+                let (lk_n, lk_wait, lk_hold, lk_wmax, lk_hmax) = planner.lock_census();
                 if d.queue.is_empty() && d.proc_states[1..].iter().all(|&n| n == 0) {
                     continue;
                 }
@@ -445,7 +446,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
                      parks={} serves={} evictions={} deferrals={} \
                      evict_rollbacks={} restores={} restore_failures={} gate_parks={} \
-                     hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} \
+                     hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
+                     runway={}/{} \
+                     lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
                      d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
@@ -478,6 +481,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.host_swap_exhaustions_total,
                     d.host_swap_unblocks_total,
                     d.e6_relaxations_total,
+                    d.restore_absorb_short_total,
+                    d.runway_rounds_total,
+                    d.runway_pages_total,
+                    lk_n,
+                    lk_wait / 1000,
+                    lk_hold / 1000,
+                    lk_wmax,
+                    lk_hmax,
                     d.d2h_pages_total,
                     d.h2d_pages_total,
                     d.d2h_copy_us_total / 1000,

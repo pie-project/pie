@@ -512,6 +512,50 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         CUDA_CHECK(cudaFreeAsync(device, stream));
     }
 
+    // Prestaged variants: the parameter arrays are ALREADY resident on the
+    // device (one coalesced pinned upload per launch site — see
+    // PipelineParamArena in dispatch.cu) so these only launch. The legacy
+    // helpers above remain for callers without an arena slot.
+    inline void launch_commit_bump_batch_prestaged(
+        const CommitBumpLane* device,
+        std::uint32_t count,
+        cudaStream_t stream) {
+        if (count == 0) return;
+        k_commit_bump_batch<<<count, 1, 0, stream>>>(device, count);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    inline void launch_scatter_host_publish_copies_prestaged(
+        const HostPublishCopy* device,
+        std::uint32_t count,
+        cudaStream_t stream) {
+        if (count == 0) return;
+        k_scatter_host_publish_copies<<<count, 128, 0, stream>>>(
+            device, count);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    inline void launch_settle_host_channels_batch_prestaged(
+        const HostChannelSettlementLane* device,
+        std::uint32_t count,
+        cudaStream_t stream) {
+        if (count == 0) return;
+        k_settle_host_channels_batch<<<count, 128, 0, stream>>>(
+            device, count);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    inline void launch_pull_validate_host_channels_batch_prestaged(
+        const DeviceHostChannelTicket* device_tickets,
+        const PullValidateHostChannelLane* device_lanes,
+        std::uint32_t lane_count,
+        cudaStream_t stream) {
+        if (lane_count == 0) return;
+        k_pull_validate_host_channels_batch<<<lane_count, 256, 0, stream>>>(
+            device_tickets, device_lanes, lane_count);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     inline DeviceHostChannelTicket* launch_pull_validate_host_channels_batch(
         const std::vector<DeviceHostChannelTicket>& tickets,
         const std::vector<PullValidateHostChannelLane>& lanes,

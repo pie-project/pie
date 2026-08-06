@@ -179,15 +179,25 @@ pub(crate) fn kv_working_sets_for(
 
 /// Quote `working_sets` against an ALREADY-LOCKED store, keeping the result
 /// positional with the `pids` the sets came from.
+///
+/// `budget` stops the quoting once the answers cover that many pages; the
+/// positions past the cut come back `None` ("no opinion"), which is what a
+/// caller that consumes the list in preference order until its deficit is
+/// covered would have ignored anyway. Pass `u32::MAX` to quote every pid.
 pub(crate) fn quote_locked(
     kv: &crate::store::kv::KvStore,
     working_sets: Vec<Option<HashSet<WorkingSetId>>>,
+    budget: u32,
 ) -> Vec<Option<ReclaimQuote>> {
     let known: Vec<HashSet<WorkingSetId>> = working_sets.iter().flatten().cloned().collect();
-    let mut quotes = kv.reclaim_quotes(&known).into_iter();
+    let mut quotes = kv.reclaim_quotes(&known, budget).into_iter();
+    // `and_then`, not `and`: `Option::and` evaluates its argument eagerly, so
+    // a `None` entry would still consume a quote and shift every later
+    // position by one. Only known processes were quoted, so only they may
+    // take from the iterator.
     working_sets
         .into_iter()
-        .map(|entry| entry.and(quotes.next()))
+        .map(|entry| entry.and_then(|_| quotes.next()))
         .collect()
 }
 
@@ -197,13 +207,14 @@ pub(crate) fn kv_reclaim_quotes(
     pids: &[uuid::Uuid],
     model: usize,
     driver: usize,
+    budget: u32,
 ) -> Vec<Option<ReclaimQuote>> {
     let working_sets = kv_working_sets_for(pids, model, driver);
     let Some(stores) = crate::store::registry::try_get(model, driver) else {
         return vec![None; pids.len()];
     };
     crate::store::registry::with_kv_lock(&stores.kv, "planner-quotes", |kv| {
-        quote_locked(kv, working_sets)
+        quote_locked(kv, working_sets, budget)
     })
 }
 

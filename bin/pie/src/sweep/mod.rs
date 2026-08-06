@@ -170,6 +170,32 @@ fn median_and_rel_sigma(samples: &[f64]) -> (f64, f64) {
     (median, variance.sqrt() / median)
 }
 
+/// The distinct reasons a set of lanes gave, with how many gave each.
+///
+/// Deduplicated because a fleet fails the same way in every lane far more
+/// often than it fails N different ways, and 64 copies of one line buries the
+/// one line. Capped for the same reason.
+fn distinct_reasons(failures: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for reason in failures {
+        match counts.iter_mut().find(|(seen, _)| seen == reason) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((reason.clone(), 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut out: Vec<String> = counts
+        .iter()
+        .take(SHOWN)
+        .map(|(reason, n)| format!("  {n}x {reason}"))
+        .collect();
+    if counts.len() > SHOWN {
+        out.push(format!("  ... and {} more distinct", counts.len() - SHOWN));
+    }
+    out.join("\n")
+}
+
 /// Run the load once and throw the result away.
 ///
 /// **Not optional, and not test scaffolding.** Measured on an L40S: the first
@@ -193,10 +219,14 @@ pub async fn warmup(addr: &str, program: &str, inputs: &[String]) -> Result<()> 
     for round in 0..MAX_WARMUP_ROUNDS {
         let run = fleet::run(addr, program, inputs).await;
         if run.failed_lanes() > 0 {
+            // The reason, not just the count. A bare count sent readers to
+            // `pie inferlet list` for a program that was already installed,
+            // while the lanes had been saying something else entirely.
             anyhow::bail!(
-                "{} of {} lanes failed during warmup; the fleet cannot run here at all",
+                "{} of {} lanes failed during warmup; the fleet cannot run here at all.\n{}",
                 run.failed_lanes(),
-                inputs.len()
+                inputs.len(),
+                distinct_reasons(&run.failures)
             );
         }
         let rate = run.throughput_tok_s();
@@ -461,5 +491,30 @@ mod tests {
     fn a_round_with_a_dead_lane_does_not_rank() {
         assert!(round(BASE, 100.0, 0.01, 0).is_measurement());
         assert!(!round(BASE, 400.0, 0.01, 1).is_measurement());
+    }
+
+    /// A fleet fails the same way in every lane far more often than it fails
+    /// many ways, so the reader gets one line with a count, not 64 copies.
+    #[test]
+    fn identical_lane_failures_collapse_to_one_counted_line() {
+        let same = vec!["parse input".to_string(); 64];
+        assert_eq!(distinct_reasons(&same), "  64x parse input");
+    }
+
+    /// The reasons that matter most are the ones most lanes gave, and the tail
+    /// is counted rather than dropped -- a truncation nobody can see is the
+    /// bug this whole change exists to fix.
+    #[test]
+    fn distinct_reasons_rank_by_count_and_say_what_was_cut() {
+        let mixed: Vec<String> = ["a", "a", "a", "b", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rendered = distinct_reasons(&mixed);
+        assert!(rendered.starts_with("  3x a\n  2x b\n"), "got: {rendered}");
+        assert!(
+            rendered.ends_with("... and 2 more distinct"),
+            "the tail must be counted, not silently dropped; got: {rendered}"
+        );
     }
 }
