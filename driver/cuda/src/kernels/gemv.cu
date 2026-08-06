@@ -26,7 +26,7 @@ __global__ void gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ act,
     const __nv_bfloat16* __restrict__ bias,
     __nv_bfloat16* __restrict__ out,
-    int N, int K)
+    int N, int K, float beta)
 {
     const int row = blockIdx.x * kWarps + threadIdx.y;
     if (row >= N) return;
@@ -72,6 +72,7 @@ __global__ void gemv_bf16_kernel(
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
     if (threadIdx.x == 0) {
+        if (beta != 0.f) acc += beta * __bfloat162float(out[row]);
         // Round to bf16 *before* adding the bias, then round again. That is
         // a redundant-looking double rounding, and it is deliberate: it is
         // exactly what the separate `add_bias_bf16_kernel` did when it read
@@ -103,7 +104,7 @@ __global__ void gemv_splitk_bf16_kernel(
     const __nv_bfloat16* __restrict__ act,
     const __nv_bfloat16* __restrict__ bias,
     __nv_bfloat16* __restrict__ out,
-    int N, int K)
+    int N, int K, float beta)
 {
     const int row = blockIdx.x;
     if (row >= N) return;
@@ -138,6 +139,7 @@ __global__ void gemv_splitk_bf16_kernel(
     float total = 0.f;
     #pragma unroll
     for (int w = 0; w < kWarps; ++w) total += partial[w];
+    if (beta != 0.f) total += beta * __bfloat162float(out[row]);
     // Same double rounding as the kernel above, for the same reason: it is
     // what the separate bias kernel used to do, so the fold stays bit-exact.
     __nv_bfloat16 v = __float2bfloat16(total);
@@ -159,7 +161,8 @@ bool launch_gemv_bf16(
     const void* bias,
     void*       out,
     int N, int K,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    float beta)
 {
     // The float4 loads need each row to start 16-byte aligned: that holds
     // iff the base is aligned and the row stride is a multiple of 8 bf16.
@@ -185,7 +188,7 @@ bool launch_gemv_bf16(
                 static_cast<const __nv_bfloat16*>(act),
                 static_cast<const __nv_bfloat16*>(bias),
                 static_cast<__nv_bfloat16*>(out),
-                N, K);
+                N, K, beta);
         return true;
     }
     const long long blocks = (N + kWarps - 1) / kWarps;
@@ -200,7 +203,7 @@ bool launch_gemv_bf16(
             static_cast<const __nv_bfloat16*>(act),
             static_cast<const __nv_bfloat16*>(bias),
             static_cast<__nv_bfloat16*>(out),
-            N, K);
+            N, K, beta);
     return true;
 }
 
