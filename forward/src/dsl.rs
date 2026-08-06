@@ -1646,6 +1646,89 @@ pub mod cuda {
         .expect("a routed projection produces its value")
     }
 
+    /// `ops::flashinfer_cutlass_moe_bf16`: the whole routed block —
+    /// permute, both grouped GEMMs, the activation, and the weighted
+    /// finalize — as ONE call.
+    ///
+    /// This is the leg the decode path actually takes, and it is stated
+    /// first because it is the only one that is a single rectangle. Its
+    /// `bool` return reads like a runtime fallthrough, but every false
+    /// it can produce is decided before the fire: null operands (a
+    /// binding question) and `workspace_bytes < needed`, where `needed`
+    /// is a pure function of the static dims and `num_rows`, and the
+    /// caller has already required `N <= cutlass_max_rows` — the row
+    /// count the workspace was sized for. So the leg is a FACT plus a
+    /// row bound, not a gamble, and fires above the bound decline rather
+    /// than the declaration guessing.
+    ///
+    /// Consumes the router's two outputs and both expert banks; produces
+    /// the combined `[Tokens, hidden]` in one value, which is why the
+    /// text that names it has no separate WeightedSum.
+    pub fn moe_fused_cutlass(
+        x: &Val,
+        experts: &Val,
+        weights: &Val,
+        gate_up: &MatW,
+        down: &MatW,
+        hidden: u32,
+    ) -> Val {
+        record(
+            &x.t,
+            gate_up.layer,
+            "ops::flashinfer_cutlass_moe_bf16",
+            vec![gate_up.name.clone(), down.name.clone()],
+            None,
+            vec![x.id, experts.id, weights.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
+        )
+        .expect("the fused MoE produces its value")
+    }
+
+    /// `kernels::launch_residual_add_bf16`: the explicit stream add, for
+    /// the legs whose producer wrote to scratch instead of folding.
+    pub fn residual_add(x: &Val, residual: &Val, hidden: u32) -> Val {
+        record(
+            &x.t,
+            x.layer,
+            "launch_residual_add_bf16",
+            vec![],
+            None,
+            vec![x.id, residual.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
+        )
+        .expect("the residual add produces its value")
+    }
+
+    /// `kernels::launch_sigmoid_dot_scalar_gate_add_bf16`: the shared
+    /// expert's landing with its gate logit folded in — one launch that
+    /// dots `norm_x` with the `[1, H]` gate row, sigmoids the scalar, and
+    /// accumulates `shared` into the stream.
+    ///
+    /// The general form is a `[Tokens, 1]` GEMM followed by
+    /// `launch_sigmoid_scalar_gate_add_bf16`; this fused form runs when
+    /// the gate weight is bound unquantized and `N` is within the decode
+    /// fast path's bound (1024). Every fire this text covers is under
+    /// `cutlass_max_rows` (<= 512), so within the declaration's own row
+    /// range the fused form is not a guarded arm but the only arm.
+    pub fn sigmoid_dot_scalar_gate_add(
+        x: &Val,
+        gate: &MatW,
+        shared: &Val,
+        base: &Val,
+        hidden: u32,
+    ) -> Val {
+        record(
+            &x.t,
+            gate.layer,
+            "launch_sigmoid_dot_scalar_gate_add_bf16",
+            vec![gate.name.clone()],
+            None,
+            vec![x.id, base.id, shared.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
+        )
+        .expect("the shared-expert landing produces its value")
+    }
+
     /// `kernels::launch_chunked_swiglu_bf16` over the routed rows — the
     /// same kernel [`swiglu`]'s packed arm names, launched with `N * k`
     /// rows instead of `N`. A separate statement because the SHAPE

@@ -188,8 +188,17 @@ pub static KERNELS: &[KernelSig] = &[
     // the grouped-GEMM and host-routed legs reach the same numbers by
     // shapes no `Dim` spells, and are named refusals, not entries.
     kernel!(topk_softmax "launch_topk_softmax_bf16"),
+    // The whole routed block as one call — permute, both grouped GEMMs,
+    // the activation and the weighted finalize. The leg decode actually
+    // takes, and the only one that is a single rectangle.
+    // Namespaced because it is not a `kernels::launch_*` at all: it is an
+    // `ops::` entry point that installs tactics and runs a CUTLASS
+    // pipeline. The symbol says so.
+    kernel!(moe_fused_cutlass "ops::flashinfer_cutlass_moe_bf16"),
     kernel!(moe_gate_up_gemv "launch_moe_gate_up_decode_gemv_bf16"),
     kernel!(moe_down_gemv "launch_moe_down_decode_gemv_bf16"),
+    kernel!(moe_shared_gate_dot "launch_sigmoid_dot_scalar_gate_add_bf16"),
+    kernel!(residual_add_cuda "launch_residual_add_bf16"),
     // The combine folds the residual when the MoE output lands straight
     // on the stream (tp=1) — one launch where the semantic text has a
     // WeightedSum and a ResidualAdd.
