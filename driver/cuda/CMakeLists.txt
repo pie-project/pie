@@ -221,6 +221,69 @@ if(EXISTS "${_FI_PATCH_FILE}" AND NOT EXISTS "${_FI_PATCH_SENTINEL}")
   message(STATUS "Patched FlashInfer narrowing conversion in ${_FI_PATCH_FILE}")
 endif()
 
+# FlashInfer gates its Mamba TMA kernels on FLASHINFER_MAMBA_ENABLE_SM90 and
+# nothing else, which is sound for the way upstream builds: a translation unit
+# compiled for sm_90 and no other architecture. We compile ONE translation unit
+# for every entry in CMAKE_CUDA_ARCHITECTURES, and a compile definition reaches
+# every -gencode pass, so defining it hands the TMA kernels to the sm_80/86/89
+# passes as well -- and libcu++ does not expose the APIs they call there.
+# `nv/detail/__target_macros` defines __CUDA_MINIMUM_ARCH__ as __CUDA_ARCH__
+# under nvcc, i.e. PER PASS rather than the minimum of the arch list, and
+# `cuda/std/__cccl/ptx_isa.h` withholds __cccl_lib_experimental_ctk12_cp_async_exposure
+# below 900. The sub-900 passes then fail on cp_async_bulk_tensor_4d_*,
+# cp_async_bulk_commit_group, cp_async_bulk_wait_group_read and
+# fence_proxy_async_shared_cta.
+#
+# So make the guard per-pass as well as per-build. Every site takes the SAME
+# condition, and that is what makes it sound rather than merely quieter: the
+# horizontal kernel's definition sits at namespace scope and the only code that
+# launches it sits in the host launcher, so under one shared condition they
+# appear and vanish together in every pass. The vertical kernel keeps its
+# definition with an empty body on the passes that cannot launch it. The host
+# pass has no __CUDA_ARCH__ at all and therefore keeps everything, which is what
+# the launcher needs in order to compile.
+#
+# This takes nothing away from sm_80/86/89. `src/ops/flashinfer_mamba.cu` only
+# enters FlashInfer's SSU at all when the device's major version is >= 9, and
+# FlashInfer's own selector independently sends sm_major < 9 to kSimple, so
+# these kernels were unreachable on those architectures before this patch.
+#
+# The site COUNT is asserted, not just the presence of the text: a FlashInfer
+# bump that adds or drops a guard would otherwise patch a different set and
+# still configure cleanly, which is the silent half-patch this must not become.
+# A missing file is fatal here for the same reason, rather than the skip the
+# patches above take -- upstream moving this header would otherwise read as
+# "nothing to patch" and hand the TMA kernels straight back to sm_80.
+set(_FI_ARCH_SENTINEL "${flashinfer_SOURCE_DIR}/.pie_mamba_arch_guarded")
+# Deliberately not _FI_PATCH_FILE: that one belongs to the narrowing patch
+# above, which its own comment says to delete once upstream fixes it, and this
+# patch must not quietly stop applying when that happens.
+set(_FI_ARCH_FILE
+  "${flashinfer_SOURCE_DIR}/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh")
+set(_FI_ARCH_GUARD_OLD "#ifdef FLASHINFER_MAMBA_ENABLE_SM90")
+set(_FI_ARCH_GUARD_NEW
+  "#if defined(FLASHINFER_MAMBA_ENABLE_SM90) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900)")
+if(NOT EXISTS "${_FI_ARCH_SENTINEL}")
+  if(NOT EXISTS "${_FI_ARCH_FILE}")
+    message(FATAL_ERROR
+      "FlashInfer Mamba arch-guard patch cannot find ${_FI_ARCH_FILE}")
+  endif()
+  file(READ "${_FI_ARCH_FILE}" _fi_arch_src)
+  string(REGEX MATCHALL "${_FI_ARCH_GUARD_OLD}" _fi_arch_sites "${_fi_arch_src}")
+  list(LENGTH _fi_arch_sites _fi_arch_count)
+  if(NOT _fi_arch_count EQUAL 6)
+    message(FATAL_ERROR
+      "FlashInfer Mamba arch-guard patch expects 6 `${_FI_ARCH_GUARD_OLD}` sites in "
+      "${_FI_ARCH_FILE}, found ${_fi_arch_count}")
+  endif()
+  string(REPLACE "${_FI_ARCH_GUARD_OLD}" "${_FI_ARCH_GUARD_NEW}"
+    _fi_arch_src "${_fi_arch_src}")
+  file(WRITE "${_FI_ARCH_FILE}" "${_fi_arch_src}")
+  file(WRITE "${_FI_ARCH_SENTINEL}" "patched")
+  message(STATUS
+    "Guarded FlashInfer Mamba SM90 kernels per arch pass in ${_FI_ARCH_FILE}")
+endif()
+
 # `finalizeMoeRoutingKernel` unpermutes GEMM2's output and does the topk-weighted
 # reduction. Its launcher asks for exactly `num_rows` blocks and the kernel reads
 # the token count back out of `gridDim.x`, so the grid is pinned to the batch
@@ -387,6 +450,12 @@ endif()
 # Without it, sm_90+ runs would silently fall back to the slow simple
 # algorithm even though the runtime SM check would otherwise pick
 # vertical/horizontal.
+#
+# "Contains sm_90" is the right question for this define and the wrong one for
+# the compiler: the define reaches every -gencode pass, including the ones that
+# cannot compile TMA. Which passes keep the kernels is settled per pass by the
+# arch guard patched into the FlashInfer header above, so a mixed arch list can
+# enable this without the sm_80/86/89 passes failing on it.
 if(PIE_HAS_SM90 OR PIE_HAS_SM100)
   set(PIE_CUDA_FLASHINFER_MAMBA_SM90 ON)
   message(STATUS "Enabling FlashInfer Mamba SM90 vertical/horizontal SSU kernels")
