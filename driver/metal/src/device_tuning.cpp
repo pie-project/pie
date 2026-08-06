@@ -39,7 +39,14 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
         default:
             break;
     }
+    // Every tuned constant gets an override, and for the same reason the first
+    // one did: measuring a crossover means running the same binary twice with
+    // different answers, and a rebuild between arms is a different binary.
     t.qmm_min_batch = env_int("PIE_METAL_QMM_MIN_BATCH", t.qmm_min_batch);
+    t.qmm_bn_crossover_tg =
+        env_int("PIE_METAL_QMM_BN_CROSSOVER_TG", t.qmm_bn_crossover_tg);
+    t.moe_tile_mid_per = env_int("PIE_METAL_MOE_TILE_MID_PER", t.moe_tile_mid_per);
+    t.moe_tile_wide_per = env_int("PIE_METAL_MOE_TILE_WIDE_PER", t.moe_tile_wide_per);
     return t;
 }
 
@@ -62,5 +69,8 @@ const DeviceTuning& device_tuning() {
 }
 
 int qmm_min_batch() { return device_tuning().qmm_min_batch; }
+int qmm_bn_crossover_tg() { return device_tuning().qmm_bn_crossover_tg; }
+int moe_tile_mid_per() { return device_tuning().moe_tile_mid_per; }
+int moe_tile_wide_per() { return device_tuning().moe_tile_wide_per; }
 
 }  // namespace pie::metal

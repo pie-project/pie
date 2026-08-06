@@ -49,6 +49,35 @@ struct DeviceTuning {
     /// matrix throughput moves the crossover down; the GEMV's advantage at
     /// small N is a memory-bound one and does not.
     int qmm_min_batch = 12;
+
+    /// The threadgroup count at which the unsplit GEMM's BN=32 tile overtakes
+    /// BN=16.
+    ///
+    /// M1 Max: 160. Measured with `roofline_probe` over fifteen (M, N) pairs
+    /// and then checked against a real llama-3.2-1B prefill, which agrees --
+    /// 2565.8 / 2663.7 / 2578.3 tok/s at BN 16/32/64, 448 rows. The sweep
+    /// brackets the crossover between 144 threadgroups and 192, so this sits in
+    /// the gap.
+    ///
+    /// A machine with more cores saturates later and wants this HIGHER, since
+    /// the narrow tile's only advantage is that it makes more threadgroups.
+    int qmm_bn_crossover_tg = 160;
+
+    /// Rows an expert's run must hold before the mixture's GEMM takes a wider
+    /// row tile: 32 above `moe_tile_mid_per`, 64 above `moe_tile_wide_per`.
+    ///
+    /// M1 Max: 12 and 88. Measured end to end over eight (rows, expert count)
+    /// pairs on gpt-oss-20b and gemma-4-26B; the table is in
+    /// `shared_kernels.hpp`. Measured END TO END on purpose --
+    /// `roofline_probe` predicts the dense tile correctly and this one wrong
+    /// three times over, because its single hot expert cannot show what
+    /// thirty-two cold ones cost.
+    ///
+    /// These move with per-core matrix throughput the way `qmm_min_batch`
+    /// does: a machine that runs a wide tile relatively faster wants both
+    /// thresholds LOWER.
+    int moe_tile_mid_per = 12;
+    int moe_tile_wide_per = 88;
 };
 
 /// The platform query. `device_tuning_apple.mm` on Apple, a stub in
@@ -69,5 +98,12 @@ const DeviceTuning& device_tuning();
 /// The GEMM crossover for this device. A function and not a constant because
 /// it is a property of the machine; see `DeviceTuning::qmm_min_batch`.
 int qmm_min_batch();
+
+/// The unsplit GEMM's BN crossover, in threadgroups.
+int qmm_bn_crossover_tg();
+
+/// The mixture's two row-tile crossovers, in rows per expert.
+int moe_tile_mid_per();
+int moe_tile_wide_per();
 
 }  // namespace pie::metal

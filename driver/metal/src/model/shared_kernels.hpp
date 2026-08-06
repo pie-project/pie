@@ -10,6 +10,8 @@
 
 #include <cstdint>
 #include <cstdlib>
+
+#include "device_tuning.hpp"
 #include <cstring>
 #include <stdexcept>
 
@@ -176,8 +178,8 @@ inline bool moe_should_batch(int n_pairs, int n_experts) {
 inline int moe_tile_rows(int n_pairs, int n_experts) {
     if (!moe_should_batch(n_pairs, n_experts)) return 1;
     const int per = n_pairs / n_experts;
-    if (per >= 88) return 64;
-    return per >= 12 ? 32 : 16;
+    if (per >= moe_tile_wide_per()) return 64;
+    return per >= moe_tile_mid_per() ? 32 : 16;
 }
 
 /// Which row of a routed PSO table a tile selects. The tables hold the two

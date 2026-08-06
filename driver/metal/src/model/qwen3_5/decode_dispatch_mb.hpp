@@ -144,7 +144,10 @@ inline int qmm_bn(int out_vec, int N) {
 /// (where 16 still wins) and 192 (where 32 does); the machine saturates higher
 /// than that, and using the saturation number here cost up to 12% because it
 /// let the choice run past 32 to 64.
-inline constexpr int kQmmBnCrossoverTg = 160;
+/// Read from `DeviceTuning`, not a constant: it is the threadgroup count at
+/// which a wider tile stops being worth fewer of them, and how many
+/// threadgroups fill the machine is the machine's business.
+inline int qmm_bn_crossover_tg_value() { return qmm_bn_crossover_tg(); }
 
 /// `qmm_bn` for a family whose GEMM has no split-K behind it.
 ///
@@ -196,7 +199,7 @@ inline int qmm_bn_unsplit(int out_vec, int N) {
     const int bm = qmm_bm(N);
     if (N < qmm_min_batch() || N % bm != 0 || out_vec % 16 != 0) return 0;
     const int row_tiles = N / bm;
-    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= kQmmBnCrossoverTg) return 32;
+    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= qmm_bn_crossover_tg_value()) return 32;
     return 16;
 }
 
