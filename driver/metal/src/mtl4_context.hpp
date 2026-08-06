@@ -211,6 +211,35 @@ class RawMetalContext {
     /// into every setup path because it was written once, is exactly how
     /// `setup_simple` came to have no check at all.
     static void set_device_working_set_bytes_for_test(size_t bytes);
+
+    /// What the machine can actually hand out right now, in bytes, or 0 if it
+    /// would not say.
+    ///
+    /// `device_working_set_bytes` is a device property: on Apple silicon it is
+    /// a flat fraction of installed RAM and never moves. It therefore reports
+    /// the same ceiling to the first model of the day and to one starting on a
+    /// box where twenty gigabytes are already spoken for. Unified memory means
+    /// those are not the same question.
+    ///
+    /// This is the second one. It counts only pages the kernel can actually
+    /// give up -- free, inactive, purgeable, and file-backed, all of which are
+    /// reclaimable under pressure. Wired pages are not included, because they
+    /// cannot be paged out, and neither can memory a GPU context has already
+    /// committed. That exclusion is the point: a wedged context's pages are
+    /// charged to no live process and show up in no process listing, so the
+    /// only way to see them is to ask what is left rather than what is used.
+    static size_t host_reclaimable_bytes();
+
+    /// Test hook for `host_reclaimable_bytes`; 0 restores asking the kernel.
+    static void set_host_reclaimable_bytes_for_test(size_t bytes);
+
+    /// True while `set_device_working_set_bytes_for_test` is in force.
+    ///
+    /// A forced working set describes an imaginary device, so pairing it with
+    /// the real machine's free memory compares two unrelated worlds and makes
+    /// the answer depend on whatever else is running. Callers that consult
+    /// both bounds use this to drop the host one under test.
+    static bool device_working_set_is_forced();
     ~RawMetalContext();
 
     RawMetalContext(const RawMetalContext&)            = delete;

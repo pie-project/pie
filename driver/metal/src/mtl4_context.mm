@@ -20,6 +20,8 @@
 
 #include <chrono>
 #include <sys/stat.h>
+#include <mach/mach.h>
+#include <mach/mach_host.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -453,6 +455,40 @@ size_t RawMetalContext::device_working_set_bytes() {
     }
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     return dev == nil ? 0 : size_t(dev.recommendedMaxWorkingSetSize);
+}
+
+static std::atomic<size_t> g_reclaimable_override{0};
+
+bool RawMetalContext::device_working_set_is_forced() {
+    return g_working_set_override.load(std::memory_order_relaxed) != 0;
+}
+
+void RawMetalContext::set_host_reclaimable_bytes_for_test(size_t bytes) {
+    g_reclaimable_override.store(bytes, std::memory_order_relaxed);
+}
+
+size_t RawMetalContext::host_reclaimable_bytes() {
+    if (const size_t forced = g_reclaimable_override.load(std::memory_order_relaxed);
+        forced != 0) {
+        return forced;
+    }
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return 0;
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm),
+                          &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    // `external_page_count` is the file-backed set and is already a subset of
+    // active+inactive, so counting inactive and external both would double-
+    // count the clean file pages that make up most of a freshly-loaded model's
+    // footprint. Take inactive plus purgeable plus free, and add only the
+    // file-backed pages the kernel has parked as speculative.
+    const uint64_t pages = uint64_t(vm.free_count) + vm.inactive_count +
+                           vm.purgeable_count + vm.speculative_count;
+    return size_t(pages * uint64_t(page));
 }
 
 std::unique_ptr<RawMetalContext> RawMetalContext::create(

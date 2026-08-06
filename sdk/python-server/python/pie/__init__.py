@@ -5,12 +5,11 @@ Embed `pie serve` inside a Python script:
     import asyncio
     from pie.server import Server
     from pie.config import (
-        Config, ServerConfig, AuthConfig, ModelConfig, DriverConfig,
+        Config, ServerConfig, ModelConfig, DriverConfig,
     )
 
     cfg = Config(
         server=ServerConfig(port=0),     # 0 = auto-pick a free port
-        auth=AuthConfig(enabled=False),
         model=ModelConfig(
             name="default",
             hf_repo="Qwen/Qwen3-0.6B",

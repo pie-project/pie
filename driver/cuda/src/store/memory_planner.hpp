@@ -71,6 +71,7 @@ CudaMemoryPlan plan_cuda_memory(
     int max_Hk,
     bool gemma4_selected,
     const std::vector<int>& gemma4_per_layer_head_dim,
+    const std::vector<int>& gemma4_per_layer_num_kv_heads,
     const std::vector<int>& gemma4_kv_source_layer,
     bool qwen3_5_selected,
     bool qwen3_5_moe_selected,
