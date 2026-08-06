@@ -728,13 +728,18 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
             &["launch_split_qkv_bf16"]
         }),
 
+        // Partial rope IS a different kernel, and the trace already says
+        // which: the rotary width crosses as `param1`, zero for the full
+        // rotation. So the lowering names the pair the same way it names
+        // the norm's, and the width the executor needs is the width the
+        // declaration already carried.
         Rope { kind, partial } => {
-            if partial.is_some() {
-                Semantic::Unlowered("partial rope is a different kernel")
-            } else if matches!(kind, crate::trace::RopeKind::Standard) {
-                Semantic::Kernels(&["launch_rope_bf16"])
-            } else {
+            if !matches!(kind, crate::trace::RopeKind::Standard) {
                 Semantic::Unlowered("only standard rope is emitted")
+            } else if partial.is_some() {
+                Semantic::Kernels(&["launch_rope_partial_bf16"])
+            } else {
+                Semantic::Kernels(&["launch_rope_bf16"])
             }
         }
 
@@ -1130,7 +1135,6 @@ mod tests {
     const LEDGER_QWEN35_DECODE: &[&str] = &[
         "  18  GdnPrep: no lowering rule for this kind",
         "  18  RmsnormGated: no lowering rule for this kind",
-        "   6  Rope: partial rope is a different kernel",
         "   6  SigmoidGateMul: no lowering rule for this kind",
         "   6  SplitQGate: no lowering rule for this kind",
         "  24  Swiglu: the fused-gate_up binding fact is not in the facts",

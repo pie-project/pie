@@ -1462,10 +1462,22 @@ void llama_like_forward_declared(
                     "declared forward: only standard rope is emitted "
                     "(build gate admits nothing else)");
             }
-            kernels::launch_rope_bf16(
-                ws.q.data(), ws.k.data(), positions,
-                N, num_q_heads, num_kv_heads, d,
-                cfg.rope_theta, stream);
+            // The rotary width crosses as param1, zero for the full
+            // rotation (no real partial width is 0 — the driver clamps to
+            // >= 2 — so the resting value cannot be mistaken). A partial
+            // trace therefore states its own width, and the executor does
+            // not re-derive it from the config.
+            if (op.param1 != 0) {
+                kernels::launch_rope_partial_bf16(
+                    ws.q.data(), ws.k.data(), positions,
+                    N, num_q_heads, num_kv_heads, d,
+                    static_cast<int>(op.param1), cfg.rope_theta, stream);
+            } else {
+                kernels::launch_rope_bf16(
+                    ws.q.data(), ws.k.data(), positions,
+                    N, num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, stream);
+            }
             break;
         }
         case PieForwardOpKind::KvAppend: {
