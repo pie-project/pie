@@ -24,13 +24,17 @@
 
 namespace pie::metal::gemma4 {
 
-int gemma4_qmm_rows(int rows) {
+int gemma4_qmm_rows(const Gemma4Geometry& g, int rows) {
     const int n = rows < 1 ? 1 : rows;
-    // `qmm_min_batch()` is qwen3.5's crossover between the GEMV and the GEMM, and
-    // this family inherits it. MEASURED here rather than assumed: lowering it
-    // to 4, so the GEMM engages at 8 rows instead of 12, costs gemma4 17%
-    // (8 lanes, 128.5 -> 106.5 tok/s). The inherited number holds.
-    if (n < qmm_min_batch()) return n;
+    // The GEMV/GEMM crossover, which `device_tuning.hpp` owns and which this
+    // family inherits rather than measures. What it does NOT inherit is one
+    // number for both shapes of checkpoint: a gemma-4-26B-A4B is a mixture and
+    // an E2B is dense, and on an M2 Max the two want different crossovers --
+    // dense 8, routed 12. Measured here from this family's own side on the M1
+    // Max first, where lowering the single number to 4 (so the GEMM engaged at
+    // 8 rows instead of 12) cost 17% on 8 lanes, 128.5 -> 106.5 tok/s; that
+    // checkpoint was routed, which is the half of the split that kept 12.
+    if (n < qmm_min_batch(g.is_moe())) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -62,7 +66,9 @@ int gemma4_moe_qmm_bn(Kind k, const Gemma4Geometry& g, int rows, int layer) {
     if (!is_routed(k) || gemma4_moe_tile_rows(g, rows) <= 1) return 0;
     const KN kn = qmv_kn(k, g, layer);
     if (kn.N == 0) return 0;
-    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows));
+    // Routed, so the routed crossover; `moe_should_batch` has already admitted
+    // this batch and the sorted count clears either number regardless.
+    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows), qmm_min_batch(true));
 }
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -249,12 +255,12 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
         return g4.qmv_routed;
     }
     if (const KN kn = qmv_kn(d.kind, g, d.layer); kn.N != 0) {
-        const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
+        const int M = gemma4_qmm_rows(g, d.kind == Kind::LmHead ? S : N);
         const int bm = qmm_bm(M);
         // `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only
         // where split-K supplies the threadgroups the wide tile gives up, and
         // this family dispatches no split (see `launch_shape_mb`).
-        const int bn = qmm_bn_unsplit(kn.N, M);
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
         const int wide = qmm_bm_slot(bm);
         // No split-K here either; see `launch_shape_mb`.
         const int split = 0;
@@ -407,12 +413,12 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         return;
     }
     if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
-        const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
+        const int M = gemma4_qmm_rows(g, d.kind == Kind::LmHead ? S : N);
         const int bm = qmm_bm(M);
         // Same chooser as `pso_for_mb`, for the same reason -- and it has to be
         // the same one: the grid and the pipeline disagreeing about BN is a
         // dispatch that computes the wrong thing rather than one that refuses.
-        const int bn = qmm_bn_unsplit(kn.N, M);
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
         // NO split-K. The split GEMM accumulates partial sums into a split
         // buffer and needs a reduce pass to fold them; qwen3.5 has both, this
         // family has neither -- so a split dispatch here wrote partials nobody
@@ -728,7 +734,7 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
             mb.qmm_cast_bf16_f16.valid()) {
             se.set_pso(mb.qmm_cast_bf16_f16);
             se.set_argtable_ordinal(ordinal_base + d.ordinal);
-            const std::uint32_t count = std::uint32_t(gemma4_qmm_rows(m)) *
+            const std::uint32_t count = std::uint32_t(gemma4_qmm_rows(g, m)) *
                                         std::uint32_t(qmv_kn(d.kind, g, d.layer).K);
             se.dispatch(Grid{count, 1, 1}, Threadgroup{256, 1, 1});
             se.barrier();
@@ -778,7 +784,8 @@ bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
     if (g.has_alt_quant() && gemma4_uses_alt_quant(d.kind)) return false;
     const KN kn = qmv_kn(d.kind, g, d.layer);
     if (kn.N == 0) return false;
-    return qmm_bn_unsplit(int(kn.N), gemma4_qmm_rows(m)) > 0;
+    return qmm_bn_unsplit(int(kn.N), gemma4_qmm_rows(g, m),
+                          qmm_min_batch(g.is_moe())) > 0;
 }
 
 /// Which dispatches stage, as opposed to reading what an earlier one staged.

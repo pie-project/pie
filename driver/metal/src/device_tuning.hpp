@@ -55,7 +55,53 @@ struct DeviceTuning {
     /// above is the crossover and not the weather.) The M4's wider per-core
     /// matrix throughput moves the crossover down; the GEMV's advantage at
     /// small N is a memory-bound one and does not.
+    ///
+    /// M2 Max (Apple8, 38 cores): 8. Measured the same way -- one binary, the
+    /// env override, arms alternated within each batch, three reps each -- on
+    /// four DENSE checkpoints, GEMM against GEMV, tok/s:
+    ///
+    ///     batch        6              7              8
+    ///     Llama-1B   386.9/393.0   427.8/398.5    480.3/408.5
+    ///     Llama-3B   166.7/167.6   181.0/167.8    204.1/171.2
+    ///     Qwen3-1.7B 270.9/283.8   300.3/290.9    339.1/296.4
+    ///     gemma-4E2B 173.9/197.9   192.3/202.8    220.6/210.9
+    ///
+    /// Eight is the first batch where the GEMM wins on ALL FOUR (+17.6, +19.2,
+    /// +14.4, +4.6%), and the last batch where it loses on any is seven --
+    /// gemma-4-E2B, -5.2%. Seven would buy the llama family another 3-8% and
+    /// cost gemma that, so the value is the one with no measured regression
+    /// anywhere rather than the one with the highest mean.
+    ///
+    /// DENSE only: see `qmm_min_batch_moe`, which the same sweep left at 12.
     int qmm_min_batch = 12;
+
+    /// The same crossover for a checkpoint whose FFN is ROUTED.
+    ///
+    /// A separate number because the measurement says so, not for symmetry. In
+    /// a mixture the dense projections this constant governs are the attention
+    /// four and the head; the FFN -- the largest weights in the layer, and on a
+    /// decode the whole of the bandwidth -- is routed and takes
+    /// `moe_tile_rows`' own decision instead. So the GEMM here pays its padding
+    /// without the matrices that repay it.
+    ///
+    /// M2 Max (Apple8, 38 cores), GEMM against GEMV at the batches where the
+    /// dense value would have switched, tok/s:
+    ///
+    ///     batch          6             7             8
+    ///     Qwen3-30B    63.6/63.5    67.8/75.2    90.4/98.3
+    ///     gemma-4-26B  60.1/64.3    71.7/76.6    84.8/96.3
+    ///     gpt-oss-20B  96.0/101.3  102.1/104.9  107.4/107.8
+    ///
+    /// The GEMV wins or ties at every one of them: taking the dense value here
+    /// would cost Qwen3-30B 8% and gemma-4-26B 12% at the batch it helps a
+    /// dense model most. So a routed checkpoint keeps the M1 number.
+    ///
+    /// This agrees with what the two routed families already recorded from
+    /// their own side on the M1 Max -- `gemma4_qmm_rows` measured a lowered
+    /// crossover at -17%, `gptoss_qmm_rows` at -1%. Those were read then as
+    /// "the inherited number holds"; they were the routed half of this split,
+    /// taken before there was a dense half to compare against.
+    int qmm_min_batch_moe = 12;
 
     /// The threadgroup count at which the unsplit GEMM's BN=32 tile overtakes
     /// BN=16.
@@ -181,12 +227,21 @@ const DeviceInfo& device_info();
 ///
 /// `PIE_METAL_QMM_MIN_BATCH` overrides `qmm_min_batch` for a run, which is how
 /// the crossover above was measured: a rebuild between arms is a different
-/// binary, and a different binary is a different measurement.
+/// binary, and a different binary is a different measurement. It carries the
+/// ROUTED crossover with it unless `PIE_METAL_QMM_MIN_BATCH_MOE` names one --
+/// a sweep that set only the dense number would otherwise measure a mixture
+/// that never changed path and read the flat curve as the crossover not
+/// mattering.
 const DeviceTuning& device_tuning();
 
 /// The GEMM crossover for this device. A function and not a constant because
 /// it is a property of the machine; see `DeviceTuning::qmm_min_batch`.
-int qmm_min_batch();
+///
+/// Takes whether the checkpoint's FFN is routed, because the crossover is a
+/// property of the machine AND of what the GEMM gets to cover: see
+/// `DeviceTuning::qmm_min_batch_moe`. A parameter and not two functions so
+/// that a caller cannot ask the question without answering it.
+int qmm_min_batch(bool is_moe);
 
 /// The unsplit GEMM's BN=16 -> BN=32 tile crossover, in threadgroups counted
 /// at BN=32. See `DeviceTuning::qmm_bn_crossover_tg`.
