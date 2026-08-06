@@ -187,10 +187,6 @@ pub static KERNELS: &[KernelSig] = &[
     // value on this leg, so the whole branch stays a list of rectangles;
     // the grouped-GEMM and host-routed legs reach the same numbers by
     // shapes no `Dim` spells, and are named refusals, not entries.
-    // The `(1 + w)` fold. The semantic Rmsnorm lowering emits only the
-    // Plain kernel, so a Gemma-fold norm needs stating; the MoE block is
-    // the first body that hit it.
-    kernel!(rmsnorm_gemma "launch_rmsnorm_gemma_bf16"),
     kernel!(topk_softmax "launch_topk_softmax_bf16"),
     // The whole routed block as one call — permute, both grouped GEMMs,
     // the activation and the weighted finalize. The leg decode actually

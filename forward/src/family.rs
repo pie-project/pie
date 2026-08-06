@@ -877,13 +877,9 @@ fn moe_mlp_body_cuda(
     }
 
     let w = MoeLayerW::new(l, facts);
-    // The norm is stated rather than left semantic: every qwen3.5/3.6
-    // checkpoint but plain `qwen3_moe` takes the Gemma `(1 + w)` fold,
-    // and the lowering emits only the Plain kernel.
-    let m = match facts.norm_variant {
-        NormVariant::Gemma => dsl::cuda::rmsnorm_gemma(y, &w.mlp_norm),
-        NormVariant::Plain => rmsnorm(y, &w.mlp_norm),
-    };
+    // Semantic: the lowering reads the variant and names the fold's
+    // kernel, so there is nothing here for a CUDA reading to add.
+    let m = rmsnorm(y, &w.mlp_norm);
 
     // The router stays two ops — a plain GEMM for the logits, then the
     // fused top-k/softmax/renormalize — because the fused call takes the

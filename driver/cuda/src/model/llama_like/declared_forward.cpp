@@ -1163,12 +1163,26 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::Rmsnorm: {
-            if (op.param0 !=
-                static_cast<std::uint32_t>(PieForwardNormVariant::Plain)) {
-                throw std::runtime_error(
-                    "declared forward: only the Plain rmsnorm variant is "
-                    "emitted (Gemma folding is a different arithmetic)");
-            }
+            // Gemma folds `(1 + w)` instead of `w`. Different arithmetic,
+            // so a different kernel — but the same signature and the same
+            // row space, and the variant rides on the wire, so the choice
+            // is one symbol and every arm below fans onto it. This used
+            // to throw; the lowering now names the fold's kernel, and a
+            // refusal here would be the executor disagreeing with the
+            // declaration it was handed.
+            const bool gemma_fold =
+                op.param0 !=
+                static_cast<std::uint32_t>(PieForwardNormVariant::Plain);
+            const auto norm = [&](const void* x, const void* weight,
+                                  void* y, int rows, int width) {
+                if (gemma_fold) {
+                    kernels::launch_rmsnorm_gemma_bf16(
+                        x, weight, y, rows, width, eps, stream);
+                } else {
+                    kernels::launch_rmsnorm_bf16(
+                        x, weight, y, rows, width, eps, stream);
+                }
+            };
             const std::string_view name = plan.weight_name(op);
             const ParsedWeightName nm = parse_weight_name(name);
             if (nm.field == "attn_norm") {
@@ -1179,19 +1193,16 @@ void llama_like_forward_declared(
                 void* const attn_norm_out =
                     values.slot(plan.outputs(op)[0],
                                 plan.value(plan.outputs(op)[0]));
-                kernels::launch_rmsnorm_bf16(
-                    // Post-norm norms the o_proj OUTPUT (the pinned
-                    // scratch), pre-norm the residual stream.
-                    post_norm ? ws.norm_x.data() : ws.y.data(),
-                    wb.require(name).data(),
-                    attn_norm_out, N, H, eps, stream);
+                // Post-norm norms the o_proj OUTPUT (the pinned
+                // scratch), pre-norm the residual stream.
+                norm(post_norm ? ws.norm_x.data() : ws.y.data(),
+                     wb.require(name).data(), attn_norm_out, N, H);
             } else if (nm.field == "mlp_norm") {
                 const auto& layer = layer_of(w, nm, name);
                 if (post_norm) {
                     // Post-norm: the down_proj OUTPUT (in norm_x) → norm_y.
-                    kernels::launch_rmsnorm_bf16(
-                        ws.norm_x.data(), wb.require(name).data(),
-                        ws.norm_y.data(), N, H, eps, stream);
+                    norm(ws.norm_x.data(), wb.require(name).data(),
+                         ws.norm_y.data(), N, H);
                 } else {
                     // ISLAND (value arena): the normed activation is a
                     // TRACED VALUE, not "ws.norm_y" — that name is this
@@ -1199,25 +1210,22 @@ void llama_like_forward_declared(
                     // role `ws.norm_x`. Producer and consumer move
                     // together; the post-norm arm above keeps its
                     // convention until its own island moves.
-                    kernels::launch_rmsnorm_bf16(
-                        ws.y.data(), wb.require(name).data(),
-                        values.slot(plan.outputs(op)[0],
-                                    plan.value(plan.outputs(op)[0])),
-                        N, H, eps, stream);
+                    norm(ws.y.data(), wb.require(name).data(),
+                         values.slot(plan.outputs(op)[0],
+                                     plan.value(plan.outputs(op)[0])),
+                         N, H);
                 }
             } else if (nm.field == "q_norm") {
                 // Global qk-norm (olmo2): ONE row RMSNorm over the
                 // flattened [N, heads * head_dim] projection, in place —
                 // the hand-written `rmsnorm_qk` global branch, verbatim.
                 const auto& layer = layer_of(w, nm, name);
-                kernels::launch_rmsnorm_bf16(
-                    ws.q.data(), wb.require(name).data(),
-                    ws.q.data(), N, Hq, eps, stream);
+                norm(ws.q.data(), wb.require(name).data(),
+                     ws.q.data(), N, Hq);
             } else if (nm.field == "k_norm") {
                 const auto& layer = layer_of(w, nm, name);
-                kernels::launch_rmsnorm_bf16(
-                    ws.k.data(), wb.require(name).data(),
-                    ws.k.data(), N, Hk, eps, stream);
+                norm(ws.k.data(), wb.require(name).data(),
+                     ws.k.data(), N, Hk);
             } else if (nm.layer < 0 && nm.field == "final_norm") {
                 // Deferred to LmHead: the hand-written epilogue interleaves
                 // the final norm with the logit-row gather (norm is row-wise,

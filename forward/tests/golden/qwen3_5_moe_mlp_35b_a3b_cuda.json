@@ -104,11 +104,9 @@
   "ops": [
     {
       "kind": {
-        "Launch": {
-          "kernel": "launch_rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.0.mlp_norm"
-          ]
+        "Rmsnorm": {
+          "weight": "layer.0.mlp_norm",
+          "variant": "Gemma"
         }
       },
       "inputs": [

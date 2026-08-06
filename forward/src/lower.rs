@@ -700,14 +700,22 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         AddBias { .. } => Semantic::Kernels(&["launch_add_bias_bf16"]),
         ResidualAdd => Semantic::Kernels(&["launch_residual_add_bf16"]),
 
-        // Gemma folds `(1 + w)` — different arithmetic, a different
-        // kernel, and this executor refuses it outright.
+        // Gemma folds `(1 + w)` — different arithmetic, so a different
+        // kernel, but the same signature and the same row space. The
+        // variant is already on the wire (`param0`), so naming the
+        // symbol is the whole of what the lowering owes; the executor
+        // reads the same field to pick.
+        //
+        // The per-head kind differs only in its ROW COUNT (`N * heads`
+        // rows of `head_dim` rather than `N` of `hidden`), which the
+        // executor derives from the weight's geometry either way — so
+        // both kinds fan onto the same pair.
         Rmsnorm { variant, .. } | RmsnormPerHead { variant, .. } => {
-            if variant.is_plain() {
-                Semantic::Kernels(&["launch_rmsnorm_bf16"])
+            Semantic::Kernels(if variant.is_plain() {
+                &["launch_rmsnorm_bf16"]
             } else {
-                Semantic::Unlowered("only the Plain rmsnorm variant is emitted")
-            }
+                &["launch_rmsnorm_gemma_bf16"]
+            })
         }
 
         // Inside a peel's tail the split serves absolute row offsets in a
@@ -1078,6 +1086,55 @@ mod tests {
         }
         out
     }
+
+    /// The qwen3_5 family's residue LEDGER, pinned by kind and count.
+    ///
+    /// llama_like's cutover was driven by exactly this: a ledger that
+    /// names what the flat list still does not carry, so each rung can
+    /// be read as a line leaving it. qwen3_5 has never had one — its
+    /// executor still walks, and "it walks" was the whole of what was
+    /// written down.
+    ///
+    /// The counts are per fire, not per layer, so they move when a body
+    /// changes and stay put when a fixture does.
+    #[test]
+    fn the_qwen3_5_residue_ledger() {
+        let facts = crate::facts::Qwen35HybridFacts::qwen3_5_0_8b();
+        let cuda = crate::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+        let plan = family::qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::Decode);
+        let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
+        let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
+        for u in &out.residue {
+            *ledger
+                .entry(format!("{}: {}", u.kind, u.why))
+                .or_default() += 1;
+        }
+        let seen: Vec<String> = ledger
+            .iter()
+            .map(|(k, n)| format!("{n:>4}  {k}"))
+            .collect();
+        let expected: Vec<String> = LEDGER_QWEN35_DECODE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            seen,
+            expected,
+            "the qwen3_5 residue ledger moved.\n\
+             Every line here is a statement the flat list does not carry. \
+             If a rung removed one, update the constant and say which \
+             statement now names its kernel; if a rung ADDED one, that is \
+             a body stating something the lowering cannot read."
+        );
+    }
+
+    /// The ledger's current contents — see [`the_qwen3_5_residue_ledger`].
+    /// One entry per (kind, reason), counted per DECODE fire.
+    const LEDGER_QWEN35_DECODE: &[&str] = &[
+        "  18  GdnPrep: no lowering rule for this kind",
+        "  18  RmsnormGated: no lowering rule for this kind",
+        "   6  Rope: partial rope is a different kernel",
+        "   6  SigmoidGateMul: no lowering rule for this kind",
+        "   6  SplitQGate: no lowering rule for this kind",
+        "  24  Swiglu: the fused-gate_up binding fact is not in the facts",
+    ];
 
     /// Qwen3.6-27B owes NOTHING that Qwen3.5-0.8B does not already owe.
     ///

@@ -1646,29 +1646,6 @@ pub mod cuda {
         .expect("a routed projection produces its value")
     }
 
-    /// `kernels::launch_rmsnorm_gemma_bf16`: the `(1 + w)` fold.
-    ///
-    /// The semantic [`super::rmsnorm`] carries the variant as a FACT and
-    /// the lowering emits only the Plain kernel, so a Gemma-fold norm
-    /// was residue wherever it appeared. It appears on every qwen3.5/3.6
-    /// checkpoint but plain `qwen3_moe`, which is why the MoE block is
-    /// the first body to need it stated.
-    pub fn rmsnorm_gemma(x: &Val, w: &NormW) -> Val {
-        // Hoisted: a borrow taken inside the argument list would still be
-        // live when `record` borrows mutably.
-        let out = (x.t.inner.borrow().value_shape(x.id), DType::BF16);
-        record(
-            &x.t,
-            w.layer,
-            "launch_rmsnorm_gemma_bf16",
-            vec![w.name.clone()],
-            None,
-            vec![x.id],
-            Some(out),
-        )
-        .expect("the norm produces its value")
-    }
-
     /// `ops::flashinfer_cutlass_moe_bf16`: the whole routed block —
     /// permute, both grouped GEMMs, the activation, and the weighted
     /// finalize — as ONE call.
