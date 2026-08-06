@@ -198,8 +198,7 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(logit_softcap "launch_logit_softcap_bf16"),
     // Q-only rotation: a KV-shared layer's K was rotated at its source
     // layer. One operand is the statement.
-    kernel!(rope_q_only_partial "launch_rope_partial_bf16"),
-    kernel!(rope_q_only "launch_rope_bf16"),
+    kernel!(rope_partial_q_only "launch_rope_partial_bf16"),
     // Six statements in one launch; the only value that survives is q.
     kernel!(qkv_packed_post "launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
         sink = Some("kv.pages")),

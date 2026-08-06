@@ -3351,30 +3351,44 @@ pub fn gemma4_cuda(
             let attn_in = if fused_post {
                 let packed = matmul(&normed, &w.qkv);
                 dsl::cuda::qkv_packed_post(&packed, &w.q_norm, &w.k_norm, &kv, facts.q_heads * d)
-            } else {
-                // The separate form. A shared layer takes only the q
-                // leg of it: no k/v projection, no k/v norm, no rope on
-                // k, no write.
+            } else if shared {
+                // A shared layer takes only the Q leg: no k/v
+                // projection, no k/v norm, no rope on k, no write. Which
+                // KERNEL rotates q still follows the layer kind, because
+                // the driver reaches both by passing `num_kv_heads = 0`
+                // to the launcher the un-shared layer of that kind would
+                // have used — NOT by falling back to a generic rope.
                 let q = matmul(&normed, &w.q_proj);
-                if shared {
+                if full {
                     let q = rmsnorm(&q, &w.q_norm);
-                    // K was rotated at its SOURCE layer, where it was
-                    // written to the cache — so only q rotates here.
-                    dsl::cuda::rope_q_only(&q, full)
+                    dsl::cuda::rope_partial_q_only(&q)
                 } else {
-                    let k = matmul(&normed, &w.k_proj);
-                    let v = matmul(&normed, &w.v_proj);
-                    let v = dsl::cuda::rmsnorm_no_scale(&v);
-                    let (q, k) = if full {
-                        let q = rmsnorm(&q, &w.q_norm);
-                        let k = rmsnorm(&k, &w.k_norm);
-                        dsl::rope_partial(&q, &k, RopeKind::Standard, facts.global_rotary_dim)
-                    } else {
-                        dsl::cuda::qk_rmsnorm_rope_rounded(&q, &k, &w.q_norm, &w.k_norm)
-                    };
-                    dsl::cuda::write_kv_to_pages(&k, &v, &kv);
-                    q
+                    dsl::cuda::qk_rmsnorm_rope_rounded_q_only(&q, &w.q_norm)
                 }
+            } else {
+                let (q, k, v) = if cuda.fused_qkv {
+                    let packed = matmul(&normed, &w.qkv);
+                    dsl::split_qkv(&packed, facts.q_heads * d, facts.kv_heads * d)
+                } else {
+                    (
+                        matmul(&normed, &w.q_proj),
+                        matmul(&normed, &w.k_proj),
+                        matmul(&normed, &w.v_proj),
+                    )
+                };
+                let v = dsl::cuda::rmsnorm_no_scale(&v);
+                let (q, k) = if full {
+                    // Partial rope has no fused pair, so the norms are
+                    // their own statements — `can_fuse_qk_norm_rope`
+                    // reads `!partial`.
+                    let q = rmsnorm(&q, &w.q_norm);
+                    let k = rmsnorm(&k, &w.k_norm);
+                    dsl::rope_partial(&q, &k, RopeKind::Standard, facts.global_rotary_dim)
+                } else {
+                    dsl::cuda::qk_rmsnorm_rope_rounded(&q, &k, &w.q_norm, &w.k_norm)
+                };
+                dsl::cuda::write_kv_to_pages(&k, &v, &kv);
+                q
             };
 
             let a = dsl::cuda::attention_flashinfer_decode(&attn_in, &kv)

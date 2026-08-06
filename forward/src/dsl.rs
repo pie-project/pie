@@ -1625,33 +1625,51 @@ pub mod cuda {
         .expect("the activation produces its value")
     }
 
-    /// `kernels::launch_rope{,_partial}_bf16` rotating Q ALONE.
+    /// `kernels::launch_rope_partial_bf16` rotating Q ALONE.
     ///
     /// A KV-shared layer's K was rotated at its SOURCE layer, where it
     /// was written to the cache, so rotating it again here would be
     /// wrong twice over — the value is not even in this layer's
-    /// registers. The driver expresses that by passing `num_kv_heads =
-    /// 0`; the trace expresses it by the statement having ONE operand.
+    /// registers. The driver says that with `num_kv_heads = 0`; the
+    /// trace says it by the statement having ONE operand.
     ///
-    /// The semantic [`super::rope`] cannot say this: its shape is a
-    /// (q, k) pair, and a pair with nothing in the second slot is a
-    /// different statement, not a degenerate one.
-    pub fn rope_q_only(q: &Val, partial: bool) -> Val {
+    /// The semantic [`super::rope`] cannot: its shape is a (q, k) pair,
+    /// and a pair with an empty slot is a different statement, not a
+    /// degenerate one.
+    pub fn rope_partial_q_only(q: &Val) -> Val {
         let out = (q.t.inner.borrow().value_shape(q.id), DType::BF16);
         record(
             &q.t,
             q.layer,
-            if partial {
-                "launch_rope_partial_bf16"
-            } else {
-                "launch_rope_bf16"
-            },
+            "launch_rope_partial_bf16",
             vec![],
             None,
             vec![q.id],
             Some(out),
         )
         .expect("the rotation produces its value")
+    }
+
+    /// [`qk_rmsnorm_rope_rounded`] with K absent — the SHARED sliding
+    /// layer's form.
+    ///
+    /// Same symbol, and that is the point: the driver reaches this by
+    /// passing `k_norm = nullptr` and `num_kv_heads = 0` to the very
+    /// same launcher, so a declaration that spelled it as a rope plus a
+    /// separate norm would be naming a pair of kernels the pass never
+    /// fires. One operand, one weight, one launch.
+    pub fn qk_rmsnorm_rope_rounded_q_only(q: &Val, q_norm: &NormW) -> Val {
+        let out = (q.t.inner.borrow().value_shape(q.id), DType::BF16);
+        record(
+            &q.t,
+            q_norm.layer,
+            "launch_qk_rmsnorm_rope_bf16_rounded",
+            vec![q_norm.name.clone()],
+            None,
+            vec![q.id],
+            Some(out),
+        )
+        .expect("the fused pair produces q")
     }
 
     /// `kernels::launch_rmsnorm_no_scale_bf16`: `v / rms(v)` per head,
