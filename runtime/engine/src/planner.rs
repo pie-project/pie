@@ -1651,7 +1651,12 @@ impl ResidencyPlanner {
             // only — a demand that reserves off the free lists trivially
             // fits, and reading totals is a store-lock hold the per-fire
             // hot path must not pay (§16).
-            let limbo_started_us = crate::scheduler::fire_timing_now_us();
+            let limbo_probe = crate::scheduler::fire_timing_enabled();
+            let limbo_started_us = if limbo_probe {
+                crate::scheduler::fire_timing_now_us()
+            } else {
+                0
+            };
             let (_, kv_total) = self.port.device_stats();
             if demand.kv_pages > kv_total {
                 return Err(PlannerError::Impossible {
@@ -1724,7 +1729,7 @@ impl ResidencyPlanner {
                     // quorum so frames seal without it; rejoin is implicit
                     // on the lane's next accepted fire.
                     crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
-                    {
+                    if limbo_probe {
                         use std::sync::atomic::Ordering::Relaxed;
                         let acc = &crate::scheduler::GUEST_PHASES;
                         let limbo = crate::scheduler::fire_timing_now_us()

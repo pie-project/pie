@@ -345,7 +345,15 @@ async fn acquire_grant<C: FireContext>(
         return Err("pipeline: KV residency planner is not installed".to_string());
     };
     let pid = ctx.process_id();
-    let acq_started_us = crate::scheduler::fire_timing_now_us();
+    // Probe only: two clock reads per fire on the default path is not a cost
+    // production should carry for a number nothing reads unless the wave
+    // ledger is on.
+    let probe = crate::scheduler::fire_timing_enabled();
+    let acq_started_us = if probe {
+        crate::scheduler::fire_timing_now_us()
+    } else {
+        0
+    };
     let outcome = loop {
         match planner
             .acquire(pid, pipeline_id, demand)
@@ -361,7 +369,7 @@ async fn acquire_grant<C: FireContext>(
             Err(error) => break Err(error),
         }
     };
-    {
+    if probe {
         use std::sync::atomic::Ordering::Relaxed;
         let acc = &crate::scheduler::GUEST_PHASES;
         let acq = crate::scheduler::fire_timing_now_us().saturating_sub(acq_started_us) * 1_000;

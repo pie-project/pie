@@ -403,10 +403,12 @@ impl ProcessCtx {
                 now.saturating_sub(wake_us) * 1_000,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            acc.take_first_us
-                .fetch_min(now, std::sync::atomic::Ordering::Relaxed);
-            acc.take_last_us
-                .fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+            if crate::scheduler::fire_timing_enabled() {
+                acc.take_first_us
+                    .fetch_min(now, std::sync::atomic::Ordering::Relaxed);
+                acc.take_last_us
+                    .fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         self.last_take_us = now;
     }
