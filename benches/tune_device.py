@@ -53,6 +53,7 @@ import statistics
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 PREFILL = re.compile(r"prefill:\s+\d+ tok in [\d.]+ s\s+=\s+([\d.]+) tok/s")
@@ -176,10 +177,65 @@ class Knob:
     field: str          # the `DeviceTuning` member, for the printed block
     env: str            # the override
     values: list[int]   # candidates, default first
-    model: str          # substring matching a checkpoint directory
+    models: list[str]   # substrings matching checkpoint directories; a value
+                        # only moves the family default if it wins on ALL of
+                        # them, which is the standard the M2 entry in
+                        # `device_tuning.hpp` was already held to and the
+                        # script was not
     rule: Callable      # what the driver chooses, for finding a batch that splits
     why: str
     rows: list[int] = field(default_factory=list)  # batches to consider
+
+
+# `values[0]` is scored as "the default", so a stale literal here does not
+# produce a wrong number -- it produces a wrong SENTENCE, which is worse,
+# because the number is right and the reader has no way to tell.
+#
+# It happened. `moe_batch_min_per_expert` moved from 8 to 4 in
+# `device_tuning.hpp` and this list kept the 8, so the sweep reported "4 beats
+# the default 8 by +90.4%" and printed `t.moe_batch_min_per_expert = 4;` as
+# something to paste into `tuning_for()`. Both halves are false: 4 was already
+# the default, the +90.4% was the cost of the value nobody runs, and the paste
+# was a no-op dressed as the largest win in the table. A file whose whole
+# purpose is that a value must arrive with its measurement had produced a
+# measurement of nothing.
+#
+# So the defaults are not transcribed any more. They are read from the header
+# that owns them, and a knob whose first candidate is not the default is a hard
+# error rather than a footnote.
+_TUNING_HPP = (Path(__file__).resolve().parent.parent
+               / "driver/metal/src/device_tuning.hpp")
+
+
+def header_defaults() -> dict[str, int]:
+    """`DeviceTuning`'s field initializers, by name.
+
+    Only the plain `type name = literal;` members, which is all of them; a
+    field that stops being one will simply be absent and trip the check below
+    rather than be guessed at.
+    """
+    out: dict[str, int] = {}
+    text = _TUNING_HPP.read_text()
+    for m in re.finditer(r"^\s{4}(?:int|bool)\s+(\w+)\s*=\s*(\w+)\s*;", text, re.M):
+        name, raw = m.group(1), m.group(2)
+        if raw in ("true", "false"):
+            out[name] = 1 if raw == "true" else 0
+        elif raw.isdigit():
+            out[name] = int(raw)
+    return out
+
+
+def check_defaults_match_header(knobs: list["Knob"]) -> list[str]:
+    """The knobs whose first candidate is not what the header ships."""
+    have = header_defaults()
+    bad = []
+    for k in knobs:
+        if k.field not in have:
+            bad.append(f"{k.field}: not found in {_TUNING_HPP.name}")
+        elif have[k.field] != k.values[0]:
+            bad.append(f"{k.field}: header says {have[k.field]}, "
+                       f"KNOBS says {k.values[0]}")
+    return bad
 
 
 # Row counts worth considering. A threshold's two sides are by construction
@@ -188,32 +244,32 @@ class Knob:
 COMMON_ROWS = [32, 48, 64, 96, 128, 192, 256, 320, 448, 512, 704, 1024]
 
 KNOBS: list[Knob] = [
-    Knob("fp16_qmm", "PIE_METAL_FP16_QMM", [1, 0], "gemma-4-e2b", rule_always,
+    Knob("fp16_qmm", "PIE_METAL_FP16_QMM", [1, 0], ["gemma-4-e2b", "gemma-4-31b-it", "Qwen3.6-27B"], rule_always,
          "M1 and M2 emulate bfloat16 matrix ops and Apple9 does not, so this "
          "is the one field whose default may be wrong rather than unmeasured",
          rows=[448]),
     Knob("qmm_min_batch", "PIE_METAL_QMM_MIN_BATCH", [12, 8, 16],
-         "Llama-3.2-1B-Instruct-4bit", rule_qmm_min_batch,
+         ["Llama-3.2-1B-Instruct-4bit"], rule_qmm_min_batch,
          "matvec against GEMM. Its crossover is small by construction, so the "
          "two sides are close there and the noise guard earns its keep",
          rows=[12, 8, 16, 24, 32]),
     Knob("qmm_bn_crossover_tg", "PIE_METAL_QMM_BN_CROSSOVER_TG",
-         [160, 96, 256], "Llama-3.2-1B-Instruct-4bit", rule_qmm_bn_crossover,
+         [160, 96, 256], ["Llama-3.2-1B-Instruct-4bit"], rule_qmm_bn_crossover,
          "a threadgroup count, so a wider GPU saturates later and wants it up. "
          "Decided per projection, so the batch has to be one where the "
          "candidates disagree about at least one of the model's widths",
          rows=[64, 96, 128, 192, 256, 448, 1024]),
     Knob("moe_tile_wide_per", "PIE_METAL_MOE_TILE_WIDE_PER", [88, 56, 128],
-         "gpt-oss-20b", rule_moe_wide,
+         ["gpt-oss-20b"], rule_moe_wide,
          "rows an expert needs before a 64-row tile pays; end to end because "
          "the probe has misled this one three times"),
     Knob("moe_tile_mid_per", "PIE_METAL_MOE_TILE_MID_PER", [12, 8, 24],
-         "gemma-4-26B-A4B", rule_moe_mid, "the same trade one rung down"),
+         ["gemma-4-26B-A4B"], rule_moe_mid, "the same trade one rung down"),
     Knob("sdpa_tile_min_rows_per_request", "PIE_METAL_SDPA_TILE_MIN_ROWS",
-         [32, 16, 64], "Llama-3.2-1B-Instruct-4bit", rule_sdpa_tile,
+         [32, 16, 64], ["Llama-3.2-1B-Instruct-4bit"], rule_sdpa_tile,
          "tiled attention against per-row"),
     Knob("moe_batch_min_per_expert", "PIE_METAL_MOE_BATCH_MIN_PER_EXPERT",
-         [8, 4, 16], "gpt-oss-20b", rule_moe_batch,
+         [4, 8, 2], ["gpt-oss-20b"], rule_moe_batch,
          "sorting the mixture against leaving it a matvec"),
 ]
 
@@ -347,13 +403,19 @@ def report(knob: Knob, runs: dict[int, list[float]], rows: int,
         print(f"    -> {top} beats the default {default} by {gap:+.1f}% "
               f"(noise {noise:.1f}%)")
         return top
+    # Both branches below return the DEFAULT rather than None. A checkpoint
+    # that measured and declined to move is not a checkpoint that was never
+    # asked, and the caller needs to tell them apart: a family default may only
+    # move when every checkpoint asked for it, so an abstention that reads as
+    # an absence would let one model carry the vote.
     if -gap > noise:
         print(f"    -> keeps the default {default}: {top} comes in {-gap:.1f}% "
               f"below it (noise {noise:.1f}%)")
-    else:
-        print(f"    -> no winner: {top} is {gap:+.1f}% against the default and "
-              f"the runs themselves move {noise:.1f}%. Raise --repeats, or take "
-              "it that the paths cost the same here.")
+        return default
+    print(f"    -> no winner: {top} is {gap:+.1f}% against the default and "
+          f"the runs themselves move {noise:.1f}%. Raise --repeats, or take "
+          "it that the paths cost the same here.")
+    return default
     return None
 
 
@@ -371,6 +433,17 @@ def main() -> int:
                          "the table is measurement rather than weather")
     args = ap.parse_args()
 
+    # Before anything is measured: a sweep that scores against the wrong
+    # baseline is not slower to notice, it is impossible to notice.
+    if drift := check_defaults_match_header(KNOBS):
+        print("KNOBS disagrees with device_tuning.hpp about what ships:",
+              file=sys.stderr)
+        for line in drift:
+            print(f"  {line}", file=sys.stderr)
+        print("Fix the candidate list; `values[0]` is scored as the default.",
+              file=sys.stderr)
+        return 2
+
     roots = args.checkpoint_root or [
         os.path.expanduser("~/.cache/huggingface/hub"),
         os.path.expanduser("~/.pie-bench"),
@@ -385,36 +458,61 @@ def main() -> int:
             continue
         print(f"\n{knob.field}  ({knob.env})")
         print(f"  {knob.why}")
-        ckpt = find_checkpoint(knob.model, roots)
-        if ckpt is None:
-            print(f"  SKIP: no checkpoint matching '{knob.model}'")
-            continue
-        model = Model.load(ckpt)
+        # Every checkpoint this knob names, because one is not enough to move
+        # a FAMILY default: `fp16_qmm` reverses sign with model size on an M4
+        # Pro, and a sweep that had asked only the small one would have
+        # recommended a 1.7-4.7% regression on the four models anybody runs.
+        verdicts: dict[str, int | None] = {}
+        for model_name in knob.models:
+            ckpt = find_checkpoint(model_name, roots)
+            if ckpt is None:
+                print(f"  SKIP: no checkpoint matching '{model_name}'")
+                verdicts[model_name] = None
+                continue
+            model = Model.load(ckpt)
 
-        split = pick_rows(knob, model, want_split=True)
-        if split is None:
-            print(f"  SKIP: no batch in {knob.rows or COMMON_ROWS} makes these "
-                  "settings take different paths, so a sweep here would time "
-                  "the same work three times.")
-            continue
-        rows, choices = split
-        print(f"  {display_name(ckpt)} at {rows} rows"
-              + (f", where the arms choose {choices}" if choices else
-                 ", divergence not predictable from config"))
-        best = report(knob, sweep(knob, args.bench, ckpt, rows, args.repeats),
-                      rows, choices, control=False)
-        if best is not None:
-            chosen[knob.field] = best
+            split = pick_rows(knob, model, want_split=True)
+            if split is None:
+                print(f"  SKIP: no batch in {knob.rows or COMMON_ROWS} makes "
+                      "these settings take different paths, so a sweep here "
+                      "would time the same work three times.")
+                verdicts[model_name] = None
+                continue
+            rows, choices = split
+            print(f"  {display_name(ckpt)} at {rows} rows"
+                  + (f", where the arms choose {choices}" if choices else
+                     ", divergence not predictable from config"))
+            best = report(knob, sweep(knob, args.bench, ckpt, rows, args.repeats),
+                          rows, choices, control=False)
+            verdicts[model_name] = best
 
-        if args.control:
-            same = pick_rows(knob, model, want_split=False)
-            if same is None:
-                print("  (no control: nothing here makes these settings agree, "
-                      "or their choice is not predictable from the config)")
-            else:
-                print(f"  control: {same[0]} rows, all arms choose {same[1][0]}")
-                report(knob, sweep(knob, args.bench, ckpt, same[0], args.repeats),
-                       same[0], same[1], control=True)
+            if args.control:
+                same = pick_rows(knob, model, want_split=False)
+                if same is None:
+                    print("  (no control: nothing here makes these settings "
+                          "agree, or their choice is not predictable from the "
+                          "config)")
+                else:
+                    print(f"  control: {same[0]} rows, all arms choose {same[1][0]}")
+                    report(knob, sweep(knob, args.bench, ckpt, same[0], args.repeats),
+                           same[0], same[1], control=True)
+
+        measured = {m: v for m, v in verdicts.items() if v is not None}
+        movers = {m: v for m, v in measured.items() if v != knob.values[0]}
+        if not measured or not movers:
+            continue
+        winners = set(movers.values())
+        if len(movers) == len(measured) and len(winners) == 1:
+            chosen[knob.field] = winners.pop()
+        else:
+            kept = [m for m in measured if m not in movers]
+            print(f"    -> NOT RECOMMENDED: "
+                  + "; ".join(f"{m} wants {v}" for m, v in movers.items())
+                  + (f", but {', '.join(kept)} keeps {knob.values[0]}" if kept else "")
+                  + ". A family default needs every checkpoint that was asked, "
+                    "or the value is a property of one model rather than of "
+                    "this device.")
+
 
     print("\n" + "=" * 70)
     if not chosen:

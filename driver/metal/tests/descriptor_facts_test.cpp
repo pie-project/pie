@@ -71,6 +71,42 @@ int main() {
     expect(!pie::metal::read_model_facts_from_descriptor(foreign).has_value(),
            "a JSON object without pie.model/1 is refused");
 
+    // `arch_name` is the key BOTH registries use -- this driver's family
+    // switch and the runtime's `instruct::create`. The descriptor carries
+    // `architectures[0]` verbatim, so the reduction to a stem happens here,
+    // and a suffix this misses is not a refusal: the name simply fails to
+    // match any row and takes the fallback, which for `instruct::create` is
+    // ChatML. A gemma-4 served that way loads correct weights, runs correct
+    // kernels and answers a conversation nobody had.
+    std::printf("-- architectures[0] reduces to the stem the registries key on --\n");
+    struct { const char* in; const char* want; } stems[] = {
+        {"Qwen3ForCausalLM", "qwen3"},
+        {"Gemma4ForConditionalGeneration", "gemma4"},
+        {"Gemma3ForConditionalGeneration", "gemma3"},
+        // The reason the suffix list is explicit: the first `for` in this one
+        // is inside the stem, so cutting there would leave `re`.
+        {"ReformerForCausalLM", "reformer"},
+        // Nothing to strip stays whole rather than becoming empty.
+        {"Llama", "llama"},
+    };
+    for (const auto& c : stems) {
+        const std::string got = pie::metal::arch_stem(c.in);
+        expect(got == c.want,
+               std::string(c.in) + " -> " + got + " (want " + c.want + ")");
+    }
+
+    // And the two paths that reach `ModelFacts` must agree on it, since a
+    // snapshot boot and an artifact boot serve the same registry.
+    const std::string mm_descriptor = R"({
+      "version": "pie.model/1",
+      "model_type": "gemma4_text",
+      "arch_name": "Gemma4ForConditionalGeneration",
+      "num_hidden_layers": 60
+    })";
+    const auto mm = pie::metal::read_model_facts_from_descriptor(mm_descriptor);
+    expect(mm.has_value() && mm->arch_name == "gemma4",
+           "a descriptor's ForConditionalGeneration reduces the same way");
+
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
