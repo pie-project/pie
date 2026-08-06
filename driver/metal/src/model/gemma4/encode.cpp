@@ -312,9 +312,11 @@ bool qmv_needs_tail(int K, const AffineFormat& fmt) {
     return K % block != 0;
 }
 
-bool gemma4_uses_alt_quant(Kind k) {
-    return k == Kind::QmvGate || k == Kind::QmvUp || k == Kind::QmvDown ||
-           k == Kind::RouterGemv;
+bool gemma4_uses_alt_quant(Kind k, const Gemma4Geometry& g) {
+    if (k == Kind::QmvGate || k == Kind::QmvUp || k == Kind::QmvDown) {
+        return g.alt_quant_ffn;
+    }
+    return k == Kind::RouterGemv && g.alt_quant_router;
 }
 
 Pso pso_for(const Dispatch& d, const Gemma4Geometry& g, const DecodeStepPsos& base,
@@ -325,7 +327,7 @@ Pso pso_for(const Dispatch& d, const Gemma4Geometry& g, const DecodeStepPsos& ba
     // bounds-checked one.
     if (!is_routed(d.kind)) {
         if (const KN kn = qmv_kn(d.kind, g, d.layer); kn.N != 0) {
-            const bool alt = gemma4_uses_alt_quant(d.kind) && g.has_alt_quant();
+            const bool alt = gemma4_uses_alt_quant(d.kind, g) && g.has_alt_quant();
             const AffineFormat& fmt = alt ? g.ffn_quant : g.quant;
             if (qmv_needs_tail(kn.K, fmt)) return alt ? g4.qmv_tail_alt : g4.qmv_tail;
         }
@@ -695,7 +697,7 @@ void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
         // 4. One pipeline for both would run a 4-bit kernel over 8-bit bytes:
         // it dispatches, it is fast, and every token is wrong.
         const DecodeStepPsos& B =
-            (base_alt != nullptr && gemma4_uses_alt_quant(d.kind)) ? *base_alt : base;
+            (base_alt != nullptr && gemma4_uses_alt_quant(d.kind, g)) ? *base_alt : base;
         se.set_pso(pso_for(d, g, B, g4));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
@@ -743,7 +745,7 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
         Threadgroup tg;
         launch_shape_mb(d, g, rows, grid, tg, head_rows, requests);
         const bool alt = base_alt != nullptr && mb_alt != nullptr &&
-                         gemma4_uses_alt_quant(d.kind);
+                         gemma4_uses_alt_quant(d.kind, g);
         se.set_pso(pso_for_mb(d, g, rows, alt ? *base_alt : base, alt ? *mb_alt : mb, g4,
                               head_rows, requests));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
@@ -775,13 +777,11 @@ bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
     // condition, so a dense checkpoint has none to reach.
     if (!fp16_qmm()) return false;
     if (g.is_moe() || g.quant.bits != 4 || g.quant.group != 64) return false;
-    // `gemma4_uses_alt_quant` is a property of the KIND, not of the checkpoint:
-    // it says which table the dispatch reads, and a checkpoint with one table
-    // has the same one at both names. Only a checkpoint that really ships two
-    // has an 8-bit set to keep away from -- and reading the kind alone would
-    // have excluded gate, up and down from every checkpoint, which is three
-    // quarters of the arithmetic.
-    if (g.has_alt_quant() && gemma4_uses_alt_quant(d.kind)) return false;
+    // Only a checkpoint that really ships two formats has an 8-bit set to keep
+    // away from, and only the tensors it actually spared. Reading the kind
+    // alone would have excluded gate, up and down from every checkpoint, which
+    // is three quarters of the arithmetic.
+    if (g.has_alt_quant() && gemma4_uses_alt_quant(d.kind, g)) return false;
     const KN kn = qmv_kn(d.kind, g, d.layer);
     if (kn.N == 0) return false;
     return qmm_bn_unsplit(int(kn.N), gemma4_qmm_rows(g, m),
