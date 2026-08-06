@@ -56,6 +56,11 @@ struct MixtralPhaseProfile {
     double attn = 0, router = 0, moe_gate_up = 0, moe_down = 0;
     double o_proj = 0, epilogue = 0;
     double moe_align = 0, moe_act = 0, moe_reduce = 0, moe_prep = 0;
+    // The whole fire, so `sum` is always readable against what it explains.
+    // Without it a stage that is not instrumented is invisible rather than
+    // merely unattributed, and `sum` reads like a step time -- which is how
+    // the uninstrumented Marlin MoE was once mistaken for a host-side stall.
+    double fire = 0;
     int last_N = 0;
 
     // Intervals may nest, so opens are held on a stack and each close pairs
@@ -83,6 +88,7 @@ struct MixtralPhaseProfile {
         }
         const std::size_t i = used++;
         last_stream = stream;
+        have_stream = true;
         CUDA_CHECK(cudaEventRecord(pool[i], stream));
         return i;
     }
@@ -98,10 +104,24 @@ struct MixtralPhaseProfile {
         span_dst.push_back(o.dst);
     }
     cudaStream_t last_stream{};
+    // Whether `last_stream` has been set. Not `last_stream != nullptr`: the
+    // null stream is a real stream and is the one this forward runs on, so
+    // testing the handle made the teardown sweep below a no-op here -- any
+    // span left open simply never resolved, and its counter printed 0.000
+    // rather than reporting that it was never closed.
+    bool have_stream = false;
+    // Spans the teardown sweep had to close. A stage closed by the sweep did
+    // not measure itself -- it measured from its open to the end of the fire,
+    // which is wall clock, not the stage -- so its number is reported as
+    // unclosed rather than passed off as a duration.
+    std::size_t swept = 0;
     void resolve() {
         // A fire has several exits, so anything still open at teardown is
         // closed here rather than at each of them.
-        while (!stack.empty() && last_stream) close(last_stream);
+        while (!stack.empty() && have_stream) {
+            ++swept;
+            close(last_stream);
+        }
         if (used == 0) return;
         CUDA_CHECK(cudaEventSynchronize(pool[used - 1]));
         for (std::size_t i = 0; i < spans.size(); ++i) {
@@ -130,11 +150,25 @@ struct MixtralPhaseProfile {
             // item left.
             "[MX-PROF] N=%d attn=%.3f o_proj=%.3f router=%.3f "
             "moe_gate_up=%.3f moe_down=%.3f align=%.3f act=%.3f "
-            "reduce=%.3f prep=%.3f epi=%.3f | sum=%.3f ms\n",
+            "reduce=%.3f prep=%.3f epi=%.3f | sum=%.3f fire=%.3f "
+            "unattributed=%.3f ms\n",
             last_N, attn, o_proj, router, moe_gate_up, moe_down,
             moe_align, moe_act, moe_reduce, moe_prep, epilogue,
             attn + o_proj + router + moe_gate_up + moe_down + moe_align +
-            moe_act + moe_reduce + moe_prep + epilogue);
+            moe_act + moe_reduce + moe_prep + epilogue,
+            fire,
+            fire - (attn + o_proj + router + moe_gate_up + moe_down +
+                    moe_align + moe_act + moe_reduce + moe_prep + epilogue));
+        if (swept > 1) {
+            // One is `fire` itself, which is opened to be swept. More than
+            // that means a stage boundary opened without closing its
+            // predecessor, so the totals above double-count and `sum` will
+            // exceed `fire`.
+            std::fprintf(stderr,
+                "[MX-PROF] %zu stage span(s) were left open and closed at "
+                "teardown; their totals measure to the end of the fire, not "
+                "the stage\n", swept - 1);
+        }
         cudaEventDestroy(a);
         cudaEventDestroy(b);
         for (cudaEvent_t e : pool) cudaEventDestroy(e);
@@ -362,6 +396,9 @@ void mixtral_forward_paged(
     if (prof.enabled) {
         CUDA_CHECK(cudaEventCreate(&prof.a));
         CUDA_CHECK(cudaEventCreate(&prof.b));
+        // Outermost span: `resolve()` closes whatever is still open at
+        // teardown, so this pairs with every exit the fire has.
+        prof.open(&prof.fire, stream);
     }
     const bool any_sinks = [&]{
         for (const auto& L : w.layers) {
@@ -1041,7 +1078,11 @@ void mixtral_forward_paged(
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 layer.marlin_scales_ready = true;
             }
-            if (prof.enabled) prof.open(&prof.moe_align, stream);
+            // `close` first: `moe_prep` is open on entry to this branch, and
+            // opening on top of it would leave one span per layer on the stack
+            // for `resolve()` to close at teardown. Every other stage boundary
+            // in this branch pairs the two for the same reason.
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_align, stream); }
             kernels::launch_moe_align_decode(
                 d_topk_idx.data(), d_marlin_sorted.data(),
                 d_marlin_expert_ids.data(), /*route_to_aligned_row=*/nullptr,

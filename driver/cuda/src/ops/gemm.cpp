@@ -538,8 +538,10 @@ bool run_dense_tactic(cublasHandle_t handle, const DenseTactic& t,
     switch (static_cast<GemmKind>(t.kind)) {
         case GemmKind::Gemv: {
             cudaStream_t stream = nullptr;
-            return beta == 0.f && M == 1 && cublas_stream(handle, stream) &&
-                   kernels::launch_gemv_bf16(W, act, bias, y, N, K, stream);
+            return (beta == 0.f || beta == 1.f) && M == 1 &&
+                   cublas_stream(handle, stream) &&
+                   kernels::launch_gemv_bf16(W, act, bias, y, N, K, stream,
+                                             beta);
         }
         case GemmKind::Lt: {
             if (plan == nullptr ||
@@ -696,7 +698,11 @@ std::vector<DenseTactic> dense_candidates(const Bf16LtPlan* plan, int M, int N,
     std::vector<DenseTactic> out;
     // Ordered by what the shape would have used without tuning, because ties
     // resolve to the first entry.
-    if (M == 1 && beta == 0.f) {
+    // beta = 1 too: the GEMV folds the accumulate into its epilogue, and
+    // excluding it meant every projection that adds into a residual -- o_proj
+    // on every model here -- was decided without its fastest candidate on the
+    // ballot.
+    if (M == 1 && (beta == 0.f || beta == 1.f)) {
         out.push_back({static_cast<int>(GemmKind::Gemv), 0});
     }
     out.push_back({static_cast<int>(GemmKind::GemmEx), 0});
@@ -777,6 +783,22 @@ DenseTactic tune_dense(cublasHandle_t caller, const Bf16LtPlan* plan,
         if (ms <= 0.0f) continue;
         timings.emplace_back(i, ms);
         if (fastest < 0.0f || ms < fastest) fastest = ms;
+    }
+    // PIE_GEMM_TUNE_LOG also dumps every candidate's measured time, not just
+    // the winner: knowing that the GEMV lost is not the same as knowing by how
+    // much, and the gap is what says whether a better kernel is worth writing.
+    static const bool tune_log = std::getenv("PIE_GEMM_TUNE_LOG") != nullptr;
+    if (tune_log) {
+        for (const auto& [i, ms] : timings) {
+            const int kind = candidates[i].kind;
+            std::fprintf(stderr,
+                "[gemm-cand] M=%d N=%d K=%d %s(algo=%d) %.1f us\n",
+                M, N, K,
+                kind == static_cast<int>(GemmKind::Gemv)   ? "gemv"
+              : kind == static_cast<int>(GemmKind::Lt)     ? "lt"
+                                                           : "gemmex",
+                candidates[i].algo, ms * 1000.0f);
+        }
     }
     if (fastest <= 0.0f) return best;
 
