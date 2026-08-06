@@ -257,6 +257,12 @@ def build_config(args: argparse.Namespace):
         # an operator makes about a model, not a backend detail.
         if getattr(args, "stream_routed_experts", False):
             driver_options["stream_routed_experts"] = True
+        # The bounded form of the same trade, and the only one that can admit a
+        # checkpoint bigger than the machine: streaming maps the bank and every
+        # mapped page is wired, so it moves bytes off the heap without capping
+        # them, while a slab caps them and pays a submit-and-wait per layer.
+        if getattr(args, "expert_slab_mb", 0):
+            driver_options["expert_slab_bytes"] = int(args.expert_slab_mb) * 1024 * 1024
         if getattr(args, "max_forward_tokens", 0):
             driver_options["max_forward_tokens"] = args.max_forward_tokens
         if getattr(args, "max_forward_requests", 0):
@@ -1306,6 +1312,16 @@ def build_parser() -> argparse.ArgumentParser:
                  "same `[model].stream_routed_experts` key; what they do with "
                  "it differs (cuda stages through a cache, Metal demand-faults "
                  "a page-aligned pack).",
+        )
+        sp.add_argument(
+            "--expert-slab-mb",
+            type=int,
+            default=0,
+            help="Metal only. Cap the routed experts at this many MiB of device "
+                 "memory and page them through a slab, instead of keeping the "
+                 "whole bank resident. 0 leaves the bank resident. This is what "
+                 "runs a checkpoint that does not fit; it is not a faster "
+                 "--stream-routed-experts.",
         )
         sp.add_argument("--max-forward-tokens", type=int, default=10240)
         sp.add_argument("--max-forward-requests", type=int, default=512)

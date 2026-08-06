@@ -399,6 +399,14 @@ pub fn write_metal_startup_toml(
         "stream_routed_experts",
         options.stream_routed_experts,
     );
+    // Omitted when unset rather than written as 0: the driver reads an absent
+    // key as "the whole bank stays resident", which is the same statement.
+    if let Some(bytes) = options.expert_slab_bytes {
+        model.insert(
+            "expert_slab_bytes".into(),
+            toml::Value::Integer(bytes as i64),
+        );
+    }
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -1335,6 +1343,45 @@ calibrate_planner = true
             val["model"]["stream_routed_experts"].as_bool().unwrap(),
             true,
             "the operator asked for streaming and the driver never heard about it"
+        );
+    }
+
+    /// The bounded form of the same trade has to reach the driver too, and it
+    /// is the one whose absence is hardest to notice: `expert_slab_bytes` is
+    /// the only setting under which a checkpoint larger than the machine can
+    /// be admitted, the C++ has read it since the slab landed, and no operator
+    /// could say it -- it was reachable only from a test binary's environment.
+    /// A model that does not fit then refuses to load with a message about
+    /// arithmetic rather than about the switch that would have helped.
+    ///
+    /// Omitted and not zeroed when unset, because the driver already reads an
+    /// absent key as "keep the whole bank resident".
+    #[test]
+    fn metal_startup_toml_carries_expert_slab_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snap");
+
+        let mut off = MetalDriverOptions::default();
+        off.device = "metal:0".to_string();
+        let out_off = tmp.path().join("off.toml");
+        write_metal_startup_toml(&out_off, &off, &snap, 0, DESCRIPTOR).unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_off).unwrap()).unwrap();
+        assert!(
+            val["model"].get("expert_slab_bytes").is_none(),
+            "an unset budget is an absent key, not a zero: the driver's own \
+             default is already the derivation"
+        );
+
+        let mut on = MetalDriverOptions::default();
+        on.device = "metal:0".to_string();
+        on.expert_slab_bytes = Some(2048 * 1024 * 1024);
+        let out_on = tmp.path().join("on.toml");
+        write_metal_startup_toml(&out_on, &on, &snap, 0, DESCRIPTOR).unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_on).unwrap()).unwrap();
+        assert_eq!(
+            val["model"]["expert_slab_bytes"].as_integer().unwrap(),
+            2048 * 1024 * 1024,
+            "the operator capped the expert bank and the driver never heard about it"
         );
     }
 

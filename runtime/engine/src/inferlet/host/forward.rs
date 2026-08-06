@@ -919,9 +919,23 @@ impl ProcessCtx {
                     channel: dense as u32,
                     data: bytes.clone(),
                 });
+                // The host shadow above reads the NATIVE cell -- one byte per
+                // bool -- and the driver ABI's wire cell is bit-packed, sized
+                // `(numel + 7) / 8` by CUDA and Metal alike. Every other dtype
+                // is four bytes either way, which is why handing `peek_seed`'s
+                // bytes straight to both worked for all of them and only Bool
+                // bounced: the driver read a seed eight times the width it
+                // declared and refused the bind.
+                let wire = if cell.dtype == pie_ir::types::DType::Bool {
+                    let mut packed = vec![0u8; bytes.len().div_ceil(8)];
+                    crate::pipeline::channel::pack_bool_into(&bytes, &mut packed);
+                    packed
+                } else {
+                    bytes
+                };
                 seed_values.push(crate::driver::ChannelValue {
                     channel: cell.global_id,
-                    bytes,
+                    bytes: wire,
                 });
             }
             let instance = Instance {

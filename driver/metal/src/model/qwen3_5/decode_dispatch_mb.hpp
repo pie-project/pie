@@ -35,13 +35,15 @@ inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
 }
 
 // Below this batch the GEMV is the faster kernel. The crossover is a property
-// of the MACHINE, not of the model: it was measured on an M1 Max, where pie's
-// per-step cost beats mlx-lm's at every batch up to 8 with the GEMV and only
-// loses above it, and an M4 Pro moves it down to 8. See `device_tuning.hpp` --
-// an unrecognised device still gets the 12 this constant was.
+// of the MACHINE and of whether the checkpoint's FFN is routed -- see
+// `device_tuning.hpp`. It was measured on an M1 Max, where pie's per-step cost
+// beats mlx-lm's at every batch up to 8 with the GEMV and only loses above it;
+// an M2 Max and an M4 Pro both move the DENSE crossover down to 8 and an
+// unrecognised device still gets the 12 this constant was.
 //
-// A call and not a `constexpr`, which is the whole point: the value is not
-// known until there is a device to ask.
+// Passed in rather than asked for here, which is the whole point: the value is
+// not known until there is a device to ask AND a geometry to ask about, and
+// this header has neither.
 // The ported steel GEMM is instantiated aligned-only, at BM=16 and BK=32. K is
 // not checked: every qwen3.6 projection has K % 512 == 0 (the same fact the
 // GEMV port relies on for its "fast" variant), so K % BK == 0 is free.
@@ -114,9 +116,9 @@ inline int qmm_bm_slot(int bm) {
 // BN partitions output columns only -- every element's K sum is unchanged -- so
 // the choice is bit-exact whichever way it goes.
 
-inline int qmm_bn(int out_vec, int N) {
+inline int qmm_bn(int out_vec, int N, int min_batch) {
     const int bm = qmm_bm(N);
-    if (N < qmm_min_batch() || N % bm != 0) return 0;
+    if (N < min_batch || N % bm != 0) return 0;
     // Take the WIDEST tile that divides the output, full stop.
     //
     // This used to gate on a threadgroup count, and that was right when the
@@ -144,9 +146,12 @@ inline int qmm_bn(int out_vec, int N) {
 /// (where 16 still wins) and 192 (where 32 does); the machine saturates higher
 /// than that, and using the saturation number here cost up to 12% because it
 /// let the choice run past 32 to 64.
+///
 /// Read from `DeviceTuning`, not a constant: it is the threadgroup count at
 /// which a wider tile stops being worth fewer of them, and how many
-/// threadgroups fill the machine is the machine's business.
+/// threadgroups fill the machine is the machine's business. The value above is
+/// the M1 Max's; the M4 Pro re-measurement, which lands lower for exactly that
+/// reason, is in `device_tuning.hpp`.
 inline int qmm_bn_crossover_tg_value() { return qmm_bn_crossover_tg(); }
 
 /// `qmm_bn` for a family whose GEMM has no split-K behind it.
@@ -195,11 +200,12 @@ inline int qmm_bn_crossover_tg_value() { return qmm_bn_crossover_tg(); }
 /// BN partitions output columns only, so this is bit-exact whichever way it
 /// goes; it decides how many times a weight tile is dequantized, not what the
 /// sum is.
-inline int qmm_bn_unsplit(int out_vec, int N) {
+inline int qmm_bn_unsplit(int out_vec, int N, int min_batch) {
     const int bm = qmm_bm(N);
-    if (N < qmm_min_batch() || N % bm != 0 || out_vec % 16 != 0) return 0;
+    if (N < min_batch || N % bm != 0 || out_vec % 16 != 0) return 0;
     const int row_tiles = N / bm;
-    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= qmm_bn_crossover_tg_value()) return 32;
+    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= qmm_bn_crossover_tg_value())
+        return 32;
     return 16;
 }
 
@@ -368,7 +374,10 @@ inline constexpr int kSdpaQueryTile = 32;
 /// plus a terminator.
 inline bool sdpa_should_tile(int rows, int requests) {
     const int r = requests > 0 ? requests : 1;
-    return rows / r >= kSdpaQueryTile;
+    // Not `kSdpaQueryTile`, though it is the same number on this machine. That
+    // one is the tile's HEIGHT and is the simdgroup count; this is a crossover
+    // and belongs to the machine. See `DeviceTuning`.
+    return rows / r >= sdpa_tile_min_rows_per_request();
 }
 
 // sdpa_paged_tiled: one threadgroup per (q_head, tile of kSdpaQueryTile rows).

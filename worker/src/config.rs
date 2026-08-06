@@ -1149,6 +1149,27 @@ pub struct MetalDriverOptions {
     /// Off by default: it trades resident memory for page faults, which only
     /// pays when the weights do not comfortably fit.
     pub stream_routed_experts: bool,
+    /// How many bytes the routed experts may occupy on the device, or `None`
+    /// to keep the whole bank resident.
+    ///
+    /// A stronger statement than `stream_routed_experts` and a different
+    /// mechanism, not a dial on the same one. Streaming binds the bank over a
+    /// mapping, and on Apple Silicon every mapped page is WIRED -- so it moves
+    /// bytes out of the heap but bounds nothing. A budget turns the mapping
+    /// off and pages experts through a slab of exactly this size, which is the
+    /// only setting under which a checkpoint larger than the machine can be
+    /// admitted at all. It costs a submit-and-wait per mixture layer, so it is
+    /// for when the alternative is not running.
+    ///
+    /// `None` and not 0 for "unset", the way the CUDA driver spells
+    /// `expert_cache`: the C++ side already reads an absent key as "keep the
+    /// bank resident", so a sentinel would be a second spelling of one thing.
+    ///
+    /// The C++ has read `[model].expert_slab_bytes` since the slab landed;
+    /// what was missing was any way for an operator to say it, which made the
+    /// one feature that admits an oversized model reachable only from a test
+    /// binary's environment variable.
+    pub expert_slab_bytes: Option<u64>,
     /// Metal device string, e.g. `"metal:0"`. Populated from
     /// `model.driver.device` rather than written here.
     #[serde(skip)]
@@ -1175,6 +1196,7 @@ impl Default for MetalDriverOptions {
             max_model_len: None,
             kv_cache_dtype: "auto".to_string(),
             stream_routed_experts: false,
+            expert_slab_bytes: None,
             device: "metal:0".to_string(),
             verbose: false,
             ready_timeout: Duration::from_secs(120),

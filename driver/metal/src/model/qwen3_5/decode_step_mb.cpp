@@ -83,7 +83,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // where split-K supplies the threadgroups the wide tile gives up, and
         // this family dispatches no split -- see the comment on `qmm_split`
         // just below, which is the same reason gemma4 and gpt-oss have.
-        d.qmm_bn = qmm_bn_unsplit(out, n);
+        d.qmm_bn = qmm_bn_unsplit(out, n, qmm_min_batch(g.is_moe()));
         d.qmm_bm = qmm_bm(n);
         // NO split-K, for exactly the reason gemma4's `launch_shape_mb` gives:
         // the split GEMM writes `split_k` partial [M, N] slices into a side
@@ -183,7 +183,8 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlExpertDown: {
             const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
             const int sorted = moe_sorted_rows(g, n);
-            if (const int bn = qmm_bn(N, sorted);
+            // Routed, so the routed crossover.
+            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true));
                 bn > 0 && shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
                 d.qmm_bn = bn;
                 d.qmm_bm = shared_kernels::moe_tile_rows(n * g.experts_per_token, g.n_experts);

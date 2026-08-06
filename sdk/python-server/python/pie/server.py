@@ -93,12 +93,11 @@ class Server:
 
         from pie.server import Server
         from pie.config import (
-            Config, ServerConfig, AuthConfig, ModelConfig, DriverConfig,
+            Config, ServerConfig, ModelConfig, DriverConfig,
         )
 
         cfg = Config(
             server=ServerConfig(port=0),
-            auth=AuthConfig(enabled=False),
             model=ModelConfig(
                 name="default",
                 hf_repo="Qwen/Qwen3-0.6B",
