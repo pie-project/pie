@@ -21,6 +21,13 @@ int env_int(const char* name, int fallback) {
     return int(v);
 }
 
+bool env_bool(const char* name, bool fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') return fallback;
+    // Unlike `env_int`, zero is a VALUE here and not a rejected one.
+    return !(raw[0] == '0' && raw[1] == '\0');
+}
+
 DeviceTuning tuning_for(const DeviceInfo& info) {
     DeviceTuning t;  // the M1 measurements, unchanged for any device not below
     switch (info.apple_family) {
@@ -44,9 +51,19 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
         default:
             break;
     }
+    // Every tuned constant gets an override, and for the same reason the first
+    // one did: measuring a crossover means running the same binary twice with
+    // different answers, and a rebuild between arms is a different binary.
     t.qmm_min_batch = env_int("PIE_METAL_QMM_MIN_BATCH", t.qmm_min_batch);
     t.qmm_bn_crossover_tg =
         env_int("PIE_METAL_QMM_BN_CROSSOVER_TG", t.qmm_bn_crossover_tg);
+    t.moe_tile_mid_per = env_int("PIE_METAL_MOE_TILE_MID_PER", t.moe_tile_mid_per);
+    t.moe_tile_wide_per = env_int("PIE_METAL_MOE_TILE_WIDE_PER", t.moe_tile_wide_per);
+    t.fp16_qmm = env_bool("PIE_METAL_FP16_QMM", t.fp16_qmm);
+    t.sdpa_tile_min_rows_per_request =
+        env_int("PIE_METAL_SDPA_TILE_MIN_ROWS", t.sdpa_tile_min_rows_per_request);
+    t.moe_batch_min_per_expert =
+        env_int("PIE_METAL_MOE_BATCH_MIN_PER_EXPERT", t.moe_batch_min_per_expert);
     return t;
 }
 
@@ -69,7 +86,13 @@ const DeviceTuning& device_tuning() {
 }
 
 int qmm_min_batch() { return device_tuning().qmm_min_batch; }
-
 int qmm_bn_crossover_tg() { return device_tuning().qmm_bn_crossover_tg; }
+int moe_tile_mid_per() { return device_tuning().moe_tile_mid_per; }
+int moe_tile_wide_per() { return device_tuning().moe_tile_wide_per; }
+bool fp16_qmm() { return device_tuning().fp16_qmm; }
+int sdpa_tile_min_rows_per_request() {
+    return device_tuning().sdpa_tile_min_rows_per_request;
+}
+int moe_batch_min_per_expert() { return device_tuning().moe_batch_min_per_expert; }
 
 }  // namespace pie::metal

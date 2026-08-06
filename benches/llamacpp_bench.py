@@ -38,7 +38,7 @@ def health(url: str) -> None:
 
 
 @asynccontextmanager
-async def maybe_server(args: argparse.Namespace):
+async def maybe_server(args: argparse.Namespace, slot_ctx: int | None = None):
     proc: subprocess.Popen[str] | None = None
     url = args.url
     if args.server_bin:
@@ -56,8 +56,19 @@ async def maybe_server(args: argparse.Namespace):
             # `max_model_len / parallel` tokens -- 128 at the defaults, which
             # silently truncated every request in a tput run and made the
             # engine look like it stopped early. Scale by the slot count so a
-            # slot gets the context the other engines are given.
-            "--ctx-size", str(args.max_model_len * parallel),
+            # slot gets the context it needs.
+            #
+            # What it NEEDS, not `max_model_len`. llama.cpp preallocates this
+            # whole budget where pie and mlx-lm page theirs, so asking for
+            # `max_model_len` a slot asks the machine for something the other
+            # two never take: at the 16384 `three_way.py` passes, sixteen slots
+            # is 262144 tokens of KV and the server dies with
+            # `kIOGPUCommandBufferCallbackErrorOutOfMemory` before answering a
+            # request. The workload's own widest prompt plus its output budget
+            # is the honest number, capped by `max_model_len` so the flag still
+            # means what it says.
+            "--ctx-size", str(min(args.max_model_len, slot_ctx or args.max_model_len)
+                              * parallel),
             "--parallel", str(parallel),
             "--n-gpu-layers", "all",
             # On, because the comparison is against engines running their own
@@ -102,7 +113,13 @@ async def run(args: argparse.Namespace):
     # the same question. 0 keeps the old behaviour, which is "no cap".
     gate = asyncio.Semaphore(args.concurrency) if getattr(args, "concurrency", 0) else None
 
-    async with maybe_server(args) as base_url:
+    # Rounded up to a power of two so a prompt a few tokens longer does not
+    # re-tune the server, and floored so a tiny workload still leaves room.
+    needed = max(prompt_counts) + args.max_tokens + 64
+    slot_ctx = 512
+    while slot_ctx < needed:
+        slot_ctx *= 2
+    async with maybe_server(args, slot_ctx) as base_url:
         endpoint = base_url.rstrip("/") + "/v1/completions"
 
         async def one(prompt: str, prompt_count: int, max_tokens: int) -> RequestResult:

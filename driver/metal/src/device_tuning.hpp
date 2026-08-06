@@ -11,6 +11,13 @@
 // unrecognised one does, and a machine this file has never heard of gets the
 // constants that were measured rather than an extrapolation. Overrides are
 // per-generation and each carries the measurement that justifies it.
+//
+// `benches/tune_device.py` takes that measurement. Every field below has a
+// `PIE_METAL_*` override so it can be swept without a rebuild, and the script
+// finds, for each one, a batch where its candidate values provably choose
+// DIFFERENT paths -- which is not a detail. A threshold does nothing at
+// batches that do not straddle it, so sweeping one anywhere else times the
+// same work twice and reports the reassuring answer.
 
 #pragma once
 
@@ -50,14 +57,23 @@ struct DeviceTuning {
     /// small N is a memory-bound one and does not.
     int qmm_min_batch = 12;
 
-    /// Threadgroups (counted at BN=32) past which BN=32 beats BN=16.
+    /// The threadgroup count at which the unsplit GEMM's BN=32 tile overtakes
+    /// BN=16.
     ///
-    /// M1 Max: 160. The sweep in `decode_dispatch_mb.hpp` brackets it between
-    /// 144 (16 still wins) and 192 (32 wins).
+    /// M1 Max: 160. Measured with `roofline_probe` over fifteen (M, N) pairs
+    /// and then checked against a real llama-3.2-1B prefill, which agrees --
+    /// 2565.8 / 2663.7 / 2578.3 tok/s at BN 16/32/64, 448 rows. The sweep
+    /// brackets the crossover between 144 threadgroups and 192, so this sits in
+    /// the gap.
     ///
-    /// M4 Pro (Apple9, 20 cores): 96. Re-measured with `roofline_probe` on
-    /// this machine, BM=64, GFLOP/s, the same projections the M1 sweep used.
-    /// Threadgroups here are `(N_out/32) * ceil(M/64)`:
+    /// A machine with more cores saturates later and wants this HIGHER, since
+    /// the narrow tile's only advantage is that it makes more threadgroups.
+    ///
+    /// M4 Pro (Apple9, 20 cores): 96, which is that sentence read backwards --
+    /// twenty cores against the M1 Max's thirty-two fill sooner, so the narrow
+    /// tile runs out of reasons sooner. Re-swept with `roofline_probe` on this
+    /// machine at BM=64, GFLOP/s, threadgroups counted as
+    /// `(N_out/32) * ceil(M/64)`:
     ///
     ///     tg@32    BN=16    BN=32    delta
     ///        64     5004     4615    -7.8%   (M=128, N=1024)
@@ -66,26 +82,78 @@ struct DeviceTuning {
     ///       160     5987     6411    +7.1%   (M=320, N=1024)
     ///       224     5980     6196    +3.6%   (M=448, N=1024)
     ///
-    /// The crossover moved DOWN, and it moved down for the reason the machine
-    /// has fewer cores: 20 against the M1 Max's 32, so it takes fewer
-    /// threadgroups to fill and the wide tile's smaller grid stops being a
-    /// starvation risk sooner. 160 is not merely conservative here, it is on
-    /// the wrong side of a 5.8% gap at tg=96. The bracket is (64, 96]; 96 is
-    /// the measured point and not the midpoint, which is the honest choice
-    /// when only one side of the gap was sampled.
+    /// 160 is not conservative on this card, it is on the wrong side of a 5.8%
+    /// gap. The bracket is (64, 96] and 96 is the sampled edge rather than the
+    /// midpoint, which is what to write down when only one side was measured.
     ///
-    /// End-to-end this is NOT a win, and the entry says so rather than
-    /// implying one. Same binary, arms alternated on `PIE_METAL_QMM_BN_CROSSOVER_TG`,
-    /// 160 against 96: gpt-oss-20b-Q4 179.68 -> 180.03 tok/s (3 reps),
-    /// gemma-4-E2B 621.60 -> 622.67 (2), Llama-3.2-3B 558.40 -> 560.85 (3),
-    /// and Llama-3.2-3B on a 3000-word prefill 13.09 -> 13.14 (2). Every
-    /// workload moves the same direction and none of them moves far enough to
-    /// clear the noise; what carries the change is the kernel measurement plus
-    /// four out of four agreeing signs, not any one of these numbers. The
-    /// reason the GEMM's 5.8% does not survive to the step is in the probe's
-    /// other column: these projections run at ~5% of the streaming roof, so
-    /// the step is bound by weight traffic and not by how the tiles are cut.
+    /// End to end it is NOT a win, and this says so rather than implying one.
+    /// Same binary, arms alternated on `PIE_METAL_QMM_BN_CROSSOVER_TG`, 160
+    /// against 96: gpt-oss-20b-Q4 179.68 -> 180.03 tok/s (3 reps), gemma-4-E2B
+    /// 621.60 -> 622.67 (2), Llama-3.2-3B 558.40 -> 560.85 (3), Llama-3.2-3B on
+    /// a 3000-word prefill 13.09 -> 13.14 (2). Four workloads, four agreeing
+    /// signs, not one of them clear of the noise. What carries the change is the
+    /// kernel measurement and the sign, not any of those numbers. The probe says
+    /// why the GEMM's 5.8% does not reach the step, too: these projections run
+    /// at ~5% of the streaming roof, so the step is bound by weight traffic and
+    /// not by how the tiles are cut.
     int qmm_bn_crossover_tg = 160;
+
+    /// Rows an expert's run must hold before the mixture's GEMM takes a wider
+    /// row tile: 32 above `moe_tile_mid_per`, 64 above `moe_tile_wide_per`.
+    ///
+    /// M1 Max: 12 and 88. Measured end to end over eight (rows, expert count)
+    /// pairs on gpt-oss-20b and gemma-4-26B; the table is in
+    /// `shared_kernels.hpp`. Measured END TO END on purpose --
+    /// `roofline_probe` predicts the dense tile correctly and this one wrong
+    /// three times over, because its single hot expert cannot show what
+    /// thirty-two cold ones cost.
+    ///
+    /// These move with per-core matrix throughput the way `qmm_min_batch`
+    /// does: a machine that runs a wide tile relatively faster wants both
+    /// thresholds LOWER.
+    int moe_tile_mid_per = 12;
+    int moe_tile_wide_per = 88;
+
+    /// Whether a dense g64/b4 projection stages its input to FP16 and feeds
+    /// native FP16 simdgroup MMA instead of BF16.
+    ///
+    /// M1 Max: on, and it is the largest single win this driver has -- roughly
+    /// 40% on the GEMM at every shape measured, which on gemma-4 was 938 ->
+    /// 1298 tok/s of prefill.
+    ///
+    /// It exists BECAUSE of the machine. M1 and M2 have no native bfloat16
+    /// matrix path and emulate it; Metal 3.1 and Apple9 (M3, M4) do have one.
+    /// On those the staging pass has nothing left to buy and is a dispatch, a
+    /// barrier and a buffer per projection -- so this is the one tuned field
+    /// whose default may be actively WRONG on newer silicon rather than merely
+    /// unmeasured, and the first thing to check on an M3 or M4.
+    ///
+    /// Measure it the way the crossovers are measured: `PIE_METAL_FP16_QMM=0`
+    /// against the default, same binary, arms alternated, on a prefill-heavy
+    /// shape where the GEMM is most of the fire.
+    bool fp16_qmm = true;
+
+    /// Rows a request must contribute before its attention takes the tiled
+    /// kernel instead of the per-row one.
+    ///
+    /// M1 Max: 32, which is also the tile's height -- a fire earns the tiled
+    /// shape by filling a tile. The two are separate numbers even so: the
+    /// height is the simdgroup count and cannot move, while this is a
+    /// crossover. Measured on llama-1B, where a 32-request fleet of one-row
+    /// members runs 370 tok/s tiled against 728 per-row, so the threshold has
+    /// to keep the fleet off it; a machine whose shuffles are cheaper relative
+    /// to its FMAs wants it HIGHER, since the tiled kernel's whole advantage is
+    /// that it removes reductions.
+    int sdpa_tile_min_rows_per_request = 32;
+
+    /// Rows an expert's run must hold before the mixture sorts and batches at
+    /// all, rather than running the routed projections as matvecs.
+    ///
+    /// M1 Max: 8, i.e. half the narrow tile. Below it the sort's padding costs
+    /// more than the weight re-reads it saves -- a decode routing eight pairs
+    /// over a hundred and twenty-eight experts would make every tile one live
+    /// row in sixteen. Moves with the same thing `qmm_min_batch` does.
+    int moe_batch_min_per_expert = 8;
 };
 
 /// The platform query. `device_tuning_apple.mm` on Apple, a stub in
@@ -107,8 +175,21 @@ const DeviceTuning& device_tuning();
 /// it is a property of the machine; see `DeviceTuning::qmm_min_batch`.
 int qmm_min_batch();
 
-/// The BN=16 -> BN=32 tile crossover, in threadgroups counted at BN=32.
-/// See `DeviceTuning::qmm_bn_crossover_tg`.
+/// The unsplit GEMM's BN=16 -> BN=32 tile crossover, in threadgroups counted
+/// at BN=32. See `DeviceTuning::qmm_bn_crossover_tg`.
 int qmm_bn_crossover_tg();
+
+/// The mixture's two row-tile crossovers, in rows per expert.
+int moe_tile_mid_per();
+int moe_tile_wide_per();
+
+/// Whether the dense g64/b4 GEMM stages its input to FP16.
+bool fp16_qmm();
+
+/// The attention's tiled-vs-per-row crossover, in rows per request.
+int sdpa_tile_min_rows_per_request();
+
+/// The mixture's batch-vs-matvec crossover, in rows per expert.
+int moe_batch_min_per_expert();
 
 }  // namespace pie::metal

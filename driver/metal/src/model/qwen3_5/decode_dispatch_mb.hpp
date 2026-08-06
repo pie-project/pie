@@ -145,11 +145,12 @@ inline int qmm_bn(int out_vec, int N) {
 /// than that, and using the saturation number here cost up to 12% because it
 /// let the choice run past 32 to 64.
 ///
-/// It is a property of the machine and not of the kernel -- how many
-/// threadgroups it takes to fill a GPU is what the core count means -- so the
-/// number lives in `device_tuning` and this is the M1 Max value it defaults
-/// to. The M4 Pro re-measurement, and why it lands lower, is there.
-/// `qmm_bn_crossover_tg()` is declared in `device_tuning.hpp`.
+/// Read from `DeviceTuning`, not a constant: it is the threadgroup count at
+/// which a wider tile stops being worth fewer of them, and how many
+/// threadgroups fill the machine is the machine's business. The value above is
+/// the M1 Max's; the M4 Pro re-measurement, which lands lower for exactly that
+/// reason, is in `device_tuning.hpp`.
+inline int qmm_bn_crossover_tg_value() { return qmm_bn_crossover_tg(); }
 
 /// `qmm_bn` for a family whose GEMM has no split-K behind it.
 ///
@@ -185,6 +186,15 @@ inline int qmm_bn(int out_vec, int N) {
 /// is why the rule no longer reaches for it. The threshold sits in the only gap
 /// the sweep leaves: 144 threadgroups still wants 16, 192 already wants 32.
 ///
+/// Checked against the machine and not just the probe, because the MIXTURE's
+/// tile rule was built the same way and the probe misled it three times over.
+/// Forcing each width through a real llama-3.2-1B prefill agrees with the
+/// table: at 448 rows BN=16/32/64 give 2565.8 / 2663.7 / 2578.3 tok/s and at
+/// 1024 rows 2270.8 / 2349.8 / 2297.0, so the rule's 32 is the machine's 32.
+/// The dense side's probe holds where the mixture's did not, and the reason is
+/// the mixture's alone: its threadgroups read thirty-two experts' weights
+/// where the probe reads one.
+///
 /// BN partitions output columns only, so this is bit-exact whichever way it
 /// goes; it decides how many times a weight tile is dequantized, not what the
 /// sum is.
@@ -192,7 +202,8 @@ inline int qmm_bn_unsplit(int out_vec, int N) {
     const int bm = qmm_bm(N);
     if (N < qmm_min_batch() || N % bm != 0 || out_vec % 16 != 0) return 0;
     const int row_tiles = N / bm;
-    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= qmm_bn_crossover_tg()) return 32;
+    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= qmm_bn_crossover_tg_value())
+        return 32;
     return 16;
 }
 
@@ -361,7 +372,10 @@ inline constexpr int kSdpaQueryTile = 32;
 /// plus a terminator.
 inline bool sdpa_should_tile(int rows, int requests) {
     const int r = requests > 0 ? requests : 1;
-    return rows / r >= kSdpaQueryTile;
+    // Not `kSdpaQueryTile`, though it is the same number on this machine. That
+    // one is the tile's HEIGHT and is the simdgroup count; this is a crossover
+    // and belongs to the machine. See `DeviceTuning`.
+    return rows / r >= sdpa_tile_min_rows_per_request();
 }
 
 // sdpa_paged_tiled: one threadgroup per (q_head, tile of kSdpaQueryTile rows).

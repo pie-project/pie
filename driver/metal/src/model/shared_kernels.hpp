@@ -10,6 +10,8 @@
 
 #include <cstdint>
 #include <cstdlib>
+
+#include "device_tuning.hpp"
 #include <cstring>
 #include <stdexcept>
 
@@ -123,7 +125,7 @@ inline constexpr int kMoeTileWidths[3] = {16, 32, 64};
 /// eight pairs over a hundred and twenty-eight experts, where every tile would
 /// be one live row in sixteen.
 inline bool moe_should_batch(int n_pairs, int n_experts) {
-    return n_experts > 0 && n_pairs >= n_experts * kMoeTileRows / 2;
+    return n_experts > 0 && n_pairs >= n_experts * moe_batch_min_per_expert();
 }
 
 /// Rows each expert's run is padded to, for a batch of `n_pairs`.
@@ -176,8 +178,8 @@ inline bool moe_should_batch(int n_pairs, int n_experts) {
 inline int moe_tile_rows(int n_pairs, int n_experts) {
     if (!moe_should_batch(n_pairs, n_experts)) return 1;
     const int per = n_pairs / n_experts;
-    if (per >= 88) return 64;
-    return per >= 12 ? 32 : 16;
+    if (per >= moe_tile_wide_per()) return 64;
+    return per >= moe_tile_mid_per() ? 32 : 16;
 }
 
 /// Which row of a routed PSO table a tile selects. The tables hold the two
