@@ -193,14 +193,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -289,14 +283,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -385,14 +373,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -487,14 +469,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -583,14 +559,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -679,14 +649,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -775,14 +739,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -877,14 +835,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -973,14 +925,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -1069,14 +1015,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -1165,14 +1105,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -1267,14 +1201,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -1363,14 +1291,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -1459,14 +1381,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -1555,14 +1471,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -1657,14 +1567,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -1753,14 +1657,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -1849,14 +1747,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -1945,14 +1837,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -2047,14 +1933,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -2143,14 +2023,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -2239,14 +2113,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -2335,14 +2203,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -2437,14 +2299,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -2675,14 +2531,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -2784,14 +2634,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -2893,14 +2737,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -2996,14 +2834,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -3105,14 +2937,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -3214,14 +3040,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -3323,14 +3143,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -3426,14 +3240,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -3535,14 +3343,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -3644,14 +3446,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -3753,14 +3549,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -3856,14 +3646,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -3965,14 +3749,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -4074,14 +3852,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -4183,14 +3955,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -4286,14 +4052,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -4395,14 +4155,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -4504,14 +4258,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -4613,14 +4361,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -4716,14 +4458,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -4825,14 +4561,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -4934,14 +4664,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -5043,14 +4767,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -5146,14 +4864,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -5384,14 +5096,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -5493,14 +5199,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -5602,14 +5302,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -5705,14 +5399,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -5814,14 +5502,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -5923,14 +5605,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -6032,14 +5708,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -6135,14 +5805,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -6244,14 +5908,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -6353,14 +6011,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -6462,14 +6114,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -6565,14 +6211,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -6674,14 +6314,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -6783,14 +6417,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -6892,14 +6520,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -6995,14 +6617,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -7104,14 +6720,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -7213,14 +6823,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -7322,14 +6926,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -7425,14 +7023,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -7534,14 +7126,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -7643,14 +7229,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -7752,14 +7332,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -7855,14 +7429,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -8093,14 +7661,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -8229,14 +7791,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -8365,14 +7921,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -8468,14 +8018,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -8604,14 +8148,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -8740,14 +8278,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -8876,14 +8408,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -8979,14 +8505,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -9115,14 +8635,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -9251,14 +8765,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -9387,14 +8895,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -9490,14 +8992,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -9626,14 +9122,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -9762,14 +9252,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -9898,14 +9382,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -10001,14 +9479,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -10137,14 +9609,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -10273,14 +9739,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -10409,14 +9869,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -10512,14 +9966,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -10648,14 +10096,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -10784,14 +10226,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -10920,14 +10356,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -11023,14 +10453,8 @@ const StageHooks* hooks)
             make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
             ws.up.data(), N, I, H);
     }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),

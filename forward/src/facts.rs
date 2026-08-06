@@ -804,6 +804,18 @@ pub struct Qwen35CudaFacts {
     /// the host-routed path regardless of shape.
     #[serde(default)]
     pub moe_force_general: bool,
+    /// The DENSE MLP's gate_up BINDING — `Lw.gate_up_proj_fused !=
+    /// nullptr`, so the packed GEMM lands in one buffer and the
+    /// activation is the CHUNKED swiglu over it; without it the
+    /// projection writes two and the activation is the pair form.
+    ///
+    /// [`LlamaLikeCudaFacts::gate_up_fused`]'s reasoning applies
+    /// verbatim, including why the workspace term the executor also
+    /// tested is dead. Only the MoE arm's shared expert is unaffected:
+    /// it always binds a packed bank, so its text states the chunked
+    /// form outright.
+    #[serde(default)]
+    pub gate_up_fused: bool,
 }
 
 impl Qwen35CudaFacts {
@@ -846,6 +858,10 @@ impl Qwen35CudaFacts {
             moe_shared_gate_dot: true,
             moe_streamed_experts: false,
             moe_force_general: false,
+            // 0.8B binds the packed bank (qwen3_5.cpp's loader takes the
+            // same `dense_fused_projection_joins` contract llama_like's
+            // does), so the chunked form is the golden's shape.
+            gate_up_fused: true,
         }
     }
 }

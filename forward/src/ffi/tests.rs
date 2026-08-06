@@ -866,6 +866,7 @@ fn c_cuda_facts_synthetic() -> PieForwardQwen35CudaFacts {
         moe_shared_gate_dot: 1,
         moe_streamed_experts: 0,
         moe_force_general: 0,
+        gate_up_fused: 1,
     }
 }
 

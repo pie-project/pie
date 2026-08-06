@@ -176,6 +176,9 @@ fn main() {
                 moe_shared_gate_dot: false,
                 moe_streamed_experts: false,
                 moe_force_general: false,
+                // 0.8B binds the packed bank; the emitted body states the
+                // chunked activation rather than reading a workspace.
+                gate_up_fused: true,
             },
             "qwen3_5_0_8b",
         ),

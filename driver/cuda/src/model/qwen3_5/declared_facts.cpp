@@ -615,6 +615,18 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
     cuda.verify_stash = 1;
     out.cuda_verify_stash = true;
 
+    // The dense MLP's gate_up BINDING — llama_like's reasoning verbatim
+    // (declared_forward.cpp: the executor re-derived this per layer as
+    // `gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty()`, and
+    // the second term is dead because the workspace is allocated
+    // unconditionally). Layer 0 speaks for the deployment: the loader's
+    // join contract accepts or declines a GROUP uniformly.
+    if constexpr (!kMoe) {
+        cuda.gate_up_fused =
+            (!w.layers.empty() && w.layers[0].gate_up_proj_fused != nullptr) ? 1
+                                                                            : 0;
+    }
+
     // The MoE block's terms. Only the fused CUTLASS leg is stated, so
     // these say whether that leg exists and what row bound it carries;
     // the trace refuses the block outright when any of them says no,

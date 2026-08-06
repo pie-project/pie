@@ -593,6 +593,10 @@ struct PieForwardQwen35CudaFacts {
   uint8_t moe_streamed_experts;
   /// `qwen35_moe_force_general_path()`. Non-zero is true.
   uint8_t moe_force_general;
+  /// The dense MLP bound a packed gate_up bank
+  /// (`Lw.gate_up_proj_fused != nullptr`), so the activation is the
+  /// chunked swiglu. Non-zero is true.
+  uint8_t gate_up_fused;
 };
 
 /// One row of a fire as the engine's seriation ordered them — the input

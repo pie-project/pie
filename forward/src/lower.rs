@@ -1137,7 +1137,6 @@ mod tests {
         "  18  RmsnormGated: no lowering rule for this kind",
         "   6  SigmoidGateMul: no lowering rule for this kind",
         "   6  SplitQGate: no lowering rule for this kind",
-        "  24  Swiglu: the fused-gate_up binding fact is not in the facts",
     ];
 
     /// Qwen3.6-27B owes NOTHING that Qwen3.5-0.8B does not already owe.

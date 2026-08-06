@@ -684,6 +684,20 @@ fn emit_launch(
         ));
     };
     match kernel {
+        // The activation, with the binding's answer already in it. This
+        // used to be a per-layer `if (gate_up_fused_N)` in the emitted
+        // C++ — a runtime read of a workspace to recover something the
+        // load already knew. The fact deletes the branch here, in the
+        // interpreter's arm, and in the flat list's residue at once.
+        "launch_chunked_swiglu_bf16" => {
+            b.stmt("kernels::launch_chunked_swiglu_bf16(");
+            b.stmt("    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);");
+        }
+        "launch_swiglu_bf16" => {
+            b.stmt("kernels::launch_swiglu_bf16(");
+            b.stmt("    ws.gate.data(), ws.up.data(), ws.gate.data(),");
+            b.stmt("    N * I, stream);");
+        }
         "launch_causal_conv1d_update_batched_bf16" => {
             conv_pre(b);
             b.stmt("  kernels::launch_causal_conv1d_update_batched_bf16(");

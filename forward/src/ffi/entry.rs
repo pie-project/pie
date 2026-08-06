@@ -428,6 +428,8 @@ pub struct PieForwardQwen35CudaFacts {
     pub moe_streamed_experts: u8,
     /// `qwen35_moe_force_general_path()`.
     pub moe_force_general: u8,
+    /// The dense MLP bound a packed gate_up bank.
+    pub gate_up_fused: u8,
 }
 
 fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts {
@@ -442,6 +444,7 @@ fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts 
         moe_shared_gate_dot: facts.moe_shared_gate_dot != 0,
         moe_streamed_experts: facts.moe_streamed_experts != 0,
         moe_force_general: facts.moe_force_general != 0,
+        gate_up_fused: facts.gate_up_fused != 0,
     }
 }
 

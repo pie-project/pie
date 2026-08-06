@@ -1498,6 +1498,47 @@ fn dense_mlp_body(
     y
 }
 
+/// The dense MLP block's CUDA reading — [`dense_mlp_body`]'s peer,
+/// differing in exactly one statement: the activation names its kernel.
+///
+/// `packed` is [`Qwen35CudaFacts::gate_up_fused`], and the reasoning is
+/// llama_like's verbatim — a checkpoint that bound the packed gate‖up
+/// bank lands the projection in one buffer and takes the CHUNKED kernel,
+/// one that did not lands two and takes the pair form. The trace
+/// declares ONE packed matmul either way, because whether the binding
+/// materialised it as one buffer or two is a BUFFER question.
+fn dense_mlp_body_cuda(
+    l: u32,
+    hidden: u32,
+    intermediate: u32,
+    variant: NormVariant,
+    y: &Val,
+    packed: bool,
+) -> Val {
+    let w = |name: &str| format!("layer.{l}.{name}");
+    let mlp_norm = NormW {
+        name: w("mlp_norm"),
+        variant,
+        per_head: None,
+        layer: Some(l),
+    };
+    let gate_up = MatW {
+        name: w("gate_up"),
+        width: 2 * intermediate,
+        layer: Some(l),
+    };
+    let down = MatW {
+        name: w("down"),
+        width: hidden,
+        layer: Some(l),
+    };
+    let mut y = y.clone();
+    let m = rmsnorm(&y, &mlp_norm);
+    let act = dsl::cuda::swiglu(&matmul(&m, &gate_up), intermediate, packed);
+    y += matmul(&act, &down);
+    y
+}
+
 /// The full qwen3_5 HYBRID declaration — the first whole-model trace beyond
 /// llama_like, composing the three fragment bodies exactly as plan.md Part
 /// 1 sketches:
@@ -1601,9 +1642,14 @@ pub fn qwen3_5_hybrid_cuda(
                 gdn_attn_body_cuda(t, l, &facts.gdn, &y, cuda, class)
             };
             y = match &facts.mlp {
-                Qwen35MlpKind::Dense { intermediate } => {
-                    dense_mlp_body(l, hidden, *intermediate, facts.norm_variant, &y_attn)
-                }
+                Qwen35MlpKind::Dense { intermediate } => dense_mlp_body_cuda(
+                    l,
+                    hidden,
+                    *intermediate,
+                    facts.norm_variant,
+                    &y_attn,
+                    cuda.gate_up_fused,
+                ),
                 Qwen35MlpKind::Moe(moe) => moe_mlp_body_cuda(l, moe, cuda, &y_attn, class),
             };
         }
