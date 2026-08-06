@@ -507,6 +507,151 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     return out;
 }
 
+// ── The shadow comparison ──────────────────────────────────────────────
+//
+// `PIE_DECLARED_SHADOW=1`. Off by default and inert when off: it computes
+// a description and prints, and never changes what runs.
+bool shadow_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_DECLARED_SHADOW");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+// The kinds that execute without launching a table kernel: the region
+// markers, and the observation sites (whose programs are guest sideband
+// plus bracket machinery, never a launcher). `lower` calls these
+// Structural, and the comparison must agree or every fire reports drift.
+bool shadow_launches(pie_forward::PieForwardOpKind kind) {
+    switch (kind) {
+    case pie_forward::PieForwardOpKind::Guard:
+    case pie_forward::PieForwardOpKind::Peel:
+    case pie_forward::PieForwardOpKind::HookSite:
+        return false;
+    default:
+        return true;
+    }
+}
+
+// One fire's rows, as `lower` takes them. Row-level truth where the walk
+// has it and fire-level where it does not — which is honest rather than
+// lossy, because the axes that are fire-wide TODAY (mask, lora, write
+// descriptors) are fire-wide in the trace's guards too, so a fire-wide
+// fill selects exactly the arms the walk selects.
+//
+// The one genuinely per-row axis the walk knows is the hook peel:
+// `fast_rows` is where the hook-free prefix ends, which is the same
+// split `RowPred::HookFree` makes.
+std::vector<pie_forward::PieForwardRow> shadow_rows(
+    int n_fire,
+    int fast_rows,
+    int depth_k,
+    int depth_split,
+    bool depth_union,
+    int mask_split,
+    bool has_mask,
+    bool has_lora,
+    bool has_write_desc,
+    bool wants_scores,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows)
+{
+    std::vector<pie_forward::PieForwardRow> rows(static_cast<std::size_t>(std::max(n_fire, 0)));
+    const bool compact =
+        logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+        num_logit_rows < n_fire;
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        pie_forward::PieForwardRow& row = rows[r];
+        // The spatial split's UNMASKED PREFIX is a row axis, not a
+        // fire flag: `[0, mask_split)` attends causally and the suffix
+        // takes the custom dispatch. Filling the mask fire-wide made
+        // the lowering see an empty prefix and skip statements the walk
+        // ran — the shadow's own first finding, about the shadow.
+        row.custom_mask =
+            (has_mask && (mask_split < 0 || static_cast<int>(r) >= mask_split))
+                ? 1
+                : 0;
+        row.lora = has_lora ? 1 : 0;
+        row.write_desc = has_write_desc ? 1 : 0;
+        row.wants_scores = wants_scores ? 1 : 0;
+        row.hooked = static_cast<int>(r) >= fast_rows ? 1 : 0;
+        // Two truncation shapes, and only one of them has a split.
+        // A UNION fire puts full-depth rows first and truncated after,
+        // so `depth_split` is where truncation begins; a UNIFORM
+        // truncated fire has every row at `k` and no split at all —
+        // reading the union's field there marked nothing truncated and
+        // made the lowering cover layers the walk skipped.
+        const bool truncated =
+            depth_k >= 0 &&
+            (!depth_union || static_cast<int>(r) >= depth_split);
+        row.depth_k = truncated ? depth_k : -1;
+        // Compact fires sample the LAST row of each request; the walk
+        // does not carry the index list on the host, so the shadow says
+        // "the last `num_logit_rows` rows", which is that set whenever
+        // the requests are equal-length and a reported row-range drift
+        // otherwise. Stated so a reader does not mistake it for truth.
+        row.samples = compact
+            ? (static_cast<int>(rows.size() - r) <= num_logit_rows ? 1 : 0)
+            : 1;
+    }
+    return rows;
+}
+
+// Print what the two forms disagree about, once per fire, and return.
+void shadow_report(
+    const pie_forward::ForwardPlan& plan,
+    const std::vector<std::uint32_t>& walked,
+    const std::vector<pie_forward::PieForwardRow>& rows)
+{
+    const pie_forward::PieForwardLowered lowered = plan.lower(rows.data(), rows.size());
+    if (lowered.uncovered != pie_forward::PieForwardUncovered::None) {
+        std::fprintf(stderr,
+                     "[shadow] UNCOVERED reason=%u rows=%zu — the lowering "
+                     "refuses a fire the walk served\n",
+                     static_cast<std::uint32_t>(lowered.uncovered),
+                     rows.size());
+        return;
+    }
+    // Which statements each form covered.
+    std::vector<std::uint32_t> rect_count(plan.op_count(), 0);
+    for (std::size_t i = 0; i < lowered.launches_len; ++i) {
+        const std::uint32_t at = lowered.launches[i].at_op;
+        if (at < rect_count.size()) ++rect_count[at];
+    }
+    std::size_t holes = 0;     // walked, no rectangle
+    std::size_t phantoms = 0;  // rectangle, not walked
+    std::uint32_t first_hole = 0xffffffffu;
+    std::uint32_t first_phantom = 0xffffffffu;
+    std::vector<std::uint8_t> walked_set(plan.op_count(), 0);
+    for (const std::uint32_t at : walked) {
+        if (at < walked_set.size()) walked_set[at] = 1;
+    }
+    for (const std::uint32_t at : walked) {
+        if (at >= rect_count.size()) continue;
+        if (!shadow_launches(plan.op(at).kind)) continue;
+        if (rect_count[at] == 0) {
+            ++holes;
+            if (first_hole == 0xffffffffu) first_hole = at;
+        }
+    }
+    for (std::uint32_t at = 0; at < rect_count.size(); ++at) {
+        if (rect_count[at] != 0 && walked_set[at] == 0) {
+            ++phantoms;
+            if (first_phantom == 0xffffffffu) first_phantom = at;
+        }
+    }
+    std::fprintf(stderr,
+                 "[shadow] rows=%zu walked=%zu launches=%zu arena=%zu "
+                 "holes=%zu%s phantoms=%zu%s\n",
+                 rows.size(), walked.size(), lowered.launches_len,
+                 lowered.arena_bytes,
+                 holes,
+                 holes ? (" (first op " + std::to_string(first_hole) + ")").c_str() : "",
+                 phantoms,
+                 phantoms ? (" (first op " + std::to_string(first_phantom) + ")").c_str() : "");
+}
+
 void llama_like_forward_declared(
     const LlamaLikeDeclaredPlan& declared,
     const Qwen3Weights& w,
@@ -873,6 +1018,17 @@ void llama_like_forward_declared(
         MaskRegion region;
     };
     std::vector<MaskEvent> mask_events;
+    // ── THE SHADOW (`.wiki/tart/dsl.md` migration step 6) ─────────
+    // `lower()` produces the flat launch list meant to replace this
+    // walk. Before the walk can be deleted, the two have to be shown to
+    // agree on real fires — so when armed, record which STATEMENTS this
+    // walk executes and compare against which statements the lowering
+    // produced rectangles for. Nothing here executes or suppresses
+    // anything; a disagreement is printed and the fire proceeds.
+    std::vector<std::uint32_t> shadow_ops;
+    const bool shadow = shadow_enabled();
+    if (shadow) shadow_ops.reserve(op_count);
+
     for (std::size_t i = 0; i < op_count; ++i) {
         for (;;) {
             if (!guard_skips.empty() && i == guard_skips.back().first) {
@@ -909,6 +1065,7 @@ void llama_like_forward_declared(
         // component for every family (this one carried it because the
         // depth axis landed here first).
         if (!depth.enter(op)) continue;
+        if (shadow) shadow_ops.push_back(static_cast<std::uint32_t>(i));
         N = depth.n();
         R = depth.r();
         depth_band_index = depth.band_index();
@@ -2171,6 +2328,29 @@ void llama_like_forward_declared(
                 "declared forward: op kind " +
                 std::to_string(static_cast<std::uint32_t>(op.kind)) +
                 " has no emission rule");
+        }
+    }
+    if (shadow) {
+        // After the walk, so `fast_rows` and the depth split are the
+        // ones it actually used. Diagnostic only: a throw here would
+        // make an observation into an outage.
+        try {
+            shadow_report(
+                plan, shadow_ops,
+                shadow_rows(
+                    N_fire, fast_rows, depth_k, depth_split, depth_union,
+                    (custom_mask_d != nullptr &&
+                     unmasked_prefix_rows != 0xffffffffu)
+                        ? static_cast<int>(unmasked_prefix_rows)
+                        : -1,
+                    custom_mask_d != nullptr,
+                    lora != nullptr && lora->usable(),
+                    has_write_desc,
+                    stage_hooks != nullptr &&
+                        stage_hooks->wants_attn_score,
+                    logit_row_indices_d, num_logit_rows));
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[shadow] refused: %s\n", e.what());
         }
     }
 }

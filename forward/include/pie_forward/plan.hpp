@@ -205,6 +205,39 @@ class ForwardPlan {
         return plan_;
     }
 
+    /// The flat launch list this plan lowers to for one fire's rows —
+    /// the SHADOW comparison (`.wiki/tart/dsl.md` migration step 6).
+    ///
+    /// EXECUTES NOTHING. The result describes what would run, so that a
+    /// caller can compare it against what its walk actually launched.
+    ///
+    /// The view points into storage this plan owns and is valid until
+    /// the NEXT `lower()` on this plan (one slot). `const` because the
+    /// only mutation is that slot — a cache, in the sense `mutable`
+    /// exists for — and because a shadow must not need a mutable handle
+    /// to a plan the body reads.
+    PieForwardLowered lower(const PieForwardRow* rows, std::size_t rows_len) const {
+        PieForwardLowered out{};
+        const PieForwardStatus status = pie_forward_lower(
+            const_cast<PieForwardPlan*>(&plan_), rows, rows_len, &out);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: lower failed (" + status_name(status) + ")");
+        }
+        return out;
+    }
+
+    /// The launcher symbol one rectangle names, as a view into the
+    /// lowering's own name table (NOT the plan's — those are weights).
+    static std::string_view kernel_name(
+        const PieForwardLowered& lowered, const PieForwardLaunch& launch) {
+        if (launch.kernel_name >= lowered.kernel_names_len) return {};
+        const PieForwardName& n = lowered.kernel_names[launch.kernel_name];
+        return std::string_view(
+            reinterpret_cast<const char*>(lowered.kernel_name_bytes.ptr) + n.offset,
+            n.len);
+    }
+
     std::size_t op_count() const { return view().ops.len; }
     const PieForwardOp& op(std::size_t i) const {
         const PieForwardPlan& plan = view();
