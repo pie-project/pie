@@ -151,6 +151,28 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     const Qwen3Weights& w,
     const KvCache& cache);
 
+// Do this fire's rows take the STEP's depth bands?
+//
+// One function, called by the executor (where it decides whether the
+// band arrays are read at all) and by the model's eligibility gate
+// (where it decides whether a missing band plan is a reason to fall
+// back). It exists because those two were DUPLICATES, and the duplicate
+// went stale: the gate's copy carried the argument "a prefill trace does
+// not state the depth axis, so the bands are never read", which the very
+// next commit invalidated by teaching the Prefill class to state it.
+// Qwen2.5-1.5B then threw 5,080 times. A mirror is not a proof.
+//
+// The rule itself is the hand-written path's, term for term
+// (`llama_like.cpp`'s `bands_runnable`): bands describe a PURE-DECODE
+// fire's rows. `derive_depth_bands` refuses a region table carrying any
+// multi-token region, so a step's bands never describe a prefill fire's
+// rows even when the step stamped them for its decode fires — and the
+// hand path ignores them there too, which is what makes ignoring them
+// the parity-preserving answer rather than a demotion.
+bool llama_like_bands_apply(const LlamaLikeDeclaredPlan& declared,
+                            const LlamaLikePlanState& plan_state,
+                            bool is_pure_decode);
+
 // Execute the traced form. Same argument surface as
 // `llama_like_forward_paged` minus the inputs the eligibility gate already
 // excluded (hooks, custom mask, write descriptor, vision). Reads the SAME

@@ -360,6 +360,20 @@ const char* no_plan_name(NoPlanReason r) {
 
 }  // namespace
 
+bool llama_like_bands_apply(const LlamaLikeDeclaredPlan& declared,
+                            const LlamaLikePlanState& plan_state,
+                            bool is_pure_decode) {
+    if (plan_state.depth_band_count < 2) return false;
+    // Bands describe a PURE-DECODE fire's rows — the hand path's rule
+    // (`bands_runnable`), and `derive_depth_bands` enforces it from the
+    // other side by refusing any region table with a multi-token region.
+    if (!is_pure_decode) return false;
+    // And the fire's own class has to state the axis, or the arms have
+    // nowhere to put a band.
+    const auto& plan = is_pure_decode ? declared.decode : declared.prefill;
+    return static_cast<bool>(plan) && plan.view().depth_window != 0;
+}
+
 LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     const HfConfig& cfg,
     const LlamaLikeForwardCfg& fwd_cfg,
@@ -830,7 +844,12 @@ void llama_like_forward_declared(
     // fires derive max_layers FULL, so the union/uniform logic above
     // stays idle.
     const int band_count = static_cast<int>(plan_state.depth_band_count);
-    const bool depth_banded = band_count >= 2 && depth_stated;
+    // NOT `band_count >= 2 && depth_stated` computed here: the model's
+    // eligibility gate has to make the same decision, and when the two
+    // were separate copies the gate's went stale one commit after it was
+    // written. One function, both callers.
+    const bool depth_banded =
+        llama_like_bands_apply(declared, plan_state, is_pure_decode);
     if (depth_banded) {
         for (int j = 0; j < band_count; ++j) {
             if (plan_state.depth_band_rows[static_cast<std::size_t>(j)] >
