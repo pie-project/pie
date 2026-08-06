@@ -20,6 +20,21 @@ struct DecodeGeometry {
     /// with. See `AffineFormat`: they are one fact, the config states it, and
     /// a pipeline built for the wrong pair answers instead of failing.
     AffineFormat quant{4, 64};
+    /// The format the ROUTING projections are in when it is not the model's.
+    ///
+    /// mlx_lm quantizes per tensor and spares the two that decide where a token
+    /// goes: Qwen3.6-35B-A3B's `mlp.gate` (hidden -> one logit per expert) and
+    /// `mlp.shared_expert_gate` (hidden -> one) are 8-bit inside a 4-bit
+    /// checkpoint. Read as 4-bit they still produce finite, plausible numbers --
+    /// the router's logits came out at cosine 0.84 to mlx-lm's and the shared
+    /// gate's at cosine 1.0 and 0.56 of the magnitude, which is a mixture
+    /// routing to almost the right experts and weighting them wrongly.
+    ///
+    /// Both are hidden-by-a-few projections, so they are dispatched as matvecs
+    /// off a second pipeline table rather than being given an alternate GEMM:
+    /// 256 columns against the 17408 of an FFN is not where a prefill's time is.
+    AffineFormat alt_quant{0, 0};
+    bool has_alt_quant() const { return alt_quant.bits != 0 && alt_quant.group != 0; }
     int rotary_dims = 64;     // derived from partial_rotary_factor * head_dim
     float rope_theta = 1e7f;  // `config.json`'s rope_parameters overrides
     int mrope_section[3] = {11, 11, 10};

@@ -1176,6 +1176,22 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         ctx_.reset();
         return false;
     }
+    // The second quantized set. A checkpoint that spares its two routing
+    // projections at another width gets one more table, and only the two kinds
+    // that read it are taken from it -- everything else stays on the pipelines
+    // the model-wide format named. `mb_geometry` and the strided branch both
+    // keep those kinds on the matvec, so there is no batched shape to build.
+    if (g_.has_alt_quant()) {
+        DecodeStepPsos alt{};
+        if (!load_decode_psos(*ctx_, kernels_dir, alt, g_.alt_quant, &load_err,
+                              DecodePsoFeatures{.routing_only = true})) {
+            if (err) *err = "PSO load failed (second quantized set): " + load_err;
+            ctx_.reset();
+            return false;
+        }
+        psos_[Kernel::LlRouter] = alt[Kernel::LlRouter];
+        psos_[Kernel::LlSharedGateProj] = alt[Kernel::LlSharedGateProj];
+    }
     if (g_.paged_kv_enabled &&
         !load_multibatch_psos(
             *ctx_, kernels_dir, mb_psos_, g_.quant, &load_err,
@@ -2641,6 +2657,41 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         // and read back here rather than decided a second time -- see
         // `plan_ties_embeddings`.
         geom.tied_embeddings = plan_ties_embeddings(load_plan);
+        // The routing projections' format, read off the checkpoint rather than
+        // the config: mlx_lm's quantization predicate singles out tensors by
+        // NAME, and `config.json` records only the model-wide choice beside a
+        // list of exceptions this driver does not parse. Both routing weights
+        // are read, and a disagreement between them is refused rather than
+        // resolved -- there is one alternate pipeline table.
+        {
+            const auto view = load_plan.view();
+            AffineFormat found{0, 0};
+            bool conflict = false;
+            for (std::size_t i = 0; i < view.tensors.len; ++i) {
+                const auto& t = view.tensors.ptr[i];
+                const std::string name(reinterpret_cast<const char*>(t.name.ptr), t.name.len);
+                const bool routing = name.find("mlp.gate.weight") != std::string::npos ||
+                                     name.find("mlp.shared_expert_gate.weight") != std::string::npos;
+                if (!routing) continue;
+                const AffineFormat f{int(t.quant_bits_per_element), int(t.quant_group_size)};
+                if (f.bits == 0 || f.group == 0) continue;
+                if (f.bits == geom.quant.bits && f.group == geom.quant.group) continue;
+                if (found.bits != 0 && (found.bits != f.bits || found.group != f.group)) {
+                    conflict = true;
+                    break;
+                }
+                found = f;
+            }
+            if (conflict) {
+                if (err != nullptr) {
+                    *err = "qwen3.5: the router and the shared expert's gate are quantized "
+                           "differently from each other, and this driver builds one "
+                           "alternate pipeline table";
+                }
+                return false;
+            }
+            geom.alt_quant = found;
+        }
     }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes

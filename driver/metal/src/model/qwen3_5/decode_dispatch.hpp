@@ -23,7 +23,13 @@ namespace pie::metal {
 // → N/8 threadgroups. Requires N%8==0 (holds for every qwen3.6 projection,
 // incl. lm_head N=vocab=248320). K is a bound constant, not a launch dim.
 inline void qmv_dispatch(int N, Grid& g, Threadgroup& tg) {
-    g  = Grid{32, uint32_t(N) / 4, 1};
+    // Rounded UP. `affine_qmv_fast` produces four outputs per simdgroup, so a
+    // truncating count drops every output past the last whole four -- and at
+    // N < 4 it drops the dispatch entirely. The shared expert's gate is
+    // hidden -> ONE logit a token: its grid was {32, 0, 1}, no threads ran,
+    // its buffer kept the zeros it was allocated with, and every routed token
+    // was combined under `sigmoid(0) = 0.5` instead of its own gate.
+    g  = Grid{32, (uint32_t(N) + 3u) / 4u, 1};
     tg = Threadgroup{32, 2, 1};
 }
 

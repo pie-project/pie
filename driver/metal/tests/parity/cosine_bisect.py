@@ -21,6 +21,11 @@ GDN_ORDER = ["attn_norm", "gdn_in_qkv", "gdn_in_z", "gdn_in_a", "gdn_in_b",
 ATTN_ORDER = ["attn_norm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm",
               "rope_q", "rope_k", "sdpa", "attn_gated", "o_proj", "attn_resid"]
 MLP_ORDER = ["ffn_norm", "gate_proj", "up_proj", "swiglu", "down_proj", "layer_out"]
+# The routed FFN, in token order. `router` and `moe_out` bracket the mixture;
+# the four `shared_*` are the dense expert that runs beside it, and `ffn_out`
+# is the two summed under the one-per-token gate.
+MOE_ORDER = ["ffn_norm", "router", "moe_out", "shared_gate", "shared_up",
+             "shared_act", "shared_down", "shared_g", "ffn_out", "layer_out"]
 
 # gemma4: the norm sandwich, the per-layer-embedding residual and the layer
 # scalar are all extra, and the whole PLE stream runs once before the stack.
@@ -79,7 +84,8 @@ FAMILIES = {
     "gptoss": lambda: build(24, GO_LAYER),
     "gemma4": lambda: build(35, G4_LAYER, pre=G4_PRE, tail=G4_TAIL),
     "qwen3_5": lambda: build(
-        24, lambda L: (ATTN_ORDER if (L % 4) == 3 else GDN_ORDER) + MLP_ORDER),
+        64, lambda L: (ATTN_ORDER if (L % 4) == 3 else GDN_ORDER)
+        + MLP_ORDER + MOE_ORDER),
 }
 
 
