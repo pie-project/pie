@@ -1,0 +1,53 @@
+{
+  "schemas": 48,
+  "rows": [
+    {
+      "batch": 8,
+      "distinct": 8,
+      "engrain_us": 638.8819310814142,
+      "xgrammar_serial_us": 230.36007769405842,
+      "xgrammar_threaded_us": 230.36007769405842,
+      "forward_us": null
+    },
+    {
+      "batch": 32,
+      "distinct": 32,
+      "engrain_us": 776.6834460198879,
+      "xgrammar_serial_us": 828.2542694360018,
+      "xgrammar_threaded_us": 828.2542694360018,
+      "forward_us": null
+    },
+    {
+      "batch": 64,
+      "distinct": 48,
+      "engrain_us": 960.7973042875528,
+      "xgrammar_serial_us": 1696.1486544460058,
+      "xgrammar_threaded_us": 1696.1486544460058,
+      "forward_us": null
+    },
+    {
+      "batch": 128,
+      "distinct": 48,
+      "engrain_us": 1048.8061234354973,
+      "xgrammar_serial_us": 3417.1275328844786,
+      "xgrammar_threaded_us": 3417.1275328844786,
+      "forward_us": null
+    },
+    {
+      "batch": 256,
+      "distinct": 48,
+      "engrain_us": 1332.4404135346413,
+      "xgrammar_serial_us": 7374.360458925366,
+      "xgrammar_threaded_us": 4424.359649419785,
+      "forward_us": null
+    },
+    {
+      "batch": 512,
+      "distinct": 48,
+      "engrain_us": 1688.6205412447453,
+      "xgrammar_serial_us": 15888.202004134655,
+      "xgrammar_threaded_us": 8602.656424045563,
+      "forward_us": null
+    }
+  ]
+}

@@ -28,6 +28,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 RESULTS = Path("results")
+
+# vLLM fills XGrammar's rows on a thread pool only above this many structured
+# requests in a step, in chunks of sixteen. Below it the fill is serial, and a
+# comparison that threads anyway is not measuring what serving does.
+_VLLM_THREADS_ABOVE = 128
 OUT = RESULTS / "lockstep.json"
 
 
@@ -80,9 +85,10 @@ def main() -> int:
         type=int,
         default=8,
         help="threads to fill XGrammar's rows with, in chunks of sixteen, "
-        "which is what vLLM does above a batch of 128. Their per-row work is "
-        "the same either way; this is the difference between counting it and "
-        "waiting for it, and serving waits.",
+        "which is what vLLM does above 128 structured requests in a step and "
+        "not below. Their per-row work is the same either way; this is the "
+        "difference between counting it and waiting for it, and serving "
+        "waits.",
     )
     parser.add_argument(
         "--distinct",
@@ -175,9 +181,15 @@ def main() -> int:
 
             bitmask = xg.allocate_token_bitmask(batch, len(tokenizer))
             ourtimes, theirtimes, theirthreaded = [], [], []
+            # vLLM's own rule, read out of its source rather than guessed:
+            # `len(structured_output_request_ids) > 128`, in chunks of sixteen.
+            # At or below that it fills serially, and threading it here was
+            # wrong in both directions - at batch 32 the pool costs more than
+            # the work and made XGrammar look slower than vLLM would run it,
+            # and at batch 128 it made them look faster.
             pool_of_threads = (
                 ThreadPoolExecutor(max_workers=arguments.workers)
-                if arguments.workers > 1 and batch > 16
+                if arguments.workers > 1 and batch > _VLLM_THREADS_ABOVE
                 else None
             )
             for _ in range(arguments.repeats):
