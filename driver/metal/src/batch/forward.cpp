@@ -604,6 +604,7 @@ struct MetalExecutor::Impl {
         const pie_loader::LoadPlan& load_plan,
         std::size_t storage_page_size,
         bool stream_routed_experts,
+        std::uint32_t max_ctx_tokens,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
     int vocab() const { return simple_ ? simple_->vocab() : g_.vocab; }
@@ -976,8 +977,17 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                             const pie_loader::LoadPlan& load_plan,
                             std::size_t storage_page_size,
                             bool stream_routed_experts,
+                            std::uint32_t max_ctx_tokens,
                             std::string* err) {
     g_ = geom;
+    // The same line `setup_simple` has, for the same reason: `max_ctx_` sizes
+    // the M=1 ring `plan_heap` reserves, and this path used to leave it at the
+    // ceiling. So `max_model_len` moved nothing here while the refusal that
+    // printed the ring named `max_model_len` as its knob -- an operator could
+    // set it to 512, watch 8 GiB not move, and have nothing to read.
+    if (max_ctx_tokens > 0) {
+        max_ctx_ = int(std::min<std::uint32_t>(max_ctx_tokens, kMetalMaxCtxTokens));
+    }
 
     // The mmap is transient: the LoadPlan copies each finalized tensor
     // once into the resident weights region.
@@ -2651,6 +2661,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             load_plan,
             cfg.storage_page_size,
             cfg.stream_routed_experts,
+            cfg.max_ctx_tokens,
             &derr)) {
         if (err != nullptr) *err = "Metal forward setup failed: " + derr;
         return false;
