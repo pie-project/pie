@@ -17,6 +17,12 @@ are historical record, not results.
 | 5 | over- and under-acceptance on the exact fragment, three engines | `rigor.fragment`, `rigor.soundness` | 2026-08-06 |
 | 6 | end to end in vLLM, three engines | `rigor.e2e` | 2026-08-06 |
 | 7 | arena size, sharing and the verdict trade | `rigor.cost` + a live pool | 2026-08-05 |
+| 8 | online serving, Poisson arrivals, four engines | `rigor.online` | 2026-08-06 |
+
+`rigor.online` reads `results/corpus-agreed.json`, which is the exact fragment
+screened once to the 417 schemas all three backends accept. Screening inside
+each arm compiles the whole corpus in three engines before a single request is
+served, which is minutes of nothing per arm.
 
 ## The corpus the correctness and end-to-end results use
 
@@ -118,6 +124,14 @@ and the verdict table and charged a flat 20 bytes per group: 2.9 MB reported
 against a real 7.5. A 1 GiB budget was holding what a 2.6 GiB one had been
 asked for. It is now counted from the arrays the arena uploads and checked
 against them to 100.0%.
+
+**A known wrong mask, reported rather than withheld.** `rigor.online` with
+`ENGRAIN_VERIFY=1` shows a row whose batched mask is missing twelve words of
+bits against the same row computed alone, under continuous batching only, and
+three of 400 requests die with `grammar rejected tokens`. It is not
+root-caused. The correctness results walk the host reference matcher and are
+unaffected; the serving numbers are measured on an engine with this path live
+and the paper says so.
 
 **A cross-engine refusal is not automatically the refuser's fault.** The first
 version of `rigor.nonjson` counted every string one engine generated and the

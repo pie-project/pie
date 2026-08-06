@@ -806,6 +806,79 @@ crosses at 30, because XGrammar's per-row cost scales with the vocabulary and
 ours is launch-bound at small batch. At batch 512 it reverses and we win most
 on the smallest vocabulary, 7.1$\times$.
 
+\subsection{Requests that arrive over time, and a defect it found}
+\label{sec:eval-online}
+
+Every measurement above submits its whole batch at once and waits, which is a
+throughput experiment. It hides the two numbers an operator is judged on ---
+time to first token and how evenly the rest arrive --- and it hides the case
+this engine's admit/release design exists for, a batch whose composition
+changes because requests are joining and leaving rather than starting together.
+So we drive the engine with Poisson arrivals, each request carrying its own
+schema, and record per-request latency (Table~\ref{tab:online}).
+
+\begin{table}[t]
+\caption{Poisson arrivals into vLLM's async engine, Qwen3-0.6B, 400 requests
+over 32 schemas, 96-token cap. Milliseconds. Source: \texttt{rigor.online}.}
+\label{tab:online}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{llrrrr}
+\toprule
+offered & engine & served & TTFT p50 & TTFT p99 & ITL p50 \\
+\midrule
+16 q/s & none & 15.1 & 18.9 & 48.3 & 3.2 \\
+ & engrain & 14.9 & 27.4 & 547.5 & 6.1 \\
+ & XGrammar & 15.0 & 22.3 & 78.2 & 3.2 \\
+ & llguidance & 15.1 & \textbf{21.4} & \textbf{43.6} & 3.2 \\
+\midrule
+64 q/s & none & 56.4 & 29.3 & 52.0 & 3.2 \\
+ & engrain & 53.7 & 46.2 & 1{,}338.7 & 9.9 \\
+ & XGrammar & 52.4 & 69.5 & 120.9 & 21.8 \\
+ & llguidance & 56.1 & \textbf{35.3} & \textbf{54.1} & 4.7 \\
+\midrule
+256 q/s & none & 125.0 & 330.7 & 1{,}018 & 5.2 \\
+ & engrain & 75.0 & 1{,}726 & 2{,}711 & \textbf{10.1} \\
+ & XGrammar & 68.5 & 1{,}125 & 2{,}998 & 25.5 \\
+ & llguidance & \textbf{100.3} & \textbf{520.8} & \textbf{1{,}617} & 20.7 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\textbf{We are last on time to first token at every rate}, and it is the cold
+path of \S\ref{sec:costs}: a schema nobody has compiled costs 227\,ms before
+its first mask, and under Poisson arrivals that lands in the tail of whichever
+request drew it. \textbf{Inter-token latency is the one we win}, and only where
+the batch is large enough for the mask to matter: 9.9\,ms against XGrammar's
+21.8 at 64\,q/s, and at saturation 10.1 against llguidance's 20.7 and
+XGrammar's 25.5. Sustained throughput at saturation is llguidance 100\,q/s,
+engrain 75, XGrammar 68.5, against an unconstrained 125.
+
+\paragraph{And it found a defect the six verifications do not reach.} With
+per-row verification enabled, and only under continuous batching:
+
+\begin{center}
+\begin{small}
+\texttt{row 6 (grammar 31): 0 words with extra bits, 12 with missing}\\
+\texttt{same row alone: DIFFERS from the batch; alone vs matcher: agrees}
+\end{small}
+\end{center}
+
+Computed alone the device agrees with the reference matcher; computed in the
+batch it is missing twelve words of bits, which is a mask too narrow for the
+row it belongs to. Three of 400 requests died outright. Our \texttt{mixed}
+verification changes the grammar assignment between recording a graph and
+replaying it, but every row is present for the whole run --- only arrivals and
+departures give rows that join and leave \emph{mid-flight}, and that is the
+shape none of the six cover. The correctness results of
+\S\ref{sec:correctness} walk the host reference matcher and are unaffected, but
+the serving numbers in this section are measured on an engine with a known
+wrong-mask path, and we report them with that stated rather than withheld.
+
 \subsection{Speculative decoding}
 \label{sec:eval-spec}
 
@@ -1197,10 +1270,11 @@ own documents. \textbf{Fused sampling is
 suggests. \textbf{Heterogeneous pools of 8--16 schemas cost us
 33--36$\times$} what those schemas cost alone. \textbf{The memo and graph
 capture pay only below batch 32.} \textbf{One GPU}: every launch shape, memo
-size and chunk count was fitted on an A100. \textbf{Untested}: staggered
-arrivals under continuous batching --- every end-to-end run here submits the
-whole batch at once --- tensor parallelism, prefill-heavy workloads, and a
-vocabulary above 200{,}000 tokens.
+size and chunk count was fitted on an A100. \textbf{A known wrong-mask path}:
+under continuous batching a row's mask can come out narrower in the batch than
+computed alone (\S\ref{sec:eval-online}); it is not root-caused, and it is the
+first thing to fix. \textbf{Untested}: tensor parallelism, prefill-heavy
+workloads, and a vocabulary above 200{,}000 tokens.
 
 \section{Related Work}
 \label{sec:related}
