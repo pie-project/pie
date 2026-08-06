@@ -85,6 +85,11 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // just below, which is the same reason gemma4 and gpt-oss have.
         d.qmm_bn = qmm_bn_unsplit(out, n, qmm_min_batch(g.is_moe()));
         d.qmm_bm = qmm_bm(n);
+        // The second quantized set has a matvec and no GEMM: a checkpoint that
+        // spares its two routing projections at 8 bits gets one extra pipeline
+        // table, not an extra table of every batched shape. Both are
+        // hidden-by-a-few, so this costs nothing worth a second table.
+        if (qwen35_uses_alt_quant(d.kind, g)) d.qmm_bn = 0;
         // NO split-K, for exactly the reason gemma4's `launch_shape_mb` gives:
         // the split GEMM writes `split_k` partial [M, N] slices into a side
         // buffer and needs a reduce pass to sum them, and NOTHING IN THIS
@@ -535,7 +540,8 @@ void encode_prefill_dags_mb(StepEncoder& se,
     for (size_t i = 0; i < length; ++i) {
         const Dispatch& d0 = dags[0][i];
         if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead &&
-            d0.kind != Kernel::LmHeadUntied) {
+            d0.kind != Kernel::LmHeadUntied &&
+            !qwen35_uses_alt_quant(d0.kind, *geometry)) {
             const int out = qmv_out_size(d0.kind, *geometry);
             if (out == 16 && !d0.fuse_residual && mb_psos.qmv_wide_strided.valid()) {
                 constexpr int vecs = 4;

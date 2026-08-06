@@ -99,7 +99,10 @@ inline void routed_qmv_dispatch(int N, int experts_per_token, Grid& g, Threadgro
                                 int rows = 1) {
     const std::uint32_t r = std::uint32_t(rows > 0 ? rows : 1);
     const std::uint32_t slots = std::uint32_t(experts_per_token > 0 ? experts_per_token : 1);
-    g = Grid{32u * r, std::uint32_t(N > 0 ? N : 1) / 4u, slots};
+    // Rounded UP: the kernel writes four outputs a simdgroup and guards each
+    // against `out_vec_size`, so a width that is not a multiple of four gets
+    // a partial group rather than losing its tail. See `qmv_dispatch`.
+    g = Grid{32u * r, (std::uint32_t(N > 0 ? N : 1) + 3u) / 4u, slots};
     tg = Threadgroup{32, 2, 1};
 }
 

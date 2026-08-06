@@ -141,9 +141,15 @@ METAL_FUNC void qmv_fast_impl(
     x += block_size;
   }
 
+  // Bounded, because a simdgroup produces four outputs whether or not the
+  // matrix has four left. Every projection here used to be a whole number of
+  // eight and the host rounded the grid DOWN, which cost nothing until a
+  // projection was one column wide -- the shared expert's gate -- and lost the
+  // whole dispatch. The grid rounds up now, so the last group has to know where
+  // the matrix ends.
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && out_row + row < out_vec_size) {
       y[row] = static_cast<T>(result[row]);
     }
   }
@@ -231,7 +237,7 @@ METAL_FUNC void qmv_fast_residual_impl(
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && out_row + row < out_vec_size) {
       T q = static_cast<T>(result[row]);                       // same bf16 round as standalone qmv
       y[row] = static_cast<T>(float(q) + float(residual[row]));  // then residual_add's round
     }
@@ -467,7 +473,7 @@ METAL_FUNC void qmv_gptoss_impl(
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
     U v = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && out_row + row < out_vec_size) {
       if (BIASED) v += U(bias_row[out_row + row]);
       y_row[row] = static_cast<T>(v);
     }

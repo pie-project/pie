@@ -528,6 +528,16 @@ struct SetupConfig {
         int mlp_only_layer_count = 0;
         float eps = 1e-6f;
         bool tied_embeddings = true;
+        /// `norm_topk_prob`, defaulting to renormalized-over-the-selected.
+        ///
+        /// mlx-lm's `qwen3_next.ModelArgs` declares `norm_topk_prob: bool =
+        /// False`, which reads like this default is wrong for a checkpoint --
+        /// Qwen3.6-35B-A3B -- whose config omits the field. It is not: the
+        /// model mlx-lm actually loads for that checkpoint comes back with
+        /// `norm_topk_prob True` on every layer, and the taps agree. Flipping
+        /// the default here moved the last layer's residual from cosine 0.982
+        /// to 0.862 against mlx-lm and was reverted. Left written down because
+        /// the declaration is genuinely misleading.
         bool norm_topk_prob = true;
         bool present() const { return n_layers > 0 && hidden > 0; }
     } qwen35;
