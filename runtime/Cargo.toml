@@ -64,7 +64,7 @@ p256 = { version = "0.13", features = ["pkcs8", "ecdsa"] }
 p384 = { version = "0.13", features = ["pkcs8", "ecdsa"] }
 sha2 = "0.10"
 chrono = "0.4"
-ringbuffer = "0.15"
+ringbuffer = "0.16"
 # default-features off so reqwest's `default-tls` (native-tls → openssl) is
 # never pulled in: it dynamically links libssl.so.1.1, which doesn't exist on
 # OpenSSL-3 distros (Ubuntu 22.04+) and breaks the manylinux_2_28 release
