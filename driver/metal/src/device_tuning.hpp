@@ -11,6 +11,13 @@
 // unrecognised one does, and a machine this file has never heard of gets the
 // constants that were measured rather than an extrapolation. Overrides are
 // per-generation and each carries the measurement that justifies it.
+//
+// `benches/tune_device.py` takes that measurement. Every field below has a
+// `PIE_METAL_*` override so it can be swept without a rebuild, and the script
+// finds, for each one, a batch where its candidate values provably choose
+// DIFFERENT paths -- which is not a detail. A threshold does nothing at
+// batches that do not straddle it, so sweeping one anywhere else times the
+// same work twice and reports the reassuring answer.
 
 #pragma once
 
