@@ -46,7 +46,7 @@ pub struct PlanArena {
     shadow_wire: Vec<super::types::PieForwardLaunch>,
     shadow_names: Vec<PieForwardName>,
     shadow_name_bytes: Vec<u8>,
-    shadow_structural: Vec<u32>,
+    shadow_structural: Vec<super::types::PieForwardSite>,
 }
 
 /// Interns strings into the arena's name table during a build.
@@ -671,7 +671,14 @@ pub fn lower(
     }
 
     arena.shadow_structural.clear();
-    arena.shadow_structural.extend_from_slice(&lowered.structural);
+    arena.shadow_structural.extend(lowered.structural.iter().map(|site| {
+        super::types::PieForwardSite {
+            at_op: site.at_op,
+            row_lo: site.rows.start,
+            row_hi: site.rows.end,
+            _pad: 0,
+        }
+    }));
 
     let view = PieForwardLowered {
         launches: arena.shadow_wire.as_ptr(),

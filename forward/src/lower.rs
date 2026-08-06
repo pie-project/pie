@@ -16,12 +16,13 @@
 //!                       L.layers.lo, L.layers.hi, stream);
 //! ```
 //!
-//! This module is the host half of that, and ONLY the host half. The
-//! driver still executes `declared_forward.cpp` and the generated
-//! `.inc`s; switching it over is a separate change whose gate is the
-//! killer soak and the declared==hand A/B, not a byte comparison — see
-//! `.wiki/tart/macos.md`'s sibling note in `dsl.md` step 6. Nothing here
-//! is on any execution path yet.
+//! **This is what a declared fire runs.** `declared_forward.cpp` builds
+//! the rows, calls `pie_forward_lower`, and executes the result; its
+//! walk over the region IR was deleted in the cutover's step 3, so there
+//! is no second form and no switch between them. The one remaining
+//! consumer of the traced form that does NOT come through here is the
+//! generated `.inc` — an ahead-of-time emission of the same declaration
+//! that also carries the unionized supergraph build.
 //!
 //! # Three decisions this module makes, from the doc's amendments
 //!
@@ -100,6 +101,23 @@ pub struct Fire {
     /// their launches carry [`Launch::rows_device`]. Clear, the host's
     /// counts are the truth and an empty region emits nothing.
     pub captures_across_splits: bool,
+}
+
+/// A STRUCTURAL statement and the rows it brackets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Site {
+    pub at_op: u32,
+    /// The rows live where it sits — the SAME window its neighbouring
+    /// launches take.
+    ///
+    /// A site observes rows, so it needs a row count for the same
+    /// reason a launch needs a grid: an observation program is handed
+    /// `rows` rows of the query buffer, and past the live count those
+    /// rows are frozen at whatever the last layer that owned them left
+    /// behind. Carrying only the statement index (what this list did
+    /// when sites first joined it) makes every site a fire-wide one,
+    /// which is right for exactly the fires that are not truncated.
+    pub rows: Range<u32>,
 }
 
 /// One flat launch: a kernel over a rectangle of (rows × layers).
@@ -222,7 +240,7 @@ pub struct Lowered {
     ///
     /// So the list is what a fire DOES: rectangles for what it launches,
     /// these for what it brackets.
-    pub structural: Vec<u32>,
+    pub structural: Vec<Site>,
     /// Statements that still run on the device without a rectangle —
     /// see [`Unlowered`]. Empty is the cutover gate: only then is
     /// `launches` the WHOLE of what a fire executes, and only then can
@@ -298,7 +316,7 @@ struct Lowerer<'a> {
     peel_tail: bool,
     residue: Vec<Unlowered>,
     fire: Fire,
-    structural: Vec<u32>,
+    structural: Vec<Site>,
     /// The peel region the launches being emitted sit in.
     peel_region: Option<PeelRegion>,
 }
@@ -409,8 +427,12 @@ impl Lowerer<'_> {
                             // are gone. Same window the launches take,
                             // and skipping it here is what the walk
                             // does by refusing to enter the op at all.
-                            if !self.depth_window(op, &window, i)?.is_empty() {
-                                self.structural.push(i as u32);
+                            let live = self.depth_window(op, &window, i)?;
+                            if !live.is_empty() {
+                                self.structural.push(Site {
+                                    at_op: i as u32,
+                                    rows: live,
+                                });
                             }
                         }
                         Semantic::Kernels(symbols) => {
@@ -1100,11 +1122,19 @@ mod tests {
         for out in [&plain_out, &masked_out] {
             assert!(!out.structural.is_empty(), "a live fire brackets its layers");
             assert!(
-                out.structural.iter().all(|&at| sites.contains(&(at as usize))),
+                out.structural
+                    .iter()
+                    .all(|s| sites.contains(&(s.at_op as usize))),
                 "only sites are structural"
             );
             // Ordered, because a bracket opens before it closes.
-            assert!(out.structural.windows(2).all(|w| w[0] < w[1]));
+            assert!(out
+                .structural
+                .windows(2)
+                .all(|w| w[0].at_op < w[1].at_op));
+            // And every site brackets a NON-EMPTY window — an empty one
+            // would be a retired layer's, which does not fire at all.
+            assert!(out.structural.iter().all(|s| !s.rows.is_empty()));
         }
         assert_ne!(
             plain_out.structural, masked_out.structural,

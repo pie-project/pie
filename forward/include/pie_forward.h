@@ -629,6 +629,20 @@ struct PieForwardLaunch {
   uint8_t _pad;
 };
 
+/// One STRUCTURAL statement: where it sits, and the rows it brackets.
+///
+/// The rows are why this is a struct rather than an index. A site hands
+/// an observation program `row_hi - row_lo` rows of the query buffer,
+/// and past the live count those rows are frozen at whatever the last
+/// layer that owned them left behind — so a truncated fire's site needs
+/// its window for the same reason its launches do.
+struct PieForwardSite {
+  uint32_t at_op;
+  uint32_t row_lo;
+  uint32_t row_hi;
+  uint32_t _pad;
+};
+
 /// Zero is a lowering; every other value is a group that should not have
 /// been formed (an ADMISSION answer, not a runtime fire split).
 enum class PieForwardUncovered : uint32_t {
@@ -649,11 +663,11 @@ struct PieForwardLowered {
   const PieForwardName *kernel_names;
   size_t kernel_names_len;
   PieForwardBytes kernel_name_bytes;
-  /// The STRUCTURAL statements inside live regions, in walk order — op
-  /// indices. A site launches no table kernel, so it has no rectangle,
-  /// but it runs guest programs and brackets a layer's sideband; a form
-  /// driven by this list runs these and only these.
-  const uint32_t *structural;
+  /// The STRUCTURAL statements inside live regions, in walk order. A
+  /// site launches no table kernel, so it has no rectangle, but it runs
+  /// guest programs and brackets a layer's sideband; a form driven by
+  /// this list runs these and only these.
+  const PieForwardSite *structural;
   size_t structural_len;
   /// Peak activation bytes the frame would need.
   size_t arena_bytes;

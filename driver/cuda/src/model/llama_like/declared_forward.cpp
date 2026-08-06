@@ -14,7 +14,6 @@
 
 #include <cuda_runtime.h>
 
-#include "model/declared/depth_window.hpp"
 #include "model/declared/value_arena.hpp"
 #include "model/declared/arms.hpp"
 #include "model/declared/weights.hpp"
@@ -507,57 +506,43 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     return out;
 }
 
-// ── The shadow comparison ──────────────────────────────────────────────
+// `PIE_DECLARED_FLAT_TRACE=1`: print what each fire's list served. A
+// diagnostic, never a switch — there is nothing left to switch between.
 //
-// `PIE_DECLARED_SHADOW=1`. Off by default and inert when off: it computes
-// a description and prints, and never changes what runs.
-// The declared path executes `lower()`'s list. `PIE_DECLARED_FLAT=0`
-// disarms it back onto the walk below, which is still here and still
-// under the same parity gate — the flip is the LAST reversible step of
-// the cutover, and it is deliberately taken one increment before the
-// walk is deleted so that a regression found in the meantime has a
-// one-word A/B rather than a revert.
-bool flat_enabled() {
+// It replaces `PIE_DECLARED_SHADOW`, which armed the walk-vs-lowering
+// comparison that carried this migration (47% agreement on its first
+// run, 100% for the two increments before the drive was written, and
+// three real defects found on the way). With the walk gone the shadow
+// has nothing to compare against; what survives it is this line and the
+// `devwin` count, which the capture-split probe needs to show it took
+// the path at all.
+bool flat_trace_enabled() {
     static const bool on = [] {
-        const char* v = std::getenv("PIE_DECLARED_FLAT");
-        return v == nullptr || v[0] == '\0' || v[0] != '0';
-    }();
-    return on;
-}
-
-bool shadow_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("PIE_DECLARED_SHADOW");
+        const char* v = std::getenv("PIE_DECLARED_FLAT_TRACE");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     return on;
 }
 
-// The kinds that execute without launching a table kernel: the region
-// markers, and the observation sites (whose programs are guest sideband
-// plus bracket machinery, never a launcher). `lower` calls these
-// Structural, and the comparison must agree or every fire reports drift.
-bool shadow_launches(pie_forward::PieForwardOpKind kind) {
-    switch (kind) {
-    case pie_forward::PieForwardOpKind::Guard:
-    case pie_forward::PieForwardOpKind::Peel:
-    case pie_forward::PieForwardOpKind::HookSite:
-        return false;
-    default:
-        return true;
-    }
-}
-
-// One fire's rows, as `lower` takes them. Row-level truth where the walk
-// has it and fire-level where it does not — which is honest rather than
-// lossy, because the axes that are fire-wide TODAY (mask, lora, write
-// descriptors) are fire-wide in the trace's guards too, so a fire-wide
-// fill selects exactly the arms the walk selects.
+// ONE FIRE'S ROWS — the executor's input, and now its only one.
 //
-// The one genuinely per-row axis the walk knows is the hook peel:
-// `fast_rows` is where the hook-free prefix ends, which is the same
-// split `RowPred::HookFree` makes.
-std::vector<pie_forward::PieForwardRow> shadow_rows(
+// This is where a fire stops being a bundle of driver words and becomes
+// what the lowering takes: a row per token, each carrying the axes it
+// sits on. Everything downstream is a function of this array and the
+// declaration.
+//
+// Row-level truth where the driver has it and fire-level where it does
+// not, which is honest rather than lossy: the axes that are fire-wide
+// TODAY (mask, lora, write descriptors) are fire-wide in the trace's
+// guards too, so a fire-wide fill selects exactly the arms a per-row one
+// would. The genuinely per-row axes are the hook peel (`fast_rows` ends
+// the hook-free prefix), the spatial mask split, and depth.
+//
+// It was born as `shadow_rows`, feeding the comparison that proved the
+// lowering agreed with the walk. The walk is gone and the name went
+// with it; the function did not have to change at all, which is the
+// clearest statement of what that comparison was for.
+std::vector<pie_forward::PieForwardRow> fire_rows(
     int n_fire,
     int fast_rows,
     int depth_k,
@@ -631,128 +616,6 @@ std::vector<pie_forward::PieForwardRow> shadow_rows(
     return rows;
 }
 
-// Print what the two forms disagree about, once per fire, and return.
-struct ShadowShape {
-    int n_fire;
-    int fast_rows;
-    int mask_split;
-    int depth_k;
-    int depth_split;
-    bool depth_union;
-    int bands;
-    /// The fire captures across splits, so the walk emits BOTH peel
-    /// regions and an empty one early-outs on a device word. The flat
-    /// list has no such rectangle — `Launch::rows` is a host range —
-    /// so its statements are legitimately fewer here. Labelled rather
-    /// than counted, because it is a DIFFERENCE the cutover has to
-    /// answer, not drift to chase.
-    bool devwin;
-};
-
-void shadow_report(
-    const pie_forward::ForwardPlan& plan,
-    const std::vector<std::uint32_t>& walked,
-    const std::vector<pie_forward::PieForwardRow>& rows,
-    const ShadowShape& shape)
-{
-    // The capture decision travels WITH the fire: under device-window
-    // capture the walk emits both peel regions, so the lowering must
-    // describe both or it is describing a different graph.
-    const pie_forward::PieForwardLowered lowered =
-        plan.lower(rows.data(), rows.size(), shape.devwin);
-    if (lowered.uncovered != pie_forward::PieForwardUncovered::None) {
-        std::fprintf(stderr,
-                     "[shadow] UNCOVERED reason=%u rows=%zu — the lowering "
-                     "refuses a fire the walk served\n",
-                     static_cast<std::uint32_t>(lowered.uncovered),
-                     rows.size());
-        return;
-    }
-    // Which statements each form covered.
-    std::vector<std::uint32_t> rect_count(plan.op_count(), 0);
-    for (std::size_t i = 0; i < lowered.launches_len; ++i) {
-        const std::uint32_t at = lowered.launches[i].at_op;
-        if (at < rect_count.size()) ++rect_count[at];
-    }
-    // The SITES, compared as their own claim: a form driven by the list
-    // brackets exactly the statements it names, so if the walk brackets
-    // a different set the drive would run guest programs in a dead arm
-    // (or skip a live one). Rectangles cannot catch that — a site has
-    // none.
-    std::size_t site_drift = 0;
-    {
-        std::vector<std::uint32_t> walked_sites;
-        for (const std::uint32_t at : walked) {
-            if (at < plan.op_count() &&
-                plan.op(at).kind == pie_forward::PieForwardOpKind::HookSite) {
-                walked_sites.push_back(at);
-            }
-        }
-        const std::size_t n = lowered.structural_len;
-        if (walked_sites.size() != n) {
-            site_drift = walked_sites.size() > n ? walked_sites.size() - n
-                                                 : n - walked_sites.size();
-        } else {
-            for (std::size_t j = 0; j < n; ++j) {
-                if (walked_sites[j] != lowered.structural[j]) ++site_drift;
-            }
-        }
-    }
-    std::size_t holes = 0;     // walked, no rectangle
-    std::size_t phantoms = 0;  // rectangle, not walked
-    std::uint32_t first_hole = 0xffffffffu;
-    std::uint32_t first_phantom = 0xffffffffu;
-    std::vector<std::uint8_t> walked_set(plan.op_count(), 0);
-    for (const std::uint32_t at : walked) {
-        if (at < walked_set.size()) walked_set[at] = 1;
-    }
-    for (const std::uint32_t at : walked) {
-        if (at >= rect_count.size()) continue;
-        if (!shadow_launches(plan.op(at).kind)) continue;
-        if (rect_count[at] == 0) {
-            ++holes;
-            if (first_hole == 0xffffffffu) first_hole = at;
-        }
-    }
-    for (std::uint32_t at = 0; at < rect_count.size(); ++at) {
-        if (rect_count[at] != 0 && walked_set[at] == 0) {
-            ++phantoms;
-            if (first_phantom == 0xffffffffu) first_phantom = at;
-        }
-    }
-    // Name what drifted. An op INDEX is not a diagnosis — the kind and
-    // the layer are, and printing them is the difference between "three
-    // classes remain" and knowing which axis to fill.
-    const auto describe = [&](std::uint32_t at) {
-        if (at >= plan.op_count()) return std::string("-");
-        const PieForwardOp& op = plan.op(at);
-        return std::to_string(at) + ":kind" +
-               std::to_string(static_cast<std::uint32_t>(op.kind)) +
-               "@L" + std::to_string(op.layer);
-    };
-    if (holes == 0 && phantoms == 0 && site_drift == 0) {
-        std::fprintf(stderr,
-                     "[shadow] rows=%zu walked=%zu launches=%zu arena=%zu "
-                     "holes=0 phantoms=0\n",
-                     rows.size(), walked.size(), lowered.launches_len,
-                     lowered.arena_bytes);
-        return;
-    }
-    std::fprintf(stderr,
-                 "[shadow] rows=%zu walked=%zu launches=%zu arena=%zu "
-                 "holes=%zu%s phantoms=%zu%s sites=%zu | shape N=%d fast=%d mask=%d "
-                 "k=%d split=%d union=%d bands=%d devwin=%d\n",
-                 rows.size(), walked.size(), lowered.launches_len,
-                 lowered.arena_bytes,
-                 holes,
-                 holes ? (" (" + describe(first_hole) + ")").c_str() : "",
-                 phantoms,
-                 phantoms ? (" (" + describe(first_phantom) + ")").c_str() : "",
-                 site_drift,
-                 shape.n_fire, shape.fast_rows, shape.mask_split,
-                 shape.depth_k, shape.depth_split, shape.depth_union ? 1 : 0,
-                 shape.bands, shape.devwin ? 1 : 0);
-}
 
 void llama_like_forward_declared(
     const LlamaLikeDeclaredPlan& declared,
@@ -875,14 +738,11 @@ void llama_like_forward_declared(
     // arms, nothing below derives a path (north-star-dsl.md).
     const pie_forward::ForwardPlan& plan =
         is_pure_decode ? declared.decode : declared.prefill;
-    // STRUCTURAL S-4: N/R are MUTABLE walk state — the depth window
-    // rebinds them per op (layer-tagged ops at layer >= k run over the
-    // full-depth prefix on a union fire, and are SKIPPED on a uniform
-    // truncated fire). Fire-level values stay in N_fire/R_fire.
+    // The fire's extents. They used to have MUTABLE peers (`N`, `R`)
+    // that a depth window rebound per op; a rectangle's row count is
+    // that number now, so the only extents left are the fire's own.
     const int N_fire = total_tokens;
     const int R_fire = num_requests;
-    int N = total_tokens;
-    int R = num_requests;
     const bool depth_stated = plan.view().depth_window != 0;
     const int depth_k =
         depth_stated && declared_max_layers != 0xffffffffu &&
@@ -901,7 +761,6 @@ void llama_like_forward_declared(
             "depth union (declared): planned split without a usable "
             "prefix plan (gate drift)");
     }
-    bool depth_tail_active = false;
     // ④ Act 1 (banded depth): >= 2 distinct-k bands stamped by the
     // prepare. Deepest-first arrays; at layer L the live rows are
     // N_fire below the shallowest k, else the matched band's start row
@@ -926,7 +785,6 @@ void llama_like_forward_declared(
                          R_fire, band_count);
         }
     }
-    int depth_band_index = -1;
     // The SSA value arena (`model/declared/value_arena.hpp`): values an arm
     // asks for by id, over a workspace block. Reset once per fire; the ask
     // order is the op order, so a value keeps its address across fires of
@@ -934,26 +792,15 @@ void llama_like_forward_declared(
     declared::ValueArena values;
     values.reset(ws.declared_values.data(), ws.declared_values.nbytes(),
                  plan, N_fire, R_fire);
-    declared::DepthWindow depth(
-        declared::DepthFacts{
-            .stated = depth_stated,
-            .k = depth_k,
-            .union_fire = depth_union,
-            .split = depth_split,
-            .band_count = depth_banded
-                ? static_cast<std::uint32_t>(band_count) : 0u,
-            .band_k = plan_state.depth_band_k.data(),
-            .band_rows = plan_state.depth_band_rows.data(),
-        },
-        N_fire, R_fire);
     // The Peel split (A3): the hook-free prefix row count — the
     // hand-written `fast_rows` derivation verbatim. A runtime INPUT of
     // the stated Peel op, not a choice: with no hooks every row is the
     // prefix; the dispatch proved rows [0, fast_rows) belong to no
     // attention-stage program.
     const int fast_rows = stage_hooks == nullptr
-        ? R
-        : std::min(static_cast<int>(stage_hooks->hook_free_prefix_rows), R);
+        ? R_fire
+        : std::min(static_cast<int>(stage_hooks->hook_free_prefix_rows),
+                   R_fire);
     // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
     // it a silent fallback to the hand-written path would be
     // indistinguishable from a passing A/B run; fast_rows is what proves
@@ -962,7 +809,7 @@ void llama_like_forward_declared(
         std::fprintf(stderr,
                      "[declared-forward] N=%d R=%d decode=%d fast_rows=%d "
                      "mask=%d hooked=%d lora=%d ops=%zu\n",
-                     N, R, is_pure_decode ? 1 : 0, fast_rows,
+                     N_fire, R_fire, is_pure_decode ? 1 : 0, fast_rows,
                      custom_mask_d != nullptr ? 1 : 0,
                      stage_hooks != nullptr ? 1 : 0,
                      (lora != nullptr && lora->usable()) ? 1 : 0,
@@ -1001,7 +848,7 @@ void llama_like_forward_declared(
             : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
     if (has_lora && lora_staged == nullptr) {
-        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, /*tp=*/1, stream,
+        lora_state.emplace(*lora, cfg, N_fire, H, Hq, Hk, I, /*tp=*/1, stream,
                            ws,
                            post_norm ? static_cast<const void*>(ws.y.data())
                                      : static_cast<const void*>(
@@ -1011,7 +858,7 @@ void llama_like_forward_declared(
     if (has_lora && std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[lora-fire] declared R=%d lanes=%u grouping=%s%s\n",
-                     R, lora->count,
+                     R_fire, lora->count,
                      lora_staged != nullptr
                          ? lora_staged->grouping_desc().c_str()
                          : lora_state->grouping_desc().c_str(),
@@ -1068,7 +915,7 @@ void llama_like_forward_declared(
                 "launch_attention_xqa_decode_bf16_prepared") {
             ops::prepare_attention_xqa_decode_bf16(
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                R, cache.page_size(), plan_state.xqa_max_pages_per_seq,
+                R_fire, cache.page_size(), plan_state.xqa_max_pages_per_seq,
                 attn_ws, stream);
             break;
         }
@@ -1078,67 +925,42 @@ void llama_like_forward_declared(
     // swiglu kernel the following Swiglu op launches (the hand-written
     // `use_fused_gu` pairing).
     bool gate_up_used_fused = false;
-    // Guard skip STACK (A1): when a taken region ends, everything to the
-    // chain's end is dead and the walk jumps it. Guards NEST since the
-    // class-collapse amendment (the mask arm carries the write-mechanism
-    // guard), so pending skips stack — inner skips (pushed later) always
-    // end at or before their enclosing region's skip point, so popping
-    // in LIFO order at each index is exact.
-    std::vector<std::pair<std::size_t, std::size_t>> guard_skips;
-    // The Peel row window (A3): `{win_start, win_len}` over token rows,
-    // `{0, N}` outside peel regions. Region transitions are index
-    // events, the guard skips' peer; the windowed call forms below bind
-    // it (offset zero + full length is the identity).
-    int win_start = 0;
-    int win_len = N;
-    // Device-window mode (peel_window_d != nullptr, hook captures only):
-    // the walk emits BOTH Peel regions at full-N grids and the windowed
-    // call forms read the split from the device word — so the captured
-    // launches are split-independent and the hook fingerprint can drop
-    // the row split. The region marker tells each windowed site which
-    // face of the word it consumes (prefix = [0, w0), tail = {w0, w1}).
+    // WHICH FACE of a row split a launch serves. Two axes, never nested
+    // (the engine plans the mask split UNPLANNED for hooked fires), and
+    // both are now RECTANGLE properties rather than walk state — they
+    // arrive as `execute_op` parameters that these names shadow.
+    //
+    // `WinRegion` is the hook peel's, and only under device-window
+    // capture (`peel_window_d != nullptr`): both regions launch at
+    // full-N grids and the windowed call forms read the split from the
+    // device word, so the captured exec is split-independent and the
+    // hook fingerprint can drop the split. The marker says which face
+    // of the word a site consumes (prefix = [0, w0), tail = {w0, w1}).
+    //
+    // `MaskRegion` is the spatial split's (NS-4 in the IR): the
+    // attention call forms key their addressing on it. `None` outside
+    // such peels, and inside one at its UNPLANNED endpoint — the
+    // prepare kept the fire-level arm and the tail runs full-N.
     enum class WinRegion { Full, Prefix, Tail };
-    WinRegion win_region = WinRegion::Full;
-    struct WinEvent {
-        std::size_t at;
-        int start;
-        int len;
-        WinRegion region = WinRegion::Full;
-    };
-    std::vector<WinEvent> win_events;
-    // The UnmaskedPrefix peel's region marker (NS-4 in the IR): which
-    // face of the spatial mask split the current launch serves — the
-    // attention call forms below key their addressing on it. `None`
-    // outside such peels, and inside one at its UNPLANNED endpoint
-    // (prepare kept the fire-level arm; the tail runs full-N). A
-    // separate axis from win_region: the hook window and the mask
-    // split never nest (the engine plans UNPLANNED for hooked fires).
     enum class MaskRegion { None, Prefix, Tail };
-    MaskRegion mask_region = MaskRegion::None;
-    struct MaskEvent {
-        std::size_t at;
-        MaskRegion region;
-    };
-    std::vector<MaskEvent> mask_events;
-    // ── THE SHADOW (`.wiki/tart/dsl.md` migration step 6) ─────────
-    // `lower()` produces the flat launch list meant to replace this
-    // walk. Before the walk can be deleted, the two have to be shown to
-    // agree on real fires — so when armed, record which STATEMENTS this
-    // walk executes and compare against which statements the lowering
-    // produced rectangles for. Nothing here executes or suppresses
-    // anything; a disagreement is printed and the fire proceeds.
-    std::vector<std::uint32_t> shadow_ops;
-    const bool shadow = shadow_enabled();
-    if (shadow) shadow_ops.reserve(op_count);
+    const bool flat_trace = flat_trace_enabled();
 
-    // An observation SITE, as a function of one statement.
+    // An observation SITE, as a function of one statement and its rows.
     //
     // It launches no table kernel, which is why it has no rectangle —
     // and it still runs the guest programs, stages the score capture
     // and opens the page-mask bracket, which is why a form driven by
     // the list has to run it. `Lowered::structural` names the live
     // ones; this is what running one means.
-    const auto execute_site = [&](const PieForwardOp& op) {
+    //
+    // `N` is a PARAMETER for the same reason the arms' is. A site hands
+    // its programs `N` rows of the query buffer, and on a truncated
+    // fire the rows past the live count at this layer are frozen at
+    // whatever the last layer that owned them left behind. The list
+    // carries the window (`PieForwardSite::row_lo/row_hi`); reading a
+    // fire-wide count instead would show a banded fire's programs rows
+    // that stopped being theirs.
+    const auto execute_site = [&](const PieForwardOp& op, int N) {
         // A3: the sites live in the ONE body every unmasked fire
         // walks — a fire with no attached programs passes through
         // by argument, zero launches, zero sideband setup.
@@ -2239,12 +2061,10 @@ void llama_like_forward_declared(
             // other op's rectangle is in `Dim::Tokens`; the epilogue's
             // is in `Dim::Requests` (`lower()` emits it over the
             // SAMPLED rows). The number this arm wants is the height of
-            // `ws.y` — the fire's tokens — which `DepthWindow` hands
-            // the walk unchanged for an untagged op (`depth_role == 0`
-            // is never a tail op, so `n_ == n_fire_` here on every
-            // posture). Saying `N_fire` makes that provable at the
-            // point of use instead of leaving the drive to special-case
-            // one op kind.
+            // `ws.y` — the fire's tokens — and the epilogue is untagged
+            // by depth, so no window ever narrowed it. Saying `N_fire`
+            // makes that provable at the point of use instead of
+            // leaving the drive to special-case one op kind.
             const bool compact_logits =
                 logit_row_indices_d != nullptr && num_logit_rows > 0 &&
                 num_logit_rows < N_fire;
@@ -2280,38 +2100,48 @@ void llama_like_forward_declared(
         }
     };
 
-    // ── THE FLAT DRIVE (`.wiki/tart/dsl.md` cutover step 2b) ───────
+    // ── WHAT A DECLARED FIRE RUNS ──────────────────────────────────
     //
-    // THIS is what a declared fire runs (`PIE_DECLARED_FLAT=0` disarms
-    // it back onto the walk). The walk below decides what runs by
-    // TRAVERSING — guard chains, row peels, a depth window per op. This
-    // decides it by READING `lower()`'s list, which the shadow said was
-    // the same answer on every fire for two increments before the drive
-    // was written, and which has since carried every soak and census.
+    // Build the fire's rows, lower them, execute the list. That is the
+    // whole of it, and it is the shape `.wiki/tart/dsl.md` asked for: a
+    // loop with no vocabulary in it.
     //
-    // Nothing about the ARMS changes. Step 1 gave them the eight words
-    // they read about where they are; step 2a gave the list the sites
-    // it was missing. So this is only a different source for the same
-    // arguments, which is why it is a ~60-line block and not a rewrite:
+    // Until `.wiki/tart/dsl.md` cutover step 3 there was a second form
+    // below this one — a WALK that decided the same thing by traversing
+    // the region IR, with a guard-skip stack, peel and mask index
+    // events, and a depth window rebound per op. It is deleted. What
+    // stood in for it while it existed was the shadow comparison, which
+    // agreed on every fire for two increments before this drive was
+    // written and found three real defects doing so.
+    //
+    // Nothing about the ARMS changed across any of it. Step 1 gave them
+    // the words they read about where they are; step 2a gave the list
+    // the observation sites it was missing; this maps one onto the
+    // other:
     //
     //   win_start/win_len  the rectangle, directly
-    //   N                  its row count, with NO exception — the
-    //                      epilogue's rows are Dim::Requests, and its
-    //                      arm now names `N_fire` for the one thing it
-    //                      wanted from token space (the height of
-    //                      `ws.y`) instead of borrowing this parameter
-    //   R                  rows == N_fire ? R_fire : rows — the WALK's
-    //                      own rule (`depth_window.hpp` sets n_ and r_
-    //                      to the same live count whenever it narrows,
-    //                      and only the un-narrowed case distinguishes
-    //                      tokens from requests)
-    //   mask_region        the rectangle's peel
-    //   band index         the band whose row count this IS — the
-    //                      "prepared plan found by ROW COUNT" the whole
-    //                      design turns on, and the reason the walk's
-    //                      three-band ceiling has nothing to sit on
-    if (flat_enabled()) {
-        const std::vector<pie_forward::PieForwardRow> rows = shadow_rows(
+    //   win_region         which face of the hook split — and ONLY
+    //                      under device-window capture, where the
+    //                      rectangle is a full-window grid and the
+    //                      split is a device word
+    //   N                  the rectangle's row count, with NO
+    //                      exception: the epilogue's rows are
+    //                      Dim::Requests and its arm names `N_fire`
+    //                      itself for the one thing it wants from token
+    //                      space
+    //   R                  rows == N_fire ? R_fire : rows — narrowing
+    //                      makes tokens and requests the same live
+    //                      count, so only the un-narrowed case
+    //                      distinguishes them
+    //   mask_region        which face of the spatial split
+    //   band index         the band whose row count this IS. A prepared
+    //                      plan is found by ROW COUNT, which is why
+    //                      nothing here indexes bands and why the
+    //                      three-band ceiling has nothing left to sit
+    //                      on in this file (it survives in the PREPARE,
+    //                      which holds at most three plans).
+    {
+        const std::vector<pie_forward::PieForwardRow> rows = fire_rows(
             N_fire, fast_rows, depth_k, depth_split, depth_union,
             plan_state.depth_band_k.data(), plan_state.depth_band_rows.data(),
             depth_banded ? static_cast<std::size_t>(band_count) : 0,
@@ -2352,14 +2182,17 @@ void llama_like_forward_declared(
             const bool site_first =
                 at >= flat.launches_len ||
                 (next_site < flat.structural_len &&
-                 flat.structural[next_site] < flat.launches[at].at_op);
+                 flat.structural[next_site].at_op < flat.launches[at].at_op);
             if (site_first) {
+                const pie_forward::PieForwardSite& S =
+                    flat.structural[next_site];
                 // The arena advances with the STATEMENT, whichever form
                 // is driving: slots whose value was last read before
                 // this op return to the free list, and skipping that is
                 // how a bump arena runs out of block on the first fire.
-                values.begin_op(flat.structural[next_site]);
-                execute_site(plan.op(flat.structural[next_site]));
+                values.begin_op(S.at_op);
+                execute_site(plan.op(S.at_op),
+                             static_cast<int>(S.row_hi - S.row_lo));
                 ++next_site;
                 continue;
             }
@@ -2421,12 +2254,12 @@ void llama_like_forward_declared(
                        band_of(live),
                        /*depth_tail_active=*/depth_union && live == depth_split);
         }
-        if (shadow) {
+        if (flat_trace) {
             // `devwin` counts the rectangles whose rows are a GRID and
             // whose split is a device word. It is here because the
-            // capture bug below was invisible without it: the probe that
-            // proves the fix needs to show the path was taken at all,
-            // and no other output says so.
+            // capture defect (step 2e) was invisible without it: a probe
+            // that never takes the path passes either way, so proving a
+            // fix needs the count as much as the text.
             std::size_t devwin = 0;
             for (std::size_t j = 0; j < flat.launches_len; ++j) {
                 if (flat.launches[j].rows_device != 0) ++devwin;
@@ -2436,290 +2269,10 @@ void llama_like_forward_declared(
                          rows.size(), flat.launches_len, flat.structural_len,
                          devwin);
         }
-        return;
-    }
-
-
-    for (std::size_t i = 0; i < op_count; ++i) {
-        for (;;) {
-            if (!guard_skips.empty() && i == guard_skips.back().first) {
-                i += guard_skips.back().second;
-                guard_skips.pop_back();
-                continue;
-            }
-            if (!win_events.empty() && i == win_events.back().at) {
-                win_start = win_events.back().start;
-                win_len = win_events.back().len;
-                win_region = win_events.back().region;
-                win_events.pop_back();
-                continue;
-            }
-            if (!mask_events.empty() && i == mask_events.back().at) {
-                mask_region = mask_events.back().region;
-                mask_events.pop_back();
-                continue;
-            }
-            break;
-        }
-        if (i >= op_count) break;
-        const PieForwardOp& op = plan.op(i);
-        values.begin_op(i);
-        // STRUCTURAL S-4: the depth window, per op, keyed on the op's
-        // OWN layer tag (the declaration's stated axis — the trace is
-        // layer-unrolled while k is a runtime input, so the window is a
-        // per-op rebind, not a region op). Uniform truncated fire:
-        // tail-layer ops are SKIPPED (the unchanged epilogue, layer -1,
-        // is the logit-lens head). Union fire: tail-layer ops run over
-        // the full-depth prefix rows.
-        // The window is `model/declared/depth_window.hpp`'s — it reads the
-        // op's STATED role and the prepare's bands, so it is the same
-        // component for every family (this one carried it because the
-        // depth axis landed here first).
-        if (!depth.enter(op)) continue;
-        if (shadow) shadow_ops.push_back(static_cast<std::uint32_t>(i));
-        N = depth.n();
-        R = depth.r();
-        depth_band_index = depth.band_index();
-        depth_tail_active = depth.tail_active();
-        switch (op.kind) {
-        case PieForwardOpKind::Peel: {
-            // A3: both regions run, over complementary row ranges —
-            // prefix `[0, fast_rows)`, tail `[fast_rows, N)`. An empty
-            // range skips its region's launches, exactly the
-            // hand-written `fast_rows > 0` / `unfused_tail_rows > 0`
-            // gates: fast_rows == N is the classic all-fused fire,
-            // 0 the all-hooked one, anything between the mixed fire.
-            const std::size_t prefix_len = op.param0;
-            const std::size_t tail_len = op.param1;
-            const std::size_t tail_start = i + 1 + prefix_len;
-            const std::size_t end = tail_start + tail_len;
-            {
-                // The peel's AXIS rides the aux run (PeelWindow):
-                // empty = the hook-free prefix (fast_rows, below),
-                // [1] = the unmasked prefix — the spatial mask split,
-                // NS-4 stated in the IR. The mask axis never touches
-                // the win_start/len machinery (that word is the hook
-                // axis's): it only marks regions, and the attention
-                // call forms key their addressing on the marker.
-                const auto aux = plan.aux_names(op);
-                if (aux.size >= 1 && aux[0] == 1) {
-                    const bool planned =
-                        plan_state.spatial_mask_split >= 0 &&
-                        unmasked_prefix_rows != 0xffffffffu;
-                    if (!planned) {
-                        // The UNPLANNED endpoint: the tail region IS
-                        // the fire-level custom dispatch, full-N.
-                        mask_region = MaskRegion::None;
-                        i = tail_start - 1;  // skip the prefix region
-                        break;
-                    }
-                    if (plan_state.spatial_mask_split !=
-                        static_cast<int>(unmasked_prefix_rows)) {
-                        throw std::runtime_error(
-                            "spatial mask: the planned split and the "
-                            "prepared split drifted");
-                    }
-                    if (plan_state.use_xqa_decode) {
-                        throw std::runtime_error(
-                            "spatial mask: the XQA prefix is not wired "
-                            "(its fire-wide prepare is R-shaped)");
-                    }
-                    if (mask_suffix_qo_indptr_d == nullptr) {
-                        throw std::runtime_error(
-                            "spatial mask: suffix qo identity missing");
-                    }
-                    mask_events.push_back({end, MaskRegion::None});
-                    if (plan_state.spatial_mask_split > 0) {
-                        mask_events.push_back(
-                            {tail_start, MaskRegion::Tail});
-                        mask_region = MaskRegion::Prefix;
-                    } else {
-                        // The all-masked composed fire: no prefix.
-                        mask_region = MaskRegion::Tail;
-                        i = tail_start - 1;
-                    }
-                    break;
-                }
-            }
-            if (peel_window_d != nullptr) {
-                // Device-window capture: BOTH regions are emitted — an
-                // empty region's kernels launch and early-out on the
-                // device word, so the captured exec replays across
-                // splits. No host skips, no host windows.
-                win_events.push_back({end, 0, N, WinRegion::Full});
-                win_events.push_back({tail_start, 0, N, WinRegion::Tail});
-                win_region = WinRegion::Prefix;
-                break;
-            }
-            const int tail_rows = N - fast_rows;
-            win_events.push_back({end, 0, N, WinRegion::Full});
-            if (fast_rows > 0) {
-                win_start = 0;
-                win_len = fast_rows;
-                if (tail_rows > 0) {
-                    win_events.push_back(
-                        {tail_start, fast_rows, tail_rows, WinRegion::Full});
-                } else {
-                    guard_skips.emplace_back(tail_start, tail_len);
-                }
-                // the loop's ++i lands on the prefix region
-            } else {
-                win_start = 0;
-                win_len = N;
-                i = tail_start - 1;  // skip the empty prefix region
-            }
-            break;
-        }
-        case PieForwardOpKind::HookSite:
-            execute_site(op);
-            break;
-        case PieForwardOpKind::Guard: {
-            // The one branch a class trace carries — a CHAIN of arms over
-            // runtime inputs (closed predicate vocabulary,
-            // `PieForwardGuardPred`): param0 = arm count, aux run =
-            // [pred kind, payload, region len] per arm + trailing
-            // else-region len. Evaluate arms in order, run the first that
-            // holds (or the else), jump everything dead.
-            const auto aux = plan.aux_names(op);
-            const std::uint32_t n_arms = op.param0;
-            if (aux.size != static_cast<std::size_t>(n_arms) * 3 + 1) {
-                throw std::runtime_error(
-                    "declared forward: Guard aux run has " +
-                    std::to_string(aux.size) + " entries for " +
-                    std::to_string(n_arms) + " arms");
-            }
-            const auto pred_holds = [&](std::uint32_t kind,
-                                        std::uint32_t payload) -> bool {
-                switch (kind) {
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::HasWriteDesc):
-                    return has_write_desc;
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::TokensLE):
-                    return N <= static_cast<int>(payload);
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::TokensGT):
-                    return N > static_cast<int>(payload);
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::WantsAttnScore):
-                    return stage_hooks != nullptr &&
-                           stage_hooks->wants_attn_score;
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::HasCustomMask):
-                    // A1 (the class-collapse amendment): the mask arm
-                    // of the decode/prefill traces.
-                    return custom_mask_d != nullptr;
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::HasStageHooks):
-                    // A2: the hooked arm (retired vocabulary since A3;
-                    // kept for any trace that still states it).
-                    return stage_hooks != nullptr;
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::HasLora):
-                    // The §5.1 correction arm: usable lora lanes take the
-                    // general sequence + the correction pseudo-symbol.
-                    return has_lora;
-                default:
-                    throw std::runtime_error(
-                        "declared forward: guard predicate kind " +
-                        std::to_string(kind) +
-                        " is not in this executor's vocabulary");
-                }
-            };
-            // Region layout: arm regions in order, then the else region.
-            std::size_t chosen_start = SIZE_MAX;
-            std::uint32_t chosen_len = 0;
-            std::size_t cursor = i + 1;
-            for (std::uint32_t a = 0; a < n_arms; ++a) {
-                const std::uint32_t len = aux[a * 3 + 2];
-                if (chosen_start == SIZE_MAX &&
-                    pred_holds(aux[a * 3], aux[a * 3 + 1])) {
-                    chosen_start = cursor;
-                    chosen_len = len;
-                }
-                cursor += len;
-            }
-            const std::uint32_t else_len = aux[n_arms * 3];
-            if (chosen_start == SIZE_MAX) {
-                chosen_start = cursor;
-                chosen_len = else_len;
-            }
-            const std::size_t total_end = cursor + else_len;
-            // Jump to the chosen region; when it ends, jump to total_end
-            // (stacked, so a nested guard inside the region composes).
-            guard_skips.emplace_back(chosen_start + chosen_len,
-                                     total_end - (chosen_start + chosen_len));
-            i = chosen_start - 1;  // the loop's ++i lands on the region
-            break;
-        }
-        default:
-            // Not a traversal statement, so it is one the arms serve.
-            execute_op(op, N, R, win_start, win_len, win_region,
-                       mask_region, depth_band_index, depth_tail_active);
-            break;
-        }
-    }
-    if (shadow) {
-        // After the walk, so `fast_rows` and the depth split are the
-        // ones it actually used. Diagnostic only: a throw here would
-        // make an observation into an outage.
-        try {
-            shadow_report(
-                plan, shadow_ops,
-                shadow_rows(
-                    N_fire, fast_rows, depth_k, depth_split, depth_union,
-                    plan_state.depth_band_k.data(),
-                    plan_state.depth_band_rows.data(),
-                    // `depth_banded ? band_count : 0` — the SAME word
-                    // the walk's window reads. The band arrays are
-                    // fixed-capacity, so their `size()` says 3 on a fire
-                    // that is not banded at all; reading it cost one
-                    // wrong diagnosis before this line said so.
-                    depth_banded ? static_cast<std::size_t>(band_count) : 0,
-                    // The split the WALK used, which is the PREPARED
-                    // one: the engine plans `unmasked_prefix_rows` and
-                    // the driver may decline (a prefill fire is not a
-                    // spatial-mask fire), in which case the peel takes
-                    // its UNPLANNED endpoint and the tail runs full-N.
-                    // Reading the engine's word instead of the walk's
-                    // made the lowering split fires the walk did not —
-                    // the same mistake as reading the band arrays'
-                    // `size()`, and worth naming twice.
-                    (custom_mask_d != nullptr &&
-                     unmasked_prefix_rows != 0xffffffffu &&
-                     plan_state.spatial_mask_split >= 0)
-                        ? plan_state.spatial_mask_split
-                        : -1,
-                    custom_mask_d != nullptr,
-                    lora != nullptr && lora->usable(),
-                    has_write_desc,
-                    stage_hooks != nullptr &&
-                        stage_hooks->wants_attn_score,
-                    logit_row_indices_d, num_logit_rows),
-                ShadowShape{
-                    N_fire, fast_rows,
-                    // The split the WALK used, which is the PREPARED
-                    // one: the engine plans `unmasked_prefix_rows` and
-                    // the driver may decline (a prefill fire is not a
-                    // spatial-mask fire), in which case the peel takes
-                    // its UNPLANNED endpoint and the tail runs full-N.
-                    // Reading the engine's word instead of the walk's
-                    // made the lowering split fires the walk did not —
-                    // the same mistake as reading the band arrays'
-                    // `size()`, and worth naming twice.
-                    (custom_mask_d != nullptr &&
-                     unmasked_prefix_rows != 0xffffffffu &&
-                     plan_state.spatial_mask_split >= 0)
-                        ? plan_state.spatial_mask_split
-                        : -1,
-                    depth_k, depth_split, depth_union,
-                    depth_banded ? band_count : 0,
-                    peel_window_d != nullptr});
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "[shadow] refused: %s\n", e.what());
-        }
     }
 }
+
+
 
 
 bool llama_like_supergraph_supported(const LlamaLikeDeclaredPlan& declared) {

@@ -645,6 +645,22 @@ pub struct PieForwardLaunch {
     pub _pad: u8,
 }
 
+/// One STRUCTURAL statement: where it sits, and the rows it brackets.
+///
+/// The rows are why this is a struct rather than an index. A site hands
+/// an observation program `row_hi - row_lo` rows of the query buffer,
+/// and past the live count those rows are frozen at whatever the last
+/// layer that owned them left behind — so a truncated fire's site needs
+/// its window for the same reason its launches do.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PieForwardSite {
+    pub at_op: u32,
+    pub row_lo: u32,
+    pub row_hi: u32,
+    pub _pad: u32,
+}
+
 /// What [`crate::lower::Uncovered`] crosses as: zero is a lowering, and
 /// every other value is a group that should not have been formed.
 #[repr(u32)]
@@ -669,11 +685,11 @@ pub struct PieForwardLowered {
     pub kernel_names: *const PieForwardName,
     pub kernel_names_len: usize,
     pub kernel_name_bytes: PieForwardBytes,
-    /// The STRUCTURAL statements inside live regions, in walk order —
-    /// op indices. A site launches no table kernel, so it has no
-    /// rectangle, but it runs guest programs and brackets a layer's
-    /// sideband; a form driven by this list runs these and only these.
-    pub structural: *const u32,
+    /// The STRUCTURAL statements inside live regions, in walk order. A
+    /// site launches no table kernel, so it has no rectangle, but it
+    /// runs guest programs and brackets a layer's sideband; a form
+    /// driven by this list runs these and only these.
+    pub structural: *const PieForwardSite,
     pub structural_len: usize,
     /// Peak activation bytes the frame would need.
     pub arena_bytes: usize,
