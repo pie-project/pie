@@ -45,30 +45,29 @@ async fn main(input: String) -> Result<String> {
         let page = rs.buffer_page_size().max(1);
         let pages = (steps as u32 + 1).div_ceil(page) + 1;
         rs.alloc_buffer(pages)
-            .map_err(|e| format!("alloc_buffer({pages}): {e}"))?;
+            .with_context(|| format!("alloc_buffer({pages})"))?;
         pages
     } else {
         0
     };
 
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     let prompt = wit_model::encode(PROMPT);
     let n = prompt.len() as u32;
     let max_pages = (n + steps as u32 + 1).div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // ── Prefill. Folds, in BOTH arms: a buffer that starts out holding the
     // whole prompt would price the prompt, not the decode.
-    let toks_p = Channel::from(prompt.iter().map(|&t| t as i32).collect::<Vec<_>>());
-    let embed_indptr_p = Channel::from(vec![0u32, n]);
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>());
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>());
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]);
-    let w_slot_p = Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>());
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>());
+    let toks_p = Channel::from_iter(prompt.iter().map(|&t| t as i32));
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let positions_p = Channel::from_iter(0..n);
+    let pages_p = Channel::from_iter(0..max_pages);
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]);
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size));
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size));
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
     // Created BEFORE the prefill so the prefill epilogue can seed it on the
     // DEVICE. That is what lets a decode fire ride in the same frame as the
@@ -77,20 +76,28 @@ async fn main(input: String) -> Result<String> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]);
+    let kv_len_p = Channel::from([n]);
     fwd_p.attention(
-        &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: None,
+            },
+        }),
+        std::slice::from_ref(&rs),
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
+        },
     )?;
-    fwd_p.recurrent(std::slice::from_ref(&rs))?;
     let tok_in_p = tok_in.clone();
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
@@ -110,48 +117,68 @@ async fn main(input: String) -> Result<String> {
     let out = Channel::new([1], dtype::i32)
         .capacity(capacity as u32)
         .named("out");
-    let lane1 = Channel::from(vec![0u32, 1u32]);
-    let positions = Channel::from(vec![n]);
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>());
-    let page_indptr = Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]);
-    let w_slot = Channel::from(vec![n / page_size]);
-    let w_off = Channel::from(vec![n % page_size]);
+    let lane1 = Channel::from([0u32, 1u32]);
+    let positions = Channel::from([n]);
+    let pages = Channel::from_iter(0..max_pages);
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]);
+    let w_slot = Channel::from([n / page_size]);
+    let w_off = Channel::from([n % page_size]);
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
-    let kv_len = Channel::from(vec![n + 1]);
-    fwd.attention(
-        &ws,
-        ..,
-        (n / page_size)..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
-    )?;
-    // THE ONLY DIFFERENCE BETWEEN THE ARMS.
-    let fold_len = Channel::from(vec![0u32]).named("fold_len");
+    let kv_len = Channel::from([n + 1]);
+    let kv = || {
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
+        })
+    };
+    // THE ONLY DIFFERENCE BETWEEN THE ARMS: the RS geometry. The KV half and
+    // the working sets are identical, so only `RsGeometry` is written twice —
+    // its `buffer` type differs per arm, so the two cannot share a binding.
+    let fold_len = Channel::from([0u32]).named("fold_len");
+    let rs_ws = std::slice::from_ref(&rs);
     match mode {
-        Mode::Fold => fwd.recurrent(std::slice::from_ref(&rs))?,
+        Mode::Fold => fwd.attention(
+            kv(),
+            rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
+        )?,
         Mode::Buffer => fwd
-            .recurrent_with(std::slice::from_ref(&rs), &fold_len, ..)
-            .map_err(|e| format!("buffered recurrent binding: {e}"))?,
+            .attention(
+                kv(),
+                rs_ws,
+                RsGeometry {
+                    fold_len: Some(&fold_len),
+                    buffer: ..,
+                },
+            )
+            .context("buffered recurrent binding")?,
     }
     fwd.epilogue(move || {
-        let length = kv_len.take().tensor();
+        let length = kv_len.take();
         let t = reduce_argmax(intrinsics::logits());
-        let next_length = add(&length, 1u32);
-        let page_count = div(add(&next_length, page_size - 1), page_size);
+        let next_length = &length + 1u32;
+        let page_count = next_length.div_ceil(page_size);
         tok_in.put(&t);
         kv_len.put(&next_length);
         positions.put(&length);
-        w_slot.put(div(&length, page_size));
-        w_off.put(rem(&length, page_size));
-        page_indptr.take();
-        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        w_slot.put(&length / page_size);
+        w_off.put(&length % page_size);
+        page_indptr.put(indptr(1, &page_count));
         out.put(&t);
     });
 
@@ -160,17 +187,12 @@ async fn main(input: String) -> Result<String> {
     // run-ahead scheduler uses and the one that fails on a linear model.
     let mut submitted = 0usize;
     if coframe {
-        submit_frame(&pipe, &[Some(&fwd_p), Some(&fwd)])
-            .map_err(|e| format!("first frame submit: {e}"))?;
+        submit_frame(&pipe, &[Some(&fwd_p), Some(&fwd)]).context("first frame submit")?;
         submitted = 1;
     } else {
-        fwd_p.submit(&pipe).map_err(|e| format!("prefill: {e}"))?;
+        fwd_p.submit(&pipe).context("prefill")?;
     }
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    let g0 = g0_ch.take_host::<i32>().await?;
     let mut generated: Vec<u32> = vec![g0 as u32];
 
     // Timed region: every decode fire, and nothing else. Allocation and
@@ -178,18 +200,14 @@ async fn main(input: String) -> Result<String> {
     let fires = steps - 1;
     let clock = std::time::Instant::now();
     while submitted < fires.min(window) {
-        fwd.submit(&pipe).map_err(|e| format!("decode: {e}"))?;
+        fwd.submit(&pipe).context("decode")?;
         submitted += 1;
     }
     for _ in 0..fires {
-        let t = out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("out take: {e}"))?[0];
+        let t = out.take_host::<i32>().await?;
         generated.push(t as u32);
         if submitted < fires {
-            fwd.submit(&pipe).map_err(|e| format!("decode: {e}"))?;
+            fwd.submit(&pipe).context("decode")?;
             submitted += 1;
         }
     }

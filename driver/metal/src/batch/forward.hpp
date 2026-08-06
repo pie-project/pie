@@ -47,12 +47,12 @@ struct StepTiming;
 class StepEncoder;
 class RawMetalContext;
 struct SlotHandle;
+struct WeightBytes;
 
 }  // namespace pie::metal
 
 namespace pie::metal::batch {
 
-struct NativeAccess;
 
 // One member's forward request for this fire: the NEW tokens/positions this
 // fire adds (prefill chunk or a single decode token — never the full
@@ -117,6 +117,11 @@ struct MemberForwardDesc {
     std::uint32_t query_len = 0;
     std::uint32_t key_len = 0;
     std::uint32_t kv_len = 0;
+    // Prefer the device's exact greedy token for every readout row and skip
+    // full-logits staging when the family supports it. Other families retain
+    // the existing logits path, so this is an optimization request, not a
+    // capability requirement.
+    bool greedy_token_only = false;
 };
 
 // f32 logits materialized for this fire's readout rows, in
@@ -133,6 +138,10 @@ struct LogitsOut {
     std::uint64_t device_gpu_address = 0;
     std::uint64_t device_bytes = 0;
     std::uint32_t device_row_offset = 0;
+    // Optional Shared-storage device-greedy result. Valid until the next fire,
+    // like the logits view; `greedy_row_offset` selects this member's rows.
+    const std::uint32_t* greedy_contents = nullptr;
+    std::uint32_t greedy_row_offset = 0;
 };
 
 struct PtirCommandCallbacks {
@@ -184,6 +193,49 @@ bool validate_request_local_positions(
 // fixed this bound is also a floor on usable concurrency.
 inline constexpr std::uint32_t kPhase1bRsSlots = 64;
 inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
+
+/// What the recurrent-state slots are allowed to cost, in bytes.
+///
+/// Sixty-four slots was a COUNT, chosen where a slot was 21 MB and sixty-four
+/// of them 1.37 GB. A slot's size is the model's, not a constant: at forty
+/// layers, thirty-two value heads and a 128-wide state, one slot is 67 MiB and
+/// sixty-four are 4.3 GiB -- which is what stood between Qwen3.5-35B-A3B and a
+/// machine that would otherwise have held it. So the BUDGET is the constant,
+/// because it is the thing that was actually being chosen, and the count is
+/// derived from what a slot costs for the checkpoint in hand.
+inline constexpr std::uint64_t kRsSlotBudgetBytes = 1536ull << 20;
+
+/// Bytes one recurrent-state slot costs for this geometry: conv in, conv out
+/// and the recurrent state, for every GDN layer.
+///
+/// The same formula as `MetalExecutor::rs_slot_bytes()`, which needs a live
+/// executor and so cannot answer before setup -- and answering before setup is
+/// the whole point. Kept beside the slot count it feeds.
+std::uint64_t rs_slot_bytes_for(const DecodeGeometry& g);
+
+/// The recurrent-state budget for THIS device: the constant above, or a tenth
+/// of the device's recommended working set, whichever is larger.
+///
+/// A fleet constant chosen on a 32 GiB M1 Max buys nine slots of Qwen3.6-27B's
+/// 170 MiB state, and the slot count is a hard concurrency ceiling -- the tenth
+/// request fails the planner with "every RS folded slot is held" rather than
+/// queueing. A 48 GiB M4 Pro has the memory for twenty-two and no way to say
+/// so. A tenth of the recommended working set leaves the M1 Max where the
+/// constant put it and gives the M4 Pro 3.74 GiB.
+std::uint64_t rs_slot_budget_bytes();
+
+/// How many slots to reserve: as many as the budget buys, never more than
+/// `kPhase1bRsSlots`, and never more than `requested_slots`.
+///
+/// `requested_slots` is a CEILING. It used to be a floor, which made
+/// `budget_bytes` decorative -- see the definition for what that cost.
+///
+/// ONE function, called by the capabilities pass and by setup, because a
+/// capability advertising more slots than setup allocates is a request the
+/// driver accepts and cannot hold -- the same rule, and the same reason, as
+/// `simple_family_max_forward_tokens`.
+std::uint32_t rs_slots_for_budget(const DecodeGeometry& g, std::uint64_t budget_bytes,
+                                  std::uint32_t requested_slots);
 
 // Tokens the resident KV/GDN ring holds, across the WHOLE fleet -- it is one
 // linear ring, not a per-request allocation, so the whole fleet shares it. At
@@ -295,8 +347,8 @@ inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)
     std::string kernels_dir;     // compiled .metal library search dir
-    std::string arch_name;       // read_model_facts() arch, for a truthful early reject
-    std::uint32_t vocab_size = 0;      // config.json vocab_size, cross-checked vs the shipped geometry
+    std::string arch_name;       // descriptor `model_type`, for a truthful early reject
+    std::uint32_t vocab_size = 0;      // descriptor vocab_size, cross-checked vs the shipped geometry
     bool has_linear_attn = false;      // config-derived GDN/hybrid signal (qwen3.6 requires this)
     // Phase 1b/3 paged-KV bridge: the runtime's configured pool capacity
     // (cfg.batching.total_pages/kv_page_size) — MetalExecutor::setup()
@@ -311,6 +363,11 @@ struct SetupConfig {
     // itself, because only the driver knows the device
     // (`loader/architecture.md` §3).
     std::string snapshot_dir;
+    // The `pie.model/1` document this boot was handed, verbatim — what the
+    // compile request carries. Forwarded rather than distilled: the fields the
+    // authors read are decided beside the authors (`ModelFacts::from_descriptor`),
+    // so a fact nobody here has heard of still reaches them.
+    std::string descriptor_json;
     // Page this model's routed experts in from a mapping instead of keeping
     // them resident in the heap.
     //
@@ -320,9 +377,28 @@ struct SetupConfig {
     // `PIE_METAL_STREAM_EXPERTS` here, which meant setting the config on a
     // Metal backend did nothing and said nothing.
     bool stream_routed_experts = false;
+    /// How many bytes the routed experts may occupy on the device. Zero means
+    /// the whole bank stays resident, which is what every model that fits
+    /// should do.
+    ///
+    /// Non-zero is the only setting under which a model can exceed the
+    /// machine, and it is a different mechanism from `stream_routed_experts`
+    /// rather than a stronger version of it: streaming maps the bank and every
+    /// mapped page is WIRED, so it bounds nothing. A budget turns mapping off
+    /// and pages the experts through a slab of this size instead, which costs
+    /// a submit-and-wait per mixture layer. Set it only when the alternative
+    /// is not running at all.
+    std::uint64_t expert_slab_bytes = 0;
     // Which storage schema to author against. It selects a contract on this
     // side of the loader call and never crosses it (§10.4).
     std::string model_type;
+
+    /// `config.json`'s `quantization` block. Not per-family, because it
+    /// describes the FILE and not the architecture -- and not recoverable from
+    /// the tensors, because 8 bits in groups of 64 and 4 bits in groups of 128
+    /// pack identically. Zero means the config declared none.
+    int quant_bits = 0;
+    int quant_group_size = 0;
     /// Gemma 4's shape, when `model_type` says so. Zero means "not gemma4", so
     /// a config that never mentions this family cannot accidentally select it.
     struct Gemma4Facts {
@@ -342,6 +418,15 @@ struct SetupConfig {
         float rope_theta_full = 1.0e6f;
         float rope_theta_sliding = 1.0e4f;
         float full_partial_rotary = 0.25f;
+        // The mixture, and the k-eq-V attention that comes with it on the 26B.
+        // Zero and false on every dense member, which is how the geometry tells
+        // a dense gemma 4 from a routed one.
+        bool enable_moe = false;
+        int n_experts = 0;
+        int experts_per_token = 0;
+        int moe_intermediate = 0;
+        bool attention_k_eq_v = false;
+        int n_global_kv_heads = 0;
         bool present() const { return n_layers > 0 && hidden > 0; }
     } gemma4;
     /// GPT-OSS's shape, when `model_type` says so. Zero means "not gpt-oss",
@@ -367,6 +452,96 @@ struct SetupConfig {
         float rope_beta_slow = 1.0f;
         bool present() const { return n_layers > 0 && hidden > 0; }
     } gptoss;
+    /// The llama-shaped families' shape, when `model_type` says so. Zero means
+    /// "not one of them", on the same principle as the two above.
+    ///
+    /// One struct for `llama`, `llama3`, `mistral`, `qwen2`, `qwen3`,
+    /// `qwen2_moe` and `qwen3_moe`, because those differ in two FIELDS and not
+    /// in shape: whether q and k are normed, and whether the FFN is routed.
+    /// Splitting them would be seven copies of the same fifteen integers.
+    struct LlamaFacts {
+        int n_layers = 0;
+        int hidden = 0;
+        int vocab = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;
+        int intermediate = 0;
+        int n_experts = 0;
+        int experts_per_token = 0;
+        int moe_intermediate = 0;
+        float eps = 1e-5f;
+        float rope_theta = 500000.0f;
+        float rope_scale = 1.0f;
+        /// `rope_scaling.rope_type`, verbatim. Empty or "linear"/"default" is
+        /// implemented; anything else -- Llama 3.1's piecewise schedule above
+        /// all -- is REFUSED by the geometry rather than approximated by
+        /// `rope_scale`, which runs and is wrong past the original context.
+        std::string rope_scaling_kind;
+        /// Llama 3.1's three extra knobs. `rope_scale` carries its `factor`.
+        float rope_low_freq_factor = 1.0f;
+        float rope_high_freq_factor = 4.0f;
+        int rope_original_max_position = 8192;
+        /// Set when the checkpoint ships `self_attn.q_norm`. A config fact
+        /// rather than a model_type one: `qwen3` has it and `qwen2` does not,
+        /// and both are this family.
+        bool qk_norm = false;
+        bool tied_embeddings = true;
+        /// `norm_topk_prob`. True means the routing weights are renormalized
+        /// over the selected experts, which is what `router_topk` computes.
+        /// Defaults to true because a config that omits it (Mixtral, gpt-oss)
+        /// means it; only an explicit false is a model this driver refuses.
+        bool norm_topk_prob = true;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } llama;
+
+    /// Qwen3.5 / Qwen3-Next: the GDN hybrid's shape.
+    ///
+    /// This family used to have no facts at all. Its `DecodeGeometry` was
+    /// default-constructed and the defaults were one preview checkpoint's
+    /// dimensions, so the driver ran that checkpoint and mis-ran every other
+    /// one -- silently, because nothing in the path ever compared a config
+    /// against what it was about to execute.
+    struct Qwen35Facts {
+        int n_layers = 0;
+        int hidden = 0;
+        int vocab = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;
+        int intermediate = 0;
+        /// The linear-attention block's head counts and dims. The convolution
+        /// width and the value total are derived from them by the geometry.
+        int gdn_k_heads = 0;
+        int gdn_v_heads = 0;
+        int gdn_k_dim = 0;
+        int gdn_v_dim = 0;
+        int gdn_conv_k = 0;
+        /// One full-attention layer every `interval`. -1 means the config
+        /// listed an irregular pattern, which the geometry refuses.
+        int full_attn_interval = 0;
+        int n_experts = 0;
+        int experts_per_token = 0;
+        int moe_intermediate = 0;
+        int shared_expert_intermediate = 0;
+        int decoder_sparse_step = 1;
+        int mlp_only_layer_count = 0;
+        float eps = 1e-6f;
+        bool tied_embeddings = true;
+        bool norm_topk_prob = true;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } qwen35;
+
+    /// How many tokens the KV ring must hold, across ALL resident requests.
+    ///
+    /// Zero means `kMetalMaxCtxTokens`: a ring sized for a full fleet, which is
+    /// what `pie serve` wants and what every caller got when this was a
+    /// constant. It stopped being affordable as a constant. The ring does not
+    /// scale with the model, so at 48 layers it is 13 GiB of KV whatever the
+    /// weights are -- fine beside a 405 MB checkpoint, and the difference
+    /// between running and not beside a 17 GiB one. A caller that knows it
+    /// drives ONE sequence should not pay for sixty-four.
+    std::uint32_t max_ctx_tokens = 0;
     // `config.json`'s RoPE hyperparameters, read out of the nested
     // `rope_parameters` object this family uses (context.cpp). The defaults
     // below are Qwen3.5's, so a checkpoint that omits them still lands on the
@@ -532,6 +707,11 @@ class MetalExecutor {
     bool ready() const;
     std::uint32_t vocab() const;
 
+    /// Resident weight bytes, and how many of them one decoded token reads.
+    /// A fact about the heap, not a formula over a config -- see
+    /// `weight_bytes` in `loader/heap_bind_metal.hpp`.
+    WeightBytes weight_bytes() const;
+
     // One member's forward for this fire: validates the Phase 1a linear-
     // sequence contract, advances the resident decoder (reset+replay for a
     // fresh sequence, or an incremental `step()` run for a continuation),
@@ -635,40 +815,6 @@ class MetalExecutor {
         std::string* err);
 
   private:
-    friend struct NativeAccess;
-
-    bool setup_native(
-        const std::string& checkpoint_dir,
-        const std::string& kernels_dir,
-        const ::pie::metal::DecodeGeometry& geometry,
-        std::string* error);
-    bool setup_kv_pool_native(
-        std::uint32_t total_pages,
-        std::uint32_t page_size,
-        std::string* error);
-    void reset_state_native();
-    void reset_state_native(std::uint32_t slot);
-    bool copy_state_slot_native(
-        std::uint32_t src_slot,
-        std::uint32_t dst_slot,
-        std::string* error);
-    ::pie::metal::StepTiming step_native(
-        std::uint32_t token_id,
-        std::uint32_t position,
-        std::uint32_t slot);
-    bool run_batch_step_native(
-        const ::pie::metal::BatchSchedule& schedule,
-        const ::pie::metal::BatchStepInputs& inputs,
-        std::string* error);
-    std::uint64_t paged_bind_generation_native() const;
-    const ::pie::metal::KvPagePool& kv_pool_native() const;
-    int vocab_native() const;
-    void copy_logits_f32_native(float* output) const;
-    void copy_batch_logits_f32_native(
-        std::uint32_t token_row,
-        float* output) const;
-    std::uint32_t argmax_native() const;
-
     // Shared body of `forward` (single member) and `forward_batch` (one member
     // at a time, in the scheduled order). `batch_serialized` = true forces the
     // cross-sequence "another sequence is ring-backed" gate OFF: within a batch

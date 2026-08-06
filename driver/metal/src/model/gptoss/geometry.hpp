@@ -27,6 +27,8 @@
 #include <cstddef>
 #include <string>
 
+#include "../shared_kernels.hpp"
+
 namespace pie::metal::gptoss {
 
 struct GptOssGeometry {
@@ -65,10 +67,7 @@ struct GptOssGeometry {
     float swiglu_limit = 7.0f;
     float swiglu_alpha = 1.702f;
 
-    int q_group = 64;
-    int q_bits = 4;
-
-    /// The router's quantization width, which is NOT `q_bits`: `mlx_lm`'s
+    /// The router's quantization width, which is NOT the bank's: `mlx_lm`'s
     /// quantization predicate leaves a 32 x 2880 router at 8 bits while
     /// everything around it goes to 4, but a checkpoint quantized uniformly
     /// ships a 4-bit one. Nothing in `config.json` says which, so this is
@@ -77,6 +76,28 @@ struct GptOssGeometry {
     /// wrong values and routes to the wrong experts, which survives as fluent
     /// wrong text rather than as a crash.
     int router_bits = 8;
+
+    /// The attention/embedding projections' quantization width, which is a
+    /// third thing again: `mlx-community/gpt-oss-20b-MXFP4-Q8` declares a
+    /// global `{mxfp4, 4, group 32}` and then overrides `embed_tokens`, every
+    /// `q/k/v/o_proj`, every `mlp.router` and `lm_head` back to
+    /// `{affine, 8, group 64}`. Two `4`s were hardcoded against that -- the
+    /// `b_4` PSO suffix here and the `kGptOssBase` pair that builds the
+    /// prefill GEMM tables -- so an 8-bit checkpoint's projections were read
+    /// by 4-bit matvecs at half the stride. That is not a crash: it is noise
+    /// that looks like text. Solved from the staged tensors for the same
+    /// reason `router_bits` is, and by the same arithmetic -- these
+    /// projections are affine group-64 whatever their width, which is exactly
+    /// what `router_bits_from_extents` assumes.
+    int proj_bits = 4;
+
+    /// The expert bank is read in the MXFP4 the checkpoint published, rather
+    /// than dequantized and re-quantized to affine U4 at load. Solved the same
+    /// way `router_bits` is -- from the tensors that were staged -- because
+    /// `config.json` says "mxfp4" for a checkpoint the loader may still have
+    /// converted, and the only honest witness of which happened is what is in
+    /// the heap. Chooses both what is bound and which matvec runs.
+    bool mxfp4_experts = false;
 
     int max_tokens = 1;
     int max_requests = 1;
@@ -113,6 +134,26 @@ inline bool geometry_from_facts(const Facts& f, GptOssGeometry& out, std::string
     }
     if (f.experts_per_token > f.n_experts) {
         if (err) *err = "gpt-oss geometry: `num_experts_per_tok` exceeds `num_local_experts`";
+        return false;
+    }
+    // The same two bounds llama's routed branch refuses, because it is the same
+    // `router_topk`: it holds the chosen logits in a fixed threadgroup array and
+    // ranks one expert per lane, and it CLAMPS to both. Clamping silently would
+    // route with fewer experts than the config asks for, or among the first
+    // 1024, while every consumer keeps striding by the configured k --
+    // `go_kind_width` sizes the expert stacks at `experts_per_token *
+    // intermediate` whatever the kernel actually filled.
+    if (f.experts_per_token > shared_kernels::kRouterMaxTopK) {
+        if (err) *err = "gpt-oss geometry: `num_experts_per_tok` " +
+                        std::to_string(f.experts_per_token) +
+                        " exceeds the router's top-k limit of " +
+                        std::to_string(shared_kernels::kRouterMaxTopK);
+        return false;
+    }
+    if (f.n_experts > shared_kernels::kRouterMaxExperts) {
+        if (err) *err = "gpt-oss geometry: `num_local_experts` " + std::to_string(f.n_experts) +
+                        " exceeds the " + std::to_string(shared_kernels::kRouterMaxExperts) +
+                        " a single threadgroup can rank";
         return false;
     }
     if (f.n_kv_heads <= 0 || f.n_q_heads % f.n_kv_heads != 0) {

@@ -33,15 +33,6 @@ use std::time::Instant;
 
 use super::{ProcessId, ResidencyPlanner};
 
-/// Step markers for the opt-in event trace (`PIE_CONTENTION_TRACE_EVENTS`):
-/// one line per executor step pins down exactly where a transfer stalls or
-/// why it rolled back. Format and clock come from the shared
-/// [`crate::planner::trace_mark`] owner.
-macro_rules! step {
-    ($pid:expr, $($arg:tt)*) => {
-        crate::planner::trace_mark!("planner-exec", $pid, $($arg)*)
-    };
-}
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
 use crate::store::kv::{KvRestoreTxn, KvSuspendPrepare, KvSuspendTxn};
@@ -88,13 +79,14 @@ pub(super) fn spawn_restore(
     pages: super::grant::DevicePageReservation,
 ) {
     // On the no-runtime path the unpolled future drops `pages` back to the
-    // pool; the entry re-queues.
+    // pool; the entry re-queues. Nothing was attempted, so that one is worth
+    // a retry — an abnormal join is not: a panicking executor panics again.
     let task = restore(planner.clone(), pid, pages);
     let spawned = spawn_watched(planner.clone(), pid, "restore", task, |planner, pid| {
         planner.restore_failed(pid, "restore executor died")
     });
     if !spawned {
-        planner.restore_failed(pid, "no tokio runtime for the restore executor");
+        planner.restore_deferred(pid, "no tokio runtime for the restore executor");
     }
 }
 
@@ -273,7 +265,6 @@ async fn drain_detachable(pid: ProcessId) {
             let Some(op) = op else {
                 break;
             };
-            step!(pid, "drain: finalizing a settled host op");
             if let Err(error) = crate::pipeline::fire::finalize_op_detached(op).await {
                 tracing::warn!(pid = %pid, %error, "planner: detachable finalize failed");
                 break;
@@ -288,11 +279,9 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let working_sets: HashSet<WorkingSetId> =
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, driver);
     if working_sets.is_empty() {
-        step!(pid, "evict rollback: no working sets");
         planner.eviction_failed(pid);
         return;
     }
-    step!(pid, "evict start: {} working set(s)", working_sets.len());
     // Step 2: fences up — no new fire can lease/prepare against these sets.
     let mut fence = FenceGuard::raise(handles);
     // Step 3: EVERY lane the victim owns leaves the wait-all quorum
@@ -306,19 +295,10 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     // Step 4: settle what the planner can (host-KV ops); the victim's own
     // yielded fire task settles the rest. Quiescence below is the gate.
     drain_detachable(pid).await;
-    step!(pid, "evict drained; quiescing leases");
     // Step 5: lease quiescence — the seal against mid-build stragglers.
-    for (index, handle) in fence.handles.iter().enumerate() {
-        if handle.active_leases() > 0 {
-            step!(
-                pid,
-                "quiesce: waiting on set {index} ({} lease(s))",
-                handle.active_leases()
-            );
-        }
+    for handle in fence.handles.iter() {
         handle.quiesce().await;
     }
-    step!(pid, "evict quiesced; preparing");
     // Step 6: prepare → D2H → commit.
     let stores = crate::store::registry::get(model, driver);
     let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
@@ -326,8 +306,7 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     });
     let txn = match prepared {
         Ok(KvSuspendPrepare::Prepared(txn)) => txn,
-        Ok(KvSuspendPrepare::Deferred(disposition)) => {
-            step!(pid, "evict rollback: prepare deferred ({disposition:?})");
+        Ok(KvSuspendPrepare::Deferred(_)) => {
             planner.eviction_failed_prepare_deferred(pid);
             return;
         }
@@ -335,7 +314,6 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             // No kill rung here: without swap room this victim cannot move,
             // and the head waits for completions instead. Park the victim so
             // the deterministic re-pick cannot spin on it (§20.6).
-            step!(pid, "evict rollback: host swap full");
             tracing::warn!(pid = %pid, %error, "planner: eviction blocked on host swap");
             planner.eviction_failed_host_swap_full(pid);
             return;
@@ -359,13 +337,11 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         }
     };
     suspend.arm(completion.clone());
-    step!(pid, "evict D2H posted: {} page(s)", gpu_ids.len());
     let copied = completion.wait().await;
     planner.record_d2h_copy(copy_started.elapsed());
     suspend.disarm_completion();
     if let Err(error) = copied {
         suspend.abort_now();
-        step!(pid, "evict rollback: D2H failed {error}");
         tracing::warn!(pid = %pid, %error, "planner: KV D2H eviction copy failed");
         planner.eviction_failed(pid);
         return;
@@ -376,14 +352,12 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     });
     match freed {
         Ok(freed) => {
-            step!(pid, "evict committed: {freed} page(s) freed");
             // The fences outlive the task: the evicted period keeps them up,
             // restore (or working-set release) clears them.
             fence.keep_raised();
             planner.report_evicted(pid, freed as u32);
         }
         Err(error) => {
-            step!(pid, "evict rollback: commit failed {error}");
             tracing::warn!(pid = %pid, %error, "planner: suspend commit failed");
             planner.eviction_failed(pid);
         }
@@ -415,12 +389,12 @@ async fn restore(
     let txn = match prepared {
         Ok(txn) => txn,
         Err(error) => {
-            step!(pid, "restore failed at prepare: {error}");
-            planner.restore_failed(pid, &error.to_string());
+            // Worth one more round: `Step::ServeRestore` rebuilds the ask
+            // from what is swapped now, so a short grant is not short twice.
+            planner.restore_deferred(pid, &error.to_string());
             return;
         }
     };
-    step!(pid, "restore prepared: {} page(s)", txn.page_count());
     if txn.page_count() == 0 {
         // Nothing left on swap (discarded/released while evicted): commit
         // the empty transaction and rejoin.
@@ -429,6 +403,8 @@ async fn restore(
         });
         match committed {
             Ok(_) => planner.report_restored(pid, 0),
+            // Page-table bookkeeping, not transport: it fails identically
+            // on a second commit of the same empty transaction.
             Err(error) => planner.restore_failed(pid, &error.to_string()),
         }
         return;
@@ -440,7 +416,11 @@ async fn restore(
         Ok(completion) => completion,
         Err(error) => {
             restore.abort_now();
-            planner.restore_failed(pid, &format!("H2D submit: {error:#}"));
+            // Provisionally retryable: a submit that fails once may be a
+            // transient driver refusal rather than a dead context. Nobody has
+            // measured which, so this keeps the benefit of the doubt — for
+            // exactly one attempt.
+            planner.restore_deferred(pid, &format!("H2D submit: {error:#}"));
             return;
         }
     };
@@ -450,7 +430,8 @@ async fn restore(
     restore.disarm_completion();
     if let Err(error) = copied {
         restore.abort_now();
-        planner.restore_failed(pid, &format!("H2D copy: {error}"));
+        // Same benefit of the doubt as the submit above.
+        planner.restore_deferred(pid, &format!("H2D copy: {error}"));
         return;
     }
     let txn = restore.take_restore();
@@ -459,12 +440,11 @@ async fn restore(
     });
     match restored {
         Ok(restored) => {
-            step!(pid, "restore committed: {restored} page(s)");
             planner.report_restored(pid, restored as u32);
             crate::scheduler::nudge(driver);
         }
         Err(error) => {
-            step!(pid, "restore failed at commit: {error}");
+            // The copy landed; only the page table refused. Deterministic.
             planner.restore_failed(pid, &error.to_string());
         }
     }

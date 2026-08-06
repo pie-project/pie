@@ -125,8 +125,49 @@ fn discover_zt_file(snapshot_dir: &Path) -> Option<PathBuf> {
 /// `.zt` are single-file and state it by being one file.
 ///
 /// The order below is the order a snapshot is likely to hold: a `.zt`
-/// artifact (what `pie model optimize` writes), else the canonical HF
+/// artifact (what `pie model convert` writes), else the canonical HF
 /// safetensors layout, else GGUF.
+/// The bytes of the metadata object named `path`, or `None` if the checkpoint
+/// has no such object.
+///
+/// Lives here rather than on [`CheckpointMetadata`] because this module is
+/// where the filesystem is allowed to exist: everything below the reader takes
+/// values, and `standalone.rs` enforces it. Consumers that instead resolved
+/// the object to a file, seeked to its offset and read its span were
+/// reimplementing addressing the loader already does — and would keep working
+/// while silently disagreeing with it if, say, a sharded artifact put the
+/// object somewhere other than the root.
+pub fn read_meta(metadata: &CheckpointMetadata, path: &str) -> Result<Option<Vec<u8>>, Error> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Some(object) = metadata.meta_object(path) else {
+        return Ok(None);
+    };
+    let file = metadata
+        .files
+        .iter()
+        .find(|file| file.id == object.file_id)
+        .ok_or_else(|| {
+            Error::Checkpoint(format!(
+                "{} points at a file the checkpoint lacks",
+                object.name
+            ))
+        })?;
+    let mut handle = std::fs::File::open(&file.path)
+        .map_err(|err| Error::Checkpoint(format!("cannot open {}: {err}", file.path)))?;
+    handle
+        .seek(SeekFrom::Start(object.file_offset))
+        .map_err(|err| Error::Checkpoint(format!("cannot seek in {}: {err}", file.path)))?;
+    let mut bytes = vec![0u8; object.span_bytes as usize];
+    handle.read_exact(&mut bytes).map_err(|err| {
+        Error::Checkpoint(format!(
+            "cannot read {} from {}: {err}",
+            object.name, file.path
+        ))
+    })?;
+    Ok(Some(bytes))
+}
+
 pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, Error> {
     if let Some(zt) = discover_zt_file(snapshot_dir) {
         return zt::parse_checkpoint(&zt);

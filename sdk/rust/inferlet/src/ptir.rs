@@ -28,10 +28,9 @@ use std::rc::Rc;
 
 use pie_dsl::builder::Builder;
 use pie_dsl::channel::PutValue;
-use pie_dsl::value::{Arg, ConstData};
+use pie_dsl::value::ConstData;
 use pie_dsl::{
-    AsTensor, Channel as DslChannel, DType, IntoConst, IntoPut, IntoShape, Port, Shape, Stage,
-    Tensor,
+    Channel as DslChannel, DType, IntoConst, IntoPut, IntoShape, Port, Shape, Stage, Tensor,
 };
 
 use crate::pie::inferlet::channel as wit_channel;
@@ -49,12 +48,12 @@ pub use pie_dsl::intrinsics;
 pub use pie_dsl::DType as Dtype;
 pub use pie_dsl::{
     abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
-    entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota, l2norm,
-    le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem, mul, ne, neg,
-    not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, recip, reduce_argmax, reduce_max,
-    reduce_min, reduce_sum, rem, reshape, rng, row_membership, scalar_gather, scatter_add,
-    scatter_set, select, sign, sink_window_mask, sliding_window_mask, softmax, sort_desc, sub,
-    top_k, transpose,
+    entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, indptr, iota,
+    l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem, mul,
+    ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, recip, reduce_argmax,
+    reduce_max, reduce_min, reduce_sum, rem, reshape, rng, row_membership, scalar_gather,
+    scatter_add, scatter_set, select, sign, sink_window_mask, sliding_window_mask, softmax,
+    sort_desc, sub, top_k, transpose,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,22 +63,63 @@ pub use pie_dsl::{
 // A stage trace interns channels and yields dense channel ids keyed by the
 // dsl channel's gid; `forward-pass.program` wants the WIT handles in that dense
 // order. Every channel the author can reference is created via `Channel::new`/
-// `from`/`seeded`, so registering (gid -> Rc<wit_channel::Channel>) at construction
-// lets a forward pass resolve each `Traced.channel_order` entry. Inferlets are
-// single-threaded (wasm), so a thread-local registry is sound.
+// `from`/`seeded`, so keying the WIT side by gid lets a forward pass resolve
+// each `Traced.channel_order` entry. Inferlets are single-threaded (wasm), so
+// thread-local registries are sound.
+//
+// The WIT resource is created on FIRST USE, not at declaration, because its
+// capacity is a constructor argument: `Channel::new(..).capacity(n)` would
+// otherwise have to throw away the resource it just made -- which is exactly
+// what it used to do, wasting one host channel per call and silently dropping
+// the staged seed of a `Channel::from(v).capacity(n)`.
 
 thread_local! {
     static WIT_CHANNELS: RefCell<HashMap<u64, Rc<wit_channel::Channel>>> = RefCell::new(HashMap::new());
+    static DECLARED: RefCell<HashMap<u64, ChannelSpec>> = RefCell::new(HashMap::new());
 }
 
-fn register_channel(gid: u64, wit: Rc<wit_channel::Channel>) {
-    WIT_CHANNELS.with(|m| {
-        m.borrow_mut().insert(gid, wit);
+#[derive(Clone)]
+struct ChannelSpec {
+    dims: Vec<u32>,
+    dtype: WitDtype,
+    capacity: u32,
+}
+
+fn declare_channel(gid: u64, spec: ChannelSpec) {
+    DECLARED.with(|m| {
+        m.borrow_mut().insert(gid, spec);
     });
 }
 
+/// Whether `gid`'s WIT resource exists yet. A declared-but-unused channel has
+/// none, which is what makes its capacity still editable.
+fn channel_exists(gid: u64) -> bool {
+    WIT_CHANNELS.with(|m| m.borrow().contains_key(&gid))
+}
+
+fn set_declared_capacity(gid: u64, capacity: u32) {
+    DECLARED.with(|m| {
+        if let Some(spec) = m.borrow_mut().get_mut(&gid) {
+            spec.capacity = capacity;
+        }
+    });
+}
+
+/// The WIT handle for `gid`, creating it from the declaration on first ask.
 fn lookup_channel(gid: u64) -> Option<Rc<wit_channel::Channel>> {
-    WIT_CHANNELS.with(|m| m.borrow().get(&gid).cloned())
+    if let Some(wit) = WIT_CHANNELS.with(|m| m.borrow().get(&gid).cloned()) {
+        return Some(wit);
+    }
+    let spec = DECLARED.with(|m| m.borrow().get(&gid).cloned())?;
+    let wit = Rc::new(wit_channel::Channel::new(
+        &spec.dims,
+        spec.dtype,
+        spec.capacity,
+    ));
+    WIT_CHANNELS.with(|m| {
+        m.borrow_mut().insert(gid, Rc::clone(&wit));
+    });
+    Some(wit)
 }
 
 fn to_wit_dtype(d: DType) -> WitDtype {
@@ -115,7 +155,7 @@ fn claim_port(port: Port, ch: &Channel) -> DslChannel {
 /// A GPU-resident bounded queue (overview §1). Owns the `pie-dsl` trace
 /// declaration and the WIT `channel` resource. In a stage closure `take`/`read`/
 /// `put` record IR ops; on the host `put` stages a value (seed / host-writer
-/// cell) and `Taken::get().await`/`Taken::bytes().await` materialize a committed value.
+/// cell) and `take_host`/`read_host` await a committed value.
 /// A registry-backed COPY TOKEN (F9): the channel's shared state (DSL trace
 /// state + WIT handle) lives in thread-local registries keyed by gid, and
 /// this token holds only the gid plus immutable metadata. Stage closures
@@ -170,7 +210,7 @@ pub fn unpad_tokens(window: &[i32]) -> Vec<u32> {
 impl Channel {
     /// `Channel::new([shape], dtype)` at capacity 1 (overview §1).
     pub fn new(shape: impl IntoShape, dtype: DType) -> Channel {
-        Channel::build(shape.into_shape(), dtype, 1, false)
+        Channel::build(shape.into_shape(), dtype, false)
     }
 
     /// An initially empty channel whose producer is the host.
@@ -179,7 +219,7 @@ impl Channel {
     /// the first value is available, so a consuming pass may be submitted
     /// run-ahead and receive the value later.
     pub fn writer(shape: impl IntoShape, dtype: DType) -> Channel {
-        let channel = Channel::build(shape.into_shape(), dtype, 1, false);
+        let channel = Channel::build(shape.into_shape(), dtype, false);
         channel.dsl().note_host_put();
         channel
     }
@@ -196,14 +236,17 @@ impl Channel {
     }
 
     /// Widen the ring to `n` cells (deeper run-ahead).
+    ///
+    /// The WIT resource takes its capacity at construction, so this must come
+    /// before the channel is first used -- which for a seeded channel means
+    /// before the seed, since staging it is a use.
     pub fn capacity(self, n: u32) -> Channel {
-        let dsl = self.dsl().capacity(n);
-        let wit = Rc::new(wit_channel::Channel::new(
-            &dims_of(self.shape),
-            to_wit_dtype(self.dtype),
-            n,
-        ));
-        register_channel(dsl.gid(), wit);
+        assert!(
+            !channel_exists(self.gid),
+            "capacity must be set before the channel is used"
+        );
+        self.dsl().capacity(n);
+        set_declared_capacity(self.gid, n);
         self
     }
 
@@ -218,7 +261,7 @@ impl Channel {
     /// channel as a pre-submit `put`, never the container.
     pub fn from(v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
-        let ch = Channel::build(data.shape, data.dtype, 1, true);
+        let ch = Channel::build(data.shape, data.dtype, true);
         ch.wit()
             .put(&data.bytes)
             .expect("stage seed on a fresh channel");
@@ -228,7 +271,7 @@ impl Channel {
     /// A seeded channel of a given shape whose seed value is supplied at
     /// instantiation (device loop-carried multi-dim channels, D2).
     pub fn seeded(shape: impl IntoShape, dtype: DType) -> Channel {
-        Channel::build(shape.into_shape(), dtype, 1, true)
+        Channel::build(shape.into_shape(), dtype, true)
     }
 
     /// `Channel::from_shaped([shape], v)` — like [`from`], but reinterprets the
@@ -244,31 +287,28 @@ impl Channel {
             data.shape.numel(),
             "from_shaped: element count mismatch"
         );
-        let ch = Channel::build(shape, data.dtype, 1, true);
+        let ch = Channel::build(shape, data.dtype, true);
         ch.wit()
             .put(&data.bytes)
             .expect("stage seed on a fresh channel");
         ch
     }
 
-    fn build(shape: Shape, dtype: DType, capacity: u32, seeded: bool) -> Channel {
+    fn build(shape: Shape, dtype: DType, seeded: bool) -> Channel {
         let dsl = if seeded {
             DslChannel::seeded(shape, dtype)
         } else {
             DslChannel::new(shape, dtype)
         };
-        let dsl = if capacity != 1 {
-            dsl.capacity(capacity)
-        } else {
-            dsl
-        };
-        let wit = Rc::new(wit_channel::Channel::new(
-            &dims_of(shape),
-            to_wit_dtype(dtype),
-            capacity,
-        ));
         let gid = dsl.gid();
-        register_channel(gid, wit);
+        declare_channel(
+            gid,
+            ChannelSpec {
+                dims: dims_of(shape),
+                dtype: to_wit_dtype(dtype),
+                capacity: 1,
+            },
+        );
         Channel { gid, shape, dtype }
     }
 
@@ -279,27 +319,78 @@ impl Channel {
         self.shape
     }
 
-    /// `take()` — consume a cell. In a stage closure: records a `ChanTake` and
-    /// yields an in-program value ([`AsTensor`]). On the host: [`Taken::get`]
-    /// awaits the committed value (awaits until a fire fills it; poison ⇒
-    /// `Err`).
-    pub fn take(&self) -> Taken {
-        Taken {
-            dsl: self.dsl().take(),
-            wit: self.wit(),
-            mode: TakenMode::Take,
-            dtype: self.dtype,
-        }
+    /// `take()` — consume a cell, inside a stage closure. Records a `ChanTake`
+    /// and yields the in-program value. The host counterpart is
+    /// [`take_host`](Self::take_host); asking a host channel for an in-program
+    /// value is an authoring error and is reported as one.
+    pub fn take(&self) -> Tensor {
+        self.dsl().take()
     }
 
-    /// `read()` — peek a cell (leaves it full). Same dual as [`take`](Self::take).
-    pub fn read(&self) -> Taken {
-        Taken {
-            dsl: self.dsl().read(),
-            wit: self.wit(),
-            mode: TakenMode::Read,
-            dtype: self.dtype,
+    /// `read()` — peek a cell (leaves it full), inside a stage closure. Device
+    /// counterpart of [`read_host`](Self::read_host).
+    pub fn read(&self) -> Tensor {
+        self.dsl().read()
+    }
+
+    /// Consume a cell on the host, decoded as `T` — a whole `Vec<f32>`, or a
+    /// bare `f32` for a channel that holds one value. Awaits in-flight fires;
+    /// a poisoned channel returns `Err`.
+    ///
+    /// `T`'s element type must be the channel's own dtype. The bytes are a raw
+    /// little-endian window, so decoding an `f32` channel as `i32` would
+    /// reinterpret the bit pattern and return plausible garbage.
+    ///
+    /// Errors already name the channel, so inferlets do not repeat it in a
+    /// [`context`](crate::Context) call.
+    ///
+    /// ```ignore
+    /// let logits = out.take_host::<Vec<f32>>().await?;
+    /// let count = n_ch.take_host::<i32>().await?;
+    /// ```
+    pub async fn take_host<T: FromChannel>(&self) -> Result<T, String> {
+        self.check_host::<T>("take")?;
+        self.dsl().note_host_take();
+        let raw = self.wit().take().await;
+        self.decode_host::<T>(raw, "take")
+    }
+
+    /// Peek a cell on the host (leaves it full). Same as
+    /// [`take_host`](Self::take_host) otherwise.
+    pub async fn read_host<T: FromChannel>(&self) -> Result<T, String> {
+        self.check_host::<T>("read")?;
+        self.dsl().note_host_read();
+        let raw = self.wit().read().await;
+        self.decode_host::<T>(raw, "read")
+    }
+
+    /// `"{channel} take"` / `"{channel} read"` — the prefix on every host
+    /// readback error, so the message names the channel without the inferlet
+    /// spelling it out again.
+    fn host_label(&self, verb: &str) -> String {
+        format!("{} {verb}", self.dsl().name())
+    }
+
+    fn check_host<T: FromChannel>(&self, verb: &str) -> Result<(), String> {
+        if T::DTYPE != self.dtype {
+            return Err(format!(
+                "{}: channel holds {:?}, decoded as {:?}",
+                self.host_label(verb),
+                self.dtype,
+                T::DTYPE
+            ));
         }
+        Ok(())
+    }
+
+    fn decode_host<T: FromChannel>(
+        &self,
+        raw: Result<Vec<u8>, String>,
+        verb: &str,
+    ) -> Result<T, String> {
+        let label = self.host_label(verb);
+        let raw = raw.map_err(|e| format!("{label}: {e}"))?;
+        T::from_bytes(&raw).map_err(|e| format!("{label}: {e}"))
     }
 
     /// `put(v)` — in a stage closure `v` is an in-program [`Tensor`] (device
@@ -307,7 +398,7 @@ impl Channel {
     /// channel as the next cell / a seed, and the host-writer endpoint is
     /// recorded on the trace side for host-role derivation). Fire-and-forget
     /// (D1: staged puts coalesce into the next submit); a fire that fails
-    /// surfaces downstream as poison at [`Taken::get`]/[`Taken::bytes`].
+    /// surfaces downstream as an `Err` from [`take_host`](Self::take_host).
     pub fn put(&self, v: impl IntoPut) {
         match v.into_put() {
             PutValue::Tensor(t) => {
@@ -330,61 +421,38 @@ impl Channel {
     }
 }
 
-/// The result of [`Channel::take`]/[`Channel::read`]. In a stage closure it is
-/// an in-program value (via [`AsTensor`]); on the host [`get`](Self::get) /
-/// [`bytes`](Self::bytes) await the committed value.
-pub struct Taken {
-    dsl: pie_dsl::Taken,
-    wit: Rc<wit_channel::Channel>,
-    mode: TakenMode,
-    dtype: DType,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TakenMode {
-    Take,
-    Read,
-}
-
-impl Taken {
-    /// The in-program [`Tensor`] (panics on a host take — a frontend bug).
-    pub fn tensor(self) -> Tensor {
-        self.dsl.tensor()
-    }
-
-    /// Materialize the committed value to the host as raw little-endian bytes.
-    /// Awaits in-flight fires; a poisoned channel returns `Err`.
-    pub async fn bytes(self) -> Result<Vec<u8>, String> {
-        match self.mode {
-            TakenMode::Take => self.wit.take().await,
-            TakenMode::Read => self.wit.read().await,
+/// Seed a channel straight from an iterator, without materializing a `Vec`
+/// first: `Channel::from_iter(0..n)` rather than
+/// `Channel::from((0..n).collect::<Vec<_>>())`. Page tables, position vectors
+/// and write-slot maps are all built this way.
+///
+/// `IntoConst` cannot accept iterators — a blanket impl over `IntoIterator`
+/// collides with the scalar impls — so the element types are spelled out here
+/// instead, which is also what makes `.collect::<Channel>()` infer.
+macro_rules! channel_from_iter {
+    ($t:ty) => {
+        impl FromIterator<$t> for Channel {
+            fn from_iter<I: IntoIterator<Item = $t>>(iter: I) -> Channel {
+                Channel::from(iter.into_iter().collect::<Vec<$t>>())
+            }
         }
-    }
-
-    /// Materialize the committed value to the host, decoded to `T`.
-    pub async fn get<T: HostElem>(self) -> Result<Vec<T>, String> {
-        let raw = self.bytes().await?;
-        let _ = self.dtype;
-        Ok(T::decode(&raw))
-    }
+    };
 }
-
-impl AsTensor for Taken {
-    fn to_arg(&self) -> Arg {
-        self.dsl.to_arg()
-    }
-}
-impl AsTensor for &Taken {
-    fn to_arg(&self) -> Arg {
-        (*self).to_arg()
-    }
-}
+channel_from_iter!(u32);
+channel_from_iter!(i32);
+channel_from_iter!(f32);
+channel_from_iter!(bool);
 
 /// A host-readable element type (little-endian, 4 bytes/elem; `bool` is 1 byte).
+///
+/// [`DTYPE`](Self::DTYPE) is what makes the raw byte window self-describing:
+/// [`Channel::take_host`] refuses a `T` the channel does not hold.
 pub trait HostElem: Copy {
+    const DTYPE: DType;
     fn decode(raw: &[u8]) -> Vec<Self>;
 }
 impl HostElem for i32 {
+    const DTYPE: DType = DType::I32;
     fn decode(raw: &[u8]) -> Vec<i32> {
         raw.chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -392,6 +460,7 @@ impl HostElem for i32 {
     }
 }
 impl HostElem for u32 {
+    const DTYPE: DType = DType::U32;
     fn decode(raw: &[u8]) -> Vec<u32> {
         raw.chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -399,12 +468,55 @@ impl HostElem for u32 {
     }
 }
 impl HostElem for f32 {
+    const DTYPE: DType = DType::F32;
     fn decode(raw: &[u8]) -> Vec<f32> {
         raw.chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
 }
+impl HostElem for bool {
+    const DTYPE: DType = DType::Bool;
+    fn decode(raw: &[u8]) -> Vec<bool> {
+        raw.iter().map(|&byte| byte != 0).collect()
+    }
+}
+
+/// A type [`Channel::take_host`] can materialize a channel into: a whole
+/// `Vec<T>`, or a bare `T` for a channel that holds a single value.
+///
+/// The impls are spelled out rather than blanket over [`HostElem`] because
+/// `impl<T: HostElem> FromChannel for T` and `for Vec<T>` overlap under
+/// coherence.
+pub trait FromChannel: Sized {
+    /// The dtype the channel must hold.
+    const DTYPE: DType;
+    fn from_bytes(raw: &[u8]) -> Result<Self, String>;
+}
+
+macro_rules! from_channel {
+    ($t:ty) => {
+        impl FromChannel for Vec<$t> {
+            const DTYPE: DType = <$t as HostElem>::DTYPE;
+            fn from_bytes(raw: &[u8]) -> Result<Self, String> {
+                Ok(<$t as HostElem>::decode(raw))
+            }
+        }
+        impl FromChannel for $t {
+            const DTYPE: DType = <$t as HostElem>::DTYPE;
+            fn from_bytes(raw: &[u8]) -> Result<Self, String> {
+                <$t as HostElem>::decode(raw)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("channel is empty, expected one {}", stringify!($t)))
+            }
+        }
+    };
+}
+from_channel!(i32);
+from_channel!(u32);
+from_channel!(f32);
+from_channel!(bool);
 
 // ---------------------------------------------------------------------------
 // WorkingSet
@@ -425,11 +537,6 @@ impl WorkingSet {
         WorkingSet {
             kv: Rc::new(KvWorkingSet::new()),
         }
-    }
-
-    /// Tokens per KV page for this working set's model.
-    pub fn page_size(&self) -> u32 {
-        self.kv.page_size()
     }
 
     /// Current logical extent in pages, including reserved-but-unwritten space.
@@ -529,11 +636,6 @@ pub struct PageGrant {
 }
 
 impl PageGrant {
-    /// First granted index.
-    pub fn start(&self) -> u32 {
-        self.start
-    }
-
     /// The granted WorkingSet-relative page indexes (contiguous).
     pub fn ids(&self) -> &[u32] {
         &self.ids
@@ -576,8 +678,12 @@ impl RsWorkingSet {
     }
 
     /// Size in bytes of one folded recurrent-state object for this model.
+    /// A cached [`crate::model::rs_state_size`]; see [`WorkingSet::page_size`].
     pub fn state_size(&self) -> u64 {
-        self.rs.state_size()
+        thread_local! {
+            static SIZE: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
+        }
+        SIZE.with(|c| *c.get_or_init(crate::model::rs_state_size))
     }
 
     /// Current number of buffered page slots.
@@ -585,9 +691,13 @@ impl RsWorkingSet {
         self.rs.buffer_size()
     }
 
-    /// Tokens per buffered RS page for this working set's model/driver.
+    /// Tokens per buffered RS page for this model/driver. A cached
+    /// [`crate::model::rs_buffer_page_size`]; see [`WorkingSet::page_size`].
     pub fn buffer_page_size(&self) -> u32 {
-        self.rs.buffer_page_size()
+        thread_local! {
+            static SIZE: std::cell::OnceCell<u32> = const { std::cell::OnceCell::new() };
+        }
+        SIZE.with(|c| *c.get_or_init(crate::model::rs_buffer_page_size))
     }
 
     /// Append `n` reserved buffered page slots; returns the contiguous
@@ -648,25 +758,102 @@ impl Default for RsWorkingSet {
 
 type StageClosure = Box<dyn Fn()>;
 
-/// The one WIT forward-pass resource, whichever interface it came from.
+/// The forward-pass resource of one `pie:inferlet` forward interface.
 ///
-/// `pie:inferlet` exposes three forward interfaces (`forward`,
-/// `forward-recurrent`, `forward-hybrid`) so that attention-only state
-/// algorithms cannot be named against a folded recurrent state. wit-bindgen
-/// generates three unrelated Rust resource types for them; this enum is where
-/// that three-way split stops, so the tracing/bookkeeping below exists once.
-enum PassWit {
-    Attention(wit_attention::ForwardPass),
-    Recurrent(wit_recurrent::ForwardPass),
-    Hybrid(wit_hybrid::ForwardPass),
+/// `pie:inferlet` exposes three of them (`forward`, `forward-recurrent`,
+/// `forward-hybrid`) so that attention-only state algorithms cannot be named
+/// against a folded recurrent state, and wit-bindgen generates three unrelated
+/// Rust resource types to match. This trait is the shape those three share, so
+/// [`Pass`]'s tracing and bookkeeping is written once WITHOUT collapsing them
+/// into a single type: `Pass<W>` stays as distinct per interface as `W` is.
+pub trait PassWit: Sized + 'static {
+    fn new() -> Self;
+
+    fn embed(
+        &self,
+        tokens: &wit_channel::Channel,
+        indptr: &wit_channel::Channel,
+    ) -> Result<(), String>;
+
+    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String>;
+
+    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
+
+    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
 }
 
-/// The shared forward-pass builder. Never public: guests always hold one of
-/// the three newtypes in [`attention`] / [`recurrent`] / [`hybrid`], which is
-/// what makes a cross-kind helper a COMPILE error rather than a silent
+impl PassWit for wit_attention::ForwardPass {
+    fn new() -> Self {
+        wit_attention::ForwardPass::new()
+    }
+    fn embed(
+        &self,
+        tokens: &wit_channel::Channel,
+        indptr: &wit_channel::Channel,
+    ) -> Result<(), String> {
+        wit_attention::ForwardPass::embed(self, tokens, indptr)
+    }
+    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
+        wit_attention::ForwardPass::readout(self, indices)
+    }
+    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
+        wit_attention::ForwardPass::program(self, bytes, channels)
+    }
+    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
+        wit_attention::submit(on, slots)
+    }
+}
+
+impl PassWit for wit_recurrent::ForwardPass {
+    fn new() -> Self {
+        wit_recurrent::ForwardPass::new()
+    }
+    fn embed(
+        &self,
+        tokens: &wit_channel::Channel,
+        indptr: &wit_channel::Channel,
+    ) -> Result<(), String> {
+        wit_recurrent::ForwardPass::embed(self, tokens, indptr)
+    }
+    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
+        wit_recurrent::ForwardPass::readout(self, indices)
+    }
+    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
+        wit_recurrent::ForwardPass::program(self, bytes, channels)
+    }
+    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
+        wit_recurrent::submit(on, slots)
+    }
+}
+
+impl PassWit for wit_hybrid::ForwardPass {
+    fn new() -> Self {
+        wit_hybrid::ForwardPass::new()
+    }
+    fn embed(
+        &self,
+        tokens: &wit_channel::Channel,
+        indptr: &wit_channel::Channel,
+    ) -> Result<(), String> {
+        wit_hybrid::ForwardPass::embed(self, tokens, indptr)
+    }
+    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
+        wit_hybrid::ForwardPass::readout(self, indices)
+    }
+    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
+        wit_hybrid::ForwardPass::program(self, bytes, channels)
+    }
+    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
+        wit_hybrid::submit(on, slots)
+    }
+}
+
+/// The forward-pass builder over the `W` interface. Guests name it through the
+/// per-interface aliases in [`attention`] / [`recurrent`] / [`hybrid`], which
+/// is what makes a cross-kind helper a COMPILE error rather than a silent
 /// semantic bug.
-struct PassCore {
-    wit: PassWit,
+pub struct Pass<W: PassWit> {
+    wit: W,
     inner: RefCell<ForwardInner>,
 }
 
@@ -677,17 +864,14 @@ struct ForwardInner {
     page_size: u32,
     attention_ws: Option<Rc<KvWorkingSet>>,
     rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
-    /// The KV half of the state binding, recorded but not yet sent.
-    kv_bind: Option<KvBind>,
-    rs_bind: Option<RsGeometryBind>,
     program_attached: bool,
 }
 
-/// A recorded KV binding. The WIT call is DEFERRED to `attach_program`
-/// because `forward-hybrid.attention` binds KV and RS in one call -- they are
-/// one set of geometry over different layers of the same forward -- while the
-/// guest-facing SDK keeps them as two independent, order-free calls.
-struct KvBind {
+/// A [`KvGeometry`] with its ports claimed and its channels resolved to WIT
+/// handles, held only long enough for the caller to issue its own interface's
+/// state-binding call. The handles are `Rc` because [`Channel::wit`] hands
+/// out shared ownership, and the WIT record borrows them.
+struct StagedKv {
     ws: Rc<KvWorkingSet>,
     readable: PageDeclaration,
     writable: PageDeclaration,
@@ -700,18 +884,94 @@ struct KvBind {
     mask: Option<Rc<wit_channel::Channel>>,
 }
 
-/// A recorded `rs-geometry`: where the bound recurrent state lives for this
-/// fire and where its folded boundary lands.
-struct RsGeometryBind {
-    /// The fold-len channel as a descriptor port, or `None` for the
-    /// synthesized fold-everything geometry. Claiming it is what lets a stage
-    /// COMPUTE the fold length: the driver resolves the port on device, so a
-    /// speculative decode's accepted count never round-trips through the host.
-    port: Option<(Port, Channel)>,
-    fold_len: Rc<wit_channel::Channel>,
+/// The attention geometry of one fire — a field-for-field mirror of the WIT
+/// `kv-geometry` record (`forward.wit`, `forward-hybrid.wit`).
+///
+/// The record exists in WIT so the whole group can be handled as a unit; it
+/// exists here for the same reason, and because six consecutive `&Channel`
+/// arguments carrying five different `u32` meanings is a swap waiting to
+/// happen. Nothing is hidden: every field is exactly the channel the host
+/// binds to that PTIR port.
+///
+/// The two page spans take any `u32` range, which is what `page-span`'s
+/// `{ start, end: option<u32> }` means: `..` is the whole working set,
+/// `first..` is a suffix, `a..b` a window.
+///
+/// ```ignore
+/// fwd.attention(&ws, KvGeometry {
+///     readable_pages: ..,
+///     writable_pages: (n / page_size)..,
+///     kv_len: &kv_len,
+///     pages: &pages,
+///     page_indptr: &page_indptr,
+///     w_slot: &w_slot,
+///     w_off: &w_off,
+///     positions: &positions,
+///     mask: None,
+/// })?;
+/// ```
+pub struct KvGeometry<'a, R, W> {
+    pub readable_pages: R,
+    pub writable_pages: W,
+    pub kv_len: &'a Channel,
+    pub pages: &'a Channel,
+    pub page_indptr: &'a Channel,
+    pub w_slot: &'a Channel,
+    pub w_off: &'a Channel,
+    pub positions: &'a Channel,
+    /// `None` omits PTIR's AttnMask port; `Some` binds that channel to it.
+    pub mask: Option<&'a Channel>,
+}
+
+/// Where the bound recurrent state's folded boundary lands for one fire — a
+/// field-for-field mirror of the WIT `rs-geometry` record
+/// (`forward-recurrent.wit`, `forward-hybrid.wit`).
+///
+/// ```ignore
+/// // Fold everything: the ordinary decode.
+/// RsGeometry { fold_len: None, buffer: .. }
+/// // Fold nothing: buffer this fire's tokens, which is what makes a linear
+/// // model speculatable -- unfolded tokens cost nothing to abandon.
+/// RsGeometry { fold_len: Some(&zero), buffer: ..n }
+/// ```
+pub struct RsGeometry<'a, B> {
+    /// A channel carrying, per request, how far the folded boundary advances
+    /// over `[buffer | this fire's tokens]`, clamped to that tail. `None` is
+    /// the fold-everything channel of `u32::MAX` the SDK would otherwise make
+    /// every caller build by hand.
+    ///
+    /// A channel rather than a scalar so that a device-computed accepted count
+    /// can drive the fold directly, fusing verify and commit into one fire:
+    /// the driver resolves it as a descriptor port, so the count never
+    /// round-trips through the host.
+    pub fold_len: Option<&'a Channel>,
     /// Capacity grant, not an address. The buffer's addressing is derived by
     /// the runtime from its own occupancy; a guest copy of it could only
     /// agree or be refused.
+    pub buffer: B,
+}
+
+/// A KV working set together with the geometry it is read and written
+/// through — a field-for-field mirror of the WIT `kv-binding` record
+/// (`forward-hybrid.wit`), which exists so that the pair can be made optional
+/// as a unit.
+pub struct KvBinding<'a, R, W> {
+    pub working_set: &'a WorkingSet,
+    pub geometry: KvGeometry<'a, R, W>,
+}
+
+thread_local! {
+    /// The `fold-len` of a pass that folds unconditionally: `u32::MAX` clamps
+    /// to "every token of every fire". Degenerate but MEANINGFUL -- the fast
+    /// path stated explicitly, not the dummy geometry this surface avoids.
+    static FOLD_ALL: Channel = Channel::from(vec![u32::MAX]);
+}
+
+/// [`RsGeometry`] with its port claimed and its channel resolved, alongside the
+/// working sets it applies to. See [`StagedKv`].
+struct StagedRs {
+    working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
+    fold_len: Rc<wit_channel::Channel>,
     buffer: PageDeclaration,
 }
 
@@ -791,21 +1051,19 @@ mod page_declaration_tests {
     }
 }
 
-impl PassCore {
-    fn new(wit: PassWit) -> PassCore {
+impl<W: PassWit> Pass<W> {
+    pub fn new() -> Pass<W> {
         let vocab = crate::model::output_vocab_size();
-        let page_size = crate::model::kv_page_size();
-        PassCore {
-            wit,
+        let page_size = kv_page_size();
+        Pass {
+            wit: W::new(),
             inner: RefCell::new(ForwardInner {
-                rs_bind: None,
                 ports: Vec::new(),
                 stages: Vec::new(),
                 vocab,
                 page_size,
                 attention_ws: None,
                 rs_working_sets: Vec::new(),
-                kv_bind: None,
                 program_attached: false,
             }),
         }
@@ -833,11 +1091,7 @@ impl PassCore {
         self.ensure_ports_available(&[Port::EmbedTokens, Port::EmbedIndptr])?;
         let token_wit = tokens.wit();
         let indptr_wit = indptr.wit();
-        match &self.wit {
-            PassWit::Attention(w) => w.embed(token_wit.as_ref(), indptr_wit.as_ref()),
-            PassWit::Recurrent(w) => w.embed(token_wit.as_ref(), indptr_wit.as_ref()),
-            PassWit::Hybrid(w) => w.embed(token_wit.as_ref(), indptr_wit.as_ref()),
-        }?;
+        self.wit.embed(token_wit.as_ref(), indptr_wit.as_ref())?;
         self.inner.borrow_mut().ports.extend([
             (Port::EmbedTokens, claim_port(Port::EmbedTokens, tokens)),
             (Port::EmbedIndptr, claim_port(Port::EmbedIndptr, indptr)),
@@ -845,140 +1099,132 @@ impl PassCore {
         Ok(())
     }
 
-    /// Bind attention and all of its geometry channels. This is the only
-    /// attention binding surface; `mask: None` omits PTIR's existing AttnMask
-    /// port, while `Some` binds that channel.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attention<R, W>(
+    /// Claim the KV geometry ports and resolve its channels. The caller issues
+    /// its own interface's state-binding call with the result: `forward` takes
+    /// the working set and geometry directly, `forward-hybrid` wraps them in a
+    /// `kv-binding` alongside the recurrent half.
+    ///
+    /// After the program is attached this is a REBIND -- a request-set or
+    /// geometry change between fires -- and the ports are already traced into
+    /// the program, so only the WIT-side handles are refreshed.
+    fn stage_kv<R, Wr>(
         &self,
         ws: &WorkingSet,
-        readable: R,
-        writable: W,
-        kv_len: &Channel,
-        pages: &Channel,
-        page_indptr: &Channel,
-        w_slot: &Channel,
-        w_off: &Channel,
-        positions: &Channel,
-        mask: Option<&Channel>,
-    ) -> Result<(), String>
+        geom: KvGeometry<'_, R, Wr>,
+    ) -> Result<StagedKv, String>
     where
         R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
+        Wr: RangeBounds<u32>,
     {
-        let mut ports = vec![
-            Port::KvLen,
-            Port::Pages,
-            Port::PageIndptr,
-            Port::WSlot,
-            Port::WOff,
-            Port::Positions,
-        ];
-        if mask.is_some() {
-            ports.push(Port::AttnMask);
+        let KvGeometry {
+            readable_pages,
+            writable_pages,
+            kv_len,
+            pages,
+            page_indptr,
+            w_slot,
+            w_off,
+            positions,
+            mask,
+        } = geom;
+        let rebind = self.inner.borrow().program_attached;
+        if !rebind {
+            let mut ports = vec![
+                Port::KvLen,
+                Port::Pages,
+                Port::PageIndptr,
+                Port::WSlot,
+                Port::WOff,
+                Port::Positions,
+            ];
+            if mask.is_some() {
+                ports.push(Port::AttnMask);
+            }
+            self.ensure_ports_available(&ports)?;
         }
-        self.ensure_ports_available(&ports)?;
-        let readable = PageDeclaration::from_range(readable)?;
-        let writable = PageDeclaration::from_range(writable)?;
-        let kv_len_wit = kv_len.wit();
-        let pages_wit = pages.wit();
-        let page_indptr_wit = page_indptr.wit();
-        let w_slot_wit = w_slot.wit();
-        let w_off_wit = w_off.wit();
-        let positions_wit = positions.wit();
-        let mask_wit = mask.map(Channel::wit);
-        let mut inner = self.inner.borrow_mut();
-        inner.ports.extend([
-            (Port::KvLen, claim_port(Port::KvLen, kv_len)),
-            (Port::Pages, claim_port(Port::Pages, pages)),
-            (Port::PageIndptr, claim_port(Port::PageIndptr, page_indptr)),
-            (Port::WSlot, claim_port(Port::WSlot, w_slot)),
-            (Port::WOff, claim_port(Port::WOff, w_off)),
-            (Port::Positions, claim_port(Port::Positions, positions)),
-        ]);
-        if let Some(mask) = mask {
-            inner
-                .ports
-                .push((Port::AttnMask, claim_port(Port::AttnMask, mask)));
-        }
-        inner.attention_ws = Some(ws.kv.clone());
-        inner.kv_bind = Some(KvBind {
+        let staged = StagedKv {
             ws: ws.kv.clone(),
-            readable,
-            writable,
-            kv_len: kv_len_wit,
-            pages: pages_wit,
-            page_indptr: page_indptr_wit,
-            w_slot: w_slot_wit,
-            w_off: w_off_wit,
-            positions: positions_wit,
-            mask: mask_wit,
-        });
-        Ok(())
+            readable: PageDeclaration::from_range(readable_pages)?,
+            writable: PageDeclaration::from_range(writable_pages)?,
+            kv_len: kv_len.wit(),
+            pages: pages.wit(),
+            page_indptr: page_indptr.wit(),
+            w_slot: w_slot.wit(),
+            w_off: w_off.wit(),
+            positions: positions.wit(),
+            mask: mask.map(Channel::wit),
+        };
+        let mut inner = self.inner.borrow_mut();
+        inner.attention_ws = Some(ws.kv.clone());
+        if !rebind {
+            inner.ports.extend([
+                (Port::KvLen, claim_port(Port::KvLen, kv_len)),
+                (Port::Pages, claim_port(Port::Pages, pages)),
+                (Port::PageIndptr, claim_port(Port::PageIndptr, page_indptr)),
+                (Port::WSlot, claim_port(Port::WSlot, w_slot)),
+                (Port::WOff, claim_port(Port::WOff, w_off)),
+                (Port::Positions, claim_port(Port::Positions, positions)),
+            ]);
+            if let Some(mask) = mask {
+                inner
+                    .ports
+                    .push((Port::AttnMask, claim_port(Port::AttnMask, mask)));
+            }
+        }
+        Ok(staged)
     }
 
-    /// Record the recurrent-state working sets (resolved request order) and,
-    /// optionally, the buffered geometry. Like the KV half, the WIT call is
-    /// deferred to `attach_program`.
-    fn bind_recurrent(
+    /// Claim the fold-len port and resolve the recurrent working sets, in
+    /// resolved request order. See [`Pass::stage_kv`] for the rebind rule.
+    fn stage_rs<B>(
         &self,
         working_sets: &[RsWorkingSet],
-        geom: RsGeometryBind,
-    ) -> Result<(), String> {
+        geom: RsGeometry<'_, B>,
+    ) -> Result<StagedRs, String>
+    where
+        B: RangeBounds<u32>,
+    {
         if working_sets.is_empty() {
             return Err(
                 "forward pass needs one recurrent-state working set per request".to_string(),
             );
         }
-        if self.inner.borrow().program_attached {
-            // Post-attachment this is a REBIND (a request-set change between
-            // fires), which goes straight out over WIT instead of being
-            // recorded for `flush_state_binding`.
-            return self.rebind_recurrent(working_sets, geom);
-        }
-        let mut inner = self.inner.borrow_mut();
-        inner.rs_working_sets = working_sets.iter().map(|rs| rs.rs.clone()).collect();
-        if let Some((port, channel)) = geom.port {
-            inner.ports.push((port, claim_port(port, &channel)));
-        }
-        inner.rs_bind = Some(geom);
-        Ok(())
-    }
-
-    /// Rebind the recurrent-state working sets of an ALREADY-BOUND pass (a
-    /// request-set change between fires). Only legal after the program is
-    /// attached; before that, `bind_recurrent` records instead.
-    fn rebind_recurrent(
-        &self,
-        working_sets: &[RsWorkingSet],
-        geom: RsGeometryBind,
-    ) -> Result<(), String> {
-        let replacement: Vec<Rc<crate::working_set::RsWorkingSet>> =
-            working_sets.iter().map(|rs| rs.rs.clone()).collect();
-        let borrows: Vec<&crate::working_set::RsWorkingSet> =
-            replacement.iter().map(Rc::as_ref).collect();
-        match &self.wit {
-            PassWit::Recurrent(w) => w.attention(&borrows, &recurrent_rs_geometry(&geom)),
-            PassWit::Hybrid(w) => w.attention(None, &borrows, &hybrid_rs_geometry(&geom)),
-            PassWit::Attention(_) => {
-                Err("an attention-only forward pass has no recurrent state".to_string())
+        let buffer = PageDeclaration::from_range(geom.buffer)?;
+        let staged = match geom.fold_len {
+            Some(fold_len) => {
+                if !self.inner.borrow().program_attached {
+                    self.ensure_ports_available(&[Port::RsFoldLen])?;
+                    let mut inner = self.inner.borrow_mut();
+                    inner
+                        .ports
+                        .push((Port::RsFoldLen, claim_port(Port::RsFoldLen, fold_len)));
+                }
+                fold_len.wit()
             }
-        }?;
-        let mut inner = self.inner.borrow_mut();
-        inner.rs_working_sets = replacement;
-        inner.rs_bind = Some(geom);
-        Ok(())
+            // `u32::MAX` per request clamps to "the whole tail" host-side, so
+            // one broadcast element says fold everything for every request.
+            // Minted once per guest thread: a rebind must not leak a fresh
+            // channel every time the request set changes. No port is claimed
+            // either -- a pass that folds everything unconditionally has
+            // nothing to compute, and a dead port would land in every plain
+            // recurrent trace.
+            None => FOLD_ALL.with(Channel::wit),
+        };
+        let working_sets: Vec<Rc<crate::working_set::RsWorkingSet>> =
+            working_sets.iter().map(|rs| rs.rs.clone()).collect();
+        self.inner.borrow_mut().rs_working_sets = working_sets.clone();
+        Ok(StagedRs {
+            working_sets,
+            fold_len: staged,
+            buffer,
+        })
     }
 
     /// Bind readout indexes through a channel, separately from embedding.
     pub fn readout(&self, indices: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::Readout])?;
         let indices_wit = indices.wit();
-        match &self.wit {
-            PassWit::Attention(w) => w.readout(indices_wit.as_ref()),
-            PassWit::Recurrent(w) => w.readout(indices_wit.as_ref()),
-            PassWit::Hybrid(w) => w.readout(indices_wit.as_ref()),
-        }?;
+        self.wit.readout(indices_wit.as_ref())?;
         self.inner
             .borrow_mut()
             .ports
@@ -989,14 +1235,6 @@ impl PassCore {
     /// Attach the `prologue` stage (overview §5.3).
     pub fn prologue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Prologue, body);
-    }
-    /// Attach the `on_attn_proj` stage (per layer, before attention).
-    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttnProj, body);
-    }
-    /// Attach the `on_attn` stage (per layer, after attention).
-    pub fn on_attn(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttn, body);
     }
     /// Attach the `epilogue` stage (sampling programs; after the forward).
     pub fn epilogue(&self, body: impl Fn() + 'static) {
@@ -1029,74 +1267,14 @@ impl PassCore {
     /// A decode loop should NOT call this. Use [`run_ahead`], which fills
     /// [`live_slots`] per frame and sizes its window from
     /// [`channel_capacity`], or [`submit_frame`] to drive frames by hand.
-    fn submit(&self, on: &Pipeline) -> Result<(), String> {
-        submit_core_frame(on, &[Some(self)])
-    }
-
-    /// Issue the ONE deferred state-binding WIT call. Called once, at the top
-    /// of `attach_program`, so that a hybrid pass -- whose interface binds KV
-    /// and RS together -- still lets the guest record the two halves through
-    /// independent, order-free SDK calls.
-    fn flush_state_binding(&self) -> Result<(), String> {
-        let inner = self.inner.borrow();
-        let rs: Vec<&crate::working_set::RsWorkingSet> =
-            inner.rs_working_sets.iter().map(Rc::as_ref).collect();
-        match &self.wit {
-            PassWit::Attention(w) => {
-                let Some(kv) = inner.kv_bind.as_ref() else {
-                    return Err("attention must be bound before submit".to_string());
-                };
-                let geom = wit_attention::KvGeometry {
-                    readable_pages: kv.readable.wit(),
-                    writable_pages: kv.writable.wit(),
-                    kv_len: kv.kv_len.as_ref(),
-                    pages: kv.pages.as_ref(),
-                    page_indptr: kv.page_indptr.as_ref(),
-                    w_slot: kv.w_slot.as_ref(),
-                    w_off: kv.w_off.as_ref(),
-                    positions: kv.positions.as_ref(),
-                    mask: kv.mask.as_deref(),
-                };
-                w.attention(kv.ws.as_ref(), &geom)
-            }
-            PassWit::Recurrent(w) => {
-                let Some(geom) = inner.rs_bind.as_ref() else {
-                    return Err("recurrent state must be bound before submit".to_string());
-                };
-                w.attention(&rs, &recurrent_rs_geometry(geom))
-            }
-            PassWit::Hybrid(w) => {
-                let Some(kv) = inner.kv_bind.as_ref() else {
-                    return Err("attention must be bound before submit".to_string());
-                };
-                let binding = wit_hybrid::KvBinding {
-                    working_set: kv.ws.as_ref(),
-                    geometry: wit_hybrid::KvGeometry {
-                        readable_pages: kv.readable.wit(),
-                        writable_pages: kv.writable.wit(),
-                        kv_len: kv.kv_len.as_ref(),
-                        pages: kv.pages.as_ref(),
-                        page_indptr: kv.page_indptr.as_ref(),
-                        w_slot: kv.w_slot.as_ref(),
-                        w_off: kv.w_off.as_ref(),
-                        positions: kv.positions.as_ref(),
-                        mask: kv.mask.as_deref(),
-                    },
-                };
-                let Some(geom) = inner.rs_bind.as_ref() else {
-                    return Err("recurrent state must be bound before submit".to_string());
-                };
-                w.attention(Some(&binding), &rs, &hybrid_rs_geometry(geom))
-            }
-        }
+    pub fn submit(&self, on: &Pipeline) -> Result<(), String> {
+        submit_frame(on, &[Some(self)])
     }
 
     fn attach_program(&self) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Ok(());
         }
-        self.flush_state_binding()?;
-
         let inner = self.inner.borrow();
         let mut builder = Builder::new(inner.vocab, inner.page_size);
         for (port, channel) in &inner.ports {
@@ -1114,14 +1292,16 @@ impl PassCore {
             .collect();
         let borrows: Vec<&wit_channel::Channel> = handles.iter().map(Rc::as_ref).collect();
         let bytes = traced.encode();
-        match &self.wit {
-            PassWit::Attention(w) => w.program(&bytes, &borrows),
-            PassWit::Recurrent(w) => w.program(&bytes, &borrows),
-            PassWit::Hybrid(w) => w.program(&bytes, &borrows),
-        }?;
+        self.wit.program(&bytes, &borrows)?;
         drop(inner);
         self.inner.borrow_mut().program_attached = true;
         Ok(())
+    }
+}
+
+impl<W: PassWit> Default for Pass<W> {
+    fn default() -> Self {
+        Pass::new()
     }
 }
 
@@ -1205,13 +1385,23 @@ pub fn live_slots() -> usize {
     }
     LIVE.with(|live| {
         *live.get_or_init(|| {
-            if crate::model::is_linear() {
+            if crate::model::pass_kind() != crate::model::ForwardKind::Attention {
                 1
             } else {
                 frame_size()
             }
         })
     })
+}
+
+/// Tokens per KV page (cached) — the divisor in every page-geometry
+/// expression. Also reachable as [`WorkingSet::page_size`], which is the
+/// spelling to prefer when a working set is in hand.
+pub fn kv_page_size() -> u32 {
+    thread_local! {
+        static PAGE: std::cell::OnceCell<u32> = const { std::cell::OnceCell::new() };
+    }
+    PAGE.with(|c| *c.get_or_init(crate::model::kv_page_size))
 }
 
 /// Max embed tokens in a single pass (C) — the guest-side prefill chunk
@@ -1283,7 +1473,10 @@ fn even_spans(n: u32, cap: u32) -> Vec<(u32, u32)> {
 /// in every slot) and slots may be heterogeneous (prefill chunks first, then
 /// decode). First submit of a pass traces and attaches its program;
 /// attachment, bind, and frame-validation errors surface here.
-fn submit_core_frame(on: &Pipeline, slots: &[Option<&PassCore>]) -> Result<(), String> {
+///
+/// A frame is monomorphic in its slot type by construction: `W` is one
+/// interface, so a mixed frame does not typecheck.
+pub fn submit_frame<W: PassWit>(on: &Pipeline, slots: &[Option<&Pass<W>>]) -> Result<(), String> {
     let k = frame_size();
     if slots.len() > k {
         return Err(format!(
@@ -1294,32 +1487,12 @@ fn submit_core_frame(on: &Pipeline, slots: &[Option<&PassCore>]) -> Result<(), S
     for pass in slots.iter().flatten() {
         pass.attach_program()?;
     }
-    // A frame is monomorphic in its slot type. The public entry points take
-    // `&[Option<&ForwardPass>]` of ONE module, so a mixed frame is already
-    // unrepresentable; this match just picks the matching WIT `submit`.
-    let kind = slots.iter().flatten().next();
-    let Some(kind) = kind else {
+    if slots.iter().flatten().next().is_none() {
         return Ok(());
-    };
-    macro_rules! dispatch {
-        ($variant:ident, $wit:path) => {{
-            let mut borrows: Vec<Option<&_>> = slots
-                .iter()
-                .map(|slot| match slot.map(|pass| &pass.wit) {
-                    Some(PassWit::$variant(w)) => Some(w),
-                    Some(_) => unreachable!("frames are monomorphic in their pass kind"),
-                    None => None,
-                })
-                .collect();
-            borrows.resize(k, None);
-            $wit(&on.wit, &borrows)
-        }};
     }
-    match &kind.wit {
-        PassWit::Attention(_) => dispatch!(Attention, wit_attention::submit),
-        PassWit::Recurrent(_) => dispatch!(Recurrent, wit_recurrent::submit),
-        PassWit::Hybrid(_) => dispatch!(Hybrid, wit_hybrid::submit),
-    }
+    let mut borrows: Vec<Option<&W>> = slots.iter().map(|slot| slot.map(|p| &p.wit)).collect();
+    borrows.resize(k, None);
+    W::submit(&on.wit, &borrows)
 }
 
 /// Keeps the engine's run-ahead window full while `on_token` consumes results,
@@ -1349,9 +1522,9 @@ fn submit_core_frame(on: &Pipeline, slots: &[Option<&PassCore>]) -> Result<(), S
 /// [`Pipeline::close`] reclaims them.
 ///
 /// Returns the number of times `on_token` ran.
-async fn run_ahead_core(
+pub async fn run_ahead<W: PassWit>(
     on: &Pipeline,
-    pass: &PassCore,
+    pass: &Pass<W>,
     budget: usize,
     mut on_token: impl AsyncFnMut() -> Result<std::ops::ControlFlow<()>, String>,
 ) -> Result<usize, String> {
@@ -1376,8 +1549,8 @@ async fn run_ahead_core(
         if live == 0 {
             return Ok(());
         }
-        let slots: Vec<Option<&PassCore>> = vec![Some(pass); live];
-        submit_core_frame(on, &slots)?;
+        let slots: Vec<Option<&Pass<W>>> = vec![Some(pass); live];
+        submit_frame(on, &slots)?;
         *submitted += live;
         Ok(())
     };
@@ -1477,21 +1650,30 @@ impl Default for Pipeline {
 /// algorithm from silently compiling against a hybrid model.
 pub mod shared_prelude {
     pub use super::{
-        Channel, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD, WorkingSet, channel_capacity,
-        frame_size, live_slots, max_embed_length, pad_tokens, prefill_chunks, unpad_tokens,
+        Channel, KvBinding, KvGeometry, PageGrant, Pipeline, RsGeometry, RsWorkingSet, TOKEN_PAD,
+        WorkingSet, channel_capacity, frame_size, kv_page_size, live_slots, max_embed_length,
+        pad_tokens, prefill_chunks, unpad_tokens,
     };
+    /// Every inferlet returns `inferlet::Result` from `#[inferlet::main]` and
+    /// asks the model for its tokenizer and vocabulary, so both come with the
+    /// prelude rather than being imported by hand 34 times over.
+    pub use crate::{Context, Result, model};
+    /// Only `Stage`: dtypes are spelled `dtype::f32` and friends, one
+    /// lowercase spelling for the one thing they name.
+    pub use pie_dsl::Stage;
     pub use pie_dsl::dtype;
     pub use pie_dsl::intrinsics;
+    /// The arithmetic intrinsics are deliberately absent: `+ - * / %` and
+    /// unary `-` are their spelling, and one spelling is the point.
     pub use pie_dsl::value::{
-        AsTensor, Tensor, abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum,
-        div, entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel,
-        gumbel_max, iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul,
-        max_elem, min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge,
-        rank_le, recip, reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng,
-        row_membership, scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
-        sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
+        Tensor, abs, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, entropy,
+        entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, indptr,
+        iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem,
+        min_elem, ne, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, recip,
+        reduce_argmax, reduce_max, reduce_min, reduce_sum, reshape, rng, row_membership,
+        scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
+        sliding_window_mask, softmax, sort_desc, top_k, transpose,
     };
-    pub use pie_dsl::{DType, Stage};
     pub use std::ops::ControlFlow;
 }
 
@@ -1499,98 +1681,144 @@ pub mod shared_prelude {
 // The three author-facing pass modules
 // ---------------------------------------------------------------------------
 
-/// Everything the three pass modules share, generated once. The DUPLICATION is
-/// the product: three unrelated `ForwardPass` types mean a helper written for
-/// attention-only KV eviction (H2O, SnapKV, TOVA, Quest) cannot even name a
-/// hybrid model's pass, which is the correctness gate this split exists for.
-macro_rules! pass_module {
-    ($variant:ident, $wit:path, $doc:expr) => {
-        #[doc = $doc]
-        pub struct ForwardPass(::std::rc::Rc<$crate::ptir::PassCore>);
-
-        impl ForwardPass {
-            pub fn new() -> Self {
-                Self(::std::rc::Rc::new($crate::ptir::PassCore::new(
-                    $crate::ptir::PassWit::$variant(<$wit>::new()),
-                )))
-            }
-
-            /// Bind token ids and CSR row indptr. Both are channels.
-            pub fn embed(
-                &self,
-                tokens: &$crate::ptir::Channel,
-                indptr: &$crate::ptir::Channel,
-            ) -> Result<(), String> {
-                self.0.embed(tokens, indptr)
-            }
-
-            /// Bind readout indexes through a channel, separately from embedding.
-            pub fn readout(&self, indices: &$crate::ptir::Channel) -> Result<(), String> {
-                self.0.readout(indices)
-            }
-
-            /// Attach the `prologue` stage.
-            pub fn prologue(&self, body: impl Fn() + 'static) {
-                self.0.prologue(body)
-            }
-            /// Attach the `epilogue` stage (sampling programs; after the forward).
-            pub fn epilogue(&self, body: impl Fn() + 'static) {
-                self.0.epilogue(body)
-            }
-
-            /// Enqueue this pass as a SINGLE-SLOT FRAME on `on`.
-            pub fn submit(&self, on: &$crate::ptir::Pipeline) -> Result<(), String> {
-                self.0.submit(on)
-            }
-        }
-
-        impl Default for ForwardPass {
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-
-        /// Submit ONE FRAME on `on`: up to `frame_size()` ordered slots, slot i
-        /// executing in wave i; missing trailing slots are padded with no-ops.
-        pub fn submit_frame(
-            on: &$crate::ptir::Pipeline,
-            slots: &[Option<&ForwardPass>],
-        ) -> Result<(), String> {
-            let cores: Vec<Option<&$crate::ptir::PassCore>> = slots
-                .iter()
-                .map(|slot| slot.map(|pass| pass.0.as_ref()))
-                .collect();
-            $crate::ptir::submit_core_frame(on, &cores)
-        }
-
-        /// Keeps the engine's run-ahead window full while `on_token` consumes
-        /// results. See the crate-level `run_ahead` documentation.
-        pub async fn run_ahead(
-            on: &$crate::ptir::Pipeline,
-            pass: &ForwardPass,
-            budget: usize,
-            on_token: impl AsyncFnMut() -> Result<::std::ops::ControlFlow<()>, String>,
-        ) -> Result<usize, String> {
-            $crate::ptir::run_ahead_core(on, pass.0.as_ref(), budget, on_token).await
-        }
-    };
-}
-
 /// Attention taps, legal only where attention layers exist.
-macro_rules! pass_module_attention_stages {
-    () => {
-        impl ForwardPass {
-            /// Attach the `on_attn_proj` stage (per layer, before attention).
-            pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
-                self.0.on_attn_proj(body)
-            }
-            /// Attach the `on_attn` stage (per layer, after attention).
-            pub fn on_attn(&self, body: impl Fn() + 'static) {
-                self.0.on_attn(body)
-            }
-        }
-    };
+impl Pass<wit_attention::ForwardPass> {
+    /// Attach the `on_attn_proj` stage (per layer, before attention).
+    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttnProj, body);
+    }
+    /// Attach the `on_attn` stage (per layer, after attention).
+    pub fn on_attn(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttn, body);
+    }
+
+    /// `pie:inferlet/forward.attention` — bind the KV working set and all of
+    /// its geometry channels. See [`KvGeometry`]. REQUIRED.
+    pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        let kv = self.stage_kv(ws, geom)?;
+        wit_attention::ForwardPass::attention(
+            &self.wit,
+            kv.ws.as_ref(),
+            &wit_attention::KvGeometry {
+                readable_pages: kv.readable.wit(),
+                writable_pages: kv.writable.wit(),
+                kv_len: kv.kv_len.as_ref(),
+                pages: kv.pages.as_ref(),
+                page_indptr: kv.page_indptr.as_ref(),
+                w_slot: kv.w_slot.as_ref(),
+                w_off: kv.w_off.as_ref(),
+                positions: kv.positions.as_ref(),
+                mask: kv.mask.as_deref(),
+            },
+        )
+    }
 }
+
+impl Pass<wit_hybrid::ForwardPass> {
+    /// Attach the `on_attn_proj` stage (per attention layer, before attention).
+    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttnProj, body);
+    }
+    /// Attach the `on_attn` stage (per attention layer, after attention).
+    pub fn on_attn(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttn, body);
+    }
+
+    /// `pie:inferlet/forward-hybrid.attention` — bind BOTH halves of the state
+    /// this pass fires over. REQUIRED.
+    ///
+    /// One call because they are one binding: the same forward reads paged KV
+    /// in its attention layers and a folded state in its recurrent ones, and
+    /// the runtime has to see them together to place the fire. `kv` is an
+    /// [`Option`] so a recurrent-only commit fire is expressible without
+    /// inventing dummy attention geometry.
+    ///
+    /// Calling it again after the first submit REBINDS -- the request set or
+    /// the fold boundary changed between fires -- which is how a beam fork or
+    /// a speculative commit re-aims an already-traced pass.
+    pub fn attention<R, W, B>(
+        &self,
+        kv: Option<KvBinding<'_, R, W>>,
+        rs: &[RsWorkingSet],
+        rs_geom: RsGeometry<'_, B>,
+    ) -> Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+        B: RangeBounds<u32>,
+    {
+        let kv = kv
+            .map(|kv| self.stage_kv(kv.working_set, kv.geometry))
+            .transpose()?;
+        let rs = self.stage_rs(rs, rs_geom)?;
+        let binding = kv.as_ref().map(|kv| wit_hybrid::KvBinding {
+            working_set: kv.ws.as_ref(),
+            geometry: wit_hybrid::KvGeometry {
+                readable_pages: kv.readable.wit(),
+                writable_pages: kv.writable.wit(),
+                kv_len: kv.kv_len.as_ref(),
+                pages: kv.pages.as_ref(),
+                page_indptr: kv.page_indptr.as_ref(),
+                w_slot: kv.w_slot.as_ref(),
+                w_off: kv.w_off.as_ref(),
+                positions: kv.positions.as_ref(),
+                mask: kv.mask.as_deref(),
+            },
+        });
+        let borrows: Vec<&crate::working_set::RsWorkingSet> =
+            rs.working_sets.iter().map(Rc::as_ref).collect();
+        wit_hybrid::ForwardPass::attention(
+            &self.wit,
+            binding.as_ref(),
+            &borrows,
+            &wit_hybrid::RsGeometry {
+                fold_len: rs.fold_len.as_ref(),
+                buffer: rs.buffer.wit(),
+            },
+        )
+    }
+}
+
+impl Pass<wit_recurrent::ForwardPass> {
+    /// `pie:inferlet/forward-recurrent.attention` — bind the recurrent state:
+    /// one working set per request, in resolved request order, plus where its
+    /// folded boundary lands. REQUIRED.
+    ///
+    /// The mechanism is a recurrence, but the SLOT NAME is `attention` in all
+    /// three interfaces: the role inside a pass is the same regardless of
+    /// mechanism, and only the signature varies.
+    ///
+    /// Calling it again after the first submit REBINDS.
+    pub fn attention<B>(&self, rs: &[RsWorkingSet], geom: RsGeometry<'_, B>) -> Result<(), String>
+    where
+        B: RangeBounds<u32>,
+    {
+        let rs = self.stage_rs(rs, geom)?;
+        let borrows: Vec<&crate::working_set::RsWorkingSet> =
+            rs.working_sets.iter().map(Rc::as_ref).collect();
+        wit_recurrent::ForwardPass::attention(
+            &self.wit,
+            &borrows,
+            &wit_recurrent::RsGeometry {
+                fold_len: rs.fold_len.as_ref(),
+                buffer: rs.buffer.wit(),
+            },
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The three author-facing pass aliases
+// ---------------------------------------------------------------------------
+//
+// One alias per `pie:inferlet` forward interface. They are DISTINCT types --
+// `Pass<A>` and `Pass<H>` share no impl -- which is the correctness gate this
+// split exists for: a helper written for attention-only KV eviction (H2O,
+// SnapKV, TOVA, Quest) cannot even name a hybrid model's pass.
 
 /// `pie:inferlet/forward` — paged, per-token, reversibly discardable KV only.
 ///
@@ -1600,50 +1828,9 @@ macro_rules! pass_module_attention_stages {
 ///
 /// [`ForwardKind::Attention`]: crate::model::ForwardKind
 pub mod attention {
-    use super::*;
-
-    pass_module!(
-        Attention,
-        wit_attention::ForwardPass,
-        "An attention-only forward pass."
-    );
-    pass_module_attention_stages!();
-
-    impl ForwardPass {
-        /// Bind attention and all of its geometry channels. `mask: None` omits
-        /// PTIR's AttnMask port; `Some` binds that channel to it.
-        #[allow(clippy::too_many_arguments)]
-        pub fn attention<R, W>(
-            &self,
-            ws: &WorkingSet,
-            readable: R,
-            writable: W,
-            kv_len: &Channel,
-            pages: &Channel,
-            page_indptr: &Channel,
-            w_slot: &Channel,
-            w_off: &Channel,
-            positions: &Channel,
-            mask: Option<&Channel>,
-        ) -> Result<(), String>
-        where
-            R: ::std::ops::RangeBounds<u32>,
-            W: ::std::ops::RangeBounds<u32>,
-        {
-            self.0.attention(
-                ws,
-                readable,
-                writable,
-                kv_len,
-                pages,
-                page_indptr,
-                w_slot,
-                w_off,
-                positions,
-                mask,
-            )
-        }
-    }
+    /// An attention-only forward pass.
+    pub type ForwardPass = super::Pass<super::wit_attention::ForwardPass>;
+    pub use super::{run_ahead, submit_frame};
 
     /// Glob-import surface for attention-only inferlet authors.
     pub mod prelude {
@@ -1660,40 +1847,9 @@ pub mod attention {
 ///
 /// [`ForwardKind::Recurrent`]: crate::model::ForwardKind
 pub mod recurrent {
-    use super::*;
-
-    pass_module!(
-        Recurrent,
-        wit_recurrent::ForwardPass,
-        "A recurrent-only forward pass."
-    );
-
-    impl ForwardPass {
-        /// Bind the recurrent-state working sets in resolved request order.
-        /// The mechanism is a recurrence, but the SLOT is the same one
-        /// `attention` names in the other two interfaces.
-        pub fn attention(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-            self.0.bind_recurrent(working_sets, rs_geometry_fold_all()?)
-        }
-
-        /// Bind the recurrent state AND state where its folded boundary
-        /// lands. See [`hybrid::ForwardPass::recurrent_with`] -- the surface
-        /// and the semantics are identical.
-        ///
-        /// [`hybrid::ForwardPass::recurrent_with`]: crate::ptir::hybrid::ForwardPass::recurrent_with
-        pub fn attention_with<B>(
-            &self,
-            working_sets: &[RsWorkingSet],
-            fold_len: &Channel,
-            buffer: B,
-        ) -> Result<(), String>
-        where
-            B: RangeBounds<u32>,
-        {
-            let geom = rs_geometry_bind(fold_len, buffer)?;
-            self.0.bind_recurrent(working_sets, geom)
-        }
-    }
+    /// A recurrent-only forward pass.
+    pub type ForwardPass = super::Pass<super::wit_recurrent::ForwardPass>;
+    pub use super::{run_ahead, submit_frame};
 
     /// Glob-import surface for recurrent-only inferlet authors.
     pub mod prelude {
@@ -1711,138 +1867,15 @@ pub mod recurrent {
 ///
 /// [`ForwardKind::Hybrid`]: crate::model::ForwardKind
 pub mod hybrid {
-    use super::*;
-
-    pass_module!(Hybrid, wit_hybrid::ForwardPass, "A hybrid forward pass.");
-    pass_module_attention_stages!();
-
-    impl ForwardPass {
-        /// Bind the ATTENTION half. The two halves are recorded independently
-        /// and issued as the single `forward-hybrid.attention` call on first
-        /// submit, so their order here does not matter -- but both are
-        /// required.
-        #[allow(clippy::too_many_arguments)]
-        pub fn attention<R, W>(
-            &self,
-            ws: &WorkingSet,
-            readable: R,
-            writable: W,
-            kv_len: &Channel,
-            pages: &Channel,
-            page_indptr: &Channel,
-            w_slot: &Channel,
-            w_off: &Channel,
-            positions: &Channel,
-            mask: Option<&Channel>,
-        ) -> Result<(), String>
-        where
-            R: ::std::ops::RangeBounds<u32>,
-            W: ::std::ops::RangeBounds<u32>,
-        {
-            self.0.attention(
-                ws,
-                readable,
-                writable,
-                kv_len,
-                pages,
-                page_indptr,
-                w_slot,
-                w_off,
-                positions,
-                mask,
-            )
-        }
-
-        /// Bind the RECURRENT half: one working set per request, in resolved
-        /// request order.
-        pub fn recurrent(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-            self.0.bind_recurrent(working_sets, rs_geometry_fold_all()?)
-        }
-
-        /// Bind the RECURRENT half AND state where its folded boundary lands.
-        ///
-        /// `fold_len` is a channel carrying, per request, how far the folded
-        /// boundary advances over `[buffer | this fire's tokens]`, clamped to
-        /// that tail:
-        ///
-        /// - `u32::MAX` -- fold everything. What [`recurrent`] supplies.
-        /// - `0` -- fold nothing; append every token of this fire to the
-        ///   buffer. This is what makes a linear model speculatable: buffered
-        ///   tokens that are never folded cost nothing to abandon.
-        /// - `n <= buffer_len` -- fold the first `n` buffered tokens and drop
-        ///   the covered head pages. The COMMIT half of speculation.
-        ///
-        /// A channel rather than a scalar so that a device-computed accepted
-        /// count can drive the fold directly, fusing verify and commit into
-        /// one fire.
-        ///
-        /// [`recurrent`]: ForwardPass::recurrent
-        pub fn recurrent_with<B>(
-            &self,
-            working_sets: &[RsWorkingSet],
-            fold_len: &Channel,
-            buffer: B,
-        ) -> Result<(), String>
-        where
-            B: RangeBounds<u32>,
-        {
-            let geom = rs_geometry_bind(fold_len, buffer)?;
-            self.0.bind_recurrent(working_sets, geom)
-        }
-    }
+    /// A hybrid forward pass.
+    pub type ForwardPass = super::Pass<super::wit_hybrid::ForwardPass>;
+    pub use super::{run_ahead, submit_frame};
 
     /// Glob-import surface for hybrid inferlet authors.
     pub mod prelude {
         pub use super::{ForwardPass, run_ahead, submit_frame};
         pub use crate::ptir::shared_prelude::*;
     }
-}
-
-fn recurrent_rs_geometry(geom: &RsGeometryBind) -> wit_recurrent::RsGeometry<'_> {
-    wit_recurrent::RsGeometry {
-        fold_len: geom.fold_len.as_ref(),
-        buffer: geom.buffer.wit(),
-    }
-}
-
-fn hybrid_rs_geometry(geom: &RsGeometryBind) -> wit_hybrid::RsGeometry<'_> {
-    wit_hybrid::RsGeometry {
-        fold_len: geom.fold_len.as_ref(),
-        buffer: geom.buffer.wit(),
-    }
-}
-
-fn rs_geometry_bind<B>(fold_len: &Channel, buffer: B) -> Result<RsGeometryBind, String>
-where
-    B: RangeBounds<u32>,
-{
-    Ok(RsGeometryBind {
-        port: Some((Port::RsFoldLen, *fold_len)),
-        fold_len: fold_len.wit(),
-        buffer: PageDeclaration::from_range(buffer)?,
-    })
-}
-
-/// The geometry of a pass that never buffers: an empty buffer and a `fold-len`
-/// past the tail, which clamps to "fold every token of every fire".
-///
-/// This is degenerate but MEANINGFUL -- it is the fast path stated explicitly,
-/// not the dummy geometry this surface exists to avoid. The buffer channels are
-/// never dereferenced because `buffer-len` is zero.
-fn rs_geometry_fold_all() -> Result<RsGeometryBind, String> {
-    thread_local! {
-        /// Minted once per guest thread: a rebind must not leak a fresh
-        /// channel every time the request set changes.
-        static FOLD_ALL: Channel = Channel::from(vec![u32::MAX]);
-    }
-    FOLD_ALL.with(|fold_len| {
-        let mut geom = rs_geometry_bind(fold_len, 0..0)?;
-        // A pass that folds everything unconditionally has nothing to compute,
-        // so claiming the port would put a dead one in every plain recurrent
-        // trace.
-        geom.port = None;
-        Ok(geom)
-    })
 }
 
 #[cfg(test)]

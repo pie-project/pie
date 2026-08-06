@@ -3,7 +3,7 @@
 //! until every awaited lane's next FRAME is fully submitted, then seal the
 //! dense epoch and dispatch its k waves in slot order.
 //!
-//! Every deployment routes here, including `PIE_FRAME_SIZE=1`:
+//! Every deployment routes here, including k = 1:
 //! a 1-slot frame IS a wave, so k = 1 reproduces the per-wave wait-all
 //! barrier (each tracked fire arrives as its own single-fire frame; a seal
 //! boundary is a wave boundary). The former per-wave `WaitAllPolicy`
@@ -63,41 +63,43 @@
 //! `on_fire_dropped` (rejected while queued).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::stats::SchedulerStats;
 use crate::scheduler::ProcessId;
 
-/// Default run-ahead depth: one batch computing plus one prefetched.
-/// The N9 depth dose-response superseded the older depth-3 default:
-/// depth 2 reduced missing/deferred enough to win steady throughput in
-/// all three paired production-shape runs while retaining pre-enqueue.
-/// `PIE_SCHED_MAX_IN_FLIGHT` may reduce this; depth above three is
-/// intentionally capped because the CUDA driver sizes its pinned staging
-/// pools from this value (`kSchedulerMaxInFlight` in
-/// driver/cuda/src/runahead.hpp — staging depth must EXCEED run-ahead,
-/// so raising this without raising that re-serializes every submit).
-const DEFAULT_MAX_IN_FLIGHT: usize = 2;
-const MAX_IN_FLIGHT: usize = 3;
+/// Default dispatch depth (`[model.scheduler] frame_dispatch_depth`): one
+/// batch computing plus one prefetched. The N9 depth dose-response superseded
+/// the older depth-3 default: depth 2 reduced missing/deferred enough to win
+/// steady throughput in all three paired production-shape runs while retaining
+/// pre-enqueue.
+///
+/// Dispatch-time preparation is the allocation-credit gate: physical pool
+/// allocation is atomic, and an exhausted request remains a retrying
+/// preparation rather than overcommitting. Depth therefore costs committed
+/// pages, which is half of why deeper is not simply better.
+///
+/// The joint bound against the driver's staging pool
+/// (`frame_dispatch_depth * frame_size < kUploadStagingDepth`) is enforced by
+/// `SchedulerConfig::validate()`, where both factors are visible at once.
+const DEFAULT_DISPATCH_DEPTH: usize = 2;
 
-/// Reads the requested run-ahead depth once. Dispatch-time preparation is the
-/// allocation-credit gate: physical pool allocation is atomic, and an
-/// exhausted request remains a retrying preparation rather than overcommitting.
-fn parse_max_in_flight(value: Option<&str>) -> usize {
-    value
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_IN_FLIGHT)
-        .clamp(1, MAX_IN_FLIGHT)
+pub(super) fn configured_dispatch_depth() -> usize {
+    match DISPATCH_DEPTH.load(Ordering::Relaxed) {
+        0 => DEFAULT_DISPATCH_DEPTH,
+        depth => depth,
+    }
 }
 
-pub(super) fn configured_max_in_flight() -> usize {
-    static CONFIGURED: OnceLock<usize> = OnceLock::new();
-    *CONFIGURED.get_or_init(|| {
-        parse_max_in_flight(std::env::var("PIE_SCHED_MAX_IN_FLIGHT").ok().as_deref())
-    })
+/// Install the configured dispatch depth at bootstrap.
+pub(crate) fn set_dispatch_depth(depth: usize) {
+    DISPATCH_DEPTH.store(depth, Ordering::Relaxed);
 }
+
+/// `0` = never installed; see `crate::scheduler::reconfigure`.
+static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 /// `PIE_SEAL_MODE=ready`: when the device is idle and at least one lane's
 /// next frame is arrival-complete, OPEN the boundary with that subset
@@ -110,22 +112,6 @@ pub(super) fn configured_max_in_flight() -> usize {
 fn seal_mode_ready() -> bool {
     static CONFIGURED: OnceLock<bool> = OnceLock::new();
     *CONFIGURED.get_or_init(|| std::env::var("PIE_SEAL_MODE").is_ok_and(|value| value == "ready"))
-}
-
-/// `PIE_GATE_DUMP_MS=<ms>`: while the device is executing and the gate is
-/// held, dump the IDENTITY and state of every lane denying the seal, at
-/// most once per interval (0/absent = off). The counters can only say how
-/// many and how they classify; this says WHO, which is what the chain-
-/// collapse investigation (analysis.md 10.22-10.23) ran out of.
-fn gate_dump_interval() -> Option<Duration> {
-    static CONFIGURED: OnceLock<Option<Duration>> = OnceLock::new();
-    *CONFIGURED.get_or_init(|| {
-        std::env::var("PIE_GATE_DUMP_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|ms| *ms > 0)
-            .map(Duration::from_millis)
-    })
 }
 
 /// Default ON; `PIE_GATE_CONTRIBUTED=0` restores the strict wait-all rule.
@@ -214,16 +200,6 @@ impl PendingFrame {
     fn is_complete(&self) -> bool {
         self.park || self.fires.len() >= self.expected as usize
     }
-
-    /// Diagnostics only (`PIE_GATE_DUMP_MS`): how much of this frame has
-    /// arrived, and how much it is waiting for.
-    fn arrived_slots(&self) -> usize {
-        self.fires.len()
-    }
-
-    fn expected_slots(&self) -> u32 {
-        self.expected
-    }
 }
 
 struct LaneState {
@@ -273,11 +249,6 @@ struct LaneState {
     /// only ever runs against a CLOSED boundary, this is true for every
     /// blocking lane there, so testing it said nothing.
     fired_this_boundary: bool,
-    /// Seal counter at this lane's last implicit rejoin, `u64::MAX` if it has
-    /// never parked. Probe-only: it ages a rejoin so the run-ahead accumulator
-    /// can ask whether the lanes holding a seal are the ones that just came
-    /// back from a planner park.
-    rejoin_seal: u64,
 }
 
 /// The wait-all gate's verdict for ONE lane — [`LaneState::gate_verdict`].
@@ -290,8 +261,7 @@ enum GateVerdict {
     Blocking,
     /// A member with nothing queued that the engine still OWES a result, so
     /// its next frame cannot exist until the device answers (see
-    /// [`gate_contributed`]). Not counted missing, and counted into
-    /// `RUN_AHEAD.contrib_skipped`.
+    /// [`gate_contributed`]). Not counted missing.
     SkippedOwed,
 }
 
@@ -490,12 +460,6 @@ pub(super) struct FramePolicy {
     /// seal candidate. `Some(seq) == arrival_seq` at the next evaluation
     /// means no new arrival landed in between: quiesced.
     quiesce_mark: Option<u64>,
-    /// Monotonic seal counter, used only to age a lane's last implicit
-    /// rejoin for the run-ahead probe.
-    seal_seq: u64,
-    /// Probe: start of the current episode in which the wait-all gate is held
-    /// with at least one awaited lane missing.
-    gate_block_from: Option<Instant>,
     /// Lanes with fires the engine has dispatched but not yet retired: the
     /// engine owes them a result, so the submit deadline's clock must not run
     /// against them. This is the debt a lockstep guest (no run-ahead, awaits
@@ -503,6 +467,15 @@ pub(super) struct FramePolicy {
     /// without it an aggressive deadline would kill exactly the guests that
     /// are behaving, since they cannot submit until the engine answers.
     in_flight_lanes: BTreeSet<ProcessId>,
+    /// When each in-flight lane's debt was incurred. `in_flight_lanes` stops
+    /// the silence clock outright, which is right for a wave that will retire
+    /// and wrong for one that never will: a command buffer that came back out
+    /// of memory is never retired, `on_frame_retired` is never called, and the
+    /// lane's clock is reset on every tick forever. The engine then owes a
+    /// result it cannot produce and the scheduler waits for it without limit
+    /// -- a hang with no message, which is how the Qwen residency overrun
+    /// presented before it was diagnosed. The debt itself gets a deadline.
+    in_flight_since: BTreeMap<ProcessId, Instant>,
     /// How long a silent member may hold the boundary before the LEASH drops
     /// it from the wait-set. Not a verdict and not a failure: the lane parks,
     /// its queued frames still dispatch, and its next fire rejoins. Purely a
@@ -516,8 +489,6 @@ pub(super) struct FramePolicy {
     /// already protects the fleet, so nothing but a genuinely abandoned
     /// process reaches this.
     silence_timeout: Duration,
-    /// Next instant a blocked-gate dump may be emitted (`PIE_GATE_DUMP_MS`).
-    gate_dump_at: Option<Instant>,
     /// [`gate_contributed`], read once so the lever is fixed for the policy's
     /// life (and overridable in tests without touching the process
     /// environment). `false` is the strict wait-all rule.
@@ -599,18 +570,16 @@ impl FramePolicy {
             strict_watchdog_deadline: None,
             arrival_seq: 0,
             quiesce_mark: None,
-            seal_seq: 0,
-            gate_block_from: None,
             in_flight_lanes: BTreeSet::new(),
+            in_flight_since: BTreeMap::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
-            gate_dump_at: None,
             gate_contributed: gate_contributed(),
             stats,
         }
     }
 
-    /// Whether this deployment runs 1-slot frames (`PIE_FRAME_SIZE=1`):
+    /// Whether this deployment runs 1-slot frames (k = 1):
     /// a frame is a wave, and the worker synthesizes a per-fire stamp at
     /// admission instead of the guest submitting frames.
     pub fn single_slot(&self) -> bool {
@@ -626,17 +595,6 @@ impl FramePolicy {
         tokens: usize,
         rows: usize,
     ) {
-        if Self::stamp_trace() {
-            use std::sync::atomic::{AtomicU64, Ordering as O};
-            static N: AtomicU64 = AtomicU64::new(0);
-            let n = N.fetch_add(1, O::Relaxed) + 1;
-            if n % 256 == 0 {
-                eprintln!(
-                    "[stamp] n={n} k={} slot={} fires={} seq={}",
-                    self.k, stamp.slot, stamp.fires, stamp.seq
-                );
-            }
-        }
         self.record_arrival(
             stamp,
             owner,
@@ -653,17 +611,6 @@ impl FramePolicy {
     /// toward its frame's arrival completeness so the frame can seal (its
     /// surviving fires execute; the guest observed the rejection).
     pub fn on_fire_rejected_at_admission(&mut self, stamp: FrameStamp, owner: Option<ProcessId>) {
-        if Self::stamp_trace() {
-            use std::sync::atomic::{AtomicU64, Ordering as O};
-            static N: AtomicU64 = AtomicU64::new(0);
-            let n = N.fetch_add(1, O::Relaxed) + 1;
-            if n % 256 == 0 {
-                eprintln!(
-                    "[stamp] n={n} k={} slot={} fires={} seq={}",
-                    self.k, stamp.slot, stamp.fires, stamp.seq
-                );
-            }
-        }
         self.record_arrival(
             stamp,
             owner,
@@ -708,7 +655,6 @@ impl FramePolicy {
             }
             _ => false,
         };
-        let seal_seq = self.seal_seq;
         let lane = self.lanes.entry(stamp.lane).or_insert_with(|| LaneState {
             owner,
             awaited: !suspended,
@@ -723,7 +669,6 @@ impl FramePolicy {
             // arriving mid-boundary is not a member of it, and one arriving
             // between boundaries is picked up by the next gate.
             fired_this_boundary: true,
-            rejoin_seal: u64::MAX,
         });
         if lane.owner.is_none() {
             lane.owner = owner;
@@ -737,10 +682,6 @@ impl FramePolicy {
         if lane.parked && !suspended {
             lane.parked = false;
             lane.awaited = true;
-            lane.rejoin_seal = seal_seq;
-            crate::scheduler::RUN_AHEAD
-                .rejoins
-                .fetch_add(1, Ordering::Relaxed);
         }
         // Any accepted arrival is proof of life: the deadline measures
         // consecutive silence while blocking a seal, not elapsed lifetime.
@@ -749,20 +690,6 @@ impl FramePolicy {
         let frame = match lane.frames.iter_mut().find(|frame| frame.seq == stamp.seq) {
             Some(frame) => frame,
             None => {
-                // Arrival-time queue depth: how many frames this lane already
-                // has queued when a NEW frame starts arriving. 0 = the lane
-                // runs frame-to-frame (reactive); >=1 = real run-ahead depth
-                // at the scheduler. Distinguishes guest pacing from every
-                // downstream suspect (ring, staging, seal).
-                {
-                    let acc = &crate::scheduler::RUN_AHEAD;
-                    let cell = match lane.frames.len() {
-                        0 => &acc.arrq0,
-                        1 => &acc.arrq1,
-                        _ => &acc.arrq2,
-                    };
-                    cell.fetch_add(1, Ordering::Relaxed);
-                }
                 lane.frames.push_back(PendingFrame {
                     seq: stamp.seq,
                     expected: stamp.fires,
@@ -857,31 +784,9 @@ impl FramePolicy {
     /// and a live one is charged for engine latency. Re-arming from each
     /// retirement is monotonically safe under both.
     pub fn on_frame_retired(&mut self, lanes: impl IntoIterator<Item = ProcessId>) {
-        // Completion-time queue census: how many frames each awaited lane
-        // holds at the moment a wave retires — the scheduler-side truth
-        // about whether run-ahead inventory exists when the device needs
-        // the next wave (arrival-time sampling can't see this).
-        {
-            let acc = &crate::scheduler::RUN_AHEAD;
-            let (mut r0, mut r1, mut r2) = (0u64, 0u64, 0u64);
-            for state in self.lanes.values().filter(|state| state.awaited) {
-                let complete = state
-                    .frames
-                    .iter()
-                    .filter(|frame| frame.is_complete())
-                    .count();
-                match complete {
-                    0 => r0 += 1,
-                    1 => r1 += 1,
-                    _ => r2 += 1,
-                }
-            }
-            acc.retq0.fetch_add(r0, Ordering::Relaxed);
-            acc.retq1.fetch_add(r1, Ordering::Relaxed);
-            acc.retq2.fetch_add(r2, Ordering::Relaxed);
-        }
         for lane in lanes {
             self.in_flight_lanes.remove(&lane);
+            self.in_flight_since.remove(&lane);
             if let Some(state) = self.lanes.get_mut(&lane) {
                 state.clock_from = None;
             }
@@ -928,11 +833,6 @@ impl FramePolicy {
                 self.staged.insert(pid);
             }
         }
-    }
-
-    fn stamp_trace() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("PIE_FRAME_SHAPE").is_some())
     }
 
     /// Bootstrap: seed the slot balance with the execution pool's initial
@@ -1076,13 +976,6 @@ impl FramePolicy {
     /// nothing and left the process in `joins_in_flight` forever, wedging
     /// the seal gate against a join that could never arrive.
     pub fn on_lane_leave(&mut self, lane: ProcessId, owner: Option<ProcessId>, purge_queued: bool) {
-        if !purge_queued {
-            let acc = &crate::scheduler::RUN_AHEAD;
-            acc.leave_close.fetch_add(1, Ordering::Relaxed);
-            if self.lanes.contains_key(&lane) {
-                acc.leave_hit.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         // Recover the owner from the lane while it still exists; an explicit
         // `owner` wins, since a laneless leaver can only be identified that way.
         let owner = owner.or_else(|| self.lanes.get(&lane).and_then(|state| state.owner));
@@ -1119,9 +1012,6 @@ impl FramePolicy {
                 .is_some_and(|state| state.frames.is_empty());
             if drained {
                 self.lanes.remove(&lane);
-                crate::scheduler::RUN_AHEAD
-                    .leave_removed
-                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         if let Some(owner) = owner {
@@ -1246,6 +1136,10 @@ impl FramePolicy {
     fn forget_staged(&mut self, pid: ProcessId) {
         self.staged.remove(&pid);
         self.joins_in_flight.remove(&pid);
+        // A lane that departs owing a result owes it to nobody. Dropped here
+        // as well as at retirement so the debt ledger cannot outlive the
+        // process it is keyed by.
+        self.in_flight_since.remove(&pid);
     }
 
     /// Mirror of the quorum's empty-wait-set re-arm: when the last awaited
@@ -1305,7 +1199,7 @@ impl FramePolicy {
     /// partition's content at an instant when no fire had executed, so a
     /// prefill-heavy boundary could only ever produce prefill-only launches
     /// (CONTENTION_FOLLOWUP §20.49). The worker posts at most
-    /// `configured_max_in_flight()` frames, so partitions beyond that were
+    /// `configured_dispatch_depth()` frames, so partitions beyond that were
     /// dispatched long after their content froze.
     ///
     /// Called only once the wait-all gate holds for a CLOSED boundary (no
@@ -1320,27 +1214,6 @@ impl FramePolicy {
         // seals, so a call that finds nothing sealable leaves the policy
         // untouched and control at the gate.
         let mid_boundary = self.boundary_open();
-        if !mid_boundary {
-            // Run-ahead histogram, sampled once per boundary (== once per
-            // wave). `frames.len()` counts the frame about to be sealed plus
-            // whatever the guest queued behind it, so `len - 1` is this
-            // lane's run-ahead in frames.
-            let acc = &crate::scheduler::RUN_AHEAD;
-            let (mut n, mut a0, mut a1, mut a2) = (0u64, 0u64, 0u64, 0u64);
-            for lane in self.lanes.values().filter(|lane| lane.awaited) {
-                n += 1;
-                match lane.frames.len() {
-                    0 | 1 => a0 += 1,
-                    2 => a1 += 1,
-                    _ => a2 += 1,
-                }
-            }
-            acc.lanes.fetch_add(n, Ordering::Relaxed);
-            acc.ahead0.fetch_add(a0, Ordering::Relaxed);
-            acc.ahead1.fetch_add(a1, Ordering::Relaxed);
-            acc.ahead2.fetch_add(a2, Ordering::Relaxed);
-            self.seal_seq = self.seal_seq.wrapping_add(1);
-        }
 
         // ONE partition per call. Candidate order: the lowest-id lane that has
         // not fired into this boundary first (progress guarantee: every
@@ -1542,6 +1415,17 @@ impl FramePolicy {
                 // clocks stop here and only restart at `on_frame_retired`,
                 // so the wave's own latency is never charged to the guest.
                 self.in_flight_lanes.extend(frame.members.iter().copied());
+                // Stamped once per lane, not re-stamped: a lane already in
+                // debt from an earlier wave is measured from when the debt
+                // began, or a steady stream of new waves would refresh the
+                // backstop it exists to enforce.
+                // `now`, not `Instant::now()`: the scan below measures the debt
+                // against the same clock the caller passed, and two clocks
+                // that differ by a scheduling delay make the backstop fire a
+                // tick late for reasons nothing can see.
+                for member in frame.members.iter().copied() {
+                    self.in_flight_since.entry(member).or_insert(now);
+                }
                 return FramePlan::Dispatch(frame.waves);
             }
             // Boundary: the wait-all frame quorum. Seal only once every
@@ -1617,26 +1501,12 @@ impl FramePolicy {
             // busy, and a global clock would be reset by their traffic
             // forever.
             let mut expired: Vec<ProcessId> = Vec::new();
-            let mut blocking_pin = false;
-            let (mut blk_owed, mut blk_empty, mut blk_partial) = (0u64, 0u64, 0u64);
             let leash = self.submit_deadline;
             let silence = self.silence_timeout;
-            // WHO is denying the seal (see `gate_dump_interval`). Rate-limited
-            // and off by default, so the scan below pays one bool.
-            let dump_due = executing
-                && gate_dump_interval().is_some_and(|every| {
-                    self.gate_dump_at.is_none_or(|at| now >= at)
-                        && {
-                            self.gate_dump_at = Some(now + every);
-                            true
-                        }
-                });
-            let mut dump: Vec<serde_json::Value> = Vec::new();
             // The relaxation applies only while a frame is EXECUTING: with the
             // device idle there is no chain to protect and dense gathering is
             // simply right.
             let contributed_relax = self.gate_contributed && executing;
-            let mut contrib_skipped = 0u64;
             // The gate is reached only for a CLOSED boundary — the block above
             // either sealed and restarted the loop, or ran `close_boundary`.
             // That is what makes `fired_this_boundary` uninformative here (it
@@ -1650,25 +1520,47 @@ impl FramePolicy {
                     || lane
                         .owner
                         .is_some_and(|owner| self.pending_binds.contains_key(&owner));
+                // The debt's own deadline. Generous on purpose -- twice the
+                // silence timeout -- because this is a backstop against an
+                // engine that will never answer, not a bound on how long a
+                // legitimate wave may take. A lane past it is treated as
+                // silent again, so the ordinary expiry below reports it
+                // instead of the scheduler waiting forever without a word.
+                //
+                // Hoisted ABOVE the gate verdict because the two compose: the
+                // relaxation skips a lane precisely because the engine owes it
+                // a result, which is the same state this backstop exists to
+                // notice when the result never comes. Skipping such a lane
+                // forever would swallow exactly the hang the backstop reports,
+                // so a debt past its deadline suppresses the relaxation and
+                // the lane is judged by the ordinary ladder below. No measured
+                // run has ever carried a debt this old, so the rule the
+                // campaign measured is unchanged.
+                let debt_since = if owes { self.in_flight_since.get(lane_id).copied() } else { None };
+                let owes_forever = debt_since
+                    .is_some_and(|from| now.saturating_duration_since(from) >= silence * 2);
                 // THE gate rule lives in `gate_verdict`. Leashed: already
                 // dropped by the leash below and still silent — it blocks
                 // nobody, but the clock keeps running because only a submit or
                 // a park ends the silence.
-                let blocking = match lane.gate_verdict(contributed_relax, owes) {
+                let blocking = match lane.gate_verdict(contributed_relax && !owes_forever, owes) {
                     GateVerdict::Blocking => true,
-                    GateVerdict::SkippedOwed => {
-                        contrib_skipped += 1;
-                        false
-                    }
-                    GateVerdict::Satisfied => false,
+                    GateVerdict::SkippedOwed | GateVerdict::Satisfied => false,
                 };
                 if !blocking && !lane.leashed {
                     lane.clock_from = None;
                     continue;
                 }
-                if owes {
+                if owes && !owes_forever {
                     lane.clock_from = None;
                 } else {
+                    // Seed the silence clock from when the DEBT began, not
+                    // from now: the lane has been unanswered for twice the
+                    // timeout already, and starting a fresh clock here would
+                    // make the backstop take three timeouts to fire.
+                    if owes_forever {
+                        lane.clock_from = debt_since;
+                    }
                     match lane.clock_from {
                         Some(from) if now.saturating_duration_since(from) >= silence => {
                             // The guest has neither submitted nor parked for
@@ -1700,44 +1592,6 @@ impl FramePolicy {
                 }
                 if blocking {
                     missing += 1;
-                    blocking_pin = true;
-                    if dump_due && dump.len() < 16 {
-                        let front = lane.frames.front();
-                        dump.push(serde_json::json!({
-                            "lane": lane_id.to_string()[..8],
-                            "owner": lane.owner.map(|o| o.to_string()[..8].to_string()),
-                            "frames": lane.frames.len(),
-                            "front_arrived": front.map(PendingFrame::arrived_slots),
-                            "front_expect": front.map(PendingFrame::expected_slots),
-                            "owes": owes,
-                            "parked": lane.parked,
-                            "leashed": lane.leashed,
-                            "fired_this_boundary": lane.fired_this_boundary,
-                            "blocking_us": lane.clock_from
-                                .map(|from| now.saturating_duration_since(from).as_micros() as u64),
-                        }));
-                    }
-                    // Classified by STATE first. `owes` used to be the first
-                    // arm of a priority chain, and during execution every
-                    // member of the in-flight frame is owed — so `blk_owed`
-                    // absorbed the whole census and hid whether a blocking lane
-                    // had no frame at all or a half-arrived one. That is the
-                    // reading §10.21 got wrong, and it cost two more counters
-                    // to answer (§10.22: no frame 99%, incomplete 1%).
-                    //
-                    // So: empty vs partial PARTITIONS the blocking lanes
-                    // (`blk_empty + blk_partial == blocking`), and `blk_owed`
-                    // is an independent overlapping marker on top — a lane is
-                    // counted in exactly one of the first two and, if the
-                    // engine owes it a result, in `blk_owed` as well.
-                    if lane.frames.is_empty() {
-                        blk_empty += 1;
-                    } else {
-                        blk_partial += 1;
-                    }
-                    if owes {
-                        blk_owed += 1;
-                    }
                 }
             }
             if !expired.is_empty() {
@@ -1746,57 +1600,6 @@ impl FramePolicy {
                 expired.sort_unstable();
                 expired.dedup();
                 return FramePlan::Terminate(expired);
-            }
-            {
-                // Run-ahead probe. `blocking` is summed over gate
-                // evaluations; `block_ns` times the episode the gate spends
-                // held with any awaited lane missing, which is the quantity
-                // directly comparable with the inter-wave GPU idle.
-                let acc = &crate::scheduler::RUN_AHEAD;
-                acc.blocking.fetch_add(missing as u64, Ordering::Relaxed);
-                acc.blk_owed.fetch_add(blk_owed, Ordering::Relaxed);
-                acc.blk_empty.fetch_add(blk_empty, Ordering::Relaxed);
-                acc.blk_partial.fetch_add(blk_partial, Ordering::Relaxed);
-                acc.contrib_skipped.fetch_add(contrib_skipped, Ordering::Relaxed);
-                acc.gate_evals.fetch_add(1, Ordering::Relaxed);
-                acc.miss_max.fetch_max(missing as u64, Ordering::Relaxed);
-                if executing {
-                    // The S3 discriminator: while the device is busy, a held
-                    // gate is a chance to seal/build/submit the next wave
-                    // early; a blocked one names the lanes denying it.
-                    acc.exec_evals.fetch_add(1, Ordering::Relaxed);
-                    acc.exec_blk_owed.fetch_add(blk_owed, Ordering::Relaxed);
-                    acc.exec_blk_empty.fetch_add(blk_empty, Ordering::Relaxed);
-                    acc.exec_blk_partial
-                        .fetch_add(blk_partial, Ordering::Relaxed);
-                    acc.exec_miss_min
-                        .fetch_min(missing as u64, Ordering::Relaxed);
-                    if missing == 0 {
-                        acc.exec_held.fetch_add(1, Ordering::Relaxed);
-                    } else if missing <= 3 {
-                        // Near miss: these lanes are the LAST holes.
-                        acc.exec_nm_evals.fetch_add(1, Ordering::Relaxed);
-                        acc.exec_nm_owed.fetch_add(blk_owed, Ordering::Relaxed);
-                        acc.exec_nm_empty.fetch_add(blk_empty, Ordering::Relaxed);
-                        acc.exec_nm_partial
-                            .fetch_add(blk_partial, Ordering::Relaxed);
-                    }
-                }
-                if missing == 1 && blocking_pin {
-                    acc.pin_n.fetch_add(1, Ordering::Relaxed);
-                }
-                if missing > 0 {
-                    if self.gate_block_from.is_none() {
-                        acc.miss_start.fetch_add(missing as u64, Ordering::Relaxed);
-                    }
-                    self.gate_block_from.get_or_insert(now);
-                } else if let Some(from) = self.gate_block_from.take() {
-                    acc.block_ns.fetch_add(
-                        now.saturating_duration_since(from).as_nanos() as u64,
-                        Ordering::Relaxed,
-                    );
-                    acc.block_episodes.fetch_add(1, Ordering::Relaxed);
-                }
             }
             // A joiner never holds the seal. It is by definition NOT a
             // member yet — no lane in the wait-set — so sealing without it
@@ -1808,23 +1611,7 @@ impl FramePolicy {
             // deadline breaches on any scenario. It bought +6% epoch density
             // on `churn_extreme` alone, which never reached throughput — not
             // worth a 20ms timer and an admission earmark to guess at.
-            if !dump.is_empty() {
-                crate::scheduler::fire_timing_write(&serde_json::json!({
-                    "schema": 1,
-                    "source": "scheduler",
-                    "event": "gate_block_dump",
-                    "at_us": crate::scheduler::fire_timing_now_us(),
-                    "missing": missing,
-                    "awaited": self.lanes.values().filter(|lane| lane.awaited).count(),
-                    "lanes": self.lanes.len(),
-                    "in_flight_lanes": self.in_flight_lanes.len(),
-                    "pending_binds": self.pending_binds.values().sum::<usize>(),
-                    "joins_in_flight": self.joins_in_flight.len(),
-                    "blockers": dump,
-                }));
-            }
             if missing > 0 {
-                let mut stalled = false;
                 if executing {
                     // An epoch is executing: its retirements re-decide and
                     // the gather continues in the background.
@@ -1843,9 +1630,6 @@ impl FramePolicy {
                     // Pure event arithmetic — no timers, no thresholds.
                     if self.quiesce_mark == Some(self.arrival_seq) {
                         self.quiesce_mark = None;
-                        crate::scheduler::RUN_AHEAD
-                            .early_open
-                            .fetch_add(1, Ordering::Relaxed);
                         self.strict_watchdog_deadline = None;
                         match self.seal() {
                             Some(FramePlan::Dispatch(_)) => continue,
@@ -1864,31 +1648,12 @@ impl FramePolicy {
                     .get_or_insert(now + Duration::from_micros(STRICT_WATCHDOG_US));
                 if now >= *deadline {
                     *deadline = now + Duration::from_micros(STRICT_WATCHDOG_US);
-                    crate::scheduler::fire_timing_write(&serde_json::json!({
-                        "schema": 1,
-                        "source": "scheduler",
-                        "event": "frame_wait_watchdog",
-                        "at_us": crate::scheduler::fire_timing_now_us(),
-                        "missing_count": missing,
-                        "pending_binds": self.pending_binds.values().sum::<usize>(),
-                        "pending_slots": self.pending_slots,
-                        "departing": self.departing.len(),
-                        "joins_in_flight": self.joins_in_flight.len(),
-                        "staged": self.staged.len(),
-                        "slotted": self.slotted.len(),
-                        "awaited_lanes":
-                            self.lanes.values().filter(|lane| lane.awaited).count(),
-                    }));
-                    stalled = true;
                 }
                 let plan = FramePlan::Hold(
                     deadline
                         .saturating_duration_since(now)
                         .min(Duration::from_micros(GATHER_POLL_US)),
                 );
-                if stalled && crate::planner::trace_enabled() {
-                    println!("[frame-stall] {}", self.debug_summary());
-                }
                 return plan;
             }
             self.strict_watchdog_deadline = None;
@@ -1899,16 +1664,7 @@ impl FramePolicy {
             // any drain barrier: a seal never excludes a busy lane, because
             // it waits for every lane's submission instead.
             match self.seal() {
-                Some(FramePlan::Dispatch(_)) => {
-                    if executing {
-                        // The next wave sealed while the device was still
-                        // busy with the current one: the chain engaged.
-                        crate::scheduler::RUN_AHEAD
-                            .seal_exec
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    continue;
-                }
+                Some(FramePlan::Dispatch(_)) => continue,
                 Some(plan) => return plan,
                 // Ready lanes exist but none can seal (all busy in an
                 // executing round partition): retirements re-decide.
@@ -2008,12 +1764,11 @@ mod tests {
     }
 
     #[test]
-    fn max_in_flight_configuration_is_truthful_and_safely_capped() {
-        assert_eq!(parse_max_in_flight(None), DEFAULT_MAX_IN_FLIGHT);
-        assert_eq!(parse_max_in_flight(Some("0")), 1);
-        assert_eq!(parse_max_in_flight(Some("4")), MAX_IN_FLIGHT);
-        assert_eq!(parse_max_in_flight(Some("invalid")), DEFAULT_MAX_IN_FLIGHT);
-        assert!(configured_max_in_flight() >= 1);
+    fn dispatch_depth_defaults_when_bootstrap_installs_nothing() {
+        // Nothing in this binary installs a depth, so the accessor must still
+        // hand back a usable one: a driver harness that never boots the worker
+        // config path still dispatches.
+        assert_eq!(configured_dispatch_depth(), DEFAULT_DISPATCH_DEPTH);
     }
 
     /// Density at k = 1 comes from the wait-all gate, not from a timer: two
@@ -2865,6 +2620,52 @@ mod tests {
         );
     }
 
+    /// ...but the debt itself has a deadline. A wave the driver never retires
+    /// -- a command buffer returned out of memory, say -- leaves the lane in
+    /// `in_flight_lanes` forever, and the branch above resets its clock on
+    /// every tick. The scheduler then waits for a result that cannot arrive,
+    /// with no message and no bound. Past twice the silence timeout the debt
+    /// stops excusing the silence and the ordinary expiry reports it.
+    #[test]
+    fn a_result_that_never_arrives_does_not_excuse_the_silence_forever() {
+        let deadline = Duration::from_millis(50);
+        let silence = Duration::from_secs(30);
+        let mut policy = FramePolicy::new(2, 64, 4096, None)
+            .with_submit_deadline(deadline)
+            .with_silence_timeout(silence);
+        let (a, b) = (pid(), pid());
+        for (owner, base) in [(a, 400), (b, 402)] {
+            policy.on_fire_enqueued(stamp(owner, 0, 0, 2), Some(owner), base, 1, 1);
+            policy.on_fire_enqueued(stamp(owner, 0, 1, 2), Some(owner), base + 1, 1, 1);
+        }
+        let queued: QueuedFireIds = [400, 401, 402, 403].into_iter().collect();
+        let now = Instant::now();
+        assert!(matches!(plan(&mut policy, &queued, now), FramePlan::Dispatch(_)));
+
+        // b's wave retires and b keeps the fleet working; a's never does.
+        let tick = |policy: &mut FramePolicy, seq: u64, at: Instant| -> FramePlan {
+            let base = 410u64 + seq * 2;
+            policy.on_fire_enqueued(stamp(b, seq, 0, 2), Some(b), base, 1, 1);
+            policy.on_fire_enqueued(stamp(b, seq, 1, 2), Some(b), base + 1, 1, 1);
+            let queued: QueuedFireIds = [base, base + 1].into_iter().collect();
+            let out = plan(policy, &queued, at);
+            policy.on_frame_retired([b]);
+            out
+        };
+        policy.on_frame_retired([b]);
+
+        // Inside the debt's budget a is excused, however long the fleet runs.
+        assert!(
+            !matches!(tick(&mut policy, 1, now + silence), FramePlan::Terminate(_)),
+            "a wave may legitimately take a long time"
+        );
+        assert_eq!(
+            tick(&mut policy, 2, now + silence * 2),
+            FramePlan::Terminate(vec![a]),
+            "a result that never came back cannot excuse the silence forever"
+        );
+    }
+
     /// The clock measures consecutive blocking, not lifetime: a lane that
     /// keeps submitting is never at risk however long it lives.
     #[test]
@@ -3047,6 +2848,40 @@ mod tests {
             vec![21],
             "the gatherable fleet seals while the device still owes `a` a result"
         );
+    }
+
+    /// A debt the engine will never answer must not hide behind the
+    /// exemption. The relaxation skips a lane BECAUSE the engine owes it a
+    /// result, which is the same state the never-answered backstop exists to
+    /// notice; composed naively the skip returns before the backstop is even
+    /// consulted, and a lane whose command buffer died would be waited on in
+    /// silence forever. Past the debt deadline the relaxation stands down and
+    /// the lane is judged by the ordinary ladder.
+    #[test]
+    fn a_debt_past_its_deadline_stops_buying_the_exemption() {
+        let (mut policy, a, b) = contributed_scenario(true);
+        let queued: QueuedFireIds = [21].into_iter().collect();
+        // Fresh debt: `a` is skipped and the rest of the fleet seals.
+        assert_eq!(
+            fires(&policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now())),
+            vec![21],
+            "a fresh debt buys the exemption"
+        );
+        policy.on_fire_enqueued(stamp(b, 2, 0, 1), Some(b), 22, 1, 1);
+        // Same state, but the debt is now older than twice the silence
+        // timeout: `a` is counted missing again, so the gate holds instead of
+        // sealing without it.
+        let far = Instant::now() + policy.silence_timeout * 2 + Duration::from_millis(1);
+        let queued: QueuedFireIds = [22].into_iter().collect();
+        assert!(
+            !matches!(
+                policy.plan_dispatch(&queued, &HashSet::new(), true, far),
+                FramePlan::Dispatch(_)
+            ),
+            "a debt past its deadline no longer exempts the lane, so the fleet \
+             does not seal without it -- the backstop judges it instead"
+        );
+        assert!(policy.owes_lane(a), "the debt is still outstanding");
     }
 
     /// The debt is what buys the exemption, so paying it takes the exemption

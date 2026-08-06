@@ -43,15 +43,29 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
 /// How many rows the activation pool must hold for `max_rows` to be paddable to
 /// a whole GEMM tile.
 int gptoss_qmm_pool_rows(int max_rows);
+int gptoss_moe_pairs(const GptOssGeometry& g, int rows);
+int gptoss_moe_tile_rows(const GptOssGeometry& g, int rows);
+int gptoss_moe_sorted_rows(const GptOssGeometry& g, int rows);
 void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid& grid,
                      Threadgroup& tg, int head_rows = 0);
+/// `[begin, end)` walks a SLICE of the step. The default is the whole DAG; a
+/// narrower range is how a step is cut into ordered command buffers so the
+/// host can page routed experts in between them. The walk is otherwise
+/// identical, barriers included -- a segment boundary already ends a command
+/// buffer, which is a stronger ordering than a barrier.
 void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const GptOssGeometry& g, int rows, const DecodeStepPsos& base,
                            const MultiBatchPsos& mb, const GptOssPsos& go,
-                           int ordinal_base = 0, int head_rows = 0);
+                           int ordinal_base = 0, int head_rows = 0,
+                           /// The fire's request count, which with `rows` is
+                           /// what decides the attention's shape. 0 means the
+                           /// caller does not know, and an unknown fire keeps
+                           /// the per-row kernel.
+                           int requests = 0, std::size_t begin = 0,
+                           std::size_t end = 0);
 
-/// Encode the step against paged KV. One row -- gpt-oss has no M>1 path -- but
-/// the row's history is a page list, so several sequences coexist.
+/// Encode a single-row step against paged KV. Wider fires use
+/// `encode_gptoss_step_mb`, including the sorted routed GEMM.
 void encode_gptoss_step_paged(StepEncoder& se, const std::vector<Dispatch>& dag,
                               const GptOssGeometry& g, const DecodeStepPsos& base,
                               const MultiBatchPsos& mb, const GptOssPsos& go,

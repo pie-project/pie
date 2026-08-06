@@ -19,8 +19,47 @@ members = [
     "runtime/tokenizer",
     # Constrained-decoding grammar engine (EBNF/regex/json-schema/matcher/bitmask).
     "runtime/grammar",
-    # Model metadata + instruct chat templates + multimodal host-decode.
-    "runtime/model",
+    # The two registries: `model_type` -> load-contract author, `arch_name` ->
+    # chat template. The implementations live in the per-generation crates
+    # below; this crate names them and holds host-side multimodal decode, the
+    # one aspect not yet split per generation.
+    "model",
+    # HF `config.json` normalization -> the `pie.model/1` descriptor. A leaf:
+    # serde only, no driver and no runtime, so `pie model convert` can run it.
+    #
+    # Under `model/` because that is what it is: "what is this model made of",
+    # answered once at import. It sat under `runtime/` while the runtime was
+    # its only caller; `pie-model` reads the descriptor directly now
+    # (`ModelFacts::from_descriptor`), and a crate a model-knowledge crate
+    # depends on is not runtime machinery.
+    # Shared by every generation crate: the authoring DSL and the chat
+    # vocabulary, and no knowledge of any one model.
+    "model/common",
+    "model/config",
+    # One crate per model generation. A generation is a crate rather than a
+    # module because the forward aspect (PTIR per generation) lands into these,
+    # and because a crate boundary is the only thing Rust has that stops one
+    # generation reaching into another.
+    "model/csm",
+    "model/deepseek_r1",
+    "model/deepseek_v4",
+    "model/gemma_2",
+    "model/gemma_3",
+    "model/gemma_4",
+    "model/glm_5",
+    "model/gpt_oss",
+    "model/kimi_k2",
+    "model/kimi_k3",
+    "model/llama_2",
+    "model/llama_3",
+    "model/mistral_3",
+    "model/nemotron_h",
+    "model/olmo_2",
+    "model/olmo_3",
+    "model/phi_3",
+    "model/qwen_2",
+    "model/qwen_3",
+    "model/qwen_3_5",
     # Shared process skeleton (paths, config sourcing, tracing/metrics, signals,
     # CLI skeleton). Depends on no role lib. Lives under `bin/` because it also
     # ships the `pie-env` command; the bins import its lib as `startup`.
@@ -55,8 +94,12 @@ members = [
     "driver/dummy",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime (see loader/architecture.md).
+    # `loader` is the compiler alone; `loader/capi` is its C ABI — the repr(C)
+    # marshalling, the extern entry points, the committed pie_loader.h and the
+    # `pie-loader` CLI — which is what the drivers actually link.
     "loader",
-    "loader/cbindgen",
+    "loader/capi",
+    "loader/capi/cbindgen",
     "sdk/python-server",
     # Thin binary shells composing the `startup` skeleton + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).
@@ -64,6 +107,11 @@ members = [
     "bin/gateway",
     "bin/worker",
     "bin/pie",
+    # The engine's on-device end-to-end suite. No code of its own; it exists so
+    # that `cargo test -p pie-bin` means the CLI's own tests rather than
+    # "compile thirty GPU test binaries". Almost everything in it is `#[ignore]`d
+    # and asks for a real device.
+    "tests/gpu",
 ]
 exclude = [
     "tests/inferlets",
@@ -93,17 +141,26 @@ rust-version = "1.91"
 # dance: `ztensor` owns the container format and its validation,
 # `ztensor-compat` owns the foreign-format projections.
 #
-# ztensor 2.0.0 is on crates.io, so this is an ordinary version requirement.
+# An ordinary version requirement. It was a revision-pinned git dependency
+# while the two were developed together, which `Cargo.lock` not being tracked
+# here made necessary: a branch would have resolved to whatever v2's tip was at
+# clone time, and v2 moved under us.
 #
-# To develop the two together, point these at a sibling checkout:
+# The patch is named, not just `"2.1"`, because 2.1.1 broke the API on purpose
+# and says so in its changelog. This is still a caret range — it does not pin —
+# but it puts the floor above the break, so no resolution can land on 2.1.0 and
+# fail to compile. `Cargo.lock` is not tracked here, which is what makes the
+# floor the only thing deciding that.
 #
-#     ztensor = { path = "../ztensor/ztensor" }
-#     ztensor-compat = { path = "../ztensor/ztensor-compat" }
-#
-# or add a `[patch]` section, which leaves this file alone.
+# 2.1.0 put the modules on the spec's layers (`format` is L0+L1 and opens no
+# file, `provide` is the projection face) and scoped the object builders. 2.1.1
+# narrowed what is left: bytes are reached through `Tensor::data`, since the
+# nine shorthands for it addressed one part while `verify` on the same receiver
+# covered them all, and `Part::bytes` hands back a `Cow` rather than a
+# lookalike of one.
 [workspace.dependencies]
-ztensor = "=2.0.0"
-ztensor-compat = "=2.0.0"
+ztensor = "2.1.1"
+ztensor-compat = "2.1.1"
 
 # Shared lint table. Opt in per crate with `[lints] workspace = true`; today
 # only the `compiler/*` crates do, because they are the only ones at zero

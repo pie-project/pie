@@ -3,10 +3,36 @@
 #include <cmath>
 #include <string>
 
+#include "model/shared_kernels.hpp"
+
 namespace pie::metal::gptoss {
 
-bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int router_bits,
-                       GptOssPsos& out, std::string* err) {
+bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
+                       const GptOssGeometry& g, GptOssPsos& out, std::string* err) {
+    // The attention width is the geometry's, not a literal: see the header.
+    const std::string d = "_d_" + std::to_string(g.head_dim);
+    // The expert bank's codec chooses its matvec. Same kernel body, same routed
+    // offsets, same bias epilogue -- the codec is a template parameter, so the
+    // only thing that differs here is which instantiation is named.
+    const std::string routed_name = g.mxfp4_experts
+                                        ? "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4"
+                                        : "affine_qmv_routed_bias_bfloat16_gs_64_b_4";
+    // The router's width is the checkpoint's to state. It is the same dense
+    // biased matvec at either width, so an unsolved one fails by NAME here --
+    // there is no instantiation to compile -- rather than silently defaulting
+    // to the common one and reading the bytes at half the stride.
+    const std::string router_name = "affine_qmv_tail_bias_bfloat16_gs_64_b_" +
+                                    std::to_string(g.router_bits);
+    // The projections' width is the checkpoint's, not a constant: see
+    // `GptOssGeometry::proj_bits`. These entrypoints were `..._b_4` outright,
+    // which read an 8-bit checkpoint's rows at half their stride.
+    const std::string proj_name = "affine_qmv_tail_bfloat16_gs_64_b_" +
+                                  std::to_string(g.proj_bits);
+    const std::string proj_bias_name = "affine_qmv_tail_bias_bfloat16_gs_64_b_" +
+                                       std::to_string(g.proj_bits);
+    const std::string sink_name = "sdpa_vector_decode_sink_bfloat16" + d;
+    const std::string sink_paged_name = "sdpa_paged_decode_sink_bfloat16" + d;
+    const std::string sink_tiled_name = "sdpa_paged_tiled_sink_bfloat16" + d;
     const std::string dir =
         kernels_dir.empty() || kernels_dir.back() == '/' ? kernels_dir : kernels_dir + "/";
     struct Spec {
@@ -16,16 +42,18 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int
     };
     // bf16 throughout: the activation dtype every ported M=1 kernel already uses.
     const Spec specs[] = {
-        {"quantized_qmv.metal", "affine_qmv_tail_bfloat16_gs_64_b_4", &out.qmv_tail},
-        {"quantized_qmv.metal", "affine_qmv_tail_bias_bfloat16_gs_64_b_4", &out.qmv_tail_bias},
-        {"quantized_qmv.metal", "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
-         &out.qmv_routed_bias},
-        {"quantized_qmv.metal", "affine_qmv_u8_bias_bfloat16_gs_64", &out.qmv_u8_bias},
-        {"gptoss.metal", "router_topk_bfloat16", &out.router_topk},
+        {"quantized_qmv.metal", proj_name.c_str(), &out.qmv_tail},
+        {"quantized_qmv.metal", proj_bias_name.c_str(), &out.qmv_tail_bias},
+        {"quantized_qmv.metal", routed_name.c_str(), &out.qmv_routed_bias},
+        {"quantized_qmv.metal", router_name.c_str(), &out.qmv_router},
+        {"moe_route.metal", "router_topk_bfloat16", &out.router_topk},
+        {"moe_route.metal", "moe_route_sort", &out.moe_sort},
+        {"moe_route.metal", "moe_route_gather", &out.moe_gather},
+        {"moe_route.metal", "moe_combine_sorted", &out.moe_combine},
         {"gptoss.metal", "gptoss_swiglu_bfloat16", &out.swiglu},
-        {"gptoss.metal", "expert_combine_bfloat16", &out.expert_combine},
-        {"sdpa_sliding.metal", "sdpa_vector_decode_sink_bfloat16_d_64", &out.sdpa_sink},
-        {"sdpa_paged.metal", "sdpa_paged_decode_sink_bfloat16_d_64", &out.sdpa_sink_paged},
+        {"sdpa_sliding.metal", sink_name.c_str(), &out.sdpa_sink},
+        {"sdpa_paged.metal", sink_paged_name.c_str(), &out.sdpa_sink_paged},
+        {"sdpa_paged.metal", sink_tiled_name.c_str(), &out.sdpa_sink_paged_tiled},
         {"rope.metal", "rope_neox_freqs_mb_bfloat16", &out.rope_freqs_mb},
         {"row_gather.metal", "row_gather_bfloat16", &out.row_gather},
         {"rope.metal", "rope_neox_freqs_decode_bfloat16", &out.rope_freqs},
@@ -41,22 +69,30 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int
             return false;
         }
     }
-    // The router's width is the checkpoint's to state, and the two kernels read
-    // incompatible packings, so an unsolved width is refused here rather than
-    // defaulted to the common one.
-    switch (router_bits) {
-        case 8: out.qmv_router = out.qmv_u8_bias; break;
-        // The dense biased 4-bit matvec: the router is [n_experts, hidden] with
-        // a bias, which is the same shape as an attention projection.
-        case 4: out.qmv_router = out.qmv_tail_bias; break;
-        default:
-            if (err != nullptr) {
-                *err = "gpt-oss PSOs: the router's quantization width could not be solved "
-                       "from the checkpoint (got " +
-                       std::to_string(router_bits) +
-                       "); only 4- and 8-bit routers have a kernel here";
+    if (g.mxfp4_experts) {
+        // `bm` is spelled from the shared tile widths, not restated: it is
+        // the same number the sort padded each expert's run to and the same
+        // number the grid divides the sorted rows by. Hardcoding it here made
+        // this the one place that did not follow the constant -- and a grid
+        // built for one tiling against a pipeline compiled for another is
+        // wrong numbers, not a crash.
+        for (int t = 0; t < 3; ++t) {
+            for (int i = 0; i < 3; ++i) {
+                const std::string fn =
+                    "mxfp4_qmm_t_routed_bias_bfloat16_bm_" +
+                    std::to_string(shared_kernels::kMoeTileWidths[t]) + "_bn_" +
+                    std::to_string(16 << i);
+                std::string compile_error;
+                out.qmm_routed_bias[t][i] = ctx.compile_pso_from_file(
+                    dir + "quantized_qmm_t.metal", fn, &compile_error);
+                if (!out.qmm_routed_bias[t][i].valid()) {
+                    if (err != nullptr)
+                        *err = "gpt-oss PSO '" + fn + "' (quantized_qmm_t.metal): " +
+                               compile_error;
+                    return false;
+                }
             }
-            return false;
+        }
     }
     return true;
 }

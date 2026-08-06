@@ -37,16 +37,6 @@ namespace pie_cuda_driver::model {
 // told which order they read.
 bool qwen35_moe_gate_up_swapped();
 
-/// True when the Gated DeltaNet input projections are stored pre-joined as
-/// `in_proj_qkvz` / `in_proj_ba` instead of as four separate tensors.
-///
-/// Opt-in (`PIE_QWEN35_FUSED_GDN_PROJ`): joining b/a measured as a wash on
-/// Qwen3.6-35B-A3B, because the split kernel that unpacks the result costs
-/// back what the dropped GEMV saved. Read by the contract, which is what
-/// decides the layout, and by the bind, which reads whichever layout the
-/// contract produced.
-bool qwen35_fused_gdn_projection_enabled();
-
 /// True when the speculative head reads `lm_head` as int8 rather than bf16.
 ///
 /// Opt-in (`PIE_QWEN35_MTP_INT8_LM_HEAD`): the draft step's argmax GEMV is
@@ -78,8 +68,6 @@ struct Qwen3_5MoeLayerWeights {
     const DeviceTensor* la_in_proj_z   = nullptr;
     const DeviceTensor* la_in_proj_b   = nullptr;
     const DeviceTensor* la_in_proj_a   = nullptr;
-    const DeviceTensor* la_in_proj_qkvz = nullptr;
-    const DeviceTensor* la_in_proj_ba   = nullptr;
     const DeviceTensor* la_conv1d_w    = nullptr;
     const DeviceTensor* la_conv1d_b    = nullptr;
     const DeviceTensor* la_dt_bias     = nullptr;

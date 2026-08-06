@@ -10,10 +10,9 @@ interface reasoning {
         complete(string),
     }
 
-    /// Create a decoder to detect reasoning blocks in generated tokens
-    create-decoder: func() -> decoder;
-
+    /// Detects reasoning blocks in generated tokens.
     resource decoder {
+        constructor();
         feed: func(tokens: list<u32>) -> result<event, error>;
         reset: func();
     }

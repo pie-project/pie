@@ -248,6 +248,14 @@ struct HfConfig {
     // standard `num_key_value_heads` and have their own v_proj.
     bool gemma4_attention_k_eq_v = false;
     int  gemma4_num_global_key_value_heads = 0;
+    // Two more Gemma-4 keys this driver does not read, carried because
+    // `pie.model/1` is generated from this struct and the Metal driver does
+    // read them: the full-attention head width (sliding layers use `head_dim`)
+    // and whether the MLP is double-wide. Without them a Metal artifact would
+    // have to fall back to `config.json` for the whole family, which is the
+    // half-normalized state the descriptor exists to avoid.
+    int  gemma4_global_head_dim = 0;
+    bool gemma4_double_wide_mlp = false;
 
     // GPT-OSS-specific knobs. Inert on every other model.
     //   * `swiglu_limit` — clipping threshold applied to gate values
@@ -525,7 +533,15 @@ struct HfConfig {
     int qwen3_vl_vision_end_token_id = -1;
 };
 
-// Parse `<snapshot_dir>/config.json`. Throws on missing required fields.
-HfConfig parse_hf_config(const std::filesystem::path& path);
+// `parse_hf_config` used to be declared here, and `config.cpp` was its 855-line
+// implementation. Both are gone: `config.json` is normalized once, in Rust, at
+// import (or by the worker for a plain snapshot), and what a driver reads is
+// the `pie.model/1` descriptor — see `model/descriptor.hpp`.
+//
+// This header stays because the struct above is the *schema*, not the parser.
+// Three things generate from it: `descriptor.cpp` (the reader),
+// `model/config/src/schema.rs` (the Rust normalizer's output type), and
+// the golden dumper in `tests/hf_config_dump/`. Adding a field here is still
+// how a new fact reaches the driver; deriving it from raw HF JSON is not.
 
 }  // namespace pie_cuda_driver

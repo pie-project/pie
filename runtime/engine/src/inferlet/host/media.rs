@@ -38,8 +38,8 @@ pub struct Image {
     pub patch_grid: multimodal::Grid,
     /// Model-specific delimiter tokens the context places immediately before /
     /// after this span (e.g. Qwen `<|vision_start|>` / `<|vision_end|>`). Empty
-    /// when the model needs none. The SDK's `append-image` applies them, so the
-    /// inferlet never names them.
+    /// when the model needs none. A guest reads them off the span and splices
+    /// them in, so it never names them itself.
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,
 }
@@ -89,7 +89,7 @@ fn encode_delim(s: &str) -> Vec<u32> {
     if s.is_empty() {
         Vec::new()
     } else {
-        pie_model::model().tokenize(s)
+        crate::model::model().tokenize(s)
     }
 }
 
@@ -115,7 +115,7 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
     /// Decode + resize + patchify an encoded still image per the bound model.
     async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Image>, String>> {
         let (processor, prefix, suffix) = {
-            let m = pie_model::model();
+            let m = crate::model::model();
             let arch = m.arch_name();
             let varch = match VisionArch::from_arch_name(arch) {
                 Some(a) => a,
@@ -149,9 +149,13 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
         Ok(self.ctx().table.get(&this)?.span.position_span)
     }
 
-    async fn grid(&mut self, this: Resource<Image>) -> Result<(u32, u32, u32)> {
+    async fn grid(&mut self, this: Resource<Image>) -> Result<pie::inferlet::media::MergedGrid> {
         let g = self.ctx().table.get(&this)?.span.grid;
-        Ok((g.t, g.h, g.w))
+        Ok(pie::inferlet::media::MergedGrid {
+            t: g.t,
+            h: g.h,
+            w: g.w,
+        })
     }
 
     async fn prefix_tokens(&mut self, this: Resource<Image>) -> Result<Vec<u32>> {
@@ -177,7 +181,7 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
         max_frames: u32,
     ) -> Result<Result<Resource<Video>, String>> {
         let (processor, prefix, suffix) = {
-            let m = pie_model::model();
+            let m = crate::model::model();
             let arch = m.arch_name();
             let varch = match VisionArch::from_arch_name(arch) {
                 Some(a) => a,
@@ -264,7 +268,7 @@ impl pie::inferlet::media::HostAudio for ProcessCtx {
     /// model. Non-audio models return a clean error.
     async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Audio>, String>> {
         let (prefix, suffix) = {
-            let m = pie_model::model();
+            let m = crate::model::model();
             let arch = m.arch_name();
             if !multimodal::audio_arch_supported(arch) {
                 return Ok(Err(format!(

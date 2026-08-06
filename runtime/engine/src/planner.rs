@@ -55,13 +55,10 @@ use grant::{DevicePageReservation, RsSlotReservation};
 
 use crate::store::kv::page_table::ReclaimQuote;
 
-/// Process identity the planner tracks (FCFS clock key, residency key).
-pub type ProcessId = uuid::Uuid;
-
 /// Opt-in event markers (`PIE_CONTENTION_TRACE_EVENTS=1`): `println!`, not
 /// `tracing` — the embedded (pyo3) server installs no subscriber. The
-/// timestamp shares the fire-timing monotonic clock so planner events
-/// correlate with `PIE_FIRE_TIMING` wave records in one benchmark log.
+/// timestamp shares the fire-timing monotonic clock, which is what lets these
+/// markers be read against the scheduler's own timing records.
 ///
 /// **This is a separate switch from the periodic stall sampler**
 /// (`PIE_CONTENTION_TRACE_MS`) on purpose. The markers fire per planner
@@ -93,55 +90,10 @@ macro_rules! ptrace {
     };
 }
 
-/// The one owner of the pid-tagged marker format —
-/// `[<scope> t_us=<µs>] pid=<pid> <msg>` — used by every probe site outside
-/// this module (`planner-exec` steps, `build` hp/dg markers, forward-path
-/// rx markers). Same flag, same monotonic clock, so all contention events
-/// correlate in one benchmark log.
-macro_rules! trace_mark {
-    ($scope:expr, $pid:expr, $($arg:tt)*) => {
-        if $crate::planner::trace_enabled() {
-            println!(
-                "[{} t_us={}] pid={} {}",
-                $scope,
-                $crate::scheduler::fire_timing_now_us(),
-                $pid,
-                format_args!($($arg)*)
-            );
-        }
-    };
-}
-pub(crate) use trace_mark;
+/// Process identity the planner tracks (FCFS clock key, residency key).
+pub type ProcessId = uuid::Uuid;
 
-/// The planner's whole configuration, parsed from the environment exactly
-/// once at the bootstrap edge and injected explicitly. The only quantity is
-/// the transport retry bound — every other number in the design is a ledger
-/// value or exact arithmetic.
-#[derive(Clone, Copy, Debug)]
-pub struct PlannerConfig {
-    /// Restore attempts per evictee before the process is failed loud (the
-    /// irreducible transport retry — H3).
-    pub restore_retries: u32,
-}
 
-impl Default for PlannerConfig {
-    fn default() -> Self {
-        Self { restore_retries: 3 }
-    }
-}
-
-impl PlannerConfig {
-    /// Parse the operator-facing environment (`PIE_KV_RESTORE_RETRIES`).
-    pub fn from_env() -> Self {
-        let defaults = Self::default();
-        Self {
-            restore_retries: std::env::var("PIE_KV_RESTORE_RETRIES")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(defaults.restore_retries),
-        }
-    }
-}
 
 /// Minimal physical port the planner drives — pool stats, rung-0 idle
 /// reclaim, and concrete reservations. The planner owns ALL policy; this
@@ -391,21 +343,6 @@ impl std::fmt::Display for PlannerError {
 
 impl std::error::Error for PlannerError {}
 
-/// Probe: charges one `plan()` pass and its wall time to `RUN_AHEAD`.
-struct PlanProbe(std::time::Instant);
-impl Drop for PlanProbe {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let acc = &crate::scheduler::RUN_AHEAD;
-        acc.plan_calls.fetch_add(1, Relaxed);
-        acc.plan_ns
-            .fetch_add(self.0.elapsed().as_nanos() as u64, Relaxed);
-    }
-}
-fn scopeguard_plan(t0: std::time::Instant) -> PlanProbe {
-    PlanProbe(t0)
-}
-
 /// Opt-in planner-mutex census (`PIE_PLANNER_LOCK_TRACE=1`). The planner lock
 /// is global and the contended hot path takes it on EVERY fire (`note_progress`
 /// once `waiters != 0`), so "is this a convoy?" has to be answered by
@@ -537,6 +474,14 @@ pub struct PlannerQueueEntry {
 /// How many unparked admitted processes [`PlannerDiagnostics::runners`]
 /// reports. A wedge needs the first few; a healthy fleet needs none.
 const RUNNER_DUMP_CAP: usize = 24;
+
+/// The reciprocal of the host-pool slice the eviction rung may not spend on
+/// a fleet that is still running — see the HOST RESERVE note in
+/// [`ResidencyPlanner::plan_eviction`]. It only has to be large enough that
+/// a live fleet's evictees cannot squeeze the pool to the `host_free == 0`
+/// kill arm, and small enough that it never binds where host room is
+/// plentiful relative to the device pool.
+const HOST_RESERVE_DIVISOR: u32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct PlannerDiagnostics {
@@ -676,8 +621,10 @@ struct Proc {
     /// Spawn-order clock — the single, authoritative FCFS key.
     seq: u64,
     state: Residency,
-    /// Bounded transport retries consumed by failed restores.
-    restore_attempts: u32,
+    /// Whether this process has already spent its one restore retry. Cleared
+    /// on every successful restore, so the allowance is per episode and not
+    /// per lifetime.
+    restore_retried: bool,
     /// E6 — progress before re-eviction. `false` from restore commit until
     /// this process's next `acquire` call (any outcome — every fire passes
     /// through `acquire`, and a restored guest always re-asks: it was parked
@@ -724,7 +671,7 @@ impl Proc {
         Self {
             seq,
             state: Residency::Resident,
-            restore_attempts: 0,
+            restore_retried: false,
             progressed: true,
             admitted: false,
             signal: Arc::new(Notify::new()),
@@ -940,6 +887,23 @@ impl Inner {
     /// something an evictee owns — that the yield must not outlive, so
     /// [`Inner::fleet_stalled`] hands the head straight back to the oldest
     /// entry of any kind.
+    ///
+    /// That argument has a second precondition it did not name: eviction
+    /// must be able to KEEP evicting. It is funded by the host pool, which
+    /// is finite, and the only event that returns a host slot is a restore
+    /// — the very thing being yielded. Once the pool is out, "evict every
+    /// resident" is not reachable, the unmet allocations stay unmet, and
+    /// the evictees holding the host pool can never come back to release
+    /// it. `fleet_stalled` does not catch it, because residents ARE
+    /// completing; the fleet is live and starving a resource at the same
+    /// time. Measured on `soak` (160 device pages, 1024 host pages, 4096
+    /// requests at 256-way): the rung drained host_free 1024 -> 0 in the
+    /// first seconds and it never recovered — restores pinned at 1-8 and
+    /// `evicted` at ~210 for the remaining 60 s while every further
+    /// attempt rolled back on `HostSwapFull`, 21895 of them, and the
+    /// starvation rung killed 138 of the stranded processes. Before the
+    /// yield the same fleet ran 123 evictions, 0 rollbacks and 0 kills.
+    /// So [`Inner::eviction_unfundable`] is the second valve.
     fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
         let mut oldest_restore: Option<EntryKey> = None;
         let mut allocation: Option<EntryKey> = None;
@@ -961,7 +925,7 @@ impl Inner {
         }
         let head = match (allocation, oldest_restore) {
             (Some(allocation), Some(restore)) => {
-                if restore < allocation && self.fleet_stalled() {
+                if restore < allocation && (self.fleet_stalled() || self.eviction_unfundable()) {
                     restore
                 } else {
                     allocation
@@ -973,6 +937,21 @@ impl Inner {
         self.queue
             .get_key_value(&head)
             .map(|(&key, waiter)| (key, waiter))
+    }
+
+    /// Eviction has run out of the resource that funds it. A victim parked
+    /// in `host_swap_blocked` is proof: its bytes were refused by the host
+    /// pool, and victim selection is deterministic, so nothing about that
+    /// answer changes until host slots are actually returned. Only a
+    /// restore returns them, which is why this gates the restore yield in
+    /// [`Inner::unmet_head`] — preferring an allocation here cannot serve
+    /// it, since the rung that would fund it is blocked on the same pool.
+    ///
+    /// Deliberately a live signal rather than a latch: `clear_host_swap_blocks`
+    /// empties the set the moment host room returns, so the yield resumes as
+    /// soon as eviction can pay for itself again.
+    fn eviction_unfundable(&self) -> bool {
+        !self.host_swap_blocked.is_empty()
     }
 
     /// The pages the burst behind the head still needs beyond the
@@ -1185,7 +1164,6 @@ pub struct ResidencyPlanner {
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
     port: Arc<dyn PoolPort>,
     stats: PlannerStats,
-    config: PlannerConfig,
 }
 
 /// Removes a parked allocation entry when its `acquire` future is dropped
@@ -1237,9 +1215,6 @@ pub(crate) struct AllocationTicket {
     planner: Arc<ResidencyPlanner>,
     key: EntryKey,
     notify: Arc<Notify>,
-    /// When the ask parked — the `park_ns` accounting moves here with the
-    /// collect loop.
-    park_started_us: u64,
     collected: bool,
 }
 
@@ -1266,15 +1241,6 @@ impl AllocationTicket {
                     }
                     // The collection unblocked the next head.
                     self.planner.poke();
-                    {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        let acc = &crate::scheduler::GUEST_PHASES;
-                        let waited = crate::scheduler::fire_timing_now_us()
-                            .saturating_sub(self.park_started_us)
-                            * 1_000;
-                        acc.park_ns.fetch_add(waited, Relaxed);
-                        acc.park_max_ns.fetch_max(waited, Relaxed);
-                    }
                     return outcome.map(Acquired::Granted);
                 }
                 Collect::Yield => {
@@ -1298,7 +1264,7 @@ impl Drop for AllocationTicket {
 }
 
 impl ResidencyPlanner {
-    pub fn new(port: Arc<dyn PoolPort>, config: PlannerConfig) -> Self {
+    pub fn new(port: Arc<dyn PoolPort>) -> Self {
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             waiters: AtomicUsize::new(0),
@@ -1307,7 +1273,6 @@ impl ResidencyPlanner {
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
-            config,
         }
     }
 
@@ -1506,14 +1471,8 @@ impl ResidencyPlanner {
     pub fn pages_freed(self: &Arc<Self>) {
         self.re_arm_idle_reclaim();
         if self.waiters.load(Ordering::Acquire) != 0 {
-            crate::scheduler::RUN_AHEAD
-                .freed_poke
-                .fetch_add(1, Ordering::Relaxed);
             self.poke();
         } else {
-            crate::scheduler::RUN_AHEAD
-                .freed_skip
-                .fetch_add(1, Ordering::Relaxed);
             // §10.14: with nobody waiting the poke is normally skipped, but
             // a free event is also the runway's chance to notice it is
             // still short and top up before the next ask parks.
@@ -1591,192 +1550,147 @@ impl ResidencyPlanner {
             }
             return Ok(Acquired::Granted(AllocationGrant::empty()));
         }
-        loop {
-            // Fast path. Uncontended (no waiters, everyone resident): two
-            // free-list pops, no planner lock. Once anything is queued the
-            // fast path closes and EVERY ask parks FCFS at its process's
-            // spawn position.
-            //
-            // The elder bypass that used to live here — a process older
-            // than the queue head could still reserve directly — was
-            // deleted 2026-07-26 (`rainer_v3.md` §8.5). It was justified by
-            // a 47% inter-batch gap measured 2026-07-25, before the §17
-            // mechanism fixes; re-measured after them it earns nothing:
-            // A4/A6/E3 all land inside their bands with it gone, F2 stays
-            // 12/12, and one ordering rule disappears with it. v2 lists it
-            // under "dies ... derivatives of implicit membership".
-            let uncontended = self.waiters.load(Ordering::Acquire) == 0
-                && self.nonresident.load(Ordering::Acquire) == 0;
-            // Opt-in (`PIE_ALLOC_FAST_SMALL=1`) head-harmless bypass: even
-            // with the fast path closed, serve THIS ask straight from the
-            // free lists when free pages cover the ask AND the FCFS head's
-            // remaining shortfall — the head could not have used what this
-            // ask takes, so no page the head is entitled to is diverted.
-            // (12% of contended parks happen with free >= demand; under
-            // strict FCFS they wait for the queue anyway.) Exact
-            // arithmetic, no constants; racing drains are safe because
-            // `try_reserve` simply fails and the ask parks as before.
-            if !uncontended && fast_small_bypass_enabled() && demand.rs_slots == 0 {
-                let (free_now, _) = self.port.device_stats();
-                let head_covered = self.with_inner(|inner| {
-                    let head_shortfall = inner
-                        .unmet_head()
-                        .map(|(_, waiter)| {
-                            waiter.kv_need().saturating_sub(inner.accum.len() as u32)
-                        })
-                        .unwrap_or(0);
-                    free_now >= demand.kv_pages.saturating_add(head_shortfall)
-                });
-                if head_covered && let Some(grant) = self.try_reserve(demand) {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    crate::scheduler::GUEST_PHASES
-                        .fast_small_n
-                        .fetch_add(1, Relaxed);
-                    self.note_progress(pid);
-                    return Ok(Acquired::Granted(grant));
-                }
-            }
-            if !uncontended {
-                // E6 progress: this process is asking to fire again. Under
-                // contention only — the same condition the zero-demand path
-                // uses, and the elder check used to fold this in.
+        // Fast path. Uncontended (no waiters, everyone resident): two
+        // free-list pops, no planner lock. Once anything is queued the
+        // fast path closes and EVERY ask parks FCFS at its process's
+        // spawn position.
+        //
+        // The elder bypass that used to live here — a process older
+        // than the queue head could still reserve directly — was
+        // deleted 2026-07-26 (`rainer_v3.md` §8.5). It was justified by
+        // a 47% inter-batch gap measured 2026-07-25, before the §17
+        // mechanism fixes; re-measured after them it earns nothing:
+        // A4/A6/E3 all land inside their bands with it gone, F2 stays
+        // 12/12, and one ordering rule disappears with it. v2 lists it
+        // under "dies ... derivatives of implicit membership".
+        let uncontended = self.waiters.load(Ordering::Acquire) == 0
+            && self.nonresident.load(Ordering::Acquire) == 0;
+        // Opt-in (`PIE_ALLOC_FAST_SMALL=1`) head-harmless bypass: even
+        // with the fast path closed, serve THIS ask straight from the
+        // free lists when free pages cover the ask AND the FCFS head's
+        // remaining shortfall — the head could not have used what this
+        // ask takes, so no page the head is entitled to is diverted.
+        // (12% of contended parks happen with free >= demand; under
+        // strict FCFS they wait for the queue anyway.) Exact
+        // arithmetic, no constants; racing drains are safe because
+        // `try_reserve` simply fails and the ask parks as before.
+        if !uncontended && fast_small_bypass_enabled() && demand.rs_slots == 0 {
+            let (free_now, _) = self.port.device_stats();
+            let head_covered = self.with_inner(|inner| {
+                let head_shortfall = inner
+                    .unmet_head()
+                    .map(|(_, waiter)| waiter.kv_need().saturating_sub(inner.accum.len() as u32))
+                    .unwrap_or(0);
+                free_now >= demand.kv_pages.saturating_add(head_shortfall)
+            });
+            if head_covered && let Some(grant) = self.try_reserve(demand) {
                 self.note_progress(pid);
-            }
-            if uncontended && let Some(grant) = self.try_reserve(demand) {
-                self.poke_if_runway_short();
                 return Ok(Acquired::Granted(grant));
             }
-            // The reserve failed (or the fast path is closed): run the
-            // exact-arithmetic exhaustion check before parking. Slow path
-            // only — a demand that reserves off the free lists trivially
-            // fits, and reading totals is a store-lock hold the per-fire
-            // hot path must not pay (§16).
-            let limbo_probe = crate::scheduler::fire_timing_enabled();
-            let limbo_started_us = if limbo_probe {
-                crate::scheduler::fire_timing_now_us()
-            } else {
-                0
-            };
-            let (_, kv_total) = self.port.device_stats();
-            if demand.kv_pages > kv_total {
+        }
+        if !uncontended {
+            // E6 progress: this process is asking to fire again. Under
+            // contention only — the same condition the zero-demand path
+            // uses, and the elder check used to fold this in.
+            self.note_progress(pid);
+        }
+        if uncontended && let Some(grant) = self.try_reserve(demand) {
+            self.poke_if_runway_short();
+            return Ok(Acquired::Granted(grant));
+        }
+        // The reserve failed (or the fast path is closed): run the
+        // exact-arithmetic exhaustion check before parking. Slow path
+        // only — a demand that reserves off the free lists trivially
+        // fits, and reading totals is a store-lock hold the per-fire
+        // hot path must not pay (§16).
+        let (_, kv_total) = self.port.device_stats();
+        if demand.kv_pages > kv_total {
+            return Err(PlannerError::Impossible {
+                need: demand.kv_pages,
+                total: kv_total,
+            });
+        }
+        if demand.rs_slots > 0 {
+            let (_, rs_total) = self.port.rs_stats();
+            if demand.rs_slots > rs_total {
                 return Err(PlannerError::Impossible {
-                    need: demand.kv_pages,
-                    total: kv_total,
+                    need: demand.rs_slots,
+                    total: rs_total,
                 });
             }
-            if demand.rs_slots > 0 {
-                let (_, rs_total) = self.port.rs_stats();
-                if demand.rs_slots > rs_total {
-                    return Err(PlannerError::Impossible {
-                        need: demand.rs_slots,
-                        total: rs_total,
-                    });
-                }
+        }
+        enum Parked {
+            Entry(EntryKey, Arc<Notify>),
+            NotResident,
+            Gone,
+        }
+        let parked = self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get(&pid) else {
+                return Parked::Gone;
+            };
+            if proc.state != Residency::Resident {
+                return Parked::NotResident;
             }
-            enum Parked {
-                Entry(EntryKey, Arc<Notify>),
-                NotResident,
-                Gone,
-            }
-            let parked = self.with_inner(|inner| {
-                let Some(proc) = inner.procs.get(&pid) else {
-                    return Parked::Gone;
-                };
-                if proc.state != Residency::Resident {
-                    return Parked::NotResident;
-                }
-                let key = (proc.seq, inner.next_id);
-                inner.next_id += 1;
-                let notify = Arc::new(Notify::new());
-                inner.queue.insert(
-                    key,
-                    Waiter {
-                        pid,
-                        kind: WaitKind::Allocation {
-                            demand,
-                            notify: notify.clone(),
-                            outcome: None,
-                            yielded: false,
-                        },
+            let key = (proc.seq, inner.next_id);
+            inner.next_id += 1;
+            let notify = Arc::new(Notify::new());
+            inner.queue.insert(
+                key,
+                Waiter {
+                    pid,
+                    kind: WaitKind::Allocation {
+                        demand,
+                        notify: notify.clone(),
+                        outcome: None,
+                        yielded: false,
                     },
-                );
-                Parked::Entry(key, notify)
-            });
-            match parked {
-                Parked::Gone => return Err(PlannerError::Cancelled),
-                Parked::NotResident => {
-                    // Out of the set (or in transfer): the fire path settles
-                    // the process's tail and waits out the eviction.
-                    return Ok(Acquired::Yield);
-                }
-                Parked::Entry(key, notify) => {
-                    self.stats.parks.fetch_add(1, Ordering::Relaxed);
-                    ptrace!("park key={:?} pid={} kv={}", key, pid, demand.kv_pages);
-                    // Park census for the wave records: when the ask parked,
-                    // was the pool actually empty, or did it park only
-                    // because the FCFS fast path closes once anyone waits?
-                    let park_started_us = crate::scheduler::fire_timing_now_us();
-                    {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        let acc = &crate::scheduler::GUEST_PHASES;
-                        acc.park_n.fetch_add(1, Relaxed);
-                        let (free_now, _) = self.port.device_stats();
-                        if free_now as u64 >= u64::from(demand.kv_pages) {
-                            acc.park_free_n.fetch_add(1, Relaxed);
-                        }
-                    }
-                    // The park empties this lane's seat in the wait-all
-                    // quorum so frames seal without it; rejoin is implicit
-                    // on the lane's next accepted fire.
-                    crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
-                    if limbo_probe {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        let acc = &crate::scheduler::GUEST_PHASES;
-                        let limbo = crate::scheduler::fire_timing_now_us()
-                            .saturating_sub(limbo_started_us)
-                            * 1_000;
-                        acc.limbo_ns.fetch_add(limbo, Relaxed);
-                        acc.limbo_max_ns.fetch_max(limbo, Relaxed);
-                    }
-                    let mut registration = WaitRegistration {
-                        planner: self,
-                        key,
-                        active: true,
-                    };
-                    self.poke();
-                    loop {
-                        let notified = notify.notified();
-                        tokio::pin!(notified);
-                        notified.as_mut().enable();
-                        match self.collect_outcome(key) {
-                            Collect::Ready(outcome) => {
-                                registration.disarm();
-                                ptrace!("collect key={:?} ok={}", key, outcome.is_ok());
-                                if matches!(outcome, Err(PlannerError::Cancelled)) {
-                                    self.stats.cancelled_waits.fetch_add(1, Ordering::Relaxed);
-                                }
-                                // The collection unblocked the next head.
-                                self.poke();
-                                {
-                                    use std::sync::atomic::Ordering::Relaxed;
-                                    let acc = &crate::scheduler::GUEST_PHASES;
-                                    let waited = crate::scheduler::fire_timing_now_us()
-                                        .saturating_sub(park_started_us)
-                                        * 1_000;
-                                    acc.park_ns.fetch_add(waited, Relaxed);
-                                    acc.park_max_ns.fetch_max(waited, Relaxed);
-                                }
-                                return outcome.map(Acquired::Granted);
+                },
+            );
+            Parked::Entry(key, notify)
+        });
+        match parked {
+            Parked::Gone => return Err(PlannerError::Cancelled),
+            Parked::NotResident => {
+                // Out of the set (or in transfer): the fire path settles
+                // the process's tail and waits out the eviction.
+                return Ok(Acquired::Yield);
+            }
+            Parked::Entry(key, notify) => {
+                self.stats.parks.fetch_add(1, Ordering::Relaxed);
+                ptrace!("park key={:?} pid={} kv={}", key, pid, demand.kv_pages);
+                // The park empties this lane's seat in the wait-all
+                // quorum so frames seal without it; rejoin is implicit
+                // on the lane's next accepted fire.
+                crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
+                let mut registration = WaitRegistration {
+                    planner: self,
+                    key,
+                    active: true,
+                };
+                self.poke();
+                loop {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    match self.collect_outcome(key) {
+                        Collect::Ready(outcome) => {
+                            registration.disarm();
+                            ptrace!("collect key={:?} ok={}", key, outcome.is_ok());
+                            if matches!(outcome, Err(PlannerError::Cancelled)) {
+                                self.stats.cancelled_waits.fetch_add(1, Ordering::Relaxed);
                             }
-                            Collect::Yield => {
-                                registration.disarm();
-                                self.poke();
-                                return Ok(Acquired::Yield);
-                            }
-                            Collect::Wait => {}
+                            // The collection unblocked the next head.
+                            self.poke();
+                            return outcome.map(Acquired::Granted);
                         }
-                        notified.await;
+                        Collect::Yield => {
+                            registration.disarm();
+                            self.poke();
+                            return Ok(Acquired::Yield);
+                        }
+                        Collect::Wait => {}
                     }
+                    notified.await;
                 }
             }
         }
@@ -1820,10 +1734,6 @@ impl ResidencyPlanner {
                 free_now >= demand.kv_pages.saturating_add(head_shortfall)
             });
             if head_covered && let Some(grant) = self.try_reserve(demand) {
-                use std::sync::atomic::Ordering::Relaxed;
-                crate::scheduler::GUEST_PHASES
-                    .fast_small_n
-                    .fetch_add(1, Relaxed);
                 self.note_progress(pid);
                 return Ok(Enqueued::Granted(grant));
             }
@@ -1838,7 +1748,6 @@ impl ResidencyPlanner {
         }
         // Exact-arithmetic exhaustion check before parking — slow path only,
         // as in `acquire`.
-        let limbo_started_us = crate::scheduler::fire_timing_now_us();
         let (_, kv_total) = self.port.device_stats();
         if demand.kv_pages > kv_total {
             return Err(PlannerError::Impossible {
@@ -1890,35 +1799,15 @@ impl ResidencyPlanner {
             Parked::Entry(key, notify) => {
                 self.stats.parks.fetch_add(1, Ordering::Relaxed);
                 ptrace!("park key={:?} pid={} kv={}", key, pid, demand.kv_pages);
-                let park_started_us = crate::scheduler::fire_timing_now_us();
-                {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let acc = &crate::scheduler::GUEST_PHASES;
-                    acc.park_n.fetch_add(1, Relaxed);
-                    let (free_now, _) = self.port.device_stats();
-                    if free_now as u64 >= u64::from(demand.kv_pages) {
-                        acc.park_free_n.fetch_add(1, Relaxed);
-                    }
-                }
                 // The park empties this lane's seat in the wait-all quorum so
                 // frames seal without it; rejoin is implicit on the lane's
                 // next accepted fire — for a deferred frame, the engine
                 // completion task's own submission.
                 crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
-                {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let acc = &crate::scheduler::GUEST_PHASES;
-                    let limbo = crate::scheduler::fire_timing_now_us()
-                        .saturating_sub(limbo_started_us)
-                        * 1_000;
-                    acc.limbo_ns.fetch_add(limbo, Relaxed);
-                    acc.limbo_max_ns.fetch_max(limbo, Relaxed);
-                }
                 let ticket = AllocationTicket {
                     planner: Arc::clone(self),
                     key,
                     notify,
-                    park_started_us,
                     collected: false,
                 };
                 self.poke();
@@ -2056,8 +1945,6 @@ impl ResidencyPlanner {
     /// is covered, serve it, repeat. Falls through to rung 0 (idle reclaim)
     /// and then eviction planning when the pool runs dry.
     pub fn plan(self: &Arc<Self>) {
-        let plan_t0 = std::time::Instant::now();
-        let _plan_probe = scopeguard_plan(plan_t0);
         loop {
             let step = self.with_inner(|inner| {
                 let Some((key, waiter)) = inner.unmet_head() else {
@@ -2225,7 +2112,6 @@ impl ResidencyPlanner {
                     match outcome {
                         ServeOutcome::Served(notify) => {
                             self.stats.serves.fetch_add(1, Ordering::Relaxed);
-                            ptrace!("serve key={:?} kv={}", key, demand.kv_pages);
                             notify.notify_waiters();
                             // CASCADE: the served head no longer competes
                             // (`is_unmet` skips it), so keep draining — the
@@ -2317,7 +2203,6 @@ impl ResidencyPlanner {
                     });
                     match boarded {
                         Board::Go(pages) => {
-                            ptrace!("restore-serve pid={} pages={}", pid, pages.len());
                             exec::spawn_restore(self.clone(), pid, pages);
                             continue;
                         }
@@ -2448,9 +2333,45 @@ impl ResidencyPlanner {
         // Eviction funds the head only when KV bytes can physically move
         // out: a swap-incapable driver or an exhausted host pool leaves the
         // starvation predicate as the last rung.
-        let (host_free, _) = self.port.host_stats();
+        let (host_free, host_total) = self.port.host_stats();
         if !self.port.suspend_capable() || host_free == 0 {
             self.check_starvation(StarveCause::NoSwapRoom);
+            return;
+        }
+        // HOST RESERVE. The rung may not spend the last of the host pool on
+        // a fleet that is still running.
+        //
+        // The gate below asks whether waiting can produce the next page. It
+        // does not ask what the eviction is being paid for with. Eviction is
+        // funded by the host pool, the pool is finite, and the only event
+        // that returns a host slot is a restore — so a saturated fleet,
+        // whose `free` is 0 by definition and whose head is therefore
+        // permanently unmet, drains the host pool to nothing and then meets
+        // the `host_free == 0` arm above, which is a KILL. The fleet was
+        // never in trouble; it was recycling its pages as fast as it could.
+        //
+        // Measured on `soak` (160 device pages, 1024 host pages, 4096
+        // requests at 256-way): the rung took host_free 1024 -> 0 in the
+        // first seconds and held it there for the remaining 60 s, running
+        // 631 evictions against 123 before the rung was opened and handing
+        // 99 processes to the starvation rung — every one of them destroyed
+        // and restarted, i.e. work thrown away by a fleet that was
+        // completing normally.
+        //
+        // So the last slice of the host pool is reserved for the case the
+        // rung actually exists for. [`Self::is_wedged`] — nothing admitted
+        // can progress on its own — spends it; anything less defers and
+        // waits for the completion that a live fleet will deliver. This
+        // does not close the rung at high oversubscription, which is the
+        // defect the wedge predicate had: the reserve is a fraction of the
+        // HOST pool, so it binds only where host room is scarce relative to
+        // demand. On the D/512 shape the rung exists for (8192 device pages
+        // against 16384 host pages) the reserve is 2048 host pages and the
+        // device pool cannot put enough out to reach it.
+        if host_free.saturating_mul(HOST_RESERVE_DIVISOR) <= host_total && !self.is_wedged() {
+            self.stats
+                .eviction_deferrals
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         // LOAD CONTROL. Eviction is a SUPPLY rung, not a demand rung.
@@ -2481,13 +2402,14 @@ impl ResidencyPlanner {
         // wedge predicate was reaching for.
         //
         // This IS more eviction than before, and the X-shape number above
-        // is the standing warning about paying for it. Two things bound
+        // is the standing warning about paying for it. Three things bound
         // it. Host swap is opt-in — with no host room the rung returns
         // `NoSwapRoom` above and never reaches this gate at all, so every
-        // no-swap deployment is unaffected. And the gate is demand-exact:
-        // pages already in flight count as supply, so a round is ordered
-        // only for the shortfall the in-flight ones cannot cover, and the
-        // rung shuts itself the instant they do.
+        // no-swap deployment is unaffected. The HOST RESERVE above caps
+        // how much of the host pool a live fleet may spend. And the gate is
+        // demand-exact: pages already in flight count as supply, so a round
+        // is ordered only for the shortfall the in-flight ones cannot cover,
+        // and the rung shuts itself the instant they do.
         //
         // It used to be `evicting.is_empty()` instead, which capped the
         // rung at ONE victim in flight — a rate of one victim-landing
@@ -3066,7 +2988,7 @@ impl ResidencyPlanner {
             crate::inferlet::process::residency::kv_working_sets_for(&pids, model, driver);
 
         // One atomic decision: store lock outside, planner lock inside.
-        let (head, deficit, picks) =
+        let (head, _deficit, picks) =
             crate::store::registry::with_kv_lock(&stores.kv, "planner-endgame", |kv| {
                 self.with_inner(|inner| {
                     let Some((head, waiter)) = inner.unmet_head() else {
@@ -3137,18 +3059,11 @@ impl ResidencyPlanner {
         let (Some(head), false) = (head, picks.is_empty()) else {
             return false;
         };
-        let n = picks.len();
         // The last-resort rung is liveness, never runway: `runway_grab` 0.
         if !self.commit_evictions(head, picks, true, 0) {
             return false;
         }
         self.stats.e6_relaxations.fetch_add(1, Ordering::Relaxed);
-        ptrace!(
-            "last-resort-evict head_seq={} deficit={} picked={}",
-            head.0,
-            deficit,
-            n
-        );
         true
     }
 
@@ -3279,7 +3194,6 @@ impl ResidencyPlanner {
             ServeOutcome::Served(notify) => {
                 self.stats.serves.fetch_add(1, Ordering::Relaxed);
                 self.stats.hoard_bypasses.fetch_add(1, Ordering::Relaxed);
-                ptrace!("hoard-bypass serve key={:?} kv={}", key, demand.kv_pages);
                 notify.notify_waiters();
                 self.poke();
                 true
@@ -3392,60 +3306,6 @@ impl ResidencyPlanner {
         // would otherwise return `Starved`.
         if self.serve_from_hoard() {
             return;
-        }
-        // Trace-gated post-mortem: the exact state that reached destruction.
-        // Every field here was needed to tell the two wedge classes apart
-        // (E6 hysteresis vs a genuinely unreclaimable holder) — see §18.7/§18.9.
-        if trace_enabled() {
-            let (pids, dump) = self.with_inner(|inner| {
-                let q: Vec<String> = inner
-                    .queue
-                    .iter()
-                    .map(|((seq, _), w)| {
-                        let kind = match &w.kind {
-                            WaitKind::Allocation {
-                                outcome, yielded, ..
-                            } => format!("alloc:served={}:yielded={}", outcome.is_some(), yielded),
-                            WaitKind::Restore { .. } => "restore".to_string(),
-                        };
-                        format!("{seq}:{kind}:need={}", w.kv_need())
-                    })
-                    .collect();
-                let p: Vec<String> = inner
-                    .procs
-                    .values()
-                    .map(|proc| format!("{}:{:?}:prog={}", proc.seq, proc.state, proc.progressed))
-                    .collect();
-                let pids: Vec<(ProcessId, u64)> = inner
-                    .procs
-                    .iter()
-                    .map(|(id, proc)| (*id, proc.seq))
-                    .collect();
-                (
-                    pids,
-                    format!("queue=[{}] procs=[{}]", q.join(","), p.join(",")),
-                )
-            });
-            let (model, driver) = self.port.locus();
-            let ids: Vec<ProcessId> = pids.iter().map(|(id, _)| *id).collect();
-            // A diagnostic dump wants every opinion, not a covering prefix.
-            let quotes = crate::inferlet::process::residency::kv_reclaim_quotes(
-                &ids,
-                model,
-                driver,
-                u32::MAX,
-            );
-            let q: Vec<String> = pids
-                .iter()
-                .zip(quotes)
-                .map(|((_, seq), quote)| format!("{seq}:{quote:?}"))
-                .collect();
-            ptrace!(
-                "WEDGE-KILL cause={:?} {} quotes=[{}]",
-                cause,
-                dump,
-                q.join(",")
-            );
         }
         let (free, total) = self.port.device_stats();
         // A destruction already ordered has not been paid out yet: gate the
@@ -3792,7 +3652,7 @@ impl ResidencyPlanner {
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
-            proc.restore_attempts = 0;
+            proc.restore_retried = false;
             // E6: not re-evictable until its next `acquire`.
             proc.progressed = false;
             Some(proc.signal.clone())
@@ -3810,41 +3670,81 @@ impl ResidencyPlanner {
         self.poke();
     }
 
-    /// A restore attempt failed. Bounded transport retries: the process
-    /// re-queues as evicted at its spawn position; past the bound it is
-    /// failed loud through the runtime abort path.
+    /// A restore broke somewhere that says nothing about what the transfer
+    /// left behind — a committed page table, or an executor that died
+    /// mid-sequence. There is no clean evicted state to return to, so the
+    /// process is failed loud through the runtime abort path.
     fn restore_failed(self: &Arc<Self>, pid: ProcessId, reason: &str) {
-        let exhausted = self.with_inner(|inner| {
+        let live = self.with_inner(|inner| {
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return false;
             };
             if proc.state != Residency::Restoring {
                 return false;
             }
-            proc.restore_attempts += 1;
             proc.state = Residency::Evicted;
-            let attempts_exhausted = proc.restore_attempts >= self.config.restore_retries.max(1);
-            if !attempts_exhausted {
-                let key = (proc.seq, inner.next_id);
-                inner.next_id += 1;
-                inner.queue.insert(
-                    key,
-                    Waiter {
-                        pid,
-                        kind: WaitKind::Restore { demand: 0 },
-                    },
-                );
-            }
-            attempts_exhausted
+            true
         });
         self.stats.restore_failures.fetch_add(1, Ordering::Relaxed);
-        if exhausted {
-            let reason = format!("KV restore failed after bounded retries: {reason}");
-            tracing::error!(pid = %pid, %reason, "planner: failing evicted process loud");
-            crate::inferlet::process::terminate(pid, Err(reason));
+        if live {
+            self.fail_restore_loud(pid, reason);
         } else {
-            self.poke();
+            self.poke(); // stale report: the process already moved on.
         }
+    }
+
+    /// A restore broke before anything was committed: it either never
+    /// started, or `abort_now` rolled it back. Either way the process is
+    /// exactly where it was — evicted, holding nothing — so it goes back in
+    /// line at its spawn position rather than dying for it.
+    ///
+    /// Once per episode, and deliberately not a tunable. The re-serve
+    /// rebuilds the ask from what is swapped *now* (`Step::ServeRestore`), so
+    /// a short grant cannot be short twice; anything that breaks again breaks
+    /// for a reason a third attempt would not fix.
+    fn restore_deferred(self: &Arc<Self>, pid: ProcessId, reason: &str) {
+        enum Outcome {
+            /// The report no longer applies — the process terminated, or
+            /// another path already moved it out of `Restoring`.
+            Stale,
+            Requeued,
+            /// The one re-queue was already spent this episode.
+            Spent,
+        }
+        let outcome = self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get_mut(&pid) else {
+                return Outcome::Stale;
+            };
+            if proc.state != Residency::Restoring {
+                return Outcome::Stale;
+            }
+            proc.state = Residency::Evicted;
+            if proc.restore_retried {
+                return Outcome::Spent;
+            }
+            proc.restore_retried = true;
+            let key = (proc.seq, inner.next_id);
+            inner.next_id += 1;
+            inner.queue.insert(
+                key,
+                Waiter {
+                    pid,
+                    kind: WaitKind::Restore { demand: 0 },
+                },
+            );
+            Outcome::Requeued
+        });
+        self.stats.restore_failures.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            Outcome::Stale | Outcome::Requeued => self.poke(),
+            Outcome::Spent => self.fail_restore_loud(pid, reason),
+        }
+    }
+
+    fn fail_restore_loud(self: &Arc<Self>, pid: ProcessId, reason: &str) {
+        let reason = format!("KV restore failed: {reason}");
+        tracing::error!(pid = %pid, %reason, "planner: failing evicted process loud");
+        crate::inferlet::process::terminate(pid, Err(reason));
     }
 
     pub fn record_host_swap_exhaustion(&self) {
@@ -4327,6 +4227,61 @@ mod service_order_tests {
         assert_eq!(key.0, 1);
         assert!(matches!(waiter.kind, WaitKind::Allocation { .. }));
     }
+
+    /// The second valve. The fleet is live — a resident is running, so
+    /// `fleet_stalled` is false and the first valve stays shut — but the
+    /// host pool that funds eviction is out, and only a restore returns a
+    /// host slot. Yielding here serves nobody: the allocation it yields to
+    /// can only be funded by an eviction that cannot be paid for. On `soak`
+    /// this ran for 60 s and cost 21895 rollbacks and 138 starvation kills.
+    #[test]
+    fn a_restore_takes_the_head_once_eviction_cannot_be_funded() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            (2, Residency::Resident, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[2], 3, 1);
+        assert!(!inner.fleet_stalled(), "a resident is still running");
+        assert_eq!(
+            inner.unmet_head().expect("a head").0.0,
+            3,
+            "with host room the yield stands"
+        );
+
+        inner.host_swap_blocked.insert(pids[1]);
+
+        assert!(inner.eviction_unfundable());
+        let (key, waiter) = inner.unmet_head().expect("a head");
+        assert_eq!(key.0, 1, "the older restore must take the head");
+        assert!(matches!(waiter.kind, WaitKind::Restore { .. }));
+    }
+
+    /// And it is a live signal, not a latch: once host room returns the
+    /// blocked set is cleared and the yield resumes, so the fix cannot
+    /// re-introduce the evict/restore ping-pong it is bounding.
+    #[test]
+    fn returning_host_room_resumes_the_yield() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            (2, Residency::Resident, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[2], 3, 1);
+        inner.host_swap_blocked.insert(pids[1]);
+        assert_eq!(inner.unmet_head().expect("a head").0.0, 1);
+
+        inner.host_swap_blocked.clear();
+
+        assert!(!inner.eviction_unfundable());
+        assert_eq!(
+            inner.unmet_head().expect("a head").0.0,
+            3,
+            "the allocation takes the head again"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4347,14 +4302,18 @@ mod starvation_race_tests {
         free: parking_lot::Mutex<Vec<PhysicalKvPageId>>,
         total: u32,
         stall: AtomicU32,
-        /// Host swap room. Zero (the default) keeps `plan_eviction` on its
-        /// `NoSwapRoom` short-circuit, which is what every starvation-rung
-        /// test wants; non-zero lets a test reach the load-control gate.
+        /// Host swap room still free. Zero (the default) keeps
+        /// `plan_eviction` on its `NoSwapRoom` short-circuit, which is what
+        /// every starvation-rung test wants; non-zero lets a test reach the
+        /// load-control gate.
         host: u32,
         /// Every `reserve_device_up_to` request, in order — how the drain
         /// ASKED for its supply, which is what tells one pull for a whole
         /// burst apart from one pull per waiter.
         pulls: parking_lot::Mutex<Vec<u32>>,
+        /// Host swap capacity. Kept apart from `host` so a test can put the
+        /// pool under the reserve without emptying it.
+        host_total: u32,
     }
 
     impl RacePool {
@@ -4365,6 +4324,7 @@ mod starvation_race_tests {
                 stall: AtomicU32::new(0),
                 host: 0,
                 pulls: parking_lot::Mutex::new(Vec::new()),
+                host_total: 0,
             }
         }
 
@@ -4373,6 +4333,18 @@ mod starvation_race_tests {
         fn with_swap(total: u32, host: u32) -> Self {
             Self {
                 host,
+                host_total: host,
+                ..Self::new(total)
+            }
+        }
+
+        /// A swap-capable pool whose host room is already down to `host` of
+        /// `host_total`, so the HOST RESERVE gate can be exercised without
+        /// emptying the pool (which is the separate `NoSwapRoom` arm).
+        fn with_host_pressure(total: u32, host: u32, host_total: u32) -> Self {
+            Self {
+                host,
+                host_total,
                 ..Self::new(total)
             }
         }
@@ -4393,7 +4365,7 @@ mod starvation_race_tests {
             (self.free.lock().len() as u32, self.total)
         }
         fn host_stats(&self) -> (u32, u32) {
-            (self.host, self.host)
+            (self.host, self.host_total)
         }
         fn rs_stats(&self) -> (u32, u32) {
             (0, 0)
@@ -4406,7 +4378,7 @@ mod starvation_race_tests {
             // straight to `check_starvation(NoSwapRoom)` — the shortest path
             // to the starvation rung, and it skips `last_resort_evict`
             // (which needs the real residency tables).
-            self.host > 0
+            self.host_total > 0
         }
         fn locus(&self) -> (usize, usize) {
             (0, 0)
@@ -4459,10 +4431,7 @@ mod starvation_race_tests {
     #[test]
     fn a_burst_serves_exactly_the_fundable_prefix_in_one_pass() {
         let pool = Arc::new(RacePool::new(64));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone() as Arc<dyn PoolPort>,
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
 
         // A running holder keeps the wedge predicate false, so the rungs
         // below the drain stay out of this while the pool is empty.
@@ -4577,10 +4546,7 @@ mod starvation_race_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn starvation_rung_does_not_kill_while_the_pool_can_fund_the_head() {
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
         // A running process owns the whole pool. While it is registered and
         // unparked the wedge predicate is false, so the two asks below park
@@ -4666,10 +4632,7 @@ mod starvation_race_tests {
         // Total 4, free 0: the victim owns the pool, so the head's ask is
         // fundable in principle (not `Impossible`) but parks.
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
         // A younger admitted resident is the only legal victim for the head.
         let head = ProcessId::new_v4();
@@ -4744,10 +4707,7 @@ mod starvation_race_tests {
     #[test]
     fn a_restart_inherits_its_fcfs_position() {
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone() as Arc<dyn PoolPort>,
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
 
         let victim = ProcessId::new_v4();
         let younger = ProcessId::new_v4();
@@ -4799,10 +4759,7 @@ mod starvation_race_tests {
         // Non-zero capacity with an empty free list: an ask bigger than the
         // pool is failed loud instead of parking.
         let pool = Arc::new(RacePool::with_swap(4, 64));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
         // §10.14: pin the runway latch closed so the DEMAND-EXACT arithmetic
         // stays under test even when the verification environment exports
         // PIE_SUPPLY_RUNWAY (the env read is a process-global OnceLock, so a
@@ -4909,10 +4866,7 @@ mod starvation_race_tests {
     #[test]
     fn a_runway_shortfall_starts_a_round_with_an_empty_queue() {
         let pool = Arc::new(RacePool::with_swap(4, 64));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone() as Arc<dyn PoolPort>,
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
 
         // Two admitted residents; the free list and the queue are empty.
         let elder = ProcessId::new_v4();
@@ -4968,6 +4922,90 @@ mod starvation_race_tests {
         );
     }
 
+    /// HOST RESERVE: the rung may not spend the last of the host pool on a
+    /// fleet that is still running.
+    ///
+    /// Load control asks whether waiting can produce the next page. It does
+    /// not ask what the eviction is PAID for. A saturated fleet has `free`
+    /// at 0 by definition, so its head is permanently unmet and the gate is
+    /// permanently open — which drained the host pool to nothing and then
+    /// handed the stranded processes to the starvation rung, one rung below
+    /// the `host_free == 0` arm. See `plan_eviction`'s HOST RESERVE note
+    /// for the `soak` measurement.
+    ///
+    /// Two fixtures identical but for host room, so the reserve is the only
+    /// thing that can differ in the outcome. That the reserve is still
+    /// SPENT by a wedge is the `!is_wedged()` clause in the gate, and the
+    /// suite's wedge scenarios (`tinyswap`, `tinyswap_thrash`, `onefits`)
+    /// are what hold it: all of them still reach eviction.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_running_fleet_may_not_spend_the_last_of_the_host_pool() {
+        for host_free in [8u32, 64] {
+            let under_reserve = host_free * HOST_RESERVE_DIVISOR <= 128;
+            assert_eq!(under_reserve, host_free == 8, "the fixtures straddle it");
+
+            // Host room down to `host_free` of 128, and never zero: the
+            // `NoSwapRoom` arm is a different gate and must not be what
+            // fires here.
+            let pool = Arc::new(RacePool::with_host_pressure(4, host_free, 128));
+            let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
+
+            // An unparked admitted runner: the fleet is live, so the head's
+            // ask parks instead of being destroyed on arrival.
+            let holder = ProcessId::new_v4();
+            planner.register(holder);
+            planner.note_admitted(holder);
+
+            let head = ProcessId::new_v4();
+            planner.register(head);
+            planner.note_admitted(head);
+            // Younger, resident, admitted: legal victims, so a set exists
+            // and only the gate can hold the round back.
+            for _ in 0..3 {
+                let pid = ProcessId::new_v4();
+                planner.register(pid);
+                planner.note_admitted(pid);
+            }
+
+            let demand = Demand {
+                kv_pages: 1,
+                rs_slots: 0,
+            };
+            let p = planner.clone();
+            let parked = tokio::spawn(async move { p.acquire(head, head, demand).await });
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if planner.diagnostics().queue.len() == 1 {
+                    break;
+                }
+            }
+            assert_eq!(planner.diagnostics().queue.len(), 1, "the ask must park");
+
+            // Everything load control looks at says "evict": empty pool,
+            // unmet head, nothing in flight, fleet not wedged. Only the
+            // reserve is left to tell the two rounds apart.
+            assert!(planner.supply_stalled(), "an empty pool with an unmet head");
+            assert!(!planner.is_wedged(), "a running holder is not a wedge");
+
+            let before = planner.diagnostics().eviction_deferrals_total;
+            planner.plan_eviction();
+            let deferred = planner.diagnostics().eviction_deferrals_total - before;
+            assert_eq!(
+                deferred,
+                u64::from(under_reserve),
+                "a live fleet under the reserve waits for the completion it \
+                 will deliver, and evicts as usual above it (host_free={host_free})"
+            );
+            assert_eq!(
+                planner.diagnostics().starvations_total,
+                0,
+                "and deferring is never starving"
+            );
+
+            parked.abort();
+        }
+    }
+
     /// The destruction guard clears on BOTH of its exits, so it can never
     /// wedge the deadlock breaker it rate-limits.
     ///
@@ -4979,10 +5017,7 @@ mod starvation_race_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn an_ordered_kill_stops_counting_once_the_victim_dies_or_re_contends() {
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
         // A running holder keeps the wedge predicate false throughout, so
         // the rung under test is never entered for real.
@@ -5043,10 +5078,7 @@ mod starvation_race_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dropping_an_uncollected_ticket_deregisters_the_ask() {
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
         // A running holder keeps the wedge predicate false so the parked ask
         // is not destroyed on arrival by the starvation rung.
@@ -5083,10 +5115,7 @@ mod starvation_race_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_ticket_collects_the_grant_the_drain_serves() {
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
         let holder = ProcessId::new_v4();
         planner.register(holder);

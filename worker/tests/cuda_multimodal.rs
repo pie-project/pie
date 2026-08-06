@@ -61,11 +61,9 @@ fn mm_cuda_toml(snapshot_path: &str) -> String {
          [runtime]\n\
          allow_fs = true\n\
          fs_scratch_dir = \"{scratch}\"\n\n\
-         [auth]\n\
-         enabled = false\n\n\
          [model]\n\
          name = \"default\"\n\
-         hf_repo = \"{snapshot}\"\n\n\
+         model = \"{snapshot}\"\n\n\
          [model.driver]\n\
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\n\

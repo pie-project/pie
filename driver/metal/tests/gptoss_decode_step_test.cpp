@@ -81,6 +81,20 @@ void the_geometry_is_the_checkpoints() {
     ragged_gqa.n_kv_heads = 7;
     expect(!geometry_from_facts(ragged_gqa, bad, &err),
            "so is a head count grouped attention cannot divide: " + err);
+    // `router_topk` clamps both of these instead of failing, and gpt-oss shares
+    // that kernel with llama. A clamped k routes to fewer experts than the
+    // config asks for while `go_kind_width` keeps sizing the expert stacks by
+    // the configured k, so the slots past the clamp are never written and the
+    // model still produces text.
+    Facts wide_k;
+    wide_k.n_experts = 128;
+    wide_k.experts_per_token = 20;
+    expect(!geometry_from_facts(wide_k, bad, &err),
+           "so is a top-k wider than the router can hold: " + err);
+    Facts many_experts;
+    many_experts.n_experts = 2048;
+    expect(!geometry_from_facts(many_experts, bad, &err),
+           "so is an expert count past one threadgroup of lanes: " + err);
 }
 
 void the_step_is_this_many_dispatches() {
@@ -100,8 +114,9 @@ void the_step_is_this_many_dispatches() {
     for (Kind k : {Kind::AttnNorm, Kind::QmvQ, Kind::QmvK, Kind::QmvV, Kind::RopeQ,
                    Kind::RopeK, Kind::KvAppend, Kind::SdpaSink, Kind::QmvO,
                    Kind::AttnResidual, Kind::FfnNorm, Kind::RouterGemv, Kind::RouterTopK,
-                   Kind::ExpertGate, Kind::ExpertUp, Kind::ExpertSwiGlu, Kind::ExpertDown,
-                   Kind::ExpertCombine, Kind::FfnResidual}) {
+                   Kind::ExpertSort, Kind::ExpertGather, Kind::ExpertGate, Kind::ExpertUp,
+                   Kind::ExpertSwiGlu, Kind::ExpertDown, Kind::ExpertCombine,
+                   Kind::FfnResidual}) {
         expect_eq(count(dag, k), g.n_layers, "one per layer");
     }
 
@@ -112,7 +127,7 @@ void the_step_is_this_many_dispatches() {
     expect_eq(count(dag, Kind::LmHead), 1, "one logits matvec");
     expect_eq(count(dag, Kind::Argmax), 0, "argmax is opt-in");
 
-    const int per_layer = 19;
+    const int per_layer = 21;
     // Tail: the row gather, the final norm and the LM head.
     expect_eq(s.total, 1 + g.n_layers * per_layer + 3,
               "the whole step is exactly this many dispatches");

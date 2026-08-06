@@ -34,9 +34,9 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
-=== ptir_m3_generic_ready_v35
-function_name: ptir_m3_generic_ready_v35
+#   reason: cumsum/cumprod widened from F32-only to every numeric dtype; the m1 runtime's scan block now branches on the operand dtype instead of loading every lane through m1_load_f. The oracle dumps change only because that block is embedded verbatim in every emitted source -- no emitted structure moved, and the f32 path is byte-for-byte the arithmetic the oracle recorded.
+=== ptir_m3_generic_ready_v36
+function_name: ptir_m3_generic_ready_v36
 ok: true
 source: bytes=2977 prefix=none tail_bytes=2977
 #include <metal_stdlib>
@@ -91,7 +91,7 @@ struct M3RowMeta {
   uint mtp_offset;
   uint reserved;
 };
-kernel void ptir_m3_generic_ready_v35(const device uchar* lane_bytes [[buffer(0)]], const device M3ChannelMeta* meta [[buffer(1)]], uint lane_index [[thread_position_in_grid]]) {
+kernel void ptir_m3_generic_ready_v36(const device uchar* lane_bytes [[buffer(0)]], const device M3ChannelMeta* meta [[buffer(1)]], uint lane_index [[thread_position_in_grid]]) {
   const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
   if (lane_index >= header->lane_count) return;
   const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
@@ -118,8 +118,8 @@ kernel void ptir_m3_generic_ready_v35(const device uchar* lane_bytes [[buffer(0)
   status->state = 1;
 }
 === end
-=== ptir_m3_generic_commit_v35
-function_name: ptir_m3_generic_commit_v35
+=== ptir_m3_generic_commit_v36
+function_name: ptir_m3_generic_commit_v36
 ok: true
 source: bytes=2978 prefix=none tail_bytes=2978
 #include <metal_stdlib>
@@ -174,7 +174,7 @@ struct M3RowMeta {
   uint mtp_offset;
   uint reserved;
 };
-kernel void ptir_m3_generic_commit_v35(const device uchar* lane_bytes [[buffer(0)]], const device M3ChannelMeta* meta [[buffer(1)]], uint lane_index [[thread_position_in_grid]]) {
+kernel void ptir_m3_generic_commit_v36(const device uchar* lane_bytes [[buffer(0)]], const device M3ChannelMeta* meta [[buffer(1)]], uint lane_index [[thread_position_in_grid]]) {
   const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
   if (lane_index >= header->lane_count) return;
   const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));

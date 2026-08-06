@@ -40,6 +40,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "sdpa_online.h"
+
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_vector_decode_swa(
     const device T* queries [[buffer(0)]],
@@ -122,12 +124,9 @@ template <typename T, int D, int V = D>
     }
     score = simd_sum(score);
 
-    U new_max = max(max_score, score);
-    U factor = fast::exp(max_score - new_max);
-    U exp_score = fast::exp(score - new_max);
-
-    max_score = new_max;
-    sum_exp_score = sum_exp_score * factor + exp_score;
+    U factor, exp_score;
+    sdpa_online_update(
+        score, max_score, sum_exp_score, factor, exp_score);
     for (int j = 0; j < v_per_thread; j++) {
       o[j] = o[j] * factor + exp_score * values[j];
     }
@@ -171,15 +170,11 @@ template <typename T, int D, int V = D>
       const constant int&, const constant int&,                          \
       uint3, uint3, uint, uint);
 
-instantiate_sdpa_swa(float32, float, 256, 256)
-instantiate_sdpa_swa(float16, half, 256, 256)
 instantiate_sdpa_swa(bfloat16, bfloat, 256, 256)
 
 // gemma4 full-attention layers {4,9,14,19,24,29,34} use head_dim 512 (theta 1e6,
 // full rotation). The kernel is compile-time templated on D, so a distinct PSO is
 // required; the encode_fn selects it per-layer for is_full_attn() dispatches.
-instantiate_sdpa_swa(float32, float, 512, 512)
-instantiate_sdpa_swa(float16, half, 512, 512)
 instantiate_sdpa_swa(bfloat16, bfloat, 512, 512)
 
 template <typename T, int D, int V = D>
@@ -265,12 +260,9 @@ template <typename T, int D, int V = D>
     }
     score = simd_sum(score);
 
-    U new_max = max(max_score, score);
-    U factor = fast::exp(max_score - new_max);
-    U exp_score = fast::exp(score - new_max);
-
-    max_score = new_max;
-    sum_exp_score = sum_exp_score * factor + exp_score;
+    U factor, exp_score;
+    sdpa_online_update(
+        score, max_score, sum_exp_score, factor, exp_score);
     for (int j = 0; j < v_per_thread; j++) {
       o[j] = o[j] * factor + exp_score * values[j];
     }
@@ -294,9 +286,7 @@ template <typename T, int D, int V = D>
   // the output goes to zero. Folded in at a shared reference so a sink larger
   // than every logit does not overflow the exponential.
   const U sink = static_cast<U>(sinks[tid.x]);
-  const U m2 = max(new_max, sink);
-  const U orescale = fast::exp(new_max - m2);
-  sum_exp_score = sum_exp_score * orescale + fast::exp(sink - m2);
+  const U orescale = sdpa_merge_sink(sink, new_max, sum_exp_score);
 
   for (int i = 0; i < v_per_thread; i++) {
     outputs[simd_lid * BD + simd_gid] = o[i];
@@ -326,5 +316,4 @@ template <typename T, int D, int V = D>
       const constant int&, const constant int&, const device itype*,     \
       uint3, uint3, uint, uint);
 
-instantiate_sdpa_sink(float32, float, 64, 64)
 instantiate_sdpa_sink(bfloat16, bfloat, 64, 64)

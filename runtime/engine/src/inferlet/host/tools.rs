@@ -27,25 +27,20 @@ impl pie::inferlet::tools::Host for ProcessCtx {
         &mut self,
         tools: Vec<String>,
     ) -> Result<Result<Vec<u32>, pie::inferlet::types::Error>> {
-        let tokens = pie_model::model().instruct().equip(&tools);
+        let tokens = crate::model::model().instruct().equip(&tools);
         Ok(Ok(tokens))
     }
 
     async fn answer(&mut self, name: String, value: String) -> Result<Vec<u32>> {
-        Ok(pie_model::model().instruct().answer(&name, &value))
+        Ok(crate::model::model().instruct().answer(&name, &value))
     }
 
-    async fn create_decoder(&mut self) -> Result<Resource<Decoder>> {
-        let inner = pie_model::model().instruct().tool_decoder();
-        let decoder = Decoder { inner };
-        Ok(self.ctx().table.push(decoder)?)
-    }
 
     async fn format(
         &mut self,
         tools: Vec<String>,
     ) -> Result<Option<Resource<crate::inferlet::host::grammar::Grammar>>> {
-        let Some(tg) = pie_model::model().instruct().tool_call_grammar(&tools) else {
+        let Some(tg) = crate::model::model().instruct().tool_call_grammar(&tools) else {
             return Ok(None);
         };
         let compiled =
@@ -58,7 +53,7 @@ impl pie::inferlet::tools::Host for ProcessCtx {
         &mut self,
         tools: Vec<String>,
     ) -> Result<Resource<crate::inferlet::host::grammar::Matcher>> {
-        let model = pie_model::model();
+        let model = crate::model::model();
         let instruct = model.instruct();
         let stop_tokens = instruct.seal();
 
@@ -76,6 +71,12 @@ impl pie::inferlet::tools::Host for ProcessCtx {
 }
 
 impl pie::inferlet::tools::HostDecoder for ProcessCtx {
+    async fn new(&mut self) -> Result<Resource<Decoder>> {
+        let inner = crate::model::model().instruct().tool_decoder();
+        let decoder = Decoder { inner };
+        Ok(self.ctx().table.push(decoder)?)
+    }
+
     async fn feed(
         &mut self,
         this: Resource<Decoder>,
@@ -85,7 +86,12 @@ impl pie::inferlet::tools::HostDecoder for ProcessCtx {
         let event = decoder.inner.feed(&tokens);
         Ok(Ok(match event {
             ToolEvent::Start => pie::inferlet::tools::Event::Start,
-            ToolEvent::Call(name, args) => pie::inferlet::tools::Event::Call((name, args)),
+            ToolEvent::Call(name, args) => {
+                pie::inferlet::tools::Event::Call(pie::inferlet::tools::ToolCall {
+                    name,
+                    arguments_json: args,
+                })
+            }
         }))
     }
 

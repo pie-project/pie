@@ -486,7 +486,7 @@ int main(int argc, char** argv) {
     }
     Gemma4Psos psos;
     std::string error;
-    if (!build_gemma4_psos(*ctx, kernels_dir, psos, &error)) {
+    if (!build_gemma4_psos(*ctx, kernels_dir, Gemma4Geometry{}, psos, &error)) {
         std::printf("  FAIL  build_gemma4_psos: %s\n", error.c_str());
         return 1;
     }
@@ -499,8 +499,15 @@ int main(int argc, char** argv) {
     DecodeStepPsos base;
     MultiBatchPsos mb;
     std::string berr;
-    if (load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/true, &berr) &&
-        load_multibatch_psos(*ctx, kernels_dir, mb, /*with_d512=*/false, &berr)) {
+    // The gemma4 checkpoints these tests read are affine b4/g64; this test is
+    // about pipeline resolution, not the quantization axis.
+    const AffineFormat q{/*bits=*/4, /*group=*/64};
+    if (load_decode_psos(
+            *ctx, kernels_dir, base, q, &berr,
+            DecodePsoFeatures{.argmax = true}) &&
+        load_multibatch_psos(
+            *ctx, kernels_dir, mb, q, &berr,
+            MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
         the_paged_kernel_agrees_with_the_contiguous_one(*ctx, psos, base, mb, 512, "512");
         the_paged_kernel_agrees_with_the_contiguous_one(*ctx, psos, base, mb, 0, "0 (full)");
     } else {

@@ -200,8 +200,6 @@ impl HostShadow {
     /// the interpreter's phase order over the fire's values, then commit the
     /// net takes and puts. Device-decided puts commit as unknown cells.
     pub fn advance(&mut self, bound: &BoundTrace, cells: &BoundCells) {
-        let metered = crate::scheduler::fire_timing_enabled();
-        let started = metered.then(std::time::Instant::now);
         // Cross-stage pass overlay: pending puts (Ok = known value, Err =
         // committed-but-unknown), visible to later stages' reads.
         let mut pending: BTreeMap<u32, Result<Value, EvalBlocker>> = BTreeMap::new();
@@ -258,18 +256,6 @@ impl HostShadow {
         }
         for (chan, slot) in pending {
             self.queues.entry(chan).or_default().push_back(slot.ok());
-        }
-        if let Some(started) = started {
-            use std::sync::atomic::Ordering;
-            let folds = plan
-                .phases
-                .iter()
-                .filter(|phase| matches!(phase, Phase::Fold(_)))
-                .count() as u64;
-            crate::scheduler::SHADOW_ADVANCE_CALLS.fetch_add(1, Ordering::Relaxed);
-            crate::scheduler::SHADOW_ADVANCE_FOLDS.fetch_add(folds, Ordering::Relaxed);
-            crate::scheduler::SHADOW_ADVANCE_NS
-                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }
 }

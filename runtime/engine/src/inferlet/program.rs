@@ -29,8 +29,8 @@ use super::python::snapshot;
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the program manager service.
-pub fn spawn(wasm_engine: &WasmEngine, registry_url: String, cache_dir: PathBuf) {
-    let mut repository = Repository::new(registry_url, cache_dir);
+pub fn spawn(wasm_engine: &WasmEngine, registry_url: String, programs_dir: PathBuf) {
+    let mut repository = Repository::new(registry_url, programs_dir);
 
     // Scan disk on startup: load existing programs into index
     repository.load_program_cache();

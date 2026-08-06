@@ -263,7 +263,7 @@ fn retirement_waits_for_every_in_flight_write() {
     assert_eq!(
         s.available_slots(),
         free_after_publish,
-        "retirement is gated on the global in-flight count"
+        "retirement waits for the write whose epoch the free is tagged with"
     );
 
     s.settle(held);
@@ -271,6 +271,31 @@ fn retirement_waits_for_every_in_flight_write() {
         s.available_slots() > free_after_publish,
         "the displaced slot returns once nothing is in flight"
     );
+}
+
+#[test]
+fn a_completed_free_retires_while_a_newer_write_is_outstanding() {
+    let mut s = store();
+    let doomed = store_with_state(&mut s);
+    let other = s.create_working_set(geom());
+
+    // Nothing is outstanding, so this free is tagged with an epoch that has
+    // already completed on the device.
+    s.release_working_set(doomed, s.current_epoch());
+
+    // Now a NEWER write goes in flight. Its sequence is above the free's tag,
+    // so it was prepared after the slot became unreachable and cannot be
+    // touching it. Retirement must not wait for it.
+    let held = s.prepare_write(other, true, None).unwrap();
+    let held = s.publish_prepared(held).unwrap();
+    let under_load = s.available_slots();
+
+    s.retire_idle();
+    assert!(
+        s.available_slots() > under_load,
+        "a free whose epoch has completed retires even under sustained load"
+    );
+    s.settle(held);
 }
 
 #[test]
@@ -377,13 +402,7 @@ fn a_fold_may_not_reach_past_the_tokens_that_exist() {
     let ws = s.create_working_set(geom());
     s.alloc_buffer(ws, 2).unwrap();
     let prepared = s
-        .prepare_general(
-            ws,
-            false,
-            None,
-            Some((0, 4)),
-            RsBufferIntent::Write,
-        )
+        .prepare_general(ws, false, None, Some((0, 4)), RsBufferIntent::Write)
         .unwrap();
     settled(&mut s, prepared);
     assert_eq!(s.buffer_tokens(ws), Ok(4));
@@ -577,7 +596,11 @@ fn reserving_a_buffer_page_does_not_buffer_a_token() {
     let mut s = store();
     let ws = s.create_working_set(geom());
 
-    assert_eq!(s.buffer_tokens(ws).unwrap(), 0, "a new working set is empty");
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "a new working set is empty"
+    );
 
     s.alloc_buffer(ws, 2).unwrap();
     assert_eq!(s.buffer_size(ws).unwrap(), 2, "two pages reserved");
@@ -598,7 +621,11 @@ fn reserving_a_buffer_page_does_not_buffer_a_token() {
     // Rewriting the same span must not double-count.
     let prepared = s.prepare_write(ws, false, Some((0, 3))).unwrap();
     settled(&mut s, prepared);
-    assert_eq!(s.buffer_tokens(ws).unwrap(), 3, "a rewrite is not an append");
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        3,
+        "a rewrite is not an append"
+    );
 
     // A disjoint append advances the fill to its far edge.
     let prepared = s.prepare_write(ws, false, Some((4, 4))).unwrap();
@@ -734,7 +761,11 @@ fn folding_a_whole_page_rebases_the_head() {
 
     let prepared = s.prepare_fold(ws, 6).unwrap();
     settled(&mut s, prepared);
-    assert_eq!(s.buffer_size(ws).unwrap(), 1, "page 0 fully covered, dropped");
+    assert_eq!(
+        s.buffer_size(ws).unwrap(),
+        1,
+        "page 0 fully covered, dropped"
+    );
     assert_eq!(
         s.buffer_head(ws).unwrap(),
         2,
@@ -782,7 +813,8 @@ fn emptying_the_buffer_rebases_the_head_so_the_next_window_starts_at_zero() {
         let prepared = s.prepare_fold(ws, 2).unwrap();
         settled(&mut s, prepared);
         let size = s.buffer_size(ws).unwrap();
-        s.free_buffer(ws, &(0..size).collect::<Vec<_>>(), 0).unwrap();
+        s.free_buffer(ws, &(0..size).collect::<Vec<_>>(), 0)
+            .unwrap();
         assert_eq!(
             s.buffer_head(ws).unwrap(),
             0,

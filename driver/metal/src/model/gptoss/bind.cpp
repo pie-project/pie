@@ -27,6 +27,13 @@ int router_bits_from_extents(std::uint64_t weight_bytes, std::uint64_t scale_byt
     return (bits == 4 || bits == 8) ? int(bits) : 0;
 }
 
+bool mxfp4_experts_from_weights(const std::unordered_map<std::string, SlotHandle>& weights) {
+    // The absence of a zero point is what distinguishes the two 4-bit formats,
+    // and it is the same rule the contract used when it decided not to decode.
+    return weights.count("layers.0.mlp.experts.gate_proj.weight") != 0 &&
+           weights.count("layers.0.mlp.experts.gate_proj.biases") == 0;
+}
+
 int router_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights) {
     const auto w = weights.find("layers.0.mlp.router.weight");
     const auto s = weights.find("layers.0.mlp.router.scales");
@@ -34,29 +41,25 @@ int router_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& 
     return router_bits_from_extents(w->second.size, s->second.size);
 }
 
-ScratchColoring color_gptoss_scratch(const std::vector<Dispatch>& dag, const ScratchPlan& plan,
-                                     bool no_recycle) {
-    std::vector<pie::metal::scratch::Use> uses;
-    uses.reserve(plan.uses.size());
-    for (const Use& u : plan.uses) {
-        uses.push_back({u.index, u.bind_index, u.value, u.is_write});
-    }
-    const auto colored = pie::metal::scratch::color_live_ranges(uses, gptoss_run_ends(dag),
-                                                               plan.value_count, no_recycle);
-    ScratchColoring out;
-    out.colors_used = colored.colors_used;
-    out.hazard_free = colored.hazard_free;
-    out.per_dispatch.resize(dag.size());
-    for (const Use& u : plan.uses) {
-        out.per_dispatch[std::size_t(u.index)].push_back(
-            {u.bind_index, colored.color[std::size_t(u.value)]});
-    }
-    return out;
+int proj_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights) {
+    const auto w = weights.find("layers.0.self_attn.q_proj.weight");
+    const auto s = weights.find("layers.0.self_attn.q_proj.scales");
+    if (w == weights.end() || s == weights.end()) return 0;
+    return router_bits_from_extents(w->second.size, s->second.size);
+}
+
+ScratchColoring color_gptoss_scratch(const std::vector<Dispatch>& dag,
+                                    const ScratchPlan& plan, bool no_recycle) {
+    return model::color_family_scratch(dag.size(), plan.uses, gptoss_run_ends(dag),
+                                       plan.value_count, no_recycle);
 }
 
 void bind_gptoss_dag(RawMetalContext& ctx, const BoundGptOss& b, const std::vector<Dispatch>& dag,
                      const GptOssGeometry& g, const ScratchColoring& scratch, int ordinal_base) {
     auto io = [&](IoSlot s) -> const SlotHandle& { return b.io[static_cast<int>(s)]; };
+
+    DecodeGeometry wg{};
+    wg.mxfp4_experts = g.mxfp4_experts;
 
     for (std::size_t di = 0; di < dag.size(); ++di) {
         const Dispatch& d = dag[di];
@@ -64,7 +67,7 @@ void bind_gptoss_dag(RawMetalContext& ctx, const BoundGptOss& b, const std::vect
         const int L = d.layer;
 
         // (a) Weights.
-        for (const WeightBind& wb : weight_binds(shared_kind(d.kind), L, DecodeGeometry{}, false)) {
+        for (const WeightBind& wb : weight_binds(shared_kind(d.kind), L, wg, false)) {
             const auto it = b.weights.find(wb.tensor);
             if (it == b.weights.end()) {
                 throw std::runtime_error("gpt-oss bind: unstaged weight " + wb.tensor);
@@ -129,12 +132,15 @@ void bind_gptoss_dag_paged(RawMetalContext& ctx, const BoundGptOss& b,
         throw std::runtime_error("gpt-oss paged bind: KV pages do not cover all layers");
     }
 
+    DecodeGeometry wg{};
+    wg.mxfp4_experts = g.mxfp4_experts;
+
     for (std::size_t di = 0; di < dag.size(); ++di) {
         const Dispatch& d = dag[di];
         const int ord = ordinal_base + d.ordinal;
         const int L = d.layer;
 
-        for (const WeightBind& wb : weight_binds(shared_kind(d.kind), L, DecodeGeometry{}, false)) {
+        for (const WeightBind& wb : weight_binds(shared_kind(d.kind), L, wg, false)) {
             const auto it = b.weights.find(wb.tensor);
             if (it == b.weights.end()) {
                 throw std::runtime_error("gpt-oss paged bind: unstaged weight " + wb.tensor);

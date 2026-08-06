@@ -22,6 +22,8 @@
 #include "decode_step_mb.hpp"  // M=1 helpers (qmv_dispatch, rms_dispatch, ...)
 #include "mtl4_context.hpp"     // Grid, Threadgroup
 
+#include "device_tuning.hpp"
+
 namespace pie::metal {
 
 // affine_qmv_fast over N token rows (batched GEMV). tid.x = token row (0..N-1), tid.y = out-row
@@ -32,9 +34,14 @@ inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
     tg = Threadgroup{32, 2, 1};
 }
 
-// Below this batch the GEMV is the faster kernel: measured, pie's per-step cost
-// beats mlx-lm's at every batch up to 8 with the GEMV and only loses above it.
-inline constexpr int kQmmMinBatch = 12;
+// Below this batch the GEMV is the faster kernel. The crossover is a property
+// of the MACHINE, not of the model: it was measured on an M1 Max, where pie's
+// per-step cost beats mlx-lm's at every batch up to 8 with the GEMV and only
+// loses above it, and an M4 Pro moves it down to 8. See `device_tuning.hpp` --
+// an unrecognised device still gets the 12 this constant was.
+//
+// A call and not a `constexpr`, which is the whole point: the value is not
+// known until there is a device to ask.
 // The ported steel GEMM is instantiated aligned-only, at BM=16 and BK=32. K is
 // not checked: every qwen3.6 projection has K % 512 == 0 (the same fact the
 // GEMV port relies on for its "fast" variant), so K % BK == 0 is free.
@@ -45,11 +52,51 @@ inline constexpr int kQmmMinBatch = 12;
 // projections).  A taller block halves that work at the cost of halving the
 // threadgroup count, so it is only worth taking once the batch is wide enough
 // to have blocks to spare: at M=32, BM=32 measures 20.4ms against BM=16's 24.4.
-inline constexpr int kQmmBM = 16;
-inline constexpr int kQmmBMWide = 32;
-inline constexpr int kQmmWideMinBatch = 32;
+// The row blocks the GEMM is instantiated for, narrowest first. This is a
+// LIST rather than a narrow/wide pair because the argument above does not stop
+// at 32: a 128-row prompt at BM=32 still unpacks every weight four times, and
+// measured on an M1 Max the third rung is worth as much as the second was --
+// llama-1B prefills 1236 tok/s at BM=16, 1616 at 32 and 1936 at 64.
+// A fourth rung would need more accumulators per lane than BM=64/BN=32's
+// sixteen, which is where the register file stops paying.
+//
+// The other three axes were swept at this rung and none of them moved, so the
+// list is where the tuning is:
+//   BK=64  is SLOWER (1647 vs 1817 on llama-1B) and illegal below gs=64 --
+//          QuantizedBlockLoader asserts BCOLS <= group_size, so a gs=32
+//          checkpoint cannot compile it at all.
+//   WM=4   is SLOWER (1714). Splitting a 64-row block four ways puts each lane
+//          back to sixteen accumulators, and it does not help: the 32 that
+//          WM=2 spends are not what the kernel is short of.
+//   BN=32  is slower than 64 at this rung, so `qmm_bn`'s argument survives.
+inline constexpr int kQmmBMs[] = {16, 32, 64};
+inline constexpr int kQmmBMCount = int(sizeof(kQmmBMs) / sizeof(kQmmBMs[0]));
+inline constexpr int kQmmBM = kQmmBMs[0];
+inline constexpr int kQmmBMWide = kQmmBMs[kQmmBMCount - 1];
 
-inline int qmm_bm(int N) { return N >= kQmmWideMinBatch ? kQmmBMWide : kQmmBM; }
+/// Which row block a batch of `N` rows should use, as an index into `kQmmBMs`.
+/// A block only pays for itself once the batch can fill it, so the rule is the
+/// widest rung the batch can cover. Callers pad the grid up to that rung, which
+/// is why the row count they pad to must be asked of THIS function and not of
+/// `kQmmBMWide`: padding a one-row decode to the widest block would launch 64
+/// rows of arithmetic to compute one.
+inline int qmm_bm_index(int N) {
+    int best = 0;
+    for (int i = 1; i < kQmmBMCount; ++i)
+        if (N >= kQmmBMs[i]) best = i;
+    return best;
+}
+
+inline int qmm_bm(int N) { return kQmmBMs[qmm_bm_index(N)]; }
+
+/// The reverse: which `kQmmBMs` rung a chosen row block is. Dispatch records
+/// the block it launched, not the batch it came from, so the PSO lookup has to
+/// come back the other way.
+inline int qmm_bm_slot(int bm) {
+    for (int i = 0; i < kQmmBMCount; ++i)
+        if (kQmmBMs[i] == bm) return i;
+    return 0;
+}
 
 // Output columns per threadgroup.  This GEMM is occupancy-bound, not bandwidth-
 // bound: measured standalone at the model's shapes it turns in ~380 GFLOP/s at
@@ -69,7 +116,7 @@ inline int qmm_bm(int N) { return N >= kQmmWideMinBatch ? kQmmBMWide : kQmmBM; }
 
 inline int qmm_bn(int out_vec, int N) {
     const int bm = qmm_bm(N);
-    if (N < kQmmMinBatch || N % bm != 0) return 0;
+    if (N < qmm_min_batch() || N % bm != 0) return 0;
     // Take the WIDEST tile that divides the output, full stop.
     //
     // This used to gate on a threadgroup count, and that was right when the
@@ -88,6 +135,74 @@ inline int qmm_bn(int out_vec, int N) {
     return best;
 }
 
+/// The threadgroup count past which this GEMM stops caring about more of them.
+///
+/// Where BN=32 starts beating BN=16, in threadgroups.
+///
+/// NOT the machine's saturation point, which is what an earlier version of this
+/// called it. The sweep below brackets the crossover between 144 threadgroups
+/// (where 16 still wins) and 192 (where 32 does); the machine saturates higher
+/// than that, and using the saturation number here cost up to 12% because it
+/// let the choice run past 32 to 64.
+/// Read from `DeviceTuning`, not a constant: it is the threadgroup count at
+/// which a wider tile stops being worth fewer of them, and how many
+/// threadgroups fill the machine is the machine's business.
+inline int qmm_bn_crossover_tg_value() { return qmm_bn_crossover_tg(); }
+
+/// `qmm_bn` for a family whose GEMM has no split-K behind it.
+///
+/// The rule above is correct *because* the split supplies threadgroups when the
+/// output tiles do not. A family that dispatches no split has no such supply,
+/// and taking the widest tile then starves the machine: at M=128 with BM=64 a
+/// projection to 1024 columns gets `1024/64 * 128/64` = 32 threadgroups, which
+/// the curve prices at a third of what the same work does at 200.
+///
+/// So: the narrow tile until there is enough work to fill the machine, and 32
+/// after that. Never 64 -- that is the finding, not an omission. Measured with
+/// `roofline_probe` on gemma-4-E2B's own projections, BM=64, GFLOP/s, best of
+/// each row starred:
+///
+///     M     N        tg@32    BN=16     BN=32     BN=64
+///     128    512        16   *2187*     1829      1054
+///     128   1024        32   *3249*     3115      2234
+///     128   2048        64   *3399*     3346      3333
+///     128   3584       112    3595     *3904*     3098
+///     128   6144       192    3829     *4302*     4012
+///     192   1536       144   *3820*     3529      2386
+///     192   2048       192    3694     *4082*     3103
+///     192   6144       576    3919     *4457*     4162
+///     448    256        56   *2727*     2603      1896
+///     448   1536       336    3865     *4101*     3573
+///     448   2048       448    3820     *4337*     3851
+///     448   6144      1344    3986     *4569*     4275
+///    1024   1536       768    4000     *4565*     4252
+///    1024   2048      1024    3941     *4511*     4131
+///    1024   6144      3072    4016     *4619*     4326
+///
+/// Sixteen columns of measurement and BN=64 is the best of none of them, which
+/// is why the rule no longer reaches for it. The threshold sits in the only gap
+/// the sweep leaves: 144 threadgroups still wants 16, 192 already wants 32.
+///
+/// Checked against the machine and not just the probe, because the MIXTURE's
+/// tile rule was built the same way and the probe misled it three times over.
+/// Forcing each width through a real llama-3.2-1B prefill agrees with the
+/// table: at 448 rows BN=16/32/64 give 2565.8 / 2663.7 / 2578.3 tok/s and at
+/// 1024 rows 2270.8 / 2349.8 / 2297.0, so the rule's 32 is the machine's 32.
+/// The dense side's probe holds where the mixture's did not, and the reason is
+/// the mixture's alone: its threadgroups read thirty-two experts' weights
+/// where the probe reads one.
+///
+/// BN partitions output columns only, so this is bit-exact whichever way it
+/// goes; it decides how many times a weight tile is dequantized, not what the
+/// sum is.
+inline int qmm_bn_unsplit(int out_vec, int N) {
+    const int bm = qmm_bm(N);
+    if (N < qmm_min_batch() || N % bm != 0 || out_vec % 16 != 0) return 0;
+    const int row_tiles = N / bm;
+    if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= qmm_bn_crossover_tg_value()) return 32;
+    return 16;
+}
+
 // Split the K dimension when the output tiles alone leave the machine short.
 // MLX picks the split to land near 512 threadgroups (backend/metal/
 // quantized.cpp:880) and sends every transposed non-batched decode down this
@@ -95,16 +210,13 @@ inline int qmm_bn(int out_vec, int N) {
 // point independently.  A projection to hidden (N=1024, 32 tiles) takes a split
 // of 16, gate/up (N=3584, 112 tiles) takes 4, and lm_head has 7760 tiles of its
 // own and takes none.
-// MLX targets 512 threadgroups here, which is right for the hardware it was
-// tuned on and 7% wrong for this one: swept on an M1 Max, the decode step is
-// 29.0ms at 64, 24.7 at 128, 24.7 at 256 and 26.1 at 512, and an interleaved
-// A/B against MLX's value reads 86.85ms to 93.61ms at 32 lanes.  256 sits in
-// the middle of the flat region rather than on its edge.
-//
-// The shape of the curve is the reason: past the point where the machine is
-// full, more partitions only add reduce traffic, and a 32-core M1 Max fills at
-// a lower count than the parts MLX tunes for.
-inline constexpr int kQmmSplitTargetTgs = 256;
+// 512 is MLX's number and it is this machine's too. An earlier sweep here
+// preferred 256 and was measured against qwen3.5's split path, which never
+// dispatched its reduce -- it was timing a kernel that computed the wrong
+// answer, so the curve it drew was not this GEMM's curve. Re-swept on llama-1B
+// at 32 lanes with the reduce in place: 741 tok/s at 128, 873 at 256, 887 at
+// 512, 886 at 1024, 876 at 2048. Flat from 512 on, so take its near edge.
+inline constexpr int kQmmSplitTargetTgs = 512;
 inline constexpr int kQmmSplitBN = 32;
 inline constexpr int kQmmSplitMaxSplits = 16;
 // The widest projection that takes this path.  lm_head has enough output tiles
@@ -116,13 +228,18 @@ inline constexpr int kQmmSplitMaxOut = 8192;
 // groups, or it reads into the next group's scales.
 inline int qmm_split_k(int out_vec, int N, int K, int bm) {
     if (out_vec % kQmmSplitBN != 0 || bm <= 0) return 1;
-    // Count the batch in units of the NARROW row block, not the one this
-    // dispatch happens to use.  A wide block covers twice the rows in one
-    // threadgroup, so counting by it would call a 32-row batch as parallel as a
-    // 16-row one and split both the same -- measured at 32 lanes that costs
-    // 8% (32.37ms split against 29.86 unsplit), where at 16 lanes splitting
-    // wins 11% (18.29 against 20.50).
-    const int tiles = (out_vec / kQmmSplitBN) * ((N + kQmmBM - 1) / kQmmBM);
+    // Count the tiles the SPLIT dispatch will actually launch: `kQmmSplitBN`
+    // wide and `bm` tall, which is the grid `qmm_t_splitk_dispatch` builds.
+    //
+    // This used to count rows in units of `kQmmBM`, the NARROWEST block, on the
+    // theory that a wide block is twice as parallel and should be split half as
+    // deep. That is backwards -- a wide block covers twice the rows in ONE
+    // threadgroup, so it produces half the tiles and needs MORE split, not less
+    // -- and the numbers that appeared to support it were measured on qwen3.5's
+    // split path, which never dispatched its reduce and so was timing the
+    // wrong answer. Counting honestly is worth 741 -> 870 tok/s at 32 lanes on
+    // llama-1B.
+    const int tiles = (out_vec / kQmmSplitBN) * ((N + bm - 1) / bm);
     static const int target = [] {
         const char* e = std::getenv("PIE_METAL_SPLIT_TGS");
         return e ? std::atoi(e) : kQmmSplitTargetTgs;
@@ -161,7 +278,9 @@ inline void qmm_splitk_reduce_dispatch(int out_vec, int N, Grid& g, Threadgroup&
 // weight thirty-two times.
 inline int qmm_strided_bm(int padded_rows) {
     static const bool off = std::getenv("PIE_METAL_NO_PREFILL_BM32") != nullptr;
-    return (!off && padded_rows >= kQmmWideMinBatch) ? kQmmBMWide : kQmmBM;
+    // The strided form is instantiated as a narrow/wide PAIR, not over
+    // `kQmmBMs`, so it stops at 32 whatever the aligned table grew to.
+    return (!off && padded_rows >= 32) ? 32 : kQmmBM;
 }
 
 inline int qmm_strided_rows(int N, int max_rows) {
@@ -186,7 +305,9 @@ inline void qmm_t_dispatch(int out_vec, int N, int bn, int bm, Grid& g, Threadgr
 // rms_single_row over N tokens × n_rows rows-per-token (e.g. per-head q/k norm). One
 // threadgroup per row; rows stack token-major [N*n_rows, row_size]. grid.x = (row_size/4)*n_rows*N.
 inline void rms_mb_dispatch(int row_size, int n_rows, int N, Grid& g, Threadgroup& tg) {
-    const uint32_t t = uint32_t(row_size) / 4;  // N_READS = 4
+    // Rounded up, matching `rms_dispatch`: at N == 1 these two must agree
+    // exactly, because a family that uses this one for both is relying on it.
+    const uint32_t t = (uint32_t(row_size) + 3) / 4;  // N_READS = 4
     g  = Grid{t * uint32_t(n_rows) * uint32_t(N), 1, 1};
     tg = Threadgroup{t, 1, 1};
 }
@@ -217,6 +338,45 @@ inline void rope_mb_dispatch(int rotary_dims, int n_heads, int N, Grid& g, Threa
 // tg=(1024,1,1). Causal bound per row = position_ids[row]; request = req_of_token[row].
 inline void sdpa_paged_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) {
     g  = Grid{uint32_t(n_q_heads) * 1024u, uint32_t(N), 1};
+    tg = Threadgroup{1024, 1, 1};
+}
+
+// Query rows per threadgroup in `sdpa_paged_tiled` -- one per simdgroup, and a
+// threadgroup is 1024 threads. It is the factor by which that kernel divides
+// the K/V traffic, and it must equal the kernel's own QT.
+inline constexpr int kSdpaQueryTile = 32;
+
+// Whether to tile the query rows. The tiled kernel gives a row a simdgroup
+// where the per-row kernel gives it a threadgroup, so below a full tile it is
+// strictly worse: at one row it would run one simdgroup of the thirty-two the
+// other kernel would have used. A fire earns the tiled shape by filling a tile.
+/// Whether a fire's attention should use the tiled kernel rather than the
+/// per-row one.
+///
+/// NOT a row count. The tiled kernel walks RUNS OF EQUAL REQUEST inside each
+/// 32-row tile, staging that run's keys into threadgroup memory and letting
+/// only the run's own simdgroups read them -- so its whole advantage is rows
+/// that share a key span, and its cost is a serial pass per run. A prefill is
+/// all one run and wins outright. A fleet of decodes is the opposite shape:
+/// thirty-two rows, thirty-two runs, one simdgroup live per pass and the tile
+/// staged thirty-two times. Measured on llama-1B, batch 32, that is 370 tok/s
+/// tiled against 728 per-row, and batch 64 is 480 against 915.
+///
+/// Asking only `N >= kSdpaQueryTile` could not tell those apart, because the
+/// two fires have the SAME row count. The request count is what separates
+/// them, and the caller already has it: `qo_indptr` is one entry per request
+/// plus a terminator.
+inline bool sdpa_should_tile(int rows, int requests) {
+    const int r = requests > 0 ? requests : 1;
+    return rows / r >= kSdpaQueryTile;
+}
+
+// sdpa_paged_tiled: one threadgroup per (q_head, tile of kSdpaQueryTile rows).
+// grid=(n_q_heads*1024, ceil(N/QT), 1), tg=(1024,1,1). The grid rounds UP, so
+// the kernel reads N from bind::SdpaPaged::Rows to retire its partial tile.
+inline void sdpa_paged_tiled_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) {
+    const uint32_t tiles = uint32_t((N + kSdpaQueryTile - 1) / kSdpaQueryTile);
+    g  = Grid{uint32_t(n_q_heads) * 1024u, tiles < 1u ? 1u : tiles, 1};
     tg = Threadgroup{1024, 1, 1};
 }
 

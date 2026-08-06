@@ -139,11 +139,13 @@ pub struct DevGeo {
     /// at finalize to reclaim continuing heirs' unused fresh pages.
     pub w_cont_dense: usize,
     /// The program binds an `AttnMask` descriptor channel (dense per-cell
-    /// mask). Detected at bind and asserted by tests, but NOT yet consulted
-    /// by the fire or scheduler path: the intended rule — such fires are
-    /// scheduled SOLO, because the driver's composed multi-program batch
-    /// does not merge dense device masks with other programs' geometry (v1
-    /// scope) — is unwired. The `allow` marks that gap rather than hiding it.
+    /// mask). Detected at bind and asserted by tests. The SOLO scheduling
+    /// rule it names — the driver's composed multi-program batch does not
+    /// merge dense device masks with other programs' geometry (v1 scope) —
+    /// is carried by [`crate::pipeline::instance::BoundForwardPass`]'s
+    /// `dense_mask` instead, which is the same binding read off the same
+    /// ports and is available on every fire, not just the leased ones. This
+    /// copy is redundant; the `allow` marks that rather than hiding it.
     #[allow(dead_code)]
     pub has_mask: bool,
     /// POOL-OWNED device geometry: the program reserved its own page pool and

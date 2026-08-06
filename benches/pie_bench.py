@@ -195,7 +195,6 @@ def measured_average(
 
 def build_config(args: argparse.Namespace):
     from pie.config import (
-        AuthConfig,
         Config,
         DriverConfig,
         ModelConfig,
@@ -216,7 +215,7 @@ def build_config(args: argparse.Namespace):
     if args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
-            "ready_timeout_s": float(args.server_startup_timeout),
+            "ready_timeout": f"{int(args.server_startup_timeout)}s",
         }
         if args.memory_profile != "auto":
             driver_options["memory_profile"] = args.memory_profile
@@ -238,10 +237,14 @@ def build_config(args: argparse.Namespace):
             driver_options["enable_system_speculation"] = True
         # `gpu_mem_utilization` sizes only the memory planner's *logical* KV
         # budget; the runtime is free to exceed it, so it cannot create KV
-        # pressure. `total_pages` is the one binding cap, and `swap_pool_size`
-        # is what arms the suspend/restore rung (it defaults to 0, i.e. off).
+        # pressure. `max_total_pages` is the one binding cap, and
+        # `swap_pool_size` is what arms the suspend/restore rung (it defaults
+        # to 0, i.e. off). The knob is named `max_total_pages` here and
+        # `total_pages` on Metal because they are not the same quantity: there
+        # the value IS the pool, here it is a ceiling over a number derived
+        # from `gpu_mem_utilization` (worker/src/config.rs).
         if getattr(args, "total_pages", 0):
-            driver_options["total_pages"] = args.total_pages
+            driver_options["max_total_pages"] = args.total_pages
         if getattr(args, "swap_pool_size", 0):
             driver_options["swap_pool_size"] = args.swap_pool_size
     elif args.driver == "metal":
@@ -260,6 +263,16 @@ def build_config(args: argparse.Namespace):
             driver_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "total_pages", 0):
             driver_options["total_pages"] = args.total_pages
+        # `--max-model-len` is the cross-engine context knob (llama.cpp takes
+        # it as `--ctx-size`, vLLM as `max_model_len`), and on every other
+        # engine it means ONE REQUEST's context. The Metal driver's knob is
+        # the whole fleet's ring -- it is one shared linear ring, not a
+        # per-request allocation -- so the fair translation multiplies by the
+        # fleet the client will actually offer. Sending the per-request number
+        # straight through would hand a 16-way run 128 tokens per request and
+        # measure a starved engine against unstarved ones.
+        fleet = max(1, args.concurrency) if args.mode != "latency" else 1
+        driver_options["max_model_len"] = args.max_model_len * fleet
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -371,7 +384,6 @@ def build_config(args: argparse.Namespace):
             verbose=True,
             max_concurrent_processes=max_concurrent_processes,
         ),
-        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
             # A pooling slot costs ~4 GiB of VIRTUAL address space (wasmtime
@@ -461,9 +473,10 @@ async def cli_pie_client(args: argparse.Namespace):
 
     pie_bin = Path(args.pie_bin)
     if not pie_bin.exists():
+        feature = "driver-metal" if args.driver == "metal" else "driver-cuda"
         raise FileNotFoundError(
-            f"missing {pie_bin}; build with: cargo build -p pie-worker --release "
-            "--no-default-features --features driver-cuda"
+            f"missing {pie_bin}; build with: cargo build --release -p pie-bin "
+            f"--no-default-features --features {feature}"
         )
 
     proc = await asyncio.create_subprocess_exec(
@@ -1254,7 +1267,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--memory-profile",
             default="auto",
-            choices=["auto", "latency", "balanced", "throughput", "capacity"],
+            choices=["auto", "latency", "throughput"],
         )
         sp.add_argument(
             "--kv-pages", type=int, default=2048,

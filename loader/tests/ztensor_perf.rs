@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
-use pie_loader::checkpoint::zt::parse_checkpoint_files;
 use pie_loader::checkpoint::zt::parse_checkpoint;
+use pie_loader::checkpoint::zt::parse_checkpoint_files;
 
 fn tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zt_perf_{tag}_{}", std::process::id()));
@@ -55,11 +55,15 @@ fn median(mut xs: Vec<Duration>) -> Duration {
 fn time(runs: usize, mut f: impl FnMut()) -> Duration {
     // One warmup: the first open faults the file in.
     f();
-    median((0..runs).map(|_| {
-        let t = Instant::now();
-        f();
-        t.elapsed()
-    }).collect())
+    median(
+        (0..runs)
+            .map(|_| {
+                let t = Instant::now();
+                f();
+                t.elapsed()
+            })
+            .collect(),
+    )
 }
 
 #[test]
@@ -102,7 +106,7 @@ fn reading_a_checkpoint_through_ztensor_stays_within_budget() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Reading the `.zt` artifact `optimize` writes, against reading the
+/// Reading the `.zt` artifact `convert` writes, against reading the
 /// safetensors it replaced. The manifest is CBOR rather than JSON and the
 /// reader validates every blob reference, so this is the number that decides
 /// whether the artifact format costs anything at load.
@@ -121,8 +125,8 @@ fn reading_a_zt_artifact_is_not_slower_than_safetensors() {
         let payload = vec![0u8; 64];
         for i in 0..TENSORS {
             w.add(
-                &format!("blk.{i:05}.attn.weight"),
-                &[16],
+                format!("blk.{i:05}.attn.weight"),
+                [16],
                 ztensor::DType::F32,
                 &payload,
             )

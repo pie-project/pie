@@ -22,34 +22,25 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "kernels.hpp"
+#include "../shared_kernels.hpp"
+#include "scratch.hpp"
 
 namespace pie::metal::gemma4 {
 namespace {
 
-// Replicated EXACTLY from the .metal sources; see kernels.hpp for the others.
-struct RmsParams {  // rms_norm.metal:22 (buffer 3)
-    float eps;
-    std::uint32_t axis_size;
-    std::uint32_t w_stride;
-    std::uint32_t plus_one;
-};
+using shared_kernels::RmsParams;
 
 template <class V>
 inline void bind_const(RawMetalContext& ctx, int ord, std::uint8_t idx, const V& val, int* count) {
-    SlotHandle s = ctx.const_slot(ord, idx, sizeof(V));
-    if (!s.valid()) {
-        throw std::runtime_error("gemma4 consts: heap_alloc failed (budget too small)");
-    }
-    std::memcpy(s.contents(), &val, sizeof(V));
-    ctx.arg_bind_ordinal(ord, idx, s);
-    if (count != nullptr) ++*count;
+    shared_kernels::bind_const(ctx, ord, idx, val, count, "gemma4");
 }
 
 /// Gemma 4 stores plain RMS weights. `plus_one` stays 0 — the `(1 + w)` gain is
 /// an earlier Gemma's, and applying it here is an ~80% error per norm that the
 /// residual stream compounds.
 RmsParams rms_params(const Gemma4Geometry& g, int axis) {
-    return RmsParams{g.eps, std::uint32_t(axis), 1u, g.norm_plus_one ? 1u : 0u};
+    return RmsParams{
+        g.eps, std::uint32_t(axis), 1u, g.norm_plus_one ? 1u : 0u, 1.0f};
 }
 
 /// The KV cache is [n_kv_heads, max_ctx, head_dim] per owning layer, so the head
@@ -66,7 +57,9 @@ KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer) {
     const int H = g.hidden;
     const int hd = layer >= 0 ? g.head_dim_of(layer) : g.head_dim;
     const int q_dim = g.n_q_heads * hd;
-    const int kv_dim = g.n_kv_heads * hd;
+    // Per layer: the full-attention layers use `num_global_key_value_heads`,
+    // which on gemma-4-26B is 2 against the sliding layers' 8.
+    const int kv_dim = (layer >= 0 ? g.n_kv_heads_of(layer) : g.n_kv_heads) * hd;
     const int inter = layer >= 0 ? g.intermediate_of(layer) : g.intermediate;
     const int ple_total = g.n_layers * g.per_layer_emb_dim;
     switch (k) {
@@ -83,6 +76,11 @@ KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer) {
         case Kind::PleProjGemv: return {H, ple_total};
         case Kind::PleGateGemv: return {H, g.per_layer_emb_dim};
         case Kind::PleProjLayerGemv: return {g.per_layer_emb_dim, H};
+        // ── the mixture ──
+        case Kind::RouterGemv: return {H, g.n_experts};
+        case Kind::ExpertGate: return {H, g.moe_intermediate};
+        case Kind::ExpertUp: return {H, g.moe_intermediate};
+        case Kind::ExpertDown: return {g.moe_intermediate, H};
         default: return {0, 0};
     }
 }
@@ -107,6 +105,34 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::K, kn.K, &count);
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::N, kn.N, &count);
+            if (d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
+                d.kind == Kind::ExpertDown) {
+                using Q = bind::GoQmv;
+                // The sort collapsed the slot axis: one row per (token, slot)
+                // pair, so all three of these are the dense case over a taller
+                // batch, and the pair's expert is `row_expert[p]`, not `tid.z`.
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::XSlotStride, 0, &count);
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::XRowStride,
+                                         std::int32_t(kn.K), &count);
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::SlotsPerRow, 1, &count);
+                bind_const<std::int32_t>(
+                    ctx, ord, (std::uint8_t)bind::Qmm::M,
+                    std::int32_t(gemma4_moe_sorted_rows(g, int(R))), &count);
+                continue;
+            }
+            // The bounds-checked matvec reads the three stride constants the
+            // routed one does -- it is the same kernel with the expert axis
+            // switched off -- so a dense projection that lands on it must bind
+            // them too. Bound whenever the kind COULD take it rather than only
+            // when it does: the alternative is for this file to re-derive the
+            // pipeline choice `pso_for` already made.
+            {
+                using Q = bind::GoQmv;
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::XSlotStride, 0, &count);
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::XRowStride,
+                                         std::int32_t(kn.K), &count);
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::SlotsPerRow, 1, &count);
+            }
             // The padded row count, matching `launch_shape_mb`: the GEMM is
             // dispatched over whole tiles, and M is what bounds its inner loop.
             const std::uint32_t m = std::uint32_t(
@@ -130,9 +156,27 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kind::PostAttnResidual:
             case Kind::PostFfnResidual:
             case Kind::PleResidualScaled:
+            // The mixture's three extra hidden-wide norms are the plain norm;
+            // only the weight they bind differs, which `shared_kind` answers.
+            case Kind::MoeNorm:
+            case Kind::DenseBranchNorm:
+            case Kind::MoeBranchNorm:
                 bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
                                       rms_params(g, g.hidden), &count);
                 break;
+            // mlx-lm normalizes the router's input with `scale * hidden**-0.5`
+            // and the checkpoint stores only `scale`. Without the root every
+            // logit is 53x too large, which survives the top-k -- a uniform
+            // positive scale does not reorder -- but comes out of the softmax
+            // as a one-hot: the mixture degenerates to its single best expert.
+            // This is the ONLY norm with a gain; it must not share a case with
+            // the others, which is exactly the bug that cost an afternoon.
+            case Kind::RouterNorm: {
+                RmsParams p = rms_params(g, g.hidden);
+                p.gain = 1.0f / std::sqrt(float(g.hidden));
+                bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params, p, &count);
+                break;
+            }
             case Kind::QNorm:
             case Kind::KNorm:
                 // Per-head, so the axis is this layer's head_dim, not hidden.
@@ -147,7 +191,8 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
                                       rms_params(g, g.per_layer_emb_dim), &count);
                 break;
-            case Kind::VNorm: {
+            case Kind::VNorm:
+            case Kind::VNormFromK: {
                 // Weightless: eps and the axis, nothing else.
                 const VNormParams p{g.eps, std::uint32_t(hd)};
                 bind_const<VNormParams>(ctx, ord, (std::uint8_t)bind::VNorm::Params, p, &count);
@@ -174,17 +219,25 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             // decided by the caller and not guessed from `rows`: the executor
             // may run the paged kernel at one token.
             case Kind::Sdpa: {
-                const std::int32_t gqa = g.n_kv_heads > 0 ? g.n_q_heads / g.n_kv_heads : 1;
+                const std::int32_t nkv = g.n_kv_heads_of(L);
+                const std::int32_t gqa = nkv > 0 ? g.n_q_heads / nkv : 1;
                 if (paged) {
                     using P = bind::SdpaPaged;
                     bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::GqaFactor, gqa, &count);
                     bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::PageSize,
                                              g.kv_page_size, &count);
-                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::NKvHeads,
-                                             g.n_kv_heads, &count);
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::NKvHeads, nkv, &count);
                     bind_const<float>(ctx, ord, (std::uint8_t)P::Scale, 1.0f, &count);
                     bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Window,
                                              d.sliding ? g.sliding_window : 0, &count);
+                    // N, for the tiled pipeline's partial last tile. Bound
+                    // whether or not this fire tiles: the bind table is per
+                    // Kind and the pipeline choice is per row count. Unbound,
+                    // the tiled kernel reads a stale ordinal for N and decides
+                    // which of its rows exist from it -- wrong attention, not
+                    // a crash.
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Rows,
+                                             std::int32_t(R), &count);
                     break;
                 }
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Sdpa::GqaFactor, gqa,
@@ -237,8 +290,55 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                              g.kv_page_size, &count);
                     bind_const<std::int32_t>(ctx, ord,
                                              (std::uint8_t)bind::KvAppendPaged::NKvHeads,
-                                             g.n_kv_heads, &count);
+                                             g.n_kv_heads_of(L), &count);
                 }
+                break;
+
+            // ── the mixture ──
+            case Kind::RouterTopK: {
+                const shared_kernels::RouterParams p{std::uint32_t(g.n_experts),
+                                                    std::uint32_t(g.experts_per_token)};
+                bind_const<shared_kernels::RouterParams>(
+                    ctx, ord, (std::uint8_t)bind::GoRouterTopK::Params, p, &count);
+                break;
+            }
+            case Kind::ExpertSort:
+            case Kind::ExpertGather: {
+                // One params struct for both, so the sort's padding and the
+                // gather's bounds cannot disagree. `width` is only read by the
+                // gather, which moves hidden-wide rows.
+                const shared_kernels::MoeRouteParams p{
+                    R * std::uint32_t(g.experts_per_token),
+                    std::uint32_t(g.n_experts),
+                    std::uint32_t(g.experts_per_token),
+                    std::uint32_t(gemma4_moe_tile_rows(g, int(R))),
+                    std::uint32_t(gemma4_moe_sorted_rows(g, int(R))),
+                    std::uint32_t(g.hidden)};
+                bind_const<shared_kernels::MoeRouteParams>(
+                    ctx, ord,
+                    d.kind == Kind::ExpertSort ? (std::uint8_t)bind::MoeRouteSort::Params
+                                               : (std::uint8_t)bind::MoeRouteRows::Params,
+                    p, &count);
+                break;
+            }
+            case Kind::ExpertGeglu: {
+                // The whole SORTED stack, flat. Sized off the sorted count and
+                // not `rows * k`, because the sort pads every expert's run to a
+                // tile and the padding rows are real rows of what this reads.
+                const GegluParams p{
+                    std::uint32_t(gemma4_moe_sorted_rows(g, int(R)) * g.moe_intermediate)};
+                bind_const<GegluParams>(ctx, ord, (std::uint8_t)bind::Geglu::Params, p, &count);
+                break;
+            }
+            case Kind::ExpertCombine: {
+                const shared_kernels::ExpertCombineParams p{
+                    std::uint32_t(g.hidden), std::uint32_t(g.experts_per_token)};
+                bind_const<shared_kernels::ExpertCombineParams>(
+                    ctx, ord, (std::uint8_t)bind::GoExpertCombine::Params, p, &count);
+                break;
+            }
+            // The one add this family does not fuse into a norm.
+            case Kind::BranchAdd:
                 break;
 
             // ── elementwise ──
@@ -318,6 +418,48 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         }
     }
     return count;
+}
+
+
+/// Bind the FP16 staging buffer to every projection that reads one.
+///
+/// Slot 12 is the staged input the FP16 GEMM reads instead of slot 3, and slot
+/// 13 is how many elements the staging pass writes. Both are bound on the
+/// PROJECTION's table rather than a table of their own, because the staging
+/// pass has no DAG entry to own one.
+int bind_gemma4_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                         const Gemma4Geometry& g, int rows, int head_rows,
+                         const SlotHandle& staging, std::vector<SlotHandle>& keep) {
+    keep.clear();
+    if (!staging.valid()) return 0;
+    const int R = rows < 1 ? 1 : rows;
+    const int S = head_rows < 1 ? R : std::min(head_rows, R);
+    std::vector<std::pair<std::int32_t, SlotHandle>> counts;
+    int bound = 0;
+    for (const Dispatch& d : dag) {
+        const int m = d.kind == Kind::LmHead ? S : R;
+        if (!gemma4_fp16_qmm(g, d, m)) continue;
+        const std::int32_t elems = std::int32_t(gemma4_qmm_rows(m)) *
+                                   std::int32_t(qmv_kn(d.kind, g, d.layer).K);
+        SlotHandle count;
+        for (const auto& entry : counts) {
+            if (entry.first == elems) {
+                count = entry.second;
+                break;
+            }
+        }
+        if (!count.valid()) {
+            count = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            if (!count.valid()) continue;
+            *static_cast<std::int32_t*>(count.contents()) = elems;
+            counts.push_back({elems, count});
+            keep.push_back(count);
+        }
+        ctx.arg_bind_ordinal(d.ordinal, 12, staging);
+        ctx.arg_bind_ordinal(d.ordinal, 13, count);
+        ++bound;
+    }
+    return bound;
 }
 
 }  // namespace pie::metal::gemma4

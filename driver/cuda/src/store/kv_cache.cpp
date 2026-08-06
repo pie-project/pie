@@ -16,16 +16,6 @@ namespace pie_cuda_driver {
 
 namespace {
 
-bool env_requests_hnd_kv_layout() {
-    const char* value = std::getenv("PIE_CUDA_KV_LAYOUT");
-    if (value == nullptr || value[0] == '\0') {
-        value = std::getenv("PIE_CUDA_KV_CACHE_LAYOUT");
-    }
-    if (value == nullptr) return false;
-    const std::string layout(value);
-    return layout == "HND" || layout == "hnd";
-}
-
 // Quest key envelopes cost `2 * 2 * kv_heads * head_dim` bytes per page per
 // layer — `4 / (page_size * 2)` of the key tier, i.e. 12.5% at
 // `page_size = 16`, or 6.25% of K and V together. They are bf16 because an
@@ -84,7 +74,7 @@ KvCache KvCache::allocate(int num_layers,
     c.num_kv_heads_ = num_kv_heads;
     c.head_dim_ = head_dim;
     c.format_ = std::move(format);
-    c.hnd_layout_ = c.format_.is_native_bf16() && env_requests_hnd_kv_layout();
+    c.hnd_layout_ = false;
 
     c.k_layers_.reserve(num_layers);
     c.v_layers_.reserve(num_layers);
@@ -180,7 +170,7 @@ KvCache KvCache::allocate_per_layer(int num_layers,
     c.num_kv_heads_ = num_kv_heads;
     c.head_dim_ = per_layer_head_dim.empty() ? 0 : per_layer_head_dim[0];
     c.format_ = std::move(format);
-    c.hnd_layout_ = c.format_.is_native_bf16() && env_requests_hnd_kv_layout();
+    c.hnd_layout_ = false;
     c.per_layer_head_dim_ = per_layer_head_dim;
     c.kv_source_layer_ = kv_source_layer;
     c.per_layer_num_kv_heads_ = per_layer_num_kv_heads;

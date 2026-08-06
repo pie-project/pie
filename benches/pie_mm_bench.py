@@ -84,7 +84,7 @@ def build_config(args: argparse.Namespace, port: int):
 
     driver_options = {
         "gpu_mem_utilization": args.gpu_mem_util,
-        "ready_timeout_s": float(args.server_startup_timeout),
+        "ready_timeout": f"{int(args.server_startup_timeout)}s",
     }
     requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,

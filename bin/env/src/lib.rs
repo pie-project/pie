@@ -68,6 +68,7 @@
 //! daemons.
 
 mod config;
+pub use config::{Origin, cli_config_path};
 mod lifecycle;
 mod observe;
 pub mod paths;

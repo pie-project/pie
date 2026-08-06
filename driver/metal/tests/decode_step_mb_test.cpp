@@ -9,6 +9,9 @@
 #include "decode_step_mb.hpp"
 #include "heap_bind.hpp"
 #include "scratch.hpp"
+#include "model/shared_kernels.hpp"
+
+#include <cstring>
 
 using namespace pie::metal;
 
@@ -37,13 +40,13 @@ int required_slots(Kernel k) {
         case Kernel::GatedRms: return 5;
         case Kernel::Residual:
         case Kernel::LayerOut:
-        case Kernel::SiluMul:
+        case Kernel::SiluMul: return 3;
         case Kernel::QSplit: return 4;
         case Kernel::Rope:
         case Kernel::RopeK: return 5;
         case Kernel::KvAppendPaged: return 15;
         case Kernel::SdpaPaged: return 12;
-        case Kernel::AttnGate: return 3;
+        case Kernel::AttnGate: return 2;
         default: return 0;
     }
 }
@@ -222,6 +225,97 @@ int main() {
     }
     expect(row_offsets,
            "per-token prefill tables address the matching IO, scratch, explicit-write, and logits rows");
+
+    // ── the mixture's routing constants are a function of the batch width ──
+    //
+    // Every other constant this family binds is per-row, which is why they are
+    // bound once at setup and reused at whatever width a step arrives at. The
+    // sort's are not: it is told how many (token, slot) pairs to place and how
+    // many rows their tile-padded runs occupy. Bound at one width and fired at
+    // another it walks off the end of the routing, so this asserts the value
+    // actually in the slot, at two widths, through the same rebind the fire
+    // path uses.
+    {
+        DecodeGeometry moe = g;
+        moe.n_experts = 128;
+        moe.experts_per_token = 8;
+        moe.moe_intermediate = 512;
+        expect(moe.is_moe(), "a routed geometry for the constant-width check");
+
+        // 512 tokens is past the batching threshold and 4 is not: it is
+        // `n_experts * kMoeTileRows / 2` = 512 PAIRS, which at 8 slots a token
+        // is 64 tokens. Both sides matter -- the padded row count is the
+        // identity below the threshold and 2.5x above it.
+        const int wide = 512, narrow = 4;
+        const auto moe_dag = build_decode_dag_mb(moe, wide);
+        bind_decode_consts(*ctx, moe_dag, moe, 4096, true, wide);
+
+        const auto route_params = [&](const std::vector<Dispatch>& dag) {
+            shared_kernels::MoeRouteParams p{};
+            for (const Dispatch& d : dag) {
+                if (d.kind != Kernel::LlMoeSort) continue;
+                SlotHandle s = ctx->const_slot(d.ordinal, uint8_t(bind::MoeRouteSort::Params),
+                                               sizeof(p));
+                if (s.valid()) std::memcpy(&p, s.contents(), sizeof(p));
+                break;
+            }
+            return p;
+        };
+
+        const auto at_wide = route_params(moe_dag);
+        const int wide_pairs = wide * moe.experts_per_token;
+        const uint32_t wide_tile = uint32_t(
+            shared_kernels::moe_tile_rows(wide_pairs, moe.n_experts));
+        expect(at_wide.n == uint32_t(wide_pairs) &&
+                   at_wide.padded == uint32_t(moe_sorted_rows(moe, wide)) &&
+                   at_wide.tile_rows == wide_tile,
+               "the sort is told the pair count and padded rows of the width it was bound at");
+        // The number itself is not the point; the AGREEMENT is. The sort pads
+        // each expert's run to `tile_rows` and the routed GEMM's grid divides
+        // the sorted rows by its BM, so a pipeline compiled for one against a
+        // grid built for the other reads another expert's rows -- wrong
+        // numbers, not a crash. That is a bug this driver has shipped: gpt-oss
+        // spelled its routed BM as a literal 16 while everything around it
+        // spelled it from the constant, and nothing noticed until the constant
+        // moved.
+        bool gemm_bm_matches_sort = false;
+        for (const Dispatch& d : moe_dag) {
+            if (d.kind != Kernel::LlExpertGate && d.kind != Kernel::LlExpertUp &&
+                d.kind != Kernel::LlExpertDown) {
+                continue;
+            }
+            if (d.qmm_bn <= 0) continue;   // matvec: no tile to agree about
+            gemm_bm_matches_sort = uint32_t(d.qmm_bm) == at_wide.tile_rows;
+            if (!gemm_bm_matches_sort) break;
+        }
+        expect(gemm_bm_matches_sort,
+               "and the routed GEMM's row block is the tile the sort padded to");
+        expect(at_wide.padded > uint32_t(wide * moe.experts_per_token),
+               "and the padded count is the sort's, not the linear one");
+
+        bind_token_consts(*ctx, moe_dag, moe, narrow);
+        const auto at_narrow = route_params(moe_dag);
+        expect(at_narrow.n == uint32_t(narrow * moe.experts_per_token) &&
+                   at_narrow.padded == uint32_t(narrow * moe.experts_per_token) &&
+                   at_narrow.tile_rows == 1u,
+               "rebinding at a narrower width moves the pair count with it, and drops the tile");
+        expect(at_narrow.n_experts == uint32_t(moe.n_experts) &&
+                   at_narrow.experts_per_token == uint32_t(moe.experts_per_token) &&
+                   at_narrow.width == uint32_t(moe.hidden),
+               "while the width-invariant half of the same struct survives the rebind");
+
+        // Residual dispatches derive their flat extent from the launch. They
+        // no longer carry a decorative width constant at slot 3, which also
+        // removes the old collision with GoRouterTopK::Params.
+        bool residual_slot_is_clear = false;
+        for (const Dispatch& d : moe_dag) {
+            if (d.kind != Kernel::Residual && d.kind != Kernel::LayerOut) continue;
+            residual_slot_is_clear = !ctx->arg_slot_is_bound(d.ordinal, 3);
+            break;
+        }
+        expect(residual_slot_is_clear,
+               "a residual in a routed DAG has no stale width/route-param slot");
+    }
     std::printf("\n==== decode_step_mb_test: %d passed, %d failed ====\n", pass, fail);
     return fail == 0 ? 0 : 1;
 }

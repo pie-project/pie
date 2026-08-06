@@ -20,8 +20,8 @@
 //! than deleted, allowed rather than silently masked.
 #![allow(dead_code)]
 
-use crate::store::rs::write::{RsPreparedWrite, RsPublished};
 use crate::store::rs::write::RsBufferIntent;
+use crate::store::rs::write::{RsPreparedWrite, RsPublished};
 use crate::store::rs::{RsStore, RsWorkingSetId};
 
 /// The published RS write for one in-flight PTIR fire, held across
@@ -124,10 +124,7 @@ pub enum RsPlan {
 impl RsPlan {
     /// `(write_state, fold_tokens, buffer_tokens, buffer_intent)` for row
     /// `index` — exactly the arguments `RsStore::prepare` classifies against.
-    fn row(
-        &self,
-        index: usize,
-    ) -> (bool, Option<u32>, Option<(u32, u32)>, RsBufferIntent) {
+    fn row(&self, index: usize) -> (bool, Option<u32>, Option<(u32, u32)>, RsBufferIntent) {
         match self {
             RsPlan::Fold => (true, None, None, RsBufferIntent::Write),
             RsPlan::Buffer {
@@ -344,23 +341,17 @@ fn prepare_many_impl(
         }
 
         let prepared = match granted.as_deref_mut() {
-            Some(granted) => {
-                store.prepare_reserved(
-                    ws,
-                    write_state,
-                    fold_tokens,
-                    buffer_tokens,
-                    buffer_intent,
-                    granted,
-                )
-            }
-            None => store.prepare_general(
+            Some(granted) => store.prepare_reserved(
                 ws,
                 write_state,
                 fold_tokens,
                 buffer_tokens,
                 buffer_intent,
+                granted,
             ),
+            None => {
+                store.prepare_general(ws, write_state, fold_tokens, buffer_tokens, buffer_intent)
+            }
         };
         let prepared = match prepared {
             Ok(mut prepared) => {
@@ -414,7 +405,9 @@ fn prepare_many_impl(
                 // snapshots the state at `fold_lens[r]`; a pure commit's rows
                 // ARE the replay. The driver cannot tell them apart from the
                 // fold flag alone.
-                if buffer_intent == RsBufferIntent::Write && buffer_tokens.is_some_and(|(_, len)| len > 0) {
+                if buffer_intent == RsBufferIntent::Write
+                    && buffer_tokens.is_some_and(|(_, len)| len > 0)
+                {
                     flags |= crate::driver::RS_FLAG_BUFFER_WRITE;
                 }
                 out.slot_flags.push(flags);
@@ -471,10 +464,11 @@ fn prepare_many_impl(
     // ALREADY committed this fire's mapping and taken an in-flight hold, and
     // two obligations outlive any error below: the deferred fold must be
     // applied (dropping it would leave the boundary where no one expects it)
-    // and the hold must be settled (`retire_idle` gates ALL pool retirement
-    // on `in_flight == 0`, so leaking one wedges slot recycling for the rest
-    // of the process). `#[must_use]` does not help here -- the value is bound
-    // to a local, and the lint only catches a discarded temporary.
+    // and the hold must be settled (an unsettled sequence stays in the store's
+    // outstanding set forever, pinning the retirement watermark below it and
+    // wedging slot recycling for the rest of the process). `#[must_use]` does
+    // not help here -- the value is bound to a local, and the lint only
+    // catches a discarded temporary.
     let read_side = (|out: &mut PreparedRs| -> Result<(), String> {
         // Built AFTER the publish, so it reflects the pages this fire just
         // materialized or privatized rather than the mapping the guest saw.
@@ -791,8 +785,15 @@ mod tests {
         assert_eq!(slabs.len(), 3);
 
         // Fold the first 8 buffered tokens = slabs 0 and 1.
-        let out =
-            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8], fold_len_is_device: false }).unwrap();
+        let out = prepare_many(
+            &mut store,
+            &[ws],
+            &RsPlan::FoldBuffered {
+                tokens: vec![8],
+                fold_len_is_device: false,
+            },
+        )
+        .unwrap();
         assert_eq!(out.fold_lens, vec![8]);
         assert_eq!(out.buffer_slot_indptr, vec![0, 2]);
         assert_eq!(
@@ -822,8 +823,15 @@ mod tests {
 
         let error = prepare_many(&mut store, &[ws], &buffer_plan(0, vec![4])).unwrap_err();
         assert!(error.contains("no folded state"), "{error}");
-        let error =
-            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![4], fold_len_is_device: false }).unwrap_err();
+        let error = prepare_many(
+            &mut store,
+            &[ws],
+            &RsPlan::FoldBuffered {
+                tokens: vec![4],
+                fold_len_is_device: false,
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("no folded state"), "{error}");
         assert_eq!(store.available_slots(), 4, "nothing leaked");
     }
@@ -835,7 +843,15 @@ mod tests {
         store.alloc_buffer(ws, 1).unwrap(); // capacity 4 tokens
         let free = store.available_slots();
         assert!(
-            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8], fold_len_is_device: false }).is_err()
+            prepare_many(
+                &mut store,
+                &[ws],
+                &RsPlan::FoldBuffered {
+                    tokens: vec![8],
+                    fold_len_is_device: false
+                }
+            )
+            .is_err()
         );
         assert_eq!(store.available_slots(), free, "nothing leaked");
     }

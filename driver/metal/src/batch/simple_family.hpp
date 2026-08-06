@@ -36,8 +36,9 @@
 #include <vector>
 
 #include "mtl4_context.hpp"
+#include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "forward.hpp"
 
 namespace pie::metal::batch {
@@ -84,8 +85,11 @@ class SimpleFamilyEngine {
     /// Takes the switch as a bit rather than a `SetupConfig`: qwen3.5 asks
     /// this from a path that has a `DecodeGeometry` and no config, and the
     /// predicate never wanted more than the one bit anyway.
+    /// `slab_paging` says the bank will be PAGED rather than mapped, which
+    /// changes one thing: a per-expert bias must join the slab instead of
+    /// staying resident, because paging renumbers the buffer that indexes it.
     static std::function<bool(const std::string&)> stream_predicate(
-        model::ModelFamily family, bool stream_routed_experts);
+        bool stream_routed_experts, bool slab_paging = false);
 
     /// One fire: several requests' new tokens sharing a command buffer.
     ///
@@ -111,10 +115,20 @@ class SimpleFamilyEngine {
         /// and reads one per request, and the LM head is the step's most
         /// expensive dispatch by two orders of magnitude.
         std::vector<std::uint32_t> sample_rows;
+        bool run_argmax = false;
     };
 
     virtual int vocab() const = 0;
     virtual int n_layers() const = 0;
+
+    /// What the heap actually holds, and how much of it a token reads.
+    ///
+    /// The counting RULE lives once, in `pie::metal::weight_bytes`. What each
+    /// family supplies is the two numbers only it knows -- the width of its
+    /// expert bank and how much of it a token pulls -- because a mixture's size
+    /// and its cost are different questions and nothing in the tensor names
+    /// answers the second.
+    virtual WeightBytes weight_bytes() const = 0;
 
     /// Whether this family stores its KV in pages the runtime allocates, and so
     /// can hold several sequences at once. False means a single-sequence ring:
@@ -158,6 +172,9 @@ class SimpleFamilyEngine {
     /// dispatch writes here directly, so nothing copies between the model and
     /// the sampler.
     virtual SlotHandle logits_slot() const = 0;
+
+    /// Optional u32 greedy tokens, one per sampled row from the last fire.
+    virtual SlotHandle greedy_tokens_slot() const { return {}; }
 
     /// Dump every tapped activation of the LAST step, under the names
     /// `tests/parity/gemma4_mlx_taps.py` writes.

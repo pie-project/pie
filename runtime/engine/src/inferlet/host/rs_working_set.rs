@@ -15,7 +15,6 @@ use crate::inferlet::host::pipeline::Pipeline;
 use crate::store::registry as store_registry;
 use crate::store::rs::RsGeometry;
 use crate::store::rs::working_set::RsWorkingSet;
-use pie_model;
 
 type WitRange = pie::inferlet::working_set::PageRange;
 
@@ -26,7 +25,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<RsWorkingSet>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let model = 0;
-        let caps = pie_model::model().rs_caps();
+        let caps = crate::model::model().rs_caps();
         let geom = RsGeometry {
             state_size: caps.state_size,
             buffer_page_tokens: caps.buffer_page_size,
@@ -39,10 +38,6 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         Ok(self.ctx().table.push(ws)?)
     }
 
-    async fn state_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u64> {
-        crate::inferlet::process::gate::residency_gate(self).await?;
-        Ok(self.ctx().table.get(&this)?.geom.state_size)
-    }
 
     async fn buffer_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
         crate::inferlet::process::gate::residency_gate(self).await?;
@@ -52,10 +47,6 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         Ok(size.map_err(anyhow::Error::from)?)
     }
 
-    async fn buffer_page_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
-        crate::inferlet::process::gate::residency_gate(self).await?;
-        Ok(self.ctx().table.get(&this)?.geom.buffer_page_tokens)
-    }
 
     async fn alloc_buffer(
         &mut self,

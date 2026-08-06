@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "checkpoint_path.hpp"
 #include "mtl4_context.hpp"
 #include "batch/decode_abi.hpp"
 #include "batch/golden_tap.hpp"
@@ -23,7 +24,7 @@
 #include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
 #include "pie_loader/checkpoint_source.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/gemma4/bind.hpp"
 #include "model/gemma4/decode_consts.hpp"
 #include "model/gemma4/decode_step.hpp"
@@ -60,6 +61,10 @@ struct Facts {
     bool double_wide_mlp = true;
     float final_softcap = 30.0f;
     float rope_theta_full = 1.0e6f, rope_theta_sliding = 1.0e4f, full_partial_rotary = 0.25f;
+    bool enable_moe = false;
+    int n_experts = 0, experts_per_token = 0, moe_intermediate = 0;
+    bool attention_k_eq_v = false;
+    int n_global_kv_heads = 0;
     bool present() const { return n_layers > 0 && hidden > 0; }
 };
 
@@ -190,7 +195,7 @@ int encode_gemma4_variant(StepEncoder& se, const std::vector<gemma4::Dispatch>& 
         Grid grid;
         Threadgroup tg;
         launch_shape(d, g, grid, tg);
-        se.set_pso(pso_for(d, base, g4));
+        se.set_pso(pso_for(d, g, base, g4));
         se.set_argtable_ordinal(d.ordinal);
         se.dispatch(grid, tg);
         const bool last = i + 1 >= dag.size();
@@ -242,8 +247,8 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::string ckpt = argc > 1 ? argv[1] : std::string();
     if (ckpt.empty()) {
-        const char* home = std::getenv("HOME");
-        if (home != nullptr) ckpt = std::string(home) + "/.pie-bench/gemma4-e2b-pie";
+        ckpt = pie::metal::test::find_checkpoint("gemma4-e2b-pie",
+                                                 "models--mlx-community--gemma-4-e2b-it-4bit");
     }
     std::string kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
 
@@ -299,8 +304,10 @@ int main(int argc, char** argv) {
     pie_loader::LoadPlan plan;
     try {
         pie::metal::model::ContractFacts facts;
-        facts.first_kv_shared_layer = g.first_kv_shared();
-        plan = compile_load_plan(ckpt, metal_device_target(), "gemma4", facts);
+        facts.num_hidden_layers = g.n_layers;
+        facts.num_kv_shared_layers = g.num_kv_shared_layers;
+        plan = compile_load_plan(ckpt, metal_device_target(),
+                                 descriptor_for_testing("gemma4", facts));
     } catch (const std::exception& e) {
         std::printf("  FAIL  compile_load_plan: %s\n", e.what());
         return 1;
@@ -309,12 +316,18 @@ int main(int argc, char** argv) {
 
     // ── weights ──
     BoundGemma4 b;
+    std::shared_ptr<void> weight_mapping;
     try {
         const auto storage = plan.view();
-        pie_loader::CheckpointSource view(storage);
+        auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
         StagedWeights staged =
-            stage_plan_weights(*ctx, view, plan, storage.memory.persistent_bytes);
+            stage_plan_weights(*ctx, std::move(view), plan, storage.memory.persistent_bytes);
         b.weights = std::move(staged.weights);
+        // The mapping has to outlive `b.weights`: when the checkpoint places
+        // its tensors where a device pointer may point, those slots are slices
+        // of the checkpoint's own mmap rather than copies in the heap, and
+        // dropping `staged` here would unmap them under the GPU.
+        weight_mapping = std::move(staged.weight_mapping);
     } catch (const std::exception& e) {
         std::printf("  FAIL  stage_plan_weights: %s\n", e.what());
         return 1;
@@ -355,8 +368,8 @@ int main(int argc, char** argv) {
 
     Gemma4Psos psos;
     DecodeStepPsos base;
-    if (!build_gemma4_psos(*ctx, kernels_dir, psos, &err) ||
-        !load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/false, &err)) {
+    if (!build_gemma4_psos(*ctx, kernels_dir, g, psos, &err) ||
+        !load_decode_psos(*ctx, kernels_dir, base, g.quant, &err)) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }

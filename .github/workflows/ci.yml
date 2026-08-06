@@ -208,6 +208,48 @@ jobs:
   # sdk/tools/bakery/src/bakery/wit). Manual three-way editing has regressed
   # twice (commit 94043eb1). scripts/sync-wit.sh regenerates the copies from
   # source; this job fails if a PR edited the interface without re-syncing.
+  # Guest bitrot — the two inferlet trees are their own cargo workspaces, so
+  # `cargo build --workspace` above never touches them and an SDK change that
+  # breaks every guest still goes green. That is not hypothetical: nine
+  # commits of SDK work silently broke 13 of the 37 crates under
+  # runtime/engine/tests/inferlets before anyone built them (c82e06bba).
+  # These are the SDK's only consumers; if they do not compile, the SDK's
+  # public surface is whatever the last refactor happened to leave behind.
+  guest-inferlets:
+    name: guest inferlets (both trees, wasm32-wasip2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tests/inferlets/target
+            runtime/engine/tests/inferlets/target
+          key: ${{ runner.os }}-guest-inferlets-${{ hashFiles('tests/inferlets/Cargo.lock', 'runtime/engine/tests/inferlets/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-guest-inferlets-
+
+      # Warnings are denied: an unused import or a stale `mut` in a guest is
+      # usually the visible end of an SDK surface that moved.
+      - name: cargo check (tests/inferlets)
+        run: cargo check --target wasm32-wasip2 --manifest-path tests/inferlets/Cargo.toml
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: cargo check (runtime/engine/tests/inferlets)
+        run: cargo check --target wasm32-wasip2 --manifest-path runtime/engine/tests/inferlets/Cargo.toml
+        env:
+          RUSTFLAGS: -D warnings
+
   wit-drift:
     name: wit drift (sync-wit.sh)
     runs-on: ubuntu-latest
@@ -260,7 +302,15 @@ jobs:
 
       - name: cargo test (pie-worker, dummy)
         run: |
-          cargo test -p pie-worker --bin pie \
+          cargo test -p pie-worker \
+            --no-default-features --features driver-dummy
+
+      # The `pie` command lives in `bin/pie` (`pie-bin`); `pie-worker` is a
+      # library with no `[[bin]]`. Building the worker alone never produced a
+      # runnable CLI, so nothing here covered the composition root.
+      - name: cargo build (pie binary, dummy)
+        run: |
+          cargo build -p pie-bin \
             --no-default-features --features driver-dummy
 
   # macOS Metal driver build. Verifies driver/metal's cmake + link
@@ -293,6 +343,13 @@ jobs:
 
       - name: cargo build (driver-metal)
         run: cargo build -p pie-worker --no-default-features --features driver-metal
+
+      # Build the actual CLI too. Every macOS boot blocker found in the Metal
+      # smoke test (B1/B2/B3) was reachable only by running `pie`, and no job
+      # built it — the worker library compiling proves the driver links, not
+      # that the platform has a working binary.
+      - name: cargo build (pie binary, driver-metal)
+        run: cargo build -p pie-bin --no-default-features --features driver-metal
 
       # `src/batch/forward.cpp` compiles a LoadPlan, so every Metal target that
       # links the archive into an executable needs `pie-loader` as a staticlib

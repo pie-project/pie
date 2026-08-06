@@ -41,6 +41,4 @@ template <typename T>
       const device itype*, device itype*,                  \
       const device uint*, constant RowGatherParams&, uint2);
 
-instantiate_row_gather(float32, float)
-instantiate_row_gather(float16, half)
 instantiate_row_gather(bfloat16, bfloat)

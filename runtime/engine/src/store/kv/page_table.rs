@@ -1783,26 +1783,6 @@ impl KvPageTable {
         let shared_ws_set = self.locations_shared_outward(working_sets, &target)?;
         let cache_only = self.locations_held_by_cache_roots(&target);
 
-        // DIAGNOSIS (PIE_CONTENTION_TRACE_EVENTS): when the suspend path finds
-        // nothing to reclaim, report WHY — how many target pages were shared
-        // with another working set, held by a cache root, or already swapped.
-        let diagnose = crate::planner::trace_enabled();
-        let (target_len, mut shared_ws, mut shared_cache, mut swapped) =
-            (target.len(), 0usize, 0usize, 0usize);
-        if diagnose {
-            for location in &target {
-                if cache_only.contains(location) {
-                    shared_cache += 1;
-                }
-                if shared_ws_set.contains(location) && !cache_only.contains(location) {
-                    shared_ws += 1;
-                }
-                if matches!(self.backing_at(location), Ok(KvPageBacking::Swapped(_))) {
-                    swapped += 1;
-                }
-            }
-        }
-
         let pages: Vec<_> = target
             .into_iter()
             .filter(|location| !shared_ws_set.contains(location) && !cache_only.contains(location))
@@ -1811,17 +1791,6 @@ impl KvPageTable {
                 KvPageBacking::Swapped(_) => None,
             })
             .collect();
-        if diagnose && pages.is_empty() && target_len > 0 {
-            println!(
-                "[nothing-reclaimable] working_sets={} target_pages={} \
-                 shared_with_other_ws={} held_by_cache_root={} swapped={}",
-                working_sets.len(),
-                target_len,
-                shared_ws,
-                shared_cache,
-                swapped,
-            );
-        }
         Ok((pages, false))
     }
 

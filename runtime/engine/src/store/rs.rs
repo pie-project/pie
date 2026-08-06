@@ -55,7 +55,7 @@ pub mod write;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::pool::{Pool, PoolId};
@@ -280,7 +280,12 @@ pub struct RsStore {
     working_sets: GenMap<RsWsMarker, RsEntry>,
     /// See `KvStore::seq`: submission sequence for epoch retirement.
     seq: u64,
-    in_flight: u64,
+    /// Submission sequences prepared but not yet settled or cancelled.
+    ///
+    /// Ordered because retirement is bounded by the SMALLEST element: every
+    /// sequence below it has completed on the device, so anything freed at or
+    /// before that epoch can no longer be referenced.
+    outstanding: BTreeSet<u64>,
 }
 
 impl RsStore {
@@ -290,7 +295,7 @@ impl RsStore {
             refs: HashMap::new(),
             working_sets: GenMap::new(),
             seq: 0,
-            in_flight: 0,
+            outstanding: BTreeSet::new(),
         }
     }
 
@@ -299,16 +304,39 @@ impl RsStore {
         self.seq
     }
 
-    /// Retire everything immediately when no prepared write is in flight.
+    /// Retire every free whose epoch is provably complete on the device.
     ///
-    /// Nothing in flight means no device operation can still reference a
-    /// recycled slot, so every pending epoch is releasable — the bound is the
-    /// in-flight count, never the epoch value (host ops such as
-    /// `release_working_set` tag frees with caller-supplied epochs).
+    /// A slot is recycled with the epoch of the free, and `decref` pins that
+    /// epoch to `self.seq` — the newest sequence ever issued — so no device
+    /// operation referencing the slot can carry a sequence ABOVE its tag.
+    /// Retiring through the newest completed sequence therefore hands out only
+    /// slots nothing can still be reading or writing.
+    ///
+    /// "Newest completed" is the smallest outstanding sequence minus one, not
+    /// the newest settled one: fires settle out of order, so a young fire
+    /// finishing first says nothing about an older one still on the device.
+    /// With nothing outstanding every epoch is releasable.
+    ///
+    /// The two halves of that invariant are what make this sound, and both are
+    /// load-bearing, because the obvious half-measures are not. Gating on
+    /// idleness alone (`outstanding.is_empty()`) is safe but starves: under
+    /// sustained load the store is never idle, so freed slots accumulate
+    /// unretired and the pool reads empty while every slot in it is
+    /// releasable — on Qwen3.6-27B (24 slots, admission pinned to 16) that
+    /// failed 8 of 32 requests with "every RS folded slot is held". Retiring
+    /// on the free epoch alone is fast but lies: it treats the epoch as if it
+    /// had completed merely because a newer write exists, and hands the slot
+    /// out from under the device. Measured, that version won +31% on the
+    /// pinned-admission path and then hung the uncapped one (32/32 completed
+    /// before, a 300 s stall after), which is what aliasing live state looks
+    /// like from outside. Waiting for the epoch to actually COMPLETE is what
+    /// buys the throughput without the aliasing.
     pub fn retire_idle(&mut self) {
-        if self.in_flight == 0 {
-            self.pool.retire_through(u64::MAX);
-        }
+        let completed = match self.outstanding.iter().next() {
+            Some(&oldest) => oldest.saturating_sub(1),
+            None => u64::MAX,
+        };
+        self.pool.retire_through(completed);
     }
 
     // ------------------------------------------------------------------
@@ -399,11 +427,7 @@ impl RsStore {
     /// Capacity is untouched: this releases TOKENS, not pages. `free_buffer`
     /// remains the capacity operation, and the two now divide cleanly —
     /// content versus capacity.
-    pub fn discard_buffered(
-        &mut self,
-        ws: RsWorkingSetId,
-        count: u32,
-    ) -> Result<(), RsError> {
+    pub fn discard_buffered(&mut self, ws: RsWorkingSetId, count: u32) -> Result<(), RsError> {
         let entry = self.entry_mut(ws)?;
         if count > entry.occupancy.bound() {
             return Err(RsError::DiscardExceedsBuffer {
@@ -608,7 +632,14 @@ impl RsStore {
         write_state: bool,
         buffer_tokens: Option<(u32, u32)>,
     ) -> Result<RsPreparedWrite, RsError> {
-        self.prepare(ws, write_state, None, buffer_tokens, RsBufferIntent::Write, None)
+        self.prepare(
+            ws,
+            write_state,
+            None,
+            buffer_tokens,
+            RsBufferIntent::Write,
+            None,
+        )
     }
 
     /// Prepare a folded-state write from caller-owned reserved slots,
@@ -637,7 +668,14 @@ impl RsStore {
         if let Some(tokens) = fold_tokens {
             self.validate_fold(ws, tokens, buffer_tokens, buffer_intent)?;
         }
-        self.prepare(ws, write_state, fold_tokens, buffer_tokens, buffer_intent, None)
+        self.prepare(
+            ws,
+            write_state,
+            fold_tokens,
+            buffer_tokens,
+            buffer_intent,
+            None,
+        )
     }
 
     /// [`prepare_general`] from caller-owned reserved slots (the acquisition
@@ -813,7 +851,7 @@ impl RsStore {
             .collect();
 
         self.seq += 1;
-        self.in_flight += 1;
+        self.outstanding.insert(self.seq);
         Ok(RsPreparedWrite {
             fold_len_is_bound: false,
             ws,
@@ -861,17 +899,15 @@ impl RsStore {
             self.cancel_batch(prepared);
             return Err(error);
         }
-        let rows = prepared.len();
-        let seq = prepared
+        let seqs = prepared
             .iter()
             .map(RsPreparedWrite::seq)
-            .max()
-            .unwrap_or(self.seq);
+            .collect::<Vec<_>>();
         let mut folds = RsPendingFolds::default();
         for write in prepared {
             self.publish_prevalidated(write, &mut folds);
         }
-        Ok((RsPublished::new(seq, rows), folds))
+        Ok((RsPublished::new(seqs), folds))
     }
 
     /// Apply the fold advances a `publish_batch` deferred.
@@ -909,11 +945,7 @@ impl RsStore {
         }
     }
 
-    fn publish_prevalidated(
-        &mut self,
-        prepared: RsPreparedWrite,
-        folds: &mut RsPendingFolds,
-    ) {
+    fn publish_prevalidated(&mut self, prepared: RsPreparedWrite, folds: &mut RsPendingFolds) {
         let ws = prepared.ws;
         // Displaced slots are recycled against the current submission
         // sequence; `retire_idle` is what actually hands them back, and it
@@ -961,11 +993,7 @@ impl RsStore {
             entry.occupancy = entry.occupancy.map(|n| n.max(start.saturating_add(len)));
         }
 
-        if let Some(tokens) = prepared
-            .state
-            .as_ref()
-            .and_then(|state| state.fold_tokens)
-        {
+        if let Some(tokens) = prepared.state.as_ref().and_then(|state| state.fold_tokens) {
             folds.0.push(RsPendingFold {
                 ws,
                 tokens,
@@ -978,7 +1006,9 @@ impl RsStore {
     /// The mapping is already authoritative (fail-stop, as in `KvStore`); all
     /// that remains is releasing the in-flight hold on pool retirement.
     pub fn settle(&mut self, published: RsPublished) {
-        self.in_flight = self.in_flight.saturating_sub(published.rows() as u64);
+        for seq in published.seqs() {
+            self.outstanding.remove(seq);
+        }
         self.retire_idle();
     }
 
@@ -988,7 +1018,7 @@ impl RsStore {
     pub fn cancel_prepared(&mut self, prepared: RsPreparedWrite) {
         self.pool
             .recycle_after_epoch(prepared.allocated, prepared.seq);
-        self.in_flight = self.in_flight.saturating_sub(1);
+        self.outstanding.remove(&prepared.seq);
         self.retire_idle();
     }
 
@@ -1162,6 +1192,15 @@ impl RsStore {
         *count -= 1;
         if *count == 0 {
             self.refs.remove(&id);
+            // Pin the tag to the newest sequence ever issued rather than
+            // trusting the caller's. Sequences are monotonic, so every write
+            // that could still reference this slot has a sequence at or below
+            // `self.seq`, and nothing prepared later can reach it: the slot is
+            // unreferenced and stays unallocatable until it retires. A caller
+            // holding a stale epoch would otherwise tag the free BELOW a write
+            // still in flight against it, which is the aliasing `retire_idle`
+            // documents.
+            let epoch = epoch.max(self.seq);
             self.pool.recycle_after_epoch(vec![id], epoch);
         }
     }

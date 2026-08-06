@@ -45,6 +45,11 @@ enum class Kind : std::uint8_t {
     /// top-k over those logits, then softmax over the k that survive. Emits both
     /// the chosen expert ids and their normalized weights.
     RouterTopK,
+    /// Expert-major reordering. At decode tile_rows=1 and the routed matvecs
+    /// consume the four sorted rows; at a wide fire each expert run pads to a
+    /// GEMM tile and amortizes one weight read across its rows.
+    ExpertSort,
+    ExpertGather,
     /// The three routed projections. Each reads `experts_per_token` expert
     /// slices selected by `RouterTopK`, not a fixed weight.
     ExpertGate, ExpertUp,
@@ -66,6 +71,18 @@ enum class Kind : std::uint8_t {
     LmHead,
     Argmax,
 };
+
+/// Which kinds run on the rows the sampler will READ rather than on every token.
+///
+/// `RowGather` compacts the sampled positions to a dense prefix, and everything
+/// after it works on that prefix. Two places ask this -- the scratch sizer, so
+/// a colour holding one of these is allocated for the shorter count, and the
+/// golden-tap dumper, so a published tensor has the rows it really has -- and
+/// they have to give the same answer. When they disagree the sizer wins and the
+/// dumper reads past the value into whatever the pool put after it.
+constexpr bool is_tail(Kind k) {
+    return k == Kind::RowGather || k == Kind::FinalRms || k == Kind::LmHead;
+}
 
 struct Dispatch {
     Kind kind;
@@ -107,6 +124,8 @@ inline std::vector<Dispatch> build_gptoss_dag(const GptOssGeometry& g, bool with
         emit(Kind::FfnNorm, L, sliding);
         emit(Kind::RouterGemv, L, sliding);
         emit(Kind::RouterTopK, L, sliding);
+        emit(Kind::ExpertSort, L, sliding);
+        emit(Kind::ExpertGather, L, sliding);
         emit(Kind::ExpertGate, L, sliding);
         emit(Kind::ExpertUp, L, sliding);
         emit(Kind::ExpertSwiGlu, L, sliding);
@@ -120,6 +139,12 @@ inline std::vector<Dispatch> build_gptoss_dag(const GptOssGeometry& g, bool with
     emit(Kind::LmHead, -1, false);
     if (with_argmax) emit(Kind::Argmax, -1, false);
     return dag;
+}
+
+inline bool is_expert_sorted(Kind k) {
+    return k == Kind::ExpertGather || k == Kind::ExpertGate ||
+           k == Kind::ExpertUp || k == Kind::ExpertSwiGlu ||
+           k == Kind::ExpertDown;
 }
 
 struct DagStats {
