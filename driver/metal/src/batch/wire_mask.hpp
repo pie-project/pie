@@ -106,37 +106,37 @@ inline bool causal_prefix_lengths(
     return true;
 }
 
-/// Cut a page CSR back to the lengths a causal mask vouches for.
+/// The first request whose mask length disagrees with what the page CSR says
+/// its KV length is, or -1 when they all agree.
 ///
-/// `lengths[r]` keys survive for request `r`; the pages past them were
-/// reserved, not written. Keeps each request's first `ceil(len / page_size)`
-/// page ids and restates its last-page fill, so the geometry the kernel reads
-/// describes only history.
-inline void trim_kv_to_lengths(
-    std::vector<std::uint32_t>& kv_page_indices,
-    std::vector<std::uint32_t>& kv_page_indptr,
-    std::vector<std::uint32_t>& kv_last_page_lens,
+/// These two are the same number stated twice, and the inferlet that states
+/// them says so: "the page CSR is the SOURCE OF TRUTH for kv_len on the wire
+/// ... declaring the whole pool here would claim a kv length the pass does not
+/// have and silently corrupt attention". Silently is the problem. When they
+/// disagree the mask is a second opinion the driver cannot reconcile -- it
+/// cannot know which one the KV WRITE used -- so the only safe answer is to
+/// say which two numbers differ and stop.
+///
+/// The disagreement is not hypothetical and its usual cause is dull: an
+/// inferlet paging at one size against a driver configured for another. A
+/// 53-token prefill from a `PAGE_T = 16` inferlet arrives as four pages, and a
+/// driver reading them at 32 makes that 117 keys against the mask's 53.
+inline int first_kv_len_disagreement(
     const std::vector<std::uint32_t>& lengths,
-    std::uint32_t page_size) {
-    if (page_size == 0 || kv_page_indptr.size() != lengths.size() + 1) return;
-    std::vector<std::uint32_t> pages;
-    std::vector<std::uint32_t> indptr;
-    pages.reserve(kv_page_indices.size());
-    indptr.reserve(kv_page_indptr.size());
-    indptr.push_back(0);
+    const PieU32Slice& kv_page_indptr,
+    const PieU32Slice& kv_last_page_lens,
+    std::uint32_t page_size,
+    std::uint32_t& claimed) {
     for (std::size_t r = 0; r < lengths.size(); ++r) {
-        const std::uint32_t have = kv_page_indptr[r + 1] - kv_page_indptr[r];
-        const std::uint32_t want = (lengths[r] + page_size - 1) / page_size;
-        const std::uint32_t keep = want < have ? want : have;
-        for (std::uint32_t p = 0; p < keep; ++p) {
-            pages.push_back(kv_page_indices[kv_page_indptr[r] + p]);
+        const std::uint32_t pages = kv_page_indptr.ptr[r + 1] - kv_page_indptr.ptr[r];
+        const std::uint32_t kv =
+            pages == 0 ? 0u : (pages - 1) * page_size + kv_last_page_lens.ptr[r];
+        if (kv != lengths[r]) {
+            claimed = kv;
+            return static_cast<int>(r);
         }
-        indptr.push_back(static_cast<std::uint32_t>(pages.size()));
-        kv_last_page_lens[r] =
-            keep == 0 ? 0 : lengths[r] - (keep - 1) * page_size;
     }
-    kv_page_indices.swap(pages);
-    kv_page_indptr.swap(indptr);
+    return -1;
 }
 
 }  // namespace pie::metal::wire_mask
