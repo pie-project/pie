@@ -1191,6 +1191,40 @@ mod tests {
         }
     }
 
+    /// gemma-4's residue LEDGER — the third family's, opened the way
+    /// qwen3_5's was and for the same reason: a rung is legible when it
+    /// is a line leaving this list.
+    ///
+    /// Empty means the decode body is a list of rectangles. It does NOT
+    /// mean gemma-4 runs: no driver consumes this plan yet, and the
+    /// executor is the next rung.
+    #[test]
+    fn the_gemma4_residue_ledger() {
+        let facts = crate::facts::Gemma4Facts::gemma_4_e4b();
+        let cuda = crate::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic();
+        let plan = family::gemma4_cuda(&facts, &cuda, FireClass::Decode);
+        let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
+        let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
+        for u in &out.residue {
+            *ledger
+                .entry(format!("{}: {}", u.kind, u.why))
+                .or_default() += 1;
+        }
+        let seen: Vec<String> = ledger
+            .iter()
+            .map(|(k, n)| format!("{n:>4}  {k}"))
+            .collect();
+        let expected: Vec<String> = LEDGER_GEMMA4_DECODE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(seen, expected, "the gemma-4 residue ledger moved");
+        assert!(
+            !out.launches.is_empty(),
+            "a fire that executes nothing is not a fire"
+        );
+    }
+
+    /// See [`the_gemma4_residue_ledger`]. One entry per (kind, reason).
+    const LEDGER_GEMMA4_DECODE: &[&str] = &[];
+
     /// The MoE block's own ledger, and the argument for the fused leg.
     ///
     /// The SEMANTIC reading is residue — a selector, a combine and a

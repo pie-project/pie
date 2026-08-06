@@ -23,10 +23,10 @@ use std::path::PathBuf;
 
 use pie_forward::family::{
     llama_like, llama_like_cuda, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
-    qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block, qwen3_5_moe_mlp_block_cuda,
+    gemma4_cuda, qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block, qwen3_5_moe_mlp_block_cuda,
 };
 use pie_forward::{
-    FireClass, ForwardPlan, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
+    FireClass, Gemma4CudaFacts, Gemma4Facts, ForwardPlan, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 
@@ -576,6 +576,25 @@ fn mistral_7b_v03_cuda_prefill() {
                 gate_up_fused: true,
             },
             FireClass::Prefill,
+        ),
+    );
+}
+
+/// gemma-4-E4B's decode reading — the third family's first golden.
+///
+/// Worth reading for three shapes no earlier golden has: the input norm
+/// appears ONCE (layer 0's; every other layer's arrives fused into the
+/// previous layer's PLE landing), the trailing 18 layers carry no k/v
+/// projection or cache write at all, and the two layer kinds differ by
+/// head WIDTH rather than by which statements run.
+#[test]
+fn gemma_4_e4b_cuda_decode() {
+    check_plan(
+        "gemma_4_e4b_cuda_decode",
+        &gemma4_cuda(
+            &Gemma4Facts::gemma_4_e4b(),
+            &Gemma4CudaFacts::gemma_4_e4b_synthetic(),
+            FireClass::Decode,
         ),
     );
 }

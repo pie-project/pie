@@ -60,7 +60,7 @@ pub mod ffi;
 pub mod trace;
 
 pub use facts::{
-    Gemma4Facts, LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts,
+    Gemma4CudaFacts, Gemma4Facts, LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts,
     Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 pub use trace::{

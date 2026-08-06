@@ -1142,3 +1142,40 @@ mod gemma4_tests {
         assert_eq!(f.global_rotary_dim, 2 * (0.5 * 0.25 * 512.0) as u32);
     }
 }
+
+/// The CUDA backend's load-time facts for gemma-4 — the BINDING
+/// questions its class traces resolve at trace time.
+///
+/// Three, and all three are "what did the loader materialise", which is
+/// the taxonomy's first row: a load-time fact is a trace-time `match`,
+/// erased.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Gemma4CudaFacts {
+    /// The loader bound one packed `[Hq + 2*Hk, hidden]` projection
+    /// (`qkv_proj_fused`) — llama_like's `fused_qkv`, same question.
+    pub fused_qkv: bool,
+    /// The loader bound a packed gate‖up bank — llama_like's
+    /// `gate_up_fused`, same question, different activation behind it.
+    pub gate_up_fused: bool,
+    /// The KV cache is native bf16, so the fused decode post may write
+    /// pages directly. One of the four terms
+    /// `can_fuse_packed_qkv_post` reads; the other three are the
+    /// declaration's own (`partial` is a layer-kind fact, hooks and the
+    /// fire class are class/guard vocabulary).
+    pub kv_native_bf16: bool,
+}
+
+impl Gemma4CudaFacts {
+    /// SYNTHETIC fixture — the same standing caveat every `*CudaFacts`
+    /// constructor here carries: it pins the GOLDEN FORM of the traced
+    /// arms, not a deployment's truth. The live derivation and its
+    /// digest are the executor rung's, and the digest is what corrects a
+    /// guess on first boot.
+    pub fn gemma_4_e4b_synthetic() -> Self {
+        Self {
+            fused_qkv: true,
+            gate_up_fused: true,
+            kv_native_bf16: true,
+        }
+    }
+}

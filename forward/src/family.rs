@@ -7,7 +7,7 @@
 //! programs differ, not the way two runtime paths do.
 
 use crate::facts::{
-    LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
+    Gemma4CudaFacts, Gemma4Facts, LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 use crate::dsl::{
@@ -3181,4 +3181,263 @@ mod metal_tests {
         assert!(count(&mb, "sdpa_paged_decode_bfloat16_d_256") > 0);
         assert!(count(&fold, "sdpa_vector_decode_bfloat16_d_256") > 0);
     }
+}
+
+// ── gemma-4 ──────────────────────────────────────────────────────────
+
+/// One gemma-4 layer's weight namespace, named after the driver's own
+/// fields (`Gemma4LayerWeights`) so the executor's binder is a straight
+/// map rather than a translation.
+struct Gemma4LayerW {
+    attn_norm: NormW,
+    post_attn_norm: NormW,
+    pre_ffw_norm: NormW,
+    post_ffw_norm: NormW,
+    qkv: MatW,
+    q_proj: MatW,
+    k_proj: MatW,
+    v_proj: MatW,
+    o_proj: MatW,
+    q_norm: NormW,
+    k_norm: NormW,
+    gate_up: MatW,
+    down: MatW,
+    ple_gate: MatW,
+    ple_proj: MatW,
+    ple_norm: NormW,
+}
+
+impl Gemma4LayerW {
+    fn new(l: u32, f: &Gemma4Facts) -> Self {
+        let w = |name: &str| format!("layer.{l}.{name}");
+        let d = f.head_dim_of(l);
+        let mat = |name: &str, width: u32| MatW {
+            name: w(name),
+            width,
+            layer: Some(l),
+        };
+        // gemma-4 folds `(1 + w)` on every norm of the block, like every
+        // Gemma generation before it.
+        let norm = |name: &str| NormW {
+            name: w(name),
+            variant: NormVariant::Gemma,
+            per_head: None,
+            layer: Some(l),
+        };
+        let head_norm = |name: &str| NormW {
+            name: w(name),
+            variant: NormVariant::Gemma,
+            per_head: Some(d),
+            layer: Some(l),
+        };
+        Gemma4LayerW {
+            attn_norm: norm("attn_norm"),
+            post_attn_norm: norm("post_attn_norm"),
+            pre_ffw_norm: norm("pre_ffw_norm"),
+            post_ffw_norm: norm("post_ffw_norm"),
+            qkv: mat("qkv", (f.q_heads + 2 * f.kv_heads) * d),
+            q_proj: mat("q_proj", f.q_heads * d),
+            k_proj: mat("k_proj", f.kv_heads * d),
+            v_proj: mat("v_proj", f.kv_heads * d),
+            o_proj: mat("o_proj", f.hidden),
+            q_norm: head_norm("q_norm"),
+            k_norm: head_norm("k_norm"),
+            gate_up: mat("gate_up", 2 * f.intermediate),
+            down: mat("down", f.hidden),
+            ple_gate: mat("ple_gate", f.ple_dim),
+            ple_proj: mat("ple_proj", f.hidden),
+            ple_norm: norm("ple_norm"),
+        }
+    }
+}
+
+/// The gemma-4 model's CUDA reading — `gemma4.cpp`'s decode path as a
+/// list of stated kernels.
+///
+/// # The three things a reader should look for
+///
+/// **The input norm is missing from every layer but the first.** That is
+/// not an omission: layer `l`'s PLE epilogue fires
+/// `launch_rmsnorm_residual_add_scale_rmsnorm_bf16`, whose FOURTH
+/// statement is layer `l+1`'s `attn_norm`. The fusion crosses the layer
+/// boundary, so the declaration does too — `gemma4.cpp:1999` produces
+/// it and `:1529` is the guard that skips re-computing it.
+///
+/// **A KV-shared layer's statements are ABSENT, not skipped.** The
+/// trailing [`Gemma4Facts::kv_shared_layers`] layers project no k/v,
+/// norm neither, rope no k and write no cache; their attention names
+/// the SOURCE layer's cache handle. Nothing here tests a flag per fire,
+/// because there is nothing per fire about it — the binding decided at
+/// load, and a fact is a trace-time `match`.
+///
+/// **The two layer kinds differ by WIDTH, not by function.** Sliding
+/// layers rope fully at `head_dim`; full layers rope partially at
+/// `global_head_dim`. That is why the full layers cannot take the fused
+/// packed post (its predicate reads `!partial`) and fall to the
+/// separate norm/rope statements instead.
+///
+/// Prefill and the service classes are not stated yet: this is the
+/// decode reading, and the class parameter is here so the next rung adds
+/// them where llama_like's does.
+pub fn gemma4_cuda(
+    facts: &Gemma4Facts,
+    cuda: &Gemma4CudaFacts,
+    class: FireClass,
+) -> ForwardPlan {
+    let family = format!(
+        "gemma4.cuda.{}",
+        match class {
+            FireClass::Decode => "decode",
+            FireClass::Prefill => "prefill",
+            other => panic!("gemma4 states no {other:?} class yet"),
+        }
+    );
+    let hidden = facts.hidden;
+    dsl::trace_named(&family, |t| {
+        // ── Prologue ────────────────────────────────────────────────
+        // The token embedding, scaled by sqrt(hidden).
+        let mut y = dsl::cuda::scalar_mul(&dsl::embed_with(t, "embed", hidden));
+
+        // PLE: a SECOND embedding table, projected to the whole stack's
+        // per-layer width, normed, scaled and relaid so each layer reads
+        // a contiguous slice. Once per fire, not per layer — which is
+        // the entire reason for the relay.
+        let ple_total = facts.layers * facts.ple_dim;
+        let ple = dsl::cuda::scalar_mul(&dsl::embed_with(t, "embed_per_layer", ple_total));
+        let ple = matmul(
+            &ple,
+            &MatW {
+                name: "ple_model_proj".into(),
+                width: ple_total,
+                layer: None,
+            },
+        );
+        let ple = dsl::cuda::scalar_mul(&ple);
+        let ple = rmsnorm(
+            &ple,
+            &NormW {
+                name: "ple_model_norm".into(),
+                variant: NormVariant::Gemma,
+                per_head: Some(facts.ple_dim),
+                layer: None,
+            },
+        );
+        let ple = dsl::cuda::scalar_mul(&ple);
+        let ple_table = dsl::cuda::transpose_nld_to_lnd(&ple, facts.layers, facts.ple_dim);
+
+        // ── Layers ──────────────────────────────────────────────────
+        // Layer 0 norms the stream itself; every other layer received
+        // its input norm from the layer before (see the doc above).
+        let mut normed = rmsnorm(&y, &Gemma4LayerW::new(0, facts).attn_norm);
+
+        for l in 0..facts.layers {
+            let w = Gemma4LayerW::new(l, facts);
+            let full = facts.is_full_attn(l);
+            let d = facts.head_dim_of(l);
+            let shared = facts.is_kv_shared(l);
+            // A shared layer attends through the pages of the last
+            // earlier layer of its own kind. The handle IS the sharing.
+            let kv = dsl::Kv::at(t, facts.kv_source(l).unwrap_or(l));
+
+            // The fused post writes k/v to the pages itself, so it is
+            // unavailable to a layer that writes none — and to the full
+            // layers, whose partial rope it does not implement.
+            let fused_post = cuda.fused_qkv
+                && cuda.kv_native_bf16
+                && !full
+                && !shared
+                && class == FireClass::Decode;
+
+            let attn_in = if fused_post {
+                let packed = matmul(&normed, &w.qkv);
+                dsl::cuda::qkv_packed_post(&packed, &w.q_norm, &w.k_norm, &kv, facts.q_heads * d)
+            } else {
+                // The separate form. A shared layer takes only the q
+                // leg of it: no k/v projection, no k/v norm, no rope on
+                // k, no write.
+                let q = matmul(&normed, &w.q_proj);
+                if shared {
+                    let q = rmsnorm(&q, &w.q_norm);
+                    // K was rotated at its SOURCE layer, where it was
+                    // written to the cache — so only q rotates here.
+                    dsl::cuda::rope_q_only(&q, full)
+                } else {
+                    let k = matmul(&normed, &w.k_proj);
+                    let v = matmul(&normed, &w.v_proj);
+                    let v = dsl::cuda::rmsnorm_no_scale(&v);
+                    let (q, k) = if full {
+                        let q = rmsnorm(&q, &w.q_norm);
+                        let k = rmsnorm(&k, &w.k_norm);
+                        dsl::rope_partial(&q, &k, RopeKind::Standard, facts.global_rotary_dim)
+                    } else {
+                        dsl::cuda::qk_rmsnorm_rope_rounded(&q, &k, &w.q_norm, &w.k_norm)
+                    };
+                    dsl::cuda::write_kv_to_pages(&k, &v, &kv);
+                    q
+                }
+            };
+
+            let a = dsl::cuda::attention_flashinfer_decode(&attn_in, &kv)
+                .expect("the decode class states its attention");
+            let attn_out = matmul(&a, &w.o_proj);
+
+            // Post-attention norm, land on the stream, scale, and norm
+            // for the MLP — four statements, one launch.
+            let (landed, mlp_in) = dsl::cuda::norm_residual_scale_norm(
+                &attn_out,
+                &w.post_attn_norm,
+                &w.pre_ffw_norm,
+                hidden,
+            );
+            y = landed;
+
+            let act = dsl::cuda::geglu_tanh(
+                &matmul(&mlp_in, &w.gate_up),
+                facts.intermediate,
+                cuda.gate_up_fused,
+            );
+            let mlp_out = matmul(&act, &w.down);
+            y = dsl::cuda::norm_residual_add(&mlp_out, &w.post_ffw_norm, hidden);
+
+            // ── The PLE epilogue ────────────────────────────────────
+            // Gate this layer's slice of the per-layer table into the
+            // stream, then land it — and, for every layer but the last,
+            // produce the NEXT layer's input norm in the same launch.
+            let gate = matmul(&y, &w.ple_gate);
+            let gated = dsl::cuda::geglu_tanh_pair(&gate, &ple_table, facts.ple_dim);
+            let ple_out = matmul(&gated, &w.ple_proj);
+            if l + 1 < facts.layers {
+                let next = Gemma4LayerW::new(l + 1, facts);
+                let (landed, next_norm) = dsl::cuda::norm_residual_scale_norm(
+                    &ple_out,
+                    &w.ple_norm,
+                    &next.attn_norm,
+                    hidden,
+                );
+                y = landed;
+                normed = next_norm;
+            } else {
+                // The last layer has no next input norm to fuse, so it
+                // lands unfused and the epilogue norms for itself —
+                // `gemma4.cpp`'s :2010 arm.
+                y = dsl::cuda::norm_residual_add(&ple_out, &w.ple_norm, hidden);
+            }
+        }
+
+        // ── Epilogue ────────────────────────────────────────────────
+        let normed = rmsnorm(
+            &y,
+            &NormW {
+                name: "final_norm".into(),
+                variant: NormVariant::Gemma,
+                per_head: None,
+                layer: None,
+            },
+        );
+        let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
+        let logits = dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
+        if facts.logit_softcap > 0.0 {
+            dsl::cuda::logit_softcap(&logits, facts.vocab);
+        }
+    })
 }

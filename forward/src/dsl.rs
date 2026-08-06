@@ -1603,6 +1603,57 @@ pub mod cuda {
         .expect("the activation produces its value")
     }
 
+    /// `kernels::launch_geglu_tanh_bf16` in its PAIR form: the gate and
+    /// the up operand are two buffers, not one packed bank.
+    ///
+    /// gemma-4's PLE epilogue needs it even on a checkpoint that bound a
+    /// packed MLP bank, because the "up" operand there is the layer's
+    /// slice of the per-layer table — a buffer that was never going to
+    /// be adjacent to the gate. Same kernel as [`geglu_tanh`]'s unpacked
+    /// arm; a different statement because the OPERANDS differ, which is
+    /// what a reader needs to see.
+    pub fn geglu_tanh_pair(gate: &Val, up: &Val, width: u32) -> Val {
+        record(
+            &gate.t,
+            gate.layer,
+            "launch_geglu_tanh_bf16",
+            vec![],
+            None,
+            vec![gate.id, up.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the activation produces its value")
+    }
+
+    /// `kernels::launch_rope{,_partial}_bf16` rotating Q ALONE.
+    ///
+    /// A KV-shared layer's K was rotated at its SOURCE layer, where it
+    /// was written to the cache, so rotating it again here would be
+    /// wrong twice over — the value is not even in this layer's
+    /// registers. The driver expresses that by passing `num_kv_heads =
+    /// 0`; the trace expresses it by the statement having ONE operand.
+    ///
+    /// The semantic [`super::rope`] cannot say this: its shape is a
+    /// (q, k) pair, and a pair with nothing in the second slot is a
+    /// different statement, not a degenerate one.
+    pub fn rope_q_only(q: &Val, partial: bool) -> Val {
+        let out = (q.t.inner.borrow().value_shape(q.id), DType::BF16);
+        record(
+            &q.t,
+            q.layer,
+            if partial {
+                "launch_rope_partial_bf16"
+            } else {
+                "launch_rope_bf16"
+            },
+            vec![],
+            None,
+            vec![q.id],
+            Some(out),
+        )
+        .expect("the rotation produces its value")
+    }
+
     /// `kernels::launch_rmsnorm_no_scale_bf16`: `v / rms(v)` per head,
     /// with NO learnable weight — gemma-4's V-norm.
     ///
