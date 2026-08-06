@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
+#include "kernels_manifest.hpp"
 #include "distributed.hpp"
 #include "ops/gemm.hpp"
 #include "loader/rust_author.hpp"
@@ -202,14 +203,8 @@ LoadedModel LoadedModel::load(
     CUDA_CHECK(cudaGetDeviceProperties(&dev_prop, dev_id));
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
-#ifdef PIE_CUDA_HAS_MARLIN
-    // Native MXFP4 expert execution requires a Blackwell-class FP4 path.
-    // Older GPUs keep packed MXFP4 resident but use routed BF16 dequant
-    // scratch for the selected experts.
-    const bool mxfp4_native_gemm = dev_prop.major >= 10;
-#else
-    const bool mxfp4_native_gemm = false;
-#endif
+    const bool mxfp4_native_gemm =
+        device_supports_native_mxfp4_moe(dev_prop.major);
 
     // Compile the plan for *this* device. The driver states what the device can
     // do and the loader answers with a plan that stays inside it, so there is

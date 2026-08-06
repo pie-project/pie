@@ -178,6 +178,7 @@ fn build_cuda() {
         "CMAKE_CUDA_ARCHITECTURES",
         "PIE_COMPILER_LAUNCHER",
         "PIE_CUDA_BUILD_MARLIN",
+        "PIE_CUDA_BUILD_MARLIN_MOE",
         "CPM_SOURCE_CACHE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
