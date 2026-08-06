@@ -624,8 +624,34 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
         // for `min(max_tokens, 512)` rows and no fire carries more than
         // `max_tokens`, so the smaller term never binds. That is what
         // lets this be derived here, where `max_tokens` is not in scope.
-        cuda.moe_cutlass_max_rows =
-            ops::flashinfer_cutlass_moe_enabled() ? 512u : 0u;
+        //
+        // The env gate is NOT the condition. The forward reads
+        // `!cutlass_ws.empty()`, and the workspace is empty whenever the
+        // SIZE QUERY reports zero — which it does on any arch whose
+        // grouped-GEMM units this build did not compile (sm90 today: the
+        // vendored units are sm80 and, behind PIE_HAS_SM100, sm100). So
+        // ask the same question the forward asks. Mirroring the env
+        // instead would declare a fused leg on exactly the machines that
+        // fall back to the unfused path.
+        //
+        // The query is also the arch probe, and in this tree it still
+        // THROWS rather than reporting zero when no config is backed
+        // (upstream 48c280d45 turns that into a zero). Catching here
+        // gives the same answer without waiting for the merge, and a
+        // throw means the same thing zero does: no fused leg.
+        cuda.moe_cutlass_max_rows = 0;
+        if (ops::flashinfer_cutlass_moe_enabled()) {
+            std::size_t bytes = 0;
+            try {
+                bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
+                    ops::MoeActivation::Swiglu, 512, cfg.hidden_size,
+                    cfg.moe_intermediate_size, cfg.num_experts,
+                    cfg.num_experts_per_tok, /*tp_size=*/1, /*tp_rank=*/0);
+            } catch (const std::exception&) {
+                bytes = 0;
+            }
+            cuda.moe_cutlass_max_rows = (bytes > 0) ? 512u : 0u;
+        }
         // `add_to_residual` is `(T == 1) && use_decode_fast_path`; the
         // tp term is the deployment's, the other is the class's.
         cuda.moe_residual_fold = (tp_size == 1) ? 1 : 0;
