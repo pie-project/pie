@@ -660,13 +660,20 @@ int main(int argc, char** argv) {
         // the comparison to be subtly weaker.
         const auto gate = [&](const std::vector<std::uint32_t>& pr,
                               const std::vector<int>& expect, const char* what) {
+            // A row with no recorded answer still decodes, and for the same
+            // number of steps a gated one would. It used to decode `expect`
+            // tokens, which is none of them without a reference -- so the
+            // "produced:" the ungated line ends with was followed by nothing,
+            // and a checkpoint whose head wrote no logits at all was
+            // indistinguishable from one nobody had transcribed yet.
+            const std::size_t steps = expect.empty() ? 6 : expect.size();
             Seq c;
             c.id = next_id++;
             c.tokens = pr;
-            c.tokens.resize(pr.size() + expect.size(), 0u);
+            c.tokens.resize(pr.size() + steps, 0u);
             std::vector<int> got;
             int t = fire(exec, c, std::uint32_t(pr.size()), page_size, page, true);
-            for (std::size_t i = 0; i < expect.size() && t >= 0; ++i) {
+            for (std::size_t i = 0; i < steps && t >= 0; ++i) {
                 got.push_back(t);
                 c.tokens[pr.size() + i] = std::uint32_t(t);
                 t = fire(exec, c, 1, page_size, page, true);

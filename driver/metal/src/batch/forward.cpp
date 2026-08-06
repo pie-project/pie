@@ -699,7 +699,7 @@ struct PtirLogitsCopyParams {
     std::uint32_t reserved = 0;
 };
 
-inline constexpr int kPtirLogitsCopyOrdinal = 90000;
+
 // Rows one staging dispatch can carry. Bounded by the paged forward's row
 // capacity, which is what `LogitsOut::rows` is drawn from.
 inline constexpr std::size_t kPtirLogitsCopyMaxRows = kPagedMaxForwardTokensCeiling;
@@ -1044,11 +1044,30 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // ── Build the decode DAG (shipped config: GdnPrep ON, no argmax dispatch — host samples). ──
     // Under the accuracy gate every activation value gets its own pool buffer, so a
     // tap's producer is still readable once the command buffer retires.
-    const bool taps = golden_taps_enabled();
+    const bool taps = golden_taps_enabled() && !golden_taps_recycle();
     dag_ = build_decode_dag(g_, /*with_argmax=*/false, fuse_residual_, gdn_prep_);
+    // Each DAG owns one region of the argument-table namespace. A DAG longer
+    // than its region reaches into the next one's, and the two then share
+    // tables silently -- see `ordinals_fit`.
+    if (!ordinals_fit(dag_.size())) {
+        if (err) {
+            *err = "this decoder emits " + std::to_string(dag_.size()) +
+                   " dispatches and one argument-table region holds " +
+                   std::to_string(kPrefillOrdinalStride);
+        }
+        return false;
+    }
     if (g_.paged_kv_enabled) {
         mb_dag_ = build_decode_dag_mb(g_, std::max(1, g_.max_tokens),
                                       kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
+        if (!ordinals_fit(mb_dag_.size())) {
+            if (err) {
+                *err = "this decoder's batched DAG emits " + std::to_string(mb_dag_.size()) +
+                       " dispatches and one argument-table region holds " +
+                       std::to_string(kPrefillOrdinalStride);
+            }
+            return false;
+        }
         mb_sched_ = build_scratch_schedule(mb_dag_, g_, /*no_recycle=*/taps);
         prefill_dags_ = build_decode_prefill_dags(g_, std::max(1, g_.max_tokens),
                                                    fuse_residual_, gdn_prep_);
