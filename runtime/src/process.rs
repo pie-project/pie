@@ -202,9 +202,9 @@ pub fn spawn(
     token_budget: Option<usize>,
 ) -> Result<ProcessId> {
     let process = Process::new(
-        username,
-        program_name,
-        input,
+        username.clone(),
+        program_name.clone(),
+        input.clone(),
         client_id,
         capture_outputs,
         result_tx,
@@ -212,8 +212,23 @@ pub fn spawn(
         token_budget,
     );
     let id = process.process_id;
+    let handle_slot = process.handle.clone();
+    let result_tx_for_run = process.result_tx.clone();
 
+    // Register FIRST so the process ID is routable via SERVICES.send
+    // before the wasm task can run any of its synchronous prefix.
     SERVICES.spawn(id, || process)?;
+
+    let run_handle = tokio::spawn(Process::run(
+        id,
+        username,
+        program_name,
+        input,
+        capture_outputs,
+        result_tx_for_run,
+        token_budget,
+    ));
+    *handle_slot.lock().unwrap() = Some(run_handle);
 
     Ok(id)
 }
@@ -335,7 +350,7 @@ struct Process {
     program: ProgramName,
     input: String,
     start_time: Instant,
-    handle: JoinHandle<()>,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     client_id: Option<ClientId>,
     capture_outputs: bool,
     output_buffer: VecDeque<ProcessEvent>,
@@ -361,23 +376,13 @@ impl Process {
         let process_id = Uuid::new_v4();
         let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
 
-        let handle = tokio::spawn(Self::run(
-            process_id,
-            username.clone(),
-            program.clone(),
-            input.clone(),
-            capture_outputs,
-            result_tx.clone(),
-            token_budget,
-        ));
-
         Process {
             process_id,
             username,
             program,
             input,
             start_time: Instant::now(),
-            handle,
+            handle: Arc::new(Mutex::new(None)),
             client_id,
             capture_outputs,
             output_buffer: VecDeque::new(),
@@ -527,7 +532,9 @@ impl Process {
 
     /// Abort the WASM execution task, notify any attached client, and unregister.
     fn terminate(&mut self, result: Result<String, String>) {
-        self.handle.abort();
+        if let Some(h) = self.handle.lock().unwrap().take() {
+            h.abort();
+        }
 
         // Deliver `result` to any parent waiting on the launch handle, if the
         // run loop didn't already send it (e.g., external Terminate fires
