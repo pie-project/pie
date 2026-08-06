@@ -228,10 +228,23 @@ void check_the_routed_ffn_is_bounded_by_what_the_kernels_do() {
                "a routed FFN with no expert width is refused");
     }
     {
+        // CARRIED now, not refused. The router takes its denominator from
+        // `RouterParams::softmax_over_all`, so a config whose weights come
+        // from the softmax over EVERY expert gets that softmax rather than a
+        // refusal -- but the flag has to arrive in the geometry, because one
+        // that silently defaulted to true would renormalize the weights and
+        // scale the routed FFN's contribution back up.
         Facts f = routed();
         f.norm_topk_prob = false;
-        expect(contains(refusal(f), "norm_topk_prob"),
-               "weights normalized over all experts are refused, not approximated");
+        DecodeGeometry g{};
+        std::string err;
+        expect(geometry_from_facts(f, g, &err),
+               "a router that normalizes over all experts is accepted: " + err);
+        expect(!g.norm_topk_prob, "and the flag reaches the geometry");
+
+        DecodeGeometry gn{};
+        expect(geometry_from_facts(routed(), gn, &err) && gn.norm_topk_prob,
+               "while the default stays the renormalized one");
     }
     // A shared expert runs beside the routed bank on every token. It is CARRIED
     // now, not refused -- but it has to arrive in the geometry, because a

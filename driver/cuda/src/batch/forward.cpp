@@ -52,6 +52,15 @@ void ForwardFn::attach_model(model::IModel* m) {
             "graph-safe model must gate every KV write on row_valid");
     }
     graph_safe                   = caps.graph_safe;
+    // Diagnostic escape hatch. A capturing stream forbids the event syncs the
+    // in-engine stage profilers need, so the decode path -- the one that
+    // decides throughput -- is the one path that cannot be measured while it
+    // is captured. Dropping capability, rather than replay, keeps the plan
+    // and the executor consistent with each other. Costs throughput; it is
+    // for measurement, not for serving.
+    if (graph_safe && std::getenv("PIE_CUDA_DISABLE_GRAPH_CAPTURE") != nullptr) {
+        graph_safe = false;
+    }
     graph_padding_kv_write_safe  = caps.graph_padding_kv_write_safe;
     supports_compact_logits      = caps.supports_compact_logits;
     supports_small_prefill_graph = caps.supports_small_prefill_graph;

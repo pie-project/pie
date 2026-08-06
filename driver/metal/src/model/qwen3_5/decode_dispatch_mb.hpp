@@ -313,7 +313,14 @@ inline void qmm_t_dispatch(int out_vec, int N, int bn, int bm, Grid& g, Threadgr
 inline void rms_mb_dispatch(int row_size, int n_rows, int N, Grid& g, Threadgroup& tg) {
     // Rounded up, matching `rms_dispatch`: at N == 1 these two must agree
     // exactly, because a family that uses this one for both is relying on it.
-    const uint32_t t = (uint32_t(row_size) + 3) / 4;  // N_READS = 4
+    //
+    // Capped, because a threadgroup is not allowed to be any size: 1024 is what
+    // Metal permits and `ceil(row_size / 4)` passes it at a hidden of 4100.
+    // Nothing rejected the oversized ask -- the dispatch was simply not made
+    // and the rows came out untouched, which is what Qwen3.6-27B (5120) and
+    // gemma-4-31b (5376) were reading when they answered nonsense. The kernel
+    // strides the row now, so a capped threadgroup still covers all of it.
+    const uint32_t t = std::min<uint32_t>((uint32_t(row_size) + 3) / 4, 1024);  // N_READS = 4
     g  = Grid{t * uint32_t(n_rows) * uint32_t(N), 1, 1};
     tg = Threadgroup{t, 1, 1};
 }

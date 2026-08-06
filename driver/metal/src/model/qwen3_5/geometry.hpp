@@ -39,6 +39,9 @@ struct DecodeGeometry {
     /// a dense and a routed decoder is these, not a different family.
     int n_experts = 0;
     int experts_per_token = 0;
+    /// False routes with weights from the softmax over ALL experts, which sum
+    /// to less than one. See `RouterParams::softmax_over_all`.
+    bool norm_topk_prob = true;
     int moe_intermediate = 0;
     /// The bank is stored in the MXFP4 the checkpoint published rather than
     /// re-quantized to affine U4 at load. It changes what is BOUND -- MXFP4 has

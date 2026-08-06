@@ -15,11 +15,15 @@
 #import <dispatch/dispatch.h>
 
 #include "mtl4_context.hpp"
+#include <set>
+#include <string>
 #include "observability.hpp"
 #include "elastic.hpp"
 
 #include <chrono>
 #include <sys/stat.h>
+#include <mach/mach.h>
+#include <mach/mach_host.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -86,6 +90,13 @@ struct StepState {
     // with a timestamp and reports the shares. It lives in the encoder rather
     // than in a family's encode function so that one implementation covers
     // every model and every kernel.
+    /// The bound pipeline's `maxTotalThreadsPerThreadgroup`, so `dispatch` can
+    /// say when a threadgroup is larger than the pipeline it is about to run
+    /// on. Metal does not refuse such a dispatch -- it does not happen, the
+    /// destination keeps whatever it held, and the wrong numbers travel. One
+    /// model shipped like that for as long as its hidden was over 4096.
+    std::uint32_t pso_max_threads = 0;
+    const char* pso_label = "<unset>";
     void* trace_heap = nullptr;
     std::uint32_t trace_slots = 0;
     std::uint32_t trace_n = 0;
@@ -353,11 +364,17 @@ id<MTL4ArgumentTable> RawMetalContext::Impl::argtable_for(int ordinal, bool crea
     return t;
 }
 
+static inline std::uint32_t grid_threads(Threadgroup tg) {
+    return std::uint32_t(tg.x) * std::uint32_t(tg.y) * std::uint32_t(tg.z);
+}
+
 // ── StepEncoder bridges ───────────────────────────────────────────────────────
 void StepEncoder::set_pso(Pso pso) {
     auto* s = static_cast<StepState*>(impl_);
     id<MTLComputePipelineState> p = (__bridge id<MTLComputePipelineState>)pso.obj;
     [s->en setComputePipelineState:p];
+    s->pso_max_threads = std::uint32_t(p.maxTotalThreadsPerThreadgroup);
+    s->pso_label = p.label != nil ? p.label.UTF8String : "<unlabelled>";
     if (dispatch_trace_every() > 0) {
         s->trace_pso = p.label != nil ? p.label.UTF8String : "<unlabelled>";
     }
@@ -383,6 +400,21 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
     const bool trace = dispatch_trace_every() > 0 && s->trace_heap != nullptr &&
                        2 * (s->trace_n + 1) <= s->trace_slots;
     if (trace) mark_timestamp(s->trace_heap, 2 * s->trace_n, /*precise=*/true);
+    // A threadgroup wider than the pipeline allows is not an error Metal
+    // raises; the dispatch is simply not performed. Say it once per pipeline,
+    // because the alternative is a model that answers nonsense with every
+    // check green -- which is exactly how this went unnoticed.
+    if (const std::uint32_t threads = grid_threads(tg);
+        s->pso_max_threads != 0 && threads > s->pso_max_threads) {
+        static std::set<std::string> said;
+        if (said.insert(s->pso_label).second) {
+            std::fprintf(stderr,
+                         "[pie-metal] dispatch: '%s' asked for %u threads a "
+                         "threadgroup and the pipeline allows %u; this dispatch "
+                         "does not run and its output keeps whatever it held\n",
+                         s->pso_label, threads, s->pso_max_threads);
+        }
+    }
     [s->en dispatchThreads:MTLSizeMake(grid.x, grid.y, grid.z)
         threadsPerThreadgroup:MTLSizeMake(tg.x, tg.y, tg.z)];
     if (trace) {
@@ -453,6 +485,40 @@ size_t RawMetalContext::device_working_set_bytes() {
     }
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     return dev == nil ? 0 : size_t(dev.recommendedMaxWorkingSetSize);
+}
+
+static std::atomic<size_t> g_reclaimable_override{0};
+
+bool RawMetalContext::device_working_set_is_forced() {
+    return g_working_set_override.load(std::memory_order_relaxed) != 0;
+}
+
+void RawMetalContext::set_host_reclaimable_bytes_for_test(size_t bytes) {
+    g_reclaimable_override.store(bytes, std::memory_order_relaxed);
+}
+
+size_t RawMetalContext::host_reclaimable_bytes() {
+    if (const size_t forced = g_reclaimable_override.load(std::memory_order_relaxed);
+        forced != 0) {
+        return forced;
+    }
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return 0;
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm),
+                          &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    // `external_page_count` is the file-backed set and is already a subset of
+    // active+inactive, so counting inactive and external both would double-
+    // count the clean file pages that make up most of a freshly-loaded model's
+    // footprint. Take inactive plus purgeable plus free, and add only the
+    // file-backed pages the kernel has parked as speculative.
+    const uint64_t pages = uint64_t(vm.free_count) + vm.inactive_count +
+                           vm.purgeable_count + vm.speculative_count;
+    return size_t(pages * uint64_t(page));
 }
 
 std::unique_ptr<RawMetalContext> RawMetalContext::create(
