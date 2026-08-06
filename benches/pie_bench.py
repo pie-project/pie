@@ -366,6 +366,12 @@ def build_config(args: argparse.Namespace):
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
+        # Frame geometry, absent unless asked for. `None` is dropped by the
+        # config serializer, so not passing these is exactly the engine's own
+        # default rather than a second spelling of it.
+        "frame_size": args.frame_size,
+        "frame_submit_depth": args.frame_submit_depth,
+        "frame_dispatch_depth": args.frame_dispatch_depth,
     }
     scheduler_parameters = inspect.signature(SchedulerConfig).parameters
     scheduler_kwargs = {
@@ -1318,8 +1324,23 @@ def build_parser() -> argparse.ArgumentParser:
                  "0 disables speculation; 1 is piggyback (default). Forwards "
                  "to scheduler.speculation_depth in the generated toml.",
         )
-        # `choices.values()` can yield the same parser under an alias; the
-        # duplicate add_argument then raises. Guard by option string.
+        # `choices.values()` can yield the same parser under an alias, and
+        # `common.py` registers some of these already; a duplicate
+        # add_argument raises. Guard EACH flag by its own option string --
+        # guarding a block by one member silently drops the rest, which is how
+        # the frame-geometry flags were added and then never appeared.
+        for flag, dest, helptext in (
+            ("--frame-size", "frame_size",
+             "Waves per frame (k). Default: the engine's."),
+            ("--frame-submit-depth", "frame_submit_depth",
+             "Frames a guest keeps submitted. Default: the engine's."),
+            ("--frame-dispatch-depth", "frame_dispatch_depth",
+             "Frames the engine keeps posted to the driver. "
+             "Default: the engine's."),
+        ):
+            if not any(flag in a.option_strings for a in sp._actions):
+                sp.add_argument(flag, dest=dest, type=int, default=None,
+                                help=helptext)
         if not any(
             "--run-ahead-frames" in a.option_strings for a in sp._actions
         ):

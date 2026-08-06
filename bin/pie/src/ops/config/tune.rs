@@ -269,6 +269,9 @@ pub struct TuneReport {
     /// Candidates `--budget` cut. Never silently: the report ranks only what
     /// ran, and says how much did not.
     not_measured: usize,
+    /// Lanes the sweep actually ran. Carried into the report because the
+    /// ranking is only valid near this width -- see `print`.
+    fleet: usize,
 }
 
 #[derive(serde::Serialize, Clone, Copy, PartialEq)]
@@ -309,6 +312,7 @@ pub fn build_report(
     metric: sweep::Metric,
     skipped: usize,
     wrote: bool,
+    fleet: usize,
 ) -> TuneReport {
     let base = rounds.iter().find(|r| r.knobs == *baseline);
     let gain = match (best, base) {
@@ -336,6 +340,7 @@ pub fn build_report(
                 winner: Some(round.knobs) == best.map(|b| b.knobs),
             })
             .collect(),
+        fleet,
         winner: best.map(|b| b.knobs.into()),
         gain_percent: gain,
         wrote,
@@ -444,6 +449,24 @@ impl crate::ui::Report for TuneReport {
         println!();
         println!("  Not searched: kv_page_size, max_forward_tokens and max_forward_requests are");
         println!("  fixed at boot, and belong to stage 1 above rather than to this sweep.");
+        // The width caveat, printed whether or not a winner was found, because
+        // it bounds the answer either way.
+        //
+        // Measured, and the reason this line exists: at the throughput
+        // objective's own default of 64 lanes this sweep ranked
+        // `k=3 submit=4 dispatch=1` 18.5% above the current config. The same
+        // knobs at 256 lanes came back level (15,209 vs 15,338) with a 36.8%
+        // spread, and on the real bench shapes at 256-way concurrency they
+        // were 12.8% and 16.4% SLOWER. A shallow dispatch queue wins where
+        // there is little to overlap and loses where there is a lot; 64 lanes
+        // cannot see that, and `--write` would have applied it.
+        println!();
+        println!(
+            "  Measured at {} lanes. A geometry that wins at one fleet width can lose at",
+            self.fleet
+        );
+        println!("  another -- shallower dispatch wins where there is little to overlap and");
+        println!("  loses where there is a lot. Sweep at the width you serve (`--fleet`).");
     }
 }
 
@@ -730,7 +753,13 @@ pub async fn run(global: &startup::GlobalArgs, args: TuneArgs) -> Result<crate::
     }
 
     Ok(crate::ui::Answer::report(build_report(
-        &rounds, &baseline, best, metric, skipped, wrote,
+        &rounds,
+        &baseline,
+        best,
+        metric,
+        skipped,
+        wrote,
+        workload.fleet,
     )))
 }
 
