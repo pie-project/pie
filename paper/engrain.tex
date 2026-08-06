@@ -60,12 +60,21 @@ against XGrammar's 1{,}743--3{,}382 and llguidance's 769--797, adds
 90\,\textmu{}s to an overlapped decode step where a host matcher adds 398, and
 holds its p99 flat when the host loses cores to other work while the host
 matcher's p99 rises 7.8$\times$. Masks are bit-exact against a reference
-matcher over 7{,}289 verified rows. We also report where residency is paid for,
-including where it loses: at batch 1 we are 0.4--0.7$\times$, on one of three
-schemas llguidance is 4.8$\times$ cheaper than us at batch 512, our compiler is
-112$\times$ slower than llguidance's at the median, and our lowering accepts
-documents its schema rejects 19.6\% of the time --- an audit that located and
-fixed a silent \texttt{required}-dropping defect along the way.
+matcher over 7{,}289 verified rows. Because no two engines lower a schema to
+the same language --- of 200 corpus schemas, \emph{zero} agree with XGrammar
+token for token --- we construct the common ground: 468 real schemas rewritten
+into the fragment engrain enforces exactly, membership verified by generating
+10{,}177 documents under their masks and validating every one. On it XGrammar
+has two settings and neither is both sound and complete: its default refuses
+91.7\% of valid documents whose object keys are permuted, and its order-free
+setting does not enforce \texttt{required} at all, admitting invalid documents
+26.3\% of the time. We do both, and end to end against the order-free setting we
+are 1.72$\times$ faster while producing 49\% more valid documents. We also
+report where residency is paid for: at batch 1 a host matcher serves a request
+in 0.255\,s against our 0.469, our cold path to a new schema's first mask is
+236\,ms against 17, and on an 8B model the speed difference vanishes entirely
+--- their fill hides behind a longer forward pass and ours cannot --- leaving
+only the correctness gap.
 \end{abstract}
 ]
 
@@ -143,11 +152,16 @@ single-kernel fusion is 14$\times$ slower on the batch shape serving actually
 produces (\S\ref{sec:fill}). (iii) A cross-step memo that answers 86--100\% of
 steps from a previously computed row (\S\ref{sec:memo}). (iv) Fused
 constrained sampling, with an honest account of why its win does not survive a
-ragged batch (\S\ref{sec:sampling}). (v) An evaluation against three engines
-that reports the costs of residency --- compile time, memory, small-batch
-latency, and a schema on which a baseline beats us 4.8$\times$ --- as
-first-class results, and whose correctness audit located and fixed a soundness
-defect in our own compiler (\S\ref{sec:correctness}).
+ragged batch (\S\ref{sec:sampling}). (v) A comparison methodology for
+constrained decoders, since none of them lower a schema to the same language:
+construct the fragment on which an engine is exact, verify membership by
+generating and validating rather than by asserting, and compare there --- which
+turns ``which is faster'' into a question with an answer, and located
+correctness defects in both engines, including four in our own
+(\S\ref{sec:correctness}). (vi) An evaluation that reports the costs of
+residency --- the cold path, memory, small-batch latency, and the model size at
+which our throughput advantage disappears --- as first-class results
+(\S\ref{sec:eval-e2e},~\S\ref{sec:costs}).
 
 \section{Background and Motivation}
 \label{sec:background}
@@ -428,7 +442,24 @@ both are valid. Since engrain is order-free by construction, that comparison
 was against a strictly weaker configuration. XGrammar has an
 \texttt{any\_order} flag; enabling it accepts both orders and, on 60 corpus
 schemas, \emph{also compiles faster} --- 0.81\,s against 4.89\,s. It is
-strictly its better setting and all XGrammar numbers in this paper use it.
+strictly its better setting and all XGrammar microbenchmarks in this paper use
+it.
+
+It is also, we later found, not a setting anyone deploying gets:
+\texttt{any\_order} is not exposed by vLLM, so a served request always uses the
+ordered lowering. That matters more than a fairness correction, because the two
+settings differ in \emph{which documents they accept} and in opposite
+directions --- \S\ref{sec:correctness} measures both, and the end-to-end runs
+of \S\ref{sec:eval-e2e} report the default and the matched configuration side
+by side, the latter through a one-line patch to vLLM that exposes the flag.
+
+\paragraph{The corpus.} Latency runs use JSONSchemaBench directly. Every
+correctness and end-to-end result uses the constructed fragment of
+\S\ref{sec:correctness}: 468 of the 533 schemas, rewritten so that engrain
+enforces them with nothing left over, and filtered to those XGrammar also
+compiles. It is favourable to us by construction and we say so wherever it is
+used; the alternative --- comparing two engines on schemas they lower to
+different languages --- is not a comparison of engines at all.
 
 \paragraph{The same question, asked of the others.} outlines\_core cannot be
 configured out of this: its lowering emits the literal regex
@@ -655,6 +686,116 @@ absolute cost is 36--45\,ms, but the honest statement is that pool-wide ceilings
 largest member and every sequence pays for it. This is the clearest target for
 future work.
 
+\subsection{End to end, and what a fair comparison requires}
+\label{sec:eval-e2e}
+
+Microbenchmarks of a mask do not settle a serving question, so we run both
+engines inside vLLM on the fragment of \S\ref{sec:correctness}, where neither
+is allowed to be wrong. Three methodological corrections were needed first, and
+each of them moved a number we had already reported.
+
+\paragraph{Quote the makespan, not tokens per second.}
+$\text{tok/s} = \text{tokens}/\text{makespan}$, so an engine whose requests run
+longer generates more tokens \emph{and} keeps the batch fuller, and a fuller
+batch spreads the per-step fixed cost over more rows. Ours run longer: 321 of
+512 reach the token cap against XGrammar's 223. The inflation is exactly the
+gap in tokens generated---17.7\% more tokens, and a tokens-per-second ratio
+17\% better than the makespan ratio. Capping generation short enough that both
+engines are nearly all capped collapses the work gap to 2.5\% and the two
+metrics agree to within 3\%. Both arms serve the same 512 requests, so how long
+that takes needs no normalising, and it is what we report.
+
+\paragraph{Thread the baseline where the server threads it.} vLLM fills
+XGrammar's rows on a thread pool only above 128 structured requests in a step,
+in chunks of sixteen. Threading it at every batch---which our harness did---is
+wrong in both directions: at batch 32 the pool costs more than the work, and at
+128 it makes XGrammar look faster than vLLM runs it.
+
+\paragraph{Match the semantics.} Since \texttt{any\_order} is not exposed, we
+patched vLLM to expose it. The default column below is what a user gets today;
+the matched column is the comparison of two engines on one language.
+
+\begin{table}[t]
+\caption{vLLM, Qwen3-0.6B, batch 512, 409 distinct schemas, 96-token cap.
+Makespan is the time to serve all 512 requests. Source: \texttt{rigor.e2e}.}
+\label{tab:e2e}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{lrrr}
+\toprule
+ & makespan & tokens & valid \\
+\midrule
+unconstrained & 1.66\,s & 49{,}145 & 0/512 \\
+\textbf{engrain} & \textbf{3.30\,s} & 37{,}488 & \textbf{200/512} \\
+XGrammar, ordered & 6.08\,s & 31{,}859 & 290/512 \\
+XGrammar, unordered & 5.68\,s & 38{,}453 & 134/512 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+Against the matched configuration we are \textbf{1.72$\times$ faster and
+produce 49\% more valid documents} (Table~\ref{tab:e2e}). The 290 in the
+default row is not greater correctness; it is the narrowing---forcing the
+declared order makes a document finish sooner and land inside the cap, and it
+is the same constraint that refuses 91.7\% of permuted valid documents.
+
+\paragraph{Where the crossover is.} With vLLM's own threading rule, the mask
+crossover is batch \textbf{$\approx$30}: at batch 8 XGrammar is 2.8$\times$
+cheaper, at 32 the two are level, at 128 we are 3.3$\times$ cheaper and at 512
+5.1$\times$. End to end the crossover sits between 32 and 128, and at batch 1
+XGrammar serves a request in 0.255\,s against our 0.469. Below a few dozen
+concurrent requests a host matcher is simply cheaper than a kernel launch, and
+nothing in this design changes that.
+
+\paragraph{Schema diversity helps us, which we did not expect.} Our fill
+deduplicates rows sharing a grammar \emph{and} a parse state, and a host
+matcher's per-row call is schema-agnostic, so a batch drawing on many schemas
+should close the gap. It widens it: 1.28$\times$ at one schema, 1.40$\times$ at
+64, 1.85$\times$ at 409. Going from one schema to 409 costs us 24\% of our
+makespan and costs them 79\% of theirs; row deduplication is worth less to us
+than their per-schema cache is to them. The case we assumed was our weakest is
+the one we win by most, and it is the realistic one.
+
+\paragraph{The mechanism, and the boundary of the result.} Varying the model
+size decomposes the whole comparison. With semantics matched at batch 512, the
+grammar's cost per generated token is:
+
+\begin{center}
+\begin{small}
+\begin{tabular}{lrr}
+\toprule
+ & engrain & XGrammar \\
+\midrule
+Qwen3-0.6B & \textbf{0.054\,ms} & 0.114\,ms \\
+Qwen3-8B & 0.064\,ms & 0.064\,ms \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+
+Ours is nearly constant across model sizes. \textbf{Theirs halves.} Their fill
+runs on the CPU and vLLM overlaps it with the forward pass: a 0.6B decode step
+is too short to hide it, an 8B step is long enough to hide most of it. Ours
+runs on the same device as the model and cannot be hidden---only made small. At
+8B the speed difference is gone (7.04\,s against 6.86\,s) and only the
+correctness difference remains (192 valid against 134).
+
+This is the honest boundary of the throughput claim, and it also says what
+residency is \emph{for}. A device-resident parser wins on speed when the model
+is cheap relative to the mask and the batch is over a few dozen; it wins on
+correctness, on capture, on fused sampling and on speculative decoding
+regardless, because those are not latency properties.
+
+Vocabulary size moves the crossover the same way: with opt-125m's 50{,}272
+tokens the mask does not cross until about batch 128, where Qwen3's 151{,}669
+crosses at 30, because XGrammar's per-row cost scales with the vocabulary and
+ours is launch-bound at small batch. At batch 512 it reverses and we win most
+on the smallest vocabulary, 7.1$\times$.
+
 \subsection{Speculative decoding}
 \label{sec:eval-spec}
 
@@ -805,31 +946,54 @@ what continuous batching does every step. 99 unit tests also run under all
 three backends, and the \texttt{differential} backend compares the CUDA and
 Triton implementations on every call.
 
-\paragraph{Lowering fidelity, and a metric that was measuring the wrong thing.}
-The aggregate we had been reporting --- ``56.0\% of documents generated under
-our mask validate, against XGrammar's 77.6\%'' --- turns out to conflate two
-unrelated quantities, because a random walk that runs out of byte budget
-produces truncated JSON and was counted as a failure. Decomposing it
-(Table~\ref{tab:soundness}) separates \emph{completion} (did the walk finish a
-document) from \emph{over-acceptance} (given a complete document, does the
-schema accept it). Only the second is a property of the engine.
+\paragraph{Lowering fidelity needs common ground, and there is none.}
+The second property cannot be measured by comparing two engines on arbitrary
+schemas, because they do not lower them to the same language. We looked for a
+schema on which engrain and XGrammar agree token for token: there is none. Of
+200 corpus schemas, and of 64 written specifically to be simple enough,
+\textbf{zero} agree in any whitespace configuration. The differences are not
+subtle---we admit a carriage return, which RFC 8259 says is whitespace and
+their \texttt{any\_whitespace} omits; they admit whitespace after the document
+where we do not.
+
+So we construct the common ground instead. \texttt{rigor.fragment} rewrites
+each of the 533 JSONSchemaBench schemas by applying the remedies our own
+compiler reports---close the objects, move a keyword inside the branches it
+constrains, delete what no level lowers---and keeps it only if the result lands
+inside the fragment engrain enforces with nothing left over. Membership is
+\emph{measured}: the schema is compiled, its relaxation list must be empty, and
+then twenty documents are generated under its mask and handed to a validator.
+468 schemas survive; 10{,}177 further walks under independent seeds produce
+\textbf{zero} invalid documents.
+
+Five schemas pass the first test and fail the second---a \verb|$ref| beside an
+\texttt{allOf} beside a \texttt{oneOf} reaches a relaxation nobody modelled.
+Predicting those means re-implementing the front end inside the reporter, which
+is the duplicate model that put the bug there in the first place. Generating
+documents and reading them does not.
+
+\paragraph{On that fragment, XGrammar has two settings and neither is both.}
+Table~\ref{tab:soundness} is the head-to-head. \emph{Over-acceptance} generates
+under each mask and validates the result; \emph{under-acceptance} takes the
+corpus's own documents, permutes their object keys, keeps the permutations the
+schema still accepts, and asks whether the mask admits them.
 
 \begin{table}[t]
-\caption{Random-walk generation under each engine's mask on the 194 schemas
-both engines compile, same seed, same 400-byte budget. ``Before'' and ``after''
-are the compiler defect described below. Source:
-\texttt{exp\_soundness\_split}.}
+\caption{Correctness on the fragment engrain enforces exactly. Over-acceptance
+is documents generated under the mask that the schema rejects; under-acceptance
+is valid documents, with their object keys permuted, that the mask refuses.
+Source: \texttt{rigor.fragment}, \texttt{rigor.soundness}.}
 \label{tab:soundness}
 \vskip 0.1in
 \begin{center}
 \begin{small}
-\begin{tabular}{lrrr}
+\begin{tabular}{lrr}
 \toprule
- & completion & valid $|$ complete & aggregate \\
+ & over-accepts & rejects a valid doc. \\
 \midrule
-engrain, before & 52.5\% & 70.0\% & 36.7\% \\
-engrain, after  & 50.5\% & \textbf{80.4\%} & 40.6\% \\
-XGrammar        & 63.7\% & 94.6\% & 60.2\% \\
+\textbf{engrain} & \textbf{0.0\%} (0/2{,}115) & \textbf{0.0\%} (0/420) \\
+XGrammar, ordered & 6.0\% (153/2{,}551) & \textbf{91.7\%} (385/420) \\
+XGrammar, unordered & \textbf{26.3\%} (646/2{,}452) & 0.7\% \\
 \bottomrule
 \end{tabular}
 \end{small}
@@ -837,68 +1001,105 @@ XGrammar        & 63.7\% & 94.6\% & 60.2\% \\
 \vskip -0.1in
 \end{table}
 
-\paragraph{Attributing the gap to a keyword found a bug.} Recording which JSON
-Schema keyword rejected each over-accepted document showed the failure was not
-diffuse: \textbf{219 of 243} over-acceptances were the single keyword
-\texttt{required}, against 8 for XGrammar. That concentration is what made the
-cause findable. It was not the precision level --- forcing the most faithful
-lowering moved 181 of 194 schemas from \texttt{Shadowed} to \texttt{Exact},
-cost 4$\times$ compile time and 2$\times$ tables, and left validity
-\emph{unchanged} at 70.0\%, which ruled out the hypothesis we started with.
+XGrammar's \texttt{any\_order} flag is not exposed by vLLM, so every deployed
+comparison runs its \emph{ordered} lowering, in which an object's properties
+must arrive in the order the schema declares. That is narrower than JSON
+Schema: a valid document whose keys are permuted is refused nine times in ten.
+The unordered lowering is the one that means what the schema means, and there
+\texttt{required} is not enforced at all---485 of its 646 failures are a
+missing required property.
 
-The cause was the order-free object construction. To let properties arrive in
-any order while enforcing \texttt{required}, the compiler enumerates subsets of
-the required set, one rule per subset. At the \emph{full} subset the rule
-picking the next property has no alternatives when the names are also closed
-(\texttt{additionalProperties: false}), and the code treated ``no property may
-follow'' as a construction failure, falling back to an object that does not
-enforce \texttt{required} at all. It is not a failure; it means the object must
-close. Minimally, one declared property, required, with
-\texttt{additional\-Properties: false} accepted \texttt{\{\}}; with two
-properties it did not, which is why no unit test caught it.
+Enforcing \texttt{required} on an unordered object is exactly what the subset
+construction of \S\ref{sec:automaton} is for, and it is what neither of their
+settings does. This is the paper's central correctness claim and it is not a
+matter of degree: there is no XGrammar configuration that is simultaneously
+sound and complete on this corpus, and engrain is both.
 
-Fixing it removes 78 of the 243 over-acceptances, eliminates the
-\texttt{oneOf} failures entirely, and moves validity from 70.0\% to 80.4\%
-(Table~\ref{tab:soundness}). We report the before and after because the
-methodology --- attribute, minimize, fix, re-measure --- is the contribution
-here, not the number.
+\paragraph{The residual 6\% is one bug, and we had it too.} 148 of XGrammar's
+153 ordered-mode failures are not schema violations at all---they are documents
+\texttt{json.loads} refuses, because a pattern's \verb|.| matched a raw control
+character. A regex has no idea it is being read inside a JSON string, and
+RFC 8259 requires the quotation mark, the reverse solidus and U+0000--U+001F to
+be escaped. Constructing this corpus found the same bug in \emph{our} front end
+the same morning; we fixed it by rewriting a pattern's character classes so
+they can only match string content, keeping the forbidden characters by
+spelling them the way JSON spells them---dropping them would narrow, which the
+contract forbids. It is isolated: on a plain \verb|{"type":"string"}| both
+engines correctly refuse a raw tab; inside \verb|pattern| only engrain does.
 
-\paragraph{What remains, and the honesty defect behind it.} 141
-\texttt{required} failures remain, and they have a different cause: the subset
-enumeration costs $2^{n}$ rules, so it is bounded at 4 required properties when
-the property names are open and 6 when they are closed. Past that the object
-widens. That is a defensible budget --- the alternative, fixing the property
-order as XGrammar does, rejects valid permutations, which this system's
-contract forbids --- but it was being applied \emph{silently}: 33 of the 34
-corpus schemas whose \texttt{required} was dropped reported no approximation at
-all, because the approximation list was derived from the precision level rather
-than from what the lowering did. The engine now reports it in every case, which
-takes the silent count to zero. We consider a constrained decoder that relaxes
-a schema without saying so to be the more serious of the two defects, and we
-suspect the distinction between coverage, exactness, and \emph{declared}
-exactness is under-reported across this literature.
+\paragraph{The differences are in the front end, not the parser.} On grammars
+that do not go through a schema, the two engines are equivalent.
+\texttt{rigor.nonjson} runs 26 regexes and 12 EBNF grammars---from dates,
+UUIDs and HTTP request lines to self-recursion, 64 levels of nesting, a
+left-recursive list, $a^n b^n$, an ambiguity past one token of lookahead, and a
+512-way alternation. A regex has a referee neither engine wrote:
+\texttt{re.fullmatch} adjudicates over-acceptance, a set of matching strings
+adjudicates under-acceptance, and each engine's generated strings are handed to
+the other. Both compile 38 of 38; both over-accept nothing; both admit every
+positive case and refuse every negative one; neither refuses anything the other
+generates.
+
+One difference survives, and it is at the byte level: on
+\verb|[\u0100-\u2000]+| XGrammar admits \verb|\xe0\x84\x81|, which is U+0101
+spelled in three bytes where two suffice. RFC 3629 forbids an overlong encoding
+and it is the classic way past a filter that inspects the decoded string.
+Truncated sequences, lone continuations, surrogates and bad tails are refused
+by both.
+
+We therefore attribute the \texttt{required} and ordering results above to
+\emph{how a schema is lowered}, not to the parsing machinery---which is the
+useful form of the claim, because a front end can be fixed and an automaton
+class cannot.
+
+\paragraph{Declared exactness.} A relaxation the caller is not told about is
+worse than one they are. Every grammar now reports what it does not enforce, as
+a record naming the keyword, a JSON pointer to the place, what the mask admits,
+and the edit that would enforce it. The list is validated the same way as
+everything else: over 200 corpus schemas and 2{,}003 walks, \textbf{100\%} of
+over-accepted documents are attributable to an entry in it. Reaching 100\%
+required three fixes---\texttt{anyOf} declared unconditionally, keywords driven
+from the specification's vocabulary rather than from cases we remembered, and
+\texttt{allOf} reported on the object it merges to rather than branch by
+branch---and the last of those was a schema that reported \emph{nothing}
+relaxed while admitting a document missing nine required names.
 
 \subsection{The costs of residency}
 \label{sec:costs}
 
-Residency is not free, and the honest accounting is the following three
-results. All are measured over 528 distinct JSONSchemaBench schemas.
+Residency is not free, and the honest accounting is the following.
+
+\paragraph{Memory, and a number that was wrong.} Our own accounting undercounted
+what the arena holds: it omitted the readings and the verdict table and charged
+a flat 20 bytes for a group, reporting 2.9\,MB a schema against a real 7.5. A
+budget denominated in less than the truth is not a budget---a 1\,GiB one was
+holding what a 2.6\,GiB one had been asked for, and the eviction that followed
+looked like a mystery. Counted from the arrays actually uploaded, and checked
+against them to 100.0\%, 409 fragment schemas cost 4.0\,GiB.
+
+Two changes bring that down by 2.05$\times$ (Table~\ref{tab:costs}). Every
+grammar in a pool is compiled against one tokenizer, so a block two of them
+hold is the same words twice; both large stores are content-addressed now, with
+absolute offsets and refcounted blocks. A group's list of ways to read its
+tokens is the same list in state after state---4.8$\times$ within one grammar,
+6.9$\times$ across a pool. And the verdict table, which says whether a
+(lexer state, parser state) pair admits a group without replaying the group's
+readings, is a shortcut the kernel does not need: dropping it costs 5.9\% of
+the mask and a quarter of the arena.
 
 \begin{table}[t]
-\caption{Resident table memory over 528 JSONSchemaBench schemas.
-Source: \texttt{engrain\_lab.rigor.cost}, 2026-07-30.}
+\caption{Arena for 150 fragment schemas, Qwen3-0.6B, 151{,}669 tokens.
+Source: \texttt{engrain\_lab.rigor.cost} and a live pool.}
 \label{tab:costs}
 \vskip 0.1in
 \begin{center}
 \begin{small}
-\begin{tabular}{lrrr}
+\begin{tabular}{lrr}
 \toprule
- & engrain & XGrammar & ratio \\
+ & arena & mask, batch 512 \\
 \midrule
-tables p50       & 1.41\,MiB & 52\,KiB & 27$\times$ worse \\
-tables p99       & 37.5\,MiB & ---     & 700$\times$ worse \\
-tables max       & 97.6\,MiB & ---     & \\
-\midrule
+as measured & 1{,}406.6\,MiB & 1{,}894\,\textmu{}s \\
+blocks shared & 867.1\,MiB & 1{,}894\,\textmu{}s \\
+\quad + verdicts dropped & \textbf{659.8\,MiB} & 2{,}005\,\textmu{}s \\
 \bottomrule
 \end{tabular}
 \end{small}
@@ -906,24 +1107,40 @@ tables max       & 97.6\,MiB & ---     & \\
 \vskip -0.1in
 \end{table}
 
-\textbf{Compile time} (\S\ref{sec:eval-coverage}) is \emph{linear} in the
-number of lexer states (slope 1.05, $r=0.94$): there is no algorithmic blow-up,
-only the inherent $O(|V| \times \text{lexer states})$ cost of computing what
-every token does from every lexer state. In serving, schemas arrive with
-requests, so this is a stated failure and not a footnote.
+\paragraph{It is the same bytes, in a worse place.} Measured on the same 409
+schemas, our arena is 1{,}965\,MiB of device memory and XGrammar's is
+2{,}010\,MiB of host RSS, plus 29\,MiB once every grammar has filled one mask
+and their cache has warmed. Almost identical. What differs is where they sit:
+ours competes with the KV cache. The statement is ``we pay in VRAM'', not ``we
+use an order of magnitude more'', and we had the latter as an estimate before
+we measured it.
 
-\textbf{Memory.} 1.41\,MiB at the median against a 52\,KiB compiler cache. We
-looked for structural sharing and did not find much: whole-array sharing across
-schemas gives 1.0$\times$ (nothing is byte-equal), group sets are already
-interned, and interning reading lists saves 12\%. The one lever with the right
-shape is building a lexer state's reading tables \emph{on demand}, the first
-time a parse reaches that state, since a real document visits only 1--4\% of the
-states its grammar can reach. That would address compile time and memory with
-one mechanism, and it is the main piece of future work.
+\paragraph{The distribution is the remaining lever.} Per-schema table size over
+200 fragment schemas is p50 3.66\,MiB, p90 25.19, p99 85.62, max 286.6: the top
+tenth of schemas holds \emph{half} the arena. A budget that refuses, degrades
+or pages those is worth more than another constant factor on the median, and
+\texttt{footprint()} already predicts the size before it is paid.
 
-\textbf{Exactness of what.} We report bit-exactness against \emph{our compiled
-grammar}, which is weaker and more precise than bit-exactness against the
-schema; \S\ref{sec:correctness} measures the difference. We believe every
+\paragraph{The cold path is our worst number.} From a schema nobody has seen to
+its first usable mask: 236.5\,ms at the median against XGrammar's 17.3, of
+which 98\,ms is the compiler and the rest is preparing and admitting the
+tables. In serving, schemas arrive with requests, so this is a stated failure
+rather than a footnote. Their tail is worse than ours by more than ours is
+worse at the median---p99 4.2\,s against 8.7, and worst case 11.7\,s against
+54.3---but a median a request waits on is the number that matters.
+
+\paragraph{Compile time} is \emph{linear} in the number of lexer states (slope
+1.05, $r=0.94$): there is no algorithmic blow-up, only the inherent
+$O(|V| \times \text{lexer states})$ cost of computing what every token does
+from every lexer state. The one lever with the right shape is building a lexer
+state's tables \emph{on demand}, the first time a parse reaches that state: a
+real document enters 4.3\% of the states its grammar can reach and touches
+23.4\% of the token sets. That would address compile time and memory with one
+mechanism, and it is the main piece of future work.
+
+\paragraph{Exactness of what.} We report bit-exactness against \emph{our
+compiled grammar}, which is weaker and more precise than bit-exactness against
+the schema; \S\ref{sec:correctness} measures the difference. We believe every
 system in this space owes that distinction.
 
 \section{Limitations}
@@ -933,21 +1150,28 @@ Stated as results, because the structural claim survives them and a reader
 deciding whether to deploy needs them. \textbf{Batch 1 is a loss} against both
 baselines: our floor is set by sweeping live configurations, not by the batch.
 \textbf{llguidance beats us 4.8$\times$ on one of three schemas} at batch 512,
-and its cost is flat in the grammar where ours is not. \textbf{Compile is
-112$\times$ slower than llguidance} at the median and 35$\times$ slower than
-XGrammar, with an unattributed half-hour outlier; lazy lexer residency is the
-plausible fix and is unimplemented. \textbf{Tables are 27--700$\times$ larger}
-than a host matcher's cache. \textbf{We over-accept 19.6\% of complete
-documents} against XGrammar's 5.4\%, and 141 of the 153 remaining cases are
-\texttt{required} dropped past the subset budget. \textbf{Fused sampling is
+and its cost is flat in the grammar where ours is not. \textbf{The cold path is 236\,ms} from a schema
+nobody has seen to its first usable mask, against XGrammar's 17 and
+llguidance's near-zero; schemas arrive with requests, so this is the number a
+first request waits on. Lazy lexer residency is the plausible fix and is
+unimplemented. \textbf{Our arena is the same size as XGrammar's host cache} --- 1{,}965\,MiB
+against 2{,}010 over 409 schemas --- but it sits in device memory and competes
+with the KV cache, and a tenth of the schemas hold half of it.
+\textbf{Our throughput advantage is a function of how cheap the model is}: at
+Qwen3-8B the grammar costs both engines 0.064\,ms per token and the speed
+difference disappears, because a host fill hides behind a long forward pass and
+a device fill cannot. \textbf{The corpus we measure correctness on is
+favourable by construction} --- it is the fragment where \emph{we} are exact
+--- though the under-acceptance result is not, since it permutes the baseline's
+own documents. \textbf{Fused sampling is
 1.05$\times$ on a ragged batch}, not the 7.7$\times$ a homogeneous one
 suggests. \textbf{Heterogeneous pools of 8--16 schemas cost us
 33--36$\times$} what those schemas cost alone. \textbf{The memo and graph
 capture pay only below batch 32.} \textbf{One GPU}: every launch shape, memo
-size and chunk count was fitted on an A100. \textbf{No end-to-end throughput
-claim}: grammar work is a few percent of a decode step and a vLLM A/B at batch
-256 ranged from 4{,}523 to 13{,}325 tokens per second across runs, which is too
-noisy to attribute.
+size and chunk count was fitted on an A100. \textbf{Untested}: staggered
+arrivals under continuous batching --- every end-to-end run here submits the
+whole batch at once --- tensor parallelism, prefill-heavy workloads, and a
+vocabulary above 200{,}000 tokens.
 
 \section{Related Work}
 \label{sec:related}
@@ -1001,10 +1225,18 @@ capturable, fusable with the sampler, and advanceable through a speculative
 draft without a host round trip. It adds 90\,\textmu{}s to an overlapped step
 where a host matcher adds 398, holds its tail flat under CPU contention where a
 host matcher's p99 rises 7.8$\times$, and is bit-exact over 7{,}289 verified
-rows. It also compiles 112$\times$ slower than llguidance, holds 27$\times$ more
-memory, loses below batch 32, and loses 4.8$\times$ on one schema of three. We
-believe the structural claim is worth those prices, and we have tried to report
-them precisely enough that a reader can disagree.
+rows.
+
+It is also the only engine here that is both sound and complete on the fragment
+we could construct common ground on, which took building that fragment and
+verifying it by generation rather than by argument --- a methodology we think
+this literature needs, since it found four defects in our own front end and two
+in the baseline's. And it costs: 236\,ms before a new schema's first mask
+against 17, a loss below a few dozen concurrent requests, an arena in device
+memory rather than host, and, on an 8B model, no throughput advantage at all
+once the baseline's fill hides behind the forward pass. We believe the
+structural claim is worth those prices, and we have tried to report them
+precisely enough that a reader can disagree.
 
 \bibliography{references}
 \bibliographystyle{mlsys2025}
