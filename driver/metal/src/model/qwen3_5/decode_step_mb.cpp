@@ -791,8 +791,15 @@ void encode_prefill_dags_mb(StepEncoder& se,
                     Grid grid = d.grid;
                     // prep is (dk, 1, rows*heads); the recurrent kernel keeps
                     // its (dk, dv, heads) grid and walks the rows internally.
-                    if (d.kind == Kernel::GdnPrepSlotted)
+                    if (d.kind == Kernel::GdnPrepSlotted) {
                         grid.z = d.grid.z * uint32_t(seg.rows);
+                    } else {
+                        // The scan puts two dv rows in one simdgroup so its two
+                        // per-token reductions run 16 lanes wide instead of 32.
+                        // Its x extent therefore covers two rows, not one; an
+                        // odd Dv rounds up and the kernel masks the spare row.
+                        grid.y = (grid.y + 1) / 2;
+                    }
                     se.set_argtable(d.kind, d.ordinal);
                     se.dispatch(grid, d.tg);
                     for (int r = 0; r < seg.rows; ++r)
