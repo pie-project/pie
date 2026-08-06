@@ -208,11 +208,27 @@ struct DeviceTuning {
     /// Rows an expert's run must hold before the mixture sorts and batches at
     /// all, rather than running the routed projections as matvecs.
     ///
-    /// M1 Max: 8, i.e. half the narrow tile. Below it the sort's padding costs
-    /// more than the weight re-reads it saves -- a decode routing eight pairs
-    /// over a hundred and twenty-eight experts would make every tile one live
-    /// row in sixteen. Moves with the same thing `qmm_min_batch` does.
-    int moe_batch_min_per_expert = 8;
+    /// M1 Max: 4, a QUARTER of the narrow tile. It was 8 -- half the tile --
+    /// on the model that the padding is wasted work and the break-even is
+    /// where a run half fills a tile. Measured, that model is wrong in the
+    /// direction that matters: a 4-bit mixture is bandwidth-bound, and what
+    /// batching buys is reading each expert's slice ONCE instead of once per
+    /// pair, which is worth far more than the arithmetic a half-empty tile
+    /// throws away. 128-token prefill, tok/s:
+    ///
+    ///                        min_per=8   4      2      1
+    ///     Qwen3.6-35B-A3B      220.8   275.1  275.0  265.3
+    ///     gemma-4-26b-a4b      396.3   397.9    --     --
+    ///     gpt-oss-20b          405.6   405.3    --     --
+    ///
+    /// The 35B is the row that moves because it is the widest routing here --
+    /// 256 experts at top-8, so 128 rows is four rows an expert and 8 declined
+    /// to batch at all. The other two were already batching at 8 and are
+    /// unchanged. Below 4 the padding does start to cost.
+    ///
+    /// A DECODE still never batches: one row is `experts_per_token` pairs, and
+    /// 8 pairs over 128 experts is nowhere near 4 rows an expert.
+    int moe_batch_min_per_expert = 4;
 };
 
 /// The platform query. `device_tuning_apple.mm` on Apple, a stub in

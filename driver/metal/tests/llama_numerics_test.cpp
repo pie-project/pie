@@ -46,6 +46,7 @@
 #include "model/llama/decode_consts.hpp"
 #include "model/llama/decode_step.hpp"
 #include "model/llama/encode.hpp"
+#include "device_tuning.hpp"
 #include "model/llama/geometry.hpp"
 #include "model/llama/kernels.hpp"
 #include "model/llama/scratch.hpp"
@@ -1701,23 +1702,26 @@ int main() {
     run_case("qwen3-moe (routed, 16 rows: GEMM for the dense projections)", moe, *ctx,
              kernels_dir, 0.12f, /*rows=*/16, /*paged=*/true);
 
-    // The batched mixture itself. Every routed case above stays on the matvec
-    // because `moe_should_batch` wants an expert's run to half fill a tile --
-    // eight experts and a tile of sixteen means sixty-four pairs, which two
-    // slots a token does not reach until thirty-two rows. At forty-eight the
-    // sort pads, the three routed projections become `affine_qmm_t_routed`, and
-    // this is the ONLY case that runs them.
+    // The batched mixture itself. `moe_should_batch` wants an expert's run to
+    // hold `moe_batch_min_per_expert` rows, which for eight experts at two
+    // slots a token is `8 * min_per / 2` rows -- sixteen at the measured four.
+    // At forty-eight the sort pads, the three routed projections become
+    // `affine_qmm_t_routed`, and this is the ONLY case that runs them.
     //
-    // Stated as an expectation rather than assumed, because the threshold is
-    // arithmetic on the geometry and a change to either side of it would
-    // silently move this case back onto the path the other five already cover.
+    // Stated as an expectation rather than assumed, because the threshold is a
+    // TUNING answer and a change to either side of it would silently move this
+    // case onto the path the other five already cover -- which is what happened
+    // when `min_per` went from eight to four: sixteen rows crossed over, and
+    // this line is why that was visible rather than discovered later.
     //
-    // What is pinned is the PATH, not the width: `moe_tile_rows` returns 1 for
-    // the matvec and a tile for the batched form, and which tile is a tuning
-    // answer that moves with the measurements behind it.
-    expect(llama_moe_tile_rows(moe, 48) > 1,
-           "48 routed rows take the batched path");
-    expect(llama_moe_tile_rows(moe, 16) == 1, "16 routed rows do not");
+    // What is pinned is that both paths are still reached, not where the line
+    // between them sits: the row counts here are read off the current
+    // threshold rather than being constants of their own.
+    const int min_per = pie::metal::moe_batch_min_per_expert();
+    const int batches_at = moe.n_experts * min_per / moe.experts_per_token;
+    expect(llama_moe_tile_rows(moe, batches_at) > 1,
+           "a run that reaches the threshold takes the batched path");
+    expect(llama_moe_tile_rows(moe, batches_at - 1) == 1, "one row short does not");
     run_case("qwen3-moe (routed, 48 rows: the batched mixture)", moe, *ctx, kernels_dir, 0.12f,
              /*rows=*/48, /*paged=*/true);
 

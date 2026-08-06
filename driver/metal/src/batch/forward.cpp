@@ -1703,7 +1703,13 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
                              int(pool_.size()), t * prefill_scratch_row);
-                bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_);
+                // The row pitch reaches the mixture's params here: a prefill
+                // lays every value's rows a uniform `scratch_widest_elems`
+                // apart, and the routing group is the one thing that runs over
+                // all of them at once. At one row it is unread -- every index
+                // it multiplies is zero -- so the per-token walk is unaffected.
+                bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_,
+                                   1, scratch_widest_elems(g_));
                 // A scan launched off row t's argument table reads its own
                 // length, so every row carries one.
                 prefill_scan_rows_[t] = ctx_->create_standalone_buffer(sizeof(std::int32_t));
@@ -2425,6 +2431,14 @@ bool MetalExecutor::Impl::run_prefill_step(
     // Nothing failed and nothing was slow; the first token of every prompt was
     // simply the wrong one.
     std::string stage_err;
+    // The mixture's routing runs over the WHOLE prompt when it can, off row
+    // zero's argument tables, so row zero's `n` and `padded` have to be the
+    // fire's and not the one. Allocation-free: rebinding a const slot rewrites
+    // bytes at an address the table already holds.
+    if (g_.is_moe() && !prefill_dags_.empty() && schedule.N > 1) {
+        bind_token_consts(*ctx_, prefill_dags_.front(), g_, schedule.N,
+                          scratch_widest_elems(g_));
+    }
     bool stage_failed = false;
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
