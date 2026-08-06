@@ -161,7 +161,7 @@ int main() {
         bind_scratch(*ctx, prefill[t], prefill_sched, scratch.data(), int(scratch.size()),
                      t * scratch_row);
         bind_decode_consts(*ctx, prefill[t], g, 4096, true);
-        bind_prefill_gdn_state(*ctx, b, prefill[t], uint32_t(t & 1), (t & 1) == 0);
+        bind_gdn_conv_parity(*ctx, b, prefill[t], (t & 1) == 0);
     }
 
     bool all_bound = true;

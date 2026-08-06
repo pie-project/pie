@@ -220,7 +220,14 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlMoeCombine:
             shared_kernels::expert_combine_dispatch(g.hidden, d.grid, d.tg, n); break;
         case Kernel::LlSharedCombine:
-            elementwise_mb_dispatch(g.hidden, n, d.grid, d.tg); break;
+            // The SAME helper the M=1 DAG emits this with, and not the flat
+            // `elementwise_mb_dispatch` its neighbours take: `shared_expert_combine`
+            // reads its row from `gid.y`, so a flat (width * N, 1, 1) grid puts
+            // every thread on row 0 and leaves rows 1.. holding whatever the
+            // pool did. At N=1 the two shapes are the same grid, which is why
+            // this survived every single-sequence gate and broke a fleet of two
+            // at its first step.
+            shared_kernels::moe_route_rows_dispatch(g.hidden, n, d.grid, d.tg); break;
 
         default:
             throw std::runtime_error("missing multi-batch launch geometry");
@@ -515,24 +522,26 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
     }
 }
 
-void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
-                                 const std::vector<Dispatch>& dag) {
+/// Point the GDN pair's conv ping-pong at one of its two halves.
+///
+/// `even` selects the half holding the history this fire will READ: true binds
+/// `conv_state` in and `conv_state_out` out, false the reverse.
+///
+/// The two halves may not be the same buffer, which is the whole reason this
+/// exists. `gdn_prep` runs one threadgroup per VALUE head, and `rep = Hv/Hk`
+/// value heads share a key head: that head's conv window is READ by all `rep`
+/// of them and WRITTEN by the first. Alias the output over the input and the
+/// writer shifts the window while its siblings are still reading it -- a race
+/// whose two outcomes are both finite numbers, so it reports as a fleet member
+/// that quietly disagrees with its identical neighbours rather than as a
+/// fault. `rep` is 1 on Qwen3.6-35B-A3B and 3 on Qwen3.6-27B, which is why
+/// only the 27B showed it.
+void bind_gdn_conv_parity(RawMetalContext& ctx, const BoundDecode& b,
+                          const std::vector<Dispatch>& dag, bool even) {
     for (const Dispatch& d : dag) {
         if (d.kind != Kernel::GdnPrepSlotted && d.kind != Kernel::GdnCoreSlotted) continue;
         const auto& s = b.gdn[size_t(d.layer)];
-        if (!s.conv_state.valid()) continue;
-        const uint8_t idx = d.kind == Kernel::GdnPrepSlotted
-                                ? uint8_t(bind::GdnPrep::ConvStateOut)
-                                : uint8_t(bind::GdnCoreRecurrent::ConvStateOut);
-        ctx.arg_bind_ordinal(d.ordinal, idx, s.conv_state);
-    }
-}
-
-void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
-                            const std::vector<Dispatch>& dag, uint32_t slot, bool even) {
-    for (const Dispatch& d : dag) {
-        if (d.kind != Kernel::GdnPrepSlotted && d.kind != Kernel::GdnCoreSlotted) continue;
-        const auto& s = b.gdn[size_t(d.layer)];
+        if (!s.conv_state.valid() || !s.conv_state_out.valid()) continue;
         const SlotHandle& in = even ? s.conv_state : s.conv_state_out;
         const SlotHandle& out = even ? s.conv_state_out : s.conv_state;
         if (d.kind == Kernel::GdnPrepSlotted) {
@@ -543,7 +552,6 @@ void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
             ctx.arg_bind_ordinal(d.ordinal, uint8_t(bind::GdnCoreRecurrent::ConvStateOut), out);
         }
     }
-    (void)slot;  // the slotted shader consumes the per-token SlotOfToken buffer.
 }
 
 namespace {

@@ -122,10 +122,11 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             int max_rows = 0,
                             const std::vector<GdnScanSegment>& gdn_scans = {});
 
-// Point ConvStateOut at ConvState so a paged decode shifts the conv history in
-// place; the prefill re-binds its own ordinals per fire and is unaffected.
-void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
-                                 const std::vector<Dispatch>& dag);
+// Point the GDN pair's conv ping-pong at one of its two halves: `even` binds
+// `conv_state` in and `conv_state_out` out, false the reverse. The halves may
+// not be aliased -- see the definition.
+void bind_gdn_conv_parity(RawMetalContext& ctx, const BoundDecode& b,
+                          const std::vector<Dispatch>& dag, bool even);
 
 // Interleaved A/B.  This machine is permanently contended -- the agent process
 // alone runs at ~250% CPU and macOS daemons spike on top of it -- so the same
@@ -143,9 +144,5 @@ void ab_set_arm(bool b);
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
                            bool force_barriers = false);
-
-void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
-                            const std::vector<Dispatch>& dag, uint32_t slot,
-                            bool even);
 
 }  // namespace pie::metal
