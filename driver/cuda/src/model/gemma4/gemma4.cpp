@@ -96,7 +96,29 @@ struct Gemma4ForwardProfile {
         return idx;
     }
 
-    void begin(cudaStream_t) {}
+    void begin(cudaStream_t stream) {
+        // Off unless asked for: the stage events are cheap to record but the
+        // read-back in `end()` synchronizes, which is exactly what the decode
+        // path exists to avoid.
+        static const bool want =
+            std::getenv("PIE_GEMMA4_FORWARD_PROFILE") != nullptr;
+        if (!want) return;
+        // An event recorded on a capturing stream cannot be synchronized on,
+        // so a captured fire is not measurable this way at all -- and trying
+        // is a hard error (907), not a silent miss. Eager fires still carry
+        // the same kernels, which is what the stage split is read for.
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &status) != cudaSuccess ||
+            status != cudaStreamCaptureStatusNone) {
+            return;
+        }
+        enabled = true;
+        static std::atomic<std::uint64_t> counter{0};
+        seq = counter.fetch_add(1);
+        CUDA_CHECK(cudaEventCreate(&total_start));
+        CUDA_CHECK(cudaEventCreate(&total_stop));
+        CUDA_CHECK(cudaEventRecord(total_start, stream));
+    }
 
     void end(cudaStream_t stream) {
         if (!enabled || ended) return;

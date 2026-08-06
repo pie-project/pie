@@ -222,7 +222,26 @@ inline bool current_device_supports_pdl() {
     return current_device_major() >= 9;
 }
 
-constexpr bool force_split_kv_small_enabled() { return false; }
+// Whether to let FlashInfer's own work estimator decide split-kv at the small
+// batch sizes the override below otherwise forces to non-split.
+//
+// Off, and the measurement says it has to stay off: the override is what makes
+// the decode schedule independent of KV length, which is what lets
+// `can_use_static_nonsplit_decode_plan` reuse one plan for every fire. Turn it
+// on and the full FlashInfer planner runs per decoded token -- gemma-4-26B-A4B
+// at 1k context goes from 22 s for 256 tokens to over 2400 s, a hundredfold,
+// because the host planning dwarfs whatever the split buys the kernel.
+//
+// This is not an argument that non-split is optimal. At R=1 the unsplit grid
+// is batch_size * num_kv_heads = 8 CTAs on 132 SMs, and gemma-4's decode
+// attention measures ~50x off its KV-bandwidth roofline because of it. The
+// argument is that the fix has to keep the plan static -- a precomputed split
+// factor folded into the cached plan -- not hand planning back to the caller.
+inline bool force_split_kv_small_enabled() {
+    static const bool on =
+        std::getenv("PIE_CUDA_FORCE_SPLIT_KV_SMALL") != nullptr;
+    return on;
+}
 
 constexpr bool static_nonsplit_decode_plan_enabled() { return true; }
 
