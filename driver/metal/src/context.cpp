@@ -962,6 +962,17 @@ class Context::Impl {
                           << " requests=" << (launch.qo_indptr.len - 1)
                           << " causal=" << (causal ? 1 : 0) << " lengths=";
                 for (std::uint32_t len : causal_kv_lengths) std::cerr << len << " ";
+                std::cerr << " | tokens=" << launch.token_ids.len << " readout=";
+                for (std::size_t i = 0; i < launch.sampling_indices.len; ++i) {
+                    std::cerr << launch.sampling_indices.ptr[i] << " ";
+                }
+                std::cerr << "pos=";
+                for (std::size_t i = 0; i < launch.position_ids.len && i < 4; ++i) {
+                    std::cerr << launch.position_ids.ptr[i] << " ";
+                }
+                if (launch.position_ids.len > 0) {
+                    std::cerr << "... " << launch.position_ids.ptr[launch.position_ids.len - 1];
+                }
                 std::cerr << "\n";
             }
             if (!causal) {
