@@ -197,6 +197,12 @@ struct ModelFacts {
 /// is the remaining tidy-up and needs a macOS build to verify.
 ModelFacts read_model_facts(const std::string& hf_path);
 
+/// `architectures[0]` reduced to the stem the registries key on, exposed
+/// because the descriptor path and the `config.json` path must agree and a
+/// second copy of the rule is how they stopped agreeing once. See the
+/// definition for why the suffix list is explicit.
+std::string arch_stem(std::string name);
+
 /// The facts, read out of the `pie.model/1` descriptor every boot is handed.
 ///
 /// Takes the document, not a path to it: the caller has already read the file

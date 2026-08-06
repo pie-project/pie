@@ -353,10 +353,18 @@ fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
         .and_then(|a| a.first())
         .and_then(|a| a.as_str())
         .ok_or_else(|| anyhow!("`architectures[0]` missing from {path:?}"))?;
-    // "Qwen3ForCausalLM" → "qwen3" — same heuristic the Python wrapper used.
+    // "Qwen3ForCausalLM" → "qwen3" — same heuristic the Python wrapper used,
+    // and the same one `driver/metal`'s `arch_stem` applies. The task suffix
+    // is what comes off: a multimodal release is named
+    // `<Stem>ForConditionalGeneration`, and leaving that whole misses every
+    // registry keyed on the stem.
+    //
+    // The list is explicit rather than "cut at the first `for`" because
+    // `ReformerForCausalLM` has one inside its own stem.
     let raw_arch_lower = raw_arch.to_lowercase();
     let arch_name = raw_arch_lower
-        .strip_suffix("forcausallm")
+        .strip_suffix("forconditionalgeneration")
+        .or_else(|| raw_arch_lower.strip_suffix("forcausallm"))
         .unwrap_or(&raw_arch_lower)
         .to_string();
 
