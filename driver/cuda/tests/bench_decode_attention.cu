@@ -74,8 +74,11 @@ int main(int argc, char** argv) {
     std::printf("device=%s sm=%d kv_heads=%d gqa=%d head_dim=%d window=%d\n",
                 prop.name, prop.multiProcessorCount, kv_heads, gqa, head_dim,
                 window_left);
-    std::printf("%8s %12s %12s %10s %10s\n",
-                "ctx", "flashinfer", "fa3_sm90", "fi_GB/s", "fa3_GB/s");
+    const int splits = std::getenv("SPLITS") ? std::atoi(std::getenv("SPLITS")) : 8;
+    std::printf("%8s %12s %12s %12s %10s\n",
+                "ctx", "flashinfer", "fa3_sm90", "fa3_split", "split_GB/s");
+    std::printf("(split = %d-way KV split expressed as %d one-token requests, "
+                "each over its own page range)\n", splits, splits);
 
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -138,6 +141,57 @@ int main(int argc, char** argv) {
             }
         }
 
+        // KV split as a batch split: `splits` pseudo-requests, each one token
+        // of Q over a disjoint slice of the pages. Decode puts the query at
+        // the end of whatever range it is given, so a causal q_len=1 fire over
+        // a slice attends to all of that slice -- which is exactly the partial
+        // this needs. Merging the partials is `MergeStates` over `splits`
+        // index sets, tiny next to the attention itself.
+        float split_us = -1.f;
+        if (ops::hopper_prefill_supported(head_dim, -1, splits, splits) &&
+            pages >= splits) {
+            const int chunk = (pages + splits - 1) / splits;
+            std::vector<std::uint32_t> sq(splits + 1), sindptr(splits + 1),
+                slast(splits);
+            for (int i = 0; i <= splits; ++i) sq[i] = static_cast<std::uint32_t>(i);
+            sindptr[0] = 0;
+            for (int i = 0; i < splits; ++i) {
+                const int lo = std::min(i * chunk, pages);
+                const int hi = std::min((i + 1) * chunk, pages);
+                sindptr[i + 1] = static_cast<std::uint32_t>(hi);
+                const bool last = (hi == pages);
+                slast[i] = (hi > lo)
+                    ? static_cast<std::uint32_t>(
+                          last ? (ctx - (pages - 1) * kPageSize) : kPageSize)
+                    : 1u;
+                (void)lo;
+            }
+            auto* sindptr_d = upload(sindptr);
+            auto* slast_d = upload(slast);
+            void* sq_dev = device_zeros(
+                static_cast<std::size_t>(splits) * q_heads * head_dim * 2);
+            void* spart = device_zeros(
+                static_cast<std::size_t>(splits) * q_heads * head_dim * 2);
+            void* slse = device_zeros(
+                static_cast<std::size_t>(splits) * q_heads * sizeof(float));
+            ops::HopperPrefillPlan sp;
+            ops::plan_attention_flashinfer_prefill_sm90_bf16(
+                sp, sq.data(), sindptr.data(), slast.data(), splits, splits,
+                q_heads, kv_heads, head_dim, kPageSize, workspace, stream,
+                /*enable_cuda_graph=*/true, /*causal=*/true, /*window_left=*/-1,
+                workspace.int_bytes() / 2);
+            if (sp.valid) {
+                split_us = time_us([&](cudaStream_t st) {
+                    ops::dispatch_attention_flashinfer_prefill_sm90_bf16(
+                        sp, sq_dev, k_pages, v_pages, spart, idx_d, workspace,
+                        st, 0.f, 1.0f, static_cast<float*>(slse));
+                }, stream);
+            }
+            for (void* p : {sq_dev, spart, slse}) CUDA_CHECK(cudaFree(p));
+            for (void* p : {static_cast<void*>(sindptr_d),
+                            static_cast<void*>(slast_d)}) CUDA_CHECK(cudaFree(p));
+        }
+
         // Only the in-window tail is useful work; that is what a kernel could
         // read if it bounded its scan, and what the bandwidth column charges.
         const int scanned = (window_left >= 0) ? std::min(ctx, window_left) : ctx;
@@ -146,8 +200,8 @@ int main(int argc, char** argv) {
         auto gbs = [&](float us) {
             return us > 0.f ? useful_bytes / (us * 1e3) : 0.0;
         };
-        std::printf("%8d %10.1fus %10.1fus %10.0f %10.0f\n",
-                    ctx, fi_us, fa3_us, gbs(fi_us), gbs(fa3_us));
+        std::printf("%8d %10.1fus %10.1fus %10.1fus %10.0f\n",
+                    ctx, fi_us, fa3_us, split_us, gbs(split_us));
 
         for (void* p : {k_pages, v_pages, q, out}) CUDA_CHECK(cudaFree(p));
         for (void* p : {static_cast<void*>(idx_d), static_cast<void*>(indptr_d),
