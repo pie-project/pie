@@ -313,13 +313,17 @@ fn llama_like_cuda_text(
         // (`k` is a runtime input), so it states the axis and the
         // driver's eligibility test admits only the uniform case.
         //
-        // `xqa_decode` is a decode-path property and does not gate this;
-        // `head_dim_padded` does, for the same reason it gates Decode —
-        // its staging offsets are physical-width while a window's are
-        // logical.
-        if cuda_of(FireClass::Decode)
-            .is_some_and(|c| !c.xqa_decode && !c.head_dim_padded)
-            || cuda_of(FireClass::Prefill).is_some_and(|c| !c.head_dim_padded)
+        // `xqa_decode` is a decode-path property and gates the Decode
+        // class only. `head_dim_padded` gates NEITHER, and that is the
+        // same two-halves argument one step further: a padded deployment
+        // stages q/k at PHYSICAL width while a row window addresses at
+        // logical width, so it cannot serve the narrowing half — but
+        // stopping after layer `k` addresses nothing at all, because the
+        // retired ops simply do not run. The driver holds `k`, so the
+        // driver is where that split gets decided; withholding the axis
+        // here refused the free half along with the costly one.
+        if cuda_of(FireClass::Decode).is_some_and(|c| !c.xqa_decode)
+            || cuda_of(FireClass::Prefill).is_some()
         {
             m.depth_window();
         }

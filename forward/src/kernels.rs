@@ -519,9 +519,13 @@ mod tests {
             "a prefill fire runs no planned decode dispatch, so nothing swaps"
         );
 
-        // A trace that does NOT declare the axis puts nothing on it: the
-        // padded-head deployment, whose staging offsets are physical
-        // width while a window's are logical.
+        // A PADDED-HEAD deployment declares the axis too. It cannot serve
+        // the narrowing half — its staging offsets are physical width
+        // while a row window's are logical — but stopping after layer `k`
+        // addresses nothing, and `k` is a runtime input the trace does
+        // not have. So the trace states the axis and the DRIVER refuses
+        // the shapes that narrow (`PaddedHeadNarrowing`), which is the
+        // same division of labour the Prefill class settled.
         let padded = family::llama_like_cuda(
             &facts,
             &LlamaLikeCudaFacts {
@@ -530,8 +534,21 @@ mod tests {
             },
             FireClass::Prefill,
         );
-        assert!(!padded.depth_window);
-        assert!(padded.ops.iter().all(|op| !padded.depth_windowed(op)));
+        assert!(padded.depth_window);
+
+        // The XQA decode deployment is the one that still withholds it:
+        // its prepare is fire-wide and R-shaped, so even the free half
+        // has nothing to stand on.
+        let xqa = family::llama_like_cuda(
+            &facts,
+            &LlamaLikeCudaFacts {
+                xqa_decode: true,
+                ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
+            },
+            FireClass::Decode,
+        );
+        assert!(!xqa.depth_window);
+        assert!(xqa.ops.iter().all(|op| !xqa.depth_windowed(op)));
     }
 
     /// No symbol is declared twice, and no dsl-side name is either.

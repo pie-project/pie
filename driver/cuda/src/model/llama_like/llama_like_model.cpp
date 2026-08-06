@@ -51,6 +51,13 @@ enum class DeclineReason {
     NoPlan,
     WriteDescMissing,
     SlidingWindow,
+    /// A PADDED-HEAD deployment asked to NARROW rows under the depth
+    /// axis (a union or banded fire). Phi-3-mini pads head_dim 96 -> 128,
+    /// so q/k stage at PHYSICAL width while a row window addresses at
+    /// logical width. Stopping after layer `k` is free — the retired ops
+    /// simply do not run, and address nothing — which is why the trace
+    /// states the axis and this refuses only the half that costs.
+    PaddedHeadNarrowing,
     /// A UNION prefill: full-depth rows beside truncated ones, so the
     /// tail layers would run over a row prefix and this fire's qo/kv
     /// CSRs would have to narrow with them. There is no prefill
@@ -73,6 +80,8 @@ const char* decline_name(DeclineReason r) {
     case DeclineReason::NoPlan:             return "no-plan";
     case DeclineReason::WriteDescMissing:   return "write-desc-missing";
     case DeclineReason::SlidingWindow:      return "sliding-window";
+    case DeclineReason::PaddedHeadNarrowing:
+        return "padded-head-narrowing";
     case DeclineReason::UnionPrefill:      return "union-prefill";
     case DeclineReason::TruncatedAxisUnstated:
         return "truncated-axis-unstated";
@@ -269,6 +278,11 @@ void LlamaLikeModel::body(Workspace& ws,
         // the DECLARATION states the depth axis for the fire's shape
         // (pure-decode only; a truncated lane's prefill keeps the
         // hand-written body).
+        // Phi-3-mini pads head_dim (96 -> 128), and the padded staging is
+        // what makes a ROW WINDOW unserveable there: the buffers are laid
+        // out at physical width while a window addresses at logical.
+        const bool padded_head =
+            hf_config_.head_dim != hf_config_.head_dim_kernel;
         if (in.max_layers != 0xffffffffu) {
             // The fire's OWN class states the axis or it does not — ask
             // the plan this fire will actually run, not the decode one.
@@ -276,6 +290,9 @@ void LlamaLikeModel::body(Workspace& ws,
                 in.is_pure_decode ? declared_.decode : declared_.prefill;
             if (!fire_plan || fire_plan.view().depth_window == 0) {
                 return DeclineReason::TruncatedAxisUnstated;
+            }
+            if (padded_head && in.full_depth_rows != 0xffffffffu) {
+                return DeclineReason::PaddedHeadNarrowing;
             }
             // A truncated PREFILL is admitted only when the truncation
             // is UNIFORM. That is the cheap half of the axis: every row
@@ -316,6 +333,9 @@ void LlamaLikeModel::body(Workspace& ws,
         // because by then the fire is committed. The gate turns that
         // into a fallback while there is still a choice.
         if (llama_like_bands_apply(declared_, plan_, in.is_pure_decode)) {
+            // A band IS a row narrowing, so it meets the padded-head wall
+            // for the same reason a union does.
+            if (padded_head) return DeclineReason::PaddedHeadNarrowing;
             for (std::uint32_t j = 0; j < plan_.depth_band_count; ++j) {
                 if (plan_.depth_band_rows[j] > 0 &&
                     !plan_.depth_band_plans[j]) {

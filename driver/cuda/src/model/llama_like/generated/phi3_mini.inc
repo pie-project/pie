@@ -53,6 +53,46 @@ std::uint32_t declared_full_depth_rows)
     // and the o_proj reads the stripped logical-width output.
     const int N = total_tokens;
     const int R = num_requests;
+    // STRUCTURAL S-4: the depth axis, stated by the trace
+    // (ForwardPlan::depth_window) — per-layer scopes below
+    // shadow N/R on tail layers; uniform truncation skips
+    // them and the unchanged epilogue is the logit-lens head.
+    const int depth_k =
+        declared_max_layers != 0xffffffffu &&
+        declared_max_layers <
+            static_cast<std::uint32_t>(cfg.num_hidden_layers)
+            ? static_cast<int>(declared_max_layers)
+            : cfg.num_hidden_layers;
+    const bool depth_union =
+        depth_k < cfg.num_hidden_layers &&
+        declared_full_depth_rows != 0xffffffffu;
+    const int depth_split = depth_union
+        ? static_cast<int>(declared_full_depth_rows)
+        : N;
+    if (depth_union &&
+        (depth_split <= 0 || depth_split >= R ||
+         !plan_state.depth_prefix_decode_plan)) {
+        throw std::runtime_error(
+            "depth union (generated): planned split without "
+            "a usable prefix plan (gate drift)");
+    }
+    // ④ Act 1 (banded depth): >= 2 distinct-k bands from the
+    // prepare's stamp; per-layer scopes below resolve the
+    // band containing their static layer. Banded fires
+    // derive max_layers FULL, so the union logic stays idle.
+    const int band_count =
+        static_cast<int>(plan_state.depth_band_count);
+    const bool depth_banded = band_count >= 2;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (plan_state.depth_band_rows[j] > 0 &&
+                !plan_state.depth_band_plans[j]) {
+                throw std::runtime_error(
+                    "depth bands (generated): stamped band "
+                    "without a usable prefix plan");
+            }
+        }
+    }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
@@ -99,6 +139,25 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_embed_bf16(
         token_ids, require(w.embed, "embed")->data(), ws.y.data(),
         N, H, V, stream);
+    {
+    const bool depth_tail = depth_k <= 0;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].attn_norm, "layer.0.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -114,6 +173,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[0].v_proj, "layer.0.v_proj"), w.layers[0].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -127,10 +188,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 0;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -164,6 +246,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 0;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -288,9 +389,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(0);
@@ -300,11 +407,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[0]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -338,6 +447,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 1;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].attn_norm, "layer.1.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -353,6 +483,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[1].v_proj, "layer.1.v_proj"), w.layers[1].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -366,10 +498,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 1;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -403,6 +556,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 1;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -527,9 +699,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(1);
@@ -539,11 +717,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[1]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -577,6 +757,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 2;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].attn_norm, "layer.2.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -592,6 +793,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[2].v_proj, "layer.2.v_proj"), w.layers[2].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -605,10 +808,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 2;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -642,6 +866,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 2;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -766,9 +1009,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(2);
@@ -778,11 +1027,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[2]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -816,6 +1067,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 3;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].attn_norm, "layer.3.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -831,6 +1103,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[3].v_proj, "layer.3.v_proj"), w.layers[3].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -844,10 +1118,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 3;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -881,6 +1176,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 3;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -1005,9 +1319,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(3);
@@ -1017,11 +1337,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[3]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -1055,6 +1377,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 4;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].attn_norm, "layer.4.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -1070,6 +1413,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[4].v_proj, "layer.4.v_proj"), w.layers[4].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -1083,10 +1428,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 4;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -1120,6 +1486,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 4;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -1244,9 +1629,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(4);
@@ -1256,11 +1647,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[4]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -1294,6 +1687,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 5;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].attn_norm, "layer.5.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -1309,6 +1723,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[5].v_proj, "layer.5.v_proj"), w.layers[5].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -1322,10 +1738,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 5;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -1359,6 +1796,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 5;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -1483,9 +1939,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(5);
@@ -1495,11 +1957,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[5]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -1533,6 +1997,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 6;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].attn_norm, "layer.6.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -1548,6 +2033,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[6].v_proj, "layer.6.v_proj"), w.layers[6].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -1561,10 +2048,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 6;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -1598,6 +2106,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 6;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -1722,9 +2249,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(6);
@@ -1734,11 +2267,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[6]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -1772,6 +2307,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 7;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].attn_norm, "layer.7.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -1787,6 +2343,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[7].v_proj, "layer.7.v_proj"), w.layers[7].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -1800,10 +2358,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 7;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -1837,6 +2416,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 7;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -1961,9 +2559,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(7);
@@ -1973,11 +2577,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[7]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -2011,6 +2617,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 8;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].attn_norm, "layer.8.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -2026,6 +2653,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[8].v_proj, "layer.8.v_proj"), w.layers[8].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -2039,10 +2668,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 8;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -2076,6 +2726,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 8;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -2200,9 +2869,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(8);
@@ -2212,11 +2887,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[8]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -2250,6 +2927,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 9;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].attn_norm, "layer.9.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -2265,6 +2963,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[9].v_proj, "layer.9.v_proj"), w.layers[9].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -2278,10 +2978,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 9;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -2315,6 +3036,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 9;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -2439,9 +3179,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(9);
@@ -2451,11 +3197,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[9]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -2489,6 +3237,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 10;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].attn_norm, "layer.10.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -2504,6 +3273,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[10].v_proj, "layer.10.v_proj"), w.layers[10].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -2517,10 +3288,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 10;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -2554,6 +3346,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 10;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -2678,9 +3489,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(10);
@@ -2690,11 +3507,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[10]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -2728,6 +3547,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 11;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].attn_norm, "layer.11.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -2743,6 +3583,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[11].v_proj, "layer.11.v_proj"), w.layers[11].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -2756,10 +3598,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 11;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -2793,6 +3656,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 11;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -2917,9 +3799,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(11);
@@ -2929,11 +3817,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[11]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -2967,6 +3857,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 12;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].attn_norm, "layer.12.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -2982,6 +3893,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[12].v_proj, "layer.12.v_proj"), w.layers[12].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -2995,10 +3908,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 12;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -3032,6 +3966,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 12;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -3156,9 +4109,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(12);
@@ -3168,11 +4127,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[12]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -3206,6 +4167,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 13;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].attn_norm, "layer.13.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -3221,6 +4203,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[13].v_proj, "layer.13.v_proj"), w.layers[13].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -3234,10 +4218,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 13;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -3271,6 +4276,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 13;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -3395,9 +4419,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(13);
@@ -3407,11 +4437,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[13]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -3445,6 +4477,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 14;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].attn_norm, "layer.14.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -3460,6 +4513,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[14].v_proj, "layer.14.v_proj"), w.layers[14].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -3473,10 +4528,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 14;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -3510,6 +4586,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 14;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -3634,9 +4729,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(14);
@@ -3646,11 +4747,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[14]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -3684,6 +4787,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 15;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].attn_norm, "layer.15.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -3699,6 +4823,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[15].v_proj, "layer.15.v_proj"), w.layers[15].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -3712,10 +4838,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 15;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -3749,6 +4896,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 15;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -3873,9 +5039,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(15);
@@ -3885,11 +5057,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[15]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -3923,6 +5097,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 16;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].attn_norm, "layer.16.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -3938,6 +5133,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[16].v_proj, "layer.16.v_proj"), w.layers[16].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -3951,10 +5148,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 16;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -3988,6 +5206,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 16;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -4112,9 +5349,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(16);
@@ -4124,11 +5367,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[16]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -4162,6 +5407,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 17;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].attn_norm, "layer.17.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -4177,6 +5443,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[17].v_proj, "layer.17.v_proj"), w.layers[17].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -4190,10 +5458,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 17;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -4227,6 +5516,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 17;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -4351,9 +5659,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(17);
@@ -4363,11 +5677,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[17]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -4401,6 +5717,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 18;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].attn_norm, "layer.18.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -4416,6 +5753,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[18].v_proj, "layer.18.v_proj"), w.layers[18].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -4429,10 +5768,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 18;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -4466,6 +5826,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 18;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -4590,9 +5969,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(18);
@@ -4602,11 +5987,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[18]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -4640,6 +6027,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 19;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].attn_norm, "layer.19.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -4655,6 +6063,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[19].v_proj, "layer.19.v_proj"), w.layers[19].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -4668,10 +6078,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 19;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -4705,6 +6136,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 19;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -4829,9 +6279,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(19);
@@ -4841,11 +6297,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[19]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -4879,6 +6337,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 20;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].attn_norm, "layer.20.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -4894,6 +6373,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[20].v_proj, "layer.20.v_proj"), w.layers[20].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -4907,10 +6388,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 20;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -4944,6 +6446,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 20;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -5068,9 +6589,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(20);
@@ -5080,11 +6607,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[20]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -5118,6 +6647,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 21;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].attn_norm, "layer.21.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -5133,6 +6683,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[21].v_proj, "layer.21.v_proj"), w.layers[21].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -5146,10 +6698,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 21;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -5183,6 +6756,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 21;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -5307,9 +6899,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(21);
@@ -5319,11 +6917,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[21]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -5357,6 +6957,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 22;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].attn_norm, "layer.22.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -5372,6 +6993,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[22].v_proj, "layer.22.v_proj"), w.layers[22].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -5385,10 +7008,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 22;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -5422,6 +7066,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 22;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -5546,9 +7209,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(22);
@@ -5558,11 +7227,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[22]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -5596,6 +7267,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 23;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].attn_norm, "layer.23.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -5611,6 +7303,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[23].v_proj, "layer.23.v_proj"), w.layers[23].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -5624,10 +7318,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 23;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -5661,6 +7376,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 23;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -5785,9 +7519,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(23);
@@ -5797,11 +7537,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[23]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -5835,6 +7577,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 24;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].attn_norm, "layer.24.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -5850,6 +7613,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[24].v_proj, "layer.24.v_proj"), w.layers[24].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -5863,10 +7628,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 24;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -5900,6 +7686,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 24;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -6024,9 +7829,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(24);
@@ -6036,11 +7847,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[24]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -6074,6 +7887,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 25;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].attn_norm, "layer.25.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -6089,6 +7923,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[25].v_proj, "layer.25.v_proj"), w.layers[25].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -6102,10 +7938,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 25;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -6139,6 +7996,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 25;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -6263,9 +8139,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(25);
@@ -6275,11 +8157,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[25]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -6313,6 +8197,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 26;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].attn_norm, "layer.26.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -6328,6 +8233,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[26].v_proj, "layer.26.v_proj"), w.layers[26].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -6341,10 +8248,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 26;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -6378,6 +8306,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 26;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -6502,9 +8449,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(26);
@@ -6514,11 +8467,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[26]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -6552,6 +8507,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 27;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].attn_norm, "layer.27.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -6567,6 +8543,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[27].v_proj, "layer.27.v_proj"), w.layers[27].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -6580,10 +8558,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 27;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -6617,6 +8616,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 27;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -6741,9 +8759,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(27);
@@ -6753,11 +8777,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[27]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -6791,6 +8817,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 28;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[28].attn_norm, "layer.28.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -6806,6 +8853,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[28].v_proj, "layer.28.v_proj"), w.layers[28].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -6819,10 +8868,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 28;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -6856,6 +8926,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 28;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -6980,9 +9069,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(28);
@@ -6992,11 +9087,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[28]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -7030,6 +9127,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[28].down_proj, "layer.28.down"), w.layers[28].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 29;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[29].attn_norm, "layer.29.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -7045,6 +9163,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[29].v_proj, "layer.29.v_proj"), w.layers[29].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -7058,10 +9178,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 29;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -7095,6 +9236,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 29;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -7219,9 +9379,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(29);
@@ -7231,11 +9397,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[29]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -7269,6 +9437,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[29].down_proj, "layer.29.down"), w.layers[29].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 30;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[30].attn_norm, "layer.30.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -7284,6 +9473,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[30].v_proj, "layer.30.v_proj"), w.layers[30].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -7297,10 +9488,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 30;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -7334,6 +9546,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 30;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -7458,9 +9689,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(30);
@@ -7470,11 +9707,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[30]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -7508,6 +9747,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[30].down_proj, "layer.30.down"), w.layers[30].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 31;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[31].attn_norm, "layer.31.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -7523,6 +9783,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[31].v_proj, "layer.31.v_proj"), w.layers[31].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -7536,10 +9798,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 31;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -7573,6 +9856,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 31;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -7697,9 +9999,15 @@ std::uint32_t declared_full_depth_rows)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(31);
@@ -7709,11 +10017,13 @@ std::uint32_t declared_full_depth_rows)
                         ? fwd_cfg.per_layer_window_left[31]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
@@ -7747,6 +10057,8 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[31].down_proj, "layer.31.down"), w.layers[31].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
     // final_norm: deferred into the LmHead epilogue below.
     if (fwd_cfg.emit_logits) {
         // The hand-written epilogue, the interpreter's arm verbatim
@@ -7820,6 +10132,46 @@ std::uint32_t declared_full_depth_rows)
     // and the o_proj reads the stripped logical-width output.
     const int N = total_tokens;
     const int R = num_requests;
+    // STRUCTURAL S-4: the depth axis, stated by the trace
+    // (ForwardPlan::depth_window) — per-layer scopes below
+    // shadow N/R on tail layers; uniform truncation skips
+    // them and the unchanged epilogue is the logit-lens head.
+    const int depth_k =
+        declared_max_layers != 0xffffffffu &&
+        declared_max_layers <
+            static_cast<std::uint32_t>(cfg.num_hidden_layers)
+            ? static_cast<int>(declared_max_layers)
+            : cfg.num_hidden_layers;
+    const bool depth_union =
+        depth_k < cfg.num_hidden_layers &&
+        declared_full_depth_rows != 0xffffffffu;
+    const int depth_split = depth_union
+        ? static_cast<int>(declared_full_depth_rows)
+        : N;
+    if (depth_union &&
+        (depth_split <= 0 || depth_split >= R ||
+         !plan_state.depth_prefix_decode_plan)) {
+        throw std::runtime_error(
+            "depth union (generated): planned split without "
+            "a usable prefix plan (gate drift)");
+    }
+    // ④ Act 1 (banded depth): >= 2 distinct-k bands from the
+    // prepare's stamp; per-layer scopes below resolve the
+    // band containing their static layer. Banded fires
+    // derive max_layers FULL, so the union logic stays idle.
+    const int band_count =
+        static_cast<int>(plan_state.depth_band_count);
+    const bool depth_banded = band_count >= 2;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (plan_state.depth_band_rows[j] > 0 &&
+                !plan_state.depth_band_plans[j]) {
+                throw std::runtime_error(
+                    "depth bands (generated): stamped band "
+                    "without a usable prefix plan");
+            }
+        }
+    }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
@@ -7866,6 +10218,25 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_embed_bf16(
         token_ids, require(w.embed, "embed")->data(), ws.y.data(),
         N, H, V, stream);
+    {
+    const bool depth_tail = depth_k <= 0;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].attn_norm, "layer.0.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -7881,6 +10252,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[0].v_proj, "layer.0.v_proj"), w.layers[0].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -7894,10 +10267,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 0;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -7931,6 +10325,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 0;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -8078,6 +10491,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 1;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].attn_norm, "layer.1.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -8093,6 +10527,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[1].v_proj, "layer.1.v_proj"), w.layers[1].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -8106,10 +10542,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 1;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -8143,6 +10600,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 1;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -8290,6 +10766,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 2;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].attn_norm, "layer.2.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -8305,6 +10802,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[2].v_proj, "layer.2.v_proj"), w.layers[2].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -8318,10 +10817,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 2;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -8355,6 +10875,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 2;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -8502,6 +11041,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 3;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].attn_norm, "layer.3.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -8517,6 +11077,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[3].v_proj, "layer.3.v_proj"), w.layers[3].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -8530,10 +11092,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 3;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -8567,6 +11150,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 3;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -8714,6 +11316,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 4;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].attn_norm, "layer.4.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -8729,6 +11352,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[4].v_proj, "layer.4.v_proj"), w.layers[4].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -8742,10 +11367,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 4;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -8779,6 +11425,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 4;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -8926,6 +11591,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 5;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].attn_norm, "layer.5.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -8941,6 +11627,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[5].v_proj, "layer.5.v_proj"), w.layers[5].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -8954,10 +11642,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 5;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -8991,6 +11700,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 5;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -9138,6 +11866,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 6;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].attn_norm, "layer.6.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -9153,6 +11902,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[6].v_proj, "layer.6.v_proj"), w.layers[6].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -9166,10 +11917,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 6;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -9203,6 +11975,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 6;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -9350,6 +12141,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 7;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].attn_norm, "layer.7.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -9365,6 +12177,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[7].v_proj, "layer.7.v_proj"), w.layers[7].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -9378,10 +12192,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 7;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -9415,6 +12250,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 7;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -9562,6 +12416,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 8;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].attn_norm, "layer.8.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -9577,6 +12452,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[8].v_proj, "layer.8.v_proj"), w.layers[8].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -9590,10 +12467,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 8;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -9627,6 +12525,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 8;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -9774,6 +12691,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 9;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].attn_norm, "layer.9.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -9789,6 +12727,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[9].v_proj, "layer.9.v_proj"), w.layers[9].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -9802,10 +12742,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 9;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -9839,6 +12800,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 9;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -9986,6 +12966,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 10;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].attn_norm, "layer.10.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -10001,6 +13002,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[10].v_proj, "layer.10.v_proj"), w.layers[10].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -10014,10 +13017,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 10;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -10051,6 +13075,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 10;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -10198,6 +13241,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 11;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].attn_norm, "layer.11.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -10213,6 +13277,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[11].v_proj, "layer.11.v_proj"), w.layers[11].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -10226,10 +13292,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 11;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -10263,6 +13350,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 11;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -10410,6 +13516,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 12;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].attn_norm, "layer.12.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -10425,6 +13552,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[12].v_proj, "layer.12.v_proj"), w.layers[12].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -10438,10 +13567,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 12;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -10475,6 +13625,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 12;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -10622,6 +13791,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 13;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].attn_norm, "layer.13.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -10637,6 +13827,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[13].v_proj, "layer.13.v_proj"), w.layers[13].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -10650,10 +13842,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 13;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -10687,6 +13900,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 13;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -10834,6 +14066,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 14;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].attn_norm, "layer.14.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -10849,6 +14102,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[14].v_proj, "layer.14.v_proj"), w.layers[14].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -10862,10 +14117,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 14;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -10899,6 +14175,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 14;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -11046,6 +14341,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 15;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].attn_norm, "layer.15.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11061,6 +14377,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[15].v_proj, "layer.15.v_proj"), w.layers[15].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -11074,10 +14392,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 15;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -11111,6 +14450,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 15;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -11258,6 +14616,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 16;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].attn_norm, "layer.16.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11273,6 +14652,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[16].v_proj, "layer.16.v_proj"), w.layers[16].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -11286,10 +14667,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 16;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -11323,6 +14725,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 16;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -11470,6 +14891,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 17;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].attn_norm, "layer.17.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11485,6 +14927,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[17].v_proj, "layer.17.v_proj"), w.layers[17].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -11498,10 +14942,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 17;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -11535,6 +15000,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 17;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -11682,6 +15166,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 18;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].attn_norm, "layer.18.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11697,6 +15202,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[18].v_proj, "layer.18.v_proj"), w.layers[18].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -11710,10 +15217,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 18;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -11747,6 +15275,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 18;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -11894,6 +15441,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 19;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].attn_norm, "layer.19.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11909,6 +15477,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[19].v_proj, "layer.19.v_proj"), w.layers[19].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -11922,10 +15492,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 19;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -11959,6 +15550,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 19;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -12106,6 +15716,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 20;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].attn_norm, "layer.20.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12121,6 +15752,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[20].v_proj, "layer.20.v_proj"), w.layers[20].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -12134,10 +15767,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 20;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -12171,6 +15825,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 20;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -12318,6 +15991,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 21;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].attn_norm, "layer.21.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12333,6 +16027,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[21].v_proj, "layer.21.v_proj"), w.layers[21].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -12346,10 +16042,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 21;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -12383,6 +16100,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 21;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -12530,6 +16266,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 22;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].attn_norm, "layer.22.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12545,6 +16302,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[22].v_proj, "layer.22.v_proj"), w.layers[22].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -12558,10 +16317,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 22;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -12595,6 +16375,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 22;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -12742,6 +16541,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 23;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].attn_norm, "layer.23.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12757,6 +16577,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[23].v_proj, "layer.23.v_proj"), w.layers[23].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -12770,10 +16592,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 23;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -12807,6 +16650,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 23;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -12954,6 +16816,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 24;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].attn_norm, "layer.24.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12969,6 +16852,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[24].v_proj, "layer.24.v_proj"), w.layers[24].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -12982,10 +16867,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 24;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -13019,6 +16925,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 24;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -13166,6 +17091,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 25;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].attn_norm, "layer.25.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13181,6 +17127,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[25].v_proj, "layer.25.v_proj"), w.layers[25].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -13194,10 +17142,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 25;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -13231,6 +17200,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 25;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -13378,6 +17366,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 26;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].attn_norm, "layer.26.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13393,6 +17402,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[26].v_proj, "layer.26.v_proj"), w.layers[26].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -13406,10 +17417,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 26;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -13443,6 +17475,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 26;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -13590,6 +17641,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 27;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].attn_norm, "layer.27.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13605,6 +17677,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[27].v_proj, "layer.27.v_proj"), w.layers[27].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -13618,10 +17692,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 27;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -13655,6 +17750,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 27;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -13802,6 +17916,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 28;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[28].attn_norm, "layer.28.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13817,6 +17952,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[28].v_proj, "layer.28.v_proj"), w.layers[28].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -13830,10 +17967,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 28;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -13867,6 +18025,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 28;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -14014,6 +18191,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[28].down_proj, "layer.28.down"), w.layers[28].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 29;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[29].attn_norm, "layer.29.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -14029,6 +18227,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[29].v_proj, "layer.29.v_proj"), w.layers[29].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -14042,10 +18242,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 29;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -14079,6 +18300,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 29;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -14226,6 +18466,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[29].down_proj, "layer.29.down"), w.layers[29].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 30;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[30].attn_norm, "layer.30.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -14241,6 +18502,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[30].v_proj, "layer.30.v_proj"), w.layers[30].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -14254,10 +18517,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 30;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -14291,6 +18575,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 30;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -14438,6 +18741,27 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[30].down_proj, "layer.30.down"), w.layers[30].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 31;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[31].attn_norm, "layer.31.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -14453,6 +18777,8 @@ std::uint32_t declared_full_depth_rows)
         ws.norm_x.data(),
         make_weight_view(require(w.layers[31].v_proj, "layer.31.v_proj"), w.layers[31].v_proj_quant),
         ws.v.data(), N, Hk, H);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -14466,10 +18792,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 31;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         kernels::launch_pad_head_dim_bf16(
             ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -14503,6 +18850,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 31;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -14650,6 +19016,8 @@ std::uint32_t declared_full_depth_rows)
         ws.gate.data(),
         make_weight_view(require(w.layers[31].down_proj, "layer.31.down"), w.layers[31].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
     // final_norm: deferred into the LmHead epilogue below.
     if (fwd_cfg.emit_logits) {
         // The hand-written epilogue, the interpreter's arm verbatim
@@ -14724,6 +19092,46 @@ std::uint32_t declared_full_depth_rows,
     // and the o_proj reads the stripped logical-width output.
     const int N = total_tokens;
     const int R = num_requests;
+    // STRUCTURAL S-4: the depth axis, stated by the trace
+    // (ForwardPlan::depth_window) — per-layer scopes below
+    // shadow N/R on tail layers; uniform truncation skips
+    // them and the unchanged epilogue is the logit-lens head.
+    const int depth_k =
+        declared_max_layers != 0xffffffffu &&
+        declared_max_layers <
+            static_cast<std::uint32_t>(cfg.num_hidden_layers)
+            ? static_cast<int>(declared_max_layers)
+            : cfg.num_hidden_layers;
+    const bool depth_union =
+        depth_k < cfg.num_hidden_layers &&
+        declared_full_depth_rows != 0xffffffffu;
+    const int depth_split = depth_union
+        ? static_cast<int>(declared_full_depth_rows)
+        : N;
+    if (depth_union &&
+        (depth_split <= 0 || depth_split >= R ||
+         !plan_state.depth_prefix_decode_plan)) {
+        throw std::runtime_error(
+            "depth union (generated): planned split without "
+            "a usable prefix plan (gate drift)");
+    }
+    // ④ Act 1 (banded depth): >= 2 distinct-k bands from the
+    // prepare's stamp; per-layer scopes below resolve the
+    // band containing their static layer. Banded fires
+    // derive max_layers FULL, so the union logic stays idle.
+    const int band_count =
+        static_cast<int>(plan_state.depth_band_count);
+    const bool depth_banded = band_count >= 2;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (plan_state.depth_band_rows[j] > 0 &&
+                !plan_state.depth_band_plans[j]) {
+                throw std::runtime_error(
+                    "depth bands (generated): stamped band "
+                    "without a usable prefix plan");
+            }
+        }
+    }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
