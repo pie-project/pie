@@ -441,7 +441,18 @@ void mixtral_forward_paged(
     // and the launch geometry are derived from, so it must not track a context
     // length that grows under a captured graph -- which is also why the view
     // itself is built on the device and the launch is unconditional.
-    constexpr int kMixtralFullSplits = 16;
+    // 16 slices x 8 kv heads is 128 CTAs, about one wave on an H100. Swept at
+    // gpt-oss's decode shape (ctx ~1100): 8 -> 239.2, 16 -> 235.6, 24 -> 241.3,
+    // 32 -> 238.3 tok/s, which is flat inside a run-to-run spread of about 5 --
+    // once the machine is full, more slices only add partials to merge. The
+    // knob stays for the next shape that needs sweeping. It must be FIXED
+    // within a process: it is the request count the plan descriptor and the
+    // launch geometry are derived from.
+    static const int kMixtralFullSplits = [] {
+        const char* v = std::getenv("PIE_MIXTRAL_FULL_SPLITS");
+        const int n = (v != nullptr) ? std::atoi(v) : 16;
+        return (n >= 1 && n <= 128) ? n : 16;
+    }();
     ops::DecodePlanCachePtr split_plan;
     DeviceBuffer<std::uint32_t> split_indptr, split_indices, split_last;
     DeviceBuffer<std::uint16_t> split_partial;
