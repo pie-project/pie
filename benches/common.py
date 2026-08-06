@@ -535,6 +535,19 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sglang-disable-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--sglang-disable-piecewise-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
+        "--sglang-disable-hybrid-swa-memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Size one uniform KV pool instead of SGLang's split "
+             "sliding-window/full-attention pools. On a sliding-window model "
+             "(Gemma) the hybrid sizer derives a token budget from the cheap "
+             "SWA layers and then refuses to start because the full-attention "
+             "layers cannot hold that many tokens — SGLang aborts where vLLM "
+             "just sizes the pool from free memory and schedules within it. "
+             "Set this to get a run at all, and to put both engines on the "
+             "same pool policy.",
+    )
+    p.add_argument(
         "--wasm-delay-us",
         type=int,
         default=0,
