@@ -96,6 +96,19 @@ struct DeviceTuning {
     /// why the GEMM's 5.8% does not reach the step, too: these projections run
     /// at ~5% of the streaming roof, so the step is bound by weight traffic and
     /// not by how the tiles are cut.
+    ///
+    /// Those four workloads were not checked for divergence, though, and this
+    /// crossover is decided PER PROJECTION: a batch where every width lands on
+    /// the same side of all three candidates times identical code. So it was
+    /// re-run on the M1 Max at a batch picked to straddle -- Llama-3.2-1B at 96
+    /// rows, where 96 takes BN=32 on the 2048-wide projections and 160 and 256
+    /// take BN=16, via `benches/tune_device.py`. 2050.8 / 2053.7 / 2053.0 tok/s
+    /// at 160 / 96 / 256, five reps alternated, +0.1% against 1.2% noise; the
+    /// control at 1024 rows, where all three choose alike, lands 0.0% apart on
+    /// 0.1% noise. So the end-to-end neutrality survives a batch that could
+    /// have shown a difference, which is worth more than the four that could
+    /// not. Do not spend time re-testing this one end to end on a new card:
+    /// sweep it with the probe, take the sign, move on.
     int qmm_bn_crossover_tg = 160;
 
     /// Rows an expert's run must hold before the mixture's GEMM takes a wider

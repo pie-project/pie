@@ -65,6 +65,7 @@ class Model:
     path: str
     n_experts: int = 0
     top_k: int = 0
+    widths: tuple[int, ...] = ()  # distinct projection output widths
 
     @staticmethod
     def load(path: str) -> "Model":
@@ -72,7 +73,20 @@ class Model:
         cfg = cfg.get("text_config", cfg)
         experts = cfg.get("num_local_experts") or cfg.get("num_experts") or 0
         top_k = cfg.get("num_experts_per_tok") or cfg.get("top_k_experts") or 0
-        return Model(path, int(experts), int(top_k))
+
+        # `qmm_bn*` is decided per projection, so the crossover's effect depends
+        # on the set of output widths a layer dispatches, not on one of them.
+        hidden = cfg.get("hidden_size") or 0
+        heads = cfg.get("num_attention_heads") or 0
+        kv = cfg.get("num_key_value_heads") or heads
+        head_dim = cfg.get("head_dim") or (hidden // heads if heads else 0)
+        inter = cfg.get("intermediate_size") or 0
+        if isinstance(inter, list):
+            inter = inter[0] if inter else 0
+        widths = {heads * head_dim, kv * head_dim, hidden, inter,
+                  cfg.get("vocab_size") or 0}
+        return Model(path, int(experts), int(top_k),
+                     tuple(sorted(w for w in widths if w > 0)))
 
 
 # Each rule returns what the driver would CHOOSE for a setting at a batch.
@@ -94,6 +108,43 @@ def rule_qmm_min_batch(value: int, rows: int, m: Model):
 def rule_sdpa_tile(value: int, rows: int, m: Model):
     # sdpa_should_tile, one request: rows/r >= sdpa_tile_min_rows_per_request().
     return "tiled" if rows >= value else "per-row"
+
+
+QMM_BMS = (16, 32, 64)  # kQmmBMs
+
+
+def qmm_bm(n: int) -> int:
+    best = QMM_BMS[0]
+    for bm in QMM_BMS[1:]:
+        if n >= bm:
+            best = bm
+    return best
+
+
+def rule_qmm_bn_crossover(value: int, rows: int, m: Model):
+    """`qmm_bn_unsplit`: BN=32 once a projection's grid clears the crossover.
+
+    Decided per projection -- `(out_vec/32) * row_tiles >= crossover` -- so
+    two settings diverge when they disagree about ANY width the model
+    dispatches, which is why this needs the config's widths and not just a
+    batch. The signature is the tile chosen for each distinct width.
+    """
+    if not m.widths:
+        return None
+    n = rows if rows < 12 else ((rows + qmm_bm(rows) - 1) // qmm_bm(rows)) * qmm_bm(rows)
+    bm = qmm_bm(n)
+    if n < 12 or n % bm != 0:
+        return "matvec"
+    row_tiles = n // bm
+    picks = []
+    for w in m.widths:
+        if w % 16 != 0:
+            picks.append("-")
+        elif w % 32 == 0 and (w // 32) * row_tiles >= value:
+            picks.append("32")
+        else:
+            picks.append("16")
+    return "/".join(picks)
 
 
 def rule_moe_batch(value: int, rows: int, m: Model):
@@ -147,11 +198,11 @@ KNOBS: list[Knob] = [
          "two sides are close there and the noise guard earns its keep",
          rows=[12, 8, 16, 24, 32]),
     Knob("qmm_bn_crossover_tg", "PIE_METAL_QMM_BN_CROSSOVER_TG",
-         [160, 96, 256], "Llama-3.2-1B-Instruct-4bit", None,
+         [160, 96, 256], "Llama-3.2-1B-Instruct-4bit", rule_qmm_bn_crossover,
          "a threadgroup count, so a wider GPU saturates later and wants it up. "
-         "The choice depends on every projection's width, so this one cannot "
-         "be shown to diverge from the config alone -- read the spread",
-         rows=[128, 448]),
+         "Decided per projection, so the batch has to be one where the "
+         "candidates disagree about at least one of the model's widths",
+         rows=[64, 96, 128, 192, 256, 448, 1024]),
     Knob("moe_tile_wide_per", "PIE_METAL_MOE_TILE_WIDE_PER", [88, 56, 128],
          "gpt-oss-20b", rule_moe_wide,
          "rows an expert needs before a 64-row tile pays; end to end because "
