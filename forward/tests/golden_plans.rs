@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use pie_forward::family::{
     llama_like, llama_like_cuda, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
-    qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block,
+    qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block, qwen3_5_moe_mlp_block_cuda,
 };
 use pie_forward::{
     FireClass, ForwardPlan, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
@@ -231,6 +231,27 @@ fn qwen3_5_moe_mlp_35b_a3b() {
     check_plan(
         "qwen3_5_moe_mlp_35b_a3b",
         &qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b()),
+    );
+}
+
+/// The same fragment's CUDA reading: the fused CUTLASS leg, which is the
+/// one the decode path takes and the only one of `run_moe_mlp`'s four
+/// that is a single rectangle.
+///
+/// Read it against the semantic golden above and the difference IS the
+/// argument: the selector's two `matmul_per_token`s, the routed swiglu
+/// and the `WeightedSum` collapse into ONE launch that produces
+/// `[Tokens, hidden]`, and the trailing `ResidualAdd` becomes an
+/// explicit `launch_residual_add_bf16` because the fused runner
+/// overwrites its output rather than accumulating.
+#[test]
+fn qwen3_5_moe_mlp_35b_a3b_cuda() {
+    check_plan(
+        "qwen3_5_moe_mlp_35b_a3b_cuda",
+        &qwen3_5_moe_mlp_block_cuda(
+            &Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+        ),
     );
 }
 

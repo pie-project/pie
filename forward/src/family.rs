@@ -807,6 +807,116 @@ fn moe_mlp_body(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val) -> Val {
     y
 }
 
+/// The MoE MLP fragment's CUDA reading, traced standalone at layer 0 —
+/// [`qwen3_5_moe_mlp_block`]'s peer, and the only place the MoE block's
+/// stated form is pinned on its own.
+pub fn qwen3_5_moe_mlp_block_cuda(
+    facts: &Qwen35MoeMlpFacts,
+    cuda: &Qwen35CudaFacts,
+) -> ForwardPlan {
+    dsl::trace_named("qwen3_5_moe_mlp_block.cuda.decode", |t| {
+        let y = dsl::input(t, facts.hidden);
+        moe_mlp_body_cuda(0, facts, cuda, &y, FireClass::Decode);
+    })
+}
+
+/// The MoE MLP block's CUDA reading — [`moe_mlp_body`]'s peer, naming
+/// the kernels the hand-written pass fires instead of leaving the
+/// selector and the combine opaque.
+///
+/// # Which leg this states, and why only one
+///
+/// `run_moe_mlp` reaches the same numbers four ways. Three of them are
+/// not rectangles:
+///
+/// - the ALIGNED/grouped leg pads routes into blocks, giving its
+///   intermediates `ceil((N*k + min(E, N*k)*(block-1)) / block) * block`
+///   rows — an extent no [`crate::trace::Dim`] spells;
+/// - the decode GEMV leg is a rectangle, but the aligned block size is
+///   8 or 16 and never 1, so the aligned leg always exists and the GEMV
+///   arm covers only `N * k < 64` (N <= 7 at top_k 8);
+/// - the HOST-routed general path reads the router back to the CPU and
+///   issues one gather/GEMM/scatter per expert, so its launch COUNT is a
+///   device-derived number.
+///
+/// The fused CUTLASS call is the fourth and the one decode actually
+/// takes: permute, both grouped GEMMs, the activation and the weighted
+/// finalize in ONE call producing `[Tokens, hidden]`. Its `bool` return
+/// is decided before the fire (see [`dsl::cuda::moe_fused_cutlass`]), so
+/// the leg is a fact plus a row bound.
+///
+/// Fires outside that bound do not get a guarded arm — a guard whose
+/// other arm cannot be stated refuses the whole plan. They DECLINE, the
+/// llama_like way: the plan states one rectangle and the driver's
+/// eligibility sends the rest to the hand-written path.
+///
+/// Everything this body refuses returns [`moe_mlp_body`] unchanged, so
+/// the refusal shows up where every other refusal does — as residue in
+/// the coverage ledger, naming its own cause.
+fn moe_mlp_body_cuda(
+    l: u32,
+    facts: &Qwen35MoeMlpFacts,
+    cuda: &Qwen35CudaFacts,
+    y: &Val,
+    class: FireClass,
+) -> Val {
+    // The fused leg is the decode fast path's. Prefill and the service
+    // classes take the host-routed path, as do a streamed expert cache
+    // (no fused slab to stride) and the force-general env; and a
+    // deployment that sized no CUTLASS workspace has no fused leg at
+    // all. tp>1 writes to scratch and follows with an allreduce, which
+    // is a different shape than the one stated here.
+    if class != FireClass::Decode
+        || cuda.moe_cutlass_max_rows == 0
+        || cuda.moe_streamed_experts
+        || cuda.moe_force_general
+        || !cuda.moe_residual_fold
+        || (facts.shared_expert_intermediate > 0 && !cuda.moe_shared_gate_dot)
+    {
+        return moe_mlp_body(l, facts, y);
+    }
+
+    let w = MoeLayerW::new(l, facts);
+    // The norm is stated rather than left semantic: every qwen3.5/3.6
+    // checkpoint but plain `qwen3_moe` takes the Gemma `(1 + w)` fold,
+    // and the lowering emits only the Plain kernel.
+    let m = match facts.norm_variant {
+        NormVariant::Gemma => dsl::cuda::rmsnorm_gemma(y, &w.mlp_norm),
+        NormVariant::Plain => rmsnorm(y, &w.mlp_norm),
+    };
+
+    // The router stays two ops — a plain GEMM for the logits, then the
+    // fused top-k/softmax/renormalize — because the fused call takes the
+    // routing as operands rather than computing it.
+    let logits = matmul(&m, &w.router);
+    let (experts, weights) = dsl::cuda::topk(&logits, facts.top_k);
+    let routed = dsl::cuda::moe_fused_cutlass(
+        &m,
+        &experts,
+        &weights,
+        &w.expert_gate_up,
+        &w.expert_down,
+        facts.hidden,
+    );
+
+    // The fused runner overwrites its output, so a folded residual costs
+    // a separate add — still one launch, and it is why the CUDA reading
+    // has no ResidualAdd at the end where the semantic body does.
+    let y = dsl::cuda::residual_add(&routed, y, facts.hidden);
+
+    if facts.shared_expert_intermediate == 0 {
+        return y;
+    }
+
+    // The shared expert is dense: two cuBLAS GEMMs around the chunked
+    // activation, then the landing accumulates into the stream the
+    // routed block already wrote.
+    let inter = facts.shared_expert_intermediate;
+    let act = dsl::cuda::swiglu(&matmul(&m, &w.shared_gate_up), inter, true);
+    let shared = matmul(&act, &w.shared_down);
+    dsl::cuda::sigmoid_dot_scalar_gate_add(&m, &w.shared_gate, &shared, &y, facts.hidden)
+}
+
 /// One qwen3_5 GDN (gated-deltanet) linear-attention block, traced
 /// standalone — the second fragment, and the other layer kind of the
 /// qwen3.5 hybrid.
@@ -1498,7 +1608,7 @@ pub fn qwen3_5_hybrid_cuda(
                 Qwen35MlpKind::Dense { intermediate } => {
                     dense_mlp_body(l, hidden, *intermediate, facts.norm_variant, &y_attn)
                 }
-                Qwen35MlpKind::Moe(moe) => moe_mlp_body(l, moe, &y_attn),
+                Qwen35MlpKind::Moe(moe) => moe_mlp_body_cuda(l, moe, cuda, &y_attn, class),
             };
         }
 

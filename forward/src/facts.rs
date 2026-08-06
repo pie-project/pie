@@ -775,6 +775,35 @@ pub struct Qwen35CudaFacts {
     /// back unchanged (the append-only discipline).
     #[serde(default)]
     pub verify_stash: bool,
+    /// `Qwen3_5MoeMlpWorkspace::cutlass_max_rows` — `min(max_tokens, 512)`
+    /// when `ops::flashinfer_cutlass_moe_enabled()` sized a workspace,
+    /// else 0. Zero means the fused leg does not exist on this
+    /// deployment; non-zero is the ROW BOUND of the MoE text, and fires
+    /// above it decline rather than the declaration guessing which of
+    /// the remaining three legs the pass would have taken.
+    #[serde(default)]
+    pub moe_cutlass_max_rows: u32,
+    /// `add_to_residual` — tp==1, so the MoE block's output lands on the
+    /// residual stream inside this pass. At tp>1 the block writes to
+    /// scratch and an allreduce follows, which is a different (and
+    /// unstated) shape.
+    #[serde(default)]
+    pub moe_residual_fold: bool,
+    /// The shared expert's gate weight is bound and unquantized, so its
+    /// landing is the fused dot form. False sends it to the
+    /// `[Tokens, 1]` GEMM plus a separate scalar-gate add, which this
+    /// text does not state.
+    #[serde(default)]
+    pub moe_shared_gate_dot: bool,
+    /// `Lw.expert_cache != nullptr` — the experts are paged one at a
+    /// time, so every device-side leg that strides a fused slab is off
+    /// the table and the pass takes the host-routed path.
+    #[serde(default)]
+    pub moe_streamed_experts: bool,
+    /// `qwen35_moe_force_general_path()` — the env that pins the pass to
+    /// the host-routed path regardless of shape.
+    #[serde(default)]
+    pub moe_force_general: bool,
 }
 
 impl Qwen35CudaFacts {
@@ -804,6 +833,19 @@ impl Qwen35CudaFacts {
             warp_tiled_max: 64,
             cached_max: 4096,
             verify_stash: true,
+            // The MoE fields describe the fused leg as the driver has it
+            // today: the CUTLASS workspace is always sized
+            // (`flashinfer_cutlass_moe_enabled()` returns true
+            // unconditionally), 512 is `kFusedMoeMaxRows`, tp=1 folds the
+            // residual, and neither the streamed-expert cache nor the
+            // force-general env is on by default. Synthetic like the rest
+            // of this fixture — the 0.8B checkpoint is dense and reaches
+            // none of them; they pin the MoE block's golden form.
+            moe_cutlass_max_rows: 512,
+            moe_residual_fold: true,
+            moe_shared_gate_dot: true,
+            moe_streamed_experts: false,
+            moe_force_general: false,
         }
     }
 }

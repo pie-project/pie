@@ -2,6 +2,8 @@
 
 #include "model/qwen3_5/declared_forward.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
+#include "model/qwen3_5/qwen3_5_moe_forward.hpp"
+#include "ops/flashinfer_moe.hpp"
 #include "store/recurrent_state_cache.hpp"
 
 #include <algorithm>
@@ -612,6 +614,40 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
     // cross-checks per commit fire (declared_facts.hpp).
     cuda.verify_stash = 1;
     out.cuda_verify_stash = true;
+
+    // The MoE block's terms. Only the fused CUTLASS leg is stated, so
+    // these say whether that leg exists and what row bound it carries;
+    // the trace refuses the block outright when any of them says no,
+    // and the fire declines above the bound.
+    if constexpr (kMoe) {
+        // 512 rather than `min(max_tokens, 512)`: the workspace is sized
+        // for `min(max_tokens, 512)` rows and no fire carries more than
+        // `max_tokens`, so the smaller term never binds. That is what
+        // lets this be derived here, where `max_tokens` is not in scope.
+        cuda.moe_cutlass_max_rows =
+            ops::flashinfer_cutlass_moe_enabled() ? 512u : 0u;
+        // `add_to_residual` is `(T == 1) && use_decode_fast_path`; the
+        // tp term is the deployment's, the other is the class's.
+        cuda.moe_residual_fold = (tp_size == 1) ? 1 : 0;
+        cuda.moe_force_general = qwen35_moe_force_general_path() ? 1 : 0;
+        // Streamed experts are a per-layer binding, but the pass reads
+        // one flag for the whole block, so disagreement between layers
+        // would already be a load bug. Any layer paging its experts
+        // takes the whole model off the device-side legs.
+        bool streamed = false;
+        bool shared_gate_dot = true;
+        for (const auto& lw : w.layers) {
+            if (lw.expert_cache != nullptr) streamed = true;
+            // The fused dot landing needs the gate bound and unquantized;
+            // a checkpoint with no shared expert never reads it, and the
+            // trace only consults this fact when it has one.
+            if (lw.shared_gate == nullptr || lw.shared_gate_quant.has_value()) {
+                shared_gate_dot = false;
+            }
+        }
+        cuda.moe_streamed_experts = streamed ? 1 : 0;
+        cuda.moe_shared_gate_dot = shared_gate_dot ? 1 : 0;
+    }
 
     // The digest naming what these traces were taken from — one format,
     // two printers (this and `emit_qwen35::facts_digest`); the live

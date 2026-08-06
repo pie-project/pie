@@ -114,6 +114,14 @@ fn committed_incs_are_regeneration_clean() {
                 warp_tiled_max: 64,
                 cached_max: 0,
                 verify_stash: true,
+                // Must mirror `bin/emit-cuda.rs` exactly — this test is
+                // the regeneration check. 0.8B is dense, so the MoE
+                // terms are the "no fused leg" values.
+                moe_cutlass_max_rows: 0,
+                moe_residual_fold: false,
+                moe_shared_gate_dot: false,
+                moe_streamed_experts: false,
+                moe_force_general: false,
             },
             "qwen3_5_0_8b",
         ),

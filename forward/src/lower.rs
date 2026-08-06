@@ -1079,6 +1079,45 @@ mod tests {
         out
     }
 
+    /// The MoE block's own ledger, and the argument for the fused leg.
+    ///
+    /// The SEMANTIC reading is residue — a selector, a combine and a
+    /// shared-expert landing that no kernel is named for. The CUDA
+    /// reading of the same fragment is a list of rectangles. Both halves
+    /// are asserted here because either one alone is half the claim: a
+    /// covered CUDA reading proves the statements exist, and an
+    /// uncovered semantic one proves they were needed.
+    #[test]
+    fn the_moe_block_covers_itself_only_in_its_cuda_reading() {
+        let facts = crate::facts::Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+        let cuda = crate::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+
+        // The semantic fragment names no backend at all, so it does not
+        // reach the residue ledger — it is refused before any op is
+        // read. That is the honest baseline: the MoE block had no CUDA
+        // reading, not a partial one.
+        let semantic = family::qwen3_5_moe_mlp_block(&facts);
+        assert!(
+            matches!(
+                lower(&semantic, &sampled(4), Fire::default()),
+                Err(Uncovered::UnknownBackend(_))
+            ),
+            "the semantic MoE block named a backend — if it was given a \
+             CUDA reading, this test is the one that should say so"
+        );
+
+        let declared = family::qwen3_5_moe_mlp_block_cuda(&facts, &cuda);
+        let out = lower(&declared, &sampled(4), Fire::default())
+            .unwrap_or_else(|e| panic!("the CUDA MoE block must lower: {e:?}"));
+        assert!(
+            out.residue.is_empty(),
+            "{} statements still owe a declaration: {:#?}",
+            out.residue.len(),
+            out.residue
+        );
+        assert_eq!(out.coverage(), 1.0);
+    }
+
     /// THE CUTOVER GATE. Every statement a live fire executes is a
     /// rectangle in the flat list — no residue, on every deployment the
     /// driver serves, in both classes, sampled and unsampled.

@@ -417,6 +417,17 @@ pub struct PieForwardQwen35CudaFacts {
     /// from the stash instead of re-running the GEMMs. Non-zero is true.
     /// Appended field (4c-iv) — the append-only struct discipline.
     pub verify_stash: u8,
+    /// The MoE block's row bound — `kFusedMoeMaxRows` (512) when the
+    /// CUTLASS workspace is sized, else 0 (no fused leg, no MoE text).
+    pub moe_cutlass_max_rows: u32,
+    /// `add_to_residual` (tp==1). Non-zero is true.
+    pub moe_residual_fold: u8,
+    /// The shared expert's gate takes the fused dot landing.
+    pub moe_shared_gate_dot: u8,
+    /// The experts are paged, so the pass is host-routed.
+    pub moe_streamed_experts: u8,
+    /// `qwen35_moe_force_general_path()`.
+    pub moe_force_general: u8,
 }
 
 fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts {
@@ -426,6 +437,11 @@ fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts 
         warp_tiled_max: facts.warp_tiled_max,
         cached_max: facts.cached_max,
         verify_stash: facts.verify_stash != 0,
+        moe_cutlass_max_rows: facts.moe_cutlass_max_rows,
+        moe_residual_fold: facts.moe_residual_fold != 0,
+        moe_shared_gate_dot: facts.moe_shared_gate_dot != 0,
+        moe_streamed_experts: facts.moe_streamed_experts != 0,
+        moe_force_general: facts.moe_force_general != 0,
     }
 }
 

@@ -1,0 +1,251 @@
+{
+  "family": "qwen3_5_moe_mlp_block.cuda.decode",
+  "values": [
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    }
+  ],
+  "ops": [
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.0.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        1
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        2
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_topk_softmax_bf16"
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        3,
+        4
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ops::flashinfer_cutlass_moe_bf16",
+          "weights": [
+            "layer.0.expert.{e}.gate_up",
+            "layer.0.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        1,
+        3,
+        4
+      ],
+      "outputs": [
+        5
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_residual_add_bf16"
+        }
+      },
+      "inputs": [
+        5,
+        0
+      ],
+      "outputs": [
+        6
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.shared_expert.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        7
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
+        }
+      },
+      "inputs": [
+        7
+      ],
+      "outputs": [
+        8
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.shared_expert.down",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        8
+      ],
+      "outputs": [
+        9
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_sigmoid_dot_scalar_gate_add_bf16",
+          "weights": [
+            "layer.0.shared_expert_gate"
+          ]
+        }
+      },
+      "inputs": [
+        1,
+        6,
+        9
+      ],
+      "outputs": [
+        10
+      ],
+      "layer": 0
+    }
+  ]
+}

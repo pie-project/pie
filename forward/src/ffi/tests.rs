@@ -860,6 +860,12 @@ fn c_cuda_facts_synthetic() -> PieForwardQwen35CudaFacts {
         warp_tiled_max: 64,
         cached_max: 4096,
         verify_stash: 1,
+        // Mirrors `Qwen35CudaFacts::qwen3_5_0_8b_synthetic`'s MoE terms.
+        moe_cutlass_max_rows: 512,
+        moe_residual_fold: 1,
+        moe_shared_gate_dot: 1,
+        moe_streamed_experts: 0,
+        moe_force_general: 0,
     }
 }
 

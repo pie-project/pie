@@ -168,6 +168,14 @@ fn main() {
                 warp_tiled_max: 64,
                 cached_max: 0,
                 verify_stash: true,
+                // 0.8B is DENSE — it reaches no MoE op, so these are the
+                // "no fused leg" values and the emitted body is unchanged
+                // by them. A MoE emission target would set them live.
+                moe_cutlass_max_rows: 0,
+                moe_residual_fold: false,
+                moe_shared_gate_dot: false,
+                moe_streamed_experts: false,
+                moe_force_general: false,
             },
             "qwen3_5_0_8b",
         ),

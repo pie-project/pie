@@ -575,6 +575,24 @@ struct PieForwardQwen35CudaFacts {
   /// from the stash instead of re-running the GEMMs. Non-zero is true.
   /// Appended field (4c-iv) — the append-only struct discipline.
   uint8_t verify_stash;
+  /// The MoE block's row bound: `kFusedMoeMaxRows` (512) when
+  /// `ops::flashinfer_cutlass_moe_enabled()` sized a workspace, else 0.
+  /// The workspace is `min(max_tokens, 512)` rows and no fire exceeds
+  /// `max_tokens`, so 512 is the bound whatever `max_tokens` is. Zero
+  /// means the deployment has no fused leg and the MoE block is not
+  /// stated at all. Appended field — the append-only struct discipline.
+  uint32_t moe_cutlass_max_rows;
+  /// `add_to_residual`: tp==1, so the MoE output lands on the residual
+  /// stream inside this pass. Non-zero is true.
+  uint8_t moe_residual_fold;
+  /// The shared expert's gate weight is bound unquantized, so its
+  /// landing is the fused dot form. Non-zero is true.
+  uint8_t moe_shared_gate_dot;
+  /// `Lw.expert_cache != nullptr`: experts are paged one at a time, so
+  /// the pass takes the host-routed path. Non-zero is true.
+  uint8_t moe_streamed_experts;
+  /// `qwen35_moe_force_general_path()`. Non-zero is true.
+  uint8_t moe_force_general;
 };
 
 /// One row of a fire as the engine's seriation ordered them — the input
