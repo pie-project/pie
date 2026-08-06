@@ -109,7 +109,7 @@ void Gemma4Model::body(Workspace& ws,
     if (declared_eligible &&
         gemma4_forward_declared(
             declared_, weights_, hf_config_, fwd_cfg_, ws, moe_ws_, kv,
-            attn_ws, cublas, in.token_ids, in.positions,
+            attn_ws, cublas, in.token_ids, in.positions, in.qo_indptr_d,
             in.kv_page_indices_d, in.kv_page_indptr_d, in.kv_last_page_lens_d,
             in.kv_page_indptr_h, in.total_tokens, in.num_requests,
             in.row_valid_d, in.logit_row_indices_d, in.num_logit_rows)) {

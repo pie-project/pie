@@ -184,6 +184,7 @@ bool gemma4_forward_declared(
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
@@ -308,11 +309,11 @@ bool gemma4_forward_declared(
             if (nm.field == "attn_norm") {
                 // Layer 0's only: every later layer's input norm arrives
                 // fused into the previous layer's PLE landing.
-                kernels::launch_rmsnorm_gemma_bf16(
+                kernels::launch_rmsnorm_bf16(
                     ws.y.data(), require(w, name).data(), ws.norm_x.data(),
                     N, H, eps, stream);
             } else if (nm.field == "final_norm") {
-                kernels::launch_rmsnorm_gemma_bf16(
+                kernels::launch_rmsnorm_bf16(
                     ws.y.data(), require(w, name).data(), ws.norm_x.data(),
                     N, H, eps, stream);
             } else {
@@ -324,15 +325,15 @@ bool gemma4_forward_declared(
             const std::string_view name = plan.weight_name(op);
             const ParsedName nm = parse_name(name);
             if (nm.field == "ple_model_norm") {
-                kernels::launch_rmsnorm_gemma_bf16(
+                kernels::launch_rmsnorm_bf16(
                     per_layer_proj, require(w, name).data(), per_layer_proj,
                     N * L, ple_dim, eps, stream);
             } else if (nm.field == "q_norm") {
-                kernels::launch_rmsnorm_gemma_bf16(
+                kernels::launch_rmsnorm_bf16(
                     ws.q.data(), require(w, name).data(), ws.q.data(),
                     N * cfg.num_attention_heads, cur_d, eps, stream);
             } else if (nm.field == "k_norm") {
-                kernels::launch_rmsnorm_gemma_bf16(
+                kernels::launch_rmsnorm_bf16(
                     ws.k.data(), require(w, name).data(), ws.k.data(),
                     N * (cur_hk / cur_d), cur_d, eps, stream);
             } else {
@@ -454,10 +455,14 @@ bool gemma4_forward_declared(
                 break;
             case G4Kernel::WriteKvToPages: {
                 auto kv_view = cache.layer_view(cur_layer);
+                // The fourth argument is `qo_indptr`, not an optional.
+                // It was passed as nullptr on an assumption, and the
+                // kernel dereferenced it — the illegal access this
+                // drive faulted with on its first live fire.
                 kernels::launch_write_kv_to_pages(
-                    kv_view, ws.k.data(), ws.v.data(), nullptr,
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    N, R, stream);
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, N, R, stream, row_valid_d);
                 break;
             }
             case G4Kernel::AttnFlashinferDecode: {
@@ -505,9 +510,17 @@ bool gemma4_forward_declared(
                 // MLP's input norm) and the PLE landing (norm_y -> y, then
                 // the NEXT layer's input norm).
                 const bool ple = nm.field == "ple_norm";
+                // The PLE landing carries the layer's own scalar; the
+                // attention landing carries 1. The declaration does not
+                // state it — it is a per-layer load-time constant the
+                // executor reads the way the hand-written pass does.
+                const float scale =
+                    ple ? w.layers[static_cast<std::size_t>(cur_layer)]
+                              .layer_scalar_value
+                        : 1.f;
                 kernels::launch_rmsnorm_residual_add_scale_rmsnorm_bf16(
                     ple ? ws.norm_y.data() : ws.norm_x.data(),
-                    require(w, first).data(), ws.y.data(), 1.f,
+                    require(w, first).data(), ws.y.data(), scale,
                     require(w, aux(1)).data(), ws.norm_x.data(),
                     N, H, eps, stream);
                 break;

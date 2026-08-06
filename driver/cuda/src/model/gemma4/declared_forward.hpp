@@ -54,6 +54,7 @@ bool gemma4_forward_declared(
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,

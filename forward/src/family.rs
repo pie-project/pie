@@ -3216,17 +3216,20 @@ impl Gemma4LayerW {
             width,
             layer: Some(l),
         };
-        // gemma-4 folds `(1 + w)` on every norm of the block, like every
-        // Gemma generation before it.
+        // PLAIN, despite the family name: `gemma4.cpp` fires
+        // `launch_rmsnorm_bf16` at all fourteen of its norm sites and
+        // `launch_rmsnorm_gemma_bf16` at none. The `(1 + w)` fold is
+        // done to the tensors at LOAD for this family, so a declaration
+        // that stated Gemma would be stating a second fold.
         let norm = |name: &str| NormW {
             name: w(name),
-            variant: NormVariant::Gemma,
+            variant: NormVariant::Plain,
             per_head: None,
             layer: Some(l),
         };
         let head_norm = |name: &str| NormW {
             name: w(name),
-            variant: NormVariant::Gemma,
+            variant: NormVariant::Plain,
             per_head: Some(d),
             layer: Some(l),
         };
@@ -3320,7 +3323,7 @@ pub fn gemma4_cuda(
             &scaled,
             &NormW {
                 name: "ple_model_norm".into(),
-                variant: NormVariant::Gemma,
+                variant: NormVariant::Plain,
                 per_head: Some(facts.ple_dim),
                 layer: None,
             },
@@ -3452,7 +3455,7 @@ pub fn gemma4_cuda(
             &y,
             &NormW {
                 name: "final_norm".into(),
-                variant: NormVariant::Gemma,
+                variant: NormVariant::Plain,
                 per_head: None,
                 layer: None,
             },
