@@ -1546,7 +1546,7 @@ bool moe_block(
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.aligned_expert_ids.data(),
                                 /*route_to_aligned_row=*/nullptr,
-                                routes, E, block, routed_blocks, stream);
+                                routes, E, block, routed_blocks, /*num_tokens_past_padded=*/nullptr, stream);
                                 });
                             profile_cuda_detail_stage(
                                 profile, profile ? &profile->moe_gather_ms : nullptr,

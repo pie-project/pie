@@ -922,6 +922,22 @@ if(PIE_CUDA_BUILD_MARLIN)
   target_include_directories(pie_driver_cuda_lib PRIVATE
     third_party/marlin)
   target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
+
+  # The expert-indexed MoE variant of the same kernel. Separate directory and
+  # namespace (`marlin_moe_wna16`) so it can be built and revised without
+  # touching the single-problem path above; `ops.cu` includes its generated
+  # instantiation for the same CUDA-13 linkage reason marlin.cu does.
+  #
+  # The generator is pruned to MXFP4 (bf16 x FE2M1 -> bf16, E8M0 scales): that
+  # is the only configuration a pie model reaches, and every extra quant config
+  # is another multi-minute nvcc translation unit on a build whose critical
+  # path marlin already is.
+  target_sources(pie_driver_cuda_lib PRIVATE
+    third_party/marlin_moe/ops.cu
+    third_party/marlin_moe/marlin_moe_wrapper.cpp)
+  target_include_directories(pie_driver_cuda_lib PRIVATE
+    third_party/marlin_moe)
+  target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN_MOE=1)
 endif()
 
 # FlashInfer Mamba SSU on Hopper/Blackwell gates the vertical/horizontal
