@@ -70,6 +70,11 @@ inline std::size_t value_bytes(const PieForwardValue& value, int n_fire,
     std::size_t width = 2;  // BF16
     switch (value.dtype) {
     case PieForwardDType::BF16: width = 2; break;
+    // Added with the dtype itself (gpt-oss's MXFP4 GEMVs cast their
+    // activation). The initializer already gave it the right answer, so
+    // this arm changes no number — it is here because a non-exhaustive
+    // switch cannot tell a reader whether that was intended.
+    case PieForwardDType::F16:  width = 2; break;
     case PieForwardDType::F32:  width = 4; break;
     case PieForwardDType::I32:  width = 4; break;
     }
