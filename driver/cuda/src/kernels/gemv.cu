@@ -11,6 +11,14 @@ namespace {
 // One warp per output row. Each lane walks the row in float4 strides (8
 // bf16 = 16 B, so a warp step covers 512 B — four full cache lines) and
 // accumulates in fp32; a single shuffle tree finishes the dot product.
+//
+// The walk is unrolled by `kUnroll` and the loads are hoisted above the math
+// that consumes them. That is the whole reason for the unroll: written the
+// obvious way each lane has exactly ONE load in flight, because the FMA on
+// `w4[i]` is the next instruction after it, and a warp that is waiting on a
+// single HBM round trip cannot cover the latency no matter how many warps the
+// SM holds. Measured on an H100 at gpt-oss's o_proj shape (N=2880, K=4096,
+// 23.6 MB per layer) the one-at-a-time version sustained about 963 GB/s.
 template <int kWarps>
 __global__ void gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ weight,
@@ -25,8 +33,30 @@ __global__ void gemv_bf16_kernel(
         reinterpret_cast<const float4*>(weight + (long long)row * K);
     const float4* x4 = reinterpret_cast<const float4*>(act);
     const int vectors = K / 8;
+    constexpr int kUnroll = 4;
     float acc = 0.f;
-    for (int i = threadIdx.x; i < vectors; i += 32) {
+    int i = threadIdx.x;
+    for (; i + 32 * (kUnroll - 1) < vectors; i += 32 * kUnroll) {
+        float4 wv[kUnroll];
+        float4 xv[kUnroll];
+        #pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            wv[u] = w4[i + 32 * u];
+            xv[u] = x4[i + 32 * u];
+        }
+        #pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const __nv_bfloat16* wb =
+                reinterpret_cast<const __nv_bfloat16*>(&wv[u]);
+            const __nv_bfloat16* xb =
+                reinterpret_cast<const __nv_bfloat16*>(&xv[u]);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+            }
+        }
+    }
+    for (; i < vectors; i += 32) {
         float4 wv = w4[i];
         float4 xv = x4[i];
         const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
