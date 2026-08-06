@@ -63,6 +63,7 @@ struct Gemma4ForwardProfile {
     float attention_ms = 0.f;
     float attn_out_ms = 0.f;
     float mlp_ms = 0.f;
+    float mlp_moe_ms = 0.f;
     float ple_residual_ms = 0.f;
     float final_norm_ms = 0.f;
     float lm_head_ms = 0.f;
@@ -190,6 +191,7 @@ void maybe_print_gemma4_forward_profile(
         << " attention_ms=" << p.attention_ms
         << " attn_out_ms=" << p.attn_out_ms
         << " mlp_ms=" << p.mlp_ms
+        << " mlp_moe_ms=" << p.mlp_moe_ms
         << " ple_residual_ms=" << p.ple_residual_ms
         << " final_norm_ms=" << p.final_norm_ms
         << " lm_head_ms=" << p.lm_head_ms
@@ -241,13 +243,16 @@ constexpr std::size_t kGemma4RowDecodeMaxPageRefs = std::size_t{1} << 20;
 constexpr int kGemma4MoeGemvMaxTokens = 1;
 
 bool gemma4_dense_gate_up_fused_enabled(const HfConfig& cfg) {
-    return !cfg.gemma4_enable_moe &&
-           cfg.hidden_size == 2560 &&
-           cfg.intermediate_size == 10240 &&
-           cfg.num_hidden_layers == 42 &&
-           cfg.num_attention_heads == 8 &&
-           cfg.num_key_value_heads == 2 &&
-           cfg.head_dim == 256;
+    // Presence of the bank decides, not the shape. `dense_fused_projection_joins`
+    // publishes `mlp.gate_up_proj.fused.weight` for every Gemma-4 that fits its
+    // byte budget, and the consumer is shape-agnostic -- one GEMM plus the same
+    // chunked GeGLU the split path runs. The allowlist this replaces named the
+    // one checkpoint the fused path had been tried on, which left 26B-A4B
+    // issuing two M=1 GEMVs per layer where one would do; `optional_tensor`
+    // already yields null when the join did not run, so an absent bank falls
+    // back on its own.
+    (void)cfg;
+    return true;
 }
 
 bool gemma4_dense_gate_up_fused_for_row_decode(const HfConfig& cfg) {
@@ -671,7 +676,13 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     Gemma4Weights w;
     const bool fuse_dense_gate_up = gemma4_dense_gate_up_fused_enabled(cfg);
     const bool fuse_dense_qkv =
-        !cfg.gemma4_enable_moe;
+        // Same rule as the gate/up bank: ask for it, and let the per-layer
+        // guards below plus `optional_tensor` decide. A layer that reads its
+        // K/V from elsewhere (`is_shared`) or derives V from K
+        // (`use_k_as_v`, Gemma-4's k_eq_v full-attention layers) still
+        // declines, so 26B-A4B fuses its 25 sliding layers and leaves the
+        // 5 full ones split.
+        true;
     const std::string p = kPrefix;
     w.embed           = &must(engine, p + "embed_tokens.weight");
     // PLE (Per-Layer Embeddings) machinery is optional — Gemma-4 E2B /
@@ -1986,8 +1997,10 @@ void gemma4_forward_paged(
                 ws.norm_x.data(), layer.mlp_norm_post_dense->data(),
                 ws.norm_y.data(), N, H, eps, stream);
             // experts → moe_ws.moe_out (raw, no post-norm).
-            gemma4_moe_block(layer, cfg, ws, moe_ws, N, is_pure_decode,
-                             cublas, stream);
+            profile_gemma4_cuda_stage(profile, profile.mlp_moe_ms, stream, [&] {
+                gemma4_moe_block(layer, cfg, ws, moe_ws, N, is_pure_decode,
+                                 cublas, stream);
+            });
             // branch_2 = post_feedforward_layernorm_2(moe_out) → norm_x
             // (norm_x's prior contents — dense_out — are no longer
             // needed).
