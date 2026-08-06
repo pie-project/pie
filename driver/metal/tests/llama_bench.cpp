@@ -634,21 +634,49 @@ int main(int argc, char** argv) {
             // affine g64. The key is what the config says, not what any one
             // tensor is, which is the same thing every other row's group means.
             //
-            // These answers are NOT mlx-lm's, whatever the Gemma-4-26B comment's
-            // "every other row" says. Fed the same twelve ids, mlx-lm greedy
-            // answers 13 279 410 12038 142760 1328 -- the same four tokens and
-            // then a different fifth. So this row is pinned to an arithmetic
-            // like the 26B's is, and the same care applies to moving it.
+            // On `kQwen36Prompt`, and for the reason the `want_prompt` field
+            // exists. gpt-oss is the only o200k vocabulary here, and it reads
+            // `kGatePrompt` as `िstenidikanل cloud.ultstenid oppل` -- not a
+            // sentence in any language, so the model has nothing to be
+            // confident about and the gate was measuring a coin flip. It was
+            // caught the way the gemma-4-31b row was, by a chip: this row is
+            // the only one of the five that failed on an M4 Pro, and mlx-lm's
+            // own top-2 margins on that prompt say why.
             //
-            // That is what stops the dense projections from taking the FP16
-            // GEMM the other families take. It is worth ~4.5% here, and the
-            // objection is measured rather than assumed: activation taps say
-            // FP16 costs about one bf16 ulp per projection, which is ordinary,
-            // but under it this checkpoint tracks mlx-lm for TWO tokens where
-            // BF16 tracks it for four. A ulp that halves the agreement with the
-            // only outside reference there is has not earned the 4.5%.
-            {"gpt-oss-20b", 24, 32, 4, 2880, 32, {13, 279, 410, 12038, 410, 25},
-             {785, 6722, 315, 9625, 1455, 12095}},
+            //     step        1     2     3     4      5      6
+            //     margin    0.50  1.25  0.25  0.00   2.88   1.75
+            //
+            // Step four is an EXACT tie, and step three is a quarter of a
+            // logit. Both engines duly disagree with themselves across
+            // machines: mlx-lm answered 13 279 410 12038 142760 1328 on the
+            // M1 Max and 13 279 410 16 13 410 on the M4, and this driver
+            // answered 13 279 410 12038 410 25 on the one and
+            // 13 279 3206 7890 484 290 on the other -- three tokens, four
+            // answers. Nothing about the arithmetic was wrong: the long gate
+            // below, which is 192 rows through the batched mixture, passes
+            // 6/6 on both machines unchanged.
+            //
+            // `kQwen36Prompt` reads as `1, 2, 3, 4, 5, 6, 7, 8,` in o200k as
+            // well -- the digit and space ids coincide -- so the row costs no
+            // new constant, and its margins are the ones a gate can stand on:
+            //
+            //     step        1     2     3     4      5      6
+            //     margin    3.81  5.19  2.81  3.00   3.00   2.81
+            //
+            // 2.81 is the floor, against 2.0 on Qwen3.6-35B-A3B, which is the
+            // tightest of the four rows that were passing already. The answer
+            // is mlx-lm's on this prompt, and this driver reproduces it on the
+            // M4; the continuation spells ` 9, 10,` and diverges from the
+            // Qwen3.6 rows at step five only because `10` is one token there
+            // and two here.
+            //
+            // The FP16 note this comment used to carry is now recorded where
+            // the switch is, in `device_tuning.hpp`: the dense projections do
+            // not take the FP16 GEMM here, and `PIE_METAL_FP16_QMM=0` and `=1`
+            // produce bit-identical continuations on this checkpoint, so it
+            // was never this row's evidence for anything.
+            {"gpt-oss-20b", 24, 32, 4, 2880, 32, {220, 24, 11, 220, 702, 11},
+             {785, 6722, 315, 9625, 1455, 12095}, kQwen36Prompt},
             // The same Llama-3.2-1B at 8 bits. It is here because it is the
             // only row that exercises a width other than 4 across a WHOLE
             // model -- the embedding gather, every projection, the batched
