@@ -149,6 +149,74 @@ __global__ void gemv_splitk_bf16_kernel(
     out[row] = v;
 }
 
+// Three projections, one launch, one grid.
+//
+// q/k/v share an activation and differ only in their weight and row count, and
+// running them separately leaves the two small ones alone on the device. At
+// gpt-oss's decode shape the tuner measures q (N=4096) at 11.2 us and 2.1 TB/s
+// but k and v (N=512) at 6.0 us each for an eighth of the bytes -- 0.5 TB/s,
+// because 512 rows is not enough grid to cover the memory latency whatever the
+// kernel does with them. Concatenating the grids gives the small two the same
+// occupancy the large one already had, for exactly the same traffic. vLLM
+// arrives at the same place from the other direction, by fusing the weights at
+// load and issuing one GEMM.
+template <int kWarps>
+__global__ void gemv3_bf16_kernel(
+    const __nv_bfloat16* __restrict__ w0,
+    const __nv_bfloat16* __restrict__ w1,
+    const __nv_bfloat16* __restrict__ w2,
+    const __nv_bfloat16* __restrict__ b0,
+    const __nv_bfloat16* __restrict__ b1,
+    const __nv_bfloat16* __restrict__ b2,
+    __nv_bfloat16* __restrict__ o0,
+    __nv_bfloat16* __restrict__ o1,
+    __nv_bfloat16* __restrict__ o2,
+    const __nv_bfloat16* __restrict__ act,
+    int n0, int n1, int n2, int K)
+{
+    int row = blockIdx.x;
+    const __nv_bfloat16* weight;
+    const __nv_bfloat16* bias;
+    __nv_bfloat16* out;
+    if (row < n0)            { weight = w0; bias = b0; out = o0; }
+    else if (row < n0 + n1)  { row -= n0;      weight = w1; bias = b1; out = o1; }
+    else                     { row -= n0 + n1; weight = w2; bias = b2; out = o2; }
+
+    const int warp = threadIdx.y;
+    const float4* w4 =
+        reinterpret_cast<const float4*>(weight + (long long)row * K);
+    const float4* x4 = reinterpret_cast<const float4*>(act);
+    const int vectors = K / 8;
+
+    float acc = 0.f;
+    for (int i = warp * 32 + threadIdx.x; i < vectors; i += kWarps * 32) {
+        float4 wv = w4[i];
+        float4 xv = x4[i];
+        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
+        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    __shared__ float partial[kWarps];
+    if (threadIdx.x == 0) partial[warp] = acc;
+    __syncthreads();
+    if (warp != 0 || threadIdx.x != 0) return;
+    float total = 0.f;
+    #pragma unroll
+    for (int w = 0; w < kWarps; ++w) total += partial[w];
+    __nv_bfloat16 v = __float2bfloat16(total);
+    if (bias != nullptr) {
+        v = __float2bfloat16(__bfloat162float(v) + __bfloat162float(bias[row]));
+    }
+    out[row] = v;
+}
+
 bool aligned16(const void* p) {
     return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0;
 }
@@ -204,6 +272,41 @@ bool launch_gemv_bf16(
             static_cast<const __nv_bfloat16*>(bias),
             static_cast<__nv_bfloat16*>(out),
             N, K, beta);
+    return true;
+}
+
+bool launch_gemv3_bf16(
+    const void* w0, const void* w1, const void* w2,
+    const void* b0, const void* b1, const void* b2,
+    void* o0, void* o1, void* o2,
+    const void* act,
+    int n0, int n1, int n2, int K,
+    cudaStream_t stream)
+{
+    if (n0 <= 0 || n1 <= 0 || n2 <= 0 || K <= 0 || (K % 8) != 0) return false;
+    if (w0 == nullptr || w1 == nullptr || w2 == nullptr || act == nullptr) {
+        return false;
+    }
+    if (o0 == nullptr || o1 == nullptr || o2 == nullptr) return false;
+    if (!aligned16(w0) || !aligned16(w1) || !aligned16(w2) ||
+        !aligned16(act)) {
+        return false;
+    }
+    constexpr int kSplitWarps = 8;
+    gemv3_bf16_kernel<kSplitWarps>
+        <<<dim3(static_cast<unsigned>(n0 + n1 + n2)), dim3(32, kSplitWarps), 0,
+           stream>>>(
+            static_cast<const __nv_bfloat16*>(w0),
+            static_cast<const __nv_bfloat16*>(w1),
+            static_cast<const __nv_bfloat16*>(w2),
+            static_cast<const __nv_bfloat16*>(b0),
+            static_cast<const __nv_bfloat16*>(b1),
+            static_cast<const __nv_bfloat16*>(b2),
+            static_cast<__nv_bfloat16*>(o0),
+            static_cast<__nv_bfloat16*>(o1),
+            static_cast<__nv_bfloat16*>(o2),
+            static_cast<const __nv_bfloat16*>(act),
+            n0, n1, n2, K);
     return true;
 }
 

@@ -21,6 +21,7 @@
 #include "kernels/deinterleave.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
+#include "kernels/gemv.hpp"
 #include "kernels/residual_add.hpp"
 #include "kernels/kv_paged.hpp"
 #include "kernels/moe_dispatch.hpp"
@@ -739,6 +740,23 @@ void mixtral_forward_paged(
         // Bias folded into the projection: at decode these route to the
         // warp-per-row GEMV, whose epilogue absorbs it for free. gpt-oss
         // biases all three, so this is 3 launches per layer removed.
+        // At one token the three projections share an activation and differ
+        // only in row count, and issuing them separately leaves k and v -- 512
+        // rows against q's 4096 -- alone on a device they cannot fill. One
+        // launch over the concatenated grid moves the same bytes and lets them
+        // ride q's occupancy. Only at N=1: above that the GEMM has rows of its
+        // own to work with and cuBLAS is the better answer.
+        const bool fused_qkv_gemv =
+            N == 1 &&
+            kernels::launch_gemv3_bf16(
+                layer.q_proj->data(), layer.k_proj->data(),
+                layer.v_proj->data(),
+                layer.q_bias ? layer.q_bias->data() : nullptr,
+                layer.k_bias ? layer.k_bias->data() : nullptr,
+                layer.v_bias ? layer.v_bias->data() : nullptr,
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                ws.norm_x.data(), Hq, Hk, Hk, H, stream);
+        if (!fused_qkv_gemv) {
         ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
             ws.norm_x.data(), layer.q_proj->data(),
             layer.q_bias ? layer.q_bias->data() : nullptr,
@@ -751,6 +769,7 @@ void mixtral_forward_paged(
             ws.norm_x.data(), layer.v_proj->data(),
             layer.v_bias ? layer.v_bias->data() : nullptr,
             ws.v.data(), N, Hk, H, stream);
+        }
 
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
