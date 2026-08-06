@@ -683,20 +683,39 @@ std::size_t flashinfer_cutlass_moe_workspace_bytes(
         num_experts <= 0 || experts_per_token <= 0) {
         return 0;
     }
-    Runner& runner = get_runner();
-    const std::size_t bytes = runner.getWorkspaceSize(
-        num_rows,
-        hidden_size,
-        inter_size,
-        num_experts,
-        experts_per_token,
-        to_cutlass_activation(activation),
-        parallelism_config(tp_size, tp_rank),
-        false,
-        false,
-        false,
-        false,
-        false);
+    // A workspace query is also the arch probe: `getWorkspaceSize` walks the
+    // TMA warp-specialized configs and throws when none of them has a
+    // compiled launcher for this SM. The vendored generated units cover sm80
+    // and (behind `PIE_HAS_SM100`) sm100, so on Hopper every config is
+    // unbacked and the query throws "Could not find valid config when
+    // calculating workspace size" — which used to abort load_model outright.
+    // Reporting zero is what the callers already handle: they leave
+    // `cutlass_ws` empty and take the non-fused expert path, the same
+    // fallback the sm100-without-Blackwell-kernels case was written for.
+    std::size_t bytes = 0;
+    try {
+        Runner& runner = get_runner();
+        bytes = runner.getWorkspaceSize(
+            num_rows,
+            hidden_size,
+            inter_size,
+            num_experts,
+            experts_per_token,
+            to_cutlass_activation(activation),
+            parallelism_config(tp_size, tp_rank),
+            false,
+            false,
+            false,
+            false,
+            false);
+    } catch (const std::exception& e) {
+        std::fprintf(
+            stderr,
+            "[pie-driver-cuda] FlashInfer CUTLASS MoE unavailable on this "
+            "device (%s); falling back to the unfused expert path\n",
+            e.what());
+        return 0;
+    }
     if (log_enabled()) {
         std::fprintf(
             stderr,
