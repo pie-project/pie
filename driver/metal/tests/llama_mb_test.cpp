@@ -202,11 +202,11 @@ void check_tiling_agrees(const char* who, const LlamaGeometry& g) {
                 const int bm = rows == 64 && requests == 64 ? 32 : qmm_bm(m);
                 if (const int split = llama_qmm_split(d.kind, g, m, requests); split > 1) {
                     qmm_t_splitk_dispatch(qmv_kn(d.kind, g).N,
-                                          llama_qmm_rows(m, requests), bm, split,
+                                          llama_qmm_rows(g, m, requests), bm, split,
                                           want, want_tg);
                 } else {
                     qmm_t_dispatch(qmv_kn(d.kind, g).N,
-                                   llama_qmm_rows(m, requests), bn, bm, want, want_tg);
+                                   llama_qmm_rows(g, m, requests), bn, bm, want, want_tg);
                 }
                 if (!same(grid, want) || !same(tg, want_tg)) ++disagreed;
             }
@@ -231,14 +231,14 @@ void check_routed_never_gemm(const LlamaGeometry& g) {
 }
 
 /// The GEMM writes its padding rows for real. They must fit.
-void check_padding_fits() {
+void check_padding_fits(const LlamaGeometry& g) {
     std::printf("\n-- the GEMM's padding stays inside the pool --\n");
     int over = 0;
     for (int max_rows = 1; max_rows <= 256; ++max_rows) {
         const int pool = llama_qmm_pool_rows(max_rows);
         if (pool < max_rows) ++over;
         for (int rows = 1; rows <= max_rows; ++rows) {
-            if (llama_qmm_rows(rows) > pool) ++over;
+            if (llama_qmm_rows(g, rows) > pool) ++over;
         }
     }
     expect_eq(over, 0, "every batch's padded row count fits the pool sized for the maximum");
@@ -246,14 +246,14 @@ void check_padding_fits() {
     // Below the GEMM's minimum batch the matvec runs and there is no padding at
     // all -- padding there would be pure waste on the decode path, which is
     // every step of a normal generation.
-    expect_eq(llama_qmm_rows(1), 1, "a decode is not padded");
+    expect_eq(llama_qmm_rows(g, 1), 1, "a decode is not padded");
     // Read, not restated: the minimum batch became a property of the device
     // rather than a constant, so the test has to ask the same question the
     // dispatch does.
-    const int min_batch = pie::metal::qmm_min_batch();
-    expect_eq(llama_qmm_rows(min_batch - 1), min_batch - 1,
+    const int min_batch = pie::metal::qmm_min_batch(g.is_moe());
+    expect_eq(llama_qmm_rows(g, min_batch - 1), min_batch - 1,
               "nothing below the GEMM's minimum batch is padded");
-    expect(llama_qmm_rows(min_batch) >= min_batch,
+    expect(llama_qmm_rows(g, min_batch) >= min_batch,
            "at the minimum batch the rows round up to a tile");
 }
 
@@ -331,7 +331,10 @@ int main() {
     check_degenerates_to_m1("qwen3-moe (routed)", moe());
     check_tiling_agrees("llama-3 (dense)", base());
     check_routed_never_gemm(moe());
-    check_padding_fits();
+    // Both shapes: the crossover differs between them, so a pool that held
+    // the dense padding is not evidence that it holds the routed one.
+    check_padding_fits(base());
+    check_padding_fits(moe());
     check_rows_widen(base());
     check_head_rows(base());
     check_pool_scales(moe());

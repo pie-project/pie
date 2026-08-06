@@ -353,9 +353,9 @@ std::vector<int> llama_run_ends(const std::vector<Dispatch>& dag) {
     return ends;
 }
 
-int llama_qmm_rows(int rows, int requests) {
+int llama_qmm_rows(const LlamaGeometry& g, int rows, int requests) {
     const int n = rows < 1 ? 1 : rows;
-    if (n < qmm_min_batch()) return n;
+    if (n < qmm_min_batch(g.is_moe())) return n;
     const int bm = llama_dense_qmm_bm(n, requests);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -389,7 +389,8 @@ int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows, int requests) {
     if (!llama_is_dense_proj(k)) return 0;
     const KN kn = qmv_kn(k, g);
     if (kn.N == 0) return 0;
-    const int bn = qmm_bn(kn.N, llama_qmm_rows(rows, requests));
+    const int bn = qmm_bn(kn.N, llama_qmm_rows(g, rows, requests),
+                          qmm_min_batch(g.is_moe()));
     if (k == Kind::LmHead && bn > 0) return 32;
     return bn;
 }
@@ -407,13 +408,13 @@ int llama_qmm_split(Kind k, const LlamaGeometry& g, int rows, int requests) {
         const int bm = llama_dense_qmm_bm(rows, requests);
         const int tiles =
             (kn.N / kQmmSplitBN) *
-            ((llama_qmm_rows(rows, requests) + bm - 1) / bm);
+            ((llama_qmm_rows(g, rows, requests) + bm - 1) / bm);
         // This checkpoint's gate/up grid already has 256 threadgroups. A
         // second K partition only adds a full-output reduce; measured at
         // batch 32 it is 1.7% slower.
         if (tiles >= 256) return 1;
     }
-    return qmm_split_k(kn.N, llama_qmm_rows(rows, requests), kn.K,
+    return qmm_split_k(kn.N, llama_qmm_rows(g, rows, requests), kn.K,
                        llama_dense_qmm_bm(rows, requests));
 }
 
@@ -447,7 +448,8 @@ int llama_qmm_bn_for(Kind k, const LlamaGeometry& g, int rows, int requests) {
     if (bn <= 0 || k == Kind::LmHead) return bn;
     if (llama_qmm_split(k, g, rows, requests) > 1) return bn;
     const KN kn = qmv_kn(k, g);
-    const int unsplit = qmm_bn_unsplit(int(kn.N), llama_qmm_rows(rows, requests));
+    const int unsplit = qmm_bn_unsplit(int(kn.N), llama_qmm_rows(g, rows, requests),
+                                       qmm_min_batch(g.is_moe()));
     return unsplit > 0 ? unsplit : bn;
 }
 
@@ -471,7 +473,7 @@ std::size_t llama_splitk_partial_elems(const LlamaGeometry& g, int max_rows) {
                 one_lane = std::max(
                     one_lane,
                     std::size_t(split) *
-                        std::size_t(llama_qmm_rows(rows, requests)) *
+                        std::size_t(llama_qmm_rows(g, rows, requests)) *
                         std::size_t(kn.N));
             }
         }
@@ -499,7 +501,9 @@ int llama_moe_qmm_bn(Kind k, const LlamaGeometry& g, int rows) {
     if (!is_routed(k) || llama_moe_tile_rows(g, rows) <= 1) return 0;
     const KN kn = qmv_kn(k, g);
     if (kn.N == 0) return 0;
-    return qmm_bn(kn.N, llama_moe_sorted_rows(g, rows));
+    // Routed, so the routed crossover -- though `moe_should_batch` has already
+    // admitted this batch and the sorted count is far above either number.
+    return qmm_bn(kn.N, llama_moe_sorted_rows(g, rows), qmm_min_batch(true));
 }
 
 void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadgroup& tg,
@@ -549,11 +553,11 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
             // padding rounds up, and a rounded-up count can land on a wider
             // rung than the one the grid was built for.
             if (const int split = llama_qmm_split(d.kind, g, m, requests); split > 1) {
-                qmm_t_splitk_dispatch(kn.N, llama_qmm_rows(m, requests),
+                qmm_t_splitk_dispatch(kn.N, llama_qmm_rows(g, m, requests),
                                       llama_dense_qmm_bm(m, requests), split, grid, tg);
                 return;
             }
-            qmm_t_dispatch(kn.N, llama_qmm_rows(m, requests), bn,
+            qmm_t_dispatch(kn.N, llama_qmm_rows(g, m, requests), bn,
                            llama_dense_qmm_bm(m, requests), grid, tg);
             return;
         }
@@ -692,7 +696,7 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const 
             se.set_pso(mb->qmm_cast_bf16_f16);
             se.set_argtable_ordinal(ordinal_base + d.ordinal);
             const std::uint32_t count =
-                std::uint32_t(llama_qmm_rows(m, requests)) *
+                std::uint32_t(llama_qmm_rows(g, m, requests)) *
                 std::uint32_t(qmv_kn(d.kind, g).K);
             se.dispatch(Grid{count, 1, 1}, Threadgroup{256, 1, 1});
             se.barrier();
@@ -721,7 +725,7 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const 
                 Grid rg;
                 Threadgroup rtg;
                 qmm_splitk_reduce_dispatch(
-                    qmv_kn(d.kind, g).N, llama_qmm_rows(m, requests), rg, rtg);
+                    qmv_kn(d.kind, g).N, llama_qmm_rows(g, m, requests), rg, rtg);
                 se.dispatch(rg, rtg);
                 // No trailing barrier inside a concurrency run. Its members
                 // own different partial slices, so this reduce can overlap the

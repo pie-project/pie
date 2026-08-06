@@ -38,7 +38,7 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
 /// Padded up to a whole `BM` tile so the GEMM engages at any batch instead of
 /// only at exact multiples of it. The pool holds `gemma4_qmm_pool_rows(max)`
 /// rows so the padding always lands somewhere allocated.
-int gemma4_qmm_rows(int rows);
+int gemma4_qmm_rows(const Gemma4Geometry& g, int rows);
 
 /// How many rows the activation pool must hold for `max_rows` to be paddable.
 int gemma4_qmm_pool_rows(int max_rows);
