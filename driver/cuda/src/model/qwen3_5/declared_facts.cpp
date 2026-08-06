@@ -475,6 +475,17 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
         // (The dense forward assumes the gate unconditionally, so no gate
         // check on the dense side — trace and hand-written path agree.)
         if (!cfg.attn_output_gate) return refuse("attn_output_gate disabled");
+        // The MoE block HAS a declaration — `moe_mlp_body_cuda` states the
+        // fused CUTLASS leg — but this executor has no arms for it: its
+        // launcher registry knows none of the MoE symbols, and
+        // `qwen35_validate_stated_kernels` turns an unknown symbol into a
+        // model-LOAD failure. So a plan built here would not fall back to
+        // the hand-written pass, it would refuse to boot the model.
+        //
+        // Refusing at build is the difference between "the declaration is
+        // ahead of the executor" and "this checkpoint does not run".
+        // Delete this line in the commit that registers the MoE kernels.
+        return refuse("the MoE block's declaration has no executor arms yet");
         if (cfg.num_experts <= 0 || cfg.num_experts_per_tok <= 0 ||
             cfg.moe_intermediate_size <= 0) {
             return refuse("moe dims unset");
