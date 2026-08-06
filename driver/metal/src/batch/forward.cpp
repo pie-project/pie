@@ -544,10 +544,16 @@ struct MetalExecutor::Impl {
     // requests, each with its own scan length, and the row's argument table is
     // what selects the segment -- so the length has to be per row too.
     std::vector<SlotHandle> prefill_scan_rows_{};
-    // A slot whose conv history was last written by the prefill's ping-pong may
-    // hold it in ConvStateOut; the paged decode writes in place and always
-    // leaves it in ConvState, so only the handover needs a copy.
+    // Which half of the GDN conv ping-pong holds each slot's history: 0 for
+    // `conv_state`, 1 for `conv_state_out`. THE record of that fact -- the
+    // prefill's per-token parity and the decode's per-fire one are both read
+    // from and written back to here, so a copy that moves a slot's history
+    // between the halves cannot desynchronize them.
     std::vector<std::uint8_t> conv_in_out_{};
+    // Which half `mb_dag_`'s GDN dispatches are currently bound to READ. One
+    // batched fire runs every row through one pair of dispatches, so every slot
+    // in it reads the same half and this is per-DAG rather than per-slot.
+    std::uint8_t mb_conv_parity_ = 0;
     Pso ptir_logits_copy_pso_{};
     std::uint32_t ptir_logits_capacity_rows_ = 0;
     std::uint32_t ptir_logits_next_row_ = 0;
@@ -1309,6 +1315,7 @@ void MetalExecutor::Impl::reset_state() {
         ctx_->zero_buffer_range(ks.k_pages, 0, ks.k_pages.size);
         ctx_->zero_buffer_range(ks.v_pages, 0, ks.v_pages.size);
     }
+    std::fill(conv_in_out_.begin(), conv_in_out_.end(), std::uint8_t{0});
     linear_state_slots_.reset_all();
 }
 
@@ -1350,6 +1357,7 @@ void MetalExecutor::Impl::reset_state(uint32_t slot) {
         ctx_->zero_buffer_range(
             gs.recurrent_state, recur_off, recur_stride);
     }
+    if (slot < conv_in_out_.size()) conv_in_out_[slot] = 0;
     linear_state_slots_.reset(slot);
 }
 
@@ -1421,6 +1429,8 @@ bool MetalExecutor::Impl::copy_state_slot(uint32_t src_slot, uint32_t dst_slot, 
     // (silently correct only when src/dst happened to share the same
     // parity by coincidence).
     linear_state_slots_.copy(src_slot, dst_slot);
+    if (src_slot < conv_in_out_.size() && dst_slot < conv_in_out_.size())
+        conv_in_out_[dst_slot] = conv_in_out_[src_slot];
     return true;
 }
 
@@ -1678,6 +1688,10 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             v_pages[size_t(L)] = kv_pool_.layers[size_t(L)].v_pages;
         }
         bind_decode_dag_mb(*ctx_, b_, mb_dag_, g_, k_pages, v_pages, gdn_prep_);
+        // That bind put the conv ping-pong back at its even half, so the
+        // decode's record of which half it is pointing at has to go back too --
+        // this runs again whenever the KV pool is resized, mid-serve.
+        mb_conv_parity_ = 0;
         const size_t prefill_scratch_row = size_t(scratch_widest_elems(g_)) * 2u;
         const size_t prefill_logits_row = size_t(g_.vocab) * 2u;
         for (size_t t = 0; t < prefill_dags_.size(); ++t) {
@@ -1693,12 +1707,6 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_,
                                std::max(1, g_.max_tokens));
             mb_bound_tokens_ = std::max(1, g_.max_tokens);
-            // Decode writes the shifted conv history straight back over the one
-            // it read.  Safe because each channel is read and written by the
-            // same thread, in that order, and prep and recurrent touch disjoint
-            // channels -- which saves copying every slot's whole conv slab back
-            // on the host after every single token.
-            alias_decode_conv_state_out(*ctx_, b_, mb_dag_);
             prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
@@ -2230,31 +2238,53 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
 
     std::vector<uint32_t> active_slots;
     active_slots.reserve(size_t(schedule.R));
+    if (conv_in_out_.size() < size_t(g_.max_slots))
+        conv_in_out_.assign(size_t(g_.max_slots), 0);
     for (const RequestSpan& sp : schedule.spans) {
         if (sp.rs_is_new) reset_state(sp.rs_slot);
         if (std::find(active_slots.begin(), active_slots.end(), sp.rs_slot) == active_slots.end())
             active_slots.push_back(sp.rs_slot);
     }
-    // The paged decode shifts the conv history in place -- each channel of each
-    // slot is read by exactly one thread before that same thread writes it, and
-    // a pure-decode fire gives every request its own slot -- so there is nothing
-    // to fold back afterwards.  The prefill still ping-pongs per prompt token,
-    // so a slot handed over mid-parity is copied once, here.
+    // One fire, one binding: every row of a batched decode goes through the
+    // same pair of GDN dispatches, so every slot in it has to read the same
+    // half of the ping-pong. A steady fleet already agrees -- its members
+    // stepped together -- and the copies below are the price of a member that
+    // joined at the other parity, which is a prompt-length-dependent fact about
+    // that member alone.
+    //
+    // The majority's half, not the first slot's: picking the first would let
+    // one arriving member move fourteen resident ones instead of itself.
+    std::size_t at_out = 0;
+    for (uint32_t slot : active_slots)
+        if (conv_in_out_[slot] != 0) ++at_out;
+    const std::uint8_t parity = at_out * 2 > active_slots.size() ? 1u : 0u;
     for (uint32_t slot : active_slots) {
-        if (slot >= conv_in_out_.size() || conv_in_out_[slot] == 0) continue;
-        conv_in_out_[slot] = 0;
+        if (conv_in_out_[slot] == parity) continue;
+        conv_in_out_[slot] = parity;
         const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
-        // copy C -> A (different handles, same offset). A full-attention layer
-        // has no GDN slab; skip it exactly as the commit below does.
+        // A full-attention layer has no GDN slab; skip it exactly as the commit
+        // below does.
         for (auto& gs : b_.gdn) {
-            if (!gs.conv_state.valid() && !gs.conv_state_out.valid()) continue;
-            if (!gs.conv_state.valid() ||
-                !ctx_->copy_buffer_range(
-                    gs.conv_state, off,
-                    gs.conv_state_out, off,
-                    g_.gdn_conv_stride_bytes()))
+            if (!gs.conv_state.valid() || !gs.conv_state_out.valid()) continue;
+            const SlotHandle& dst = parity == 0 ? gs.conv_state : gs.conv_state_out;
+            const SlotHandle& src = parity == 0 ? gs.conv_state_out : gs.conv_state;
+            if (!ctx_->copy_buffer_range(dst, off, src, off, g_.gdn_conv_stride_bytes()))
                 return fail("failed to normalize GDN ping-pong state");
         }
+    }
+    // This used to alias ConvStateOut onto ConvState and shift the history in
+    // place, on the claim that each channel is read and written by the same
+    // thread. It is not: `gdn_prep` runs one threadgroup per VALUE head and
+    // `rep = Hv/Hk` value heads share a key head, so that head's window is read
+    // by `rep` threadgroups and written by one of them. In place, the writer
+    // shifts the window out from under its siblings. Both outcomes are finite
+    // numbers, so it surfaced as a fleet member disagreeing with its identical
+    // neighbours -- deterministic values, and which member lost varying run to
+    // run. Qwen3.6-27B is rep=3 and showed it from fifteen lanes; Qwen3.6-35B-
+    // A3B is rep=1 and never could.
+    if (mb_conv_parity_ != parity) {
+        bind_gdn_conv_parity(*ctx_, b_, mb_dag_, parity == 0);
+        mb_conv_parity_ = parity;
     }
 
     // Alternate the two arms fire by fire so both see the same machine.
@@ -2357,6 +2387,8 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     }
 
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
+    // The fire wrote every active slot's shifted history into the other half.
+    for (uint32_t slot : active_slots) conv_in_out_[slot] = std::uint8_t(parity ^ 1u);
     return true;
 }
 
@@ -2374,16 +2406,22 @@ bool MetalExecutor::Impl::run_prefill_step(
 
     // Reset once per request, before its first encoded token.  Do not reset in
     // the token loop: later prompt rows must consume the preceding GDN/KV state.
+    if (conv_in_out_.size() < size_t(g_.max_slots))
+        conv_in_out_.assign(size_t(g_.max_slots), 0);
     for (const RequestSpan& sp : schedule.spans)
         if (sp.rs_is_new) reset_state(sp.rs_slot);
 
-    std::vector<int> next_step(size_t(g_.max_slots), 0);
-    for (int s = 0; s < g_.max_slots; ++s) next_step[size_t(s)] = step_count_for(uint32_t(s));
+    // The parity comes from `conv_in_out_`, not from the slot's step count.
+    // They agree while nothing but stepping moves a slot's history, and the
+    // decode's normalizing copy is exactly the thing that does: a slot the
+    // decode moved between the halves has a step count that no longer predicts
+    // which one it is in, and a continuation prefill bound off that count would
+    // read the half it did not write.
+    std::vector<std::uint8_t> next_parity(conv_in_out_.begin(), conv_in_out_.end());
     for (int t = 0; t < schedule.N; ++t) {
         const uint32_t slot = schedule.slot_of_token[size_t(t)];
-        bind_prefill_gdn_state(*ctx_, b_, prefill_dags_[size_t(t)], slot,
-                               (next_step[slot] & 1) == 0);
-        ++next_step[slot];
+        bind_gdn_conv_parity(*ctx_, b_, prefill_dags_[size_t(t)], next_parity[slot] == 0);
+        next_parity[slot] ^= 1u;
     }
 
     // The GDN scan replaces the per-token chain only when the prompt is one
@@ -2490,12 +2528,8 @@ bool MetalExecutor::Impl::run_prefill_step(
             schedule.N);
     }
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
-    // The prompt's last token decides which half of the ping-pong holds the
-    // history; the paged decode reads ConvState, so record an odd handover.
-    if (conv_in_out_.size() < size_t(g_.max_slots))
-        conv_in_out_.assign(size_t(g_.max_slots), 0);
-    for (uint32_t slot : schedule.slot_of_token)
-        conv_in_out_[slot] = std::uint8_t(step_count_for(slot) & 1);
+    // Each token of a slot's prompt flipped that slot's half once.
+    for (uint32_t slot : schedule.slot_of_token) conv_in_out_[slot] ^= 1u;
     return true;
 }
 
