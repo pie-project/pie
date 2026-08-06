@@ -201,6 +201,9 @@ Gemma4DeclaredPlan build_gemma4_declared_plan(
         out.decode = ForwardPlan::trace_gemma4_cuda(
             facts, cuda, pie_forward::PieForwardFireClass::Decode);
         gemma4_validate_stated_kernels(out.decode);
+        out.prefill = ForwardPlan::trace_gemma4_cuda(
+            facts, cuda, pie_forward::PieForwardFireClass::Prefill);
+        gemma4_validate_stated_kernels(out.prefill);
     } catch (const std::exception& e) {
         G4_REFUSE(std::string("trace failed: ") + e.what());
     }
@@ -218,9 +221,10 @@ Gemma4DeclaredPlan build_gemma4_declared_plan(
 #undef G4_REFUSE
     out.usable = true;
     std::fprintf(stderr,
-                 "[declared-gemma4] traced ops=%zu layers=%d interval=%d "
+                 "[declared-gemma4] traced ops=%zu/%zu layers=%d interval=%d "
                  "shared=%d d=%d/%d validation=OK\n",
-                 out.decode.op_count(), L, interval, shared, sliding_d, full_d);
+                 out.decode.op_count(), out.prefill.op_count(),
+                 L, interval, shared, sliding_d, full_d);
     return out;
 }
 

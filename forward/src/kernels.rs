@@ -154,6 +154,15 @@ pub static KERNELS: &[KernelSig] = &[
         needs = Prepare::DecodePlan, sink = Some("kv.pages")),
     kernel!(flashinfer_prefill "dispatch_attention_flashinfer_prefill_bf16",
         needs = Prepare::PrefillPlan, sink = Some("kv.pages")),
+    // The plan-free prefill wrapper: it builds an R-shaped plan on the
+    // way in, so it owes its caller nothing and cannot be handed a row
+    // window — `whole`, and `FireWide` for the same reason XQA is.
+    kernel!(flashinfer_prefill_planless "ops::launch_attention_flashinfer_prefill",
+        whole = true, needs = Prepare::FireWide, sink = Some("kv.pages")),
+    // Head dims flashinfer's prefill template rejects (gemma-4's 512)
+    // take a naive paged kernel instead. No plan at all; fire-shaped.
+    kernel!(attention_naive_paged "ops::launch_attention_naive_paged",
+        whole = true, sink = Some("kv.pages")),
     kernel!(flashinfer_prefill_capture "dispatch_attention_flashinfer_prefill_capture_bf16",
         needs = Prepare::PrefillPlan, sink = Some("kv.pages")),
     kernel!(flashinfer_custom "dispatch_attention_flashinfer_prefill_custom",

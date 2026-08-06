@@ -1195,35 +1195,78 @@ mod tests {
     /// qwen3_5's was and for the same reason: a rung is legible when it
     /// is a line leaving this list.
     ///
-    /// Empty means the decode body is a list of rectangles. It does NOT
-    /// mean gemma-4 runs: no driver consumes this plan yet, and the
-    /// executor is the next rung.
+    /// Empty means the body is a list of rectangles. It does NOT mean the
+    /// numbers are right: five of the six defects the executor found were
+    /// in a declaration whose ledger was already empty. This gate asks
+    /// whether statements are WELL FORMED; only a live fire asks whether
+    /// each one consumes what the pass produces.
     #[test]
     fn the_gemma4_residue_ledger() {
         let facts = crate::facts::Gemma4Facts::gemma_4_e4b();
         let cuda = crate::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic();
-        let plan = family::gemma4_cuda(&facts, &cuda, FireClass::Decode);
-        let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
-        let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
-        for u in &out.residue {
-            *ledger
-                .entry(format!("{}: {}", u.kind, u.why))
-                .or_default() += 1;
+        for (class, expected) in [
+            (FireClass::Decode, LEDGER_GEMMA4_DECODE),
+            (FireClass::Prefill, LEDGER_GEMMA4_PREFILL),
+        ] {
+            let plan = family::gemma4_cuda(&facts, &cuda, class);
+            let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
+            let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
+            for u in &out.residue {
+                *ledger
+                    .entry(format!("{}: {}", u.kind, u.why))
+                    .or_default() += 1;
+            }
+            let seen: Vec<String> = ledger
+                .iter()
+                .map(|(k, n)| format!("{n:>4}  {k}"))
+                .collect();
+            let want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(seen, want, "the gemma-4 {class:?} residue ledger moved");
+            assert!(
+                !out.launches.is_empty(),
+                "a fire that executes nothing is not a fire"
+            );
         }
-        let seen: Vec<String> = ledger
-            .iter()
-            .map(|(k, n)| format!("{n:>4}  {k}"))
-            .collect();
-        let expected: Vec<String> = LEDGER_GEMMA4_DECODE.iter().map(|s| s.to_string()).collect();
-        assert_eq!(seen, expected, "the gemma-4 residue ledger moved");
-        assert!(
-            !out.launches.is_empty(),
-            "a fire that executes nothing is not a fire"
-        );
     }
 
     /// See [`the_gemma4_residue_ledger`]. One entry per (kind, reason).
     const LEDGER_GEMMA4_DECODE: &[&str] = &[];
+
+    /// The prefill class's, which differs from the decode ledger only in
+    /// the dispatch — and states two kernels of its own, so an empty
+    /// ledger here is a claim about those two as much as about the body.
+    const LEDGER_GEMMA4_PREFILL: &[&str] = &[];
+
+    /// THE GEMMA-4 CUTOVER GATE, in the shape the other two families'
+    /// take: every statement a live fire executes is a rectangle in the
+    /// flat list, in both classes and both logit shapes.
+    ///
+    /// One geometry only, and honestly so: E4B is the sole gemma-4 fact
+    /// set anything has been read against. A second (E2B, the 31B) would
+    /// earn its own row the way 27B earned qwen3_5's.
+    #[test]
+    fn the_gemma4_flat_list_covers_every_statement() {
+        let facts = crate::facts::Gemma4Facts::gemma_4_e4b();
+        let cuda = crate::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic();
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            let plan = family::gemma4_cuda(&facts, &cuda, class);
+            for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
+                let out = lower(&plan, &rows, Fire::default())
+                    .unwrap_or_else(|e| panic!("{class:?}/{shape}: {e:?}"));
+                assert!(
+                    out.residue.is_empty(),
+                    "{class:?}/{shape}: {} statements still owe a declaration: {:#?}",
+                    out.residue.len(),
+                    out.residue
+                );
+                assert_eq!(out.coverage(), 1.0, "{class:?}/{shape}");
+                assert!(
+                    !out.launches.is_empty(),
+                    "{class:?}/{shape}: a fire that executes nothing is not a fire"
+                );
+            }
+        }
+    }
 
     /// The MoE block's own ledger, and the argument for the fused leg.
     ///

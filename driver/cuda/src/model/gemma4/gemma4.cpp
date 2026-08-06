@@ -1251,6 +1251,8 @@ void gemma4_moe_block(
 
 }  // namespace
 
+int gemma4_row_decode_qmax() { return kGemma4RowDecodeQmax; }
+
 std::uint32_t gemma4_decode_graph_layout(
     const Gemma4MoeMlpWorkspace& moe_ws)
 {

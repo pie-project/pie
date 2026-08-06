@@ -2195,6 +2195,33 @@ pub mod cuda {
         attn_at(q, kv, "dispatch_attention_flashinfer_prefill_bf16")
     }
 
+    /// `ops::launch_attention_flashinfer_prefill` — the PLAN-FREE
+    /// prefill wrapper, which builds its own R-shaped plan from the host
+    /// indptrs on the way in.
+    ///
+    /// A DIFFERENT statement from [`attention_flashinfer_prefill`], not
+    /// a spelling of it: that one names the dispatch alone and its
+    /// caller owes it a plan, while this one owes nothing and cannot be
+    /// given a row window (the plan it builds spans all R requests).
+    /// gemma-4's prefill fires this; llama_like's fires the other. The
+    /// two are one call apart in C++ and a whole contract apart here,
+    /// which is why the table carries both.
+    pub fn attention_flashinfer_prefill_planless(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "ops::launch_attention_flashinfer_prefill")
+    }
+
+    /// `ops::launch_attention_naive_paged` — the fallback prefill for a
+    /// head dim flashinfer's TC prefill template rejects.
+    ///
+    /// gemma-4's FULL-attention layers run at head_dim 512, and
+    /// flashinfer 0.6.x refuses to instantiate a prefill at
+    /// `NUM_MMA_D_QK=32`. So the deployment states a naive paged kernel
+    /// on exactly those layers — a per-layer HEAD DIM fact, erased at
+    /// trace time, not a runtime fallback the executor discovers.
+    pub fn attention_naive_paged(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "ops::launch_attention_naive_paged")
+    }
+
     /// `kernels::launch_write_kv_explicit_bf16`: the explicit-descriptor
     /// KV write (graph-replay steering; N cells, one per query token).
     /// Stated inside the `HasWriteDesc` guard's then-region.

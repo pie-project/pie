@@ -598,3 +598,21 @@ fn gemma_4_e4b_cuda_decode() {
         ),
     );
 }
+
+/// gemma-4-E4B's PREFILL reading. Identical to the decode golden save
+/// for the dispatch line, which is where the whole class difference
+/// lives: the fused qkv epilogue is decode-only (so every layer takes
+/// the unfused five), and the dispatch itself splits again on head
+/// WIDTH — the 512-wide full layers take a naive paged kernel that
+/// flashinfer's prefill template cannot be instantiated for.
+#[test]
+fn gemma_4_e4b_cuda_prefill() {
+    check_plan(
+        "gemma_4_e4b_cuda_prefill",
+        &gemma4_cuda(
+            &Gemma4Facts::gemma_4_e4b(),
+            &Gemma4CudaFacts::gemma_4_e4b_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}

@@ -3408,8 +3408,26 @@ pub fn gemma4_cuda(
                 q
             };
 
-            let a = dsl::cuda::attention_flashinfer_decode(&attn_in, &kv)
-                .expect("the decode class states its attention");
+            // The dispatch is the one place the two classes diverge, and
+            // the PREFILL side diverges again per layer — on the HEAD
+            // DIM, not on the layer kind. flashinfer 0.6.x refuses to
+            // instantiate its TC prefill template at head_dim 512
+            // ("NUM_MMA_D_QK=32"), so gemma-4's full-attention layers
+            // take a naive paged kernel there while decode at 512 is
+            // fine. Reading the driver's own test (`d == 512`) is what
+            // this states; `is_full_attn` happens to agree on E4B and is
+            // not the question asked.
+            let a = match class {
+                FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&attn_in, &kv),
+                FireClass::Prefill if d == 512 => {
+                    dsl::cuda::attention_naive_paged(&attn_in, &kv)
+                }
+                FireClass::Prefill => {
+                    dsl::cuda::attention_flashinfer_prefill_planless(&attn_in, &kv)
+                }
+                other => unreachable!("gemma4 refuses {other:?} at trace start"),
+            }
+            .expect("the class states its attention");
             let attn_out = matmul(&a, &w.o_proj);
 
             // Post-attention norm, land on the stream, scale, and norm

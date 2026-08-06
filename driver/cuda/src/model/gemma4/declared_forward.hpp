@@ -39,9 +39,10 @@ bool gemma4_declared_drive_enabled();
 Gemma4DeclaredPlan build_gemma4_declared_plan(
     const HfConfig& cfg, const Gemma4Weights& w, int tp_size);
 
-// Drive the DECODE class's flat launch list. Returns false when this
-// fire is outside what the declaration states, leaving the hand-written
-// pass to run it — the eligibility answer, not an error.
+// Drive this fire's class — decode or prefill, picked by the same test
+// the hand-written pass makes. Returns false when the fire is outside
+// what the declaration states, leaving that pass to run it: the
+// eligibility answer, not an error.
 bool gemma4_forward_declared(
     const Gemma4DeclaredPlan& declared,
     const Gemma4Weights& w,
@@ -58,9 +59,11 @@ bool gemma4_forward_declared(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
     const std::uint32_t* kv_page_indptr_h,
     int total_tokens,
     int num_requests,
+    bool is_pure_decode,
     const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows);

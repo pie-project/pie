@@ -377,6 +377,14 @@ void prepare_gemma4_decode_plans(
 std::uint32_t gemma4_decode_graph_layout(
     const Gemma4MoeMlpWorkspace& moe_ws);
 
+// The longest per-request query block the ROW-DECODE path will take. A
+// non-pure-decode fire whose requests are all this short or shorter goes
+// to that path instead of the plain prefill one — which the declared
+// drive does not state, so it declines those fires. Exposed rather than
+// restated: one definition, and a caller that asks it instead of
+// mirroring it.
+int gemma4_row_decode_qmax();
+
 void gemma4_forward_paged(
     const Gemma4Weights& w,
     const HfConfig& cfg,

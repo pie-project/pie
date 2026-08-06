@@ -1,7 +1,9 @@
 #include "model/gemma4/declared_forward.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 #include <vector>
 
@@ -16,6 +18,7 @@
 #include "kernels/embed.hpp"
 #include "kernels/kv_paged.hpp"
 #include "ops/attention_flashinfer.hpp"
+#include "ops/attention_naive_paged.hpp"
 #include "ops/gemm.hpp"
 #include <string>
 #include <string_view>
@@ -38,6 +41,7 @@ enum class G4Kernel {
     WriteKvToPages,
     AttnFlashinferDecode,
     AttnFlashinferPrefill,
+    AttnNaivePaged,
     GegluTanh,
     ChunkedGegluTanh,
     NormResidualScaleNorm,
@@ -59,8 +63,14 @@ G4Kernel resolve_g4_kernel(std::string_view k) {
     if (k == "launch_write_kv_to_pages") return G4Kernel::WriteKvToPages;
     if (k == "dispatch_attention_flashinfer_decode")
         return G4Kernel::AttnFlashinferDecode;
-    if (k == "dispatch_attention_flashinfer_prefill_bf16")
+    // gemma-4's prefill fires the PLAN-FREE wrapper, not the dispatch
+    // llama_like states — one call apart in C++, a whole contract apart
+    // in the declaration, so the symbols differ and this registry has
+    // only the one gemma-4 actually says.
+    if (k == "ops::launch_attention_flashinfer_prefill")
         return G4Kernel::AttnFlashinferPrefill;
+    if (k == "ops::launch_attention_naive_paged")
+        return G4Kernel::AttnNaivePaged;
     if (k == "launch_geglu_tanh_bf16") return G4Kernel::GegluTanh;
     if (k == "launch_chunked_geglu_tanh_bf16") return G4Kernel::ChunkedGegluTanh;
     if (k == "launch_rmsnorm_residual_add_scale_rmsnorm_bf16")
@@ -188,15 +198,42 @@ bool gemma4_forward_declared(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
     const std::uint32_t* kv_page_indptr_h,
     int total_tokens,
     int num_requests,
+    bool is_pure_decode,
     const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows)
 {
     if (!declared.usable) return false;
-    const pie_forward::ForwardPlan& plan = declared.decode;
+    // WHICH CLASS. `use_decode_path` is the hand-written pass's own test
+    // and this mirrors it, `force_prefill_path` included — a deployment
+    // forced onto the prefill kernels must reach the PREFILL class here
+    // or the drive would fire a decode dispatch the hand pass never
+    // would.
+    const bool decode_class = is_pure_decode && !fwd_cfg.force_prefill_path;
+    const pie_forward::ForwardPlan& plan =
+        decode_class ? declared.decode : declared.prefill;
+    if (!decode_class && (qo_indptr_h == nullptr || kv_page_indptr_h == nullptr)) {
+        // The prefill class's two dispatches both read host indptrs.
+        return false;
+    }
+    // Say ONCE per class that this drive took a fire of it. Without this
+    // line "the output is coherent" is evidence about the hand-written
+    // pass as easily as about this one — an eligibility gate that
+    // silently answers false looks exactly like a drive that works.
+    {
+        static std::atomic<bool> said[2] = {{false}, {false}};
+        const std::size_t slot = decode_class ? 0 : 1;
+        if (!said[slot].exchange(true)) {
+            std::fprintf(stderr,
+                         "[declared-gemma4] first %s fire: N=%d R=%d ops=%zu\n",
+                         decode_class ? "DECODE" : "PREFILL",
+                         total_tokens, num_requests, plan.op_count());
+        }
+    }
 
     const int N = total_tokens;
     const int R = num_requests;
@@ -541,8 +578,33 @@ bool gemma4_forward_declared(
                     ws.logits.data(), fwd_cfg.final_logit_softcap,
                     static_cast<std::size_t>(lm_head_rows) * V, stream);
                 break;
-            case G4Kernel::AttnFlashinferPrefill:
-                throw_drift("prefill dispatch in the decode class");
+            case G4Kernel::AttnFlashinferPrefill: {
+                auto kv_view = cache.layer_view(cur_layer);
+                ops::launch_attention_flashinfer_prefill(
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
+                    N, R, cfg.num_attention_heads, attn_ws, stream,
+                    w.per_layer_window_left[static_cast<std::size_t>(cur_layer)],
+                    /*logits_soft_cap=*/0.f, /*sm_scale=*/1.0f);
+                break;
+            }
+            case G4Kernel::AttnNaivePaged: {
+                auto kv_view = cache.layer_view(cur_layer);
+                // `num_pages_in_batch` is the host indptr's LAST entry —
+                // the fire's page count, not the layer's and not the
+                // cache's.
+                ops::launch_attention_naive_paged(
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, N, R,
+                    static_cast<int>(kv_page_indptr_h[R]),
+                    cfg.num_attention_heads, stream,
+                    w.per_layer_window_left[static_cast<std::size_t>(cur_layer)],
+                    /*sm_scale=*/1.0f, /*logits_soft_cap=*/0.f,
+                    /*lse_out=*/nullptr);
+                break;
+            }
             }
             break;
         }
@@ -557,7 +619,7 @@ bool gemma4_forward_declared(
     std::vector<pie_forward::PieForwardRow> rows(static_cast<std::size_t>(N));
     for (int r = 0; r < N; ++r) {
         auto& row = rows[static_cast<std::size_t>(r)];
-        row.multi_token = 0;
+        row.multi_token = decode_class ? 0 : 1;
         row.custom_mask = 0;
         row.hooked = 0;
         row.lora = 0;
