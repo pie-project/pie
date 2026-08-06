@@ -495,14 +495,43 @@ mod tests {
             "only the planned decode dispatch swaps"
         );
 
-        // A trace that does NOT declare the axis puts nothing on it.
+        // PREFILL declares the axis too (the cutover's last decline
+        // class was a truncated prefill), and its layer-tagged ops are
+        // on it — but NOTHING there takes the prefix-plan swap, because
+        // that is a property of the planned DECODE dispatch and a
+        // prefill fire does not run one. Which is the whole difference
+        // between the two halves of the axis: stopping after layer `k`
+        // costs a prefill nothing, and narrowing rows under it would
+        // cost it a plan it has no way to build.
         let prefill = family::llama_like_cuda(
             &facts,
             &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
             FireClass::Prefill,
         );
-        assert!(!prefill.depth_window);
-        assert!(prefill.ops.iter().all(|op| !prefill.depth_windowed(op)));
+        assert!(prefill.depth_window);
+        assert!(prefill
+            .ops
+            .iter()
+            .any(|op| prefill.depth_windowed(op)));
+        assert_eq!(
+            prefill.ops.iter().filter(|op| prefill.depth_prefix_plan(op)).count(),
+            0,
+            "a prefill fire runs no planned decode dispatch, so nothing swaps"
+        );
+
+        // A trace that does NOT declare the axis puts nothing on it: the
+        // padded-head deployment, whose staging offsets are physical
+        // width while a window's are logical.
+        let padded = family::llama_like_cuda(
+            &facts,
+            &LlamaLikeCudaFacts {
+                head_dim_padded: true,
+                ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
+            },
+            FireClass::Prefill,
+        );
+        assert!(!padded.depth_window);
+        assert!(padded.ops.iter().all(|op| !padded.depth_windowed(op)));
     }
 
     /// No symbol is declared twice, and no dsl-side name is either.

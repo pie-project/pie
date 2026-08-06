@@ -51,12 +51,12 @@ enum class DeclineReason {
     NoPlan,
     WriteDescMissing,
     SlidingWindow,
-    /// A truncated PREFILL. The depth axis is stated for the Decode
-    /// class only (`family.rs`'s `m.depth_window()`), because narrowing
-    /// rows on a prefill fire narrows its qo/kv CSRs too and there is no
-    /// prefill analogue of `depth_prefix_decode_plan`. A prepare-side
-    /// piece of work, not a driver one.
-    TruncatedPrefill,
+    /// A UNION prefill: full-depth rows beside truncated ones, so the
+    /// tail layers would run over a row prefix and this fire's qo/kv
+    /// CSRs would have to narrow with them. There is no prefill
+    /// analogue of `depth_prefix_decode_plan` to narrow them against —
+    /// a prepare-side piece of work, not a driver one.
+    UnionPrefill,
     /// A truncated DECODE whose trace does not state the axis — the XQA
     /// and padded-head deployments, where `family.rs` withholds it
     /// because the body cannot honour it there.
@@ -73,7 +73,7 @@ const char* decline_name(DeclineReason r) {
     case DeclineReason::NoPlan:             return "no-plan";
     case DeclineReason::WriteDescMissing:   return "write-desc-missing";
     case DeclineReason::SlidingWindow:      return "sliding-window";
-    case DeclineReason::TruncatedPrefill:   return "truncated-prefill";
+    case DeclineReason::UnionPrefill:      return "union-prefill";
     case DeclineReason::TruncatedAxisUnstated:
         return "truncated-axis-unstated";
     case DeclineReason::FusedQkvUnstaged:   return "fused-qkv-unstaged";
@@ -270,10 +270,24 @@ void LlamaLikeModel::body(Workspace& ws,
         // (pure-decode only; a truncated lane's prefill keeps the
         // hand-written body).
         if (in.max_layers != 0xffffffffu) {
-            if (!in.is_pure_decode) return DeclineReason::TruncatedPrefill;
-            if (!declared_.decode ||
-                declared_.decode.view().depth_window == 0) {
+            // The fire's OWN class states the axis or it does not — ask
+            // the plan this fire will actually run, not the decode one.
+            const auto& fire_plan =
+                in.is_pure_decode ? declared_.decode : declared_.prefill;
+            if (!fire_plan || fire_plan.view().depth_window == 0) {
                 return DeclineReason::TruncatedAxisUnstated;
+            }
+            // A truncated PREFILL is admitted only when the truncation
+            // is UNIFORM. That is the cheap half of the axis: every row
+            // sits at the same `k`, so the window stops after layer `k`
+            // and narrows nothing. A UNION fire puts full-depth rows
+            // beside truncated ones, and running the tail layers over a
+            // row prefix means narrowing this fire's qo/kv CSRs with
+            // them — there is no prefill analogue of
+            // `depth_prefix_decode_plan` to narrow them against.
+            if (!in.is_pure_decode &&
+                in.full_depth_rows != 0xffffffffu) {
+                return DeclineReason::UnionPrefill;
             }
         }
         // The trace committed to the fused QKV binding; a workspace without

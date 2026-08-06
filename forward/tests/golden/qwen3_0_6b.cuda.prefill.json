@@ -14884,6 +14884,7 @@
       "layer": null
     }
   ],
+  "depth_window": true,
   "seams": [
     {
       "seam": "in"

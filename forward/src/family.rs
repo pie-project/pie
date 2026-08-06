@@ -296,12 +296,30 @@ fn llama_like_cuda_text(
         let cuda_of = |class_want: FireClass| (class == class_want).then_some(cuda);
 
         // STRUCTURAL S-3, stated IN THE BODY (V2 rung ②; formerly the
-        // post-trace paint-over the review named): the lowered Decode
-        // class declares the depth axis exactly where its body can
-        // honour it — the same deployment gate as the mask peel's.
-        // Recording assigns each layer-tagged op's role from here on.
+        // post-trace paint-over the review named): a class declares the
+        // depth axis exactly where its body can honour it — the same
+        // deployment gate as the mask peel's. Recording assigns each
+        // layer-tagged op's role from here on.
+        //
+        // PREFILL states it too, since the cutover's last decline class
+        // was "truncated-prefill" and this was its whole cause. What a
+        // truncated prefill needs is the cheap half of the axis: every
+        // row sits at the same `k`, so the window STOPS after layer `k`
+        // and narrows nothing. The expensive half — a UNION fire, where
+        // full-depth rows sit beside truncated ones and the tail layers
+        // run over a row prefix — needs the qo/kv CSRs narrowed with
+        // them, and there is no prefill analogue of
+        // `depth_prefix_decode_plan`. The trace cannot tell those apart
+        // (`k` is a runtime input), so it states the axis and the
+        // driver's eligibility test admits only the uniform case.
+        //
+        // `xqa_decode` is a decode-path property and does not gate this;
+        // `head_dim_padded` does, for the same reason it gates Decode —
+        // its staging offsets are physical-width while a window's are
+        // logical.
         if cuda_of(FireClass::Decode)
             .is_some_and(|c| !c.xqa_decode && !c.head_dim_padded)
+            || cuda_of(FireClass::Prefill).is_some_and(|c| !c.head_dim_padded)
         {
             m.depth_window();
         }
