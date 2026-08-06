@@ -33,11 +33,20 @@ Gemma4Model::Gemma4Model(
         has_audio_ = true;
     }
     caps_.supports_media_encode = has_vision_ || has_audio_;
-    caps_.graph_safe = kv_cache_.format().is_native_bf16();
+    // The MoE branch (26B-A4B) reads the routing table back to the host and
+    // synchronizes the stream inside `gemma4_moe_block`, then loops the
+    // experts on the CPU. Under graph capture that synchronize is
+    // `cudaErrorStreamCaptureUnsupported` (900) and the model fails to load.
+    // The dense variants (E2B / E4B / 31B) have no such host work, so they
+    // keep capture. This is the same rule DeepSeek-V4 and Qwen3.5-MoE apply
+    // to their own per-expert dispatch paths.
+    const bool host_work_in_forward = hf_config_.gemma4_enable_moe;
+    const bool kv_capture_ok = kv_cache_.format().is_native_bf16();
+    caps_.graph_safe = kv_capture_ok && !host_work_in_forward;
     caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
     caps_.supports_small_prefill_graph =
-        kv_cache_.format().is_native_bf16() && small_spec_graph_tokens > 0;
+        kv_capture_ok && !host_work_in_forward && small_spec_graph_tokens > 0;
 }
 
 void Gemma4Model::prepare(AttentionWorkspace& attn_ws,
