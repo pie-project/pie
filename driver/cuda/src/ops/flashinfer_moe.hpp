@@ -14,10 +14,12 @@ namespace pie_cuda_driver::ops {
 // Note on Swiglu: the runner reads the gate half from the *second* half of the
 // fc1 output and the linear half from the first, i.e. silu(w[I:]) * w[:I] --
 // the opposite of pie's chunked_swiglu. fc1 weights must be stacked as
-// [up; gate], not pie's usual [gate; up].
+// [up; gate], not pie's usual [gate; up]. Geglu has the same convention; only
+// the scalar function on the gate half differs.
 enum class MoeActivation {
     Relu2,    // nemotron_h
     Swiglu,   // qwen3.5 / qwen3.6 MoE, glm5 / kimi / deepseek_v4
+    Geglu,    // gemma-4 26B-A4B routed experts (GELU-tanh gate)
 };
 
 bool flashinfer_cutlass_moe_enabled();
