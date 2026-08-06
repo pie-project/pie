@@ -195,6 +195,16 @@ struct Gemma4MoeMlpWorkspace {
     // `window_left` into a per-chunk value, so the plan's own field no longer
     // identifies the layer it serves.
     int hopper_plan_layer_window = -2;
+    // Same split for the full-attention layers, which cannot use FA3
+    // (head_dim 512) but underfill the device even harder: two KV heads is
+    // two CTAs. These ride FlashInfer's own decode plan, built for
+    // `full_splits` pseudo-requests.
+    ops::DecodePlanCachePtr full_split_plan;
+    int full_splits = 0;
+    std::vector<std::uint32_t> full_split_kv_indptr_h;
+    std::vector<std::uint32_t> full_split_last_h;
+    DeviceBuffer<std::uint32_t> full_split_kv_indptr_d;
+    DeviceBuffer<std::uint32_t> full_split_last_d;
     std::vector<std::uint32_t> hopper_split_qo_h;
     std::vector<std::uint32_t> hopper_split_kv_indptr_h;
     std::vector<std::uint32_t> hopper_split_last_h;

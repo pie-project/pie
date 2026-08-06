@@ -427,7 +427,8 @@ void dispatch_attention_flashinfer_decode_bf16(
     int window_left,
     float logits_soft_cap,
     float sm_scale,
-    float* lse_out)
+    float* lse_out,
+    bool broadcast_q)
 {
     if (!cache.valid) {
         throw std::runtime_error(
@@ -441,7 +442,7 @@ void dispatch_attention_flashinfer_decode_bf16(
             status = AttnHd<HD>::dispatch_decode(                            \
                 cache, q, k_pages, v_pages, o, kv_page_indices_d,            \
                 kv_page_indptr_d, kv_last_page_lens_d, workspace, stream,    \
-                window_left, logits_soft_cap, sm_scale, lse_out);            \
+                window_left, logits_soft_cap, sm_scale, lse_out, broadcast_q); \
             break;
 #include "kernels.def"
         default:
