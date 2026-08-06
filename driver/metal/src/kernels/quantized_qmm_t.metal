@@ -470,6 +470,30 @@ struct BaseMMAFrag<T, 8, 8> {
     }
   }
 
+  // The same store with a per-COLUMN bias folded in. `bias` points at this
+  // fragment's first column; a fragment is one row of `kElemCols` per thread,
+  // so the column within it is `j` regardless of the destination stride.
+  //
+  // Exists because the alternative was a second pass: store the tile to
+  // device memory, barrier, read it back, add, store again. See
+  // `BlockMMA::store_result_bias`.
+  template <typename DstPtrType, typename StrX, typename StrY,
+            typename BiasPtrType>
+  METAL_FUNC static constexpr void store_bias(const thread frag_type& src,
+                                              DstPtrType dst, StrX str_x,
+                                              StrY str_y, BiasPtrType bias) {
+    using U = pointer_element_t<DstPtrType>;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        dst[i * str_x + j * str_y] = static_cast<U>(
+            float(src[i * kElemCols + j]) + float(bias[j]));
+      }
+    }
+  }
+
   template <
       typename DstPtrType,
       typename StrX,
@@ -692,6 +716,23 @@ struct MMATile {
   }
 
   template <typename U, int w_x, int w_y>
+  METAL_FUNC void store_bias(device U* dst, const int ld,
+                             const device U* bias) const {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kTileRows; ++i) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kTileCols; ++j) {
+        MMAFrag_t::store_bias(
+            frag_at(i, j),
+            &(dst[(i * kFragRows) * w_x * ld + (j * kFragCols) * w_y]),
+            ld,
+            Int<1>{},
+            &(bias[(j * kFragCols) * w_y]));
+      }
+    }
+  }
+
+  template <typename U, int w_x, int w_y>
   METAL_FUNC void
   load_safe(const device U* src, const int ld, const short2 src_tile_dims) {
     STEEL_PRAGMA_UNROLL
@@ -893,6 +934,33 @@ struct BlockMMA {
     D += sm * ldd + sn;
 
     Ctile.template store<U, WM, WN>(D, ldd);
+  }
+
+  /* The same store with a per-column bias added out of the accumulator.
+   *
+   * The caller used to do this in a second pass: `store_result`, a
+   * device-scoped barrier, then every thread read its own outputs BACK from
+   * device memory, added the bias and wrote them again. Three trips through
+   * device memory for the whole output tile where one will do, on every
+   * routed expert GEMM of every layer -- and only gpt-oss pays it, because
+   * it is the one mixture here whose experts carry a bias.
+   *
+   * It is also one rounding step shorter. The read-back path rounded the
+   * accumulator to the output type, then added the bias to the ROUNDED value;
+   * this adds in fp32 and rounds once. That is a real numeric change and not
+   * only a faster one.
+   */
+  METAL_FUNC void store_result_bias(device U* D, const int ldd,
+                                    const device U* bias) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < decltype(Ctile)::kElemsPerTile; i++) {
+      Ctile.elems()[i] = Epilogue::apply(Ctile.elems()[i]);
+    }
+
+    D += sm * ldd + sn;
+    bias += sn;
+
+    Ctile.template store_bias<U, WM, WN>(D, ldd, bias);
   }
 
   METAL_FUNC void
@@ -1228,6 +1296,72 @@ struct BlockLoader {
   }
 };
 
+/* The x loader, reading one type and staging another.
+ *
+ * `BlockLoader` above copies whole `ReadVector`s, which is why it cannot
+ * convert: the copy is raw bytes. On a machine with no native bfloat matrix
+ * path the MMA wants half, and the activations on the device are bfloat, so
+ * somebody has to convert. Doing it here costs the vector copy and buys the
+ * whole K loop a native matrix instruction -- see
+ * `mxfp4_qmm_t_routed_bias_fp16`.
+ *
+ * Deliberately NOT folded into `BlockLoader` as a degenerate case: the
+ * same-type path would lose its `ReadVector` copy, and that path is every
+ * other GEMM in this file.
+ */
+template <
+    typename S,
+    typename D,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct BlockLoaderCast {
+  STEEL_CONST short n_reads = (BCOLS * BROWS) < tgp_size
+                                  ? 1
+                                  : (BCOLS * BROWS) / tgp_size;
+  STEEL_CONST short TCOLS = BCOLS / n_reads;
+  STEEL_CONST short TROWS = tgp_size / TCOLS;
+
+  const int src_ld;
+  const int tile_stride;
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup D* dst;
+  const device S* src;
+
+  METAL_FUNC BlockLoaderCast(
+      const device S* src_,
+      const int src_ld_,
+      threadgroup D* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(src_ld_),
+        tile_stride(reduction_dim ? BCOLS : BROWS * src_ld),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj(n_reads * (thread_idx % TCOLS)),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * src_ld + bj) {}
+
+  METAL_FUNC void load_unsafe() const {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BROWS; i += TROWS) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < n_reads; j++) {
+        dst[i * dst_ld + j] = D(float(src[i * src_ld + j]));
+      }
+    }
+  }
+
+  METAL_FUNC void next() {
+    src += tile_stride;
+  }
+};
+
 } // namespace steel
 } // namespace mlx
 
@@ -1490,6 +1624,20 @@ METAL_FUNC void qmm_t_loaded_impl(
 
   loader_x_t loader_x(x, x_row_stride, Xs, simd_gid, simd_lid);
   mma_t mma_op(simd_gid, simd_lid);
+  // Two fences a K-step, and nothing overlaps between them: the matrix units
+  // idle through the weight read, the load units idle through the MMA. The
+  // obvious repair is a second threadgroup tile so the next step's reads issue
+  // under this step's MMA, and it was written and measured -- gpt-oss prefill,
+  // one binary, tok/s at 128 / 448 / 1024 rows: 410.0 / 539.2 / 566.9 single
+  // against 379.4 / 500.4 / 559.0 double. Slower at every length.
+  //
+  // The reason is occupancy, which is how this GPU hides the latency anyway:
+  // the widest tile here is 10 KiB of threadgroup memory against a 32 KiB
+  // budget, so three threadgroups sit on a core and one's load overlaps
+  // another's MMA for free. Doubling the tile leaves room for one, and
+  // hand-pipelining one threadgroup does not pay for the two it evicted. The
+  // loss shrinks with row count (-7.5%, -7.2%, -1.4%) exactly as that story
+  // predicts. Not a tuning knob: there is no shape here where it wins.
   for (int k = 0; k < k_len; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     loader_x.load_unsafe();
@@ -1514,16 +1662,11 @@ METAL_FUNC void qmm_t_loaded_impl(
           float(residual[r * static_cast<int64_t>(y_row_stride) + c]));
     }
   } else if (WITH_BIAS) {
-    mma_op.store_result(y, y_row_stride);
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint idx = simd_gid * 32u + simd_lid; idx < uint(BM * BN);
-         idx += uint(WM * WN * SIMD_SIZE)) {
-      const int r = int(idx) / BN;
-      const int c = int(idx) % BN;
-      y[r * static_cast<int64_t>(y_row_stride) + c] =
-          P(float(y[r * static_cast<int64_t>(y_row_stride) + c]) +
-            float(residual[y_col + c]));
-    }
+    // The bias is per-column and the accumulator is in registers, so it folds
+    // into the store. This used to be a second pass through device memory --
+    // store, device barrier, read back, add, store again -- which cost the
+    // whole output tile two extra trips on every routed expert GEMM.
+    mma_op.store_result_bias(y, y_row_stride, residual + y_col);
   } else {
     mma_op.store_result(y, y_row_stride);
   }
@@ -1797,7 +1940,7 @@ template <typename T, int BM, int BK, int BN>
   const int e = tile_expert[tid.y];
   if (e < 0) return;
 
-  constexpr int BK_padded = BK + 16 / sizeof(T);
+  constexpr int BK_padded = BK + 16 / sizeof(half);
   constexpr int tgp_size = 4 * SIMD_SIZE;
   const int y_col = int(tid.x) * BN;
   const size_t expert_w = size_t(e) * size_t(N) * size_t(K) / 2;
@@ -1805,14 +1948,46 @@ template <typename T, int BM, int BK, int BN>
   const device uint8_t* wb = (const device uint8_t*)w + expert_w + y_col * K / 2;
   const device uint8_t* sb = exponents + expert_s + y_col * (K / 32);
 
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  // The tiles and the MMA are HALF while the checkpoint and the output stay
+  // bfloat, which is the same trick `fp16_qmm` plays on the DENSE projections
+  // and the largest single win in this driver -- about 40% on the GEMM. It was
+  // never extended to the routed mixture, and gpt-oss is the only model here
+  // whose prefill is mostly routed MXFP4, which is exactly where llama.cpp was
+  // ahead.
+  //
+  // Nothing is precast. The dense path stages a half copy of the activations
+  // in a separate dispatch because its input is a plain activation row; here
+  // the weight loader already materialises every value (MXFP4 has to be
+  // decoded anyway, so asking it for `half` instead of `bfloat` is free), and
+  // the x tile is converted once on the way into threadgroup memory rather
+  // than on every MMA read of it.
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  constexpr int WM = 2;
+  constexpr int WN = 2;
   using loader_w_t =
-      mlx::steel::Mxfp4BlockLoader<T, BN, BK, BK_padded, 1, tgp_size>;
+      mlx::steel::Mxfp4BlockLoader<T, BN, BK, BK_padded, 1, tgp_size, half>;
+  using loader_x_t = mlx::steel::
+      BlockLoaderCast<T, half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using mma_t = mlx::steel::
+      BlockMMA<half, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+
+  const int y_row = int(tid.y) * BM;
   loader_w_t loader_w(wb, sb, K, Ws, simd_gid, simd_lid);
-  qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, false, true>(
-      x, y, bias + size_t(e) * N, Xs, Ws, K, N, K, tid, simd_gid, simd_lid,
-      loader_w);
+  loader_x_t loader_x(x + size_t(y_row) * size_t(K), K, Xs, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  mma_op.store_result_bias(y + size_t(y_row) * size_t(N) + y_col, N,
+                           bias + size_t(e) * N + y_col);
 }
 
 #define instantiate_qmm_t(gs, bm, bk, bn, b)                                          \
