@@ -68,12 +68,16 @@ into the fragment engrain enforces exactly, membership verified by generating
 has two settings and neither is both sound and complete: its default refuses
 91.7\% of valid documents whose object keys are permuted, and its order-free
 setting does not enforce \texttt{required} at all, admitting invalid documents
-26.3\% of the time. We do both, and end to end against the order-free setting we
-are 1.72$\times$ faster while producing 49\% more valid documents. We also
-report where residency is paid for: at batch 1 a host matcher serves a request
-in 0.255\,s against our 0.469, our cold path to a new schema's first mask is
-236\,ms against 17, and on an 8B model the speed difference vanishes entirely
---- their fill hides behind a longer forward pass and ours cannot --- leaving
+26.3\% of the time. llguidance is sound but fixes property order with no
+setting to undo it, so \textbf{engrain is the only engine here that is both
+sound and order-free} --- and that, rather than soundness, is the correctness
+claim. End to end against XGrammar's order-free setting we are 1.72$\times$
+faster while producing 49\% more valid documents, and against llguidance
+1.13$\times$ at batch 512. We also report where residency is paid for:
+llguidance beats us end to end through batch 128 and serves a single request in
+half our time, our cold path to a new schema's first mask is 227\,ms against
+its 1.2, and on an 8B model the speed difference vanishes entirely --- a host
+fill hides behind a longer forward pass and a device fill cannot --- leaving
 only the correctness gap.
 \end{abstract}
 ]
@@ -727,7 +731,8 @@ Makespan is the time to serve all 512 requests. Source: \texttt{rigor.e2e}.}
  & makespan & tokens & valid \\
 \midrule
 unconstrained & 1.66\,s & 49{,}145 & 0/512 \\
-\textbf{engrain} & \textbf{3.30\,s} & 37{,}488 & \textbf{200/512} \\
+\textbf{engrain} & \textbf{3.30\,s} & 37{,}488 & 200/512 \\
+llguidance & 3.71\,s & 32{,}310 & 297/512 \\
 XGrammar, ordered & 6.08\,s & 31{,}859 & 290/512 \\
 XGrammar, unordered & 5.68\,s & 38{,}453 & 134/512 \\
 \bottomrule
@@ -737,17 +742,22 @@ XGrammar, unordered & 5.68\,s & 38{,}453 & 134/512 \\
 \vskip -0.1in
 \end{table}
 
-Against the matched configuration we are \textbf{1.72$\times$ faster and
-produce 49\% more valid documents} (Table~\ref{tab:e2e}). The 290 in the
-default row is not greater correctness; it is the narrowing---forcing the
-declared order makes a document finish sooner and land inside the cap, and it
-is the same constraint that refuses 91.7\% of permuted valid documents.
+Against XGrammar's matched configuration we are \textbf{1.72$\times$ faster and
+produce 49\% more valid documents} (Table~\ref{tab:e2e}). Against llguidance,
+which is the strongest baseline and beats XGrammar at every batch size, we are
+1.13$\times$ faster at batch 512 and 1.30$\times$ per generated token. The high
+validity of the two order-fixed rows is not greater correctness; it is the
+narrowing---forcing the declared order makes a document finish sooner and land
+inside the cap, which is why they also generate 14--16\% fewer tokens, and it
+is the same constraint that refuses over 91\% of permuted valid documents.
 
-\paragraph{Where the crossover is.} With vLLM's own threading rule, the mask
-crossover is batch \textbf{$\approx$30}: at batch 8 XGrammar is 2.8$\times$
-cheaper, at 32 the two are level, at 128 we are 3.3$\times$ cheaper and at 512
-5.1$\times$. End to end the crossover sits between 32 and 128, and at batch 1
-XGrammar serves a request in 0.255\,s against our 0.469. Below a few dozen
+\paragraph{Where the crossover is, and it depends on the baseline.} With
+vLLM's own threading rule the mask crossover against XGrammar is batch
+$\approx$30: at 8 they are 2.8$\times$ cheaper, at 32 the two are level, at 128
+we are 3.3$\times$ cheaper and at 512 5.1$\times$. \textbf{Against llguidance
+it is about batch 160.} End to end it serves a single request in 0.248\,s
+against our 0.469, and stays ahead through batch 128 (0.898 against 0.953)
+before we take 256 (1.380 against 1.721) and 512. Below a hundred-odd
 concurrent requests a host matcher is simply cheaper than a kernel launch, and
 nothing in this design changes that.
 
@@ -991,8 +1001,9 @@ Source: \texttt{rigor.fragment}, \texttt{rigor.soundness}.}
 \toprule
  & over-accepts & rejects a valid doc. \\
 \midrule
-\textbf{engrain} & \textbf{0.0\%} (0/2{,}115) & \textbf{0.0\%} (0/420) \\
-XGrammar, ordered & 6.0\% (153/2{,}551) & \textbf{91.7\%} (385/420) \\
+\textbf{engrain} & \textbf{0.0\%} (0/2{,}115) & \textbf{0.0\%} (0/390) \\
+llguidance & \textbf{0.0\%} (0/2{,}421) & 91.5\% (357/390) \\
+XGrammar, ordered & 6.0\% (153/2{,}551) & 91.7\% (385/420) \\
 XGrammar, unordered & \textbf{26.3\%} (646/2{,}452) & 0.7\% \\
 \bottomrule
 \end{tabular}
@@ -1009,11 +1020,23 @@ The unordered lowering is the one that means what the schema means, and there
 \texttt{required} is not enforced at all---485 of its 646 failures are a
 missing required property.
 
-Enforcing \texttt{required} on an unordered object is exactly what the subset
-construction of \S\ref{sec:automaton} is for, and it is what neither of their
-settings does. This is the paper's central correctness claim and it is not a
-matter of degree: there is no XGrammar configuration that is simultaneously
-sound and complete on this corpus, and engrain is both.
+\textbf{llguidance is sound}, and this is the result that keeps the claim
+honest: it enforces \texttt{required} correctly and admits nothing the schema
+rejects over 2{,}421 complete walks. XGrammar is the outlier, not the rule.
+llguidance pays for it the other way --- it fixes object property order in its
+lowering, and unlike XGrammar this cannot be configured away. Its JSON options
+are \texttt{item\_separator}, \texttt{key\_separator},
+\texttt{whitespace\_flexible}, \texttt{whitespace\_pattern},
+\texttt{coerce\_one\_of}, \texttt{lenient} and
+\texttt{json\_allowed\_escapes}: there is no ordering option at all.
+
+So the claim is exactly one sentence, and not a word more. \textbf{Engrain is
+the only engine here that is both sound and order-free.} It is not the only
+sound one. Enforcing \texttt{required} on an unordered object is what the
+subset construction of \S\ref{sec:automaton} is for, and the two baselines
+between them show why that is the hard combination rather than either half:
+one gives up soundness to get order-freedom, the other gives up order-freedom
+to keep soundness, and there is no configuration of either that has both.
 
 \paragraph{The residual 6\% is one bug, and we had it too.} 148 of XGrammar's
 153 ordered-mode failures are not schema violations at all---they are documents
@@ -1121,13 +1144,16 @@ tenth of schemas holds \emph{half} the arena. A budget that refuses, degrades
 or pages those is worth more than another constant factor on the median, and
 \texttt{footprint()} already predicts the size before it is paid.
 
-\paragraph{The cold path is our worst number.} From a schema nobody has seen to
-its first usable mask: 236.5\,ms at the median against XGrammar's 17.3, of
-which 98\,ms is the compiler and the rest is preparing and admitting the
-tables. In serving, schemas arrive with requests, so this is a stated failure
-rather than a footnote. Their tail is worse than ours by more than ours is
-worse at the median---p99 4.2\,s against 8.7, and worst case 11.7\,s against
-54.3---but a median a request waits on is the number that matters.
+\paragraph{The cold path is our worst number, and llguidance shows how bad.}
+From a schema nobody has seen to its first usable mask, at the median:
+\textbf{llguidance 1.2\,ms}, XGrammar 20.7, engrain 227.2, of which 98\,ms is
+our compiler and the rest is preparing and admitting the tables. In serving,
+schemas arrive with requests, so this is a stated failure rather than a
+footnote. XGrammar's tail is worse than ours---p99 4.0\,s against 8.9, worst
+case 11.9\,s against 54.5---but llguidance's is bounded at \textbf{11.5\,ms},
+because an Earley parser needs almost no precomputation. It sits at the lazy
+end of exactly the memory-for-compute curve our arena sits at the eager end of,
+and it is the strongest argument for the lazy residency below.
 
 \paragraph{Compile time} is \emph{linear} in the number of lexer states (slope
 1.05, $r=0.94$): there is no algorithmic blow-up, only the inherent
@@ -1147,13 +1173,16 @@ system in this space owes that distinction.
 \label{sec:limitations}
 
 Stated as results, because the structural claim survives them and a reader
-deciding whether to deploy needs them. \textbf{Batch 1 is a loss} against both
-baselines: our floor is set by sweeping live configurations, not by the batch.
-\textbf{llguidance beats us 4.8$\times$ on one of three schemas} at batch 512,
-and its cost is flat in the grammar where ours is not. \textbf{The cold path is 236\,ms} from a schema
-nobody has seen to its first usable mask, against XGrammar's 17 and
-llguidance's near-zero; schemas arrive with requests, so this is the number a
-first request waits on. Lazy lexer residency is the plausible fix and is
+deciding whether to deploy needs them. \textbf{llguidance beats us end to end up to
+batch 128} and serves a single request in half our time; the crossover against
+it is about batch 160, where against XGrammar it is 30. Our floor is set by
+sweeping live configurations, not by the batch. \textbf{llguidance is also
+sound}: it admits nothing its schema rejects, so our correctness claim is
+order-freedom, not soundness. \textbf{The cold path is 227\,ms} from a schema
+nobody has seen to its first usable mask, against llguidance's 1.2 and
+XGrammar's 20.7 --- 190$\times$ off the best, and llguidance's worst case is
+11.5\,ms where ours is 11.9\,s. Schemas arrive with requests, so this is the
+number a first request waits on. Lazy lexer residency is the plausible fix and is
 unimplemented. \textbf{Our arena is the same size as XGrammar's host cache} --- 1{,}965\,MiB
 against 2{,}010 over 409 schemas --- but it sits in device memory and competes
 with the KV cache, and a tenth of the schemas hold half of it.
@@ -1227,11 +1256,13 @@ where a host matcher adds 398, holds its tail flat under CPU contention where a
 host matcher's p99 rises 7.8$\times$, and is bit-exact over 7{,}289 verified
 rows.
 
-It is also the only engine here that is both sound and complete on the fragment
-we could construct common ground on, which took building that fragment and
-verifying it by generation rather than by argument --- a methodology we think
-this literature needs, since it found four defects in our own front end and two
-in the baseline's. And it costs: 236\,ms before a new schema's first mask
+It is also the only engine here that is both sound and order-free on the
+fragment we could construct common ground on, which took building that fragment
+and verifying it by generation rather than by argument --- a methodology we
+think this literature needs, since it found four defects in our own front end
+and two in a baseline's. llguidance is sound and its compiler is 190$\times$
+faster than ours; what it cannot do is accept a valid document whose properties
+arrive in a different order, and no setting changes that. And it costs: 236\,ms before a new schema's first mask
 against 17, a loss below a few dozen concurrent requests, an arena in device
 memory rather than host, and, on an 8B model, no throughput advantage at all
 once the baseline's fill hides behind the forward pass. We believe the

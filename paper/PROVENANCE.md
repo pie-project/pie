@@ -14,8 +14,8 @@ are historical record, not results.
 | 2 | coverage and compile time, three engines | `files/exp_baselines_coverage.py` | 2026-07-31 |
 | 3 | heterogeneous batches, and the cost of mixing | `files/probe_mixed_cost.py` | 2026-07-31 |
 | 4 | ablation of the memo and of graph capture | `files/exp_ablation.py` | 2026-07-31 |
-| 5 | over- and under-acceptance on the exact fragment | `rigor.fragment`, `rigor.soundness` | 2026-08-05 |
-| 6 | end to end in vLLM, three configurations | `rigor.e2e` | 2026-08-05 |
+| 5 | over- and under-acceptance on the exact fragment, three engines | `rigor.fragment`, `rigor.soundness` | 2026-08-06 |
+| 6 | end to end in vLLM, three engines | `rigor.e2e` | 2026-08-06 |
 | 7 | arena size, sharing and the verdict trade | `rigor.cost` + a live pool | 2026-08-05 |
 
 ## The corpus the correctness and end-to-end results use
@@ -42,7 +42,15 @@ baseline's own corpus documents.
 - fill under CPU contention (`engrain_lab.rigor.serving`)
 - mask latency by batch, vocabulary and diversity (`engrain_lab.rigor.lockstep`)
 - regex and EBNF, correctness and cost (`engrain_lab.rigor.nonjson`)
-- cold path from schema to first mask (session measurement, 2026-08-05)
+- cold path from schema to first mask, three engines (session measurement,
+  2026-08-06): llguidance p50 1.2 ms / max 11.5, XGrammar 20.7 / 54,473,
+  engrain 227.2 / 11,901
+- llguidance driven through a byte-level `LLTokenizer` for the correctness
+  half, so the random walk is the same walk the other two engines take. Its
+  matcher is wrapped to expose `accept_token`/`allowed_tokens`/`can_terminate`;
+  the first run of that comparison reported zero complete walks because
+  llguidance spells it `consume_token` and the harness swallowed the
+  `AttributeError`.
 - the relaxation list's completeness (`engrain_lab.rigor.relaxation`)
 - `python -m engrain_lab.verify` — six differential verifications, zero failures
 
@@ -69,6 +77,12 @@ requests in a step, in chunks of sixteen, read out of
 threaded above batch 16, which was wrong in both directions — at batch 32 the
 pool costs more than the work, and at 128 it made XGrammar look faster than
 vLLM runs it.
+
+**llguidance has no ordering option at all.** Its JSON options are
+`item_separator`, `key_separator`, `whitespace_flexible`, `whitespace_pattern`,
+`coerce_one_of`, `lenient`, `json_allowed_escapes` — property order is fixed in
+its lowering, so unlike XGrammar it cannot be given the order-free setting. It
+is measured as it ships, which is its only setting.
 
 outlines_core cannot be configured out of the same restriction: its lowering
 emits a literal regex with the properties in declared order, so order is a
