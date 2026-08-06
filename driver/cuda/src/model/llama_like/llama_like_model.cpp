@@ -62,8 +62,6 @@ enum class DeclineReason {
     /// because the body cannot honour it there.
     TruncatedAxisUnstated,
     FusedQkvUnstaged,
-    /// A banded PREFILL fire: same root as `TruncatedPrefill`.
-    BandedPrefill,
     /// A banded decode fire with a live band whose prefix plan the
     /// prepare did not stamp — the 14B device-geometry envelope class.
     BandedPlanMissing,
@@ -79,7 +77,6 @@ const char* decline_name(DeclineReason r) {
     case DeclineReason::TruncatedAxisUnstated:
         return "truncated-axis-unstated";
     case DeclineReason::FusedQkvUnstaged:   return "fused-qkv-unstaged";
-    case DeclineReason::BandedPrefill:      return "banded-prefill";
     case DeclineReason::BandedPlanMissing:  return "banded-plan-missing";
     }
     return "?";
@@ -92,7 +89,16 @@ const char* decline_name(DeclineReason r) {
 // per reason, six reasons) and it makes a class DISCOVERABLE without
 // anyone having thought to arm a trace first. Every decline class this
 // project has had to chase was one nobody knew was being taken.
-void note_decline(DeclineReason reason) {
+struct DeclineShape {
+    int n;
+    int r;
+    bool pure_decode;
+    std::uint32_t max_layers;
+    std::uint32_t full_depth_rows;
+    std::uint32_t bands;
+};
+
+void note_decline(DeclineReason reason, const DeclineShape& shape) {
     if (reason == DeclineReason::None) return;
     static const bool trace = [] {
         const char* v = std::getenv("PIE_DECLARED_DECLINE_TRACE");
@@ -107,8 +113,21 @@ void note_decline(DeclineReason reason) {
                      "PIE_DECLARED_DECLINE_TRACE=1 counts them)\n",
                      decline_name(reason));
     } else if (trace) {
-        std::fprintf(stderr, "[declared] decline reason=%s\n",
-                     decline_name(reason));
+        // The SHAPE too, because "which rule refused" is only half of a
+        // work list: closing a rule means knowing which of its shapes
+        // actually arrive. A uniformly truncated prefill and a mixed one
+        // decline through the same term and are different pieces of
+        // work.
+        std::fprintf(stderr,
+                     "[declared] decline reason=%s N=%d R=%d decode=%d "
+                     "k=%d full_rows=%d bands=%u\n",
+                     decline_name(reason), shape.n, shape.r,
+                     shape.pure_decode ? 1 : 0,
+                     shape.max_layers == 0xffffffffu
+                         ? -1 : static_cast<int>(shape.max_layers),
+                     shape.full_depth_rows == 0xffffffffu
+                         ? -1 : static_cast<int>(shape.full_depth_rows),
+                     shape.bands);
     }
 }
 
@@ -269,8 +288,18 @@ void LlamaLikeModel::body(Workspace& ws,
         // hand-written body. Without any term here the declared leg
         // silently demoted mixed-k fires to full depth (caught live at
         // 14B: R=8 co-fires, no [depth-bands], no DECLINE).
-        if (plan_.depth_band_count >= 2) {
-            if (!in.is_pure_decode) return DeclineReason::BandedPrefill;
+        // A NON-pure-decode fire under a banded step is not refused, and
+        // the argument is the hand path's own: `bands_runnable`
+        // (llama_like.cpp) requires `is_pure_decode`, so THAT path
+        // ignores the step's bands for such a fire and runs it full
+        // depth — the demotion its own comment names. The declared
+        // executor does the same thing for the same reason from the
+        // other side: a prefill trace does not state the depth axis, so
+        // `depth_banded` is false and the band arrays are never read.
+        // Two paths, one behaviour, so refusing was refusing a fire both
+        // forms agree on. Measured: N=240 R=4 prefill fires under a
+        // bands=2 step, themselves untruncated (k=-1, full_rows=-1).
+        if (plan_.depth_band_count >= 2 && in.is_pure_decode) {
             for (std::uint32_t j = 0; j < plan_.depth_band_count; ++j) {
                 if (plan_.depth_band_rows[j] > 0 &&
                     !plan_.depth_band_plans[j]) {
@@ -280,7 +309,10 @@ void LlamaLikeModel::body(Workspace& ws,
         }
         return DeclineReason::None;
     }();
-    note_decline(decline);
+    note_decline(decline,
+                 DeclineShape{in.total_tokens, in.num_requests,
+                              in.is_pure_decode, in.max_layers,
+                              in.full_depth_rows, plan_.depth_band_count});
     const bool declared_eligible = decline == DeclineReason::None;
     if (declared_eligible) {
         llama_like_forward_declared(
