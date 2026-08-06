@@ -668,6 +668,13 @@ impl Qwen35FullAttnFacts {
 /// One enum for the whole model because the family applies the same MLP
 /// kind to every layer (`qwen3_5_forward.cpp` has no per-layer MLP switch;
 /// the per-layer axis of this family is the ATTENTION kind).
+///
+/// WHICH ARM A CHECKPOINT TAKES IS A READING OF ITS CONFIG, not of its
+/// `model_type`. Qwen3.6-27B is `model_type: qwen3_5` and takes `Dense`
+/// (no `num_experts`, `intermediate_size` 17408); the MoE arm is the
+/// 35B-A3B-shaped checkpoints'. Worth stating because the opposite was
+/// once assumed here, and it aimed a stretch of work at a branch the
+/// checkpoint in question never reaches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Qwen35MlpKind {
     Dense { intermediate: u32 },
