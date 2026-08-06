@@ -61,7 +61,7 @@ ssh-key = { version = "0.6", features = ["rsa", "ed25519", "ecdsa"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 p256 = { version = "0.13", features = ["pkcs8", "ecdsa"] }
-p384 = { version = "0.13", features = ["pkcs8", "ecdsa"] }
+p384 = { version = "0.14", features = ["pkcs8", "ecdsa"] }
 sha2 = "0.10"
 chrono = "0.4"
 ringbuffer = "0.15"
