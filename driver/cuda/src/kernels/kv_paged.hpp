@@ -110,15 +110,23 @@ void launch_copy_kv_cells_bf16(
 // `window+1` tokens exactly where they were and `window_left` keeps masking
 // correctly against the same absolute positions.
 //
-// Gathers, per request, the last `dst_indptr[r+1] - dst_indptr[r]` page ids of
-// that request's slice of `src_indices`. The caller decides how many to keep
-// (see `trimmed_window_pages`), which is why the count is read off the
-// destination indptr rather than recomputed here.
-void launch_gather_trailing_pages(
+// Builds the trimmed page view ENTIRELY on the device: per request it keeps
+// the last `min(have, keep_pages)` page ids and writes the matching indptr.
+//
+// Device-side is the whole point. A host-computed page count is a constant by
+// the time it reaches a captured graph, and this decision is not constant: a
+// context crosses `keep_pages` as it grows, and graphs are shared between
+// requests of different lengths. Baking `keep` in and replaying it against a
+// shorter request underflows `src_end - keep` and reads wild memory.
+//
+// `dst_indices` must hold `R * keep_pages` entries -- the worst case, which
+// depends only on the batch shape.
+void launch_build_window_page_view(
     const std::uint32_t* src_indices,   // [src_indptr[R]] physical page ids
     const std::uint32_t* src_indptr,    // [R+1] device
-    const std::uint32_t* dst_indptr,    // [R+1] device
-    std::uint32_t* dst_indices,         // [dst_indptr[R]] out
+    int keep_pages,
+    std::uint32_t* dst_indptr,          // [R+1] out
+    std::uint32_t* dst_indices,         // [R * keep_pages] out
     int R,
     cudaStream_t stream);
 
