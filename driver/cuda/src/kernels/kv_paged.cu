@@ -1008,4 +1008,68 @@ void launch_build_window_page_view(
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+__global__ void build_full_split_view_kernel(
+    const std::uint32_t* __restrict__ src_indptr,
+    const std::uint32_t* __restrict__ src_last_page_len,
+    int splits,
+    int page_size,
+    std::uint32_t* __restrict__ dst_indptr,
+    std::uint32_t* __restrict__ dst_indices,
+    std::uint32_t* __restrict__ dst_last,
+    const std::uint32_t* __restrict__ src_indices)
+{
+    if (threadIdx.x != 0) return;
+    const std::uint32_t base = src_indptr[0];
+    const int pages = static_cast<int>(src_indptr[1] - base);
+    const std::uint32_t tail = src_last_page_len[0];
+    std::uint32_t acc = 0;
+    dst_indptr[0] = 0;
+    for (int i = 0; i < splits; ++i) {
+        // Proportional boundaries: no slice is skipped and the final one
+        // always ends on the request's last page, which is the only one whose
+        // length is partial.
+        const int lo = static_cast<int>(
+            (static_cast<long long>(i) * pages) / splits);
+        const int hi = static_cast<int>(
+            (static_cast<long long>(i + 1) * pages) / splits);
+        if (hi > lo) {
+            for (int p = lo; p < hi; ++p) {
+                dst_indices[acc + (p - lo)] = src_indices[base + p];
+            }
+            acc += static_cast<std::uint32_t>(hi - lo);
+            dst_last[i] = (hi == pages)
+                ? tail : static_cast<std::uint32_t>(page_size);
+        } else {
+            // One page so the range is well-formed, zero length so it is
+            // empty. Any valid page id will do; nothing reads it.
+            dst_indices[acc] = src_indices[base];
+            acc += 1;
+            dst_last[i] = 0;
+        }
+        dst_indptr[i + 1] = acc;
+    }
+}
+
+}  // namespace
+
+void launch_build_full_split_view(
+    const std::uint32_t* src_indptr,
+    const std::uint32_t* src_last_page_len,
+    int splits,
+    int page_size,
+    std::uint32_t* dst_indptr,
+    std::uint32_t* dst_indices,
+    std::uint32_t* dst_last,
+    const std::uint32_t* src_indices,
+    cudaStream_t stream)
+{
+    if (splits <= 0 || page_size <= 0) return;
+    build_full_split_view_kernel<<<1, 32, 0, stream>>>(
+        src_indptr, src_last_page_len, splits, page_size,
+        dst_indptr, dst_indices, dst_last, src_indices);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace pie_cuda_driver::kernels

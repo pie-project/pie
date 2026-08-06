@@ -33,6 +33,7 @@
 #include "kernels/topk_softmax.hpp"
 #include "ops/gemm.hpp"
 #include "ops/attention_flashinfer.hpp"
+#include "ops/attention_flashinfer_hopper.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -358,6 +359,76 @@ void mixtral_forward_paged(
             win_indptr.data(), win_indices.data(), R, stream);
     }
 
+    // ── Full-attention KV split ───────────────────────────────────────
+    // The other half of gpt-oss's layers see the whole context, and there the
+    // trim above has nothing to drop. What is wrong with them is parallelism:
+    // eight kv heads and one request is eight CTAs on 132 SMs, and the
+    // microbench puts that ~46x off the kernel's own bandwidth roofline (2.25
+    // MB of KV read in 37 us). Split the range into `kMixtralFullSplits`
+    // one-token requests over consecutive slices, share the query with
+    // `broadcast_q`, and fold the partials with `MergeStates`.
+    //
+    // The slice count is FIXED. It is the request count the plan's descriptor
+    // and the launch geometry are derived from, so it must not track a context
+    // length that grows under a captured graph -- which is also why the view
+    // itself is built on the device and the launch is unconditional.
+    constexpr int kMixtralFullSplits = 16;
+    ops::DecodePlanCachePtr split_plan;
+    DeviceBuffer<std::uint32_t> split_indptr, split_indices, split_last;
+    DeviceBuffer<std::uint16_t> split_partial;
+    DeviceBuffer<float> split_lse, split_lse_merged;
+    bool has_full_layer = false;
+    for (int L = 0; L < cfg.num_hidden_layers; ++L) {
+        const int w_l = (L < (int)fwd_cfg.per_layer_window_left.size())
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+        if (w_l < 0) { has_full_layer = true; break; }
+    }
+    if (use_decode_path && has_full_layer && R == 1 && page_size > 0 &&
+        custom_mask_d == nullptr) {
+        const int splits = kMixtralFullSplits;
+        split_indptr = DeviceBuffer<std::uint32_t>::alloc(splits + 1);
+        split_last = DeviceBuffer<std::uint32_t>::alloc(splits);
+        // Sized from the model's context limit, not from this fire's page
+        // count: the latter is a host value, and a capture made while it was
+        // small would replay into an allocation too short for a longer
+        // request. The pool size would also be safe but is far larger than any
+        // one request can hold, and this buffer is cut per fire.
+        const std::size_t max_req_pages =
+            (static_cast<std::size_t>(cfg.max_position_embeddings) +
+             page_size - 1) / page_size;
+        split_indices = DeviceBuffer<std::uint32_t>::alloc(
+            static_cast<std::size_t>(splits) +
+            std::min<std::size_t>(max_req_pages,
+                                  static_cast<std::size_t>(cache.num_pages())));
+        kernels::launch_build_full_split_view(
+            kv_page_indptr, kv_last_page_lens, splits, page_size,
+            split_indptr.data(), split_indices.data(), split_last.data(),
+            kv_page_indices, stream);
+        split_plan = ops::make_decode_plan();
+        // Past the primary plan's descriptor, which is sized for R.
+        ops::set_decode_plan_int_base(*split_plan, 1u << 20);
+        // The descriptor is page-count independent, so the counts handed to
+        // the planner only have to be a well-formed indptr over `splits`
+        // requests; the real ranges reach the LAUNCH, from the device.
+        std::vector<std::uint32_t> plan_indptr_h(splits + 1);
+        for (int i = 0; i <= splits; ++i) {
+            plan_indptr_h[i] = static_cast<std::uint32_t>(i);
+        }
+        ops::plan_attention_flashinfer_decode(
+            *split_plan, plan_indptr_h.data(), splits,
+            num_q_heads_local, num_kv_heads_local, d, page_size,
+            attn_ws, stream, /*enable_cuda_graph=*/true,
+            /*full_attention_variant=*/true, cache.hnd_layout());
+        const std::size_t rows =
+            static_cast<std::size_t>(splits) * num_q_heads_local;
+        split_partial = DeviceBuffer<std::uint16_t>::alloc(
+            rows * static_cast<std::size_t>(d));
+        split_lse = DeviceBuffer<float>::alloc(rows);
+        split_lse_merged =
+            DeviceBuffer<float>::alloc(static_cast<std::size_t>(num_q_heads_local));
+    }
+
     // Per-fire scratch for MoE routing. Sized for the worst case (N
     // tokens × K experts each); reallocated per call which is fine
     // since N changes, but the host-side vectors avoid touching cuda
@@ -523,7 +594,22 @@ void mixtral_forward_paged(
         // gpt-oss layers that turn out to have nullptr sinks.
         float* layer_lse = (layer.attn_sinks != nullptr) ? lse_ptr : nullptr;
 
-        if (use_decode_path) {
+        const bool use_full_split =
+            use_decode_path && !split_indices.empty() && layer_window < 0;
+        if (use_full_split) {
+            ops::dispatch_attention_flashinfer_decode_bf16(
+                *split_plan, ws.q.data(),
+                kv_view.k_pages, kv_view.v_pages,
+                split_partial.data(), split_indices.data(),
+                split_indptr.data(), split_last.data(),
+                attn_ws, stream, /*window_left=*/-1,
+                /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f,
+                split_lse.data(), /*broadcast_q=*/true);
+            ops::merge_attention_states_bf16(
+                split_partial.data(), split_lse.data(),
+                ws.attn_out.data(), split_lse_merged.data(),
+                kMixtralFullSplits, 1, num_q_heads_local, d, stream);
+        } else if (use_decode_path) {
             // One plan serves both page lists. With `enable_cuda_graph` the
             // scheduler declines to split KV, and what is left of the plan --
             // request/tile indices, o_indptr, padded batch -- is a function of
@@ -568,8 +654,12 @@ void mixtral_forward_paged(
         // softmax-denominator extension that flashinfer's DefaultAttention
         // doesn't emit natively. Per-rank shard count under TP.
         if (layer.attn_sinks != nullptr) {
+            // On a split layer each slice's lse is a partial; the total the
+            // sink extension needs is the one MergeStates just folded.
             kernels::launch_attention_sink_rescale_bf16(
-                ws.attn_out.data(), layer_lse, layer.attn_sinks->data(),
+                ws.attn_out.data(),
+                use_full_split ? split_lse_merged.data() : layer_lse,
+                layer.attn_sinks->data(),
                 N, num_q_heads_local, d, stream);
         }
         invoke_stage_hook(

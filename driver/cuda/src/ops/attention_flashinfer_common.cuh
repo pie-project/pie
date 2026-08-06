@@ -327,6 +327,13 @@ struct DecodePlanCache {
     // attention without a replan. Under any other plan the arrays ARE derived
     // from page counts, and substituting a shorter list is silently wrong.
     bool page_count_independent = false;
+    // Byte offset of this plan's descriptor inside the SHARED int workspace.
+    // Every planner otherwise carves from offset 0, which is safe only while
+    // the live plans hold identical bytes -- and two plans over different
+    // REQUEST COUNTS never do, because the field offsets are derived from that
+    // count. A caller holding two plans at once sets this to keep them apart,
+    // the way the sm90 wrapper takes `int_base_bytes`.
+    std::size_t int_base_bytes = 0;
     int static_nonsplit_num_requests = 0;
     std::vector<IdType> static_request_indices;
     std::vector<IdType> static_kv_tile_indices;
@@ -589,7 +596,8 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
         params.score_indptr = sink->indptr;
     }
 
-    void* int_buf = workspace.int_buffer();
+    void* int_buf = static_cast<std::uint8_t*>(workspace.int_buffer()) +
+                    cache.int_base_bytes;
     void* float_buf = workspace.float_buffer();
     params.request_indices    = offset_ptr<IdType>(int_buf, cache.plan_info.request_indices_offset);
     params.kv_tile_indices    = offset_ptr<IdType>(int_buf, cache.plan_info.kv_tile_indices_offset);

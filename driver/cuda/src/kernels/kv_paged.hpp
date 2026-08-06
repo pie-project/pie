@@ -130,4 +130,34 @@ void launch_build_window_page_view(
     int R,
     cudaStream_t stream);
 
+// ── Full-attention KV split view ───────────────────────────────────────
+// Splits ONE request's page range into `splits` consecutive slices and emits
+// the indptr/last-page-length pair that describes them as `splits` separate
+// one-token requests. A decode query sits at the end of whatever range it is
+// handed, so a query fired against a slice attends to exactly that slice --
+// the partial a split wants -- and `MergeStates` folds them. That turns eight
+// CTAs (one per kv head) into `8 * splits`, which is the whole point: at one
+// request the decode kernel is nowhere near its bandwidth roofline because it
+// has nothing to fill the machine with.
+//
+// Slices are contiguous sub-ranges of `src_indices`, so no page ids are moved;
+// only the indptr is new. Slices that come out EMPTY (fewer pages than slices)
+// are given one page and a last-page length of ZERO, which is a kv_len of zero
+// rather than the `(0 - 1) * page_size` that an empty range would compute --
+// that expression is negative, and it faults.
+//
+// Everything is read from device memory for the same reason the window trim is:
+// one captured graph serves every context length, so a host-computed boundary
+// is a boundary frozen at capture time.
+void launch_build_full_split_view(
+    const std::uint32_t* src_indptr,        // [2] device (single request)
+    const std::uint32_t* src_last_page_len, // [1] device
+    int splits,
+    int page_size,
+    std::uint32_t* dst_indptr,              // [splits+1] out
+    std::uint32_t* dst_indices,             // [splits + num_pages] out
+    std::uint32_t* dst_last,                // [splits] out
+    const std::uint32_t* src_indices,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels
