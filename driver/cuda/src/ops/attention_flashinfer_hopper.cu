@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "ops/attention_flashinfer_hopper.hpp"
 
 #include <cmath>
@@ -45,7 +46,8 @@ int current_device_major() {
     return cached_major;
 }
 
-template <std::uint32_t HeadDim, bool SameSchedule, bool Softcap, bool Causal>
+template <std::uint32_t HeadDim, bool SameSchedule, bool Softcap, bool Causal,
+          bool Window>
 cudaError_t dispatch_hopper_prefill(HopperParams& params,
                                     bool enable_pdl,
                                     cudaStream_t stream) {
@@ -56,26 +58,26 @@ cudaError_t dispatch_hopper_prefill(HopperParams& params,
         HeadDim,
         HeadDim,
         Mask,
-        /*LEFT_SLIDING_WINDOW=*/false,
+        Window,
         SameSchedule,
         Variant,
         HopperParams>(params, enable_pdl, stream);
 }
 
-template <std::uint32_t HeadDim, bool Softcap, bool Causal>
+template <std::uint32_t HeadDim, bool Softcap, bool Causal, bool Window>
 cudaError_t dispatch_hopper_prefill_schedule(HopperParams& params,
                                              bool same_schedule,
                                              bool enable_pdl,
                                              cudaStream_t stream) {
     if (same_schedule) {
-        return dispatch_hopper_prefill<HeadDim, true, Softcap, Causal>(
+        return dispatch_hopper_prefill<HeadDim, true, Softcap, Causal, Window>(
             params, enable_pdl, stream);
     }
-    return dispatch_hopper_prefill<HeadDim, false, Softcap, Causal>(
+    return dispatch_hopper_prefill<HeadDim, false, Softcap, Causal, Window>(
         params, enable_pdl, stream);
 }
 
-template <bool Softcap, bool Causal>
+template <bool Softcap, bool Causal, bool Window>
 cudaError_t dispatch_hopper_prefill_dim(HopperParams& params,
                                         int head_dim,
                                         bool same_schedule,
@@ -83,10 +85,32 @@ cudaError_t dispatch_hopper_prefill_dim(HopperParams& params,
                                         cudaStream_t stream) {
     switch (head_dim) {
         case 128:
-            return dispatch_hopper_prefill_schedule<128, Softcap, Causal>(
+            return dispatch_hopper_prefill_schedule<128, Softcap, Causal,
+                                                    Window>(
+                params, same_schedule, enable_pdl, stream);
+        // Gemma-4's sliding layers and Qwen3.6's full-attention layers both
+        // attend at 256. They are the shapes this driver serves from FA2
+        // today and the ones vLLM serves from FlashAttention.
+        case 256:
+            return dispatch_hopper_prefill_schedule<256, Softcap, Causal,
+                                                    Window>(
                 params, same_schedule, enable_pdl, stream);
     }
     return cudaErrorNotSupported;
+}
+
+template <bool Softcap, bool Causal>
+cudaError_t dispatch_hopper_prefill_dim_window(HopperParams& params,
+                                               int head_dim,
+                                               bool same_schedule,
+                                               bool enable_pdl,
+                                               cudaStream_t stream) {
+    if (params.window_left >= 0) {
+        return dispatch_hopper_prefill_dim<Softcap, Causal, true>(
+            params, head_dim, same_schedule, enable_pdl, stream);
+    }
+    return dispatch_hopper_prefill_dim<Softcap, Causal, false>(
+        params, head_dim, same_schedule, enable_pdl, stream);
 }
 
 template <bool Softcap>
@@ -97,23 +121,43 @@ cudaError_t dispatch_hopper_prefill_dim_mask(HopperParams& params,
                                              bool enable_pdl,
                                              cudaStream_t stream) {
     if (causal) {
-        return dispatch_hopper_prefill_dim<Softcap, true>(
+        return dispatch_hopper_prefill_dim_window<Softcap, true>(
             params, head_dim, same_schedule, enable_pdl, stream);
     }
-    return dispatch_hopper_prefill_dim<Softcap, false>(
+    return dispatch_hopper_prefill_dim_window<Softcap, false>(
         params, head_dim, same_schedule, enable_pdl, stream);
 }
 
 }  // namespace
+
+// The shapes this wrapper grew into: head_dim 256, a sliding window, and
+// decode-shaped fires. On by default -- measured on gemma-4-26B-A4B at 1k
+// context, routing the sliding layers' decode here takes attention from
+// 4.19 to 2.73 ms and the model from 122.5 to 144.1 tok/s, output unchanged.
+// The escape hatch is for bisecting a regression against the FA2 decode path.
+bool hopper_extended_shapes_enabled() {
+    static const bool off =
+        std::getenv("PIE_CUDA_DISABLE_HOPPER_EXTENDED") != nullptr;
+    return !off;
+}
 
 bool hopper_prefill_supported(int head_dim,
                               int window_left,
                               int total_tokens,
                               int num_requests) {
     if (current_device_major() < 9) return false;
-    if (window_left >= 0) return false;
-    if (total_tokens <= num_requests) return false;
-    return head_dim == 128;
+    // A sliding window is a template parameter now, not a disqualifier, and a
+    // decode fire (one token per request) is the shape this path most needs to
+    // cover -- vLLM serves exactly that from FlashAttention and pays nothing
+    // for context growth, where the FA2 decode kernel this replaces pays
+    // 2.8 ms per token at 1k on gemma-4.
+    if (!hopper_extended_shapes_enabled()) {
+        if (window_left >= 0) return false;
+        if (total_tokens <= num_requests) return false;
+        return head_dim == 128;
+    }
+    if (total_tokens < num_requests) return false;
+    return head_dim == 128 || head_dim == 256;
 }
 
 std::uint8_t hopper_prefill_graph_layout(const HopperPrefillPlan& plan) {
@@ -121,6 +165,7 @@ std::uint8_t hopper_prefill_graph_layout(const HopperPrefillPlan& plan) {
     std::uint8_t dim_class = 0;
     switch (plan.head_dim) {
         case 128: dim_class = 2; break;
+        case 256: dim_class = 4; break;
         default: dim_class = 0; break;
     }
     return static_cast<std::uint8_t>(
@@ -144,7 +189,8 @@ void plan_attention_flashinfer_prefill_sm90_bf16(
     cudaStream_t stream,
     bool enable_cuda_graph,
     bool causal,
-    int window_left) {
+    int window_left,
+    std::size_t int_base_bytes) {
     if (!hopper_prefill_supported(
             head_dim, window_left, total_tokens, num_requests)) {
         throw std::runtime_error("flashinfer sm90 prefill: unsupported shape");
@@ -169,13 +215,27 @@ void plan_attention_flashinfer_prefill_sm90_bf16(
             : 0;
     }
 
+    // Every planner in this driver carves from offset 0 of the shared int
+    // workspace. Two plans can coexist there only while their contents are
+    // identical -- which is true of the two decode plans gemma-4 builds, and
+    // is NOT true of this one. `int_base_bytes` moves this plan's descriptor
+    // clear of them; the offsets flashinfer returns are relative to the base
+    // it was handed, so they are re-biased below to stay meaningful against
+    // `workspace.int_buffer()`.
+    if (int_base_bytes >= workspace.int_bytes()) {
+        throw std::runtime_error("flashinfer sm90 prefill: int base past end");
+    }
+    auto* int_base =
+        static_cast<std::uint8_t*>(workspace.int_buffer()) + int_base_bytes;
+    auto* host_base =
+        static_cast<std::uint8_t*>(workspace.page_locked_int()) + int_base_bytes;
     ::flashinfer::PrefillPlanSM90Info plan_info;
     CUDA_CHECK(::flashinfer::PrefillSM90Plan<IdType>(
         workspace.float_buffer(),
         workspace.float_bytes(),
-        workspace.int_buffer(),
-        workspace.page_locked_int(),
-        workspace.int_bytes(),
+        int_base,
+        host_base,
+        workspace.int_bytes() - int_base_bytes,
         plan_info,
         qo_h.data(),
         kv_h.data(),
@@ -192,14 +252,15 @@ void plan_attention_flashinfer_prefill_sm90_bf16(
         sizeof(DTypeO),
         stream));
 
-    plan.qo_tile_indices_offset = plan_info.qo_tile_indices_offset;
-    plan.qo_indptr_offset = plan_info.qo_indptr_offset;
-    plan.kv_indptr_offset = plan_info.kv_indptr_offset;
-    plan.qo_len_offset = plan_info.qo_len_offset;
-    plan.kv_len_offset = plan_info.kv_len_offset;
-    plan.head_indices_offset = plan_info.head_indices_offset;
-    plan.work_indptr_offset = plan_info.work_indptr_offset;
-    plan.batch_indices_offset = plan_info.batch_indices_offset;
+    const std::int64_t bias = static_cast<std::int64_t>(int_base_bytes);
+    plan.qo_tile_indices_offset = plan_info.qo_tile_indices_offset + bias;
+    plan.qo_indptr_offset = plan_info.qo_indptr_offset + bias;
+    plan.kv_indptr_offset = plan_info.kv_indptr_offset + bias;
+    plan.qo_len_offset = plan_info.qo_len_offset + bias;
+    plan.kv_len_offset = plan_info.kv_len_offset + bias;
+    plan.head_indices_offset = plan_info.head_indices_offset + bias;
+    plan.work_indptr_offset = plan_info.work_indptr_offset + bias;
+    plan.batch_indices_offset = plan_info.batch_indices_offset + bias;
     plan.same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
     plan.total_tokens = total_tokens;
     plan.num_requests = num_requests;
