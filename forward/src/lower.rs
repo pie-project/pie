@@ -77,12 +77,26 @@ pub struct Row {
     pub write_desc: bool,
     /// The fire's attached programs read attention scores.
     pub wants_scores: bool,
+    /// This row's logits are read — it is one of the fire's SAMPLED
+    /// rows. A pure-decode fire samples every row; a prefill fire
+    /// samples the last row of each request and gathers them, which is
+    /// what makes the epilogue's row space [`Dim::Requests`] rather than
+    /// [`Dim::Tokens`], and what the driver spells `logit_row_indices`.
+    pub samples: bool,
 }
 
 /// One flat launch: a kernel over a rectangle of (rows × layers).
 ///
 /// `args` is an index into the frame's argument slots — the driver binds
 /// operands from there, which is why no buffer appears in this struct.
+///
+/// `rows` is read in the OP'S OWN row space, which its output shape
+/// names. That is [`Dim::Tokens`] for the body — where it is the fire's
+/// rows and every window is a run of them — and [`Dim::Requests`] for
+/// the epilogue, whose statements run over the SAMPLED rows after the
+/// gather has collected them. A gather is not a window: its source rows
+/// are an index list, which is an operand (hence `args`), while the
+/// rectangle it fills is contiguous like every other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     pub kernel: u16,
@@ -272,6 +286,10 @@ impl Lowerer<'_> {
                     self.emit(i, kernel, op, &live)?;
                     i += 1;
                 }
+                OpKind::LmHead { .. } => {
+                    self.epilogue(i, op, &window)?;
+                    i += 1;
+                }
                 // Everything else is a SEMANTIC statement, and it still
                 // runs on the device. The flat list is the whole of what
                 // the driver launches or it is not a replacement for the
@@ -345,6 +363,52 @@ impl Lowerer<'_> {
             layers: layer..layer + 1,
             args: at as u32,
         });
+        Ok(())
+    }
+
+    /// THE EPILOGUE, as rectangles rather than as a branch.
+    ///
+    /// The executor reads two runtime inputs here and picks between
+    /// three shapes: nothing at all when the fire samples no rows
+    /// (`emit_logits` is `num_sampling > 0`, per fire), gather → norm →
+    /// project when it samples fewer rows than it carries, and
+    /// norm → project when every row is sampled. That reads like a
+    /// two-level branch, and in the driver it is one.
+    ///
+    /// It is not one here, because all three shapes are the same three
+    /// statements over a ROW COUNT:
+    ///
+    /// * the norm and the projection run over the sampled rows — the
+    ///   epilogue's row space, which the trace already names
+    ///   [`Dim::Requests`];
+    /// * the gather EXISTS only when there are unsampled rows to skip
+    ///   past, and an empty rectangle emits nothing, which is how "no
+    ///   gather" is spelled without a branch;
+    /// * a fire that samples nothing produces zero rectangles, which is
+    ///   how `emit_logits == false` is spelled.
+    ///
+    /// So the branch survives only as long as the driver walks; when it
+    /// consumes this list instead, it disappears — which is the same
+    /// thing that happened to the swiglu's binding `if`, one layer up.
+    ///
+    /// The gather's SOURCE rows are deliberately not a rectangle. They
+    /// are an index list (`logit_row_indices`) and therefore an operand;
+    /// a prefill fire samples the last row of each request, which is not
+    /// a contiguous run and was never going to be one.
+    fn epilogue(&mut self, at: usize, op: &Op, window: &Range<u32>) -> Result<(), Uncovered> {
+        let sampled = window
+            .clone()
+            .filter(|&i| self.rows[i as usize].samples)
+            .count() as u32;
+        if sampled == 0 {
+            return Ok(());
+        }
+        let out = 0..sampled;
+        if sampled < window.len() as u32 {
+            self.emit(at, "launch_gather_bf16_rows", op, &out)?;
+        }
+        self.emit(at, "launch_rmsnorm_bf16", op, &out)?;
+        self.emit(at, "gemm_act_x_w", op, &out)?;
         Ok(())
     }
 
@@ -550,12 +614,9 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
             Semantic::Unlowered("the fused-gate_up binding fact is not in the facts")
         }
 
-        // Three launches, and which three depends on whether the fire
-        // gathers a compact logit set — a ROW WINDOW, which is precisely
-        // what `Launch::rows` expresses. It lowers once the trace says so.
-        LmHead { .. } => {
-            Semantic::Unlowered("the compact-logit gather is an unstated row window")
-        }
+        // Handled by `Lowerer::epilogue`, which needs the row counts and
+        // so cannot answer from the kind alone.
+        LmHead { .. } => Semantic::Structural,
 
         _ => Semantic::Unlowered("no lowering rule for this kind"),
     }
@@ -682,7 +743,17 @@ impl Buffers {
 
     pub fn assign(plan: &ForwardPlan, rows: &[Row]) -> Buffers {
         let n_tokens = rows.len();
-        let n_requests = rows.iter().filter(|r| !r.multi_token).count().max(1);
+        // `Dim::Requests` sizes the epilogue's values, so it must bound
+        // the SAMPLED rows too: a multi-token fire whose extra rows are
+        // sampled (MTP verify) has more logit rows than the
+        // one-row-per-request count admits, and under-sizing the logits
+        // is not a defect the arena would report.
+        let n_requests = rows
+            .iter()
+            .filter(|r| !r.multi_token)
+            .count()
+            .max(rows.iter().filter(|r| r.samples).count())
+            .max(1);
 
         // The values a seam exposes: read off the seam statements, not a
         // per-family table.
@@ -789,8 +860,28 @@ mod tests {
     use crate::family;
     use crate::trace::FireClass;
 
+    /// A fire whose rows are all plain AND all sampled — the ordinary
+    /// decode shape, and the one every row-axis test wants.
     fn plain(n: usize) -> Vec<Row> {
-        vec![Row::default(); n]
+        sampled(n)
+    }
+
+    fn sampled(n: usize) -> Vec<Row> {
+        vec![
+            Row {
+                samples: true,
+                ..Row::default()
+            };
+            n
+        ]
+    }
+
+    /// A prefill-shaped fire: `n` token rows, one of them sampled, so
+    /// the epilogue gathers.
+    fn gathered(n: usize) -> Vec<Row> {
+        let mut rows = vec![Row::default(); n];
+        rows[n - 1].samples = true;
+        rows
     }
 
     fn decode_plan() -> ForwardPlan {
@@ -824,56 +915,89 @@ mod tests {
         out
     }
 
-    /// THE CUTOVER LEDGER. Every statement a live fire executes is
-    /// either a rectangle in the flat list or a named entry in the
-    /// residue — and this test pins WHICH, by kind, across every
-    /// deployment the driver serves today.
+    /// THE CUTOVER GATE. Every statement a live fire executes is a
+    /// rectangle in the flat list — no residue, on every deployment the
+    /// driver serves, in both classes, sampled and unsampled.
     ///
-    /// It exists to be read, not just to pass. `residue` empty is the
-    /// gate that lets the driver stop walking; until then this is the
-    /// worklist, and the count moving the wrong way is a regression in
-    /// the migration itself.
+    /// This started as a ledger (88.7%-93.8%, residue `Swiglu` per layer
+    /// + `LmHead` per fire) and is now the gate itself: `launches` is
+    /// the WHOLE of what a fire runs, which is the property the driver
+    /// needs before it can stop walking. A regression here is a
+    /// statement that would silently not execute.
     #[test]
-    fn the_flat_list_says_what_it_does_not_cover() {
-        let mut kinds: BTreeMap<&'static str, (&'static str, usize)> = BTreeMap::new();
-        let mut worst = 1.0f64;
+    fn the_flat_list_covers_every_statement() {
         for (name, plan) in live_plans() {
-            let out = lower(&plan, &plain(4)).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-            for item in &out.residue {
-                let e = kinds.entry(item.kind).or_insert((item.why, 0));
-                e.1 += 1;
+            // Both epilogue shapes: a decode fire samples every row, a
+            // prefill fire samples one row per request and gathers.
+            for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
+                let out = lower(&plan, &rows).unwrap_or_else(|e| panic!("{name}/{shape}: {e:?}"));
+                assert!(
+                    out.residue.is_empty(),
+                    "{name}/{shape}: {} statements still owe a declaration: {:#?}",
+                    out.residue.len(),
+                    out.residue
+                );
+                assert_eq!(out.coverage(), 1.0, "{name}/{shape}");
+                assert!(
+                    !out.launches.is_empty(),
+                    "{name}/{shape}: a fire that executes nothing is not a fire"
+                );
             }
-            worst = worst.min(out.coverage());
-            // Whatever a statement is, it is accounted for exactly once.
-            assert!(
-                out.launches.len() + out.residue.len() > 0,
-                "{name}: a fire that executes nothing is not a fire"
-            );
         }
+    }
 
-        // The inventory, as of the flat list's first coverage pass. Each
-        // line is one statement kind still owed a declaration; the `why`
-        // is what the trace would have to state for it to become a
-        // rectangle. Update this WITH the fix, never to make a red test
-        // green.
-        let inventory: Vec<&str> = kinds.keys().copied().collect();
+    /// The epilogue is three statements over a ROW COUNT, and the two
+    /// runtime branches the executor takes are the count being zero and
+    /// the count being short.
+    #[test]
+    fn the_epilogue_is_a_row_count_not_a_branch() {
+        let plan = decode_plan();
+        // The epilogue's launches are the ones carrying the LmHead
+        // statement's index. Identifying them by SYMBOL would not work:
+        // its projection is `gemm_act_x_w`, the same launcher every
+        // body matmul takes.
+        let at_op = plan
+            .ops
+            .iter()
+            .position(|op| matches!(op.kind, OpKind::LmHead { .. }))
+            .expect("the class trace has an epilogue") as u32;
+        let epilogue = |rows: &[Row]| -> Vec<(String, Range<u32>)> {
+            let out = lower(&plan, rows).expect("coverable");
+            out.launches
+                .iter()
+                .filter(|l| l.args == at_op)
+                .map(|l| (out.kernels[l.kernel as usize].clone(), l.rows.clone()))
+                .collect()
+        };
+
+        // Every row sampled: norm and project over all four rows, no
+        // gather — there is nothing to skip past.
+        let all = epilogue(&sampled(4));
         assert_eq!(
-            inventory,
-            vec!["LmHead"],
-            "the residue changed — kinds: {kinds:#?}"
+            all,
+            vec![
+                ("launch_rmsnorm_bf16".to_string(), 0..4),
+                ("gemm_act_x_w".to_string(), 0..4),
+            ]
         );
-        // Measured 2026-08-06. The first pass read 88.7%–93.8% with a
-        // residue of one LmHead per fire plus one Swiglu PER LAYER;
-        // closing the swiglu (the activation states its kernel from the
-        // gate_up binding fact) left one statement per fire, which is
-        // what this floor now pins. The floor is here so a regression
-        // that drops a whole layer's worth of statements cannot hide
-        // behind a passing kind list.
-        assert!(
-            worst > 0.99,
-            "the flat list covers {:.1}% of the worst deployment's statements",
-            worst * 100.0
+
+        // One sampled row of four: the gather appears, and all three
+        // statements run over ONE row while the body ran over four —
+        // the epilogue's row space is Requests.
+        assert_eq!(
+            epilogue(&gathered(4)),
+            vec![
+                ("launch_gather_bf16_rows".to_string(), 0..1),
+                ("launch_rmsnorm_bf16".to_string(), 0..1),
+                ("gemm_act_x_w".to_string(), 0..1),
+            ]
         );
+
+        // Nothing sampled (`emit_logits == false`, a fire whose logits
+        // nobody reads): no rectangle at all, while the body still runs.
+        let none = vec![Row::default(); 4];
+        assert!(epilogue(&none).is_empty());
+        assert!(!lower(&plan, &none).unwrap().launches.is_empty());
     }
 
     /// A plain fire lowers, and every launch covers every row — the
