@@ -244,7 +244,7 @@ impl Lowerer<'_> {
                     let mut at = i + 1;
                     let mut remaining = window.clone();
                     for arm in arms {
-                        let taken = self.select(&remaining, arm.pred, i)?;
+                        let taken = self.select(&remaining, arm.pred);
                         let body = at..at + arm.ops as usize;
                         if !taken.is_empty() {
                             self.region(body, taken.clone())?;
@@ -457,37 +457,46 @@ impl Lowerer<'_> {
         Ok(window.start..end)
     }
 
-    /// The rows in `window` satisfying `pred`, as a contiguous range.
-    fn select(
-        &self,
-        window: &Range<u32>,
-        pred: GuardPred,
-        at: usize,
-    ) -> Result<Range<u32>, Uncovered> {
-        let (axis, holds): (&'static str, fn(&Row) -> bool) = match pred {
-            GuardPred::HasCustomMask => ("mask", |r| r.custom_mask),
-            GuardPred::HasLora => ("lora", |r| r.lora),
-            GuardPred::HasStageHooks => ("hook", |r| r.hooked),
-            GuardPred::WantsAttnScore => ("scores", |r| r.wants_scores),
-            GuardPred::HasWriteDesc => ("write_desc", |r| r.write_desc),
-            // Token-count predicates are FIRE-wide, not per row: they
-            // read the fire's N. Every row is in or out together.
-            GuardPred::TokensLE(k) => {
-                return Ok(if self.rows.len() as u32 <= k {
-                    window.clone()
-                } else {
-                    window.start..window.start
-                });
-            }
-            GuardPred::TokensGT(k) => {
-                return Ok(if self.rows.len() as u32 > k {
-                    window.clone()
-                } else {
-                    window.start..window.start
-                });
-            }
+    /// Whether `pred` holds for THE FIRE — so the arm covers `window`
+    /// whole, or not at all.
+    ///
+    /// Every `GuardPred` is a fire fact. The vocabulary says so in each
+    /// variant's own words ("the fire carries…") and the taxonomy says
+    /// it in one line: a guard chain is *per-fire runtime input, kernel
+    /// choice within one op list*, while the *per-fire ROW SPLIT* is the
+    /// [`OpKind::Peel`]. Two constructs, two jobs.
+    ///
+    /// This function used to select the SUBSET of `window` whose rows
+    /// carried the mark — inventing row semantics for a fire-level
+    /// construct, and quietly giving the DSL two row-partitioning
+    /// mechanisms where it had deliberately built one. The live shadow
+    /// comparison is what surfaced it (`.wiki/tart/dsl.md`): the walk
+    /// entered the `HasCustomMask` arm with the whole fire while the
+    /// lowering handed the unmasked rows to the *else* arm — the
+    /// fused/lora path, not the causal decode those rows want.
+    ///
+    /// So the fix is a DELETION. `Row` still carries the marks, because
+    /// the peel reads them and because moving an axis from a guard to a
+    /// row predicate is how it becomes per-row — a deliberate change,
+    /// stated in the text, not a reinterpretation the backend performs
+    /// on its own.
+    fn select(&self, window: &Range<u32>, pred: GuardPred) -> Range<u32> {
+        let holds = match pred {
+            GuardPred::HasCustomMask => self.rows.iter().any(|r| r.custom_mask),
+            GuardPred::HasLora => self.rows.iter().any(|r| r.lora),
+            GuardPred::HasStageHooks => self.rows.iter().any(|r| r.hooked),
+            GuardPred::WantsAttnScore => self.rows.iter().any(|r| r.wants_scores),
+            GuardPred::HasWriteDesc => self.rows.iter().any(|r| r.write_desc),
+            // The token thresholds read the fire's N, which is the same
+            // question asked of a count instead of a flag.
+            GuardPred::TokensLE(k) => self.rows.len() as u32 <= k,
+            GuardPred::TokensGT(k) => self.rows.len() as u32 > k,
         };
-        contiguous(self.rows, window, holds, axis, at)
+        if holds {
+            window.clone()
+        } else {
+            window.start..window.start
+        }
     }
 
     /// Where a peel's axis splits `window` — the prefix is the rows that
@@ -1078,15 +1087,19 @@ mod tests {
         );
         // Whole fire: fine.
         assert!(lower(&plan, &plain(8)).is_ok());
-        // A masked suffix would hand XQA the unmasked prefix only.
+        // And a MASKED fire is fine too, which is the point: a guard is
+        // a fire fact, so the mask arm takes the whole fire and XQA — in
+        // the else arm — does not run at all. Nothing hands a kernel a
+        // row window except a Peel, and a `whole` kernel inside a Peel
+        // is refused STATICALLY at trace time (`kernels::check_plan`),
+        // so this dynamic check is a backstop rather than the rule's
+        // live enforcement. It stays because the flat list is about to
+        // become the thing that executes.
         let mut rows = plain(8);
         for r in &mut rows[6..] {
             r.custom_mask = true;
         }
-        assert!(matches!(
-            lower(&plan, &rows),
-            Err(Uncovered::WholeKernelSplit { kernel, .. }) if kernel.contains("xqa")
-        ));
+        assert!(lower(&plan, &rows).is_ok());
     }
 
     /// Liveness reuse is the point of assigning buffers here: a
