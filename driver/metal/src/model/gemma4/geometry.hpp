@@ -47,16 +47,25 @@ struct Gemma4Geometry {
     /// a pipeline built for the wrong pair answers instead of failing.
     AffineFormat quant{4, 64};
 
-    /// The affine format of the DENSE FFN and the router, when it differs.
+    /// The affine format some tensors are in when it is not the model's.
     ///
-    /// mlx_lm quantizes per tensor, and gemma-4-26B's predicate spares its
-    /// dense `mlp.{gate,up,down}_proj` and its `router.proj` at 8 bits while
-    /// everything else is 4. One format for the whole checkpoint would run a
-    /// 4-bit pipeline over 8-bit bytes: it compiles, it binds, it dispatches,
-    /// it is fast, and every token is wrong. `{0, 0}` means "one format", which
-    /// is every other checkpoint here.
+    /// mlx_lm quantizes per tensor, and gemma-4-26B's predicate has shipped in
+    /// two shapes: lmstudio-community's QAT build spares the dense
+    /// `mlp.{gate,up,down}_proj` AND `router.proj` at 8 bits, mlx-community's
+    /// spares only `router.proj`. One format for the whole checkpoint would run
+    /// a 4-bit pipeline over 8-bit bytes: it compiles, it binds, it dispatches,
+    /// it is fast, and every token is wrong -- on the mlx-community build the
+    /// router's logits came out at cosine 0.10 to mlx-lm's while every tensor
+    /// feeding them agreed to 0.9999.
+    ///
+    /// So WHICH tensors are exempt is read off the checkpoint too, rather than
+    /// assumed to be the same set every time. `{0, 0}` means "one format",
+    /// which is every other checkpoint here.
     AffineFormat ffn_quant{0, 0};
     bool has_alt_quant() const { return ffn_quant.bits != 0 && ffn_quant.group != 0; }
+    /// Which of the two exempt groups is actually at `ffn_quant`.
+    bool alt_quant_ffn = false;
+    bool alt_quant_router = false;
 
     int global_head_dim = 512;
     /// Full layers rotate a quarter of their head; sliding layers rotate all of it.
