@@ -669,6 +669,12 @@ pub struct PieForwardLowered {
     pub kernel_names: *const PieForwardName,
     pub kernel_names_len: usize,
     pub kernel_name_bytes: PieForwardBytes,
+    /// The STRUCTURAL statements inside live regions, in walk order —
+    /// op indices. A site launches no table kernel, so it has no
+    /// rectangle, but it runs guest programs and brackets a layer's
+    /// sideband; a form driven by this list runs these and only these.
+    pub structural: *const u32,
+    pub structural_len: usize,
     /// Peak activation bytes the frame would need.
     pub arena_bytes: usize,
     /// Non-zero when the fire could not be lowered; `launches` is then
@@ -684,6 +690,8 @@ impl Default for PieForwardLowered {
             kernel_names: std::ptr::null(),
             kernel_names_len: 0,
             kernel_name_bytes: PieForwardBytes::default(),
+            structural: std::ptr::null(),
+            structural_len: 0,
             arena_bytes: 0,
             uncovered: PieForwardUncovered::None,
         }

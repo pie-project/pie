@@ -46,6 +46,7 @@ pub struct PlanArena {
     shadow_wire: Vec<super::types::PieForwardLaunch>,
     shadow_names: Vec<PieForwardName>,
     shadow_name_bytes: Vec<u8>,
+    shadow_structural: Vec<u32>,
 }
 
 /// Interns strings into the arena's name table during a build.
@@ -468,6 +469,7 @@ pub fn build(plan: &ForwardPlan) -> PieForwardPlan {
         shadow_wire: Vec::new(),
         shadow_names: Vec::new(),
         shadow_name_bytes: Vec::new(),
+        shadow_structural: Vec::new(),
     };
     let mut interner = Interner::default();
 
@@ -615,6 +617,7 @@ pub fn lower(
             arena.shadow_wire.clear();
             arena.shadow_names.clear();
             arena.shadow_name_bytes.clear();
+            arena.shadow_structural.clear();
             return PieForwardLowered {
                 uncovered: match why {
                     crate::lower::Uncovered::Rows { .. } => PieForwardUncovered::Rows,
@@ -667,6 +670,9 @@ pub fn lower(
         });
     }
 
+    arena.shadow_structural.clear();
+    arena.shadow_structural.extend_from_slice(&lowered.structural);
+
     let view = PieForwardLowered {
         launches: arena.shadow_wire.as_ptr(),
         launches_len: arena.shadow_wire.len(),
@@ -676,6 +682,8 @@ pub fn lower(
             ptr: arena.shadow_name_bytes.as_ptr(),
             len: arena.shadow_name_bytes.len(),
         },
+        structural: arena.shadow_structural.as_ptr(),
+        structural_len: arena.shadow_structural.len(),
         arena_bytes: lowered.arena_bytes,
         uncovered: PieForwardUncovered::None,
     };

@@ -212,6 +212,17 @@ pub struct Lowered {
     pub rectangles: usize,
     /// Peak activation bytes the frame needs ([`Buffers`]).
     pub arena_bytes: usize,
+    /// The STRUCTURAL statements inside live regions, in walk order.
+    ///
+    /// A site launches no table kernel, so it has no rectangle — but it
+    /// runs guest programs and brackets a layer's sideband, so a form
+    /// driven by this list has to run it, and only when the region
+    /// holding it is live. A site inside an arm the guards did not take
+    /// must not fire, and `launches` alone cannot say which those are.
+    ///
+    /// So the list is what a fire DOES: rectangles for what it launches,
+    /// these for what it brackets.
+    pub structural: Vec<u32>,
     /// Statements that still run on the device without a rectangle —
     /// see [`Unlowered`]. Empty is the cutover gate: only then is
     /// `launches` the WHOLE of what a fire executes, and only then can
@@ -258,6 +269,7 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Un
         peel_tail: false,
         residue: Vec::new(),
         fire,
+        structural: Vec::new(),
         peel_region: None,
     };
     out.region(0..plan.ops.len(), 0..n)?;
@@ -267,6 +279,7 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Un
         launches: out.launches,
         kernels: out.kernels,
         arena_bytes: buffers.bytes,
+        structural: out.structural,
         residue: out.residue,
     })
 }
@@ -285,6 +298,7 @@ struct Lowerer<'a> {
     peel_tail: bool,
     residue: Vec<Unlowered>,
     fire: Fire,
+    structural: Vec<u32>,
     /// The peel region the launches being emitted sit in.
     peel_region: Option<PeelRegion>,
 }
@@ -376,7 +390,17 @@ impl Lowerer<'_> {
                 // itself structural, or refuses — never falls through.
                 kind => {
                     match semantic(kind, self.peel_tail) {
-                        Semantic::Structural => {}
+                        Semantic::Structural => {
+                            // A site is layer-tagged like any other
+                            // statement, so a RETIRED layer's bracket
+                            // does not fire: the rows it would observe
+                            // are gone. Same window the launches take,
+                            // and skipping it here is what the walk
+                            // does by refusing to enter the op at all.
+                            if !self.depth_window(op, &window, i)?.is_empty() {
+                                self.structural.push(i as u32);
+                            }
+                        }
                         Semantic::Kernels(symbols) => {
                             let live = self.depth_window(op, &window, i)?;
                             for symbol in symbols {
@@ -1033,6 +1057,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A site inside an arm the guards did not take must NOT fire, and
+    /// the rectangles alone cannot say which those are — so the list
+    /// carries the live ones. This is what a form driven by the list
+    /// needs in order to bracket a layer's sideband correctly.
+    #[test]
+    fn the_live_sites_are_named_and_the_dead_ones_are_not() {
+        let plan = decode_plan();
+        let sites: Vec<usize> = plan
+            .ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op.kind, OpKind::HookSite { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!sites.is_empty(), "the class trace carries observation sites");
+
+        // A plain fire takes the else arm; a MASKED fire takes the mask
+        // arm. Both bracket their layers, and they are DIFFERENT sites —
+        // which is the whole reason the list has to say.
+        let plain_out = lower(&plan, &sampled(4), Fire::default()).unwrap();
+        let mut masked = sampled(4);
+        for r in &mut masked {
+            r.custom_mask = true;
+        }
+        let masked_out = lower(&plan, &masked, Fire::default()).unwrap();
+
+        for out in [&plain_out, &masked_out] {
+            assert!(!out.structural.is_empty(), "a live fire brackets its layers");
+            assert!(
+                out.structural.iter().all(|&at| sites.contains(&(at as usize))),
+                "only sites are structural"
+            );
+            // Ordered, because a bracket opens before it closes.
+            assert!(out.structural.windows(2).all(|w| w[0] < w[1]));
+        }
+        assert_ne!(
+            plain_out.structural, masked_out.structural,
+            "the two arms bracket through different sites"
+        );
+        // And a dead arm's sites are absent from BOTH.
+        assert!(plain_out.structural.len() < sites.len());
+        assert!(masked_out.structural.len() < sites.len());
     }
 
     /// A CAPTURED fire emits both peel regions whatever its split is,

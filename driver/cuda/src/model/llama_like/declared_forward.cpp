@@ -660,6 +660,30 @@ void shadow_report(
         const std::uint32_t at = lowered.launches[i].at_op;
         if (at < rect_count.size()) ++rect_count[at];
     }
+    // The SITES, compared as their own claim: a form driven by the list
+    // brackets exactly the statements it names, so if the walk brackets
+    // a different set the drive would run guest programs in a dead arm
+    // (or skip a live one). Rectangles cannot catch that — a site has
+    // none.
+    std::size_t site_drift = 0;
+    {
+        std::vector<std::uint32_t> walked_sites;
+        for (const std::uint32_t at : walked) {
+            if (at < plan.op_count() &&
+                plan.op(at).kind == pie_forward::PieForwardOpKind::HookSite) {
+                walked_sites.push_back(at);
+            }
+        }
+        const std::size_t n = lowered.structural_len;
+        if (walked_sites.size() != n) {
+            site_drift = walked_sites.size() > n ? walked_sites.size() - n
+                                                 : n - walked_sites.size();
+        } else {
+            for (std::size_t j = 0; j < n; ++j) {
+                if (walked_sites[j] != lowered.structural[j]) ++site_drift;
+            }
+        }
+    }
     std::size_t holes = 0;     // walked, no rectangle
     std::size_t phantoms = 0;  // rectangle, not walked
     std::uint32_t first_hole = 0xffffffffu;
@@ -692,7 +716,7 @@ void shadow_report(
                std::to_string(static_cast<std::uint32_t>(op.kind)) +
                "@L" + std::to_string(op.layer);
     };
-    if (holes == 0 && phantoms == 0) {
+    if (holes == 0 && phantoms == 0 && site_drift == 0) {
         std::fprintf(stderr,
                      "[shadow] rows=%zu walked=%zu launches=%zu arena=%zu "
                      "holes=0 phantoms=0\n",
@@ -702,7 +726,7 @@ void shadow_report(
     }
     std::fprintf(stderr,
                  "[shadow] rows=%zu walked=%zu launches=%zu arena=%zu "
-                 "holes=%zu%s phantoms=%zu%s | shape N=%d fast=%d mask=%d "
+                 "holes=%zu%s phantoms=%zu%s sites=%zu | shape N=%d fast=%d mask=%d "
                  "k=%d split=%d union=%d bands=%d devwin=%d\n",
                  rows.size(), walked.size(), lowered.launches_len,
                  lowered.arena_bytes,
@@ -710,6 +734,7 @@ void shadow_report(
                  holes ? (" (" + describe(first_hole) + ")").c_str() : "",
                  phantoms,
                  phantoms ? (" (" + describe(first_phantom) + ")").c_str() : "",
+                 site_drift,
                  shape.n_fire, shape.fast_rows, shape.mask_split,
                  shape.depth_k, shape.depth_split, shape.depth_union ? 1 : 0,
                  shape.bands, shape.devwin ? 1 : 0);

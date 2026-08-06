@@ -649,6 +649,12 @@ struct PieForwardLowered {
   const PieForwardName *kernel_names;
   size_t kernel_names_len;
   PieForwardBytes kernel_name_bytes;
+  /// The STRUCTURAL statements inside live regions, in walk order — op
+  /// indices. A site launches no table kernel, so it has no rectangle,
+  /// but it runs guest programs and brackets a layer's sideband; a form
+  /// driven by this list runs these and only these.
+  const uint32_t *structural;
+  size_t structural_len;
   /// Peak activation bytes the frame would need.
   size_t arena_bytes;
   /// Non-zero when the fire could not be lowered; `launches` is then
