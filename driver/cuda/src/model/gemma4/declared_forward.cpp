@@ -274,7 +274,9 @@ bool gemma4_forward_declared(
             const std::string_view name = plan.weight_name(op);
             const ParsedName nm = parse_name(name);
             if (nm.field == "ple_model_proj") {
-                gemm(per_layer_token, name, per_layer_proj,
+                // The MAIN embedding is the input; the per-layer table
+                // is the residual's other addend.
+                gemm(ws.y.data(), name, per_layer_proj,
                      N, L * ple_dim, H, 0.f);
             } else if (nm.field == "qkv") {
                 gemm(ws.norm_x.data(), name, ws.qkv_fused.data(),

@@ -3306,12 +3306,17 @@ pub fn gemma4_cuda(
         // a contiguous slice. Once per fire, not per layer — which is
         // the entire reason for the relay.
         let ple_total = facts.layers * facts.ple_dim;
-        let ple = dsl::cuda::scalar_mul(
+        let table = dsl::cuda::scalar_mul(
             &dsl::embed_with(t, "embed_per_layer", ple_total),
             "sqrt_ple_dim",
         );
+        // The projection consumes the MAIN embedding, not the table:
+        // `per_layer_proj = inputs_embeds @ ple_model_proj.T`. The table
+        // is the other addend of the residual below. Reading the call
+        // site is what settled it — the body had the projection eating
+        // its own table, which is a plausible pipeline and not this one.
         let ple = matmul(
-            &ple,
+            &y,
             &MatW {
                 name: "ple_model_proj".into(),
                 width: ple_total,
@@ -3333,7 +3338,7 @@ pub fn gemma4_cuda(
         // this prologue until an executor arm went looking for the value
         // its scale consumes and found two producers where the trace had
         // one.
-        let ple = dsl::cuda::residual_add(&normed_ple, &scaled, ple_total);
+        let ple = dsl::cuda::residual_add(&normed_ple, &table, ple_total);
         let ple = dsl::cuda::scalar_mul(&ple, "rsqrt_2");
         let ple_table = dsl::cuda::transpose_nld_to_lnd(&ple, facts.layers, facts.ple_dim);
 
