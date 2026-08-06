@@ -91,6 +91,8 @@ class SchedulerConfig:
     frame_size: Optional[int] = None
     frame_submit_depth: Optional[int] = None
     frame_dispatch_depth: Optional[int] = None
+    # Durations are written with their unit ("50ms", "120s").
+    submit_deadline: Optional[str] = None
 
 
 @dataclass
@@ -168,8 +170,10 @@ class Config:
         tables the way `to_engine_toml` does: the embedded engine deserializes
         the INTERNAL spelling, and only this method speaks the file's.
 
-        `[auth]` is not emitted: the section no longer exists in the file, and
-        the embedded server is always single-node and unauthenticated.
+        `[auth]` has no counterpart here or in `to_engine_toml`: the section
+        was retired on the Rust side, which now rejects a config carrying it
+        (`worker/src/config.rs::rejects_legacy_auth_section`), so emitting it
+        made every embedded-engine boot fail with "unknown field `auth`".
         """
         server: dict = {}
         runtime: dict = {}

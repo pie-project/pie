@@ -183,7 +183,7 @@ TestFn = Callable[..., Coroutine]
 async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     from pie.server import Server
     from pie.config import (
-        Config, ModelConfig, ServerConfig, AuthConfig, TelemetryConfig,
+        Config, ModelConfig, ServerConfig, TelemetryConfig,
         DriverConfig,
     )
 
@@ -217,7 +217,6 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
 
     cfg = Config(
         server=ServerConfig(port=0),
-        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         model=ModelConfig(
             name="default",
