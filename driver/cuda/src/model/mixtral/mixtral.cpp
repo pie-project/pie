@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <array>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -43,24 +44,96 @@ namespace {
 // Mixtral/GPT-OSS had no per-stage timing, so "the MoE is slow" could not be
 // resolved into which stage is slow. Same shape as the Kimi/Nemotron/Qwen3.5
 // profilers: CUDA events around each stage, accumulated per fire.
+// Stage timings come from a POOL of events resolved with exactly one sync, at
+// teardown. Recording a pair and synchronising on it per stage per layer put a
+// full host/device round trip inside every interval it was trying to measure:
+// a 24-layer fire took ~96 of those samples, each carrying its own sync
+// latency, and the totals came out well above the wall clock they were meant
+// to explain. Nothing is read until the fire is over.
 struct MixtralPhaseProfile {
     bool enabled = false;
     cudaEvent_t a{}, b{};
     double attn = 0, router = 0, moe_gate_up = 0, moe_down = 0;
+    double o_proj = 0, epilogue = 0;
     int last_N = 0;
+
+    // Intervals may nest, so opens are held on a stack and each close pairs
+    // with the most recent open.
+    struct Open { double* dst; std::size_t ev; };
+    std::vector<cudaEvent_t> pool;
+    std::vector<Open> stack;
+    std::vector<std::array<std::size_t, 2>> spans;
+    std::vector<double*> span_dst;
+    std::size_t used = 0;
+
+    // Recording an event on a CAPTURING stream does not measure the replay, it
+    // corrupts the capture. Refuse instead of producing a graph that fails to
+    // instantiate -- profiling wants PIE_CUDA_DISABLE_GRAPH_CAPTURE=1.
+    static bool capturing(cudaStream_t stream) {
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) return true;
+        return st != cudaStreamCaptureStatusNone;
+    }
+    std::size_t claim(cudaStream_t stream) {
+        if (used == pool.size()) {
+            cudaEvent_t e{};
+            cudaEventCreate(&e);
+            pool.push_back(e);
+        }
+        const std::size_t i = used++;
+        last_stream = stream;
+        CUDA_CHECK(cudaEventRecord(pool[i], stream));
+        return i;
+    }
+    void open(double* dst, cudaStream_t stream) {
+        if (capturing(stream)) return;
+        stack.push_back({dst, claim(stream)});
+    }
+    void close(cudaStream_t stream) {
+        if (capturing(stream) || stack.empty()) return;
+        const Open o = stack.back();
+        stack.pop_back();
+        spans.push_back({o.ev, claim(stream)});
+        span_dst.push_back(o.dst);
+    }
+    cudaStream_t last_stream{};
+    void resolve() {
+        // A fire has several exits, so anything still open at teardown is
+        // closed here rather than at each of them.
+        while (!stack.empty() && last_stream) close(last_stream);
+        if (used == 0) return;
+        CUDA_CHECK(cudaEventSynchronize(pool[used - 1]));
+        for (std::size_t i = 0; i < spans.size(); ++i) {
+            float ms = 0.f;
+            CUDA_CHECK(cudaEventElapsedTime(
+                &ms, pool[spans[i][0]], pool[spans[i][1]]));
+            *span_dst[i] += static_cast<double>(ms);
+        }
+        used = 0;
+        stack.clear();
+        spans.clear();
+        span_dst.clear();
+    }
 
     // Printed from the destructor because `mixtral_forward_paged` has several
     // returns (compact-logits epilogue, plain epilogue) and a stage total that
     // only some of them reach would be silently wrong.
     ~MixtralPhaseProfile() {
         if (!enabled) return;
+        resolve();
         std::fprintf(stderr,
-            "[MX-PROF] N=%d attn=%.3f router=%.3f moe_gate_up=%.3f "
-            "moe_down=%.3f | moe_total=%.3f ms\n",
-            last_N, attn, router, moe_gate_up, moe_down,
-            moe_gate_up + moe_down);
+            // `sum` is what the stages below account for; the rest of the
+            // fire -- the MoE dispatch, the glu, the scatter, the norms and
+            // residuals around them -- is the wall clock minus this, and at
+            // gpt-oss's decode shape that remainder is the largest single
+            // item left.
+            "[MX-PROF] N=%d attn=%.3f o_proj=%.3f router=%.3f "
+            "moe_gate_up=%.3f moe_down=%.3f | sum=%.3f ms\n",
+            last_N, attn, o_proj, router, moe_gate_up, moe_down,
+            attn + o_proj + router + moe_gate_up + moe_down + epilogue);
         cudaEventDestroy(a);
         cudaEventDestroy(b);
+        for (cudaEvent_t e : pool) cudaEventDestroy(e);
     }
 };
 
@@ -110,13 +183,9 @@ bool mixtral_profile_enabled() {
 template <class F>
 void mx_stage(MixtralPhaseProfile& p, double* dst, cudaStream_t stream, F&& fn) {
     if (!p.enabled || dst == nullptr) { fn(); return; }
-    CUDA_CHECK(cudaEventRecord(p.a, stream));
+    p.open(dst, stream);
     fn();
-    CUDA_CHECK(cudaEventRecord(p.b, stream));
-    CUDA_CHECK(cudaEventSynchronize(p.b));
-    float ms = 0.f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, p.a, p.b));
-    *dst += static_cast<double>(ms);
+    p.close(stream);
 }
 
 const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
@@ -548,7 +617,7 @@ void mixtral_forward_paged(
                 : fwd_cfg.sliding_window;
 
         // ── Attention block (identical to llama_like pre-norm path) ──
-        CUDA_CHECK(prof.enabled ? cudaEventRecord(prof.a, stream) : cudaSuccess);
+        if (prof.enabled) prof.open(&prof.attn, stream);
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
@@ -668,13 +737,8 @@ void mixtral_forward_paged(
             static_cast<std::uint32_t>(Hq),
             static_cast<std::uint32_t>(L), stream);
 
-        if (prof.enabled) {
-            CUDA_CHECK(cudaEventRecord(prof.b, stream));
-            CUDA_CHECK(cudaEventSynchronize(prof.b));
-            float ms = 0.f;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, prof.a, prof.b));
-            prof.attn += ms;
-        }
+        if (prof.enabled) prof.close(stream);
+        if (prof.enabled) prof.open(&prof.o_proj, stream);
 
         // o_proj is row-parallel under TP: write to scratch, all-reduce,
         // residual-add into y. o_bias (replicated; e.g. GPT-OSS) only goes
@@ -697,7 +761,8 @@ void mixtral_forward_paged(
         }
 
         // ── Sparse-MoE block ──
-        CUDA_CHECK(prof.enabled ? cudaEventRecord(prof.a, stream) : cudaSuccess);
+        if (prof.enabled) prof.close(stream);   // o_proj
+        if (prof.enabled) prof.open(&prof.router, stream);
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
             N, H, eps, stream);
@@ -746,13 +811,7 @@ void mixtral_forward_paged(
         // expert is pinned at once, so a slab that cannot hold the layer's
         // routed set falls back to the per-expert loop rather than deadlock
         // against its own pins.
-        if (prof.enabled) {
-            CUDA_CHECK(cudaEventRecord(prof.b, stream));
-            CUDA_CHECK(cudaEventSynchronize(prof.b));
-            float ms = 0.f;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, prof.a, prof.b));
-            prof.router += ms;
-        }
+        if (prof.enabled) prof.close(stream);
         bool streamed_fused = false;
         // The routing table is read back at most once per layer. The fused
         // paged path below needs it to decide what to page in, and the generic
@@ -1285,6 +1344,7 @@ void mixtral_forward_paged(
     if (!fwd_cfg.emit_logits) {
         return;
     }
+    if (prof.enabled) prof.open(&prof.epilogue, stream);
     // Compact logits: gather only the rows that will be sampled before the
     // lm_head, instead of materializing [N, vocab]. Every other family already
     // declares this; without it the batch engine hands the device-side sampler
@@ -1305,6 +1365,7 @@ void mixtral_forward_paged(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_y.data(), w.lm_head->data(), ws.logits.data(),
             lm_head_rows, V, H);
+        if (prof.enabled) prof.close(stream);
         return;
     }
     kernels::launch_rmsnorm_bf16(
@@ -1313,6 +1374,7 @@ void mixtral_forward_paged(
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
         N, V, H);
+    if (prof.enabled) prof.close(stream);
 }
 
 }  // namespace pie_cuda_driver::model
