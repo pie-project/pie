@@ -600,6 +600,30 @@ bool flat_trace_enabled() {
     return on;
 }
 
+// The rest of the executor's diagnostics, read ONCE.
+//
+// These were `std::getenv` calls in the fire path — four of them, on
+// every fire, for lines that print on none of them. An environment
+// lookup is not free and, more to the point, it is not what this file
+// does anywhere else: `declared_forward_enabled`, `flat_trace_enabled`
+// and `generated_forward_enabled` all latch. A diagnostic that costs
+// something when disarmed is a diagnostic people turn off for the wrong
+// reason.
+bool forward_trace_enabled() {
+    static const bool on = std::getenv("PIE_DECLARED_FORWARD_TRACE") != nullptr;
+    return on;
+}
+
+bool spatial_mask_trace_enabled() {
+    static const bool on = std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr;
+    return on;
+}
+
+bool lora_fire_trace_enabled() {
+    static const bool on = std::getenv("PIE_LORA_FIRE_TRACE") != nullptr;
+    return on;
+}
+
 // ONE FIRE'S ROWS — the executor's input, and now its only one.
 //
 // This is where a fire stops being a bundle of driver words and becomes
@@ -745,7 +769,7 @@ void llama_like_forward_declared(
         declared.facts_digest != kGeneratedDigest_qwen2_5_1_5b &&
         declared.facts_digest != kGeneratedDigest_mistral_7b_v03 &&
         declared.facts_digest != kGeneratedDigest_phi3_mini &&
-        std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
+        forward_trace_enabled()) {
         // Silent non-engagement is this path's failure mode; say why.
         std::fprintf(stderr,
                      "[declared-forward-generated] digest mismatch:\n"
@@ -861,7 +885,7 @@ void llama_like_forward_declared(
                     "kept this fire hand-written)");
             }
         }
-        if (std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
+        if (spatial_mask_trace_enabled()) {
             std::fprintf(stderr, "[depth-bands-declared] R=%d m=%d\n",
                          R_fire, band_count);
         }
@@ -886,7 +910,7 @@ void llama_like_forward_declared(
     // it a silent fallback to the hand-written path would be
     // indistinguishable from a passing A/B run; fast_rows is what proves
     // a MIXED fire walked the declared Peel.
-    if (std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
+    if (forward_trace_enabled()) {
         std::fprintf(stderr,
                      "[declared-forward] N=%d R=%d decode=%d fast_rows=%d "
                      "mask=%d hooked=%d lora=%d ops=%zu\n",
@@ -936,7 +960,7 @@ void llama_like_forward_declared(
                                            ws.norm_x.data()),
                            ws.q.data(), ws.v.data(), ws.gate.data());
     }
-    if (has_lora && std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
+    if (has_lora && lora_fire_trace_enabled()) {
         std::fprintf(stderr,
                      "[lora-fire] declared R=%d lanes=%u grouping=%s%s\n",
                      R_fire, lora->count,
