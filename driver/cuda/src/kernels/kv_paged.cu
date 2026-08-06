@@ -956,37 +956,55 @@ void launch_dequant_kv_cache_layer_to_bf16_active(
 
 namespace {
 
-__global__ void gather_trailing_pages_kernel(
+// One block: the indptr is a running sum over requests, and the gather that
+// follows has to see it, so both live behind a single __syncthreads() rather
+// than a second launch and a second read of the same few words.
+__global__ void build_window_page_view_kernel(
     const std::uint32_t* __restrict__ src_indices,
     const std::uint32_t* __restrict__ src_indptr,
-    const std::uint32_t* __restrict__ dst_indptr,
+    int keep_pages,
+    std::uint32_t* __restrict__ dst_indptr,
     std::uint32_t* __restrict__ dst_indices,
     int R)
 {
-    const int r = blockIdx.x;
-    if (r >= R) return;
-    const std::uint32_t src_end = src_indptr[r + 1];
-    const std::uint32_t dst_beg = dst_indptr[r];
-    const std::uint32_t keep    = dst_indptr[r + 1] - dst_beg;
-    // Trailing, so anchor both walks at the END of the source slice.
-    for (std::uint32_t i = threadIdx.x; i < keep; i += blockDim.x) {
-        dst_indices[dst_beg + i] = src_indices[src_end - keep + i];
+    if (threadIdx.x == 0) {
+        std::uint32_t acc = 0;
+        dst_indptr[0] = 0;
+        for (int r = 0; r < R; ++r) {
+            const std::uint32_t have = src_indptr[r + 1] - src_indptr[r];
+            const std::uint32_t keep =
+                have < static_cast<std::uint32_t>(keep_pages)
+                    ? have : static_cast<std::uint32_t>(keep_pages);
+            acc += keep;
+            dst_indptr[r + 1] = acc;
+        }
+    }
+    __syncthreads();
+    for (int r = 0; r < R; ++r) {
+        const std::uint32_t src_end = src_indptr[r + 1];
+        const std::uint32_t dst_beg = dst_indptr[r];
+        const std::uint32_t keep    = dst_indptr[r + 1] - dst_beg;
+        // Trailing, so anchor both walks at the END of the source slice.
+        for (std::uint32_t i = threadIdx.x; i < keep; i += blockDim.x) {
+            dst_indices[dst_beg + i] = src_indices[src_end - keep + i];
+        }
     }
 }
 
 }  // namespace
 
-void launch_gather_trailing_pages(
+void launch_build_window_page_view(
     const std::uint32_t* src_indices,
     const std::uint32_t* src_indptr,
-    const std::uint32_t* dst_indptr,
+    int keep_pages,
+    std::uint32_t* dst_indptr,
     std::uint32_t* dst_indices,
     int R,
     cudaStream_t stream)
 {
-    if (R <= 0) return;
-    gather_trailing_pages_kernel<<<R, 128, 0, stream>>>(
-        src_indices, src_indptr, dst_indptr, dst_indices, R);
+    if (R <= 0 || keep_pages <= 0) return;
+    build_window_page_view_kernel<<<1, 256, 0, stream>>>(
+        src_indices, src_indptr, keep_pages, dst_indptr, dst_indices, R);
     CUDA_CHECK(cudaGetLastError());
 }
 

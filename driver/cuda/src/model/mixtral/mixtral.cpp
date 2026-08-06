@@ -319,49 +319,43 @@ void mixtral_forward_paged(
     // traffic for a window that never grows. Hand them a shorter page list
     // instead: the decode query sits at the END of its range, so dropping
     // whole pages off the FRONT leaves the last `window+1` tokens in place
-    // and `window_left` still masks against the same positions. Keeping one
-    // page more than the window needs makes the count safe for any
-    // `last_page_len` without reading that array back to the host.
+    // and `window_left` still masks against the same positions.
+    //
+    // One plan serves both page lists: it is `page_count_independent`, so its
+    // descriptor is a function of the request count and not of how many pages
+    // each request holds, and a second planner run would carve from offset 0
+    // of the same int workspace as the first.
+    //
+    // WHICH pages survive is decided on the DEVICE, and unconditionally. This
+    // model does not override `graph_layout`, so one captured graph serves
+    // every context length; a host-computed count is frozen into that capture,
+    // and a fire that skips the trim emits a different kernel sequence
+    // entirely. Replaying either against a shorter request walks off the front
+    // of its page list. Keeping one page more than the window needs also makes
+    // the count safe for any `last_page_len` without reading it back.
     const int page_size = static_cast<int>(cache.page_size());
     int trim_window = -1;
     if (use_decode_path && page_size > 0) {
         for (int w : fwd_cfg.per_layer_window_left) {
             if (w < 0) continue;
             if (trim_window < 0) { trim_window = w; }
-            // One extra plan is worth it; a second distinct window is not,
-            // so decline rather than trim some layers and not others.
+            // A second distinct window would need a second page view and a
+            // second plan; no current model has one, so decline instead of
+            // trimming some windowed layers and not others.
             else if (trim_window != w) { trim_window = -1; break; }
         }
     }
     DeviceBuffer<std::uint32_t> win_indices;
     DeviceBuffer<std::uint32_t> win_indptr;
-    std::vector<std::uint32_t> win_indptr_h;
-    if (trim_window >= 0) {
+    if (trim_window >= 0 && R > 0) {
         const int keep_max = 1 + (trim_window + 1 + page_size - 1) / page_size;
-        win_indptr_h.resize(static_cast<std::size_t>(R) + 1, 0);
-        bool any_trimmed = false;
-        for (int r = 0; r < R; ++r) {
-            const int have = static_cast<int>(kv_page_indptr_h[r + 1]) -
-                             static_cast<int>(kv_page_indptr_h[r]);
-            const int keep = have < keep_max ? have : keep_max;
-            if (keep < have) any_trimmed = true;
-            win_indptr_h[r + 1] = win_indptr_h[r] +
-                                  static_cast<std::uint32_t>(keep);
-        }
-        // Every request already fits inside the window: the trimmed plan
-        // would be the full one, so skip the second plan and its gather.
-        if (any_trimmed) {
-            win_indices = DeviceBuffer<std::uint32_t>::alloc(win_indptr_h[R]);
-            win_indptr = DeviceBuffer<std::uint32_t>::alloc(
-                static_cast<std::size_t>(R) + 1);
-            CUDA_CHECK(cudaMemcpyAsync(
-                win_indptr.data(), win_indptr_h.data(),
-                win_indptr_h.size() * sizeof(std::uint32_t),
-                cudaMemcpyHostToDevice, stream));
-            kernels::launch_gather_trailing_pages(
-                kv_page_indices, kv_page_indptr, win_indptr.data(),
-                win_indices.data(), R, stream);
-        }
+        win_indices = DeviceBuffer<std::uint32_t>::alloc(
+            static_cast<std::size_t>(R) * keep_max);
+        win_indptr = DeviceBuffer<std::uint32_t>::alloc(
+            static_cast<std::size_t>(R) + 1);
+        kernels::launch_build_window_page_view(
+            kv_page_indices, kv_page_indptr, keep_max,
+            win_indptr.data(), win_indices.data(), R, stream);
     }
 
     // Per-fire scratch for MoE routing. Sized for the worst case (N
