@@ -242,6 +242,13 @@ constexpr std::size_t kGemma4RowDecodeMaxPageRefs = std::size_t{1} << 20;
 // and past that the loop's batching wins back what its sync costs.
 constexpr int kGemma4MoeGemvMaxTokens = 1;
 
+// KV splits for the sliding layers' decode. Eight is the knee measured by
+// `tests/bench_decode_attention.cu` at this model's shape -- 8 splits x 8 KV
+// heads = 64 CTAs, which is where the flat CTA sweep ended. Four leaves the
+// device short (20.7 us against 17.4), sixteen starts paying for the merge
+// (20.4) and twenty-four more so (26.0).
+constexpr int kGemma4HopperSplits = 8;
+
 bool gemma4_dense_gate_up_fused_enabled(const HfConfig& cfg) {
     // Presence of the bank decides, not the shape. `dense_fused_projection_joins`
     // publishes `mlp.gate_up_proj.fused.weight` for every Gemma-4 that fits its
@@ -464,6 +471,8 @@ void prepare_gemma4_hopper_decode_plan(
     int page_size)
 {
     moe_ws.hopper_decode_plan_sliding.valid = false;
+    moe_ws.hopper_splits = 0;
+    moe_ws.hopper_plan_layer_window = -2;
     if (num_requests <= 0) return;
     int sliding_idx = -1;
     for (std::size_t i = 0; i < w.layers.size(); ++i) {
@@ -479,20 +488,79 @@ void prepare_gemma4_hopper_decode_plan(
             sliding->head_dim, window_left, num_requests, num_requests)) {
         return;
     }
-    moe_ws.hopper_qo_indptr_h.resize(num_requests + 1);
-    for (int r = 0; r <= num_requests; ++r) {
-        moe_ws.hopper_qo_indptr_h[r] = static_cast<std::uint32_t>(r);
+    // One request only: the split turns R rows into R*S pseudo-requests, and
+    // interleaving those across requests is bookkeeping this does not need
+    // while decode concurrency is where it is.
+    const int splits = (num_requests == 1) ? kGemma4HopperSplits : 1;
+    const int pages = static_cast<int>(kv_page_indptr_h[1] - kv_page_indptr_h[0]);
+    const int last_len = static_cast<int>(kv_last_page_lens_h[0]);
+    const int kv_len = (pages - 1) * page_size + last_len;
+    if (pages < splits) return;
+
+    // Only the in-window tail is worth splitting. The oldest chunk takes one
+    // extra page and carries the window: with qo_len = 1 the kernel's first
+    // visible index is `kv_len - 1 - window_left`, so `window_left =
+    // len_0 - 1 - skip` starts it exactly at the window boundary, and the
+    // extra page is what keeps that same scalar from masking anything in the
+    // later, shorter chunks.
+    const int win_start =
+        (window_left >= 0) ? std::max(0, kv_len - window_left) : 0;
+    const int first_page = win_start / page_size;
+    const int skip = win_start - first_page * page_size;
+    const int live = pages - first_page;
+    const int chunk = std::max(1, (live + splits - 1) / splits);
+
+    moe_ws.hopper_split_qo_h.resize(splits + 1);
+    moe_ws.hopper_split_kv_indptr_h.resize(splits + 1);
+    moe_ws.hopper_split_last_h.resize(splits);
+    for (int i = 0; i <= splits; ++i) {
+        moe_ws.hopper_split_qo_h[i] = static_cast<std::uint32_t>(i);
     }
+    moe_ws.hopper_split_kv_indptr_h[0] =
+        static_cast<std::uint32_t>(first_page);
+    int cursor = first_page;
+    int split_window = -1;
+    for (int i = 0; i < splits; ++i) {
+        const int extra = (i == 0 && skip > 0) ? 1 : 0;
+        const int lo = cursor;
+        const int hi = std::min(lo + chunk + extra, pages);
+        cursor = hi;
+        moe_ws.hopper_split_kv_indptr_h[i + 1] =
+            static_cast<std::uint32_t>(hi);
+        const bool last = (hi == pages);
+        const int len = (hi > lo)
+            ? ((hi - lo - 1) * page_size + (last ? last_len : page_size))
+            : 0;
+        moe_ws.hopper_split_last_h[i] = static_cast<std::uint32_t>(
+            (hi > lo) ? (last ? last_len : page_size) : 1);
+        if (i == 0) split_window = len - 1 - skip;
+    }
+    if (cursor != pages) return;  // chunking did not cover the range
+
     ops::plan_attention_flashinfer_prefill_sm90_bf16(
         moe_ws.hopper_decode_plan_sliding,
-        moe_ws.hopper_qo_indptr_h.data(), kv_page_indptr_h,
-        kv_last_page_lens_h,
-        /*total_tokens=*/num_requests, num_requests,
+        moe_ws.hopper_split_qo_h.data(),
+        moe_ws.hopper_split_kv_indptr_h.data(),
+        moe_ws.hopper_split_last_h.data(),
+        /*total_tokens=*/splits, splits,
         q_heads, kv_heads, sliding->head_dim, page_size,
         attn_ws, /*stream=*/nullptr,
-        /*enable_cuda_graph=*/true, /*causal=*/true, window_left,
+        /*enable_cuda_graph=*/true, /*causal=*/true,
+        (skip > 0 && window_left >= 0) ? split_window : -1,
         // Clear of the decode plans, which start at offset 0.
         /*int_base_bytes=*/attn_ws.int_bytes() / 2);
+    if (!moe_ws.hopper_decode_plan_sliding.valid) return;
+    moe_ws.hopper_splits = splits;
+    moe_ws.hopper_plan_layer_window = window_left;
+    const std::size_t rows = static_cast<std::size_t>(splits) * q_heads;
+    if (moe_ws.hopper_split_partial.size() <
+        rows * static_cast<std::size_t>(sliding->head_dim)) {
+        moe_ws.hopper_split_partial = DeviceBuffer<std::uint16_t>::alloc(
+            rows * static_cast<std::size_t>(sliding->head_dim));
+        moe_ws.hopper_split_lse = DeviceBuffer<float>::alloc(rows);
+        moe_ws.hopper_split_lse_merged =
+            DeviceBuffer<float>::alloc(static_cast<std::size_t>(q_heads));
+    }
 }
 
 ops::DecodePlanCachePtr& select_prepared_plan(
@@ -1878,8 +1946,22 @@ void gemma4_forward_paged(
                     use_decode_path && hplan.valid && !layer.is_full &&
                     hplan.head_dim == d &&
                     hplan.num_kv_heads == num_kv_heads_local &&
-                    hplan.window_left == w.per_layer_window_left[l];
-                if (use_hopper_decode) {
+                    moe_ws.hopper_plan_layer_window ==
+                        w.per_layer_window_left[l];
+                if (use_hopper_decode && moe_ws.hopper_splits > 1) {
+                    ops::dispatch_attention_flashinfer_prefill_sm90_bf16(
+                        hplan, ws.q.data(), kv_view.k_pages, kv_view.v_pages,
+                        moe_ws.hopper_split_partial.data(), kv_page_indices,
+                        attn_ws, stream, /*logits_soft_cap=*/0.f,
+                        /*sm_scale=*/1.0f, moe_ws.hopper_split_lse.data(),
+                        /*broadcast_q=*/true);
+                    ops::merge_attention_states_bf16(
+                        moe_ws.hopper_split_partial.data(),
+                        moe_ws.hopper_split_lse.data(),
+                        ws.attn_out.data(),
+                        moe_ws.hopper_split_lse_merged.data(),
+                        moe_ws.hopper_splits, 1, num_q_heads_local, d, stream);
+                } else if (use_hopper_decode) {
                     ops::dispatch_attention_flashinfer_prefill_sm90_bf16(
                         hplan, ws.q.data(), kv_view.k_pages, kv_view.v_pages,
                         ws.attn_out.data(), kv_page_indices, attn_ws, stream,
