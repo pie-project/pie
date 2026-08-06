@@ -30,6 +30,12 @@ pub struct AddedToken {
     pub id: u32,
     pub content: String,
     pub special: bool,
+    /// The whitespace run BEFORE this token is consumed by the match
+    /// (Hugging Face `lstrip`). The consumed whitespace is not encoded.
+    pub lstrip: bool,
+    /// The whitespace run AFTER this token is consumed by the match
+    /// (Hugging Face `rstrip`). The consumed whitespace is not encoded.
+    pub rstrip: bool,
 }
 
 /// Whether an already-known whole piece bypasses BPE merging.
@@ -46,20 +52,59 @@ impl BpeMode {
     }
 }
 
+/// How the sentencepiece dummy prefix (`normalizer_to` marker) is injected
+/// while encoding a `ByteFallbackReplace` pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DummyPrefix {
+    /// No marker is prepended (Gemma).
+    #[default]
+    None,
+    /// Prepend one marker to every encoded text segment, unconditionally
+    /// (HF `Prepend` normalizer; the legacy Llama-2/Phi-3 shape).
+    EverySegment,
+    /// Prepend one marker only to a segment that starts the input, and only
+    /// when it does not already begin with the marker after space
+    /// replacement (HF `Metaspace` pre-tokenizer with
+    /// `prepend_scheme: "first"`; Mistral).
+    FirstSegment,
+}
+
+/// One pre-tokenizer split stage: the regex whose MATCHES become pieces,
+/// and whether the text BETWEEN matches survives as pieces too (HF
+/// `Split { behavior: Isolated }`) or is dropped (HF `Split { behavior:
+/// Removed, invert: true }` — the GPT-2/OLMo-2 tokenizer.json encoding,
+/// where the pattern matches the pieces themselves and the gaps are
+/// removed; the classic exhaustive patterns leave no gaps in practice,
+/// but the semantics are honored exactly rather than assumed away).
+#[derive(Debug)]
+pub(crate) struct Splitter {
+    pub(crate) regex: fancy_regex::Regex,
+    pub(crate) keep_gaps: bool,
+}
+
 /// Compiled tokenizer behavior for the modern model families supported by Pie.
 #[derive(Debug)]
 pub(crate) enum Pipeline {
-    /// Optional NFC, one or more isolated regex splitters, then byte-level BPE.
+    /// Optional NFC, one or more regex splitters, then byte-level BPE.
     ByteLevelRegex {
         nfc: bool,
-        splitters: Vec<fancy_regex::Regex>,
+        splitters: Vec<Splitter>,
         bpe_mode: BpeMode,
     },
-    /// Gemma-style space marker normalization with byte fallback on decode.
+    /// Sentencepiece-style space marker normalization with byte fallback on
+    /// decode. Covers Gemma (`DummyPrefix::None`), the legacy Llama-2/Phi-3
+    /// shape (`DummyPrefix::EverySegment` + decoder `Strip`), and the
+    /// Mistral Metaspace shape (`DummyPrefix::FirstSegment` + decoder
+    /// `Strip`).
     ByteFallbackReplace {
         normalizer_from: String,
         normalizer_to: String,
         unk_token_id: Option<u32>,
+        /// Dummy-prefix injection mode for encoded text segments.
+        dummy_prefix: DummyPrefix,
+        /// Remove one leading `normalizer_from` from the decoded stream
+        /// (HF decoder `Strip { start: 1 }`, undoing the dummy prefix).
+        strip_decoder_marker: bool,
     },
     /// Minimal char-level path used by grammar fixtures and `from_vocab`.
     RawChar,
@@ -112,7 +157,9 @@ pub struct Tokenizer {
     // Added / special tokens (sorted for binary_search)
     special_token_ids: Vec<u32>,
     added_token_matcher: Option<AhoCorasick>,
-    added_token_ids: Vec<u32>,
+    /// Parallel to the matcher's patterns — the token's id and its
+    /// boundary flags, which the encoder needs together.
+    added_tokens: Vec<AddedToken>,
 
     grammar: OnceLock<GrammarVocabulary>,
 }
@@ -129,6 +176,9 @@ pub struct TokenizerDecoder {
     skip_special: bool,
     pending_utf8: Vec<u8>,
     fallback_run: Vec<u8>,
+    /// Whether the pipeline's decoder `Strip` still has to inspect the first
+    /// emitted output of this stream. Disarms after the first non-empty chunk.
+    strip_armed: bool,
 }
 
 impl Tokenizer {
@@ -150,16 +200,16 @@ impl Tokenizer {
         special_token_ids.sort_unstable();
 
         // Build an Aho-Corasick matcher for added/special tokens.
-        let (added_token_matcher, added_token_ids) = if !added_tokens.is_empty() {
+        let added_token_matcher = if !added_tokens.is_empty() {
             let patterns: Vec<&str> = added_tokens.iter().map(|t| t.content.as_str()).collect();
-            let matcher = AhoCorasick::builder()
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(&patterns)
-                .context("building added-token matcher")?;
-            let ids: Vec<u32> = added_tokens.iter().map(|t| t.id).collect();
-            (Some(matcher), ids)
+            Some(
+                AhoCorasick::builder()
+                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                    .build(&patterns)
+                    .context("building added-token matcher")?,
+            )
         } else {
-            (None, vec![])
+            None
         };
 
         Ok(Tokenizer {
@@ -167,7 +217,7 @@ impl Tokenizer {
             pipeline,
             special_token_ids,
             added_token_matcher,
-            added_token_ids,
+            added_tokens,
             grammar: OnceLock::new(),
         })
     }
@@ -213,6 +263,7 @@ impl Tokenizer {
         TokenizerDecoder {
             tokenizer: self.clone(),
             skip_special,
+            strip_armed: self.strips_decoder_marker(),
             pending_utf8: Vec::new(),
             fallback_run: Vec::new(),
         }
@@ -235,20 +286,34 @@ impl Tokenizer {
             return;
         }
         let Some(matcher) = &self.added_token_matcher else {
-            self.encode_text(text, ids);
+            self.encode_text(text, true, ids);
             return;
         };
 
         let mut last_end = 0;
         for matched in matcher.find_iter(text) {
-            if matched.start() > last_end {
-                self.encode_text(&text[last_end..matched.start()], ids);
+            let token = &self.added_tokens[matched.pattern().as_usize()];
+            let mut segment_end = matched.start().max(last_end);
+            if token.lstrip {
+                // The whitespace run before the token joins the match.
+                let segment = &text[last_end..segment_end];
+                segment_end = last_end + segment.trim_end_matches(char::is_whitespace).len();
             }
-            ids.push(self.added_token_ids[matched.pattern().as_usize()]);
-            last_end = matched.end();
+            if segment_end > last_end {
+                // A segment starts the input iff it begins at byte 0; any
+                // segment after an added token cannot.
+                self.encode_text(&text[last_end..segment_end], last_end == 0, ids);
+            }
+            ids.push(token.id);
+            last_end = last_end.max(matched.end());
+            if token.rstrip {
+                // The whitespace run after the token joins the match.
+                let rest = &text[last_end..];
+                last_end += rest.len() - rest.trim_start_matches(char::is_whitespace).len();
+            }
         }
         if last_end < text.len() {
-            self.encode_text(&text[last_end..], ids);
+            self.encode_text(&text[last_end..], last_end == 0, ids);
         }
     }
 
@@ -274,7 +339,7 @@ impl Tokenizer {
         }
     }
 
-    fn encode_text(&self, text: &str, ids: &mut Vec<u32>) {
+    fn encode_text(&self, text: &str, starts_input: bool, ids: &mut Vec<u32>) {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { nfc, splitters, .. } => {
                 let text = if *nfc && is_nfc_quick(text.chars()) != IsNormalized::Yes {
@@ -287,6 +352,7 @@ impl Tokenizer {
             Pipeline::ByteFallbackReplace {
                 normalizer_from,
                 normalizer_to,
+                dummy_prefix,
                 ..
             } => {
                 let text = if text.contains(normalizer_from.as_str()) {
@@ -294,7 +360,24 @@ impl Tokenizer {
                 } else {
                     Cow::Borrowed(text)
                 };
-                self.encode_piece(&text, ids);
+                let prepend = match dummy_prefix {
+                    DummyPrefix::None => false,
+                    DummyPrefix::EverySegment => true,
+                    // Metaspace `prepend_scheme: "first"`: only the segment
+                    // starting the input, and only when the replaced text
+                    // does not already begin with the marker.
+                    DummyPrefix::FirstSegment => {
+                        starts_input && !text.starts_with(normalizer_to.as_str())
+                    }
+                };
+                if prepend {
+                    let mut prefixed = String::with_capacity(normalizer_to.len() + text.len());
+                    prefixed.push_str(normalizer_to);
+                    prefixed.push_str(&text);
+                    self.encode_piece(&prefixed, ids);
+                } else {
+                    self.encode_piece(&text, ids);
+                }
             }
             Pipeline::RawChar => self.encode_piece(text, ids),
         }
@@ -303,19 +386,19 @@ impl Tokenizer {
     fn split_regex_sequence(
         &self,
         text: &str,
-        splitters: &[fancy_regex::Regex],
+        splitters: &[Splitter],
         ids: &mut Vec<u32>,
     ) {
-        if let [regex] = splitters {
+        if let [splitter] = splitters {
             let output_start = ids.len();
             let mut last_end = 0;
-            for result in regex.find_iter(text) {
+            for result in splitter.regex.find_iter(text) {
                 let Ok(matched) = result else {
                     ids.truncate(output_start);
                     self.encode_piece(text, ids);
                     return;
                 };
-                if matched.start() > last_end {
+                if splitter.keep_gaps && matched.start() > last_end {
                     self.encode_piece(&text[last_end..matched.start()], ids);
                 }
                 if matched.start() < matched.end() {
@@ -323,7 +406,7 @@ impl Tokenizer {
                 }
                 last_end = matched.end();
             }
-            if last_end < text.len() {
+            if splitter.keep_gaps && last_end < text.len() {
                 self.encode_piece(&text[last_end..], ids);
             }
             return;
@@ -332,18 +415,18 @@ impl Tokenizer {
         let mut pieces: SmallVec<[&str; 32]> = SmallVec::new();
         pieces.push(text);
 
-        for regex in splitters {
+        for splitter in splitters {
             let mut next: SmallVec<[&str; 32]> = SmallVec::new();
             for piece in pieces.iter().copied() {
                 let mut last_end = 0;
-                for result in regex.find_iter(piece) {
+                for result in splitter.regex.find_iter(piece) {
                     let Ok(matched) = result else {
                         // Profiles contain trusted static/model regexes. Preserve
                         // input rather than returning a partially encoded result.
                         self.encode_piece(text, ids);
                         return;
                     };
-                    if matched.start() > last_end {
+                    if splitter.keep_gaps && matched.start() > last_end {
                         next.push(&piece[last_end..matched.start()]);
                     }
                     if matched.start() < matched.end() {
@@ -351,7 +434,7 @@ impl Tokenizer {
                     }
                     last_end = matched.end();
                 }
-                if last_end < piece.len() {
+                if splitter.keep_gaps && last_end < piece.len() {
                     next.push(&piece[last_end..]);
                 }
             }
@@ -367,19 +450,34 @@ impl Tokenizer {
     // Decoding
     // -----------------------------------------------------------------------
 
+    fn strips_decoder_marker(&self) -> bool {
+        matches!(
+            self.pipeline,
+            Pipeline::ByteFallbackReplace {
+                strip_decoder_marker: true,
+                ..
+            }
+        )
+    }
+
     /// Decode token IDs back into text.
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
         match &self.pipeline {
             Pipeline::ByteFallbackReplace {
                 normalizer_from,
                 normalizer_to,
+                strip_decoder_marker,
                 ..
-            } => self.decode_byte_fallback(
-                ids,
-                skip_special,
-                normalizer_to.as_bytes(),
-                normalizer_from.as_bytes(),
-            ),
+            } => {
+                let strip_prefix = strip_decoder_marker.then_some(normalizer_from.as_bytes());
+                self.decode_byte_fallback(
+                    ids,
+                    skip_special,
+                    normalizer_to.as_bytes(),
+                    normalizer_from.as_bytes(),
+                    strip_prefix,
+                )
+            }
             Pipeline::ByteLevelRegex { .. } | Pipeline::RawChar => {
                 self.decode_raw(ids, skip_special)
             }
@@ -405,6 +503,7 @@ impl Tokenizer {
         skip_special: bool,
         decoder_pattern: &[u8],
         decoder_content: &[u8],
+        strip_prefix: Option<&[u8]>,
     ) -> String {
         let mut output = Vec::with_capacity(ids.len() * 4);
         let mut fallback_bytes = Vec::new();
@@ -424,6 +523,11 @@ impl Tokenizer {
             }
         }
         flush_byte_fallback(&mut fallback_bytes, &mut output);
+        if let Some(prefix) = strip_prefix
+            && output.starts_with(prefix)
+        {
+            output.drain(..prefix.len());
+        }
         bytes_to_string(output)
     }
 
@@ -460,7 +564,7 @@ impl Tokenizer {
     pub fn get_split_regex(&self) -> String {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { splitters, .. } if splitters.len() == 1 => {
-                splitters[0].as_str().to_string()
+                splitters[0].regex.as_str().to_string()
             }
             _ => String::new(),
         }
@@ -470,7 +574,7 @@ impl Tokenizer {
     pub fn split_regexes(&self) -> Vec<&str> {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { splitters, .. } => {
-                splitters.iter().map(fancy_regex::Regex::as_str).collect()
+                splitters.iter().map(|s| s.regex.as_str()).collect()
             }
             _ => Vec::new(),
         }
@@ -604,7 +708,27 @@ impl TokenizerDecoder {
                 }
             }
         }
+        self.apply_stream_strip(&mut output);
         bytes_to_string(output)
+    }
+
+    /// The decoder's `Strip` removes one leading marker from the WHOLE
+    /// stream, so a streaming decoder has to apply it to the first
+    /// non-empty chunk and then stop looking. Batch `decode` does the
+    /// same thing at the end of one buffer; this is that rule, once, for
+    /// a stream that arrives in pieces.
+    fn apply_stream_strip(&mut self, output: &mut Vec<u8>) {
+        if !self.strip_armed || output.is_empty() {
+            return;
+        }
+        self.strip_armed = false;
+        if let Pipeline::ByteFallbackReplace {
+            normalizer_from, ..
+        } = &self.tokenizer.pipeline
+            && output.starts_with(normalizer_from.as_bytes())
+        {
+            output.drain(..normalizer_from.len());
+        }
     }
 
     /// Flush an incomplete trailing byte sequence.
@@ -625,6 +749,7 @@ impl TokenizerDecoder {
     pub fn reset(&mut self) {
         self.pending_utf8.clear();
         self.fallback_run.clear();
+        self.strip_armed = self.tokenizer.strips_decoder_marker();
     }
 }
 
@@ -786,7 +911,10 @@ mod tests {
                 nfc,
                 splitters: splitters
                     .iter()
-                    .map(|pattern| fancy_regex::Regex::new(pattern).unwrap())
+                    .map(|pattern| Splitter {
+                        regex: fancy_regex::Regex::new(pattern).unwrap(),
+                        keep_gaps: true,
+                    })
                     .collect(),
                 bpe_mode,
             },
@@ -809,6 +937,8 @@ mod tests {
                 normalizer_from: " ".into(),
                 normalizer_to: "▁".into(),
                 unk_token_id: None,
+                dummy_prefix: DummyPrefix::None,
+                strip_decoder_marker: false,
             },
             vec![],
         )
@@ -894,11 +1024,15 @@ mod tests {
                     id: 3,
                     content: "<s>".into(),
                     special: true,
+                    lstrip: false,
+                    rstrip: false,
                 },
                 AddedToken {
                     id: 4,
                     content: "</s>".into(),
                     special: true,
+                    lstrip: false,
+                    rstrip: false,
                 },
             ],
         );

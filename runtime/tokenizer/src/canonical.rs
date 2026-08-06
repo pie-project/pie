@@ -57,7 +57,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::bpe::BpeTable;
-use crate::{AddedToken, BpeMode, Pipeline, Tokenizer};
+use crate::{AddedToken, BpeMode, DummyPrefix, Pipeline, Splitter, Tokenizer};
 
 /// The schema this module reads and writes.
 pub const VERSION: &str = "pie.tokenizer/1";
@@ -150,18 +150,71 @@ struct Descriptor {
 /// Tagged by `kind` rather than by position so a reader fails on an unknown
 /// pipeline with a name in the message. Regexes travel as their pattern
 /// strings; splitter *order* is semantic, since they apply as a sequence.
+/// One splitter, as data.
+///
+/// Serializes as a BARE PATTERN STRING whenever the stage keeps the gaps
+/// between matches — which is every splitter that existed before the
+/// OLMo-2 `Removed+invert` encoding was supported, and still the common
+/// case. So an artifact written before this field existed reads back as
+/// `Isolated`, which is what those models are, rather than as "the field
+/// is absent" — the distinction the format has to get right, because a
+/// wrong default here silently drops text between matches.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+enum SplitterDescriptor {
+    /// `Split { behavior: Isolated }` — the historical form.
+    Isolated(String),
+    /// `Split { behavior: Removed, invert: true }` — matches become
+    /// pieces and the text between them is dropped.
+    Explicit { pattern: String, keep_gaps: bool },
+}
+
+impl SplitterDescriptor {
+    fn pattern(&self) -> &str {
+        match self {
+            Self::Isolated(p) => p,
+            Self::Explicit { pattern, .. } => pattern,
+        }
+    }
+
+    fn keep_gaps(&self) -> bool {
+        match self {
+            Self::Isolated(_) => true,
+            Self::Explicit { keep_gaps, .. } => *keep_gaps,
+        }
+    }
+}
+
+/// How the sentencepiece dummy prefix is injected, as data.
+///
+/// Defaults to `None`, which is what every `ByteFallbackReplace` artifact
+/// written before this field existed was: Gemma, the only member of that
+/// profile at the time.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Default, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum DummyPrefixDescriptor {
+    #[default]
+    None,
+    EverySegment,
+    FirstSegment,
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PipelineDescriptor {
     ByteLevelRegex {
         nfc: bool,
-        splitters: Vec<String>,
+        splitters: Vec<SplitterDescriptor>,
         prefer_whole_token: bool,
     },
     ByteFallbackReplace {
         normalizer_from: String,
         normalizer_to: String,
         unk_token_id: Option<u32>,
+        #[serde(default)]
+        dummy_prefix: DummyPrefixDescriptor,
+        #[serde(default)]
+        strip_decoder_marker: bool,
     },
     RawChar,
 }
@@ -171,6 +224,15 @@ struct AddedTokenDescriptor {
     id: u32,
     content: String,
     special: bool,
+    /// Boundary flags, absent from artifacts written before they were
+    /// honoured. `false` is what every such token was: the encoder did
+    /// not consume whitespace beside a match, so reading them back as
+    /// clear reproduces exactly the behaviour that artifact was written
+    /// with.
+    #[serde(default)]
+    lstrip: bool,
+    #[serde(default)]
+    rstrip: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -236,23 +298,23 @@ impl Tokenizer {
 
     /// The added tokens, recovered in the order they were registered.
     ///
-    /// `Tokenizer` does not keep the `Vec<AddedToken>` it was built from — it
-    /// consumes it into a matcher, a parallel id list and a sorted set of
-    /// special ids. `added_token_ids` is in registration order (it indexes the
-    /// matcher's patterns), so that order is what comes back; `content` comes
-    /// from the vocabulary and `special` from the sorted set.
+    /// `added_tokens` is in registration order (it indexes the matcher's
+    /// patterns), so that order is what comes back; `content` comes from
+    /// the vocabulary and `special` from the sorted set.
     fn added_token_descriptors(&self) -> Vec<AddedTokenDescriptor> {
-        self.added_token_ids
+        self.added_tokens
             .iter()
-            .map(|&id| AddedTokenDescriptor {
-                id,
+            .map(|token| AddedTokenDescriptor {
+                id: token.id,
                 content: self
                     .bpe
-                    .id_to_bytes(id)
+                    .id_to_bytes(token.id)
                     .map(String::from_utf8_lossy)
                     .unwrap_or_default()
                     .into_owned(),
-                special: self.special_token_ids.binary_search(&id).is_ok(),
+                special: self.special_token_ids.binary_search(&token.id).is_ok(),
+                lstrip: token.lstrip,
+                rstrip: token.rstrip,
             })
             .collect()
     }
@@ -266,17 +328,37 @@ fn describe_pipeline(pipeline: &Pipeline) -> PipelineDescriptor {
             bpe_mode,
         } => PipelineDescriptor::ByteLevelRegex {
             nfc: *nfc,
-            splitters: splitters.iter().map(|re| re.as_str().to_string()).collect(),
+            splitters: splitters
+                .iter()
+                .map(|s| {
+                    if s.keep_gaps {
+                        SplitterDescriptor::Isolated(s.regex.as_str().to_string())
+                    } else {
+                        SplitterDescriptor::Explicit {
+                            pattern: s.regex.as_str().to_string(),
+                            keep_gaps: false,
+                        }
+                    }
+                })
+                .collect(),
             prefer_whole_token: *bpe_mode == BpeMode::PreferWholeToken,
         },
         Pipeline::ByteFallbackReplace {
             normalizer_from,
             normalizer_to,
             unk_token_id,
+            dummy_prefix,
+            strip_decoder_marker,
         } => PipelineDescriptor::ByteFallbackReplace {
             normalizer_from: normalizer_from.clone(),
             normalizer_to: normalizer_to.clone(),
             unk_token_id: *unk_token_id,
+            dummy_prefix: match dummy_prefix {
+                DummyPrefix::None => DummyPrefixDescriptor::None,
+                DummyPrefix::EverySegment => DummyPrefixDescriptor::EverySegment,
+                DummyPrefix::FirstSegment => DummyPrefixDescriptor::FirstSegment,
+            },
+            strip_decoder_marker: *strip_decoder_marker,
         },
         Pipeline::RawChar => PipelineDescriptor::RawChar,
     }
@@ -360,6 +442,8 @@ impl Tokenizer {
                 id: token.id,
                 content: token.content,
                 special: token.special,
+                lstrip: token.lstrip,
+                rstrip: token.rstrip,
             })
             .collect();
         Tokenizer::new(bpe, pipeline, added_tokens)
@@ -375,9 +459,13 @@ fn rebuild_pipeline(descriptor: PipelineDescriptor) -> Result<Pipeline> {
         } => {
             let splitters = splitters
                 .iter()
-                .map(|pattern| {
-                    fancy_regex::Regex::new(pattern)
-                        .with_context(|| format!("recompiling splitter {pattern:?}"))
+                .map(|d| {
+                    let pattern = d.pattern();
+                    Ok(Splitter {
+                        regex: fancy_regex::Regex::new(pattern)
+                            .with_context(|| format!("recompiling splitter {pattern:?}"))?,
+                        keep_gaps: d.keep_gaps(),
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?;
             Pipeline::ByteLevelRegex {
@@ -394,10 +482,18 @@ fn rebuild_pipeline(descriptor: PipelineDescriptor) -> Result<Pipeline> {
             normalizer_from,
             normalizer_to,
             unk_token_id,
+            dummy_prefix,
+            strip_decoder_marker,
         } => Pipeline::ByteFallbackReplace {
             normalizer_from,
             normalizer_to,
             unk_token_id,
+            dummy_prefix: match dummy_prefix {
+                DummyPrefixDescriptor::None => DummyPrefix::None,
+                DummyPrefixDescriptor::EverySegment => DummyPrefix::EverySegment,
+                DummyPrefixDescriptor::FirstSegment => DummyPrefix::FirstSegment,
+            },
+            strip_decoder_marker,
         },
         PipelineDescriptor::RawChar => Pipeline::RawChar,
     })

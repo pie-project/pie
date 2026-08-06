@@ -44,61 +44,118 @@ const MODELS: &[Model] = &[
         fixture: "nemotron3",
         revision: "cbd3fa9f933d55ef16a84236559f4ee2a0526848",
     },
+    Model {
+        id: "microsoft/Phi-3-mini-4k-instruct",
+        fixture: "phi3",
+        revision: "f39ac1d28e925b323eae81227eaba4464caced4e",
+    },
+    Model {
+        id: "mistralai/Mistral-7B-Instruct-v0.3",
+        fixture: "mistral7b",
+        revision: "c170c708c41dac9275d15a8fff4eca08d52bab71",
+    },
+    Model {
+        id: "allenai/OLMo-2-0425-1B-Instruct",
+        fixture: "olmo2",
+        revision: "48d788eca847d4d7548f375ad03d3c9312f6139e",
+    },
 ];
 
 #[test]
 #[ignore = "requires official tokenizer snapshots"]
 fn official_hf_models_match_exactly() {
     for model in MODELS {
-        let path = tokenizer_path(model);
-        let pie = Arc::new(
-            Tokenizer::from_file(&path)
-                .unwrap_or_else(|error| panic!("loading {} with Pie: {error:#}", model.id)),
-        );
-        let hf = HfTokenizer::from_file(&path)
-            .unwrap_or_else(|error| panic!("loading {} with HF: {error}", model.id));
+        assert_model_matches_exactly(&tokenizer_path(model), model.id);
+    }
+}
 
+/// The restored profiles, each gated on its snapshot being present so they
+/// run in a DEFAULT `cargo test` wherever the model is already cached —
+/// which is the point: these three profiles were silently lost in a merge
+/// and nothing noticed, because the only check that covered them was
+/// `#[ignore]`d behind a snapshot requirement.
+#[test]
+fn official_phi3_matches_exactly_when_cached() {
+    assert_matches_exactly_when_cached("phi3");
+}
+
+#[test]
+fn official_mistral_matches_exactly_when_cached() {
+    assert_matches_exactly_when_cached("mistral7b");
+}
+
+#[test]
+fn official_olmo2_matches_exactly_when_cached() {
+    assert_matches_exactly_when_cached("olmo2");
+}
+
+fn assert_matches_exactly_when_cached(fixture: &str) {
+    let model = MODELS
+        .iter()
+        .find(|model| model.fixture == fixture)
+        .expect("model entry");
+    let path = PathBuf::from(std::env::var_os("HOME").expect("HOME is not set"))
+        .join(".cache/huggingface/hub")
+        .join(format!("models--{}", model.id.replace('/', "--")))
+        .join("snapshots")
+        .join(model.revision)
+        .join("tokenizer.json");
+    if !path.is_file() {
+        eprintln!("skipping: {} is not cached", model.id);
+        return;
+    }
+    assert_model_matches_exactly(&path, model.id);
+}
+
+fn assert_model_matches_exactly(path: &Path, id: &str) {
+    
+    let pie = Arc::new(
+        Tokenizer::from_file(path)
+            .unwrap_or_else(|error| panic!("loading {} with Pie: {error:#}", id)),
+    );
+    let hf = HfTokenizer::from_file(path)
+        .unwrap_or_else(|error| panic!("loading {} with HF: {error}", id));
+
+    assert_eq!(
+        pie.vocab_size(),
+        hf.get_vocab_size(true),
+        "{} vocabulary size",
+        id
+    );
+    for &text in TEXTS {
+        let pie_ids = pie.encode(text);
+        let hf_ids = hf.encode(text, false).unwrap().get_ids().to_vec();
+        assert_eq!(pie_ids, hf_ids, "{} encoding {text:?}", id);
         assert_eq!(
-            pie.vocab_size(),
-            hf.get_vocab_size(true),
-            "{} vocabulary size",
-            model.id
+            pie.decode(&hf_ids, false),
+            hf.decode(&hf_ids, false).unwrap(),
+            "{} HF→Pie decode {text:?}",
+            id
         );
-        for &text in TEXTS {
-            let pie_ids = pie.encode(text);
-            let hf_ids = hf.encode(text, false).unwrap().get_ids().to_vec();
-            assert_eq!(pie_ids, hf_ids, "{} encoding {text:?}", model.id);
-            assert_eq!(
-                pie.decode(&hf_ids, false),
-                hf.decode(&hf_ids, false).unwrap(),
-                "{} HF→Pie decode {text:?}",
-                model.id
-            );
-            assert_eq!(
-                pie.decode(&pie_ids, false),
-                hf.decode(&pie_ids, false).unwrap(),
-                "{} Pie→HF decode {text:?}",
-                model.id
-            );
-            assert_eq!(
-                pie.decode(&hf_ids, true),
-                hf.decode(&hf_ids, true).unwrap(),
-                "{} special-token filtering {text:?}",
-                model.id
-            );
-            let mut decoder = pie.decoder(false);
-            let mut incremental = String::new();
-            for token in &hf_ids {
-                incremental.push_str(&decoder.feed(std::slice::from_ref(token)));
-            }
-            incremental.push_str(&decoder.finish());
-            assert_eq!(
-                incremental,
-                pie.decode(&hf_ids, false),
-                "{} incremental decode {text:?}",
-                model.id
-            );
+        assert_eq!(
+            pie.decode(&pie_ids, false),
+            hf.decode(&pie_ids, false).unwrap(),
+            "{} Pie→HF decode {text:?}",
+            id
+        );
+        assert_eq!(
+            pie.decode(&hf_ids, true),
+            hf.decode(&hf_ids, true).unwrap(),
+            "{} special-token filtering {text:?}",
+            id
+        );
+        let mut decoder = pie.decoder(false);
+        let mut incremental = String::new();
+        for token in &hf_ids {
+            incremental.push_str(&decoder.feed(std::slice::from_ref(token)));
         }
+        incremental.push_str(&decoder.finish());
+        assert_eq!(
+            incremental,
+            pie.decode(&hf_ids, false),
+            "{} incremental decode {text:?}",
+            id
+        );
     }
 }
 

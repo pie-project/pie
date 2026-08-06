@@ -134,13 +134,25 @@ fn unsupported_legacy_shapes_are_rejected() {
             .contains("ByteLevel.use_regex must be false")
     );
 
+    // `lstrip`/`rstrip` are HONOURED, not rejected — the encoder consumes
+    // the whitespace run beside the match (Phi-3's `</s>` sets lstrip, and
+    // rejecting it is what kept that model from loading at all). What is
+    // still refused is `single_word`, which an Aho-Corasick match cannot
+    // express, so it is refused rather than silently ignored.
     let mut tokenizer = gemma_json();
     tokenizer["added_tokens"][0]["lstrip"] = json!(true);
+    assert!(
+        tokenizer.to_string().parse::<Tokenizer>().is_ok(),
+        "lstrip is honoured by the encoder"
+    );
+
+    let mut tokenizer = gemma_json();
+    tokenizer["added_tokens"][0]["single_word"] = json!(true);
     let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
     assert!(
         error
             .to_string()
-            .contains("unsupported added-token boundary flags")
+            .contains("unsupported added-token single_word flag")
     );
 
     let mut tokenizer = gemma_json();
