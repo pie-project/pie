@@ -724,11 +724,7 @@ int Context::Impl::initialize(
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
     const bool native_mxfp4_moe =
-#ifdef PIE_CUDA_HAS_MARLIN
-        dev_prop.major >= 10;
-#else
-        false;
-#endif
+        device_supports_native_mxfp4_moe(dev_prop.major);
     nlohmann::json facts = {
         {"abi_version", PIE_DRIVER_ABI_VERSION},
         {"backend", "cuda"},
