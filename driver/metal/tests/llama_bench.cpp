@@ -434,7 +434,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     const double load_s = now_s() - t_load0;
-    std::printf("  loaded in %.2f s, vocab %u\n", load_s, exec.vocab());
+    // `rs_slots` is the concurrency ceiling for a recurrent family, and it is a
+    // budget rather than a request count -- Qwen3.6-27B's linear-attention
+    // state is 170 MiB a slot, so a small enough working set hands back fewer
+    // than the fire declared. Printed because a throughput run that exceeds it
+    // is not a slow run, it is a different experiment; and because on this
+    // family the fleet check starts failing at fifteen members for a reason
+    // that is NOT this one, and ruling it out took a build.
+    std::printf("  loaded in %.2f s, vocab %u, %u recurrent slot(s)\n", load_s, exec.vocab(),
+                exec.rs_slots());
 
     const std::uint32_t page_size = exec.kv_pool_page_size();
 
@@ -1086,6 +1094,32 @@ int main(int argc, char** argv) {
     double tput_tps = 0.0;
     if (n_seqs > 1) {
         const std::size_t nf = std::size_t(n_seqs);
+        // A recurrent family cannot run a fleet wider than the slots the device
+        // affords, and `rs_slots()` is a BUDGET rather than the request count:
+        // Qwen3.6-27B's linear-attention state is 170 MiB a slot, so a device
+        // with a small enough working set will hand back fewer than were asked
+        // for however many requests the fire declares.
+        //
+        // Gated on `rs_slot_bytes()`, not on `rs_slots()`. A checkpoint with no
+        // GDN layers still reports a slot count -- gpt-oss reports one -- and
+        // reading that as a concurrency ceiling refuses an eight-wide fleet on
+        // a model that has no state to collide. The bytes are the question:
+        // zero of them means no member can overwrite another's history and the
+        // slot id is decoration.
+        //
+        // The assignment below used to be `i % exec.rs_slots()`, which keeps
+        // the id in range and quietly breaks the invariant three lines above --
+        // the wrapped members would share a slot with the low ones and compute
+        // each other's history, which is a wrong answer dressed as a throughput
+        // number. Saying the limit is worth more than producing a number under
+        // it.
+        if (exec.rs_slot_bytes() > 0 && exec.rs_slots() > 0 &&
+            nf > std::size_t(exec.rs_slots())) {
+            std::printf("  ....  throughput: %d sequences need %d recurrent slots and this "
+                        "device affords %u; re-run at PIE_BENCH_TPUT=%u or lower\n",
+                        n_seqs, n_seqs, exec.rs_slots(), exec.rs_slots());
+            return 0;
+        }
         std::vector<Seq> fleet(nf);
         std::uint32_t fpage = 0;
         bool bad = false;
@@ -1093,7 +1127,8 @@ int main(int argc, char** argv) {
             fleet[std::size_t(i)].id = std::uint32_t(100 + i);
             fleet[std::size_t(i)].tokens = prompt;
             fleet[std::size_t(i)].tokens.resize(std::size_t(n_prompt + n_decode), 1u);
-            fleet[std::size_t(i)].rs_slot = exec.rs_slots() > 0 ? i % exec.rs_slots() : 0;
+            fleet[std::size_t(i)].rs_slot =
+                exec.rs_slots() > 0 ? std::uint32_t(i) % exec.rs_slots() : 0u;
             // Prefilled one at a time and UNTIMED. What is being measured is
             // the decode fleet; folding a prefill into it would report one
             // number for two regimes.
