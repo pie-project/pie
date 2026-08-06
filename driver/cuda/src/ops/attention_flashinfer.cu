@@ -138,12 +138,13 @@ void plan_static_nonsplit_decode(
     plan.enable_cuda_graph = enable_cuda_graph;
     plan.split_kv = false;
 
-    if (cursor > workspace.int_bytes()) {
+    if (cursor + cache.int_base_bytes > workspace.int_bytes()) {
         throw std::runtime_error(
             "flashinfer decode static plan: attention int workspace too small");
     }
 
-    auto* host = static_cast<std::uint8_t*>(workspace.page_locked_int());
+    auto* host = static_cast<std::uint8_t*>(workspace.page_locked_int()) +
+                 cache.int_base_bytes;
     std::memcpy(host + plan.request_indices_offset,
                 cache.static_request_indices.data(),
                 sizeof(IdType) * static_cast<std::size_t>(num_requests));
@@ -157,8 +158,11 @@ void plan_static_nonsplit_decode(
         static_cast<IdType>(page_size);
 
     CUDA_CHECK(cudaMemcpyAsync(
-        workspace.int_buffer(), workspace.page_locked_int(), cursor,
-        cudaMemcpyHostToDevice, stream));
+        static_cast<std::uint8_t*>(workspace.int_buffer()) +
+            cache.int_base_bytes,
+        static_cast<std::uint8_t*>(workspace.page_locked_int()) +
+            cache.int_base_bytes,
+        cursor, cudaMemcpyHostToDevice, stream));
 
     cache.num_requests = num_requests;
     cache.num_q_heads  = num_q_heads;
@@ -173,6 +177,10 @@ void plan_static_nonsplit_decode(
 }
 
 }  // namespace
+
+void set_decode_plan_int_base(DecodePlanCache& cache, std::size_t bytes) {
+    cache.int_base_bytes = bytes;
+}
 
 void plan_attention_flashinfer_decode_bf16(
     DecodePlanCache& cache,

@@ -4,6 +4,7 @@
 // has qo_len == 1). Phase 2 will add the prefill path. Same call signature
 // as `attention_paged.hpp` so the forward pass can dispatch on a flag.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -53,6 +54,13 @@ bool decode_plan_is_page_count_independent(const DecodePlanCache& cache);
 
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
+// Place this plan's descriptor `bytes` into the shared int workspace. Callers
+// holding two plans at once need it: the planners otherwise all carve from
+// offset 0, and two plans over different request counts do not agree on where
+// their fields sit. Declared here because `DecodePlanCache` is opaque to the
+// model translation units.
+void set_decode_plan_int_base(DecodePlanCache& cache, std::size_t bytes);
+
 void plan_attention_flashinfer_decode_bf16(
     DecodePlanCache& cache,
     const std::uint32_t* kv_page_indptr_h,
