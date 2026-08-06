@@ -1,5 +1,15 @@
 #pragma once
 
+// `PIE_PREFILL_GRAPH=1` (default off) lets a wave carrying a prefill reach the
+// graph cache instead of dropping to the eager path with all of its decode
+// lanes. Declared here rather than in `batch/forward.hpp` because the float
+// workspace has to be sized for graph-mode planning under the same flag, and
+// `batch/workspace.cu` must not pull in the whole batch engine to ask.
+// Defined in `batch/forward.cpp`.
+namespace pie_cuda_driver {
+bool prefill_graph_enabled();
+}  // namespace pie_cuda_driver
+
 // CUDA-graph cache for the decode forward body.
 //
 // Why: every fire_batch in a steady decode workload issues the same ~420
@@ -84,6 +94,41 @@ constexpr int forward_graph_request_bucket(int requests,
 
     return bucket <= max_requests ? bucket : max_requests;
 }
+
+// Token lattice, the N-axis counterpart to the request lattice above. Only a
+// prefill-carrying wave needs it: in pure decode N == R, so bucketing R
+// already buckets N, and this is never consulted.
+//
+// Granularity is measured, not chosen. On the S cell (4096x64 @ c256) the 182
+// prefill-carrying waves produce 150 distinct exact (R, N) keys -- 82% of them
+// first-touch, each paying a full capture for a shape that never recurs, which
+// is what `forward_graph_replay_eligible` means by "one-off shapes". Rounding
+// N to a multiple of:
+//
+//     G=64  -> 81 keys, 55.5% reuse, 3.1% padding waste
+//     G=128 -> 67 keys, 63.2% reuse, 6.9% padding waste
+//     G=256 -> 56 keys, 69.2% reuse, 13.6% padding waste
+//
+// 128 is the finest grain whose key set still fits `kMaxEntries` beside the
+// 51 upfront decode graphs (67 + 51 = 118). G=64 would need 132 entries and
+// evict its own working set, spending the padding and losing the reuse that
+// paid for it.
+constexpr int kForwardGraphTokenGrain = 128;
+
+constexpr int forward_graph_token_bucket(int tokens, int max_tokens) noexcept {
+    if (tokens <= 0 || max_tokens <= 0 || tokens > max_tokens) return 0;
+    const int bucket =
+        ((tokens + kForwardGraphTokenGrain - 1) / kForwardGraphTokenGrain) *
+        kForwardGraphTokenGrain;
+    return bucket <= max_tokens ? bucket : max_tokens;
+}
+
+static_assert(forward_graph_token_bucket(1, 8192) == 128);
+static_assert(forward_graph_token_bucket(128, 8192) == 128);
+static_assert(forward_graph_token_bucket(129, 8192) == 256);
+static_assert(forward_graph_token_bucket(6003, 8192) == 6016);
+static_assert(forward_graph_token_bucket(8100, 8192) == 8192);
+static_assert(forward_graph_token_bucket(9000, 8192) == 0);
 
 static_assert(forward_graph_request_bucket(1, 512) == 1);
 static_assert(forward_graph_request_bucket(3, 512) == 4);

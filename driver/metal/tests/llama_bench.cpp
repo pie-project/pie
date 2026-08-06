@@ -206,6 +206,26 @@ int fire(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
     return want_token ? argmax_of(out, 0) : 0;
 }
 
+/// Fire a prompt, splitting it into fires the setup will actually accept.
+/// A paged family caps a forward at 1024 rows however wide the config asked,
+/// so a Tier 2 prompt is a refusal rather than a slow answer unless the caller
+/// chunks it -- which is what the scheduler does with a long prompt too, so
+/// chunking here measures the same thing the server would.  Returns the greedy
+/// token of the LAST chunk, or -1 on failure.
+int fire_prompt(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
+                std::uint32_t& next_free_page, bool want_token = false) {
+    const std::uint32_t cap = exec.max_forward_tokens();
+    const std::uint32_t step = (cap > 0 && cap < n) ? cap : n;
+    int last = 0;
+    for (std::uint32_t done = 0; done < n; done += step) {
+        const std::uint32_t take = std::min(step, n - done);
+        last = fire(exec, s, take, page_size, next_free_page,
+                    want_token && done + take >= n);
+        if (last < 0) return -1;
+    }
+    return last;
+}
+
 /// "The capital of France is Paris. The capital of Italy is".
 ///
 /// One prompt, used three ways: the greedy gate continues it, the golden-tap
@@ -1030,7 +1050,7 @@ int main(int argc, char** argv) {
     s.tokens = prompt;
     s.tokens.resize(std::size_t(n_prompt + n_decode), 1u);
     const double t0 = now_s();
-    if (fire(exec, s, std::uint32_t(n_prompt), page_size, next_page) < 0) return 1;
+    if (fire_prompt(exec, s, std::uint32_t(n_prompt), page_size, next_page) < 0) return 1;
     const double prefill_s = now_s() - t0;
 
     // ── decode ──
@@ -1071,7 +1091,7 @@ int main(int argc, char** argv) {
     s2.id = 5;
     s2.tokens = s.tokens;
     std::uint32_t next_page2 = 0;
-    if (fire(exec, s2, std::uint32_t(n_prompt), page_size, next_page2) < 0) return 1;
+    if (fire_prompt(exec, s2, std::uint32_t(n_prompt), page_size, next_page2) < 0) return 1;
     const double t2 = now_s();
     for (int i = 0; i < n_decode; ++i) {
         if (fire(exec, s2, 1, page_size, next_page2) < 0) return 1;

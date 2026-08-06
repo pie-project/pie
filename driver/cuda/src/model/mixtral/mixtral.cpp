@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <array>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -33,6 +34,7 @@
 #include "kernels/topk_softmax.hpp"
 #include "ops/gemm.hpp"
 #include "ops/attention_flashinfer.hpp"
+#include "ops/attention_flashinfer_hopper.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -42,24 +44,96 @@ namespace {
 // Mixtral/GPT-OSS had no per-stage timing, so "the MoE is slow" could not be
 // resolved into which stage is slow. Same shape as the Kimi/Nemotron/Qwen3.5
 // profilers: CUDA events around each stage, accumulated per fire.
+// Stage timings come from a POOL of events resolved with exactly one sync, at
+// teardown. Recording a pair and synchronising on it per stage per layer put a
+// full host/device round trip inside every interval it was trying to measure:
+// a 24-layer fire took ~96 of those samples, each carrying its own sync
+// latency, and the totals came out well above the wall clock they were meant
+// to explain. Nothing is read until the fire is over.
 struct MixtralPhaseProfile {
     bool enabled = false;
     cudaEvent_t a{}, b{};
     double attn = 0, router = 0, moe_gate_up = 0, moe_down = 0;
+    double o_proj = 0, epilogue = 0;
     int last_N = 0;
+
+    // Intervals may nest, so opens are held on a stack and each close pairs
+    // with the most recent open.
+    struct Open { double* dst; std::size_t ev; };
+    std::vector<cudaEvent_t> pool;
+    std::vector<Open> stack;
+    std::vector<std::array<std::size_t, 2>> spans;
+    std::vector<double*> span_dst;
+    std::size_t used = 0;
+
+    // Recording an event on a CAPTURING stream does not measure the replay, it
+    // corrupts the capture. Refuse instead of producing a graph that fails to
+    // instantiate -- profiling wants PIE_CUDA_DISABLE_GRAPH_CAPTURE=1.
+    static bool capturing(cudaStream_t stream) {
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) return true;
+        return st != cudaStreamCaptureStatusNone;
+    }
+    std::size_t claim(cudaStream_t stream) {
+        if (used == pool.size()) {
+            cudaEvent_t e{};
+            cudaEventCreate(&e);
+            pool.push_back(e);
+        }
+        const std::size_t i = used++;
+        last_stream = stream;
+        CUDA_CHECK(cudaEventRecord(pool[i], stream));
+        return i;
+    }
+    void open(double* dst, cudaStream_t stream) {
+        if (capturing(stream)) return;
+        stack.push_back({dst, claim(stream)});
+    }
+    void close(cudaStream_t stream) {
+        if (capturing(stream) || stack.empty()) return;
+        const Open o = stack.back();
+        stack.pop_back();
+        spans.push_back({o.ev, claim(stream)});
+        span_dst.push_back(o.dst);
+    }
+    cudaStream_t last_stream{};
+    void resolve() {
+        // A fire has several exits, so anything still open at teardown is
+        // closed here rather than at each of them.
+        while (!stack.empty() && last_stream) close(last_stream);
+        if (used == 0) return;
+        CUDA_CHECK(cudaEventSynchronize(pool[used - 1]));
+        for (std::size_t i = 0; i < spans.size(); ++i) {
+            float ms = 0.f;
+            CUDA_CHECK(cudaEventElapsedTime(
+                &ms, pool[spans[i][0]], pool[spans[i][1]]));
+            *span_dst[i] += static_cast<double>(ms);
+        }
+        used = 0;
+        stack.clear();
+        spans.clear();
+        span_dst.clear();
+    }
 
     // Printed from the destructor because `mixtral_forward_paged` has several
     // returns (compact-logits epilogue, plain epilogue) and a stage total that
     // only some of them reach would be silently wrong.
     ~MixtralPhaseProfile() {
         if (!enabled) return;
+        resolve();
         std::fprintf(stderr,
-            "[MX-PROF] N=%d attn=%.3f router=%.3f moe_gate_up=%.3f "
-            "moe_down=%.3f | moe_total=%.3f ms\n",
-            last_N, attn, router, moe_gate_up, moe_down,
-            moe_gate_up + moe_down);
+            // `sum` is what the stages below account for; the rest of the
+            // fire -- the MoE dispatch, the glu, the scatter, the norms and
+            // residuals around them -- is the wall clock minus this, and at
+            // gpt-oss's decode shape that remainder is the largest single
+            // item left.
+            "[MX-PROF] N=%d attn=%.3f o_proj=%.3f router=%.3f "
+            "moe_gate_up=%.3f moe_down=%.3f | sum=%.3f ms\n",
+            last_N, attn, o_proj, router, moe_gate_up, moe_down,
+            attn + o_proj + router + moe_gate_up + moe_down + epilogue);
         cudaEventDestroy(a);
         cudaEventDestroy(b);
+        for (cudaEvent_t e : pool) cudaEventDestroy(e);
     }
 };
 
@@ -109,13 +183,9 @@ bool mixtral_profile_enabled() {
 template <class F>
 void mx_stage(MixtralPhaseProfile& p, double* dst, cudaStream_t stream, F&& fn) {
     if (!p.enabled || dst == nullptr) { fn(); return; }
-    CUDA_CHECK(cudaEventRecord(p.a, stream));
+    p.open(dst, stream);
     fn();
-    CUDA_CHECK(cudaEventRecord(p.b, stream));
-    CUDA_CHECK(cudaEventSynchronize(p.b));
-    float ms = 0.f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, p.a, p.b));
-    *dst += static_cast<double>(ms);
+    p.close(stream);
 }
 
 const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
@@ -319,49 +389,124 @@ void mixtral_forward_paged(
     // traffic for a window that never grows. Hand them a shorter page list
     // instead: the decode query sits at the END of its range, so dropping
     // whole pages off the FRONT leaves the last `window+1` tokens in place
-    // and `window_left` still masks against the same positions. Keeping one
-    // page more than the window needs makes the count safe for any
-    // `last_page_len` without reading that array back to the host.
+    // and `window_left` still masks against the same positions.
+    //
+    // One plan serves both page lists: it is `page_count_independent`, so its
+    // descriptor is a function of the request count and not of how many pages
+    // each request holds, and a second planner run would carve from offset 0
+    // of the same int workspace as the first.
+    //
+    // WHICH pages survive is decided on the DEVICE, and unconditionally. This
+    // model does not override `graph_layout`, so one captured graph serves
+    // every context length; a host-computed count is frozen into that capture,
+    // and a fire that skips the trim emits a different kernel sequence
+    // entirely. Replaying either against a shorter request walks off the front
+    // of its page list. Keeping one page more than the window needs also makes
+    // the count safe for any `last_page_len` without reading it back.
     const int page_size = static_cast<int>(cache.page_size());
     int trim_window = -1;
     if (use_decode_path && page_size > 0) {
         for (int w : fwd_cfg.per_layer_window_left) {
             if (w < 0) continue;
             if (trim_window < 0) { trim_window = w; }
-            // One extra plan is worth it; a second distinct window is not,
-            // so decline rather than trim some layers and not others.
+            // A second distinct window would need a second page view and a
+            // second plan; no current model has one, so decline instead of
+            // trimming some windowed layers and not others.
             else if (trim_window != w) { trim_window = -1; break; }
         }
     }
     DeviceBuffer<std::uint32_t> win_indices;
     DeviceBuffer<std::uint32_t> win_indptr;
-    std::vector<std::uint32_t> win_indptr_h;
-    if (trim_window >= 0) {
+    if (trim_window >= 0 && R > 0) {
         const int keep_max = 1 + (trim_window + 1 + page_size - 1) / page_size;
-        win_indptr_h.resize(static_cast<std::size_t>(R) + 1, 0);
-        bool any_trimmed = false;
-        for (int r = 0; r < R; ++r) {
-            const int have = static_cast<int>(kv_page_indptr_h[r + 1]) -
-                             static_cast<int>(kv_page_indptr_h[r]);
-            const int keep = have < keep_max ? have : keep_max;
-            if (keep < have) any_trimmed = true;
-            win_indptr_h[r + 1] = win_indptr_h[r] +
-                                  static_cast<std::uint32_t>(keep);
+        win_indices = DeviceBuffer<std::uint32_t>::alloc(
+            static_cast<std::size_t>(R) * keep_max);
+        win_indptr = DeviceBuffer<std::uint32_t>::alloc(
+            static_cast<std::size_t>(R) + 1);
+        kernels::launch_build_window_page_view(
+            kv_page_indices, kv_page_indptr, keep_max,
+            win_indptr.data(), win_indices.data(), R, stream);
+    }
+
+    // ── Full-attention KV split ───────────────────────────────────────
+    // The other half of gpt-oss's layers see the whole context, and there the
+    // trim above has nothing to drop. What is wrong with them is parallelism:
+    // eight kv heads and one request is eight CTAs on 132 SMs, and the
+    // microbench puts that ~46x off the kernel's own bandwidth roofline (2.25
+    // MB of KV read in 37 us). Split the range into `kMixtralFullSplits`
+    // one-token requests over consecutive slices, share the query with
+    // `broadcast_q`, and fold the partials with `MergeStates`.
+    //
+    // The slice count is FIXED. It is the request count the plan's descriptor
+    // and the launch geometry are derived from, so it must not track a context
+    // length that grows under a captured graph -- which is also why the view
+    // itself is built on the device and the launch is unconditional.
+    // 16 slices x 8 kv heads is 128 CTAs, about one wave on an H100. Swept at
+    // gpt-oss's decode shape (ctx ~1100): 8 -> 239.2, 16 -> 235.6, 24 -> 241.3,
+    // 32 -> 238.3 tok/s, which is flat inside a run-to-run spread of about 5 --
+    // once the machine is full, more slices only add partials to merge. The
+    // knob stays for the next shape that needs sweeping. It must be FIXED
+    // within a process: it is the request count the plan descriptor and the
+    // launch geometry are derived from.
+    static const int kMixtralFullSplits = [] {
+        const char* v = std::getenv("PIE_MIXTRAL_FULL_SPLITS");
+        const int n = (v != nullptr) ? std::atoi(v) : 16;
+        return (n >= 1 && n <= 128) ? n : 16;
+    }();
+    ops::DecodePlanCachePtr split_plan;
+    DeviceBuffer<std::uint32_t> split_indptr, split_indices, split_last;
+    DeviceBuffer<std::uint16_t> split_partial;
+    DeviceBuffer<float> split_lse, split_lse_merged;
+    bool has_full_layer = false;
+    for (int L = 0; L < cfg.num_hidden_layers; ++L) {
+        const int w_l = (L < (int)fwd_cfg.per_layer_window_left.size())
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+        if (w_l < 0) { has_full_layer = true; break; }
+    }
+    if (use_decode_path && has_full_layer && R == 1 && page_size > 0 &&
+        custom_mask_d == nullptr) {
+        const int splits = kMixtralFullSplits;
+        split_indptr = DeviceBuffer<std::uint32_t>::alloc(splits + 1);
+        split_last = DeviceBuffer<std::uint32_t>::alloc(splits);
+        // Sized from the model's context limit, not from this fire's page
+        // count: the latter is a host value, and a capture made while it was
+        // small would replay into an allocation too short for a longer
+        // request. The pool size would also be safe but is far larger than any
+        // one request can hold, and this buffer is cut per fire.
+        const std::size_t max_req_pages =
+            (static_cast<std::size_t>(cfg.max_position_embeddings) +
+             page_size - 1) / page_size;
+        split_indices = DeviceBuffer<std::uint32_t>::alloc(
+            static_cast<std::size_t>(splits) +
+            std::min<std::size_t>(max_req_pages,
+                                  static_cast<std::size_t>(cache.num_pages())));
+        kernels::launch_build_full_split_view(
+            kv_page_indptr, kv_last_page_lens, splits, page_size,
+            split_indptr.data(), split_indices.data(), split_last.data(),
+            kv_page_indices, stream);
+        split_plan = ops::make_decode_plan();
+        // Past the primary plan's descriptor, which is sized for R.
+        ops::set_decode_plan_int_base(*split_plan, 1u << 20);
+        // The descriptor is page-count independent, so the counts handed to
+        // the planner only have to be a well-formed indptr over `splits`
+        // requests; the real ranges reach the LAUNCH, from the device.
+        std::vector<std::uint32_t> plan_indptr_h(splits + 1);
+        for (int i = 0; i <= splits; ++i) {
+            plan_indptr_h[i] = static_cast<std::uint32_t>(i);
         }
-        // Every request already fits inside the window: the trimmed plan
-        // would be the full one, so skip the second plan and its gather.
-        if (any_trimmed) {
-            win_indices = DeviceBuffer<std::uint32_t>::alloc(win_indptr_h[R]);
-            win_indptr = DeviceBuffer<std::uint32_t>::alloc(
-                static_cast<std::size_t>(R) + 1);
-            CUDA_CHECK(cudaMemcpyAsync(
-                win_indptr.data(), win_indptr_h.data(),
-                win_indptr_h.size() * sizeof(std::uint32_t),
-                cudaMemcpyHostToDevice, stream));
-            kernels::launch_gather_trailing_pages(
-                kv_page_indices, kv_page_indptr, win_indptr.data(),
-                win_indices.data(), R, stream);
-        }
+        ops::plan_attention_flashinfer_decode(
+            *split_plan, plan_indptr_h.data(), splits,
+            num_q_heads_local, num_kv_heads_local, d, page_size,
+            attn_ws, stream, /*enable_cuda_graph=*/true,
+            /*full_attention_variant=*/true, cache.hnd_layout());
+        const std::size_t rows =
+            static_cast<std::size_t>(splits) * num_q_heads_local;
+        split_partial = DeviceBuffer<std::uint16_t>::alloc(
+            rows * static_cast<std::size_t>(d));
+        split_lse = DeviceBuffer<float>::alloc(rows);
+        split_lse_merged =
+            DeviceBuffer<float>::alloc(static_cast<std::size_t>(num_q_heads_local));
     }
 
     // Per-fire scratch for MoE routing. Sized for the worst case (N
@@ -417,6 +562,33 @@ void mixtral_forward_paged(
     // frame grew -- read out of bounds.
     const std::size_t gemv_routes =
         use_mxfp4_decode_gemv ? max_routed : 0;
+    // Marlin reads the native slabs, the GEMV reads the packed routed form,
+    // and a checkpoint carries one lowering or the other -- so this is decided
+    // beside `use_mxfp4_decode_gemv` rather than downstream of it. Gating it on
+    // the GEMV's availability disabled it on exactly the checkpoints it serves
+    // (no `expert_gate_up_packed_ptrs` in the native lowering), leaving the
+    // layer on the per-expert native GEMM at 70 tok/s against 846.
+#ifdef PIE_CUDA_HAS_MARLIN_MOE
+    const int Ip_marlin = w.mxfp4_intermediate_padded > 0
+                              ? w.mxfp4_intermediate_padded : I;
+    const bool marlin_native_slabs =
+        !w.layers.empty() && !w.layers[0].experts.empty() &&
+        w.layers[0].experts[0].format ==
+            MixtralExpertWeightFormat::Mxfp4NativeGemm &&
+        w.layers[0].experts[0].w_gate_mxfp4 != nullptr;
+    const bool use_marlin_moe =
+        marlin_native_slabs && mxfp4_marlin_moe_enabled() &&
+        w.mxfp4_intermediate_padded > 0;
+#else
+    constexpr bool use_marlin_moe = false;
+#endif
+    // These two are the collection point both paths write through, so they are
+    // sized for either.
+    const std::size_t routed_out_routes =
+        (use_mxfp4_decode_gemv || use_marlin_moe) ? max_routed : 0;
+    const std::size_t moe_out_rows =
+        (use_mxfp4_decode_gemv || use_marlin_moe)
+            ? static_cast<std::size_t>(N) : 0;
     auto d_mxfp4_act_fp16 = DeviceBuffer<std::uint16_t>::alloc(
         use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
     auto d_mxfp4_route_gate =
@@ -435,18 +607,13 @@ void mixtral_forward_paged(
     auto d_moe_expert_counts = DeviceBuffer<std::int32_t>::alloc(
         use_mxfp4_decode_gemv ? static_cast<std::size_t>(num_experts) : 0);
     auto d_mxfp4_route_out =
-        DeviceBuffer<std::uint16_t>::alloc(gemv_routes * H);
-    auto d_mxfp4_moe_out = DeviceBuffer<std::uint16_t>::alloc(
-        use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
+        DeviceBuffer<std::uint16_t>::alloc(routed_out_routes * H);
+    auto d_mxfp4_moe_out =
+        DeviceBuffer<std::uint16_t>::alloc(moe_out_rows * H);
 #ifdef PIE_CUDA_HAS_MARLIN_MOE
     // Marlin consumes the padded block-sorted form, and writes gate/up at the
     // PADDED intermediate width (the packed weights are aligned to 128), so
     // these cannot share the gemv scratch above.
-    const int Ip_marlin = w.mxfp4_intermediate_padded > 0
-                              ? w.mxfp4_intermediate_padded : I;
-    const bool use_marlin_moe =
-        use_mxfp4_decode_gemv && mxfp4_marlin_moe_enabled() &&
-        w.mxfp4_intermediate_padded > 0;
     const int marlin_block = 16;
     const int marlin_max_blocks =
         use_marlin_moe
@@ -471,6 +638,18 @@ void mixtral_forward_paged(
         use_marlin_moe
             ? marlin_moe::marlin_moe_workspace_bytes(Ip_marlin, marlin_block)
             : 0);
+    if (use_marlin_moe) {
+        // The workspace is the kernel's `locks` array, and every threadblock
+        // in a column tile spins on its entry until the tile's leader releases
+        // it. The kernel returns it to zero on the way out, so one memset per
+        // forward is enough -- but that convention means it is only ever *read*
+        // as an initialised value, and `alloc` does not initialise. On
+        // whatever `cudaMalloc` happened to hand back non-zero, the very first
+        // MoE layer deadlocked: the GPU stayed busy, the scheduler reported
+        // "no progress, work queued or in flight", and nothing timed out.
+        CUDA_CHECK(cudaMemsetAsync(d_marlin_ws.data(), 0,
+                                   d_marlin_ws.size(), stream));
+    }
 #endif
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
@@ -483,7 +662,7 @@ void mixtral_forward_paged(
                 : fwd_cfg.sliding_window;
 
         // ── Attention block (identical to llama_like pre-norm path) ──
-        CUDA_CHECK(prof.enabled ? cudaEventRecord(prof.a, stream) : cudaSuccess);
+        if (prof.enabled) prof.open(&prof.attn, stream);
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
@@ -529,7 +708,22 @@ void mixtral_forward_paged(
         // gpt-oss layers that turn out to have nullptr sinks.
         float* layer_lse = (layer.attn_sinks != nullptr) ? lse_ptr : nullptr;
 
-        if (use_decode_path) {
+        const bool use_full_split =
+            use_decode_path && !split_indices.empty() && layer_window < 0;
+        if (use_full_split) {
+            ops::dispatch_attention_flashinfer_decode_bf16(
+                *split_plan, ws.q.data(),
+                kv_view.k_pages, kv_view.v_pages,
+                split_partial.data(), split_indices.data(),
+                split_indptr.data(), split_last.data(),
+                attn_ws, stream, /*window_left=*/-1,
+                /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f,
+                split_lse.data(), /*broadcast_q=*/true);
+            ops::merge_attention_states_bf16(
+                split_partial.data(), split_lse.data(),
+                ws.attn_out.data(), split_lse_merged.data(),
+                kMixtralFullSplits, 1, num_q_heads_local, d, stream);
+        } else if (use_decode_path) {
             // One plan serves both page lists. With `enable_cuda_graph` the
             // scheduler declines to split KV, and what is left of the plan --
             // request/tile indices, o_indptr, padded batch -- is a function of
@@ -574,8 +768,12 @@ void mixtral_forward_paged(
         // softmax-denominator extension that flashinfer's DefaultAttention
         // doesn't emit natively. Per-rank shard count under TP.
         if (layer.attn_sinks != nullptr) {
+            // On a split layer each slice's lse is a partial; the total the
+            // sink extension needs is the one MergeStates just folded.
             kernels::launch_attention_sink_rescale_bf16(
-                ws.attn_out.data(), layer_lse, layer.attn_sinks->data(),
+                ws.attn_out.data(),
+                use_full_split ? split_lse_merged.data() : layer_lse,
+                layer.attn_sinks->data(),
                 N, num_q_heads_local, d, stream);
         }
         invoke_stage_hook(
@@ -584,13 +782,8 @@ void mixtral_forward_paged(
             static_cast<std::uint32_t>(Hq),
             static_cast<std::uint32_t>(L), stream);
 
-        if (prof.enabled) {
-            CUDA_CHECK(cudaEventRecord(prof.b, stream));
-            CUDA_CHECK(cudaEventSynchronize(prof.b));
-            float ms = 0.f;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, prof.a, prof.b));
-            prof.attn += ms;
-        }
+        if (prof.enabled) prof.close(stream);
+        if (prof.enabled) prof.open(&prof.o_proj, stream);
 
         // o_proj is row-parallel under TP: write to scratch, all-reduce,
         // residual-add into y. o_bias (replicated; e.g. GPT-OSS) only goes
@@ -613,7 +806,8 @@ void mixtral_forward_paged(
         }
 
         // ── Sparse-MoE block ──
-        CUDA_CHECK(prof.enabled ? cudaEventRecord(prof.a, stream) : cudaSuccess);
+        if (prof.enabled) prof.close(stream);   // o_proj
+        if (prof.enabled) prof.open(&prof.router, stream);
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
             N, H, eps, stream);
@@ -662,13 +856,7 @@ void mixtral_forward_paged(
         // expert is pinned at once, so a slab that cannot hold the layer's
         // routed set falls back to the per-expert loop rather than deadlock
         // against its own pins.
-        if (prof.enabled) {
-            CUDA_CHECK(cudaEventRecord(prof.b, stream));
-            CUDA_CHECK(cudaEventSynchronize(prof.b));
-            float ms = 0.f;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, prof.a, prof.b));
-            prof.router += ms;
-        }
+        if (prof.enabled) prof.close(stream);
         bool streamed_fused = false;
         // The routing table is read back at most once per layer. The fused
         // paged path below needs it to decide what to page in, and the generic
@@ -1201,6 +1389,7 @@ void mixtral_forward_paged(
     if (!fwd_cfg.emit_logits) {
         return;
     }
+    if (prof.enabled) prof.open(&prof.epilogue, stream);
     // Compact logits: gather only the rows that will be sampled before the
     // lm_head, instead of materializing [N, vocab]. Every other family already
     // declares this; without it the batch engine hands the device-side sampler
@@ -1221,6 +1410,7 @@ void mixtral_forward_paged(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_y.data(), w.lm_head->data(), ws.logits.data(),
             lm_head_rows, V, H);
+        if (prof.enabled) prof.close(stream);
         return;
     }
     kernels::launch_rmsnorm_bf16(
@@ -1229,6 +1419,7 @@ void mixtral_forward_paged(
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
         N, V, H);
+    if (prof.enabled) prof.close(stream);
 }
 
 }  // namespace pie_cuda_driver::model
