@@ -63,7 +63,12 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
 /// A dense projection's GEMM row count, padded up to a whole BM tile so the
 /// matmul engages at any batch rather than only at exact multiples of one. The
 /// padding rows compute discardable values into pool rows nothing reads.
-int llama_qmm_rows(int rows, int requests = 1);
+///
+/// Takes the geometry for one field of it: whether the FFN is routed, which is
+/// half of what sets the GEMV/GEMM crossover (`device_tuning.hpp`). Asked of
+/// the geometry rather than defaulted, because a mixture answered with the
+/// dense crossover pads at a batch the machine measured slower.
+int llama_qmm_rows(const LlamaGeometry& g, int rows, int requests = 1);
 
 /// The pool's row count: the widest padding any batch up to `max_rows` can ask
 /// for, which is what the scratch must be sized against.

@@ -345,7 +345,7 @@ int bind_llama_splitk(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         const KN kn = qmv_kn(d.kind, g);
         const Triple want{std::int32_t(kn.K / split),
                           std::int32_t(kn.N) *
-                              std::int32_t(llama_qmm_rows(R, requests)),
+                              std::int32_t(llama_qmm_rows(g, R, requests)),
                           std::int32_t(split), {}, {}, {}};
         Triple* hit = nullptr;
         for (Triple& t : seen) {
@@ -394,7 +394,7 @@ int bind_llama_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         if (llama_qmm_bn(d.kind, g, m, requests) <= 0) continue;
         const KN kn = qmv_kn(d.kind, g);
         const std::int32_t elems =
-            std::int32_t(llama_qmm_rows(m, requests)) * std::int32_t(kn.K);
+            std::int32_t(llama_qmm_rows(g, m, requests)) * std::int32_t(kn.K);
         SlotHandle count;
         for (const auto& entry : counts) {
             if (entry.first == elems) {
