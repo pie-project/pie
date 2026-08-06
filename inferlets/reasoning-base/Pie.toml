@@ -1,0 +1,17 @@
+[package]
+name = "reasoning-base"
+version = "0.1.0"
+description = "Base prompt-to-completion inferlet for reasoning benchmarks"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", description = "Prompt to complete"}
+system = {type = "string", optional = true, description = "System message for the completion model"}
+max_tokens = {type = "int", optional = true, description = "Maximum completion tokens (default: 256)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature (default: 0.7)"}
+top_p = {type = "float", optional = true, description = "Top-p value (default: 0.95)"}
+thinking = {type = "bool", optional = true, description = "Allow model thinking blocks (default: false)"}

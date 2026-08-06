@@ -1,0 +1,19 @@
+[package]
+name = "reasoning-graph-of-thought"
+version = "0.1.0"
+description = "Graph-of-Thought aggregation inferlet for reasoning benchmarks"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = {type = "string", description = "Math word problem to solve"}
+num_candidates = {type = "int", optional = true, description = "Proposal count (default: 4)"}
+beam_width = {type = "int", optional = true, description = "Accepted for runner compatibility"}
+max_tokens = {type = "int", optional = true, description = "Maximum answer tokens per generation (default: 256)"}
+score_tokens = {type = "int", optional = true, description = "Accepted for runner compatibility"}
+temperature = {type = "float", optional = true, description = "Proposal sampling temperature (default: 0.7)"}
+top_p = {type = "float", optional = true, description = "Proposal top-p value (default: 0.95)"}
+thinking = {type = "bool", optional = true, description = "Allow model thinking blocks (default: false)"}
