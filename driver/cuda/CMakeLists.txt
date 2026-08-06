@@ -1018,6 +1018,13 @@ pie_add_cuda_target(test_masked_attention_geometry
   SOURCES tests/masked_attention_geometry_test.cpp src/batch/brle.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 # GPU parity for the geometry test above, through the real flashinfer prefill-custom path.
+# Kernel-level decode-attention comparison. NO_CTEST: it is a measurement
+# harness, not a pass/fail check, and it needs a Hopper device to say anything
+# about the FA3 column.
+pie_add_cuda_target(bench_decode_attention
+  SOURCES tests/bench_decode_attention.cu
+  LIBS pie_driver_cuda_lib CUDA::cudart
+  NO_CTEST)
 pie_add_cuda_target(masked_attention_parity
   SOURCES tests/masked_attention_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
