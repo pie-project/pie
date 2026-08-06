@@ -233,6 +233,17 @@ class RawMetalContext {
     /// Test hook for `host_reclaimable_bytes`; 0 restores asking the kernel.
     static void set_host_reclaimable_bytes_for_test(size_t bytes);
 
+    /// Wired bytes and installed bytes, or {0, 0} if the kernel would not say.
+    ///
+    /// Wired memory is the tell for a leaked GPU context. Those pages cannot
+    /// be paged out, are charged to no live process, and appear in no process
+    /// listing -- so every ordinary tool shows a healthy machine right up
+    /// until the window server cannot get memory to composite a frame, blocks
+    /// in the kernel on its own submit, misses its 120-second watchdog, and
+    /// takes the whole desktop down. That has happened here twice, once ten
+    /// hours after the run that caused it.
+    static std::pair<size_t, size_t> host_wired_and_installed_bytes();
+
     /// True while `set_device_working_set_bytes_for_test` is in force.
     ///
     /// A forced working set describes an imaginary device, so pairing it with

@@ -48,6 +48,7 @@
 #include "model/llama_like/qwen3.hpp"
 #include "model/workspace.hpp"
 #include "ops/attention_flashinfer.hpp"
+#include "ops/attention_flashinfer_hopper.hpp"
 #include "ops/gemm.hpp"
 
 namespace pie_cuda_driver {
@@ -178,6 +179,12 @@ struct Gemma4MoeMlpWorkspace {
     ops::DecodePlanCachePtr row_decode_plan_sliding;
     ops::DecodePlanCachePtr row_decode_plan_full;
     bool decode_plans_prepared = false;
+    // FA3 (SM90) decode plan for the sliding layers. gemma-4 attends there at
+    // head_dim 256 with a window, which is the shape FlashAttention serves at
+    // roofline and FlashInfer's paged-decode kernel does not. Built once per
+    // fire beside the decode plans; `valid == false` means fall back.
+    ops::HopperPrefillPlan hopper_decode_plan_sliding;
+    std::vector<std::uint32_t> hopper_qo_indptr_h;
     bool row_decode_prepared = false;
     int row_decode_prepared_tokens = 0;
     int row_decode_prepared_requests = 0;

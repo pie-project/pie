@@ -4199,7 +4199,6 @@ impl BatchScheduler {
         progress
     }
 
-    /// Unstamped (rider) launches currently queued — the fire-timing
     /// Retire every settled control this pass. Concurrent standalone copies
     /// settle in device order, not post order, so the sweep cannot stop at
     /// the first control that is still outstanding.

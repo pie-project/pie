@@ -63,6 +63,7 @@ struct Gemma4ForwardProfile {
     float attention_ms = 0.f;
     float attn_out_ms = 0.f;
     float mlp_ms = 0.f;
+    float mlp_moe_ms = 0.f;
     float ple_residual_ms = 0.f;
     float final_norm_ms = 0.f;
     float lm_head_ms = 0.f;
@@ -190,6 +191,7 @@ void maybe_print_gemma4_forward_profile(
         << " attention_ms=" << p.attention_ms
         << " attn_out_ms=" << p.attn_out_ms
         << " mlp_ms=" << p.mlp_ms
+        << " mlp_moe_ms=" << p.mlp_moe_ms
         << " ple_residual_ms=" << p.ple_residual_ms
         << " final_norm_ms=" << p.final_norm_ms
         << " lm_head_ms=" << p.lm_head_ms
@@ -241,13 +243,16 @@ constexpr std::size_t kGemma4RowDecodeMaxPageRefs = std::size_t{1} << 20;
 constexpr int kGemma4MoeGemvMaxTokens = 1;
 
 bool gemma4_dense_gate_up_fused_enabled(const HfConfig& cfg) {
-    return !cfg.gemma4_enable_moe &&
-           cfg.hidden_size == 2560 &&
-           cfg.intermediate_size == 10240 &&
-           cfg.num_hidden_layers == 42 &&
-           cfg.num_attention_heads == 8 &&
-           cfg.num_key_value_heads == 2 &&
-           cfg.head_dim == 256;
+    // Presence of the bank decides, not the shape. `dense_fused_projection_joins`
+    // publishes `mlp.gate_up_proj.fused.weight` for every Gemma-4 that fits its
+    // byte budget, and the consumer is shape-agnostic -- one GEMM plus the same
+    // chunked GeGLU the split path runs. The allowlist this replaces named the
+    // one checkpoint the fused path had been tried on, which left 26B-A4B
+    // issuing two M=1 GEMVs per layer where one would do; `optional_tensor`
+    // already yields null when the join did not run, so an absent bank falls
+    // back on its own.
+    (void)cfg;
+    return true;
 }
 
 bool gemma4_dense_gate_up_fused_for_row_decode(const HfConfig& cfg) {
@@ -444,6 +449,52 @@ void prepare_gemma4_plan_for_layer(
         hnd_layout);
 }
 
+// FA3 decode plan for the sliding layers. One token per request, so
+// `qo_indptr` is the identity; everything else the SM90 planner needs is the
+// same page table the decode plans were built from.
+void prepare_gemma4_hopper_decode_plan(
+    Gemma4MoeMlpWorkspace& moe_ws,
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    AttentionWorkspace& attn_ws,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int num_requests,
+    int page_size)
+{
+    moe_ws.hopper_decode_plan_sliding.valid = false;
+    if (num_requests <= 0) return;
+    int sliding_idx = -1;
+    for (std::size_t i = 0; i < w.layers.size(); ++i) {
+        if (!w.layers[i].is_full) { sliding_idx = static_cast<int>(i); break; }
+    }
+    if (sliding_idx < 0) return;
+    const auto* sliding = &w.layers[sliding_idx];
+    const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+    const int q_heads = cfg.num_attention_heads / T;
+    const int kv_heads = sliding->num_kv_heads / T;
+    const int window_left = w.per_layer_window_left[sliding_idx];
+    if (!ops::hopper_prefill_supported(
+            sliding->head_dim, window_left, num_requests, num_requests)) {
+        return;
+    }
+    moe_ws.hopper_qo_indptr_h.resize(num_requests + 1);
+    for (int r = 0; r <= num_requests; ++r) {
+        moe_ws.hopper_qo_indptr_h[r] = static_cast<std::uint32_t>(r);
+    }
+    ops::plan_attention_flashinfer_prefill_sm90_bf16(
+        moe_ws.hopper_decode_plan_sliding,
+        moe_ws.hopper_qo_indptr_h.data(), kv_page_indptr_h,
+        kv_last_page_lens_h,
+        /*total_tokens=*/num_requests, num_requests,
+        q_heads, kv_heads, sliding->head_dim, page_size,
+        attn_ws, /*stream=*/nullptr,
+        /*enable_cuda_graph=*/true, /*causal=*/true, window_left,
+        // Clear of the decode plans, which start at offset 0.
+        /*int_base_bytes=*/attn_ws.int_bytes() / 2);
+}
+
 ops::DecodePlanCachePtr& select_prepared_plan(
     Gemma4MoeMlpWorkspace& moe_ws,
     bool row_decode,
@@ -527,6 +578,9 @@ void prepare_gemma4_decode_plans(
     if (is_pure_decode) {
         prepare_pair(kv_page_indptr_h, R, /*row_decode=*/false);
         moe_ws.decode_plans_prepared = true;
+        prepare_gemma4_hopper_decode_plan(
+            moe_ws, w, cfg, fwd_cfg, attn_ws, kv_page_indptr_h,
+            kv_last_page_lens_h, R, cache.page_size());
         if (log_debug) {
             std::cerr << "[pie-driver-cuda] gemma4 plan prepare"
                       << " N=" << N
@@ -671,7 +725,13 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     Gemma4Weights w;
     const bool fuse_dense_gate_up = gemma4_dense_gate_up_fused_enabled(cfg);
     const bool fuse_dense_qkv =
-        !cfg.gemma4_enable_moe;
+        // Same rule as the gate/up bank: ask for it, and let the per-layer
+        // guards below plus `optional_tensor` decide. A layer that reads its
+        // K/V from elsewhere (`is_shared`) or derives V from K
+        // (`use_k_as_v`, Gemma-4's k_eq_v full-attention layers) still
+        // declines, so 26B-A4B fuses its 25 sliding layers and leaves the
+        // 5 full ones split.
+        true;
     const std::string p = kPrefix;
     w.embed           = &must(engine, p + "embed_tokens.weight");
     // PLE (Per-Layer Embeddings) machinery is optional — Gemma-4 E2B /
@@ -1347,9 +1407,18 @@ std::uint32_t gemma4_decode_graph_layout(
         : pack(moe_ws.decode_plan_full);
     if (sliding == 0u && full == 0u) return 0u;
 
+    // The FA3 sliding-layer plan is part of the launch geometry too: unlike
+    // the decode plans its schedule is derived from the KV lengths it was
+    // built with, so a captured graph replayed against a differently-shaped
+    // plan reads the wrong work assignment and silently produces garbage.
+    // Fold its layout in so a change forces a recapture rather than a wrong
+    // answer.
+    const std::uint32_t hopper =
+        ops::hopper_prefill_graph_layout(moe_ws.hopper_decode_plan_sliding);
     return (row_decode ? 0x10000u : 0x20000u) |
            (sliding & 0xffu) |
-           ((full & 0xffu) << 8);
+           ((full & 0xffu) << 8) |
+           ((hopper & 0xffu) << 20);
 }
 
 void gemma4_forward_paged(
@@ -1804,7 +1873,22 @@ void gemma4_forward_paged(
         profile_gemma4_cuda_stage(
             profile, profile.attention_ms, stream, [&] {
                 ops::DecodePlanCachePtr decode_plan;
-                if (use_decode_path) {
+                const auto& hplan = moe_ws.hopper_decode_plan_sliding;
+                const bool use_hopper_decode =
+                    use_decode_path && hplan.valid && !layer.is_full &&
+                    hplan.head_dim == d &&
+                    hplan.num_kv_heads == num_kv_heads_local &&
+                    hplan.window_left == w.per_layer_window_left[l];
+                if (use_hopper_decode) {
+                    ops::dispatch_attention_flashinfer_prefill_sm90_bf16(
+                        hplan, ws.q.data(), kv_view.k_pages, kv_view.v_pages,
+                        ws.attn_out.data(), kv_page_indices, attn_ws, stream,
+                        // Gemma-4 folds `query_pre_attn_scalar` into Q before
+                        // attention, so the kernel must not apply the usual
+                        // 1/sqrt(head_dim) again -- the decode path beside
+                        // this one passes the same 1.0.
+                        /*logits_soft_cap=*/0.f, /*sm_scale=*/1.0f);
+                } else if (use_decode_path) {
                     ops::DecodePlanCache* plan =
                         select_prepared_plan(
                             moe_ws, /*row_decode=*/false, layer.is_full).get();
@@ -1986,8 +2070,10 @@ void gemma4_forward_paged(
                 ws.norm_x.data(), layer.mlp_norm_post_dense->data(),
                 ws.norm_y.data(), N, H, eps, stream);
             // experts → moe_ws.moe_out (raw, no post-norm).
-            gemma4_moe_block(layer, cfg, ws, moe_ws, N, is_pure_decode,
-                             cublas, stream);
+            profile_gemma4_cuda_stage(profile, profile.mlp_moe_ms, stream, [&] {
+                gemma4_moe_block(layer, cfg, ws, moe_ws, N, is_pure_decode,
+                                 cublas, stream);
+            });
             // branch_2 = post_feedforward_layernorm_2(moe_out) → norm_x
             // (norm_x's prior contents — dense_out — are no longer
             // needed).

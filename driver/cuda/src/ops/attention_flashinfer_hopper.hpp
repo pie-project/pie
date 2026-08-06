@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include <cuda_runtime.h>
@@ -51,7 +52,8 @@ void plan_attention_flashinfer_prefill_sm90_bf16(
     cudaStream_t stream,
     bool enable_cuda_graph,
     bool causal,
-    int window_left);
+    int window_left,
+    std::size_t int_base_bytes = 0);
 
 void dispatch_attention_flashinfer_prefill_sm90_bf16(
     const HopperPrefillPlan& plan,

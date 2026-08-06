@@ -82,6 +82,15 @@ class DriverConfig:
 class SchedulerConfig:
     request_timeout_secs: Optional[int] = None
     speculation_depth: Optional[int] = None
+    # Frame geometry. Absent means the engine's own defaults, which is what
+    # every ordinary run wants; these exist so a measurement can hold the
+    # geometry fixed while something else varies. `pie config tune` moves the
+    # same three through `scheduler::reconfigure`, but only inside its own
+    # sweep -- without these there is no way to ask the QUESTION of a bench
+    # shape, and the sweep's synthetic fleet is not every shape.
+    frame_size: Optional[int] = None
+    frame_submit_depth: Optional[int] = None
+    frame_dispatch_depth: Optional[int] = None
 
 
 @dataclass

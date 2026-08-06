@@ -238,10 +238,14 @@ def build_config(args: argparse.Namespace):
             driver_options["enable_system_speculation"] = True
         # `gpu_mem_utilization` sizes only the memory planner's *logical* KV
         # budget; the runtime is free to exceed it, so it cannot create KV
-        # pressure. `total_pages` is the one binding cap, and `swap_pool_size`
-        # is what arms the suspend/restore rung (it defaults to 0, i.e. off).
+        # pressure. `max_total_pages` is the one binding cap, and
+        # `swap_pool_size` is what arms the suspend/restore rung (it defaults
+        # to 0, i.e. off). The knob is named `max_total_pages` here and
+        # `total_pages` on Metal because they are not the same quantity: there
+        # the value IS the pool, here it is a ceiling over a number derived
+        # from `gpu_mem_utilization` (worker/src/config.rs).
         if getattr(args, "total_pages", 0):
-            driver_options["total_pages"] = args.total_pages
+            driver_options["max_total_pages"] = args.total_pages
         if getattr(args, "swap_pool_size", 0):
             driver_options["swap_pool_size"] = args.swap_pool_size
     elif args.driver == "metal":
@@ -369,6 +373,12 @@ def build_config(args: argparse.Namespace):
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
+        # Frame geometry, absent unless asked for. `None` is dropped by the
+        # config serializer, so not passing these is exactly the engine's own
+        # default rather than a second spelling of it.
+        "frame_size": args.frame_size,
+        "frame_submit_depth": args.frame_submit_depth,
+        "frame_dispatch_depth": args.frame_dispatch_depth,
     }
     scheduler_parameters = inspect.signature(SchedulerConfig).parameters
     scheduler_kwargs = {
@@ -1331,6 +1341,36 @@ def build_parser() -> argparse.ArgumentParser:
                  "0 disables speculation; 1 is piggyback (default). Forwards "
                  "to scheduler.speculation_depth in the generated toml.",
         )
+        # `choices.values()` can yield the same parser under an alias, and
+        # `common.py` registers some of these already; a duplicate
+        # add_argument raises. Guard EACH flag by its own option string --
+        # guarding a block by one member silently drops the rest, which is how
+        # the frame-geometry flags were added and then never appeared.
+        for flag, dest, helptext in (
+            ("--frame-size", "frame_size",
+             "Waves per frame (k). Default: the engine's."),
+            ("--frame-submit-depth", "frame_submit_depth",
+             "Frames a guest keeps submitted. Default: the engine's."),
+            ("--frame-dispatch-depth", "frame_dispatch_depth",
+             "Frames the engine keeps posted to the driver. "
+             "Default: the engine's."),
+        ):
+            if not any(flag in a.option_strings for a in sp._actions):
+                sp.add_argument(flag, dest=dest, type=int, default=None,
+                                help=helptext)
+        if not any(
+            "--run-ahead-frames" in a.option_strings for a in sp._actions
+        ):
+            sp.add_argument(
+                "--run-ahead-frames",
+                dest="run_ahead_frames",
+                type=int,
+                default=None,
+                help="Override the inferlet's run-ahead window depth, in "
+                     "frames (forwarded as the bench input's "
+                     "run_ahead_frames; the ring grows to match). "
+                     "Default: the inferlet's own sizing.",
+            )
         sp.add_argument(
             "--dump-first-text",
             action="store_true",

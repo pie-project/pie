@@ -265,12 +265,34 @@ impl Drop for RsTxnsGuard {
     }
 }
 
+/// `PIE_KV_REALIZE_AHEAD=<pages>`: realize this many KV pages beyond the
+/// fire's writable frontier (clamped to the guest's declared working-set
+/// capacity), so a page-boundary ask is issued ~one page of waves before
+/// the page is needed and a park resolves before it can stall the lane.
+/// Absent, empty, `0`, or unparseable = off (behavior byte-identical to
+/// before the flag existed).
+fn kv_realize_ahead_pages() -> u64 {
+    static CONFIGURED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_KV_REALIZE_AHEAD")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn host_kv_demand_locked(
     store: &mut crate::store::kv::KvStore,
     ws: &KvWorkingSet,
     writable: std::ops::Range<u64>,
     declaration_realized: bool,
 ) -> Result<usize, String> {
+    // Realize-ahead extension (identity when the flag is off). Computed
+    // under the caller's lock hold from store state, so the Phase-A demand,
+    // the prepare-time staleness gate, and the grant-consuming realization
+    // in `prepare_host_kv_reserved` all price the SAME range.
+    let writable = kv::realize_ahead_range(store, ws.id, &writable, kv_realize_ahead_pages())
+        .map_err(|error| error.to_string())?;
     let realization = if declaration_realized {
         0
     } else {
@@ -327,10 +349,13 @@ async fn acquire_grant<C: FireContext>(
         match planner
             .acquire(pid, pipeline_id, demand)
             .await
-            .map_err(|error| format!("pipeline: KV capacity: {error}"))?
+            .map_err(|error| format!("pipeline: KV capacity: {error}"))
         {
-            crate::planner::Acquired::Granted(grant) => return Ok(grant),
-            crate::planner::Acquired::Yield => settle_and_wait_resident(ctx).await?,
+            Ok(crate::planner::Acquired::Granted(grant)) => return Ok(grant),
+            Ok(crate::planner::Acquired::Yield) => {
+                settle_and_wait_resident(ctx).await?;
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -354,15 +379,16 @@ async fn settle_and_wait_resident<C: FireContext>(ctx: &mut C) -> Result<(), Str
         .map_err(|error| format!("pipeline: KV residency: {error}"))
 }
 
-/// Resolve the bound RS working sets for demand sizing (phase A: validation
-/// only, no scope claim, no allocation).
-fn bound_rs_working_set_ids<C: FireContext>(
+/// Resolve the bound RS working sets (phase A: validation only, no scope
+/// claim, no allocation). The clones are Arc-shared handles, so holding them
+/// past this call never triggers an early release.
+fn resolve_bound_rs_working_sets<C: FireContext>(
     ctx: &mut C,
     model: usize,
     driver: usize,
     rs_reps: &[u32],
-) -> Anyhow<Result<Vec<crate::store::rs::RsWorkingSetId>, String>> {
-    let mut ids = Vec::with_capacity(rs_reps.len());
+) -> Anyhow<Result<Vec<RsWorkingSet>, String>> {
+    let mut sets = Vec::with_capacity(rs_reps.len());
     for (row, &rep) in rs_reps.iter().enumerate() {
         let resource: Resource<RsWorkingSet> = Resource::new_borrow(rep);
         let rs = ctx.resources().get(&resource)?.clone();
@@ -373,9 +399,20 @@ fn bound_rs_working_set_ids<C: FireContext>(
                 rs.model, rs.driver
             )));
         }
-        ids.push(rs.id);
+        sets.push(rs);
     }
-    Ok(Ok(ids))
+    Ok(Ok(sets))
+}
+
+/// [`resolve_bound_rs_working_sets`], ids only (demand sizing).
+fn bound_rs_working_set_ids<C: FireContext>(
+    ctx: &mut C,
+    model: usize,
+    driver: usize,
+    rs_reps: &[u32],
+) -> Anyhow<Result<Vec<crate::store::rs::RsWorkingSetId>, String>> {
+    Ok(resolve_bound_rs_working_sets(ctx, model, driver, rs_reps)?
+        .map(|sets| sets.iter().map(|rs| rs.id).collect()))
 }
 
 /// Resolve the fire's `rs-geometry.fold-len` into the per-row plan the
@@ -718,6 +755,13 @@ fn prepare_host_kv_reserved(
         if required > grant.remaining_kv() {
             return Err(ReservedError::Stale);
         }
+        // The demand gate above priced the realize-ahead-extended range;
+        // re-derive the identical extension (same store state, same lock
+        // hold) so realization and backing consume exactly what was priced.
+        let writable = kv::realize_ahead_range(store, ws.id, &writable, kv_realize_ahead_pages())
+            .map_err(|error| {
+                ReservedError::Fatal(format!("pipeline: KV realize-ahead range: {error}"))
+            })?;
         let (copies, txn) = if declaration_realized {
             ((Vec::new(), Vec::new()), None)
         } else {
@@ -911,40 +955,72 @@ fn prepare_bound_rs<C: FireContext>(
 
     // Resolution + model/driver validation live in the phase-A resolver;
     // only the scope claim is prepare-time work.
-    let working_sets = match bound_rs_working_set_ids(ctx, model, driver, rs_reps)? {
-        Ok(ids) => ids,
+    let working_sets = match resolve_bound_rs_working_sets(ctx, model, driver, rs_reps)? {
+        Ok(sets) => sets,
         Err(error) => return Ok(Err(ReservedError::Fatal(error))),
     };
-    for (row, &rep) in rs_reps.iter().enumerate() {
-        let resource: Resource<RsWorkingSet> = Resource::new_borrow(rep);
-        let rs = ctx.resources().get(&resource)?.clone();
+    Ok(prepare_bound_rs_resolved(
+        &working_sets,
+        stores,
+        qo_indptr,
+        pipeline_scope,
+        plan,
+        grant,
+    ))
+}
+
+/// [`prepare_bound_rs`]'s ctx-free core, over prepare-time-resolved working
+/// sets: scope claims via the Arc-shared clones (same lifecycle the resource
+/// table's own clones point at), then the staleness-gated prepare. The
+/// deferred completion task calls this directly — no [`FireContext`] exists
+/// there.
+fn prepare_bound_rs_resolved(
+    working_sets: &[RsWorkingSet],
+    stores: &crate::store::registry::Stores,
+    qo_indptr: &[u32],
+    pipeline_scope: &crate::store::PipelineScope,
+    plan: &rs::RsPlan,
+    grant: &mut crate::planner::AllocationGrant,
+) -> Result<rs::PreparedRs, ReservedError> {
+    let has_recurrent_state = crate::model::model().rs_caps().state_size > 0;
+    if let Err(error) = rs::validate_count(working_sets.len(), qo_indptr, has_recurrent_state) {
+        return Err(ReservedError::Fatal(format!(
+            "pipeline: recurrent-state binding: {error}"
+        )));
+    }
+    if working_sets.is_empty() {
+        return Ok(rs::PreparedRs::empty());
+    }
+    for (row, rs) in working_sets.iter().enumerate() {
         if let Err(owner) = rs.claim_pipeline_scope(pipeline_scope) {
-            return Ok(Err(ReservedError::Fatal(format!(
+            return Err(ReservedError::Fatal(format!(
                 "pipeline: rs-working-set at request row {row} is already scoped to pipeline \
                  {owner:#x}"
-            ))));
+            )));
         }
     }
 
     let prepared = {
         let mut store = stores.rs.lock().unwrap();
+        let ids: Vec<crate::store::rs::RsWorkingSetId> =
+            working_sets.iter().map(|rs| rs.id).collect();
         // Staleness gate under the same lock as the prepare: if the demand
         // grew while the requester awaited its grant, nothing is consumed
         // and the caller re-acquires.
-        let required = match rs::demand(&store, &working_sets, plan) {
+        let required = match rs::demand(&store, &ids, plan) {
             Ok(required) => required,
             Err(error) => {
-                return Ok(Err(ReservedError::Fatal(format!(
+                return Err(ReservedError::Fatal(format!(
                     "pipeline: rs demand: {error}"
-                ))));
+                )));
             }
         };
         if required > grant.remaining_rs() {
-            return Ok(Err(ReservedError::Stale));
+            return Err(ReservedError::Stale);
         }
-        rs::prepare_many_reserved(&mut store, &working_sets, plan, grant.lend_rs())
+        rs::prepare_many_reserved(&mut store, &ids, plan, grant.lend_rs())
     };
-    Ok(prepared.map_err(|error| ReservedError::Fatal(format!("pipeline: rs prepare: {error}"))))
+    prepared.map_err(|error| ReservedError::Fatal(format!("pipeline: rs prepare: {error}")))
 }
 
 /// Drain EVERY in-flight fire on this pipeline to settlement.
@@ -1086,14 +1162,88 @@ pub(crate) async fn await_channel_progress(
 
 type Anyhow<T> = anyhow::Result<T>;
 
+/// One host-path fire, prepared up to its grant acquisition: the owned
+/// handoff between [`prepare_submission`] and [`complete_submission`].
+/// Nothing here borrows the caller's [`FireContext`], so the acquire await
+/// sits between the halves holding no pins, no lease, and no open
+/// transaction. The post-acquire half still reaches the resource table
+/// through `ctx` (RS scope claims, completion reservation, failure marking,
+/// shadow advance).
+struct PreparedSubmission {
+    req: crate::driver::LaunchPlan,
+    ws: KvWorkingSet,
+    stores: crate::store::registry::Stores,
+    writable_pages: std::ops::Range<u64>,
+    kv_declaration_realized: bool,
+    model: usize,
+    driver: usize,
+    pid: uuid::Uuid,
+    quorum_pipeline_id: uuid::Uuid,
+    pipeline_scope: crate::store::PipelineScope,
+    pipeline_failure: PipelineFailure,
+    pipe_fires: PendingFires,
+    /// Prepare-time resolution of the pass's RS reps (Arc-shared clones). Legal to
+    /// use at completion time because the guest task is inside this submit
+    /// for the whole inline window, and deferred mode serializes the lane —
+    /// nothing can swap the reps under a prepared submission. This is what
+    /// lets the completion core run without a [`FireContext`].
+    rs_working_sets: Vec<RsWorkingSet>,
+    rs_ws_ids: Vec<crate::store::rs::RsWorkingSetId>,
+    rs_plan: rs::RsPlan,
+    cells: BoundCells,
+    accesses: Vec<(bool, bool)>,
+    fwd_rep: u32,
+    instance_id: u64,
+    scheduler: crate::scheduler::worker::SchedulerHandle,
+    frame: Option<crate::scheduler::FrameStamp>,
+    /// This fire's position in its frame's fired list (k > 1 only): the
+    /// number of frame fires submitted BEFORE it — exactly the truncation
+    /// count if this fire fails after being deferred, when the slot loop's
+    /// own mid-frame truncation can no longer attribute the failure.
+    fired_index: Option<u32>,
+}
+
+impl PreparedSubmission {
+    /// Phase-A demand for both resources, holding nothing — re-priced on
+    /// every acquisition, because a peer lane can grow either figure while
+    /// the requester awaits a grant.
+    fn demand(&self) -> Result<crate::planner::Demand, String> {
+        let kv_demand = host_kv_demand(
+            &self.stores,
+            &self.ws,
+            self.writable_pages.clone(),
+            self.kv_declaration_realized,
+        )?;
+        let kv_demand = u32::try_from(kv_demand)
+            .map_err(|_| "pipeline: KV demand exceeds the planner ABI".to_string())?;
+        let rs_demand = rs_slot_demand(&self.stores, &self.rs_ws_ids, &self.rs_plan)?;
+        Ok(crate::planner::Demand {
+            kv_pages: kv_demand,
+            rs_slots: rs_demand,
+        })
+    }
+}
+
 /// The body behind one non-no-op slot of `forward.submit(on, slots)`.
 pub async fn submit_pass_stamped<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
+    fired_index: Option<u32>,
 ) -> Anyhow<Result<(), String>> {
     {
+        // Depth-1 defer (`PIE_DEFER_ALLOC=1`): a pending deferred frame on
+        // this pipeline must land BEFORE this frame prepares — its post-
+        // submit pass mutation feeds this prepare. Runs first, ahead of the
+        // Track-B branch too: any frame entering this pipeline serializes
+        // behind the lane's one deferred frame. (The k > 1 slot loop drains
+        // explicitly before stamping, so this is the k == 1/entry cover.)
+        match await_pending_deferred(ctx, &this).await? {
+            Ok(()) => {}
+            Err(error) => return Ok(Err(error)),
+        }
+        let this_rep = this.rep();
         // Device-geometry pass (Track B): the [B,P] geometry is
         // device-produced (the program traces the wire form in-graph) and
         // the driver resolves it pre-forward, so this pass leases physical
@@ -1103,6 +1253,76 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
             return fire_device_geometry(ctx, this, fwd, frame).await;
         }
+        let mut prepared = match prepare_submission(ctx, this, fwd, frame, fired_index).await? {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(Err(error)),
+        };
+        // Phase A: pure demand for both resources, holding nothing. Phase
+        // B: acquire the one grant (KV pages + RS slots — a fire never
+        // half-succeeds); the acquire awaits are the only awaits in this
+        // build, and the requester waits at the safe point with no pins, no
+        // lease, no open transaction. Phase C: prepare from the grant; if
+        // the demand drifted while waiting (a peer lane touched the same
+        // working set), recompute both demands and re-acquire, bounded.
+        //
+        // With `PIE_DEFER_ALLOC=1`, an ask that would park DEFERS instead:
+        // the queue position is identical (same FCFS insert, same
+        // notify_lane_close), but the grant is collected by an engine task
+        // that completes the submission µs from the grant, and the guest
+        // returns Ok holding exactly one frame of run-ahead past the park.
+        let mut attempts = 0;
+        loop {
+            let demand = match prepared.demand() {
+                Ok(demand) => demand,
+                Err(error) => return Ok(Err(error)),
+            };
+            let grant = if defer_alloc_enabled() {
+                match enqueue_for_grant(ctx, prepared.quorum_pipeline_id, demand) {
+                    Ok(crate::planner::Enqueued::Granted(grant)) => grant,
+                    Ok(crate::planner::Enqueued::NotResident) => {
+                        // Today's Yield path: settle the tail, wait out the
+                        // eviction, re-price and re-ask.
+                        if let Err(error) = settle_and_wait_resident(ctx).await {
+                            return Ok(Err(error));
+                        }
+                        continue;
+                    }
+                    Ok(crate::planner::Enqueued::Ticket(ticket)) => {
+                        return defer_submission(ctx, this_rep, prepared, ticket);
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            } else {
+                match acquire_grant(ctx, prepared.quorum_pipeline_id, demand).await {
+                    Ok(grant) => grant,
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            match complete_submission(ctx, &mut prepared, grant).await? {
+                Ok(CompletionOutcome::Submitted) => return Ok(Ok(())),
+                Ok(CompletionOutcome::Fenced) => {}
+                Ok(CompletionOutcome::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
+                    attempts += 1;
+                }
+                Ok(CompletionOutcome::Stale) => return Ok(Err(stale_demand_error())),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    }
+}
+
+/// The pre-acquire half of one host-path fire: preamble drain, geometry
+/// lowering, declaration checks, scope claim, and the RS plan — everything
+/// that neither holds nor needs an allocation grant. The demand itself is
+/// [`PreparedSubmission::demand`], re-priced per acquisition.
+async fn prepare_submission<C: FireContext>(
+    ctx: &mut C,
+    this: Resource<Pipeline>,
+    fwd: Resource<ForwardPass>,
+    frame: Option<crate::scheduler::FrameStamp>,
+    fired_index: Option<u32>,
+) -> Anyhow<Result<PreparedSubmission, String>> {
+    {
         // Contention-probe marker: when the guest's WIT call reached the
         // host (vs `hp-acquire` below — the delta is the build preamble,
         // including the settlement drain).
@@ -1251,10 +1471,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.driver);
-        let (readable_pages, writable_pages) =
-            match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                let page_len = kv_store.page_len(ws.id)?;
-                Ok::<_, crate::store::kv::KvStoreError>((
+        // `page_len` reads the WorkingSet's lock-free mirror and both
+        // `resolve`s are pure, so this whole step stays off the global KV
+        // mutex — it was 42979 exclusive acquisitions per D/512 run for one
+        // integer load.
+        let (readable_pages, writable_pages) = match ws
+            .page_len()
+            .map_err(crate::store::kv::KvStoreError::from)
+            .and_then(|page_len| {
+                Ok((
                     kv_declaration.readable.resolve(page_len).map_err(|_| {
                         crate::store::kv::KvStoreError::BadWriteSet {
                             reason: "invalid readable page declaration",
@@ -1267,13 +1492,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     })?,
                 ))
             }) {
-                Ok(ranges) => ranges,
-                Err(error) => {
-                    return Ok(Err(format!(
-                        "pipeline: KV working-set declaration: {error}"
-                    )));
-                }
-            };
+            Ok(ranges) => ranges,
+            Err(error) => {
+                return Ok(Err(format!(
+                    "pipeline: KV working-set declaration: {error}"
+                )));
+            }
+        };
         // Structural declaration checks — fail fast, before anything is
         // claimed, acquired, or prepared.
         if writable_pages.is_empty() {
@@ -1312,10 +1537,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // lease, no open transaction. Phase C: prepare from the grant; if
         // the demand drifted while waiting (a peer lane touched the same
         // working set), recompute both demands and re-acquire, bounded.
-        let rs_ws_ids = match bound_rs_working_set_ids(ctx, model, driver, &rs_reps)? {
-            Ok(ids) => ids,
+        let rs_working_sets = match resolve_bound_rs_working_sets(ctx, model, driver, &rs_reps)? {
+            Ok(sets) => sets,
             Err(error) => return Ok(Err(error)),
         };
+        let rs_ws_ids: Vec<crate::store::rs::RsWorkingSetId> =
+            rs_working_sets.iter().map(|rs| rs.id).collect();
         let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &req.qo_indptr) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1323,164 +1550,600 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
         };
         suppress_defaulted_readout_for_fold(&mut req, readout_defaulted, &rs_plan);
-        let mut attempts = 0;
-        let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
-            let kv_demand = match host_kv_demand(
-                &stores,
-                &ws,
-                writable_pages.clone(),
-                kv_declaration_realized,
-            ) {
-                Ok(demand) => demand,
-                Err(error) => return Ok(Err(error)),
-            };
-            let Ok(kv_demand) = u32::try_from(kv_demand) else {
-                return Ok(Err(
-                    "pipeline: KV demand exceeds the planner ABI".to_string()
-                ));
-            };
-            let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids, &rs_plan) {
-                Ok(demand) => demand,
-                Err(error) => return Ok(Err(error)),
-            };
-            let demand = crate::planner::Demand {
-                kv_pages: kv_demand,
-                rs_slots: rs_demand,
-            };
-            let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand).await {
-                Ok(grant) => grant,
-                Err(error) => return Ok(Err(error)),
-            };
-            // The lease is the suspend seal: acquired AFTER any park (a
-            // parked ask must hold no lease, or the planner could never
-            // quiesce it) and BEFORE the prepare (so an eviction either
-            // sees this fire's lease and waits it out, or fenced first and
-            // this fire backs off to wait out the eviction).
-            let ws_guard = match ws.fire_lease() {
-                Ok(lease) => lease,
-                Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
-                    drop(grant); // the pages fund the eviction's head
-                    if let Err(error) = settle_and_wait_resident(ctx).await {
-                        return Ok(Err(error));
-                    }
-                    continue;
-                }
-                Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
-            };
-            let (copies, kvtxn) = match prepare_host_kv_reserved(
-                &stores,
-                &ws,
-                writable_pages.clone(),
-                kv_declaration_realized,
-                &mut grant,
-            ) {
-                Ok(prepared) => prepared,
-                Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
-                    attempts += 1;
-                    continue; // the grant drops here; its pages serve the queue
-                }
-                Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
-                Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
-            };
-            let kvtxn = KvTxnGuard::new(model, driver, kvtxn);
-            // Recurrent-state rows are lowered independently, in resolved
-            // request order. Their CoW copies ride the scheduler's typed
-            // pre-launch state copy so a copy failure rejects this fire
-            // before model execution.
-            match prepare_bound_rs(
-                ctx,
-                &stores,
-                model,
-                driver,
-                &rs_reps,
-                &req.qo_indptr,
-                &pipeline_scope,
-                &rs_plan,
-                &mut grant,
-            )? {
-                Ok(prepared) => break (ws_guard, copies, kvtxn, prepared),
-                Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
-                    attempts += 1;
-                    // kvtxn's guard aborts the prepared KV write on drop.
-                    continue;
-                }
-                Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
-                Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
-            }
-        };
-        rs_prepared.apply_to(&mut req);
-        let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
-        let rstxns = RsTxnsGuard::new(model, driver, rs_prepared.txn);
-        let (translation_version, translation) = match ws.translation() {
-            Ok(translation) => translation,
-            Err(error) => {
-                let reason = format!("pipeline: KV translation: {error}");
-                record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
-                return Ok(Err(reason));
-            }
-        };
-        req.kv_translation_version = translation_version;
-        req.kv_translation = translation.as_ref().to_vec();
-        let last_page_len = req.kv_last_page_lens.last().copied().unwrap_or(0);
-        let completion = ctx
-            .resources()
-            .get_mut(&fwd)?
-            .bound_instance
-            .reserve_completion();
-
-        // Preparation is complete in guest order; the scheduler sees only
-        // launch-ready work.
-        let ticket_reservation = TicketReservation::new(&cells, &accesses);
-        ticket_reservation.apply_to(&mut req);
-        let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
-            &scheduler,
+        Ok(Ok(PreparedSubmission {
             req,
-            instance_id,
+            ws,
+            stores,
+            writable_pages,
+            kv_declaration_realized,
+            model,
+            driver,
             pid,
             quorum_pipeline_id,
-            last_page_len,
-            completion.clone(),
-            copy_src,
-            copy_dst,
-            rs_copy_src,
-            rs_copy_dst,
+            pipeline_scope,
+            pipeline_failure,
+            pipe_fires,
+            rs_working_sets,
+            rs_ws_ids,
+            rs_plan,
+            cells,
+            accesses,
+            fwd_rep,
+            instance_id,
+            scheduler,
             frame,
-        )
-        .err()
-        .map(|error| format!("{error:#}"));
-        if let Some(error) = submit_error {
-            // The KV/RS transaction guards roll everything back on return.
-            let reason = format!("pipeline: submit failed: {error}");
-            record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
-            return Ok(Err(reason));
-        }
-        ticket_reservation.commit();
+            fired_index,
+        }))
+    }
+}
 
-        {
-            let p = ctx.resources().get_mut(&fwd)?;
-            let p = p.bound_mut().map_err(anyhow::Error::msg)?;
-            p.kv_declaration_realized = true;
-            let (shadow, bound, shadow_cells) =
-                (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
-            shadow.advance(bound, shadow_cells);
-        }
+/// One completion attempt against one grant. Neither retry variant consumed
+/// anything from the stores: `Stale` means the demand drifted while the
+/// requester awaited its grant (re-price and re-acquire, bounded by
+/// [`STALE_DEMAND_ATTEMPTS`]); `Fenced` means the working set was fenced for
+/// this process's eviction, already waited out here — re-acquire without
+/// spending a stale attempt.
+enum CompletionOutcome {
+    Submitted,
+    Stale,
+    Fenced,
+}
 
-        pipe_fires
+/// [`complete_submission_core`]'s outcome, before any ctx-side epilogue.
+/// `Fenced` here is PRE-back-off (the core cannot settle the tail); the ctx
+/// caller runs `settle_and_wait_resident`, the deferred path hands the frame
+/// back to the guest instead. `Failed` carries whether the owning pass must
+/// be marked failed (the two [`record_submit_failure`] sites of the old
+/// inline body); the core has already marked the pipeline-failure half.
+enum CoreCompletion {
+    /// Submitted and enqueued; the post-submit pass mutation
+    /// (`kv_declaration_realized` + shadow advance) is NOT applied — the
+    /// caller owns it (inline: immediately; deferred: on the guest task when
+    /// the handle resolves — that deferral is what makes depth-1 safe).
+    Submitted,
+    Stale,
+    Fenced,
+    Failed {
+        reason: String,
+        fail_pass: bool,
+    },
+}
+
+/// The post-acquire half of one host-path fire: lease the working set, fund
+/// the KV/RS prepares from the grant, finish the launch plan, hand it to the
+/// scheduler, and enqueue the [`PendingFire`]. `prepared` is borrowed
+/// mutably so a retry outcome hands it back intact; the launch plan moves
+/// out only past the last retry point.
+async fn complete_submission<C: FireContext>(
+    ctx: &mut C,
+    prepared: &mut PreparedSubmission,
+    grant: crate::planner::AllocationGrant,
+) -> Anyhow<Result<CompletionOutcome, String>> {
+    let fwd: Resource<ForwardPass> = Resource::new_borrow(prepared.fwd_rep);
+    let outcome = {
+        let reserved: Resource<ForwardPass> = Resource::new_borrow(prepared.fwd_rep);
+        let reserve = || -> anyhow::Result<crate::driver::WorkItemCompletion> {
+            Ok(ctx
+                .resources()
+                .get_mut(&reserved)?
+                .bound_instance
+                .reserve_completion())
+        };
+        complete_submission_core(prepared, grant, reserve)?
+    };
+    match outcome {
+        CoreCompletion::Fenced => {
+            if let Err(error) = settle_and_wait_resident(ctx).await {
+                return Ok(Err(error));
+            }
+            Ok(Ok(CompletionOutcome::Fenced))
+        }
+        CoreCompletion::Stale => Ok(Ok(CompletionOutcome::Stale)),
+        CoreCompletion::Failed { reason, fail_pass } => {
+            if fail_pass {
+                mark_pass_failed(ctx, &fwd, &reason);
+            }
+            Ok(Err(reason))
+        }
+        CoreCompletion::Submitted => {
+            {
+                let p = ctx.resources().get_mut(&fwd)?;
+                let p = p.bound_mut().map_err(anyhow::Error::msg)?;
+                p.kv_declaration_realized = true;
+                let (shadow, bound, shadow_cells) =
+                    (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
+                shadow.advance(bound, shadow_cells);
+            }
+            Ok(Ok(CompletionOutcome::Submitted))
+        }
+    }
+}
+
+/// [`complete_submission`]'s ctx-free core — everything between the grant
+/// and the FIFO enqueue that does not need the caller's resource table. The
+/// deferred completion task (`PIE_DEFER_ALLOC=1`) runs exactly this; the
+/// inline path wraps it with the ctx-side epilogue (Fenced back-off, pass
+/// failure marking, timing commit, pass mutation). `reserve` supplies the
+/// completion reservation at the same point the old inline body took it —
+/// a live `ctx` lookup inline, the defer-time captured handle deferred.
+fn complete_submission_core(
+    prepared: &mut PreparedSubmission,
+    mut grant: crate::planner::AllocationGrant,
+    reserve: impl FnOnce() -> anyhow::Result<crate::driver::WorkItemCompletion>,
+) -> Anyhow<CoreCompletion> {
+    // The lease is the suspend seal: acquired AFTER any park (a parked ask
+    // must hold no lease, or the planner could never quiesce it) and BEFORE
+    // the prepare (so an eviction either sees this fire's lease and waits
+    // it out, or fenced first and this fire backs off to wait out the
+    // eviction).
+    let ws_guard = match prepared.ws.fire_lease() {
+        Ok(lease) => lease,
+        Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
+            drop(grant); // the pages fund the eviction's head
+            return Ok(CoreCompletion::Fenced);
+        }
+        Err(error) => {
+            return Ok(CoreCompletion::Failed {
+                reason: format!("pipeline: KV working set: {error}"),
+                fail_pass: false,
+            });
+        }
+    };
+    let ((copy_src, copy_dst), kvtxn) = match prepare_host_kv_reserved(
+        &prepared.stores,
+        &prepared.ws,
+        prepared.writable_pages.clone(),
+        prepared.kv_declaration_realized,
+        &mut grant,
+    ) {
+        Ok(kv_prepared) => kv_prepared,
+        // Nothing was consumed; the grant drops on return and its pages
+        // serve the queue.
+        Err(ReservedError::Stale) => return Ok(CoreCompletion::Stale),
+        Err(ReservedError::Fatal(error)) => {
+            return Ok(CoreCompletion::Failed {
+                reason: error,
+                fail_pass: false,
+            });
+        }
+    };
+    let kvtxn = KvTxnGuard::new(prepared.model, prepared.driver, kvtxn);
+    // Recurrent-state rows are lowered independently, in resolved
+    // request order. Their CoW copies ride the scheduler's typed
+    // pre-launch state copy so a copy failure rejects this fire
+    // before model execution.
+    let rs_prepared = match prepare_bound_rs_resolved(
+        &prepared.rs_working_sets,
+        &prepared.stores,
+        &prepared.req.qo_indptr,
+        &prepared.pipeline_scope,
+        &prepared.rs_plan,
+        &mut grant,
+    ) {
+        Ok(rs_prepared) => rs_prepared,
+        // kvtxn's guard aborts the prepared KV write on drop.
+        Err(ReservedError::Stale) => return Ok(CoreCompletion::Stale),
+        Err(ReservedError::Fatal(error)) => {
+            return Ok(CoreCompletion::Failed {
+                reason: error,
+                fail_pass: false,
+            });
+        }
+    };
+    // The prepares drained exactly what they consumed; the remainder goes
+    // back to the planner BEFORE the build, not after the submit.
+    drop(grant);
+    // Past the last retry point: the launch plan leaves the prepared half.
+    let mut req = std::mem::take(&mut prepared.req);
+    rs_prepared.apply_to(&mut req);
+    let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
+    let rstxns = RsTxnsGuard::new(prepared.model, prepared.driver, rs_prepared.txn);
+    let (translation_version, translation) = match prepared.ws.translation() {
+        Ok(translation) => translation,
+        Err(error) => {
+            let reason = format!("pipeline: KV translation: {error}");
+            mark_pipeline_failure(&prepared.pipeline_failure, &reason);
+            return Ok(CoreCompletion::Failed {
+                reason,
+                fail_pass: true,
+            });
+        }
+    };
+    req.kv_translation_version = translation_version;
+    req.kv_translation = translation.as_ref().to_vec();
+    let last_page_len = req.kv_last_page_lens.last().copied().unwrap_or(0);
+    let completion = reserve()?;
+
+    // Preparation is complete in guest order; the scheduler sees only
+    // launch-ready work.
+    let ticket_reservation = TicketReservation::new(&prepared.cells, &prepared.accesses);
+    ticket_reservation.apply_to(&mut req);
+    let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
+        &prepared.scheduler,
+        req,
+        prepared.instance_id,
+        prepared.pid,
+        prepared.quorum_pipeline_id,
+        last_page_len,
+        completion.clone(),
+        copy_src,
+        copy_dst,
+        rs_copy_src,
+        rs_copy_dst,
+        prepared.frame,
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
+    if let Some(error) = submit_error {
+        // The KV/RS transaction guards roll everything back on return.
+        let reason = format!("pipeline: submit failed: {error}");
+        mark_pipeline_failure(&prepared.pipeline_failure, &reason);
+        return Ok(CoreCompletion::Failed {
+            reason,
+            fail_pass: true,
+        });
+    }
+    ticket_reservation.commit();
+
+    prepared
+        .pipe_fires
+        .lock()
+        .unwrap()
+        .push_back(PendingOp::Fire(PendingFire {
+            completion,
+            kv: FireKv::Host(kvtxn.into_inner()),
+            rstxn: rstxns.into_inner(),
+            ws_guard,
+            model: prepared.model,
+            driver: prepared.driver,
+            fwd_rep: prepared.fwd_rep,
+            instance_id: prepared.instance_id,
+            cells: prepared.cells.clone(),
+            failure: prepared.pipeline_failure.clone(),
+        }));
+    Ok(CoreCompletion::Submitted)
+}
+
+/// `PIE_DEFER_ALLOC=1`: when a fire's allocation ask would park, defer the
+/// engine's own completion of the already-submitted frame to an engine task
+/// (depth 1) instead of blocking the guest's submit call. Default off.
+fn defer_alloc_enabled() -> bool {
+    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_DEFER_ALLOC").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+/// The per-pipeline handle of the one deferred frame (depth 1). Owned by
+/// [`Pipeline::deferred`]; taken and awaited by the NEXT frame entering the
+/// pipeline before it prepares.
+pub(crate) struct DeferredSubmission {
+    outcome: tokio::sync::oneshot::Receiver<DeferredOutcome>,
+}
+
+/// How the engine completion task resolved a deferred frame.
+enum DeferredOutcome {
+    /// Submitted and enqueued. The guest applies the post-submit pass
+    /// mutation (`kv_declaration_realized` + shadow advance) ON ITS OWN
+    /// TASK before its next prepare — deferring exactly that mutation is
+    /// what makes depth-1 safe (no pass-state hoisting, no reordering).
+    Submitted { fwd_rep: u32 },
+    /// The completion hit the Fenced/Yield back-off, which only the owning
+    /// guest task can run (`settle_pipeline_tail` needs its ResourceTable).
+    /// The still-unconsumed submission comes back; the guest's next submit
+    /// runs `settle_and_wait_resident` + the inline completion itself —
+    /// rare, correctness-first. (The defer-time completion reservation was
+    /// dropped; the inline path re-reserves as it always does.)
+    MustCompleteOnGuest { prepared: Box<PreparedSubmission> },
+    /// The deferred submission failed; surfaced by the guest's next submit
+    /// exactly as a failed submit is today (`fail_pass` mirrors the
+    /// [`record_submit_failure`] sites — the pipeline half was already
+    /// marked by the engine task).
+    Failed {
+        fwd_rep: u32,
+        reason: String,
+        fail_pass: bool,
+    },
+}
+
+/// Non-blocking acquire for the defer path — [`acquire_grant`]'s preamble
+/// (zero-demand shortcut, planner lookup) around
+/// [`crate::planner::ResidencyPlanner::acquire_or_enqueue`].
+fn enqueue_for_grant<C: FireContext>(
+    ctx: &mut C,
+    pipeline_id: uuid::Uuid,
+    demand: crate::planner::Demand,
+) -> Result<crate::planner::Enqueued, String> {
+    if demand.is_zero() {
+        return Ok(crate::planner::Enqueued::Granted(
+            crate::planner::AllocationGrant::empty(),
+        ));
+    }
+    let Some(planner) = crate::planner::planner() else {
+        return Err("pipeline: KV residency planner is not installed".to_string());
+    };
+    planner
+        .acquire_or_enqueue(ctx.process_id(), pipeline_id, demand)
+        .map_err(|error| format!("pipeline: KV capacity: {error}"))
+}
+
+/// DEFER: the ask parked, so hand the prepared frame to an engine completion
+/// task and return Ok to the guest. The completion reservation is captured
+/// HERE, on the guest task — see the decision note on
+/// [`run_deferred_completion`]. The handle is stored on the pipeline first,
+/// then the task spawns, so a trap between the two cannot strand a spawned
+/// task whose outcome nobody will collect.
+fn defer_submission<C: FireContext>(
+    ctx: &mut C,
+    this_rep: u32,
+    prepared: PreparedSubmission,
+    ticket: crate::planner::AllocationTicket,
+) -> Anyhow<Result<(), String>> {
+    let fwd: Resource<ForwardPass> = Resource::new_borrow(prepared.fwd_rep);
+    let completion = ctx
+        .resources()
+        .get_mut(&fwd)?
+        .bound_instance
+        .reserve_completion();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    {
+        let this: Resource<Pipeline> = Resource::new_borrow(this_rep);
+        let previous = ctx
+            .resources()
+            .get(&this)?
+            .deferred
             .lock()
             .unwrap()
-            .push_back(PendingOp::Fire(PendingFire {
-                completion,
-                kv: FireKv::Host(kvtxn.into_inner()),
-                rstxn: rstxns.into_inner(),
-                ws_guard,
-                model,
-                driver,
-                fwd_rep,
-                instance_id,
-                cells,
-                failure: pipeline_failure,
-            }));
-        Ok(Ok(()))
+            .replace(DeferredSubmission { outcome: receiver });
+        debug_assert!(
+            previous.is_none(),
+            "depth-1: a second frame cannot defer before the first is drained"
+        );
+    }
+    tokio::spawn(async move {
+        let outcome = run_deferred_completion(prepared, ticket, completion).await;
+        // The receiver may be gone (pipeline/process teardown): a lost send
+        // is a no-op by design — the deferred frame dies with the process,
+        // like queued frames today.
+        let _ = sender.send(outcome);
+    });
+    Ok(Ok(()))
+}
+
+/// A deferred, STAMPED frame died without submitting: tell the scheduler
+/// its frame holds exactly the fires that arrived before it (the captured
+/// fired index), so the seal stops waiting for a fire that will never come
+/// (§20.8). The slot loop's own mid-frame truncation cannot cover this —
+/// by the time the failure surfaces there, it can only mis-attribute it to
+/// the NEXT slot's index. Unstamped (k == 1) fires need nothing.
+fn truncate_deferred_frame(prepared: &PreparedSubmission) {
+    if let (Some(stamp), Some(index)) = (prepared.frame, prepared.fired_index) {
+        let _ = prepared
+            .scheduler
+            .frame_truncate(stamp.lane, stamp.seq, index);
+    }
+}
+
+/// A deferred frame's terminal failure: truncate its frame (see
+/// [`truncate_deferred_frame`]) and shape the outcome.
+fn deferred_failure(
+    prepared: &PreparedSubmission,
+    reason: String,
+    fail_pass: bool,
+) -> DeferredOutcome {
+    truncate_deferred_frame(prepared);
+    DeferredOutcome::Failed {
+        fwd_rep: prepared.fwd_rep,
+        reason,
+        fail_pass,
+    }
+}
+
+/// The engine completion task for one deferred frame: collect the parked
+/// grant, then run the ctx-free completion core; re-price and re-ask on
+/// `Stale` from this task (parking again is fine here — this IS the task
+/// that waits).
+///
+/// COMPLETION-RESERVATION DECISION: the reservation is captured at defer
+/// time on the guest task (inventory (b) offered an instance_id-keyed
+/// engine-side lookup instead). Chosen because `reserve_completion`'s only
+/// effects are a waker-slot allocation and a completion-lease hold, both
+/// exactly reversed by dropping the (unsubmitted) `WorkItemCompletion`, and
+/// a concurrent instance close is already handled (the lease arrives
+/// inactive and the completion resolves closed, failing loud) — so holding
+/// it across the park changes no failure path, while an engine-side lookup
+/// would add a new keyed registry for a handle the guest task can trivially
+/// hand over. One reservation serves every attempt (it is inert until the
+/// single successful scheduler submit commits it).
+async fn run_deferred_completion(
+    mut prepared: PreparedSubmission,
+    ticket: crate::planner::AllocationTicket,
+    completion: crate::driver::WorkItemCompletion,
+) -> DeferredOutcome {
+    let fwd_rep = prepared.fwd_rep;
+    let mut attempts = 0;
+    let mut next = ticket
+        .collect()
+        .await
+        .map_err(|error| format!("pipeline: KV capacity: {error}"));
+    loop {
+        let grant = match next {
+            Ok(crate::planner::Acquired::Granted(grant)) => grant,
+            Ok(crate::planner::Acquired::Yield) => {
+                return DeferredOutcome::MustCompleteOnGuest {
+                    prepared: Box::new(prepared),
+                };
+            }
+            Err(reason) => return deferred_failure(&prepared, reason, false),
+        };
+        let attempt_completion = completion.clone();
+        match complete_submission_core(&mut prepared, grant, move || Ok(attempt_completion)) {
+            // The reserve closure above is infallible; core's only `?` is
+            // its call. Fail loud anyway rather than unwind an engine task.
+            Err(error) => {
+                let reason = format!("pipeline: deferred completion: {error:#}");
+                mark_pipeline_failure(&prepared.pipeline_failure, &reason);
+                return deferred_failure(&prepared, reason, false);
+            }
+            Ok(CoreCompletion::Submitted) => return DeferredOutcome::Submitted { fwd_rep },
+            Ok(CoreCompletion::Fenced) => {
+                return DeferredOutcome::MustCompleteOnGuest {
+                    prepared: Box::new(prepared),
+                };
+            }
+            Ok(CoreCompletion::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
+                attempts += 1;
+                next = reacquire_deferred(&prepared).await;
+            }
+            Ok(CoreCompletion::Stale) => {
+                return deferred_failure(&prepared, stale_demand_error(), false);
+            }
+            Ok(CoreCompletion::Failed { reason, fail_pass }) => {
+                return deferred_failure(&prepared, reason, fail_pass);
+            }
+        }
+    }
+}
+
+/// Re-price and re-ask from the engine task (`Stale` retry). A fresh park
+/// is collected right here; `NotResident` maps to Yield — the guest must
+/// run the residency back-off, exactly like a Yield out of the collect.
+async fn reacquire_deferred(
+    prepared: &PreparedSubmission,
+) -> Result<crate::planner::Acquired, String> {
+    let demand = prepared.demand()?;
+    if demand.is_zero() {
+        return Ok(crate::planner::Acquired::Granted(
+            crate::planner::AllocationGrant::empty(),
+        ));
+    }
+    let Some(planner) = crate::planner::planner() else {
+        return Err("pipeline: KV residency planner is not installed".to_string());
+    };
+    match planner
+        .acquire_or_enqueue(prepared.pid, prepared.quorum_pipeline_id, demand)
+        .map_err(|error| format!("pipeline: KV capacity: {error}"))?
+    {
+        crate::planner::Enqueued::Granted(grant) => Ok(crate::planner::Acquired::Granted(grant)),
+        crate::planner::Enqueued::NotResident => Ok(crate::planner::Acquired::Yield),
+        crate::planner::Enqueued::Ticket(ticket) => ticket
+            .collect()
+            .await
+            .map_err(|error| format!("pipeline: KV capacity: {error}")),
+    }
+}
+
+/// Drain this pipeline's pending deferred frame, if any: await the engine
+/// task's outcome, then run the guest-task epilogue the outcome asks for —
+/// the deferred frame's pass mutation on `Submitted`, the inline residency
+/// back-off + completion on `MustCompleteOnGuest`, the submit-shaped error
+/// on `Failed`. Called wherever a frame enters a pipeline, BEFORE its
+/// prepare (the mutation feeds that prepare — depth-1 serialization).
+async fn await_pending_deferred<C: FireContext>(
+    ctx: &mut C,
+    this: &Resource<Pipeline>,
+) -> Anyhow<Result<(), String>> {
+    if !defer_alloc_enabled() {
+        return Ok(Ok(()));
+    }
+    let pending = {
+        let pipeline = ctx.resources().get(this)?;
+        pipeline.deferred.lock().unwrap().take()
+    };
+    let Some(DeferredSubmission { outcome }) = pending else {
+        return Ok(Ok(()));
+    };
+    let outcome = match outcome.await {
+        Ok(outcome) => outcome,
+        // The sender dropped unresolved: teardown reaped the engine task.
+        // Never a panic — a terminated process's frames are dropped today
+        // too; surface it as the submit-path error it is.
+        Err(_) => {
+            return Ok(Err(
+                "pipeline: deferred submission abandoned: process terminated".to_string(),
+            ));
+        }
+    };
+    match outcome {
+        DeferredOutcome::Submitted { fwd_rep } => {
+            // The deferred frame's post-submit pass mutation, on the guest
+            // task (the exact inline epilogue). Tolerant of a dropped pass
+            // handle — with no handle there is no next submit of that pass
+            // to feed.
+            let fwd: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
+            if let Ok(p) = ctx.resources().get_mut(&fwd)
+                && let Ok(p) = p.bound_mut()
+            {
+                p.kv_declaration_realized = true;
+                let (shadow, bound, shadow_cells) =
+                    (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
+                shadow.advance(bound, shadow_cells);
+            }
+            Ok(Ok(()))
+        }
+        DeferredOutcome::MustCompleteOnGuest { prepared } => {
+            let mut prepared = *prepared;
+            // Any terminal failure below means the deferred frame never
+            // submitted: truncate its frame before surfacing the error.
+            if let Err(error) = settle_and_wait_resident(ctx).await {
+                truncate_deferred_frame(&prepared);
+                return Ok(Err(error));
+            }
+            // Today's inline driver loop, run to completion on the guest
+            // task (complete_submission applies the pass mutation itself).
+            let mut attempts = 0;
+            loop {
+                let demand = match prepared.demand() {
+                    Ok(demand) => demand,
+                    Err(error) => {
+                        truncate_deferred_frame(&prepared);
+                        return Ok(Err(error));
+                    }
+                };
+                let grant = match acquire_grant(ctx, prepared.quorum_pipeline_id, demand).await {
+                    Ok(grant) => grant,
+                    Err(error) => {
+                        truncate_deferred_frame(&prepared);
+                        return Ok(Err(error));
+                    }
+                };
+                let completed = match complete_submission(ctx, &mut prepared, grant).await {
+                    Ok(completed) => completed,
+                    // Host trap: cover it like the slot loop does (§20.8) —
+                    // truncate before unwinding.
+                    Err(error) => {
+                        truncate_deferred_frame(&prepared);
+                        return Err(error);
+                    }
+                };
+                match completed {
+                    Ok(CompletionOutcome::Submitted) => return Ok(Ok(())),
+                    Ok(CompletionOutcome::Fenced) => {}
+                    Ok(CompletionOutcome::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
+                        attempts += 1;
+                    }
+                    Ok(CompletionOutcome::Stale) => {
+                        truncate_deferred_frame(&prepared);
+                        return Ok(Err(stale_demand_error()));
+                    }
+                    Err(error) => {
+                        truncate_deferred_frame(&prepared);
+                        return Ok(Err(error));
+                    }
+                }
+            }
+        }
+        DeferredOutcome::Failed {
+            fwd_rep,
+            reason,
+            fail_pass,
+        } => {
+            if fail_pass {
+                let fwd: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
+                mark_pass_failed(ctx, &fwd, &reason);
+            }
+            Ok(Err(reason))
+        }
     }
 }
 
@@ -1525,13 +2188,33 @@ pub async fn submit_frame<C: FireContext>(
     }
     if k == 1 {
         let (_, rep) = fired[0];
-        return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None).await;
+        return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None, None).await;
+    }
+    // Depth-1 defer: drain the lane's pending deferred frame BEFORE the
+    // structural validation — its pass mutation is part of the state the
+    // frame validates and prepares against. (Each slot's stamped submit
+    // re-checks, which also serializes slot i+1 behind slot i's own defer.)
+    match await_pending_deferred(ctx, &this).await? {
+        Ok(()) => {}
+        Err(error) => return Ok(Err(error)),
     }
     if let Err(error) = validate_frame(ctx, k, &fired)? {
         return Ok(Err(error));
     }
+    submit_frame_slots(ctx, &this, &fired).await
+}
+
+
+/// One whole frame's worth of stamped submissions: draw the lane's next
+/// frame seq and submit every live slot in order (the pre-refactor body of
+/// [`submit_frame`]).
+async fn submit_frame_slots<C: FireContext>(
+    ctx: &mut C,
+    this: &Resource<Pipeline>,
+    fired: &[(u32, u32)],
+) -> Anyhow<Result<(), String>> {
     let (lane, seq) = {
-        let pipeline = ctx.resources().get(&this)?;
+        let pipeline = ctx.resources().get(this)?;
         if pipeline.scope.is_closed() {
             return Ok(Err("pipeline: pipeline is closed".to_string()));
         }
@@ -1539,6 +2222,16 @@ pub async fn submit_frame<C: FireContext>(
     };
     let fires = fired.len() as u32;
     for (index, &(slot, rep)) in fired.iter().enumerate() {
+        // Depth-1 defer: drain the predecessor's deferred handle HERE, not
+        // inside the stamped submit, so a deferred slot's failure is never
+        // charged to THIS slot's index. The deferred frame's owner already
+        // truncated its own frame at its own fired index (see
+        // `truncate_deferred_frame`); truncating again at this index would
+        // strand the seal waiting for a fire that never submitted.
+        match await_pending_deferred(ctx, this).await? {
+            Ok(()) => {}
+            Err(error) => return Ok(Err(error)),
+        }
         let stamp = crate::scheduler::FrameStamp {
             lane,
             seq,
@@ -1547,7 +2240,8 @@ pub async fn submit_frame<C: FireContext>(
         };
         let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await;
+        let outcome =
+            submit_pass_stamped(ctx, pipeline, fwd, Some(stamp), Some(index as u32)).await;
         if !matches!(outcome, Ok(Ok(()))) && index > 0 {
             // Mid-frame failure: the fires already submitted stand and
             // execute as a truncated frame; tell the scheduler how many
@@ -2316,11 +3010,25 @@ fn record_submit_failure<C: FireContext>(
     failure: &PipelineFailure,
     reason: &str,
 ) {
+    mark_pass_failed(ctx, fwd, reason);
+    mark_pipeline_failure(failure, reason);
+}
+
+/// [`record_submit_failure`]'s pass half — needs the caller's resource
+/// table, tolerant of a vanished handle (the guest may have dropped it;
+/// failure marking is then moot).
+fn mark_pass_failed<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>, reason: &str) {
     if let Ok(pass) = ctx.resources().get_mut(fwd)
         && pass.failed.is_none()
     {
         pass.failed = Some(reason.to_string());
     }
+}
+
+/// [`record_submit_failure`]'s pipeline half — ctx-free (the Arc travels
+/// with [`PreparedSubmission`]), so the deferred completion task can mark
+/// the sticky failure without a resource table.
+fn mark_pipeline_failure(failure: &PipelineFailure, reason: &str) {
     let mut pipeline = failure.lock().unwrap();
     if pipeline.is_none() {
         *pipeline = Some(reason.to_string());
