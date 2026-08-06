@@ -21,6 +21,13 @@ int env_int(const char* name, int fallback) {
     return int(v);
 }
 
+bool env_bool(const char* name, bool fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') return fallback;
+    // Unlike `env_int`, zero is a VALUE here and not a rejected one.
+    return !(raw[0] == '0' && raw[1] == '\0');
+}
+
 DeviceTuning tuning_for(const DeviceInfo& info) {
     DeviceTuning t;  // the M1 measurements, unchanged for any device not below
     switch (info.apple_family) {
@@ -47,6 +54,7 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
         env_int("PIE_METAL_QMM_BN_CROSSOVER_TG", t.qmm_bn_crossover_tg);
     t.moe_tile_mid_per = env_int("PIE_METAL_MOE_TILE_MID_PER", t.moe_tile_mid_per);
     t.moe_tile_wide_per = env_int("PIE_METAL_MOE_TILE_WIDE_PER", t.moe_tile_wide_per);
+    t.fp16_qmm = env_bool("PIE_METAL_FP16_QMM", t.fp16_qmm);
     return t;
 }
 
@@ -72,5 +80,6 @@ int qmm_min_batch() { return device_tuning().qmm_min_batch; }
 int qmm_bn_crossover_tg() { return device_tuning().qmm_bn_crossover_tg; }
 int moe_tile_mid_per() { return device_tuning().moe_tile_mid_per; }
 int moe_tile_wide_per() { return device_tuning().moe_tile_wide_per; }
+bool fp16_qmm() { return device_tuning().fp16_qmm; }
 
 }  // namespace pie::metal

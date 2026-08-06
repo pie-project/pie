@@ -78,6 +78,25 @@ struct DeviceTuning {
     /// thresholds LOWER.
     int moe_tile_mid_per = 12;
     int moe_tile_wide_per = 88;
+
+    /// Whether a dense g64/b4 projection stages its input to FP16 and feeds
+    /// native FP16 simdgroup MMA instead of BF16.
+    ///
+    /// M1 Max: on, and it is the largest single win this driver has -- roughly
+    /// 40% on the GEMM at every shape measured, which on gemma-4 was 938 ->
+    /// 1298 tok/s of prefill.
+    ///
+    /// It exists BECAUSE of the machine. M1 and M2 have no native bfloat16
+    /// matrix path and emulate it; Metal 3.1 and Apple9 (M3, M4) do have one.
+    /// On those the staging pass has nothing left to buy and is a dispatch, a
+    /// barrier and a buffer per projection -- so this is the one tuned field
+    /// whose default may be actively WRONG on newer silicon rather than merely
+    /// unmeasured, and the first thing to check on an M3 or M4.
+    ///
+    /// Measure it the way the crossovers are measured: `PIE_METAL_FP16_QMM=0`
+    /// against the default, same binary, arms alternated, on a prefill-heavy
+    /// shape where the GEMM is most of the fire.
+    bool fp16_qmm = true;
 };
 
 /// The platform query. `device_tuning_apple.mm` on Apple, a stub in
@@ -105,5 +124,8 @@ int qmm_bn_crossover_tg();
 /// The mixture's two row-tile crossovers, in rows per expert.
 int moe_tile_mid_per();
 int moe_tile_wide_per();
+
+/// Whether the dense g64/b4 GEMM stages its input to FP16.
+bool fp16_qmm();
 
 }  // namespace pie::metal

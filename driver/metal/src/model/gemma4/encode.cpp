@@ -767,6 +767,7 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
 bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
     // `is_moe` covers the routed kinds too: the DAG emits them under the same
     // condition, so a dense checkpoint has none to reach.
+    if (!fp16_qmm()) return false;
     if (g.is_moe() || g.quant.bits != 4 || g.quant.group != 64) return false;
     // `gemma4_uses_alt_quant` is a property of the KIND, not of the checkpoint:
     // it says which table the dispatch reads, and a checkpoint with one table

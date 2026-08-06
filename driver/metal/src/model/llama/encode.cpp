@@ -67,7 +67,7 @@ int llama_dense_qmm_bm(int rows, int requests) {
 }
 
 bool llama_fp16_qmm(const LlamaGeometry& g, Kind k, int rows, int requests) {
-    return !g.is_moe() && g.quant.bits == 4 && g.quant.group == 64 &&
+    return fp16_qmm() && !g.is_moe() && g.quant.bits == 4 && g.quant.group == 64 &&
            llama_qmm_bn(k, g, rows, requests) > 0;
 }
 
