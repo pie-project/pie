@@ -549,6 +549,9 @@ std::vector<pie_forward::PieForwardRow> shadow_rows(
     int depth_k,
     int depth_split,
     bool depth_union,
+    const std::uint32_t* band_k,
+    const std::uint32_t* band_rows,
+    std::size_t band_count,
     int mask_split,
     bool has_mask,
     bool has_lora,
@@ -576,16 +579,32 @@ std::vector<pie_forward::PieForwardRow> shadow_rows(
         row.write_desc = has_write_desc ? 1 : 0;
         row.wants_scores = wants_scores ? 1 : 0;
         row.hooked = static_cast<int>(r) >= fast_rows ? 1 : 0;
-        // Two truncation shapes, and only one of them has a split.
-        // A UNION fire puts full-depth rows first and truncated after,
-        // so `depth_split` is where truncation begins; a UNIFORM
-        // truncated fire has every row at `k` and no split at all —
-        // reading the union's field there marked nothing truncated and
-        // made the lowering cover layers the walk skipped.
-        const bool truncated =
-            depth_k >= 0 &&
-            (!depth_union || static_cast<int>(r) >= depth_split);
-        row.depth_k = truncated ? depth_k : -1;
+        // THREE truncation shapes, and each states itself differently.
+        //
+        // BANDED (>= 2 distinct k): `band_rows[j]` is how many rows are
+        // still live at depths >= `band_k[j]`, deepest-first. Inverting
+        // that per row: rows below `band_rows[0]` are full depth, and a
+        // row at or past `band_rows[j]` dies at `band_k[j]` for the
+        // LAST j it reaches. Not filling this at all was the shadow's
+        // largest remaining drift — a banded fire read as untruncated,
+        // so the lowering covered every layer the bands had retired.
+        //
+        // UNION: full-depth rows first, truncated after `depth_split`.
+        // UNIFORM: every row at `k`, and no split exists to read.
+        if (band_count >= 2) {
+            int k = -1;
+            for (std::size_t j = 0; j < band_count; ++j) {
+                if (static_cast<std::uint32_t>(r) >= band_rows[j]) {
+                    k = static_cast<int>(band_k[j]);
+                }
+            }
+            row.depth_k = k;
+        } else {
+            const bool truncated =
+                depth_k >= 0 &&
+                (!depth_union || static_cast<int>(r) >= depth_split);
+            row.depth_k = truncated ? depth_k : -1;
+        }
         // Compact fires sample the LAST row of each request; the walk
         // does not carry the index list on the host, so the shadow says
         // "the last `num_logit_rows` rows", which is that set whenever
@@ -599,10 +618,28 @@ std::vector<pie_forward::PieForwardRow> shadow_rows(
 }
 
 // Print what the two forms disagree about, once per fire, and return.
+struct ShadowShape {
+    int n_fire;
+    int fast_rows;
+    int mask_split;
+    int depth_k;
+    int depth_split;
+    bool depth_union;
+    int bands;
+    /// The fire captures across splits, so the walk emits BOTH peel
+    /// regions and an empty one early-outs on a device word. The flat
+    /// list has no such rectangle — `Launch::rows` is a host range —
+    /// so its statements are legitimately fewer here. Labelled rather
+    /// than counted, because it is a DIFFERENCE the cutover has to
+    /// answer, not drift to chase.
+    bool devwin;
+};
+
 void shadow_report(
     const pie_forward::ForwardPlan& plan,
     const std::vector<std::uint32_t>& walked,
-    const std::vector<pie_forward::PieForwardRow>& rows)
+    const std::vector<pie_forward::PieForwardRow>& rows,
+    const ShadowShape& shape)
 {
     const pie_forward::PieForwardLowered lowered = plan.lower(rows.data(), rows.size());
     if (lowered.uncovered != pie_forward::PieForwardUncovered::None) {
@@ -641,15 +678,37 @@ void shadow_report(
             if (first_phantom == 0xffffffffu) first_phantom = at;
         }
     }
+    // Name what drifted. An op INDEX is not a diagnosis — the kind and
+    // the layer are, and printing them is the difference between "three
+    // classes remain" and knowing which axis to fill.
+    const auto describe = [&](std::uint32_t at) {
+        if (at >= plan.op_count()) return std::string("-");
+        const PieForwardOp& op = plan.op(at);
+        return std::to_string(at) + ":kind" +
+               std::to_string(static_cast<std::uint32_t>(op.kind)) +
+               "@L" + std::to_string(op.layer);
+    };
+    if (holes == 0 && phantoms == 0) {
+        std::fprintf(stderr,
+                     "[shadow] rows=%zu walked=%zu launches=%zu arena=%zu "
+                     "holes=0 phantoms=0\n",
+                     rows.size(), walked.size(), lowered.launches_len,
+                     lowered.arena_bytes);
+        return;
+    }
     std::fprintf(stderr,
                  "[shadow] rows=%zu walked=%zu launches=%zu arena=%zu "
-                 "holes=%zu%s phantoms=%zu%s\n",
+                 "holes=%zu%s phantoms=%zu%s | shape N=%d fast=%d mask=%d "
+                 "k=%d split=%d union=%d bands=%d devwin=%d\n",
                  rows.size(), walked.size(), lowered.launches_len,
                  lowered.arena_bytes,
                  holes,
-                 holes ? (" (first op " + std::to_string(first_hole) + ")").c_str() : "",
+                 holes ? (" (" + describe(first_hole) + ")").c_str() : "",
                  phantoms,
-                 phantoms ? (" (first op " + std::to_string(first_phantom) + ")").c_str() : "");
+                 phantoms ? (" (" + describe(first_phantom) + ")").c_str() : "",
+                 shape.n_fire, shape.fast_rows, shape.mask_split,
+                 shape.depth_k, shape.depth_split, shape.depth_union ? 1 : 0,
+                 shape.bands, shape.devwin ? 1 : 0);
 }
 
 void llama_like_forward_declared(
@@ -2339,16 +2398,53 @@ void llama_like_forward_declared(
                 plan, shadow_ops,
                 shadow_rows(
                     N_fire, fast_rows, depth_k, depth_split, depth_union,
+                    plan_state.depth_band_k.data(),
+                    plan_state.depth_band_rows.data(),
+                    // `depth_banded ? band_count : 0` — the SAME word
+                    // the walk's window reads. The band arrays are
+                    // fixed-capacity, so their `size()` says 3 on a fire
+                    // that is not banded at all; reading it cost one
+                    // wrong diagnosis before this line said so.
+                    depth_banded ? static_cast<std::size_t>(band_count) : 0,
+                    // The split the WALK used, which is the PREPARED
+                    // one: the engine plans `unmasked_prefix_rows` and
+                    // the driver may decline (a prefill fire is not a
+                    // spatial-mask fire), in which case the peel takes
+                    // its UNPLANNED endpoint and the tail runs full-N.
+                    // Reading the engine's word instead of the walk's
+                    // made the lowering split fires the walk did not —
+                    // the same mistake as reading the band arrays'
+                    // `size()`, and worth naming twice.
                     (custom_mask_d != nullptr &&
-                     unmasked_prefix_rows != 0xffffffffu)
-                        ? static_cast<int>(unmasked_prefix_rows)
+                     unmasked_prefix_rows != 0xffffffffu &&
+                     plan_state.spatial_mask_split >= 0)
+                        ? plan_state.spatial_mask_split
                         : -1,
                     custom_mask_d != nullptr,
                     lora != nullptr && lora->usable(),
                     has_write_desc,
                     stage_hooks != nullptr &&
                         stage_hooks->wants_attn_score,
-                    logit_row_indices_d, num_logit_rows));
+                    logit_row_indices_d, num_logit_rows),
+                ShadowShape{
+                    N_fire, fast_rows,
+                    // The split the WALK used, which is the PREPARED
+                    // one: the engine plans `unmasked_prefix_rows` and
+                    // the driver may decline (a prefill fire is not a
+                    // spatial-mask fire), in which case the peel takes
+                    // its UNPLANNED endpoint and the tail runs full-N.
+                    // Reading the engine's word instead of the walk's
+                    // made the lowering split fires the walk did not —
+                    // the same mistake as reading the band arrays'
+                    // `size()`, and worth naming twice.
+                    (custom_mask_d != nullptr &&
+                     unmasked_prefix_rows != 0xffffffffu &&
+                     plan_state.spatial_mask_split >= 0)
+                        ? plan_state.spatial_mask_split
+                        : -1,
+                    depth_k, depth_split, depth_union,
+                    depth_banded ? band_count : 0,
+                    peel_window_d != nullptr});
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[shadow] refused: %s\n", e.what());
         }
