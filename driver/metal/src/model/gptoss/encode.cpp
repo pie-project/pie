@@ -228,9 +228,12 @@ Pso pso_for_paged(const Dispatch& d, const DecodeStepPsos& base, const MultiBatc
 
 int gptoss_qmm_rows(int rows) {
     const int n = rows < 1 ? 1 : rows;
-    // Inherited from qwen3.5 and measured here: lowering it to 4 costs gpt-oss
-    // 1% (8 lanes, 55.5 -> 54.9 tok/s), so the inherited number holds.
-    if (n < qmm_min_batch()) return n;
+    // gpt-oss is a mixture in every checkpoint there is, so the ROUTED
+    // crossover, unconditionally -- there is no dense gpt-oss to ask about.
+    // Inherited from qwen3.5 and measured here on the M1 Max: lowering it to 4
+    // cost gpt-oss 1% (8 lanes, 55.5 -> 54.9 tok/s), and on an M2 Max the GEMV
+    // still wins or ties at every batch the dense number would have switched.
+    if (n < qmm_min_batch(true)) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -290,7 +293,7 @@ int gptoss_qmm_bn(Kind k, const GptOssGeometry& g, int rows) {
     if (!gptoss_is_dense_proj(k)) return 0;
     const KN kn = qmv_kn(k, g);
     if (kn.N == 0) return 0;
-    return qmm_bn_unsplit(int(kn.N), gptoss_qmm_rows(rows));
+    return qmm_bn_unsplit(int(kn.N), gptoss_qmm_rows(rows), qmm_min_batch(true));
 }
 
 Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
