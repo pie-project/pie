@@ -511,6 +511,16 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
 //
 // `PIE_DECLARED_SHADOW=1`. Off by default and inert when off: it computes
 // a description and prints, and never changes what runs.
+// `PIE_DECLARED_FLAT=1`: execute from `lower()`'s list instead of
+// walking the region IR. Off by default — the walk is still what runs.
+bool flat_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_DECLARED_FLAT");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
 bool shadow_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_DECLARED_SHADOW");
@@ -1116,6 +1126,65 @@ void llama_like_forward_declared(
     std::vector<std::uint32_t> shadow_ops;
     const bool shadow = shadow_enabled();
     if (shadow) shadow_ops.reserve(op_count);
+
+    // An observation SITE, as a function of one statement.
+    //
+    // It launches no table kernel, which is why it has no rectangle —
+    // and it still runs the guest programs, stages the score capture
+    // and opens the page-mask bracket, which is why a form driven by
+    // the list has to run it. `Lowered::structural` names the live
+    // ones; this is what running one means.
+    const auto execute_site = [&](const PieForwardOp& op) {
+        // A3: the sites live in the ONE body every unmasked fire
+        // walks — a fire with no attached programs passes through
+        // by argument, zero launches, zero sideband setup.
+        if (stage_hooks == nullptr) return;
+        const int L = static_cast<int>(op.param1);
+        if (op.param0 == 0) {
+            // OnAttnProj: reset the layer's page view, re-seed the
+            // mask ("keep everything" unless this layer's program
+            // narrows it), stage the score capture the attention
+            // will publish through, and run the programs.
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            if (is_pure_decode) {
+                score_capture.emplace(
+                    stage_hooks, static_cast<std::uint32_t>(L),
+                    static_cast<std::uint32_t>(num_q_heads),
+                    /*capturable=*/true, stream);
+            } else {
+                prefill_score_capture.emplace(
+                    stage_hooks, static_cast<std::uint32_t>(L),
+                    static_cast<std::uint32_t>(num_q_heads),
+                    plan_state.prefill_score_window,
+                    /*capturable=*/true, stream);
+            }
+            invoke_stage_hook(
+                stage_hooks, StageHookPoint::OnAttnProj,
+                ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                static_cast<std::uint32_t>(L),
+                stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
+        } else {
+            // OnAttn: the programs read what the attention published.
+            invoke_stage_hook(
+                stage_hooks, StageHookPoint::OnAttn,
+                ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                static_cast<std::uint32_t>(L),
+                stream, /*query_is_f32=*/false,
+                {.scores = score_capture && score_capture->scores()
+                               ? score_capture->scores()
+                               : (prefill_score_capture
+                                      ? prefill_score_capture->scores()
+                                      : nullptr)});
+        }
+    };
 
     // ── THE ARMS, as a function of one RECTANGLE ───────────────────
     //
@@ -2185,6 +2254,138 @@ void llama_like_forward_declared(
         }
     };
 
+    // ── THE FLAT DRIVE (`.wiki/tart/dsl.md` cutover step 2b) ───────
+    //
+    // `PIE_DECLARED_FLAT=1`. The walk below decides what runs by
+    // TRAVERSING — guard chains, row peels, a depth window per op. This
+    // decides it by READING `lower()`'s list, which the shadow has been
+    // saying is the same answer on every fire.
+    //
+    // Nothing about the ARMS changes. Step 1 gave them the eight words
+    // they read about where they are; step 2a gave the list the sites
+    // it was missing. So this is only a different source for the same
+    // arguments, which is why it is a ~60-line block and not a rewrite:
+    //
+    //   win_start/win_len  the rectangle, directly
+    //   N                  its row count (the EPILOGUE excepted — its
+    //                      rows are Dim::Requests while its arm asks
+    //                      for the fire's tokens)
+    //   R                  rows == N_fire ? R_fire : rows — the WALK's
+    //                      own rule (`depth_window.hpp` sets n_ and r_
+    //                      to the same live count whenever it narrows,
+    //                      and only the un-narrowed case distinguishes
+    //                      tokens from requests)
+    //   mask_region        the rectangle's peel
+    //   band index         the band whose row count this IS — the
+    //                      "prepared plan found by ROW COUNT" the whole
+    //                      design turns on, and the reason the walk's
+    //                      three-band ceiling has nothing to sit on
+    if (flat_enabled()) {
+        const std::vector<pie_forward::PieForwardRow> rows = shadow_rows(
+            N_fire, fast_rows, depth_k, depth_split, depth_union,
+            plan_state.depth_band_k.data(), plan_state.depth_band_rows.data(),
+            depth_banded ? static_cast<std::size_t>(band_count) : 0,
+            (custom_mask_d != nullptr && unmasked_prefix_rows != 0xffffffffu &&
+             plan_state.spatial_mask_split >= 0)
+                ? plan_state.spatial_mask_split
+                : -1,
+            custom_mask_d != nullptr, lora != nullptr && lora->usable(),
+            has_write_desc,
+            stage_hooks != nullptr && stage_hooks->wants_attn_score,
+            logit_row_indices_d, num_logit_rows);
+        const pie_forward::PieForwardLowered flat =
+            plan.lower(rows.data(), rows.size(), peel_window_d != nullptr);
+        if (flat.uncovered != pie_forward::PieForwardUncovered::None) {
+            throw std::runtime_error(
+                "declared forward (flat): the lowering refuses this fire, "
+                "reason " +
+                std::to_string(static_cast<std::uint32_t>(flat.uncovered)) +
+                " — an admission answer arriving too late");
+        }
+        // The band a row count names. `-1` for "the whole fire", which
+        // is the walk's own degenerate rule.
+        const auto band_of = [&](int live) {
+            if (!depth_banded || live == N_fire) return -1;
+            for (int j = 0; j < band_count; ++j) {
+                if (plan_state.depth_band_rows[static_cast<std::size_t>(j)] ==
+                    static_cast<std::uint32_t>(live)) {
+                    return j;
+                }
+            }
+            return -1;
+        };
+        std::size_t next_site = 0;
+        std::size_t at = 0;
+        while (at < flat.launches_len || next_site < flat.structural_len) {
+            // Statements run in op order, and the two lists are each in
+            // that order, so this is a merge.
+            const bool site_first =
+                at >= flat.launches_len ||
+                (next_site < flat.structural_len &&
+                 flat.structural[next_site] < flat.launches[at].at_op);
+            if (site_first) {
+                // The arena advances with the STATEMENT, whichever form
+                // is driving: slots whose value was last read before
+                // this op return to the free list, and skipping that is
+                // how a bump arena runs out of block on the first fire.
+                values.begin_op(flat.structural[next_site]);
+                execute_site(plan.op(flat.structural[next_site]));
+                ++next_site;
+                continue;
+            }
+            const pie_forward::PieForwardLaunch& L = flat.launches[at];
+            // One CALL per rectangle, not per launch: an arm that runs
+            // several kernels for one statement (the epilogue's gather,
+            // norm and projection) runs all of them itself, so the
+            // rectangles sharing a statement and a window collapse.
+            std::size_t run = at + 1;
+            while (run < flat.launches_len &&
+                   flat.launches[run].at_op == L.at_op &&
+                   flat.launches[run].row_lo == L.row_lo &&
+                   flat.launches[run].row_hi == L.row_hi &&
+                   flat.launches[run].peel_axis == L.peel_axis &&
+                   flat.launches[run].peel_tail == L.peel_tail) {
+                ++run;
+            }
+            at = run;
+            values.begin_op(L.at_op);
+            const PieForwardOp& op = plan.op(L.at_op);
+            const int live = static_cast<int>(L.row_hi - L.row_lo);
+            const bool epilogue = op.kind == PieForwardOpKind::LmHead;
+            // The mask peel has an UNPLANNED endpoint: when the driver
+            // declined the split, its tail IS the fire-level custom
+            // dispatch, full-N, and the walk marks that region `None`
+            // rather than `Tail`. Reading the axis alone gave the tail
+            // its windowed addressing on a fire that has no suffix
+            // plan — which the executor caught ("peel tail without a
+            // suffix mask plan") and then a stray launch turned into an
+            // illegal access. The split's existence is the word that
+            // separates the two, so the drive reads it.
+            const bool mask_split_planned =
+                plan_state.spatial_mask_split >= 0 &&
+                unmasked_prefix_rows != 0xffffffffu;
+            const MaskRegion region =
+                (L.peel_axis != 2 || !mask_split_planned)
+                    ? MaskRegion::None
+                    : L.peel_tail ? MaskRegion::Tail
+                                  : MaskRegion::Prefix;
+            execute_op(op,
+                       /*N=*/epilogue ? N_fire : live,
+                       /*R=*/live == N_fire ? R_fire : live,
+                       /*win_start=*/static_cast<int>(L.row_lo),
+                       /*win_len=*/live,
+                       region,
+                       band_of(live),
+                       /*depth_tail_active=*/depth_union && live == depth_split);
+        }
+        if (shadow) {
+            std::fprintf(stderr, "[flat] served rows=%zu launches=%zu sites=%zu\n",
+                         rows.size(), flat.launches_len, flat.structural_len);
+        }
+        return;
+    }
+
+
     for (std::size_t i = 0; i < op_count; ++i) {
         for (;;) {
             if (!guard_skips.empty() && i == guard_skips.back().first) {
@@ -2315,58 +2516,9 @@ void llama_like_forward_declared(
             }
             break;
         }
-        case PieForwardOpKind::HookSite: {
-            // A3: the sites live in the ONE body every unmasked fire
-            // walks — a fire with no attached programs passes through
-            // by argument, zero launches, zero sideband setup.
-            if (stage_hooks == nullptr) break;
-            const int L = static_cast<int>(op.param1);
-            if (op.param0 == 0) {
-                // OnAttnProj: reset the layer's page view, re-seed the
-                // mask ("keep everything" unless this layer's program
-                // narrows it), stage the score capture the attention
-                // will publish through, and run the programs.
-                attn_page_indices = kv_page_indices;
-                attn_page_indptr = kv_page_indptr;
-                attn_last_page_lens = kv_last_page_lens;
-                page_mask.begin_layer(stream);
-                if (is_pure_decode) {
-                    score_capture.emplace(
-                        stage_hooks, static_cast<std::uint32_t>(L),
-                        static_cast<std::uint32_t>(num_q_heads),
-                        /*capturable=*/true, stream);
-                } else {
-                    prefill_score_capture.emplace(
-                        stage_hooks, static_cast<std::uint32_t>(L),
-                        static_cast<std::uint32_t>(num_q_heads),
-                        plan_state.prefill_score_window,
-                        /*capturable=*/true, stream);
-                }
-                invoke_stage_hook(
-                    stage_hooks, StageHookPoint::OnAttnProj,
-                    ws.q.data(),
-                    static_cast<std::uint32_t>(N),
-                    static_cast<std::uint32_t>(Hq),
-                    static_cast<std::uint32_t>(L),
-                    stream, /*query_is_f32=*/false,
-                    {.mask_sink = page_mask.sink()});
-            } else {
-                // OnAttn: the programs read what the attention published.
-                invoke_stage_hook(
-                    stage_hooks, StageHookPoint::OnAttn,
-                    ws.q.data(),
-                    static_cast<std::uint32_t>(N),
-                    static_cast<std::uint32_t>(Hq),
-                    static_cast<std::uint32_t>(L),
-                    stream, /*query_is_f32=*/false,
-                    {.scores = score_capture && score_capture->scores()
-                                   ? score_capture->scores()
-                                   : (prefill_score_capture
-                                          ? prefill_score_capture->scores()
-                                          : nullptr)});
-            }
+        case PieForwardOpKind::HookSite:
+            execute_site(op);
             break;
-        }
         case PieForwardOpKind::Guard: {
             // The one branch a class trace carries — a CHAIN of arms over
             // runtime inputs (closed predicate vocabulary,
