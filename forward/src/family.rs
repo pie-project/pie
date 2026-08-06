@@ -3296,14 +3296,17 @@ pub fn gemma4_cuda(
     dsl::trace_named(&family, |t| {
         // ── Prologue ────────────────────────────────────────────────
         // The token embedding, scaled by sqrt(hidden).
-        let mut y = dsl::cuda::scalar_mul(&dsl::embed_with(t, "embed", hidden));
+        let mut y = dsl::cuda::scalar_mul(&dsl::embed_with(t, "embed", hidden), "sqrt_hidden");
 
         // PLE: a SECOND embedding table, projected to the whole stack's
         // per-layer width, normed, scaled and relaid so each layer reads
         // a contiguous slice. Once per fire, not per layer — which is
         // the entire reason for the relay.
         let ple_total = facts.layers * facts.ple_dim;
-        let ple = dsl::cuda::scalar_mul(&dsl::embed_with(t, "embed_per_layer", ple_total));
+        let ple = dsl::cuda::scalar_mul(
+            &dsl::embed_with(t, "embed_per_layer", ple_total),
+            "sqrt_ple_dim",
+        );
         let ple = matmul(
             &ple,
             &MatW {
@@ -3312,7 +3315,7 @@ pub fn gemma4_cuda(
                 layer: None,
             },
         );
-        let ple = dsl::cuda::scalar_mul(&ple);
+        let ple = dsl::cuda::scalar_mul(&ple, "rsqrt_hidden");
         let ple = rmsnorm(
             &ple,
             &NormW {
@@ -3322,7 +3325,7 @@ pub fn gemma4_cuda(
                 layer: None,
             },
         );
-        let ple = dsl::cuda::scalar_mul(&ple);
+        let ple = dsl::cuda::scalar_mul(&ple, "rsqrt_2");
         let ple_table = dsl::cuda::transpose_nld_to_lnd(&ple, facts.layers, facts.ple_dim);
 
         // ── Layers ──────────────────────────────────────────────────

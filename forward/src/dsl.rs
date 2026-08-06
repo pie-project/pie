@@ -1745,14 +1745,32 @@ pub mod cuda {
     }
 
     /// `kernels::launch_scalar_mul_bf16`: multiply by a load-time
-    /// constant. gemma-4 uses it three times in the PLE prologue and
-    /// once on the embedding (`sqrt(hidden)`), and the constants are all
-    /// derived from dims — so the SCALE is not an operand, it is part of
-    /// which statement this is.
-    pub fn scalar_mul(x: &Val) -> Val {
+    /// constant, NAMED.
+    ///
+    /// gemma-4 fires this four times per fire with four different
+    /// constants — `sqrt(hidden)` on the embedding, then
+    /// `sqrt(ple_dim)`, `1/sqrt(hidden)` and `1/sqrt(2)` through the PLE
+    /// prologue. All four are derived from dims, so none is an operand;
+    /// but a statement that did not say WHICH would leave an executor
+    /// with four identical launches and no way to tell them apart. This
+    /// was written without the name first, and writing the arm is what
+    /// found it.
+    ///
+    /// The name rides the weight slot because that is what a name slot
+    /// is: `scale.` marks it as a constant rather than a tensor, so a
+    /// binder never looks for it.
+    pub fn scalar_mul(x: &Val, scale: &str) -> Val {
         let out = (x.t.inner.borrow().value_shape(x.id), DType::BF16);
-        record(&x.t, x.layer, "launch_scalar_mul_bf16", vec![], None, vec![x.id], Some(out))
-            .expect("the scale produces its value")
+        record(
+            &x.t,
+            x.layer,
+            "launch_scalar_mul_bf16",
+            vec![format!("scale.{scale}")],
+            None,
+            vec![x.id],
+            Some(out),
+        )
+        .expect("the scale produces its value")
     }
 
     /// `kernels::launch_logit_softcap_bf16`: `cap * tanh(x / cap)` over

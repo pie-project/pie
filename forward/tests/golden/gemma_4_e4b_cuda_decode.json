@@ -6078,7 +6078,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_scalar_mul_bf16"
+          "kernel": "launch_scalar_mul_bf16",
+          "weights": [
+            "scale.sqrt_hidden"
+          ]
         }
       },
       "inputs": [
@@ -6104,7 +6107,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_scalar_mul_bf16"
+          "kernel": "launch_scalar_mul_bf16",
+          "weights": [
+            "scale.sqrt_ple_dim"
+          ]
         }
       },
       "inputs": [
@@ -6133,7 +6139,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_scalar_mul_bf16"
+          "kernel": "launch_scalar_mul_bf16",
+          "weights": [
+            "scale.rsqrt_hidden"
+          ]
         }
       },
       "inputs": [
@@ -6163,7 +6172,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_scalar_mul_bf16"
+          "kernel": "launch_scalar_mul_bf16",
+          "weights": [
+            "scale.rsqrt_2"
+          ]
         }
       },
       "inputs": [
