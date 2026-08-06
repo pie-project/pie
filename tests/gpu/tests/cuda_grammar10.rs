@@ -32,7 +32,7 @@
 //! adaptive window, so `distinct_programs` is exact on the held batch.
 //!
 //! Run (GPU; needs the #10 base = alpha policy + bravo attach-hash):
-//!   cargo test -p pie-bin --features driver-cuda --test cuda_grammar10 -- --ignored --nocapture
+//!   cargo test -p pie-gpu-tests --features driver-cuda --test cuda_grammar10 -- --ignored --nocapture
 
 mod common;
 

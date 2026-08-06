@@ -46,3 +46,6 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `cuda_grammar_r2` reads RSS out of the live process to bound the
+# grammar cache's growth, which is a libc call.
+libc = "0.2"

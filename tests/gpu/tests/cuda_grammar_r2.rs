@@ -45,7 +45,7 @@
 //! are captured for the record.
 //!
 //! Run (GPU; needs alpha's hold + echo's scatter folded in):
-//!   cargo test -p pie-bin --features driver-cuda --test cuda_grammar_r2 -- --ignored --nocapture
+//!   cargo test -p pie-gpu-tests --features driver-cuda --test cuda_grammar_r2 -- --ignored --nocapture
 
 mod common;
 

@@ -22,7 +22,7 @@
 //! not matter here.
 //!
 //! `#[ignore]`, driver-cuda. Run OFF then ON, the second invocation gates:
-//!   cargo test -p pie-bin --features driver-cuda \
+//!   cargo test -p pie-gpu-tests --features driver-cuda \
 //!     --test cuda_gdn_site_summary_parity -- --ignored --nocapture
 //!   PIE_DECLARED_FORWARD=1 cargo test ... --test cuda_gdn_site_summary_parity ...
 
@@ -88,8 +88,7 @@ async fn gdn_site_summary_parity() -> Result<()> {
     let snapshot = resolve_qwen35_base_snapshot()?;
     let (controller, gateway, worker) =
         pie_bin::derive::derive_standalone(&common::cuda_standalone_toml(&snapshot))?;
-    let pie =
-        pie_bin::run_standalone(controller, gateway, worker, pie_bin::Mode::Local).await?;
+    let pie = pie_bin::run_standalone(controller, gateway, worker).await?;
     eprintln!(
         "[gdn-site-summary] booted listen={} declared={declared}",
         pie.listen_addr

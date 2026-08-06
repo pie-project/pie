@@ -23,7 +23,7 @@
 //!   with both sides fused, under the environment's default gates.
 //!
 //! `#[ignore]`, driver-cuda. Run OFF then ON, the second invocation gates:
-//!   cargo test -p pie-bin --no-default-features --features driver-cuda \
+//!   cargo test -p pie-gpu-tests --no-default-features --features driver-cuda \
 //!     --test cuda_declared_forward_parity -- --ignored --nocapture
 //!   PIE_DECLARED_FORWARD=1 cargo test ... --test cuda_declared_forward_parity ...
 
