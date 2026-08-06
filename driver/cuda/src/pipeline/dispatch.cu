@@ -558,6 +558,9 @@ struct FixedDecodeOutputs {
     // which then fail the commit check themselves. An OR cannot tell the one
     // originating cause from the many derived ones; the counts can.
     std::uint32_t* kill_reason_counts = nullptr;
+    // OR of the port indices that were not ready, so the message can say
+    // which of the seven inputs the producer had not published.
+    std::uint32_t* kill_ports = nullptr;
     std::uint32_t dummy_page = 0;
     std::uint32_t page_size = 0;
     std::uint32_t device_pages = 0;
@@ -603,6 +606,7 @@ __global__ void compose_fixed_decode(
     const std::uint32_t lane = threadIdx.x;
     bool valid = lane < lane_count;
     std::uint32_t kill_reason = 0;
+    std::uint32_t not_ready_ports = 0;
     bool sentinel = false;
     std::uint32_t token = 0;
     const FixedDecodeLane* descriptor =
@@ -623,6 +627,11 @@ __global__ void compose_fixed_decode(
             if (ready != nullptr && *ready == 0) {
                 valid = false;
                 kill_reason |= kKillPortNotReady;
+                // Which port, in the order `ports_in_lane` binds them:
+                // 0 embed_tokens, 1 positions, 2 pages, 3 page_indptr,
+                // 4 kv_len, 5 w_slot, 6 w_off. A kill that names the port
+                // names the producer, and the seven have different ones.
+                not_ready_ports |= 1u << port;
             }
         }
         const auto* token_source =
@@ -737,6 +746,9 @@ __global__ void compose_fixed_decode(
         }
         if (output.kill_reasons != nullptr && kill_reason != 0) {
             atomicOr(output.kill_reasons, kill_reason);
+        }
+        if (output.kill_ports != nullptr && not_ready_ports != 0) {
+            atomicOr(output.kill_ports, not_ready_ports);
         }
         if (output.kill_reason_counts != nullptr) {
             for (std::uint32_t bit = 0; bit < 8; ++bit) {
@@ -1578,6 +1590,8 @@ struct Dispatch::Impl {
     std::uint32_t* h_fixed_decode_kill_reasons = nullptr;
     std::uint32_t* d_fixed_decode_kill_counts = nullptr;
     std::uint32_t* h_fixed_decode_kill_counts = nullptr;
+    std::uint32_t* d_fixed_decode_kill_ports = nullptr;
+    std::uint32_t* h_fixed_decode_kill_ports = nullptr;
     std::uint32_t fixed_decode_kills_reported = 0;
     // Same diagnostic for the decode-envelope compose path (RV-16).
     std::uint32_t* d_envelope_kills = nullptr;
@@ -1905,6 +1919,12 @@ struct NotifyContext {
 };
 
 Dispatch::Impl::~Impl() {
+    if (d_fixed_decode_kill_ports != nullptr) {
+        cudaFree(d_fixed_decode_kill_ports);
+    }
+    if (h_fixed_decode_kill_ports != nullptr) {
+        cudaFreeHost(h_fixed_decode_kill_ports);
+    }
     if (d_fixed_decode_kill_counts != nullptr) {
         cudaFree(d_fixed_decode_kill_counts);
     }
@@ -6562,6 +6582,13 @@ bool Dispatch::enqueue_fixed_decode(
                                   8 * sizeof(std::uint32_t)));
         std::memset(state.h_fixed_decode_kill_counts, 0,
                     8 * sizeof(std::uint32_t));
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kill_ports,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kill_ports, 0,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kill_ports,
+                                  sizeof(std::uint32_t)));
+        *state.h_fixed_decode_kill_ports = 0;
     }
     if (const std::uint32_t seen = *state.h_fixed_decode_kills;
         seen > state.fixed_decode_kills_reported) {
@@ -6590,6 +6617,20 @@ bool Dispatch::enqueue_fixed_decode(
         note(kKillWriteSlot, "w_slot/w_off outside the translation or page");
         note(kKillWriteBounds, "write position outside [lower, upper)");
         note(kKillTranslation, "translated page >= device_pages");
+        if (const std::uint32_t ports = *state.h_fixed_decode_kill_ports;
+            ports != 0) {
+            static const char* const kPortNames[] = {
+                "embed_tokens", "positions", "pages", "page_indptr",
+                "kv_len", "w_slot", "w_off"};
+            reasons += " [ports:";
+            for (std::size_t i = 0; i < 7; ++i) {
+                if ((ports >> i) & 1u) {
+                    reasons += " ";
+                    reasons += kPortNames[i];
+                }
+            }
+            reasons += "]";
+        }
         if (reasons.empty()) reasons = "unattributed";
         std::cerr << "[pie-driver-cuda] fixed-decode compose FAIL-STOPPED "
                   << fresh << " lane(s): " << reasons
@@ -6616,6 +6657,7 @@ bool Dispatch::enqueue_fixed_decode(
         .chain_kills = state.d_fixed_decode_kills,
         .kill_reasons = state.d_fixed_decode_kill_reasons,
         .kill_reason_counts = state.d_fixed_decode_kill_counts,
+        .kill_ports = state.d_fixed_decode_kill_ports,
         .dummy_page = buffers.dummy_page,
         .page_size = staged.fixed_decode_page_size,
         .device_pages = staged.fixed_decode_device_pages,
@@ -6650,6 +6692,12 @@ bool Dispatch::enqueue_fixed_decode(
         state.h_fixed_decode_kill_counts,
         state.d_fixed_decode_kill_counts,
         8 * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost,
+        staged.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        state.h_fixed_decode_kill_ports,
+        state.d_fixed_decode_kill_ports,
+        sizeof(std::uint32_t),
         cudaMemcpyDeviceToHost,
         staged.stream));
     state.fixed_decode_upload.mark_used(staged.stream);
