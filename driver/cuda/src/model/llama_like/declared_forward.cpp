@@ -1201,10 +1201,19 @@ void llama_like_forward_declared(
     //
     // The parameters are exactly what an arm reads about WHERE it is,
     // counted off the body before the split: a row count (N, R), a row
-    // window (win_start, win_len), which side of the mask split, and
-    // which prepared plan (the band words). They SHADOW the walk's
-    // locals of the same names, so no arm body changed — which is the
-    // argument that this refactor cannot alter a launch.
+    // window (win_start, win_len), which face of the hook split
+    // (win_region) and of the mask split (mask_region), and which
+    // prepared plan (the band words). They SHADOW the walk's locals of
+    // the same names, so no arm body changed — which is the argument
+    // that this refactor cannot alter a launch.
+    //
+    // `win_region` joined the list late, and how it was missed is worth
+    // recording: the count of what the arms read (the table in the wiki)
+    // was taken over the words that appear in the arms' ARGUMENTS, and
+    // this one appears only in their kernel-CHOICE conditions
+    // (`peel_window_d != nullptr && win_region == Tail` picks the
+    // `_devwin` variant). A parameter that selects a kernel is as much
+    // "where am I" as one that sizes a grid.
     //
     // A `Launch{rows, layers, peel}` rectangle carries every one of
     // them, which is what step 2 will pass instead of the walk's state.
@@ -1213,6 +1222,7 @@ void llama_like_forward_declared(
                                 int R,
                                 int win_start,
                                 int win_len,
+                                WinRegion win_region,
                                 MaskRegion mask_region,
                                 int depth_band_index,
                                 bool depth_tail_active) {
@@ -2388,18 +2398,43 @@ void llama_like_forward_declared(
                     ? MaskRegion::None
                     : L.peel_tail ? MaskRegion::Tail
                                   : MaskRegion::Prefix;
+            // DEVICE-WINDOW capture (`rows_device`): the rectangle is a
+            // full-window GRID and the split is a device word the
+            // windowed call forms read, so the marker — not the row
+            // range — is what tells a launch which face it serves. This
+            // is the one thing the first drive got wrong: it read the
+            // row range for every peel, which is right for a host split
+            // and silently freezes THIS fire's split into a graph that
+            // is supposed to replay across all of them. Byte parity
+            // cannot see it (the fire it was measured on is correct);
+            // only the REPLAY is wrong.
+            const WinRegion window = !L.rows_device ? WinRegion::Full
+                                     : L.peel_tail ? WinRegion::Tail
+                                                   : WinRegion::Prefix;
             execute_op(op,
                        /*N=*/live,
                        /*R=*/live == N_fire ? R_fire : live,
                        /*win_start=*/static_cast<int>(L.row_lo),
                        /*win_len=*/live,
+                       window,
                        region,
                        band_of(live),
                        /*depth_tail_active=*/depth_union && live == depth_split);
         }
         if (shadow) {
-            std::fprintf(stderr, "[flat] served rows=%zu launches=%zu sites=%zu\n",
-                         rows.size(), flat.launches_len, flat.structural_len);
+            // `devwin` counts the rectangles whose rows are a GRID and
+            // whose split is a device word. It is here because the
+            // capture bug below was invisible without it: the probe that
+            // proves the fix needs to show the path was taken at all,
+            // and no other output says so.
+            std::size_t devwin = 0;
+            for (std::size_t j = 0; j < flat.launches_len; ++j) {
+                if (flat.launches[j].rows_device != 0) ++devwin;
+            }
+            std::fprintf(stderr,
+                         "[flat] served rows=%zu launches=%zu sites=%zu devwin=%zu\n",
+                         rows.size(), flat.launches_len, flat.structural_len,
+                         devwin);
         }
         return;
     }
@@ -2619,8 +2654,8 @@ void llama_like_forward_declared(
         }
         default:
             // Not a traversal statement, so it is one the arms serve.
-            execute_op(op, N, R, win_start, win_len, mask_region,
-                       depth_band_index, depth_tail_active);
+            execute_op(op, N, R, win_start, win_len, win_region,
+                       mask_region, depth_band_index, depth_tail_active);
             break;
         }
     }

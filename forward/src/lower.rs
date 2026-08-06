@@ -351,13 +351,25 @@ impl Lowerer<'_> {
                     // each early-outs on the device word. Skipping an
                     // empty one here would describe a graph that cannot
                     // serve the next fire.
+                    //
+                    // And each region's rows are then the WHOLE window,
+                    // not its half: the launches are full-window grids
+                    // and the split is a device word they read, which is
+                    // the entire point of capturing across splits. A
+                    // rectangle that named the half would be describing
+                    // a grid nobody launches, and an executor that
+                    // believed it would freeze THIS fire's split into
+                    // the graph — a wrong answer no byte-parity run can
+                    // see, because it is only wrong on the REPLAY.
                     let device = self.fire.captures_across_splits;
                     let outer_region = self.peel_region;
                     let axis = *axis;
+                    let grid = window.clone();
                     let mut run = |me: &mut Self, span: Range<usize>, w: Range<u32>, tail_side: bool| {
                         if !device && w.is_empty() {
                             return Ok(());
                         }
+                        let w = if device { grid.clone() } else { w };
                         me.peel_region = Some(PeelRegion {
                             axis,
                             tail: tail_side,
@@ -1150,6 +1162,19 @@ mod tests {
             .iter()
             .all(|l| l.peel.is_some_and(|p| p.axis == PeelWindow::HookFreePrefix
                 && p.rows_device)));
+        // And its rows are the WHOLE window, not the empty prefix half:
+        // a captured region launches a full-window grid and reads the
+        // split off the device word. Naming the half would describe a
+        // grid nobody launches, and an executor that believed it would
+        // bake this fire's split into the graph — wrong only on the
+        // REPLAY, which is why this is asserted here rather than left to
+        // a parity run to notice.
+        assert!(
+            fused
+                .iter()
+                .all(|l| l.rows.start == 0 && l.rows.end == rows.len() as u32),
+            "a captured peel region's rectangle is the full window"
+        );
 
         // And ONLY the peel's regions are marked: everything outside is
         // still a plain count, which is what keeps the list readable.
