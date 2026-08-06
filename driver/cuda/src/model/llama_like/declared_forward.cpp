@@ -215,9 +215,17 @@ enum class LaunchKernel {
     WriteKvExplicit,
     WriteKvToPages,
     LoraQkvCorrection,
+    ChunkedSwiglu,
+    Swiglu,
 };
 
 LaunchKernel resolve_launch_kernel(std::string_view kernel) {
+    if (kernel == "launch_chunked_swiglu_bf16") {
+        return LaunchKernel::ChunkedSwiglu;
+    }
+    if (kernel == "launch_swiglu_bf16") {
+        return LaunchKernel::Swiglu;
+    }
     if (kernel == "launch_rope_standard_table") {
         return LaunchKernel::RopeStandardTable;
     }
@@ -449,6 +457,19 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // Load-time: the kernel head dim the attention runs at vs the logical
     // one (Phi-3-mini pads 96 -> 128; llama_like.cpp's head_dim_padded).
     cuda.head_dim_padded = (cfg.head_dim != cfg.head_dim_kernel) ? 1 : 0;
+    // The MLP's gate_up BINDING (qwen3.cpp: the loader installs the
+    // packed bank when `contract.hpp::dense_fused_projection_joins`
+    // accepts the group — it declines quantized and non-BF16 ones). The
+    // executor used to re-derive this per layer as
+    // `gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty()`; the
+    // second term is dead (workspace.cpp allocates that buffer
+    // unconditionally, by its own comment), so the binding alone decides
+    // and it is known here. Layer 0 speaks for the deployment because
+    // the contract accepts or declines a GROUP uniformly — and the
+    // executor's per-launch cross-check refuses if a later layer ever
+    // disagrees, rather than trusting this line.
+    cuda.gate_up_fused =
+        (!w.layers.empty() && w.layers[0].gate_up_proj_fused != nullptr) ? 1 : 0;
 
     out.decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);
@@ -1248,6 +1269,37 @@ void llama_like_forward_declared(
                 attn_last_page_lens = page_mask.last_page_lens();
             };
             switch (resolve_launch_kernel(plan.weight_name(op))) {
+            // The MLP activation. The declaration states WHICH swiglu,
+            // from the gate_up binding fact it was traced with, so this
+            // arm no longer asks the workspace — it CHECKS, because a
+            // trace built against a different binding than the one this
+            // model bound would otherwise read the wrong buffer and
+            // produce plausible garbage. Refuse on drift, the same rule
+            // the region table's plan cross-check follows.
+            case LaunchKernel::ChunkedSwiglu:
+            case LaunchKernel::Swiglu: {
+                const bool stated_fused =
+                    resolve_launch_kernel(plan.weight_name(op)) ==
+                    LaunchKernel::ChunkedSwiglu;
+                if (stated_fused != gate_up_used_fused) {
+                    throw std::runtime_error(
+                        "declared forward: the trace states the "
+                        + std::string(stated_fused ? "packed" : "unfused")
+                        + " swiglu but this deployment bound the other "
+                          "gate_up form (facts drift)");
+                }
+                void* const dst =
+                    values.slot(plan.outputs(op)[0],
+                                plan.value(plan.outputs(op)[0]));
+                if (stated_fused) {
+                    kernels::launch_chunked_swiglu_bf16(
+                        ws.gate_up_fused.data(), dst, N, I, stream);
+                } else {
+                    kernels::launch_swiglu_bf16(
+                        ws.gate.data(), ws.up.data(), dst, N * I, stream);
+                }
+                break;
+            }
             case LaunchKernel::RopeStandardTable: {
                 if (ws.rope_table.empty()) {
                     throw std::runtime_error(
@@ -2040,14 +2092,14 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::Swiglu: {
-            // ISLAND (value arena): the activated MLP hidden is a traced
-            // VALUE; `ws.gate` was this family's convention for it.
-            declared::arm_swiglu(
-                ws, gate_up_used_fused,
-                values.slot(plan.outputs(op)[0],
-                            plan.value(plan.outputs(op)[0])),
-                N, I, stream);
-            break;
+            // RUNG 5, again: the choice-deriving code is deleted. Every
+            // lowered trace states its activation kernel (the gate_up
+            // binding is a load-time fact), so the semantic kind reaching
+            // this walk means the trace and the executor drifted — the
+            // same refusal `Attention` and `KvAppend` make.
+            throw std::runtime_error(
+                "declared forward: semantic Swiglu in a class trace "
+                "(the declaration states the activation kernel)");
         }
         case PieForwardOpKind::ResidualAdd: {
             // The post-norm landing: `y += norm_y` — the sub-layer's

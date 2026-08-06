@@ -174,6 +174,13 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(write_kv_explicit "launch_write_kv_explicit_bf16"),
     kernel!(write_kv_to_pages "launch_write_kv_to_pages"),
 
+    // ── mlp ────────────────────────────────────────────────────────
+    // Two spellings of one arithmetic, and the BINDING picks: a packed
+    // gate‖up bank feeds the chunked form, two narrow buffers the pair
+    // form. A load-time fact, so the declaration states it.
+    kernel!(chunked_swiglu "launch_chunked_swiglu_bf16"),
+    kernel!(swiglu "launch_swiglu_bf16"),
+
     // ── adapters ───────────────────────────────────────────────────
     kernel!(lora_qkv_correction "pie_lora_qkv_correction"),
 

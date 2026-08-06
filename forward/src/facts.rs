@@ -316,6 +316,27 @@ pub struct LlamaLikeCudaFacts {
     /// Serde-defaulted (append-only discipline).
     #[serde(default)]
     pub head_dim_padded: bool,
+    /// The checkpoint materialised a packed gate‖up bank
+    /// (`w.layers[l].gate_up_proj_fused != nullptr`), so the MLP's packed
+    /// GEMM lands in one buffer and the activation is the CHUNKED swiglu
+    /// over it; without it the projection writes two buffers and the
+    /// activation is the pair form.
+    ///
+    /// A pure WEIGHT-BINDING fact, which is why it belongs here rather
+    /// than in the walk. The executor derived it per layer as
+    /// `gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty()`, but
+    /// the second term is dead: `workspace.cpp` allocates that buffer
+    /// unconditionally ("Always allocated … lets the forward dispatch
+    /// decide per layer"). So the binding alone decides, the binding is
+    /// known at model construction, and the taxonomy's first row applies
+    /// — a load-time fact is a trace-time `match`, erased.
+    ///
+    /// Stating it deletes a runtime branch from three places at once: the
+    /// interpreter's `arm_swiglu`, the generated `.inc`'s
+    /// `if (gate_up_fused_N)` per layer, and the flat list's residue.
+    /// Serde-defaulted (append-only discipline).
+    #[serde(default)]
+    pub gate_up_fused: bool,
 }
 
 /// The METAL backend's load-time facts — what the Metal deployment
@@ -383,6 +404,13 @@ impl LlamaLikeCudaFacts {
             rope_table: true,
             force_prefill_path: false,
             head_dim_padded: false,
+            // The loader's `dense_fused_projection_joins` contract packs
+            // BF16 dense groups and declines quantized ones, so a plain
+            // BF16 deployment carries the bank. VERIFIED LIVE, not
+            // assumed — the boot log's declared-facts line is what says
+            // so, and the digest refuses the deployment if this fixture
+            // and the binding disagree.
+            gate_up_fused: true,
         }
     }
 }

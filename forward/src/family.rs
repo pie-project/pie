@@ -625,13 +625,18 @@ fn llama_like_cuda_text(
                 // separate residual landing (`+=` of a non-matmul records
                 // the explicit ResidualAdd launch).
                 y += rmsnorm(&matmul(&a, &w.o_proj), &w.attn_norm);
-                let mlp = matmul(&swiglu(&matmul(&y, &w.gate_up), f.intermediate), &w.down);
-                y += rmsnorm(&mlp, &w.mlp_norm);
+                // ② The activation STATES its kernel: which of the two
+                // swiglu spellings runs is the gate_up BINDING's answer,
+                // known at load, so it erases here instead of being
+                // re-derived from a workspace on every fire.
+                let act = cuda::swiglu(&matmul(&y, &w.gate_up), f.intermediate, cuda.gate_up_fused);
+                y += rmsnorm(&matmul(&act, &w.down), &w.mlp_norm);
             } else {
                 // Pre-norm: `+=` of a fresh matmul IS the beta=1 fold.
                 y += matmul(&a, &w.o_proj);
                 let x = rmsnorm(&y, &w.mlp_norm);
-                y += matmul(&swiglu(&matmul(&x, &w.gate_up), f.intermediate), &w.down);
+                let act = cuda::swiglu(&matmul(&x, &w.gate_up), f.intermediate, cuda.gate_up_fused);
+                y += matmul(&act, &w.down);
             }
         }
 

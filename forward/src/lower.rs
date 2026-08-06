@@ -859,17 +859,18 @@ mod tests {
         let inventory: Vec<&str> = kinds.keys().copied().collect();
         assert_eq!(
             inventory,
-            vec!["LmHead", "Swiglu"],
+            vec!["LmHead"],
             "the residue changed — kinds: {kinds:#?}"
         );
-        // Measured 2026-08-06: 88.7% (qwen3_0_6b decode) to 93.8%
-        // (olmo2_1b prefill). The residue is one LmHead per fire plus one
-        // Swiglu PER LAYER — the MLP statement is the bulk of it, which is
-        // why closing `Swiglu` is worth more than its one line suggests.
-        // The floor is here so a regression that drops a whole layer's
-        // worth of statements cannot hide behind a passing kind list.
+        // Measured 2026-08-06. The first pass read 88.7%–93.8% with a
+        // residue of one LmHead per fire plus one Swiglu PER LAYER;
+        // closing the swiglu (the activation states its kernel from the
+        // gate_up binding fact) left one statement per fire, which is
+        // what this floor now pins. The floor is here so a regression
+        // that drops a whole layer's worth of statements cannot hide
+        // behind a passing kind list.
         assert!(
-            worst > 0.88,
+            worst > 0.99,
             "the flat list covers {:.1}% of the worst deployment's statements",
             worst * 100.0
         );

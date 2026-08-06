@@ -1569,6 +1569,40 @@ pub mod cuda {
         .expect("fused post produces q")
     }
 
+    /// The MLP activation, stating which of the two swiglu kernels runs.
+    ///
+    /// `packed` is [`crate::facts::LlamaLikeCudaFacts::gate_up_fused`]: a
+    /// checkpoint that bound the packed gate‖up bank lands the projection
+    /// in one buffer and takes the CHUNKED kernel; one that did not lands
+    /// two and takes the pair form. Same arithmetic, different addressing
+    /// — which is exactly the kind of choice that used to sit in the
+    /// executor (`declared::arm_swiglu`) and in the generated file (a
+    /// per-layer `if (gate_up_fused_N)`), reading a workspace to decide
+    /// what the binding had already decided at load.
+    ///
+    /// One value either way: the trace declares ONE packed matmul before
+    /// this, and whether the binding materialised it as one buffer or two
+    /// is a BUFFER question, which is `lower::Buffers`'.
+    pub fn swiglu(x: &Val, intermediate: u32, packed: bool) -> Val {
+        record(
+            &x.t,
+            x.layer,
+            if packed {
+                "launch_chunked_swiglu_bf16"
+            } else {
+                "launch_swiglu_bf16"
+            },
+            vec![],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the activation produces its value")
+    }
+
     /// `kernels::launch_qk_rmsnorm_rope_bf16`: the fused per-head q/k
     /// norm + Standard rope, one launch — the hand-written
     /// `fuse_qk_norm_rope` branch. bf16 rounding differs between this

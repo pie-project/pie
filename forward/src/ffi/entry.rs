@@ -135,6 +135,12 @@ pub struct PieForwardLlamaLikeCudaFacts {
     /// non-zero is true. Appended field: existing zero-initialized C
     /// callers read as false.
     pub head_dim_padded: u8,
+    /// The checkpoint bound a packed gate‖up bank, so the MLP activation
+    /// is the chunked swiglu over one buffer rather than the pair form
+    /// over two. Appended field, same zero-init rule — and note the
+    /// default is the UNFUSED form, which is the conservative one: it
+    /// reads the two narrow buffers a decliner writes.
+    pub gate_up_fused: u8,
 }
 
 fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
@@ -144,6 +150,7 @@ fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
         rope_table: facts.rope_table != 0,
         head_dim_padded: facts.head_dim_padded != 0,
         force_prefill_path: facts.force_prefill_path != 0,
+        gate_up_fused: facts.gate_up_fused != 0,
     }
 }
 

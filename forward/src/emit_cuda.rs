@@ -883,38 +883,38 @@ fn emit_op(
                     } else {
                         "ws.norm_y.data()"
                     };
-                    // The binding dispatch, transliterated: fused when the
-                    // deployment materialised the packed weight AND the
-                    // workspace carries the buffer (the interpreter's
-                    // `gate_up_used_fused`, which the Swiglu right after
-                    // this reads — emitted as one combined block there).
-                    b.stmt(&format!(
-                        "const bool gate_up_fused_{layer} ="
-                    ));
-                    b.stmt(&format!(
-                        "    w.layers[{layer}].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();"
-                    ));
-                    b.stmt(&format!("if (gate_up_fused_{layer}) {{"));
-                    b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt(&format!("        {mlp_in},"));
-                    b.stmt(&format!(
-                        "        ops::WeightView(*w.layers[{layer}].gate_up_proj_fused),"
-                    ));
-                    b.stmt("        ws.gate_up_fused.data(), N, 2 * I, H);");
-                    b.stmt("} else {");
-                    b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt(&format!("        {mlp_in},"));
-                    b.stmt(&format!(
-                        "        make_weight_view(require(w.layers[{layer}].gate_proj, \"{weight}\"), w.layers[{layer}].gate_proj_quant),"
-                    ));
-                    b.stmt("        ws.gate.data(), N, I, H);");
-                    b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt(&format!("        {mlp_in},"));
-                    b.stmt(&format!(
-                        "        make_weight_view(require(w.layers[{layer}].up_proj, \"{weight}\"), w.layers[{layer}].up_proj_quant),"
-                    ));
-                    b.stmt("        ws.up.data(), N, I, H);");
-                    b.stmt("}");
+                    // The binding dispatch, RESOLVED — not transliterated.
+                    // It used to be a per-layer `const bool ... != nullptr
+                    // && !ws.gate_up_fused.empty()` and an `if` around
+                    // both GEMM forms, in a file whose whole point is that
+                    // this deployment's choices are already made. The
+                    // second term was always true (`workspace.cpp`
+                    // allocates that buffer unconditionally), and the
+                    // first is the load-time fact the trace now carries,
+                    // so only the taken branch is emitted. The `require`
+                    // on the unfused side is what refuses a binding that
+                    // disagrees with the fact.
+                    if cuda.gate_up_fused {
+                        b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                        b.stmt(&format!("    {mlp_in},"));
+                        b.stmt(&format!(
+                            "    ops::WeightView(*require(w.layers[{layer}].gate_up_proj_fused, \"{weight}\")),"
+                        ));
+                        b.stmt("    ws.gate_up_fused.data(), N, 2 * I, H);");
+                    } else {
+                        b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                        b.stmt(&format!("    {mlp_in},"));
+                        b.stmt(&format!(
+                            "    make_weight_view(require(w.layers[{layer}].gate_proj, \"{weight}\"), w.layers[{layer}].gate_proj_quant),"
+                        ));
+                        b.stmt("    ws.gate.data(), N, I, H);");
+                        b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                        b.stmt(&format!("    {mlp_in},"));
+                        b.stmt(&format!(
+                            "    make_weight_view(require(w.layers[{layer}].up_proj, \"{weight}\"), w.layers[{layer}].up_proj_quant),"
+                        ));
+                        b.stmt("    ws.up.data(), N, I, H);");
+                    }
                 }
                 ("down", true) => {
                     b.stmt("ops::gemm_act_x_w(cublas.handle(),");
@@ -1041,22 +1041,15 @@ fn emit_op(
             b.stmt("    }");
             b.stmt("}");
         }
-        OpKind::Swiglu { .. } => {
-            // Paired with the gate_up binding dispatch emitted just above;
-            // the flag name carries the layer, so nested blocks stay
-            // scope-correct in the unrolled file.
-            let layer = op
-                .layer
-                .expect("swiglu is a layer op in every llama_like trace");
-            b.stmt(&format!("if (gate_up_fused_{layer}) {{"));
-            b.stmt("    kernels::launch_chunked_swiglu_bf16(");
-            b.stmt("        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);");
-            b.stmt("} else {");
-            b.stmt("    kernels::launch_swiglu_bf16(");
-            b.stmt("        ws.gate.data(), ws.up.data(), ws.gate.data(),");
-            b.stmt("        N * I, stream);");
-            b.stmt("}");
-        }
+        // The semantic kind cannot reach a lowered cuda text — the
+        // activation states its kernel (`dsl::cuda::swiglu`), so this
+        // emission would be drift between the declaration and the file
+        // generated from it. Same refusal the executor makes for the
+        // semantic `Attention` and `KvAppend`.
+        OpKind::Swiglu { .. } => panic!(
+            "emitter: semantic Swiglu in a cuda class trace \
+             (the declaration states the activation kernel)"
+        ),
         OpKind::LmHead { weight } => {
             let member = match weight.as_str() {
                 "embed" => "w.embed",
@@ -1230,6 +1223,25 @@ fn emit_launch(
         }
     };
     match kernel {
+        // The MLP activation, no longer a per-layer `if` in the emitted
+        // file: the binding decided this at load and the trace states
+        // which spelling. The output is the traced value's slot — the
+        // island `arm_swiglu` already stood on.
+        // The MLP activation, no longer a per-layer `if` in the emitted
+        // file: the binding decided this at load and the trace states
+        // which spelling. The destination stays this family's `ws.gate`
+        // convention, character for character what the `OpKind::Swiglu`
+        // emission wrote — the island moves when the down_proj that
+        // reads it moves, not before.
+        "launch_chunked_swiglu_bf16" => {
+            b.stmt("kernels::launch_chunked_swiglu_bf16(");
+            b.stmt("    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);");
+        }
+        "launch_swiglu_bf16" => {
+            b.stmt("kernels::launch_swiglu_bf16(");
+            b.stmt("    ws.gate.data(), ws.up.data(), ws.gate.data(),");
+            b.stmt("    N * I, stream);");
+        }
         "launch_rope_standard_table" => {
             b.stmt("if (ws.rope_table.empty()) {");
             b.stmt("    throw std::runtime_error(");

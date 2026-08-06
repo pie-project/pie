@@ -4138,8 +4138,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -4518,8 +4518,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -4898,8 +4898,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5278,8 +5278,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5658,8 +5658,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6038,8 +6038,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6418,8 +6418,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6798,8 +6798,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7178,8 +7178,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7558,8 +7558,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7938,8 +7938,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8318,8 +8318,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8698,8 +8698,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9078,8 +9078,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9458,8 +9458,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9838,8 +9838,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10218,8 +10218,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10598,8 +10598,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10978,8 +10978,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11358,8 +11358,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11738,8 +11738,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -12118,8 +12118,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -12498,8 +12498,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -12878,8 +12878,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -13258,8 +13258,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -13638,8 +13638,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -14018,8 +14018,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -14398,8 +14398,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -14778,8 +14778,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -15158,8 +15158,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -15538,8 +15538,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -15918,8 +15918,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 14336
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [

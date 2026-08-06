@@ -729,31 +729,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].mlp_norm, "layer.0.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_0 =
-        w.layers[0].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_0) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[0].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].gate_proj, "layer.0.gate_up"), w.layers[0].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[0].gate_up_proj_fused, "layer.0.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -1345,31 +1326,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].mlp_norm, "layer.1.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_1 =
-        w.layers[1].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[1].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].gate_proj, "layer.1.gate_up"), w.layers[1].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[1].gate_up_proj_fused, "layer.1.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -1961,31 +1923,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].mlp_norm, "layer.2.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_2 =
-        w.layers[2].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_2) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[2].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].gate_proj, "layer.2.gate_up"), w.layers[2].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[2].gate_up_proj_fused, "layer.2.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -2577,31 +2520,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].mlp_norm, "layer.3.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_3 =
-        w.layers[3].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_3) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[3].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].gate_proj, "layer.3.gate_up"), w.layers[3].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[3].gate_up_proj_fused, "layer.3.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -3193,31 +3117,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].mlp_norm, "layer.4.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_4 =
-        w.layers[4].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_4) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[4].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].gate_proj, "layer.4.gate_up"), w.layers[4].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[4].gate_up_proj_fused, "layer.4.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -3809,31 +3714,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].mlp_norm, "layer.5.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_5 =
-        w.layers[5].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_5) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[5].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].gate_proj, "layer.5.gate_up"), w.layers[5].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[5].gate_up_proj_fused, "layer.5.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -4425,31 +4311,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].mlp_norm, "layer.6.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_6 =
-        w.layers[6].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_6) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[6].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].gate_proj, "layer.6.gate_up"), w.layers[6].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[6].gate_up_proj_fused, "layer.6.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -5041,31 +4908,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].mlp_norm, "layer.7.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_7 =
-        w.layers[7].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_7) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[7].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].gate_proj, "layer.7.gate_up"), w.layers[7].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[7].gate_up_proj_fused, "layer.7.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -5657,31 +5505,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].mlp_norm, "layer.8.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_8 =
-        w.layers[8].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_8) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[8].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].gate_proj, "layer.8.gate_up"), w.layers[8].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[8].gate_up_proj_fused, "layer.8.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -6273,31 +6102,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].mlp_norm, "layer.9.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_9 =
-        w.layers[9].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_9) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[9].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].gate_proj, "layer.9.gate_up"), w.layers[9].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[9].gate_up_proj_fused, "layer.9.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -6889,31 +6699,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].mlp_norm, "layer.10.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_10 =
-        w.layers[10].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_10) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[10].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].gate_proj, "layer.10.gate_up"), w.layers[10].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[10].gate_up_proj_fused, "layer.10.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -7505,31 +7296,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].mlp_norm, "layer.11.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_11 =
-        w.layers[11].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_11) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[11].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].gate_proj, "layer.11.gate_up"), w.layers[11].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[11].gate_up_proj_fused, "layer.11.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -8121,31 +7893,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].mlp_norm, "layer.12.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_12 =
-        w.layers[12].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_12) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[12].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].gate_proj, "layer.12.gate_up"), w.layers[12].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[12].gate_up_proj_fused, "layer.12.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -8737,31 +8490,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].mlp_norm, "layer.13.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_13 =
-        w.layers[13].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_13) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[13].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].gate_proj, "layer.13.gate_up"), w.layers[13].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[13].gate_up_proj_fused, "layer.13.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -9353,31 +9087,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].mlp_norm, "layer.14.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_14 =
-        w.layers[14].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_14) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[14].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].gate_proj, "layer.14.gate_up"), w.layers[14].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[14].gate_up_proj_fused, "layer.14.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -9969,31 +9684,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].mlp_norm, "layer.15.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_15 =
-        w.layers[15].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_15) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[15].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].gate_proj, "layer.15.gate_up"), w.layers[15].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[15].gate_up_proj_fused, "layer.15.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -10585,31 +10281,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].mlp_norm, "layer.16.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_16 =
-        w.layers[16].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_16) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[16].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].gate_proj, "layer.16.gate_up"), w.layers[16].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[16].gate_up_proj_fused, "layer.16.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -11201,31 +10878,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].mlp_norm, "layer.17.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_17 =
-        w.layers[17].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_17) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[17].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].gate_proj, "layer.17.gate_up"), w.layers[17].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[17].gate_up_proj_fused, "layer.17.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -11817,31 +11475,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].mlp_norm, "layer.18.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_18 =
-        w.layers[18].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_18) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[18].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].gate_proj, "layer.18.gate_up"), w.layers[18].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[18].gate_up_proj_fused, "layer.18.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -12433,31 +12072,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].mlp_norm, "layer.19.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_19 =
-        w.layers[19].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_19) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[19].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].gate_proj, "layer.19.gate_up"), w.layers[19].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[19].gate_up_proj_fused, "layer.19.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -13049,31 +12669,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].mlp_norm, "layer.20.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_20 =
-        w.layers[20].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_20) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[20].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].gate_proj, "layer.20.gate_up"), w.layers[20].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[20].gate_up_proj_fused, "layer.20.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -13665,31 +13266,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].mlp_norm, "layer.21.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_21 =
-        w.layers[21].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_21) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[21].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].gate_proj, "layer.21.gate_up"), w.layers[21].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[21].gate_up_proj_fused, "layer.21.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -14281,31 +13863,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].mlp_norm, "layer.22.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_22 =
-        w.layers[22].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_22) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[22].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].gate_proj, "layer.22.gate_up"), w.layers[22].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[22].gate_up_proj_fused, "layer.22.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -14897,31 +14460,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].mlp_norm, "layer.23.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_23 =
-        w.layers[23].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_23) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[23].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].gate_proj, "layer.23.gate_up"), w.layers[23].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[23].gate_up_proj_fused, "layer.23.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -15513,31 +15057,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].mlp_norm, "layer.24.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_24 =
-        w.layers[24].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_24) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[24].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].gate_proj, "layer.24.gate_up"), w.layers[24].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].up_proj, "layer.24.gate_up"), w.layers[24].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_24) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[24].gate_up_proj_fused, "layer.24.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
@@ -16129,31 +15654,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].mlp_norm, "layer.25.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_25 =
-        w.layers[25].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_25) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[25].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].gate_proj, "layer.25.gate_up"), w.layers[25].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].up_proj, "layer.25.gate_up"), w.layers[25].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_25) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[25].gate_up_proj_fused, "layer.25.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
@@ -16745,31 +16251,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].mlp_norm, "layer.26.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_26 =
-        w.layers[26].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_26) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[26].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].gate_proj, "layer.26.gate_up"), w.layers[26].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].up_proj, "layer.26.gate_up"), w.layers[26].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_26) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[26].gate_up_proj_fused, "layer.26.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
@@ -17361,31 +16848,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].mlp_norm, "layer.27.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_27 =
-        w.layers[27].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_27) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[27].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].gate_proj, "layer.27.gate_up"), w.layers[27].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].up_proj, "layer.27.gate_up"), w.layers[27].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_27) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[27].gate_up_proj_fused, "layer.27.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
@@ -17766,31 +17234,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].mlp_norm, "layer.0.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_0 =
-        w.layers[0].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_0) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[0].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].gate_proj, "layer.0.gate_up"), w.layers[0].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[0].gate_up_proj_fused, "layer.0.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -18053,31 +17502,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].mlp_norm, "layer.1.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_1 =
-        w.layers[1].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[1].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].gate_proj, "layer.1.gate_up"), w.layers[1].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[1].gate_up_proj_fused, "layer.1.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -18340,31 +17770,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].mlp_norm, "layer.2.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_2 =
-        w.layers[2].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_2) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[2].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].gate_proj, "layer.2.gate_up"), w.layers[2].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[2].gate_up_proj_fused, "layer.2.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -18627,31 +18038,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].mlp_norm, "layer.3.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_3 =
-        w.layers[3].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_3) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[3].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].gate_proj, "layer.3.gate_up"), w.layers[3].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[3].gate_up_proj_fused, "layer.3.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -18914,31 +18306,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].mlp_norm, "layer.4.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_4 =
-        w.layers[4].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_4) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[4].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].gate_proj, "layer.4.gate_up"), w.layers[4].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[4].gate_up_proj_fused, "layer.4.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -19201,31 +18574,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].mlp_norm, "layer.5.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_5 =
-        w.layers[5].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_5) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[5].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].gate_proj, "layer.5.gate_up"), w.layers[5].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[5].gate_up_proj_fused, "layer.5.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -19488,31 +18842,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].mlp_norm, "layer.6.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_6 =
-        w.layers[6].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_6) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[6].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].gate_proj, "layer.6.gate_up"), w.layers[6].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[6].gate_up_proj_fused, "layer.6.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -19775,31 +19110,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].mlp_norm, "layer.7.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_7 =
-        w.layers[7].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_7) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[7].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].gate_proj, "layer.7.gate_up"), w.layers[7].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[7].gate_up_proj_fused, "layer.7.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -20062,31 +19378,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].mlp_norm, "layer.8.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_8 =
-        w.layers[8].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_8) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[8].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].gate_proj, "layer.8.gate_up"), w.layers[8].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[8].gate_up_proj_fused, "layer.8.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -20349,31 +19646,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].mlp_norm, "layer.9.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_9 =
-        w.layers[9].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_9) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[9].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].gate_proj, "layer.9.gate_up"), w.layers[9].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[9].gate_up_proj_fused, "layer.9.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -20636,31 +19914,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].mlp_norm, "layer.10.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_10 =
-        w.layers[10].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_10) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[10].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].gate_proj, "layer.10.gate_up"), w.layers[10].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[10].gate_up_proj_fused, "layer.10.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -20923,31 +20182,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].mlp_norm, "layer.11.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_11 =
-        w.layers[11].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_11) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[11].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].gate_proj, "layer.11.gate_up"), w.layers[11].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[11].gate_up_proj_fused, "layer.11.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -21210,31 +20450,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].mlp_norm, "layer.12.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_12 =
-        w.layers[12].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_12) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[12].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].gate_proj, "layer.12.gate_up"), w.layers[12].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[12].gate_up_proj_fused, "layer.12.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -21497,31 +20718,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].mlp_norm, "layer.13.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_13 =
-        w.layers[13].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_13) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[13].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].gate_proj, "layer.13.gate_up"), w.layers[13].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[13].gate_up_proj_fused, "layer.13.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -21784,31 +20986,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].mlp_norm, "layer.14.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_14 =
-        w.layers[14].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_14) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[14].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].gate_proj, "layer.14.gate_up"), w.layers[14].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[14].gate_up_proj_fused, "layer.14.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -22071,31 +21254,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].mlp_norm, "layer.15.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_15 =
-        w.layers[15].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_15) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[15].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].gate_proj, "layer.15.gate_up"), w.layers[15].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[15].gate_up_proj_fused, "layer.15.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -22358,31 +21522,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].mlp_norm, "layer.16.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_16 =
-        w.layers[16].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_16) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[16].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].gate_proj, "layer.16.gate_up"), w.layers[16].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[16].gate_up_proj_fused, "layer.16.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -22645,31 +21790,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].mlp_norm, "layer.17.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_17 =
-        w.layers[17].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_17) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[17].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].gate_proj, "layer.17.gate_up"), w.layers[17].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[17].gate_up_proj_fused, "layer.17.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -22932,31 +22058,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].mlp_norm, "layer.18.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_18 =
-        w.layers[18].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_18) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[18].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].gate_proj, "layer.18.gate_up"), w.layers[18].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[18].gate_up_proj_fused, "layer.18.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -23219,31 +22326,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].mlp_norm, "layer.19.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_19 =
-        w.layers[19].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_19) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[19].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].gate_proj, "layer.19.gate_up"), w.layers[19].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[19].gate_up_proj_fused, "layer.19.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -23506,31 +22594,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].mlp_norm, "layer.20.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_20 =
-        w.layers[20].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_20) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[20].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].gate_proj, "layer.20.gate_up"), w.layers[20].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[20].gate_up_proj_fused, "layer.20.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -23793,31 +22862,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].mlp_norm, "layer.21.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_21 =
-        w.layers[21].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_21) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[21].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].gate_proj, "layer.21.gate_up"), w.layers[21].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[21].gate_up_proj_fused, "layer.21.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -24080,31 +23130,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].mlp_norm, "layer.22.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_22 =
-        w.layers[22].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_22) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[22].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].gate_proj, "layer.22.gate_up"), w.layers[22].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[22].gate_up_proj_fused, "layer.22.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -24367,31 +23398,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].mlp_norm, "layer.23.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_23 =
-        w.layers[23].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_23) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[23].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].gate_proj, "layer.23.gate_up"), w.layers[23].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[23].gate_up_proj_fused, "layer.23.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -24654,31 +23666,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].mlp_norm, "layer.24.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_24 =
-        w.layers[24].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_24) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[24].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].gate_proj, "layer.24.gate_up"), w.layers[24].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].up_proj, "layer.24.gate_up"), w.layers[24].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_24) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[24].gate_up_proj_fused, "layer.24.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
@@ -24941,31 +23934,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].mlp_norm, "layer.25.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_25 =
-        w.layers[25].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_25) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[25].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].gate_proj, "layer.25.gate_up"), w.layers[25].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].up_proj, "layer.25.gate_up"), w.layers[25].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_25) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[25].gate_up_proj_fused, "layer.25.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
@@ -25228,31 +24202,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].mlp_norm, "layer.26.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_26 =
-        w.layers[26].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_26) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[26].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].gate_proj, "layer.26.gate_up"), w.layers[26].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].up_proj, "layer.26.gate_up"), w.layers[26].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_26) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[26].gate_up_proj_fused, "layer.26.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
@@ -25515,31 +24470,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].mlp_norm, "layer.27.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_27 =
-        w.layers[27].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_27) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[27].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].gate_proj, "layer.27.gate_up"), w.layers[27].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].up_proj, "layer.27.gate_up"), w.layers[27].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_27) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[27].gate_up_proj_fused, "layer.27.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
@@ -25789,31 +24725,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].mlp_norm, "layer.0.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_0 =
-        w.layers[0].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_0) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[0].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].gate_proj, "layer.0.gate_up"), w.layers[0].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[0].gate_up_proj_fused, "layer.0.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -25891,31 +24808,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].mlp_norm, "layer.1.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_1 =
-        w.layers[1].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[1].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].gate_proj, "layer.1.gate_up"), w.layers[1].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[1].gate_up_proj_fused, "layer.1.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -25993,31 +24891,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].mlp_norm, "layer.2.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_2 =
-        w.layers[2].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_2) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[2].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].gate_proj, "layer.2.gate_up"), w.layers[2].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[2].gate_up_proj_fused, "layer.2.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -26095,31 +24974,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].mlp_norm, "layer.3.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_3 =
-        w.layers[3].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_3) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[3].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].gate_proj, "layer.3.gate_up"), w.layers[3].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[3].gate_up_proj_fused, "layer.3.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -26197,31 +25057,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].mlp_norm, "layer.4.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_4 =
-        w.layers[4].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_4) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[4].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].gate_proj, "layer.4.gate_up"), w.layers[4].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[4].gate_up_proj_fused, "layer.4.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -26299,31 +25140,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].mlp_norm, "layer.5.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_5 =
-        w.layers[5].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_5) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[5].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].gate_proj, "layer.5.gate_up"), w.layers[5].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[5].gate_up_proj_fused, "layer.5.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -26401,31 +25223,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].mlp_norm, "layer.6.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_6 =
-        w.layers[6].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_6) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[6].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].gate_proj, "layer.6.gate_up"), w.layers[6].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[6].gate_up_proj_fused, "layer.6.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -26503,31 +25306,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].mlp_norm, "layer.7.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_7 =
-        w.layers[7].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_7) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[7].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].gate_proj, "layer.7.gate_up"), w.layers[7].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[7].gate_up_proj_fused, "layer.7.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -26605,31 +25389,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].mlp_norm, "layer.8.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_8 =
-        w.layers[8].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_8) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[8].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].gate_proj, "layer.8.gate_up"), w.layers[8].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[8].gate_up_proj_fused, "layer.8.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -26707,31 +25472,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].mlp_norm, "layer.9.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_9 =
-        w.layers[9].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_9) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[9].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].gate_proj, "layer.9.gate_up"), w.layers[9].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[9].gate_up_proj_fused, "layer.9.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -26809,31 +25555,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].mlp_norm, "layer.10.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_10 =
-        w.layers[10].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_10) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[10].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].gate_proj, "layer.10.gate_up"), w.layers[10].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[10].gate_up_proj_fused, "layer.10.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -26911,31 +25638,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].mlp_norm, "layer.11.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_11 =
-        w.layers[11].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_11) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[11].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].gate_proj, "layer.11.gate_up"), w.layers[11].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[11].gate_up_proj_fused, "layer.11.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -27013,31 +25721,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].mlp_norm, "layer.12.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_12 =
-        w.layers[12].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_12) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[12].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].gate_proj, "layer.12.gate_up"), w.layers[12].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[12].gate_up_proj_fused, "layer.12.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -27115,31 +25804,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].mlp_norm, "layer.13.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_13 =
-        w.layers[13].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_13) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[13].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].gate_proj, "layer.13.gate_up"), w.layers[13].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[13].gate_up_proj_fused, "layer.13.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -27217,31 +25887,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].mlp_norm, "layer.14.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_14 =
-        w.layers[14].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_14) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[14].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].gate_proj, "layer.14.gate_up"), w.layers[14].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[14].gate_up_proj_fused, "layer.14.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -27319,31 +25970,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].mlp_norm, "layer.15.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_15 =
-        w.layers[15].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_15) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[15].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].gate_proj, "layer.15.gate_up"), w.layers[15].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[15].gate_up_proj_fused, "layer.15.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -27421,31 +26053,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].mlp_norm, "layer.16.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_16 =
-        w.layers[16].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_16) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[16].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].gate_proj, "layer.16.gate_up"), w.layers[16].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[16].gate_up_proj_fused, "layer.16.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -27523,31 +26136,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].mlp_norm, "layer.17.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_17 =
-        w.layers[17].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_17) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[17].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].gate_proj, "layer.17.gate_up"), w.layers[17].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[17].gate_up_proj_fused, "layer.17.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -27625,31 +26219,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].mlp_norm, "layer.18.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_18 =
-        w.layers[18].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_18) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[18].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].gate_proj, "layer.18.gate_up"), w.layers[18].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[18].gate_up_proj_fused, "layer.18.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -27727,31 +26302,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].mlp_norm, "layer.19.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_19 =
-        w.layers[19].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_19) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[19].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].gate_proj, "layer.19.gate_up"), w.layers[19].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[19].gate_up_proj_fused, "layer.19.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -27829,31 +26385,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].mlp_norm, "layer.20.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_20 =
-        w.layers[20].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_20) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[20].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].gate_proj, "layer.20.gate_up"), w.layers[20].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[20].gate_up_proj_fused, "layer.20.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -27931,31 +26468,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].mlp_norm, "layer.21.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_21 =
-        w.layers[21].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_21) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[21].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].gate_proj, "layer.21.gate_up"), w.layers[21].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[21].gate_up_proj_fused, "layer.21.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -28033,31 +26551,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].mlp_norm, "layer.22.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_22 =
-        w.layers[22].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_22) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[22].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].gate_proj, "layer.22.gate_up"), w.layers[22].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[22].gate_up_proj_fused, "layer.22.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -28135,31 +26634,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].mlp_norm, "layer.23.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_23 =
-        w.layers[23].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_23) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[23].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].gate_proj, "layer.23.gate_up"), w.layers[23].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[23].gate_up_proj_fused, "layer.23.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -28237,31 +26717,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].mlp_norm, "layer.24.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_24 =
-        w.layers[24].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_24) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[24].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].gate_proj, "layer.24.gate_up"), w.layers[24].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].up_proj, "layer.24.gate_up"), w.layers[24].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_24) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[24].gate_up_proj_fused, "layer.24.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
@@ -28339,31 +26800,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].mlp_norm, "layer.25.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_25 =
-        w.layers[25].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_25) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[25].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].gate_proj, "layer.25.gate_up"), w.layers[25].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].up_proj, "layer.25.gate_up"), w.layers[25].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_25) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[25].gate_up_proj_fused, "layer.25.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
@@ -28441,31 +26883,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].mlp_norm, "layer.26.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_26 =
-        w.layers[26].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_26) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[26].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].gate_proj, "layer.26.gate_up"), w.layers[26].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].up_proj, "layer.26.gate_up"), w.layers[26].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_26) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[26].gate_up_proj_fused, "layer.26.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
@@ -28543,31 +26966,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].mlp_norm, "layer.27.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_27 =
-        w.layers[27].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_27) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[27].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].gate_proj, "layer.27.gate_up"), w.layers[27].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].up_proj, "layer.27.gate_up"), w.layers[27].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_27) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[27].gate_up_proj_fused, "layer.27.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
@@ -28710,31 +27114,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].mlp_norm, "layer.0.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_0 =
-        w.layers[0].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_0) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[0].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].gate_proj, "layer.0.gate_up"), w.layers[0].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[0].gate_up_proj_fused, "layer.0.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -28830,31 +27215,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].mlp_norm, "layer.1.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_1 =
-        w.layers[1].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[1].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].gate_proj, "layer.1.gate_up"), w.layers[1].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[1].gate_up_proj_fused, "layer.1.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -28950,31 +27316,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].mlp_norm, "layer.2.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_2 =
-        w.layers[2].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_2) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[2].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].gate_proj, "layer.2.gate_up"), w.layers[2].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[2].gate_up_proj_fused, "layer.2.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -29070,31 +27417,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].mlp_norm, "layer.3.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_3 =
-        w.layers[3].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_3) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[3].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].gate_proj, "layer.3.gate_up"), w.layers[3].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[3].gate_up_proj_fused, "layer.3.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -29190,31 +27518,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].mlp_norm, "layer.4.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_4 =
-        w.layers[4].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_4) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[4].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].gate_proj, "layer.4.gate_up"), w.layers[4].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[4].gate_up_proj_fused, "layer.4.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -29310,31 +27619,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].mlp_norm, "layer.5.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_5 =
-        w.layers[5].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_5) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[5].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].gate_proj, "layer.5.gate_up"), w.layers[5].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[5].gate_up_proj_fused, "layer.5.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -29430,31 +27720,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].mlp_norm, "layer.6.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_6 =
-        w.layers[6].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_6) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[6].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].gate_proj, "layer.6.gate_up"), w.layers[6].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[6].gate_up_proj_fused, "layer.6.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -29550,31 +27821,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].mlp_norm, "layer.7.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_7 =
-        w.layers[7].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_7) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[7].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].gate_proj, "layer.7.gate_up"), w.layers[7].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[7].gate_up_proj_fused, "layer.7.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -29670,31 +27922,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].mlp_norm, "layer.8.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_8 =
-        w.layers[8].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_8) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[8].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].gate_proj, "layer.8.gate_up"), w.layers[8].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[8].gate_up_proj_fused, "layer.8.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -29790,31 +28023,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].mlp_norm, "layer.9.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_9 =
-        w.layers[9].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_9) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[9].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].gate_proj, "layer.9.gate_up"), w.layers[9].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[9].gate_up_proj_fused, "layer.9.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -29910,31 +28124,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].mlp_norm, "layer.10.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_10 =
-        w.layers[10].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_10) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[10].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].gate_proj, "layer.10.gate_up"), w.layers[10].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[10].gate_up_proj_fused, "layer.10.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -30030,31 +28225,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].mlp_norm, "layer.11.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_11 =
-        w.layers[11].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_11) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[11].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].gate_proj, "layer.11.gate_up"), w.layers[11].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[11].gate_up_proj_fused, "layer.11.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -30150,31 +28326,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].mlp_norm, "layer.12.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_12 =
-        w.layers[12].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_12) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[12].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].gate_proj, "layer.12.gate_up"), w.layers[12].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[12].gate_up_proj_fused, "layer.12.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -30270,31 +28427,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].mlp_norm, "layer.13.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_13 =
-        w.layers[13].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_13) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[13].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].gate_proj, "layer.13.gate_up"), w.layers[13].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[13].gate_up_proj_fused, "layer.13.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -30390,31 +28528,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].mlp_norm, "layer.14.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_14 =
-        w.layers[14].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_14) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[14].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].gate_proj, "layer.14.gate_up"), w.layers[14].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[14].gate_up_proj_fused, "layer.14.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -30510,31 +28629,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].mlp_norm, "layer.15.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_15 =
-        w.layers[15].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_15) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[15].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].gate_proj, "layer.15.gate_up"), w.layers[15].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[15].gate_up_proj_fused, "layer.15.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -30630,31 +28730,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].mlp_norm, "layer.16.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_16 =
-        w.layers[16].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_16) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[16].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].gate_proj, "layer.16.gate_up"), w.layers[16].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[16].gate_up_proj_fused, "layer.16.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -30750,31 +28831,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].mlp_norm, "layer.17.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_17 =
-        w.layers[17].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_17) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[17].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].gate_proj, "layer.17.gate_up"), w.layers[17].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[17].gate_up_proj_fused, "layer.17.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -30870,31 +28932,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].mlp_norm, "layer.18.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_18 =
-        w.layers[18].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_18) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[18].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].gate_proj, "layer.18.gate_up"), w.layers[18].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[18].gate_up_proj_fused, "layer.18.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -30990,31 +29033,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].mlp_norm, "layer.19.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_19 =
-        w.layers[19].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_19) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[19].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].gate_proj, "layer.19.gate_up"), w.layers[19].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[19].gate_up_proj_fused, "layer.19.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -31110,31 +29134,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].mlp_norm, "layer.20.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_20 =
-        w.layers[20].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_20) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[20].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].gate_proj, "layer.20.gate_up"), w.layers[20].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[20].gate_up_proj_fused, "layer.20.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -31230,31 +29235,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].mlp_norm, "layer.21.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_21 =
-        w.layers[21].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_21) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[21].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].gate_proj, "layer.21.gate_up"), w.layers[21].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[21].gate_up_proj_fused, "layer.21.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -31350,31 +29336,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].mlp_norm, "layer.22.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_22 =
-        w.layers[22].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_22) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[22].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].gate_proj, "layer.22.gate_up"), w.layers[22].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[22].gate_up_proj_fused, "layer.22.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -31470,31 +29437,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].mlp_norm, "layer.23.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_23 =
-        w.layers[23].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_23) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[23].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].gate_proj, "layer.23.gate_up"), w.layers[23].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[23].gate_up_proj_fused, "layer.23.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -31590,31 +29538,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].mlp_norm, "layer.24.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_24 =
-        w.layers[24].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_24) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[24].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].gate_proj, "layer.24.gate_up"), w.layers[24].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].up_proj, "layer.24.gate_up"), w.layers[24].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_24) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[24].gate_up_proj_fused, "layer.24.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
@@ -31710,31 +29639,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].mlp_norm, "layer.25.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_25 =
-        w.layers[25].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_25) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[25].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].gate_proj, "layer.25.gate_up"), w.layers[25].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].up_proj, "layer.25.gate_up"), w.layers[25].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_25) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[25].gate_up_proj_fused, "layer.25.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
@@ -31830,31 +29740,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].mlp_norm, "layer.26.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_26 =
-        w.layers[26].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_26) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[26].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].gate_proj, "layer.26.gate_up"), w.layers[26].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].up_proj, "layer.26.gate_up"), w.layers[26].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_26) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[26].gate_up_proj_fused, "layer.26.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
@@ -31950,31 +29841,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].mlp_norm, "layer.27.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_27 =
-        w.layers[27].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_27) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[27].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].gate_proj, "layer.27.gate_up"), w.layers[27].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].up_proj, "layer.27.gate_up"), w.layers[27].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_27) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[27].gate_up_proj_fused, "layer.27.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),

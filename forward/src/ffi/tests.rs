@@ -1090,6 +1090,7 @@ fn lowered_trace_round_trips_through_the_arena() {
         rope_table: 1,
         force_prefill_path: 0,
         head_dim_padded: 0,
+        gate_up_fused: 1,
     };
     let mut out = PieForwardPlan::default();
     assert_eq!(
@@ -1108,8 +1109,12 @@ fn lowered_trace_round_trips_through_the_arena() {
     // XQA) + the else arm's 5 — the Peel's prefix (the fused-post
     // region form) + tail (fused qk-norm+rope, the write guard's two
     // regions) — plus the plain XQA launch (this fixture is XQA-on; no
-    // capture variant, so no WantsAttnScore guard) = 421.
-    assert_eq!(launches.len(), 421);
+    // capture variant, so no WantsAttnScore guard) = 421, plus ONE
+    // swiglu per layer now that the activation states its kernel from
+    // the gate_up binding fact instead of leaving the choice to a
+    // workspace read (+28) = 449. The trace's op TOTAL is unchanged:
+    // every one of those was already a `Swiglu` statement.
+    assert_eq!(launches.len(), 449);
 
     let table = launches[0];
     assert_eq!(view::name(&out, table.weight_name), "launch_rope_standard_table");

@@ -460,6 +460,11 @@ struct PieForwardLlamaLikeCudaFacts {
   /// non-zero is true. Appended field: existing zero-initialized C
   /// callers read as false.
   uint8_t head_dim_padded;
+  /// The checkpoint bound a packed gate‖up bank, so the MLP activation
+  /// is the chunked swiglu over one buffer rather than the pair form
+  /// over two. Appended field, same zero-init rule — and the default is
+  /// the UNFUSED form, the conservative one.
+  uint8_t gate_up_fused;
 };
 
 /// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
