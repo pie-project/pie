@@ -204,9 +204,12 @@ std::size_t kv_page_bytes_homogeneous(const HfConfig& cfg,
                                       const KvCacheFormat& format);
 
 // Per-page bytes for a heterogeneous stack where layers may have
-// different head_dim or share physical pages (kv_source_layer).
+// different head_dim, different KV head counts, or share physical pages
+// (kv_source_layer). `per_layer_num_kv_heads` is the UNSHARDED count per
+// layer; pass it empty to use `cfg.num_key_value_heads` for every layer.
 std::size_t kv_page_bytes_per_layer(const HfConfig& cfg,
                                     const std::vector<int>& per_layer_head_dim,
+                                    const std::vector<int>& per_layer_num_kv_heads,
                                     const std::vector<int>& kv_source_layer,
                                     int tp_size,
                                     const KvCacheFormat& format);

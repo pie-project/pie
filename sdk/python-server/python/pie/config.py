@@ -35,16 +35,6 @@ class ServerConfig:
 
 
 # ---------------------------------------------------------------------------
-# [auth]
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AuthConfig:
-    enabled: Optional[bool] = None
-    authorized_users_dir: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
 # [telemetry]
 # ---------------------------------------------------------------------------
 
@@ -109,7 +99,6 @@ class ModelConfig:
 @dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
-    auth: AuthConfig = field(default_factory=AuthConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -122,7 +111,6 @@ class Config:
         emitters from drifting apart again.
         """
         _emit_table(buf, f"{prefix}server", _block(self.server))
-        _emit_table(buf, f"{prefix}auth", _block(self.auth))
         _emit_table(buf, f"{prefix}telemetry", _block(self.telemetry))
         _emit_table(buf, f"{prefix}runtime", _block(self.runtime))
         m = self.model
