@@ -264,7 +264,15 @@ int main(int argc, char** argv) {
     // the pool is the budget rather than the weights.
     // Under a tap dump every activation VALUE gets its own slot, so the pool
     // scales with the row count. 8 rows fit in 14 GB; 16 do not.
-    auto ctx = RawMetalContext::create(std::size_t(golden_taps_enabled() ? 12 : 8) << 30);
+    // 8 GiB fits every gemma-4 this test was written against and none of the
+    // 26B/31B builds, which is how a numerics harness stops being reachable
+    // exactly where the numbers are wrong. Overridable, so the next one is.
+    std::size_t heap_gib = golden_taps_enabled() ? 12 : 8;
+    if (const char* env = std::getenv("PIE_G4_HEAP_GIB"); env != nullptr && *env != '\0') {
+        const long v = std::atol(env);
+        if (v > 0) heap_gib = std::size_t(v);
+    }
+    auto ctx = RawMetalContext::create(heap_gib << 30);
     if (!ctx) {
         std::printf("  FAIL  RawMetalContext::create\n");
         return 1;
