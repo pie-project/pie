@@ -152,6 +152,14 @@ pub struct TuneArgs {
     /// still applies and the analytic score otherwise.
     #[arg(long)]
     pub skip_planner: bool,
+
+    /// Internal: run stage one only, then exit.
+    ///
+    /// `tune` re-execs itself with this to get stage one its own PROCESS, not
+    /// just its own boot — see `calibrate_planner`. Hidden because it is a
+    /// step of this command, not a mode an operator picks.
+    #[arg(long, hide = true)]
+    pub calibrate_only: bool,
 }
 
 impl TuneArgs {
@@ -510,6 +518,61 @@ async fn calibrate_planner(content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run stage one in a CHILD PROCESS and wait for it.
+///
+/// The engine allows one runtime per process — `bootstrap` latches on the way
+/// up and the admission pools behind it are `OnceLock`s whose own comment says
+/// "reset is by process exit only". Two boots in one process therefore do not
+/// merely fail, they fail three layers deep: the runtime flag first, then the
+/// program-manager and linker singletons, then the execution-slot capacity,
+/// each one a panic rather than an error. Stage two was unreachable on every
+/// machine for exactly this reason.
+///
+/// A child process is the contract the engine states, and it costs nothing
+/// this command was not already paying: stage one is a whole boot, so one more
+/// fork-and-exec is noise beside the weight load inside it.
+///
+/// The child reads the SAME config text this process derived — objective
+/// applied and all — through a temporary file and `PIE_CONFIG`, so the
+/// measurement is taken against the config the sweep is about to serve from
+/// rather than whatever is on disk.
+async fn calibrate_planner_in_child(content: &str, program: &str) -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("pie-tune-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, content).with_context(|| format!("write {}", cfg.display()))?;
+
+    let exe = std::env::current_exe().context("locate this executable")?;
+    let mut command = std::process::Command::new(exe);
+    // stdio is inherited, so the child's boot and calibration lines land in
+    // this command's output where the operator is already reading.
+    command
+        .env("PIE_CONFIG", &cfg)
+        .arg("config")
+        .arg("tune")
+        .arg("--calibrate-only")
+        .arg("--program")
+        .arg(program);
+
+    let status = tokio::task::spawn_blocking(move || command.status())
+        .await
+        .context("join the calibration child")?
+        .context("spawn the calibration child")?;
+
+    if !status.success() {
+        // The config is left behind ON FAILURE only: it is the derived one,
+        // not the file on disk, so it is the thing worth looking at when the
+        // calibration boot refuses it.
+        anyhow::bail!(
+            "the calibration boot failed ({status}); its output is above, and \
+             the config it was given is at {}",
+            cfg.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 /// Calibrate the planner, then sweep the frame knobs inside the arena that
 /// produced.
 pub async fn run(global: &startup::GlobalArgs, args: TuneArgs) -> Result<crate::ui::Answer> {
@@ -539,6 +602,14 @@ pub async fn run(global: &startup::GlobalArgs, args: TuneArgs) -> Result<crate::
     } else {
         content
     };
+
+    // The child this command re-execs for stage one. Placed after the
+    // objective is folded into `content` so the measurement is taken against
+    // the config the sweep will serve from, and before anything that boots.
+    if args.calibrate_only {
+        calibrate_planner(&content).await?;
+        return Ok(crate::ui::Answer::quiet());
+    }
 
     let (controller, gateway, worker) = crate::derive::derive_standalone(&content)?;
     let baseline = Knobs {
@@ -588,7 +659,7 @@ pub async fn run(global: &startup::GlobalArgs, args: TuneArgs) -> Result<crate::
         // measurement, and claiming "written to ..." after one would be this
         // command telling an operator it did something it did not.
         let before = written_at(&profile);
-        calibrate_planner(&content).await?;
+        calibrate_planner_in_child(&content, &args.program).await?;
         if written_at(&profile) == before {
             println!("  no measurement was recorded -- the driver declined to calibrate");
             println!("  (it refuses for tensor_parallel_size > 1 and recurrent-state models;");
