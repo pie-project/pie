@@ -342,7 +342,9 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kernel::GoRouterTopK:
                 bind_const<RouterParams>(
                     ctx, ord, (uint8_t)bind::GoRouterTopK::Params,
-                    RouterParams{(uint32_t)g.n_experts, (uint32_t)g.experts_per_token}, &count);
+                    RouterParams{(uint32_t)g.n_experts, (uint32_t)g.experts_per_token,
+                                 g.norm_topk_prob ? 0u : 1u},
+                    &count);
                 break;
             case Kernel::LlMoeCombine:
                 bind_const<ExpertCombineParams>(

@@ -75,9 +75,38 @@ template <typename T, bool SCALED>
   float v = lid < n ? float(logits[lid]) : NEG_INF;
 
   threadgroup float part_v[kRouterMaxSimdgroups];
+  threadgroup float part_s[kRouterMaxSimdgroups];
+  threadgroup float all_max;
+  threadgroup float all_sum;
   threadgroup uint part_i[kRouterMaxSimdgroups];
   threadgroup float chosen[kRouterMaxTopK];
   threadgroup uint winner_of_round;
+
+  // `norm_topk_prob: false` wants the softmax taken over EVERY expert and the
+  // top-k read out of it, so the k weights sum to less than one. Take that
+  // denominator here, before the selection loop consumes `v` -- each lane
+  // still holds its own logit and nothing has been knocked out yet.
+  if (p.softmax_over_all != 0u) {
+    const float m0 = simd_max(v);
+    if (simd_lid == 0) part_v[simd_gid] = m0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float best = NEG_INF;
+      for (uint sg = 0; sg < n_simd; ++sg) best = max(best, part_v[sg]);
+      all_max = best;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float e = lid < n ? fast::exp(v - all_max) : 0.0f;
+    const float s0 = simd_sum(e);
+    if (simd_lid == 0) part_s[simd_gid] = s0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float total = 0.0f;
+      for (uint sg = 0; sg < n_simd; ++sg) total += part_s[sg];
+      all_sum = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
 
   for (uint r = 0; r < k; ++r) {
     const float m = simd_max(v);
@@ -108,12 +137,18 @@ template <typename T, bool SCALED>
   }
 
   if (lid == 0) {
-    float mx = NEG_INF;
-    for (uint r = 0; r < k; ++r) mx = max(mx, chosen[r]);
-    float sum = 0.0f;
+    // Either denominator, one shape: exponentiate against a max and divide by
+    // a sum. Which max and which sum is the whole of `norm_topk_prob`.
+    float mx = all_max;
+    float sum = all_sum;
+    if (p.softmax_over_all == 0u) {
+      mx = NEG_INF;
+      for (uint r = 0; r < k; ++r) mx = max(mx, chosen[r]);
+      sum = 0.0f;
+      for (uint r = 0; r < k; ++r) sum += fast::exp(chosen[r] - mx);
+    }
     for (uint r = 0; r < k; ++r) {
       chosen[r] = fast::exp(chosen[r] - mx);
-      sum += chosen[r];
     }
     for (uint r = 0; r < k; ++r) {
       float weight = chosen[r] / sum;
