@@ -2018,7 +2018,11 @@ void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,
                 break;
 
             case Kernel::QmvLmHead:
-                // logits ALWAYS produced into the IO region (I3).
+            case Kernel::LmHeadUntied:
+                // logits ALWAYS produced into the IO region (I3). Both kinds,
+                // because which one the tail is depends only on whether the
+                // head is its own tensor -- and an untied head that wrote
+                // nowhere is exactly as silent as one that wrote here.
                 bind_slot(ctx, ord, (uint8_t)bind::Qmv::Out, io(IoSlot::Logits));
                 break;
 
