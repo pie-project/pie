@@ -1583,6 +1583,36 @@ pub mod cuda {
     /// One value either way: the trace declares ONE packed matmul before
     /// this, and whether the binding materialised it as one buffer or two
     /// is a BUFFER question, which is `lower::Buffers`'.
+    /// `kernels::launch_topk_softmax_bf16`: the router's top-k + softmax +
+    /// renormalize, one launch, two results — expert indices
+    /// (`[Tokens, k]` i32, the `dyn` value every expert-indexed statement
+    /// consumes) and routing weights (`[Tokens, k]` f32).
+    ///
+    /// The first statement of the MoE branch's CUDA text. The SEMANTIC
+    /// [`super::topk`] stays opaque; this one names the kernel, which is
+    /// what `lower()` needs before an expert-routed body can be a list of
+    /// rectangles rather than residue.
+    pub fn topk(logits: &Val, k: u32) -> (Val, Val) {
+        let ids = logits.t.with(logits.layer, |b| {
+            b.launch(
+                "launch_topk_softmax_bf16",
+                vec![],
+                None,
+                vec![logits.id],
+                vec![
+                    (Shape(vec![Dim::Tokens, Dim::Const(k)]), DType::I32),
+                    (Shape(vec![Dim::Tokens, Dim::Const(k)]), DType::F32),
+                ],
+            )
+        });
+        let mk = |id| Val {
+            t: logits.t.clone(),
+            id,
+            layer: logits.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
     pub fn swiglu(x: &Val, intermediate: u32, packed: bool) -> Val {
         record(
             &x.t,

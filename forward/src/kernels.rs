@@ -181,6 +181,12 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(chunked_swiglu "launch_chunked_swiglu_bf16"),
     kernel!(swiglu "launch_swiglu_bf16"),
 
+    // ── MoE ────────────────────────────────────────────────────────
+    // The router's top-k. The rest of the expert branch (the grouped
+    // GEMM and the two combine forms) joins as `moe_mlp_body_cuda`
+    // states them.
+    kernel!(topk_softmax "launch_topk_softmax_bf16"),
+
     // ── adapters ───────────────────────────────────────────────────
     kernel!(lora_qkv_correction "pie_lora_qkv_correction"),
 

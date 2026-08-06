@@ -761,6 +761,14 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
             Semantic::Unlowered("the fused-gate_up binding fact is not in the facts")
         }
 
+        // The router: one launch, two results. Stated by
+        // `dsl::cuda::topk`; the SEMANTIC `TopK` is still opaque, so a
+        // trace that has not been given a CUDA reading reaches here and
+        // is refused by name rather than covered by accident.
+        TopK { .. } => {
+            Semantic::Unlowered("the MoE branch has no CUDA text yet (dsl::cuda::topk states the kernel)")
+        }
+
         // Handled by `Lowerer::epilogue`, which needs the row counts and
         // so cannot answer from the kind alone.
         LmHead { .. } => Semantic::Structural,
