@@ -68,49 +68,72 @@ async fn main(input: Input) -> Result<String> {
     // Build and execute tree in parallel
     let level1_futures = (0..num_branches)
         .map(|_| {
-            let mut propose_ctx = ctx_root.fork()?;
             let question_ = question.clone();
+            let model_name_1 = model_name.clone();
             Ok(async move {
-                // Level 1: Propose Plan
+                let sys_prompt = "You are a helpful, respectful, and honest assistant that excels at \
+                    mathematical reasoning. Please follow the user\'s instructions precisely.";
+                // Level 1: Propose Plan (no fork - fresh context)
+                let model1 = Model::load(&model_name_1)?;
+                let mut propose_ctx = Context::new(&model1)?;
+                propose_ctx.system(sys_prompt);
                 let propose_prompt = format!("{}{}", PROPOSE_PROMPT_TEMPLATE, question_);
                 propose_ctx.user(&propose_prompt);
                 propose_ctx.cue();
 
-                propose_ctx
+                let propose_text = propose_ctx
                     .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
                     .max_tokens(max_tokens_per_step)
                     .collect_text()
                     .await?;
-
-                // Level 2: Execute Plan
-                propose_ctx.user(EXECUTE_PROMPT);
-                propose_ctx.flush().await?;
+                println!("\n[1] PROPOSE: {}", propose_text);
 
                 let level2_futures = (0..num_branches)
                     .map(|_| {
-                        let mut execute_ctx = propose_ctx.fork()?;
+                        let model_name_2 = model_name_1.clone();
+                        let propose_prompt_ = propose_prompt.clone();
+                        let propose_text_ = propose_text.clone();
                         Ok(async move {
+                            // Level 2: Execute Plan (no fork - fresh context, replay as text)
+                            let model2 = Model::load(&model_name_2)?;
+                            let mut execute_ctx = Context::new(&model2)?;
+                            execute_ctx.system(sys_prompt);
+                            execute_ctx.user(&propose_prompt_);
+                            execute_ctx.assistant(&propose_text_);
+                            execute_ctx.user(EXECUTE_PROMPT);
                             execute_ctx.cue();
-                            execute_ctx
+
+                            let execute_text = execute_ctx
                                 .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
                                 .max_tokens(max_tokens_per_step)
                                 .collect_text()
                                 .await?;
-
-                            // Level 3: Reflect on Solution
-                            execute_ctx.user(REFLECT_PROMPT);
-                            execute_ctx.flush().await?;
+                            println!("\nEXECUTE: {}", execute_text);
 
                             let level3_futures = (0..num_branches)
                                 .map(|_| {
-                                    let mut reflect_ctx = execute_ctx.fork()?;
+                                    let model_name_3 = model_name_2.clone();
+                                    let propose_prompt_3 = propose_prompt_.clone();
+                                    let propose_text_3 = propose_text_.clone();
+                                    let execute_text_3 = execute_text.clone();
                                     Ok(async move {
+                                        // Level 3: Reflect (no fork - fresh context, replay as text)
+                                        let model3 = Model::load(&model_name_3)?;
+                                        let mut reflect_ctx = Context::new(&model3)?;
+                                        reflect_ctx.system(sys_prompt);
+                                        reflect_ctx.user(&propose_prompt_3);
+                                        reflect_ctx.assistant(&propose_text_3);
+                                        reflect_ctx.user(EXECUTE_PROMPT);
+                                        reflect_ctx.assistant(&execute_text_3);
+                                        reflect_ctx.user(REFLECT_PROMPT);
                                         reflect_ctx.cue();
-                                        reflect_ctx
+
+                                        let reflect_text = reflect_ctx
                                             .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
                                             .max_tokens(max_tokens_per_step)
                                             .collect_text()
                                             .await?;
+                                        println!("\nREFLECT: {}", reflect_text);
                                         Ok::<_, String>(())
                                     })
                                 })
