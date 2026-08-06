@@ -785,11 +785,32 @@ void warn_once_if_the_gpu_leaked_memory_before_this_run() {
     }();
 }
 
+// What a weight that is COPIED into the heap costs the host while it is being
+// copied: the heap byte it becomes, and the mmap byte it is read from, at the
+// same time. Both are resident, so the process peaks at twice what the GPU
+// ends up holding, and it peaks there during load -- before the first
+// dispatch, and before anything else here has had a chance to refuse.
+//
+// Measured rather than assumed, because the doubling is not obvious from any
+// one number this file computes: Llama-3.2-1B is 0.65 GiB of weights and
+// peaks at 1.42 GiB (2.19x), gemma-4-e2b is 2.43 GiB and peaks at 4.90 GiB
+// (2.02x). Weights bound where they lie are exempt -- there is no second copy
+// of a tensor the GPU reads out of the mapping -- which is why the caller
+// passes the copied bytes and not the model.
+//
+// This is what six kernel panics on the 48 GiB M4 Pro were: a checkpoint of
+// 18.16 GiB passed a check that compared ~19 GiB against a quiet machine's
+// free memory and then peaked at 40.5 GiB, which took free memory to 60 MiB.
+// The panics differed -- a data abort on a PAC-mangled pointer, a WindowServer
+// watchdog, an assertion inside IOGPUGroupMemory -- and every one of them had
+// free memory under 200 MiB. The kernel dies of this in whatever way it
+// happens to die; what it does not do is give the byte back.
 bool fits_on_this_gpu(std::size_t heap_bytes,
                       std::size_t elastic_bytes,
                       std::size_t resident_weights,
                       std::string* err,
-                      const ElasticBreakdown* parts = nullptr) {
+                      const ElasticBreakdown* parts = nullptr,
+                      std::size_t transient_copy_bytes = 0) {
     warn_once_if_the_gpu_leaked_memory_before_this_run();
     const std::size_t limit = RawMetalContext::device_working_set_bytes();
     if (limit == 0) return true;  // the device would not say; do not invent one
@@ -817,8 +838,13 @@ bool fits_on_this_gpu(std::size_t heap_bytes,
             ? 0  // a forced ceiling describes a device, not this machine
             : RawMetalContext::host_reclaimable_bytes();
     constexpr std::size_t kHostMargin = 2ull * 1024 * 1024 * 1024;
+    // The host bound is about the PEAK, not the steady state. The device
+    // ceiling above is right to ignore the copy -- the GPU never holds it --
+    // but the machine does hold it, and it is the larger of the two numbers
+    // for any checkpoint that has to be copied at all.
+    const std::size_t host_want = want + transient_copy_bytes;
     const bool host_bound =
-        reclaimable != 0 && want + kHostMargin > reclaimable && want <= limit;
+        reclaimable != 0 && host_want + kHostMargin > reclaimable && want <= limit;
 
     if (want <= limit && !host_bound) return true;
     if (err) {
@@ -829,10 +855,17 @@ bool fits_on_this_gpu(std::size_t heap_bytes,
             *err = "this model does not fit the memory this machine has left: "
                    "it needs " + gib(want) + " GiB resident (" +
                    gib(resident_weights) + " GiB of weights, " +
-                   gib(elastic_bytes) + " GiB of KV, state and scratch) and only " +
-                   gib(reclaimable) + " GiB is reclaimable. The GPU itself would "
-                   "hold " + gib(limit) + " GiB, so this is the machine, not the "
-                   "device: something else already has the memory. On macOS a "
+                   gib(elastic_bytes) + " GiB of KV, state and scratch)" +
+                   (transient_copy_bytes != 0
+                        ? " and " + gib(transient_copy_bytes) +
+                              " GiB more while it loads, because a weight that is copied "
+                              "into the heap is resident twice -- once in the heap and "
+                              "once in the mapping it is read from -- so the peak is " +
+                              gib(host_want) + " GiB and not " + gib(want) + " GiB"
+                        : "") +
+                   ", and only " + gib(reclaimable) + " GiB is reclaimable. The GPU "
+                   "itself would hold " + gib(limit) + " GiB, so this is the machine, "
+                   "not the device: something else already has the memory. On macOS a "
                    "previously wedged run is the usual cause -- it survives "
                    "kill -9, holds its pages, and is only cleared by a reboot.";
             return false;
@@ -967,8 +1000,17 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // A slab makes `streamed` mean something else: those bytes are read from an
     // mmap the GPU never sees, so they are neither allocated nor resident, and
     // adding them here would refuse exactly the models this exists to run.
+    //
+    // What IS resident twice is whatever had to be copied into the heap, and
+    // for these checkpoints that is nearly the whole model -- `extra` is KV and
+    // scratch, which is built rather than read, and a slab's budget is filled
+    // from the mapping a band at a time rather than all at once.
+    const std::size_t copied =
+        heap_bytes >= extra + (slab ? std::size_t(cfg.expert_slab_bytes) : 0)
+            ? heap_bytes - extra - (slab ? std::size_t(cfg.expert_slab_bytes) : 0)
+            : 0;
     if (!fits_on_this_gpu(slab ? heap_bytes : heap_bytes + streamed, 0,
-                          slab ? heap_bytes : weights, err)) {
+                          slab ? heap_bytes : weights, err, nullptr, copied)) {
         return false;
     }
     // Two marks, because between them lies the answer to "why is loading slow"
@@ -1157,8 +1199,11 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                      max_ctx_, mb(elastic_parts.kv_ring), mb(elastic_parts.kv_pool),
                      mb(elastic_parts.state), mb(elastic_parts.scratch));
     }
+    // `resident_weights` is exactly what gets copied: the model minus whatever
+    // is bound where it lies. Every one of those bytes is resident twice while
+    // the copy runs -- see `fits_on_this_gpu`.
     if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err,
-                          &elastic_parts))
+                          &elastic_parts, resident_weights))
         return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);

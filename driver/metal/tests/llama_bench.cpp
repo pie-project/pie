@@ -446,6 +446,46 @@ int main(int argc, char** argv) {
                     too_big.c_str());
     }
 
+    // The device ceiling is not the bound that killed this machine. Six kernel
+    // panics on the 48 GiB M4 Pro all had free memory under 200 MiB, and the
+    // run that caused the last one had passed every check above: an 18.16 GiB
+    // checkpoint, a device that would hold far more, and a process that peaked
+    // at 40.5 GiB. A weight copied into the heap is resident TWICE while the
+    // copy runs -- once in the heap and once in the mapping it is read from --
+    // and nothing checked the second one.
+    //
+    // So this probe gives the driver room for the checkpoint and the whole
+    // margin, and nothing for the second copy.
+    //
+    // The assertion is on the MESSAGE and not merely on the refusal, and that
+    // is what makes this a regression gate rather than a coincidence: the
+    // clause named below is emitted only when the copy is actually counted, so
+    // deleting that term fails this test whether the driver then refuses for
+    // some other reason or admits the model outright.
+    {
+        const std::size_t kMargin = 2ull << 30;
+        const std::size_t left = std::size_t(weight_bytes) + kMargin;
+        RawMetalContext::set_host_reclaimable_bytes_for_test(left);
+        MetalExecutor probe;
+        std::string why;
+        const bool set_up = probe.setup(cfg, &why);
+        RawMetalContext::set_host_reclaimable_bytes_for_test(0);
+        if (set_up) {
+            std::printf("  FAIL  setup succeeded on a machine with only %.2f GiB left, "
+                        "against %.2f GiB of weights that are resident twice while they "
+                        "load\n",
+                        double(left) / (1 << 30), double(weight_bytes) / (1 << 30));
+            return 1;
+        }
+        if (why.find("does not fit the memory this machine has left") == std::string::npos ||
+            why.find("resident twice") == std::string::npos) {
+            std::printf("  FAIL  refused, but not for the load-time peak: %s\n", why.c_str());
+            return 1;
+        }
+        std::printf("  PASS  refused a model whose load-time peak the machine could not "
+                    "hold: %s\n", why.c_str());
+    }
+
     MetalExecutor exec;
     std::string err;
     const double t_load0 = now_s();
