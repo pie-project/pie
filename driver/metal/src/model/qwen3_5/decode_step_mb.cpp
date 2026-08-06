@@ -87,8 +87,15 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         d.qmm_bm = qmm_bm(n);
         // The second quantized set has a matvec and no GEMM: a checkpoint that
         // spares its two routing projections at 8 bits gets one extra pipeline
-        // table, not an extra table of every batched shape. Both are
-        // hidden-by-a-few, so this costs nothing worth a second table.
+        // table, not an extra table of every batched shape.
+        //
+        // Measured, because a router runs once per prompt ROW and 40 layers of
+        // them is not obviously free: building the strided GEMM at the second
+        // format too and putting the router back on the batched path moved a
+        // 128-token prefill of Qwen3.6-35B-A3B from 222.4 to 223.7 tok/s, which
+        // is inside the run-to-run spread. The dispatch trace names it 8.5% of
+        // GPU time and that share is a decode's, where the batched path does
+        // not apply. So the second table stays two pipelines.
         if (qwen35_uses_alt_quant(d.kind, g)) d.qmm_bn = 0;
         // NO split-K, for exactly the reason gemma4's `launch_shape_mb` gives:
         // the split GEMM writes `split_k` partial [M, N] slices into a side
