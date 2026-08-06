@@ -1039,7 +1039,7 @@ fn value_bytes(plan: &ForwardPlan, v: ValueId, n_tokens: usize, n_requests: usiz
     }
     elements
         * match info.dtype {
-            DType::BF16 => 2,
+            DType::BF16 | DType::F16 => 2,
             DType::F32 | DType::I32 => 4,
         }
 }
@@ -1236,6 +1236,45 @@ mod tests {
     /// the dispatch — and states two kernels of its own, so an empty
     /// ledger here is a claim about those two as much as about the body.
     const LEDGER_GEMMA4_PREFILL: &[&str] = &[];
+
+    /// gpt-oss's residue LEDGER — the fourth family's, opened the day the
+    /// text was written and before any executor exists.
+    ///
+    /// gpt-oss is the first family whose MoE block is stated end to end,
+    /// which is the whole reason to open this list here: the decode leg
+    /// is seven rectangles because two GEMVs carry the expert axis
+    /// INSIDE the value, and if any of that were wrong it would show up
+    /// as a line below rather than as a wrong number later.
+    #[test]
+    fn the_gpt_oss_residue_ledger() {
+        let facts = crate::facts::GptOssFacts::gpt_oss_20b();
+        let cuda = crate::facts::GptOssCudaFacts::gpt_oss_20b_synthetic();
+        let plan = family::gpt_oss_cuda(&facts, &cuda, FireClass::Decode);
+        let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
+        let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
+        for u in &out.residue {
+            *ledger
+                .entry(format!("{}: {}", u.kind, u.why))
+                .or_default() += 1;
+        }
+        let seen: Vec<String> = ledger
+            .iter()
+            .map(|(k, n)| format!("{n:>4}  {k}"))
+            .collect();
+        let expected: Vec<String> = LEDGER_GPT_OSS_DECODE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            seen, expected,
+            "the gpt-oss residue ledger moved.\n\
+             Every line here is a statement the flat list does not carry."
+        );
+        assert!(
+            !out.launches.is_empty(),
+            "a fire that executes nothing is not a fire"
+        );
+    }
+
+    /// See [`the_gpt_oss_residue_ledger`]. One entry per (kind, reason).
+    const LEDGER_GPT_OSS_DECODE: &[&str] = &[];
 
     /// THE GEMMA-4 CUTOVER GATE, in the shape the other two families'
     /// take: every statement a live fire executes is a rectangle in the

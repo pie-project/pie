@@ -7,7 +7,7 @@
 //! programs differ, not the way two runtime paths do.
 
 use crate::facts::{
-    Gemma4CudaFacts, Gemma4Facts, LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
+    Gemma4CudaFacts, Gemma4Facts, GptOssCudaFacts, GptOssFacts, LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 use crate::dsl::{
@@ -3488,5 +3488,223 @@ pub fn gemma4_cuda(
         if facts.logit_softcap > 0.0 {
             dsl::cuda::logit_softcap(&logits, facts.vocab);
         }
+    })
+}
+
+// ── gpt-oss ────────────────────────────────────────────────────────────
+
+/// One gpt-oss layer's weight handles. The family rides `mixtral.cpp`,
+/// so these are that file's names.
+struct GptOssLayerW {
+    attn_norm: NormW,
+    q_proj: MatW,
+    k_proj: MatW,
+    v_proj: MatW,
+    q_bias: MatW,
+    k_bias: MatW,
+    v_bias: MatW,
+    o_proj: MatW,
+    o_bias: MatW,
+    sinks: MatW,
+    mlp_norm: NormW,
+    router: MatW,
+    router_bias: MatW,
+    expert_gate_up: MatW,
+    expert_down: MatW,
+}
+
+impl GptOssLayerW {
+    fn new(l: u32, f: &GptOssFacts) -> Self {
+        let m = |name: &str, width: u32| MatW {
+            name: name.into(),
+            width,
+            layer: Some(l),
+        };
+        let d = f.head_dim;
+        Self {
+            attn_norm: NormW {
+                name: "attn_norm".into(),
+                variant: NormVariant::Plain,
+                per_head: None,
+                layer: Some(l),
+            },
+            q_proj: m("q_proj", f.q_heads * d),
+            k_proj: m("k_proj", f.kv_heads * d),
+            v_proj: m("v_proj", f.kv_heads * d),
+            q_bias: m("q_bias", f.q_heads * d),
+            k_bias: m("k_bias", f.kv_heads * d),
+            v_bias: m("v_bias", f.kv_heads * d),
+            o_proj: m("o_proj", f.hidden),
+            o_bias: m("o_bias", f.hidden),
+            sinks: m("attn_sinks", f.q_heads),
+            mlp_norm: NormW {
+                name: "mlp_norm".into(),
+                variant: NormVariant::Plain,
+                per_head: None,
+                layer: Some(l),
+            },
+            router: m("router", f.experts),
+            router_bias: m("router_bias", f.experts),
+            expert_gate_up: m("expert_gate_up_bank", f.intermediate),
+            expert_down: m("expert_down_bank", f.hidden),
+        }
+    }
+}
+
+/// gpt-oss's CUDA text — the DECODE class, and the first family whose
+/// MoE block is stated end to end.
+///
+/// Mirrors `mixtral.cpp::mixtral_forward_paged` at `tp_size == 1`, which
+/// is what `bind_gpt_oss` returns weights for: gpt-oss has no forward of
+/// its own, only a binder.
+///
+/// Three things here exist in no other family's text.
+///
+/// **The sink.** gpt-oss learns a per-head logit that joins the softmax
+/// denominator without contributing a value. flashinfer's
+/// DefaultAttention will not emit it, so the driver asks the dispatch
+/// for its LSE and rescales the output by `sigmoid(lse - sink)`. The
+/// declaration says this by having the attention statement produce TWO
+/// values on a sink-carrying layer — the `lse_out` argument is the whole
+/// difference, and the symbol does not change.
+///
+/// **The MXFP4 routed leg.** The expert weights are never materialized:
+/// two GEMVs read the packed nibbles out of HBM and index the experts
+/// through a device pointer array. That leg is SEVEN rectangles and no
+/// host sync. The alternative — a serial per-expert walk whose launch
+/// count depends on what the router picked, behind a D2H that drains the
+/// stream — is refused by name below, not stated.
+///
+/// **The clamped GLU.** `swiglu_limit` is a config constant, so gpt-oss
+/// states a different activation kernel rather than passing a limit.
+///
+/// Not stated, deliberately: yarn. The config asks for it (factor 32)
+/// and `mixtral.cpp:320` passes the plain `rope_theta`, so the driver
+/// never applies it. Declaring the scaled rope here would make this text
+/// disagree with the pass it mirrors — the bug is real and belongs in a
+/// fix to that line, not laundered into a fact.
+pub fn gpt_oss_cuda(
+    facts: &GptOssFacts,
+    cuda: &GptOssCudaFacts,
+    class: FireClass,
+) -> ForwardPlan {
+    assert!(
+        cuda.mxfp4_decode_gemv,
+        "gpt_oss states the fused MXFP4 decode leg; a deployment without \
+         the per-expert pointer arrays reaches the experts by a host walk \
+         this declaration refuses"
+    );
+    assert!(
+        !cuda.streamed_experts,
+        "gpt_oss states the resident bank; a streamed one reaches the same \
+         kernels only after a host round-trip that decides what to page in"
+    );
+    let family = format!(
+        "gpt_oss.cuda.{}",
+        match class {
+            FireClass::Decode => "decode",
+            other => panic!("gpt_oss states no {other:?} class yet"),
+        }
+    );
+    let hidden = facts.hidden;
+    dsl::trace_named(&family, |t| {
+        let mut y = dsl::embed_with(t, "embed", hidden);
+
+        for l in 0..facts.layers {
+            let w = GptOssLayerW::new(l, facts);
+            let kv = dsl::Kv::at(t, l);
+            let normed = rmsnorm(&y, &w.attn_norm);
+
+            // The q/k/v biases FOLD INTO the projection's epilogue
+            // (`gemm_act_x_wt_bias_bf16`): at decode these route to the
+            // warp-per-row GEMV, which absorbs the bias for free. Stating
+            // them as separate AddBias ops — which this text did until a
+            // census of its own golden was read against the driver — is
+            // three extra launches per layer and a different accumulation
+            // order, and nothing that only asks whether the trace LOWERS
+            // would have said so.
+            let proj = |x: &Val, w: &MatW, b: &MatW| {
+                if facts.attention_bias {
+                    dsl::cuda::gemm_bias(x, w, b)
+                } else {
+                    matmul(x, w)
+                }
+            };
+            let q = proj(&normed, &w.q_proj, &w.q_bias);
+            let k = proj(&normed, &w.k_proj, &w.k_bias);
+            let v = proj(&normed, &w.v_proj, &w.v_bias);
+
+            let (q, k) = dsl::rope(&q, &k, RopeKind::Standard);
+            dsl::cuda::write_kv_to_pages(&k, &v, &kv);
+
+            // The sink layers ask for the LSE; a layer without sinks
+            // takes the one-value dispatch and saves the write.
+            let a = if facts.attn_sinks {
+                let (o, lse) =
+                    dsl::cuda::attention_flashinfer_decode_lse(&q, &kv, facts.q_heads);
+                dsl::cuda::attention_sink_rescale(&o, &lse, &w.sinks)
+            } else {
+                dsl::cuda::attention_flashinfer_decode(&q, &kv)
+                    .expect("the decode class states its attention")
+            };
+
+            // o_proj folds the RESIDUAL (beta=1) and not its bias: the
+            // hand-written tp=1 arm calls the plain gemm and then
+            // `launch_add_bias_bf16`. The one place in this layer where
+            // the split spelling is the truthful one.
+            y += matmul(&a, &w.o_proj);
+            if facts.attention_bias {
+                y = dsl::add_bias(&y, &w.o_bias);
+            }
+
+            // ── The MoE block ───────────────────────────────────────
+            let mlp_in = rmsnorm(&y, &w.mlp_norm);
+            let logits = proj(&mlp_in, &w.router, &w.router_bias);
+            let (experts, weights) = dsl::cuda::topk(&logits, facts.top_k);
+
+            let act = dsl::cuda::bf16_to_fp16(&mlp_in);
+            let (gate, up) = dsl::cuda::mxfp4_moe_gate_up_decode(
+                &act,
+                &experts,
+                &w.expert_gate_up,
+                facts.top_k,
+                facts.intermediate,
+            );
+            // The clamp is the whole fork, and a checkpoint without one
+            // takes `launch_swiglu_bf16`'s PAIR form — a spelling no
+            // statement carries yet. Refused by name rather than guessed:
+            // every gpt-oss release so far clamps, so an unclamped one
+            // would be the first thing this text had never seen.
+            assert!(
+                facts.swiglu_limit > 0.0,
+                "gpt_oss without a swiglu limit states no activation yet"
+            );
+            let routed = dsl::cuda::gpt_oss_glu(&gate, &up, facts.intermediate);
+            let routed = dsl::cuda::bf16_to_fp16(&routed);
+            let out = dsl::cuda::mxfp4_moe_down_decode(
+                &routed,
+                &experts,
+                &w.expert_down,
+                facts.top_k,
+                hidden,
+            );
+            // The combine writes to scratch and the landing is its own
+            // launch — mixtral's tp=1 shape. (The `_add` fused form
+            // exists, and this pass does not take it.)
+            let combined = dsl::cuda::weighted_sum(&weights, &out, hidden, None);
+            y = dsl::cuda::residual_add(&combined, &y, hidden);
+        }
+
+        let normed = rmsnorm(
+            &y,
+            &NormW {
+                name: "final_norm".into(),
+                variant: NormVariant::Plain,
+                per_head: None,
+                layer: None,
+            },
+        );
+        let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
+        dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
     })
 }

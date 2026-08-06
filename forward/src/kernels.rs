@@ -242,6 +242,25 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(moe_weighted_sum "launch_token_batched_weighted_sum_bf16"),
     kernel!(moe_weighted_sum_add "launch_token_batched_weighted_sum_add_bf16"),
 
+    // ── gpt-oss ────────────────────────────────────────────────────
+    // The sink rescale, and the fp32 LSE it eats. The LSE has no row of
+    // its own: it is a second OUTPUT of the decode dispatch, requested
+    // by an argument, so the kernel that changes is none.
+    // A projection with its bias in the EPILOGUE — one launch where a
+    // matmul plus an AddBias is two, and a different accumulation order.
+    kernel!(gemm_bias "ops::gemm_act_x_wt_bias_bf16"),
+    kernel!(attention_sink_rescale "launch_attention_sink_rescale_bf16"),
+    kernel!(bf16_to_fp16 "launch_bf16_to_fp16"),
+    // The routed MXFP4 GEMVs. Like qwen3_5's GEMV leg the expert axis
+    // rides INSIDE the value, so each is one rectangle over `N * k`
+    // routes; unlike it, the weight slot names a per-expert POINTER
+    // BANK, which is a binding question and not a shape one.
+    kernel!(mxfp4_moe_gate_up "launch_mxfp4_moe_gate_up_decode_bf16"),
+    kernel!(mxfp4_moe_down "launch_mxfp4_moe_down_decode_bf16"),
+    // SwiGLU with a clamp. `swiglu_limit` is a config constant, so this
+    // is a different kernel and not a different argument.
+    kernel!(gpt_oss_glu "launch_gpt_oss_glu_bf16"),
+
     // ── adapters ───────────────────────────────────────────────────
     kernel!(lora_qkv_correction "pie_lora_qkv_correction"),
 

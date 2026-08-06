@@ -2210,6 +2210,209 @@ pub mod cuda {
         attn_at(q, kv, "ops::launch_attention_flashinfer_prefill")
     }
 
+    /// `ops::dispatch_attention_flashinfer_decode` asked for its LSE.
+    ///
+    /// The SAME symbol as [`attention_flashinfer_decode`] and a
+    /// different call: `lse_out` is the last positional argument of
+    /// every flashinfer entry point, and the driver passes it only on
+    /// layers that carry attention sinks (`layer.attn_sinks != nullptr`,
+    /// a load-time per-layer answer). Supplying it costs a per-layer
+    /// write, which is why plain Mixtral layers do not — so whether this
+    /// statement or the one-value one runs is a FACT, not a branch.
+    ///
+    /// Produces `(o, lse)`. The LSE is fp32 `[Tokens, q_heads]`, and it
+    /// exists so [`attention_sink_rescale`] can apply the
+    /// softmax-denominator extension flashinfer's DefaultAttention does
+    /// not emit natively.
+    pub fn attention_flashinfer_decode_lse(q: &Val, kv: &Kv, q_heads: u32) -> (Val, Val) {
+        let shape = q.t.inner.borrow().value_shape(q.id);
+        let ids = q.t.with(Some(kv.l), |b| {
+            b.launch(
+                "dispatch_attention_flashinfer_decode",
+                vec![],
+                kv_state(kv),
+                vec![q.id],
+                vec![
+                    (shape, DType::BF16),
+                    (Shape(vec![Dim::Tokens, Dim::Const(q_heads)]), DType::F32),
+                ],
+            )
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `ops::gemm_act_x_wt_bias_bf16`: a projection whose BIAS RIDES IN
+    /// THE EPILOGUE.
+    ///
+    /// Not a `matmul` plus an [`super::add_bias`]. At decode this routes
+    /// to the warp-per-row GEMV, whose epilogue absorbs the bias for
+    /// free — so the folded form is one launch where the split form is
+    /// two, and the two do not accumulate in the same order. A family
+    /// whose driver folds must say so: mixtral folds q/k/v and the
+    /// router, and adds `o_bias` separately, which is why gpt-oss's text
+    /// uses both spellings and neither by default.
+    pub fn gemm_bias(x: &Val, w: &MatW, bias: &MatW) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "ops::gemm_act_x_wt_bias_bf16",
+            vec![w.name.clone(), bias.name.clone()],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(w.width)]),
+                DType::BF16,
+            )),
+        )
+        .expect("a biased projection produces its value")
+    }
+
+    /// `kernels::launch_attention_sink_rescale_bf16`: `o *= sigmoid(lse
+    /// - sink_h)`, in place, per (token, head).
+    ///
+    /// gpt-oss learns a per-head SINK logit that participates in the
+    /// softmax denominator without contributing a value — so the whole
+    /// effect is a rescale of the attention output by how much
+    /// probability mass the sink would have taken. The sink weight is
+    /// `[q_heads]`, which is why it rides in the weight slot.
+    pub fn attention_sink_rescale(o: &Val, lse: &Val, sinks: &MatW) -> Val {
+        let shape = o.t.inner.borrow().value_shape(o.id);
+        record(
+            &o.t,
+            sinks.layer,
+            "launch_attention_sink_rescale_bf16",
+            vec![sinks.name.clone()],
+            None,
+            vec![o.id, lse.id],
+            Some((shape, DType::BF16)),
+        )
+        .expect("the sink rescale produces its value")
+    }
+
+    /// `kernels::launch_bf16_to_fp16`: the activation cast the MXFP4
+    /// routed GEMVs want on their input.
+    ///
+    /// A statement rather than an implementation detail of the GEMV
+    /// because it is its own launch over its own extent — and because
+    /// the routed leg casts TWICE, once on the block input and once on
+    /// the post-activation routes, over different extents.
+    pub fn bf16_to_fp16(x: &Val) -> Val {
+        let shape = x.t.inner.borrow().value_shape(x.id);
+        record(
+            &x.t,
+            x.layer,
+            "launch_bf16_to_fp16",
+            vec![],
+            None,
+            vec![x.id],
+            Some((shape, DType::F16)),
+        )
+        .expect("the cast produces its value")
+    }
+
+    /// `kernels::launch_mxfp4_moe_gate_up_decode_bf16`: BOTH routed
+    /// projections of gpt-oss's fused decode leg, in one launch,
+    /// reading the packed 4-bit nibbles straight out of HBM.
+    ///
+    /// The weight slot names the layer's per-expert POINTER BANK, not a
+    /// tensor: the kernel indexes experts through a device array of
+    /// pointers plus a parallel scale array. That indirection is a
+    /// BINDING — the executor resolves the name to whatever the layer
+    /// holds, exactly as [`moe_fused_cutlass`] resolves its two banks —
+    /// so it is not the obstacle it looks like. What would be an
+    /// obstacle is the host-routed walk this leg replaces: its launch
+    /// count depends on which experts the router picked, and no
+    /// rectangle spells that.
+    ///
+    /// Produces `(gate, up)`, each `[Tokens, k, intermediate]` — the
+    /// routed extent as a third dim, [`moe_gate_up_gemv`]'s convention.
+    pub fn mxfp4_moe_gate_up_decode(
+        x: &Val,
+        experts: &Val,
+        bank: &MatW,
+        top_k: u32,
+        intermediate: u32,
+    ) -> (Val, Val) {
+        let shape = || {
+            (
+                Shape(vec![
+                    Dim::Tokens,
+                    Dim::Const(top_k),
+                    Dim::Const(intermediate),
+                ]),
+                DType::BF16,
+            )
+        };
+        let ids = x.t.with(bank.layer, |b| {
+            b.launch(
+                "launch_mxfp4_moe_gate_up_decode_bf16",
+                vec![bank.name.clone()],
+                None,
+                vec![experts.id, x.id],
+                vec![shape(), shape()],
+            )
+        });
+        let mk = |id| Val {
+            t: x.t.clone(),
+            id,
+            layer: bank.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kernels::launch_mxfp4_moe_down_decode_bf16`: the routed down
+    /// projection, the same bank convention as
+    /// [`mxfp4_moe_gate_up_decode`].
+    pub fn mxfp4_moe_down_decode(
+        x: &Val,
+        experts: &Val,
+        bank: &MatW,
+        top_k: u32,
+        hidden: u32,
+    ) -> Val {
+        record(
+            &x.t,
+            bank.layer,
+            "launch_mxfp4_moe_down_decode_bf16",
+            vec![bank.name.clone()],
+            None,
+            vec![experts.id, x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(top_k), Dim::Const(hidden)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the routed down projection produces its value")
+    }
+
+    /// `kernels::launch_gpt_oss_glu_bf16`: SwiGLU with gpt-oss's CLAMP.
+    ///
+    /// A different kernel from [`swiglu`], not a parameterisation of it:
+    /// `swiglu_limit` is a config constant, so which of the two runs is
+    /// decided at load and erases here. Reading it as a runtime scalar
+    /// would put a branch in every fire for an answer that never
+    /// changes.
+    pub fn gpt_oss_glu(gate: &Val, up: &Val, width: u32) -> Val {
+        record(
+            &gate.t,
+            gate.layer,
+            "launch_gpt_oss_glu_bf16",
+            vec![],
+            None,
+            vec![gate.id, up.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(width)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the clamped GLU produces its value")
+    }
+
     /// `ops::launch_attention_naive_paged` — the fallback prefill for a
     /// head dim flashinfer's TC prefill template rejects.
     ///

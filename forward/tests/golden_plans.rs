@@ -23,10 +23,10 @@ use std::path::PathBuf;
 
 use pie_forward::family::{
     llama_like, llama_like_cuda, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
-    gemma4_cuda, qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block, qwen3_5_moe_mlp_block_cuda,
+    gemma4_cuda, gpt_oss_cuda, qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block, qwen3_5_moe_mlp_block_cuda,
 };
 use pie_forward::{
-    FireClass, Gemma4CudaFacts, Gemma4Facts, ForwardPlan, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
+    FireClass, Gemma4CudaFacts, Gemma4Facts, ForwardPlan, GptOssCudaFacts, GptOssFacts, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 
@@ -613,6 +613,25 @@ fn gemma_4_e4b_cuda_prefill() {
             &Gemma4Facts::gemma_4_e4b(),
             &Gemma4CudaFacts::gemma_4_e4b_synthetic(),
             FireClass::Prefill,
+        ),
+    );
+}
+
+/// gpt-oss-20b's decode reading — the fourth family's first golden, and
+/// the first whose MoE block is stated end to end.
+///
+/// Worth reading for the sink pair (the attention statement produces two
+/// values, and the second is fp32 `[Tokens, q_heads]`) and for the
+/// routed leg's seven rectangles, whose two GEMVs carry the expert axis
+/// as a third dim rather than as a launch count.
+#[test]
+fn gpt_oss_20b_cuda_decode() {
+    check_plan(
+        "gpt_oss_20b_cuda_decode",
+        &gpt_oss_cuda(
+            &GptOssFacts::gpt_oss_20b(),
+            &GptOssCudaFacts::gpt_oss_20b_synthetic(),
+            FireClass::Decode,
         ),
     );
 }

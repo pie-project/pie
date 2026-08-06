@@ -50,6 +50,7 @@ enum class PieForwardDType : uint32_t {
   BF16 = 0,
   F32 = 1,
   I32 = 2,
+  F16 = 3,
 };
 
 /// The op vocabulary, as stable wire values.
