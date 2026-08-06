@@ -645,6 +645,22 @@ int main(int argc, char** argv) {
     //
     // 16 rows does not catch it (BM=16 there) and 12 does not either, so the
     // wide block needs a case of its own.
+    //
+    // It is earning its keep again. gemma-4-26b-a4b-it-4bit reports
+    // `argmax -1` here, which is not "a wrong token" -- the search starts at
+    // -1e30 and only NaN leaves it at -1, so every logit in the row is NaN.
+    // gemma-4-31b-it-4bit, same head widths (256 sliding, 512 full) and the
+    // same 4-bit affine group of 64, reports 818 and matches. So it is the
+    // MIXTURE at BM=32, not the width and not the quantisation. Ruled out
+    // already: the pipeline exists (`instantiate_qmm_t(64, 32, 32, 16, 4)` and
+    // its five siblings are all there), K is a whole number of BK=32 (2816 and
+    // 2112 are 88 and 66), and it happens with tiled attention forced off.
+    //
+    // Separately and not the same thing: this checkpoint's tiled attention is
+    // wrong too. `PIE_METAL_SDPA_TILE_MIN_ROWS=4096` -- which turns tiling off
+    // -- takes its 53-token answer from "deike-no'=emptyia deK=A" to
+    // "The capital of France es[|im_und|>", so most of the damage at a real
+    // prompt length is there, and what is left over is this.
     if (default_prompt) {
         std::vector<std::uint32_t> ids32;
         for (int rep = 0; rep < 4; ++rep) ids32.insert(ids32.end(), ids.begin(), ids.end());
