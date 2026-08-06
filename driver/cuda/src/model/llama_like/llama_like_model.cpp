@@ -51,9 +51,22 @@ enum class DeclineReason {
     NoPlan,
     WriteDescMissing,
     SlidingWindow,
-    TruncatedNotDecode,
+    /// A truncated PREFILL. The depth axis is stated for the Decode
+    /// class only (`family.rs`'s `m.depth_window()`), because narrowing
+    /// rows on a prefill fire narrows its qo/kv CSRs too and there is no
+    /// prefill analogue of `depth_prefix_decode_plan`. A prepare-side
+    /// piece of work, not a driver one.
+    TruncatedPrefill,
+    /// A truncated DECODE whose trace does not state the axis — the XQA
+    /// and padded-head deployments, where `family.rs` withholds it
+    /// because the body cannot honour it there.
+    TruncatedAxisUnstated,
     FusedQkvUnstaged,
-    BandedNoPlans,
+    /// A banded PREFILL fire: same root as `TruncatedPrefill`.
+    BandedPrefill,
+    /// A banded decode fire with a live band whose prefix plan the
+    /// prepare did not stamp — the 14B device-geometry envelope class.
+    BandedPlanMissing,
 };
 
 const char* decline_name(DeclineReason r) {
@@ -62,9 +75,12 @@ const char* decline_name(DeclineReason r) {
     case DeclineReason::NoPlan:             return "no-plan";
     case DeclineReason::WriteDescMissing:   return "write-desc-missing";
     case DeclineReason::SlidingWindow:      return "sliding-window";
-    case DeclineReason::TruncatedNotDecode: return "truncated-not-decode";
+    case DeclineReason::TruncatedPrefill:   return "truncated-prefill";
+    case DeclineReason::TruncatedAxisUnstated:
+        return "truncated-axis-unstated";
     case DeclineReason::FusedQkvUnstaged:   return "fused-qkv-unstaged";
-    case DeclineReason::BandedNoPlans:      return "banded-no-plans";
+    case DeclineReason::BandedPrefill:      return "banded-prefill";
+    case DeclineReason::BandedPlanMissing:  return "banded-plan-missing";
     }
     return "?";
 }
@@ -82,7 +98,7 @@ void note_decline(DeclineReason reason) {
         const char* v = std::getenv("PIE_DECLARED_DECLINE_TRACE");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
-    static std::atomic<bool> latched[8] = {};
+    static std::atomic<bool> latched[16] = {};
     const std::size_t i = static_cast<std::size_t>(reason);
     if (!latched[i].exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
@@ -209,6 +225,14 @@ void LlamaLikeModel::body(Workspace& ws,
     // stderr written by two threads — is not sound, and a number nobody
     // can attribute is not a work list. Naming the term that refused
     // costs one enum and makes the list fall out of a `grep -c`.
+    //
+    // The reasons are split to the CAUSE, not to the term. Both depth
+    // terms refuse for two unrelated reasons — a prefill fire, or a
+    // decode fire missing something — and those have different owners
+    // (`family.rs` withholding the axis, the prepare not stamping a
+    // band plan) and different amounts of work. A work list that merges
+    // them reads as two items when it is four, and whoever picks one up
+    // finds out which after they start.
     const DeclineReason decline = [&]() -> DeclineReason {
         if (!static_cast<bool>(declared_)) return DeclineReason::NoPlan;
         // Explicit KV-write fires are in scope (declared_forward.hpp says
@@ -226,10 +250,12 @@ void LlamaLikeModel::body(Workspace& ws,
         // the DECLARATION states the depth axis for the fire's shape
         // (pure-decode only; a truncated lane's prefill keeps the
         // hand-written body).
-        if (in.max_layers != 0xffffffffu &&
-            !(in.is_pure_decode && declared_.decode &&
-              declared_.decode.view().depth_window != 0)) {
-            return DeclineReason::TruncatedNotDecode;
+        if (in.max_layers != 0xffffffffu) {
+            if (!in.is_pure_decode) return DeclineReason::TruncatedPrefill;
+            if (!declared_.decode ||
+                declared_.decode.view().depth_window == 0) {
+                return DeclineReason::TruncatedAxisUnstated;
+            }
         }
         // The trace committed to the fused QKV binding; a workspace without
         // the packed buffer cannot honour it (same availability check the
@@ -244,11 +270,11 @@ void LlamaLikeModel::body(Workspace& ws,
         // silently demoted mixed-k fires to full depth (caught live at
         // 14B: R=8 co-fires, no [depth-bands], no DECLINE).
         if (plan_.depth_band_count >= 2) {
-            if (!in.is_pure_decode) return DeclineReason::BandedNoPlans;
+            if (!in.is_pure_decode) return DeclineReason::BandedPrefill;
             for (std::uint32_t j = 0; j < plan_.depth_band_count; ++j) {
                 if (plan_.depth_band_rows[j] > 0 &&
                     !plan_.depth_band_plans[j]) {
-                    return DeclineReason::BandedNoPlans;
+                    return DeclineReason::BandedPlanMissing;
                 }
             }
         }
