@@ -101,6 +101,11 @@ const std::string& golden_tap_dir() {
     return dir;
 }
 
+bool golden_taps_recycle() {
+    static const bool on = std::getenv("PIE_METAL_TAPS_RECYCLE") != nullptr;
+    return on;
+}
+
 void dump_golden_taps(const std::vector<Dispatch>& dag,
                       const ScratchSchedule& sched,
                       const SlotHandle* pool,
