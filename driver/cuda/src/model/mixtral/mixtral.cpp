@@ -562,6 +562,33 @@ void mixtral_forward_paged(
     // frame grew -- read out of bounds.
     const std::size_t gemv_routes =
         use_mxfp4_decode_gemv ? max_routed : 0;
+    // Marlin reads the native slabs, the GEMV reads the packed routed form,
+    // and a checkpoint carries one lowering or the other -- so this is decided
+    // beside `use_mxfp4_decode_gemv` rather than downstream of it. Gating it on
+    // the GEMV's availability disabled it on exactly the checkpoints it serves
+    // (no `expert_gate_up_packed_ptrs` in the native lowering), leaving the
+    // layer on the per-expert native GEMM at 70 tok/s against 846.
+#ifdef PIE_CUDA_HAS_MARLIN_MOE
+    const int Ip_marlin = w.mxfp4_intermediate_padded > 0
+                              ? w.mxfp4_intermediate_padded : I;
+    const bool marlin_native_slabs =
+        !w.layers.empty() && !w.layers[0].experts.empty() &&
+        w.layers[0].experts[0].format ==
+            MixtralExpertWeightFormat::Mxfp4NativeGemm &&
+        w.layers[0].experts[0].w_gate_mxfp4 != nullptr;
+    const bool use_marlin_moe =
+        marlin_native_slabs && mxfp4_marlin_moe_enabled() &&
+        w.mxfp4_intermediate_padded > 0;
+#else
+    constexpr bool use_marlin_moe = false;
+#endif
+    // These two are the collection point both paths write through, so they are
+    // sized for either.
+    const std::size_t routed_out_routes =
+        (use_mxfp4_decode_gemv || use_marlin_moe) ? max_routed : 0;
+    const std::size_t moe_out_rows =
+        (use_mxfp4_decode_gemv || use_marlin_moe)
+            ? static_cast<std::size_t>(N) : 0;
     auto d_mxfp4_act_fp16 = DeviceBuffer<std::uint16_t>::alloc(
         use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
     auto d_mxfp4_route_gate =
@@ -580,18 +607,13 @@ void mixtral_forward_paged(
     auto d_moe_expert_counts = DeviceBuffer<std::int32_t>::alloc(
         use_mxfp4_decode_gemv ? static_cast<std::size_t>(num_experts) : 0);
     auto d_mxfp4_route_out =
-        DeviceBuffer<std::uint16_t>::alloc(gemv_routes * H);
-    auto d_mxfp4_moe_out = DeviceBuffer<std::uint16_t>::alloc(
-        use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
+        DeviceBuffer<std::uint16_t>::alloc(routed_out_routes * H);
+    auto d_mxfp4_moe_out =
+        DeviceBuffer<std::uint16_t>::alloc(moe_out_rows * H);
 #ifdef PIE_CUDA_HAS_MARLIN_MOE
     // Marlin consumes the padded block-sorted form, and writes gate/up at the
     // PADDED intermediate width (the packed weights are aligned to 128), so
     // these cannot share the gemv scratch above.
-    const int Ip_marlin = w.mxfp4_intermediate_padded > 0
-                              ? w.mxfp4_intermediate_padded : I;
-    const bool use_marlin_moe =
-        use_mxfp4_decode_gemv && mxfp4_marlin_moe_enabled() &&
-        w.mxfp4_intermediate_padded > 0;
     const int marlin_block = 16;
     const int marlin_max_blocks =
         use_marlin_moe
@@ -616,6 +638,18 @@ void mixtral_forward_paged(
         use_marlin_moe
             ? marlin_moe::marlin_moe_workspace_bytes(Ip_marlin, marlin_block)
             : 0);
+    if (use_marlin_moe) {
+        // The workspace is the kernel's `locks` array, and every threadblock
+        // in a column tile spins on its entry until the tile's leader releases
+        // it. The kernel returns it to zero on the way out, so one memset per
+        // forward is enough -- but that convention means it is only ever *read*
+        // as an initialised value, and `alloc` does not initialise. On
+        // whatever `cudaMalloc` happened to hand back non-zero, the very first
+        // MoE layer deadlocked: the GPU stayed busy, the scheduler reported
+        // "no progress, work queued or in flight", and nothing timed out.
+        CUDA_CHECK(cudaMemsetAsync(d_marlin_ws.data(), 0,
+                                   d_marlin_ws.size(), stream));
+    }
 #endif
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];

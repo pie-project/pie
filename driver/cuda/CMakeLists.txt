@@ -841,17 +841,18 @@ target_sources(pie_driver_cuda_lib PRIVATE
   $<TARGET_OBJECTS:pie_flashinfer_cutlass_moe>)
 
 # ---- Marlin (W4A16 / MXFP4 GEMM via vendored vLLM kernel) ------------------
-# OFF by default. marlin.cu is the build's critical path -- 142s of a 228s
-# clean build, because 150 explicit instantiations of a 2082-line __global__
-# template produce 152 kernels averaging 3098 SASS instructions each (91s cicc
-# + 41s ptxas). Nothing else in the driver comes close.
+# Two vendored kernels with the same lineage and very different build costs, so
+# they are two options.
+#
+# The dense, single-problem GEMM is OFF by default. marlin.cu is the build's
+# critical path -- 142s of a 228s clean build, because 150 explicit
+# instantiations of a 2082-line __global__ template produce 152 kernels
+# averaging 3098 SASS instructions each (91s cicc + 41s ptxas). Nothing else in
+# the driver comes close.
 #
 # What turning it off costs, and why that is an acceptable default:
 #   * GPTQ/AWQ INT4 dense GEMM throws at run time (ops/gemm.cpp) with a message
 #     naming this option. Those checkpoints are not part of pie's supported set.
-#   * GPT-OSS native MXFP4 MoE is refused at load time, but only on Blackwell:
-#     mxfp4_native_gemm is `major >= 10`, so Ada/Hopper already take the
-#     routed-dequant path and are unaffected.
 # Everything else -- every bf16 and FP8 model -- is untouched.
 #
 # Vendored under third_party/marlin/; the wrapper exposes a torch-free C++ API.
@@ -864,6 +865,27 @@ if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})
     set(PIE_CUDA_BUILD_MARLIN ON)
   else()
     set(PIE_CUDA_BUILD_MARLIN OFF)
+  endif()
+endif()
+
+# The expert-indexed MoE variant is ON by default, because it does not share
+# the cost that made the dense one opt-in: its generator is pruned to the
+# single quant configuration a pie model reaches (MXFP4 / bf16 / E8M0), so it
+# is one translation unit rather than fifteen.
+#
+# It is also what a supported model needs rather than an unsupported one.
+# GPT-OSS's MoE is native MXFP4, and without this kernel the driver answers
+# `native_mxfp4_moe = false` and the checkpoint falls back to per-route
+# dequant. Leaving it off is not neutral for that model; it is a decision to
+# serve it on the slow path.
+option(PIE_CUDA_BUILD_MARLIN_MOE
+  "Build vendored expert-indexed marlin MXFP4 MoE GEMM" ON)
+if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN_MOE})
+  string(TOLOWER "$ENV{PIE_CUDA_BUILD_MARLIN_MOE}" _pie_marlin_moe)
+  if(_pie_marlin_moe MATCHES "^(1|on|true|yes)$")
+    set(PIE_CUDA_BUILD_MARLIN_MOE ON)
+  else()
+    set(PIE_CUDA_BUILD_MARLIN_MOE OFF)
   endif()
 endif()
 
@@ -922,16 +944,18 @@ if(PIE_CUDA_BUILD_MARLIN)
   target_include_directories(pie_driver_cuda_lib PRIVATE
     third_party/marlin)
   target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
+endif()
 
-  # The expert-indexed MoE variant of the same kernel. Separate directory and
-  # namespace (`marlin_moe_wna16`) so it can be built and revised without
-  # touching the single-problem path above; `ops.cu` includes its generated
-  # instantiation for the same CUDA-13 linkage reason marlin.cu does.
-  #
-  # The generator is pruned to MXFP4 (bf16 x FE2M1 -> bf16, E8M0 scales): that
-  # is the only configuration a pie model reaches, and every extra quant config
-  # is another multi-minute nvcc translation unit on a build whose critical
-  # path marlin already is.
+# The expert-indexed MoE variant of the same kernel. Separate directory and
+# namespace (`marlin_moe_wna16`) so it builds and is revised independently of
+# the single-problem path above; `ops.cu` includes its generated instantiation
+# for the same CUDA-13 linkage reason marlin.cu does.
+#
+# The generator is pruned to MXFP4 (bf16 x FE2M1 -> bf16, E8M0 scales): that is
+# the only configuration a pie model reaches, and every extra quant config is
+# another multi-minute nvcc translation unit. Pruning is what lets this one
+# default to ON while the dense path stays opt-in.
+if(PIE_CUDA_BUILD_MARLIN_MOE)
   target_sources(pie_driver_cuda_lib PRIVATE
     third_party/marlin_moe/ops.cu
     third_party/marlin_moe/marlin_moe_wrapper.cpp)
