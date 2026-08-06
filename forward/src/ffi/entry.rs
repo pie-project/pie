@@ -838,10 +838,11 @@ pub struct PieForwardGptOssFacts {
     pub tied_embeddings: u8,
     /// The checkpoint biases q/k/v/o and the router.
     pub attention_bias: u8,
+    /// The deployment's rope is the YaRN-paper one.
+    pub rope_yarn_original: u8,
     /// Every layer carries `attn_sinks`, so attention is asked for its
     /// LSE and produces two values.
     pub attn_sinks: u8,
-    pub _pad: [u8; 1],
     /// `swiglu_limit`; 0 means the unclamped SwiGLU, which this family
     /// does not state.
     pub swiglu_limit: f32,
@@ -877,6 +878,7 @@ fn read_gpt_oss_facts(facts: &PieForwardGptOssFacts) -> GptOssFacts {
         tied_embeddings: facts.tied_embeddings != 0,
         swiglu_limit: facts.swiglu_limit,
         attention_bias: facts.attention_bias != 0,
+        rope_yarn_original: facts.rope_yarn_original != 0,
         attn_sinks: facts.attn_sinks != 0,
     }
 }

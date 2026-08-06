@@ -317,10 +317,16 @@ void mixtral_forward_paged(
             layer.v_bias ? layer.v_bias->data() : nullptr,
             ws.v.data(), N, Hk, H, stream);
 
-        kernels::launch_rope_bf16(
-            ws.q.data(), ws.k.data(), positions,
-            N, num_q_heads_local, num_kv_heads_local, d,
-            cfg.rope_theta, stream);
+        // The cfg's own rope, not a hardcoded plain one. gpt-oss's
+        // config asks for YaRN (factor 32 over an original 4096), the
+        // shared `apply_rope_config` had already resolved it, and this
+        // line passed `rope_theta` alone — so every gpt-oss fire ran
+        // unscaled rotations and the model's long-context range was
+        // never actually available. Plain Mixtral declares no scaling
+        // and is unchanged.
+        apply_rope(fwd_cfg, cfg,
+                   ws.q.data(), ws.k.data(), positions,
+                   N, num_q_heads_local, num_kv_heads_local, d, stream);
         // Fires POST-rope (and post q/k-norm): the query a PTIR program
         // observes here is the one that actually enters attention, so an
         // observer scoring it against the cached keys -- which are stored

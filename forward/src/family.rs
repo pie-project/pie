@@ -3582,11 +3582,12 @@ impl GptOssLayerW {
 /// **The clamped GLU.** `swiglu_limit` is a config constant, so gpt-oss
 /// states a different activation kernel rather than passing a limit.
 ///
-/// Not stated, deliberately: yarn. The config asks for it (factor 32)
-/// and `mixtral.cpp:320` passes the plain `rope_theta`, so the driver
-/// never applies it. Declaring the scaled rope here would make this text
-/// disagree with the pass it mirrors — the bug is real and belongs in a
-/// fix to that line, not laundered into a fact.
+/// Yarn was NOT stated here at first, and deliberately: the config asked
+/// for it while `mixtral.cpp` passed a plain `rope_theta`, so declaring
+/// it would have made this text disagree with the pass it mirrors. The
+/// fix went to that line instead, and the fact followed it — which is the
+/// order that keeps a declaration honest about a driver bug rather than
+/// laundering one.
 pub fn gpt_oss_cuda(
     facts: &GptOssFacts,
     cuda: &GptOssCudaFacts,
@@ -3638,7 +3639,16 @@ pub fn gpt_oss_cuda(
             let k = proj(&normed, &w.k_proj, &w.k_bias);
             let v = proj(&normed, &w.v_proj, &w.v_bias);
 
-            let (q, k) = dsl::rope(&q, &k, RopeKind::Standard);
+            // gpt-oss scales, and the driver had to be TAUGHT to: this
+            // family shares llama_like's cfg, where `apply_rope_config`
+            // had already resolved the scaling, and `mixtral.cpp` spelled
+            // a plain `launch_rope_bf16` anyway. The declaration states
+            // the kernel the fixed pass fires.
+            let (q, k) = if facts.rope_yarn_original {
+                dsl::cuda::rope_yarn_original(&q, &k)
+            } else {
+                dsl::rope(&q, &k, RopeKind::Standard)
+            };
             dsl::cuda::write_kv_to_pages(&k, &v, &kv);
 
             // The sink layers ask for the LSE; a layer without sinks

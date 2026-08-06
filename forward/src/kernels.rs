@@ -249,6 +249,9 @@ pub static KERNELS: &[KernelSig] = &[
     // A projection with its bias in the EPILOGUE — one launch where a
     // matmul plus an AddBias is two, and a different accumulation order.
     kernel!(gemm_bias "ops::gemm_act_x_wt_bias_bf16"),
+    // YaRN, as its paper spells it. A deployment's scaling is a load-time
+    // config answer, so it picks a kernel here rather than an argument.
+    kernel!(rope_yarn_original "launch_rope_yarn_original_bf16"),
     kernel!(attention_sink_rescale "launch_attention_sink_rescale_bf16"),
     kernel!(bf16_to_fp16 "launch_bf16_to_fp16"),
     // The routed MXFP4 GEMVs. Like qwen3_5's GEMV leg the expert axis

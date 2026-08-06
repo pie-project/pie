@@ -38,6 +38,7 @@ enum class GoKernel {
     WriteKvToPages,
     AttnFlashinferDecode,
     AttnSinkRescale,
+    RopeYarnOriginal,
     TopkSoftmax,
     Bf16ToFp16,
     Mxfp4GateUp,
@@ -54,6 +55,7 @@ GoKernel resolve_go_kernel(std::string_view k) {
         return GoKernel::AttnFlashinferDecode;
     if (k == "launch_attention_sink_rescale_bf16")
         return GoKernel::AttnSinkRescale;
+    if (k == "launch_rope_yarn_original_bf16") return GoKernel::RopeYarnOriginal;
     if (k == "launch_topk_softmax_bf16") return GoKernel::TopkSoftmax;
     if (k == "launch_bf16_to_fp16") return GoKernel::Bf16ToFp16;
     if (k == "launch_mxfp4_moe_gate_up_decode_bf16")
@@ -388,6 +390,18 @@ bool gpt_oss_forward_declared(
                     ws.attn_out.data(), d_lse.data(),
                     require(w, aux(0)).data(), N, cfg.num_attention_heads, d,
                     stream);
+                break;
+            case GoKernel::RopeYarnOriginal:
+                // Argument for argument the hand pass's `apply_rope`
+                // arm; the params come off the shared cfg, which had
+                // resolved them all along.
+                kernels::launch_rope_yarn_original_bf16(
+                    ws.q.data(), ws.k.data(), positions, N,
+                    cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                    cfg.rope_theta, fwd_cfg.yarn_factor,
+                    fwd_cfg.yarn_beta_fast, fwd_cfg.yarn_beta_slow,
+                    fwd_cfg.yarn_attention_factor,
+                    fwd_cfg.yarn_original_max_position, stream);
                 break;
             case GoKernel::TopkSoftmax:
                 kernels::launch_topk_softmax_bf16(

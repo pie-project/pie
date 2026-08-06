@@ -2246,6 +2246,37 @@ pub mod cuda {
         (mk(ids[0]), mk(ids[1]))
     }
 
+    /// `kernels::launch_rope_yarn_original_bf16`: the YaRN-paper rope —
+    /// a dim-index ramp between interpolated and extrapolated
+    /// frequencies, plus an `attention_factor` magnitude scale.
+    ///
+    /// A different KERNEL from the plain rope, not a parameterisation:
+    /// which one a deployment fires is decided by its config at load and
+    /// erases here. The semantic [`super::rope`] carries a `RopeKind`
+    /// the lowering refuses for anything but Standard, so a family that
+    /// scales says so by naming the launcher.
+    pub fn rope_yarn_original(q: &Val, k: &Val) -> (Val, Val) {
+        let (q_sh, k_sh) = {
+            let b = q.t.inner.borrow();
+            (b.value_shape(q.id), b.value_shape(k.id))
+        };
+        let ids = q.t.with(q.layer, |b| {
+            b.launch(
+                "launch_rope_yarn_original_bf16",
+                vec![],
+                None,
+                vec![q.id, k.id],
+                vec![(q_sh, DType::BF16), (k_sh, DType::BF16)],
+            )
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
     /// `ops::gemm_act_x_wt_bias_bf16`: a projection whose BIAS RIDES IN
     /// THE EPILOGUE.
     ///

@@ -5441,8 +5441,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -5768,8 +5768,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -6095,8 +6095,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -6422,8 +6422,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -6749,8 +6749,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -7076,8 +7076,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -7403,8 +7403,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -7730,8 +7730,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -8057,8 +8057,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -8384,8 +8384,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -8711,8 +8711,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -9038,8 +9038,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -9365,8 +9365,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -9692,8 +9692,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -10019,8 +10019,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -10346,8 +10346,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -10673,8 +10673,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -11000,8 +11000,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -11327,8 +11327,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -11654,8 +11654,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -11981,8 +11981,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -12308,8 +12308,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -12635,8 +12635,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -12962,8 +12962,8 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard"
+        "Launch": {
+          "kernel": "launch_rope_yarn_original_bf16"
         }
       },
       "inputs": [

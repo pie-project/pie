@@ -117,6 +117,17 @@ GptOssDeclaredPlan build_gpt_oss_declared_plan(
     facts.tied_embeddings = (w.lm_head == w.embed) ? 1 : 0;
     facts.attention_bias = 1;
     facts.attn_sinks = 1;
+    // The rope the shared cfg resolved. Only the two the text can state
+    // are admitted; anything else (llama3-style YaRN, mrope) refuses
+    // rather than being silently flattened to a plain rotation — which is
+    // the failure this family just had.
+    if (fwd_cfg.rope_kind == RopeKind::YaRNOriginal) {
+        facts.rope_yarn_original = 1;
+    } else if (fwd_cfg.rope_kind == RopeKind::Standard) {
+        facts.rope_yarn_original = 0;
+    } else {
+        GO_REFUSE("rope kind is neither standard nor original YaRN");
+    }
     facts.swiglu_limit = cfg.swiglu_limit;
 
     PieForwardGptOssCudaFacts cuda{};

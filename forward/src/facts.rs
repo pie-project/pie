@@ -1213,6 +1213,12 @@ pub struct GptOssFacts {
     /// q/k/v biases FOLD INTO the projection's epilogue and the rest are
     /// their own launches.
     pub attention_bias: bool,
+    /// Whether this deployment's rope is the YaRN-paper one. gpt-oss's
+    /// config asks for it (factor 32 over an original 4096 context) and
+    /// the driver resolves it at load, so it is a fact and not a fire's
+    /// question — and a WRONG one here is not a crash but a silently
+    /// unscaled rotation, which is how it went unnoticed.
+    pub rope_yarn_original: bool,
     /// Every layer carries `attn_sinks` on gpt-oss. The driver asks
     /// `layer.attn_sinks != nullptr` per layer and only requests an LSE
     /// from attention where the answer is yes — so this is what decides
@@ -1249,6 +1255,7 @@ impl GptOssFacts {
             tied_embeddings: false,
             swiglu_limit: 7.0,
             attention_bias: true,
+            rope_yarn_original: true,
             attn_sinks: true,
         }
     }

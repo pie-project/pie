@@ -735,7 +735,13 @@ struct LoraFireState {
     }
 };
 
-inline void apply_rope(
+
+}  // namespace
+
+// EXPORTED (llama_like.hpp) rather than file-local: mixtral shares this
+// family's `LlamaLikeForwardCfg`, and duplicating the dispatch there is
+// how gpt-oss came to run without the yarn its config asks for.
+void apply_rope(
     const LlamaLikeForwardCfg& fwd_cfg,
     const HfConfig& cfg,
     void* q, void* k,
@@ -771,8 +777,6 @@ inline void apply_rope(
             cfg.rope_theta, stream);
     }
 }
-
-}  // namespace
 
 // Bug#2 A/B: the fused decode QKV+qk-norm+rope+KV-write kernel
 // (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode

@@ -642,10 +642,11 @@ struct PieForwardGptOssFacts {
   uint8_t tied_embeddings;
   /// The checkpoint biases q/k/v/o and the router.
   uint8_t attention_bias;
+  /// The deployment's rope is the YaRN-paper one.
+  uint8_t rope_yarn_original;
   /// Every layer carries `attn_sinks`, so attention is asked for its
   /// LSE and produces two values.
   uint8_t attn_sinks;
-  uint8_t _pad[1];
   /// `swiglu_limit`; 0 means the unclamped SwiGLU, which this family
   /// does not state.
   float swiglu_limit;

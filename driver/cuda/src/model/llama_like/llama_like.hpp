@@ -419,4 +419,17 @@ RopeKind rope_kind_from_hf_config(const HfConfig& hf);
 // in context.cpp pulls in the same eight fields.
 void apply_rope_config(LlamaLikeForwardCfg& fwd_cfg, const HfConfig& hf);
 
+// The rope launch this cfg's `rope_kind` selects — YaRN, original YaRN,
+// or plain. Exported because MIXTRAL SHARES THIS CFG: it is handed the
+// same `LlamaLikeForwardCfg`, so the scaling its checkpoint asks for is
+// already resolved there, and a family that spells its own
+// `launch_rope_bf16` silently drops it. gpt-oss did exactly that.
+void apply_rope(
+    const LlamaLikeForwardCfg& fwd_cfg,
+    const HfConfig& cfg,
+    void* q, void* k,
+    const std::int32_t* positions,
+    int N, int num_q_heads, int num_kv_heads, int head_dim,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::model
