@@ -33,6 +33,20 @@ use crate::process::ProcessId;
 use super::pagestore::PhysicalPageId;
 use super::{Context, ContextId, ContextManager, MARKET, RestoreEntry, State};
 
+/// How a candidate is ranked in the eviction tiebreaker.
+///
+/// Two variants rather than one timestamp because the two kinds of context are
+/// stale for different reasons, and comparing them on a single clock is what
+/// produced the old degenerate ordering. See `ContextManager::better_victim`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VictimAge {
+    /// A saved snapshot: no owning process. Carries `last_access`, refreshed on
+    /// every open, so ordering by it is least-recently-used.
+    Snapshot(Instant),
+    /// A live context: carries its owning process's start time.
+    Owned(Instant),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionDenied {
     pub admission_pages: f64,
@@ -872,10 +886,90 @@ impl ContextManager {
     // Eviction
     // =========================================================================
 
+    /// Is `a` a better eviction victim than `b`? Total, and deterministic.
+    ///
+    /// The two kinds of candidate are ranked on deliberately different clocks,
+    /// because "how stale is this" means different things for each. A live
+    /// context is ranked by when its process started; a saved snapshot has no
+    /// process, and is ranked by when it was last used.
+    ///
+    /// The snapshot case is the one that matters for prefix caching.
+    /// `Message::Lookup` refreshes `last_access` on every open, so this is
+    /// genuine recency: a boundary the current conversation keeps reopening
+    /// outlives one abandoned several chats ago. It is the same signal
+    /// `enforce_snapshot_retention` already sorts its LRU by, so the two
+    /// eviction paths now agree on which snapshots are worth keeping instead of
+    /// ordering them by unrelated rules.
+    ///
+    /// Before this, a snapshot was ranked by a synthesised `Instant::now()` —
+    /// which made every snapshot look brand new, so the "prefer later spawn"
+    /// rule evicted them ahead of everything else in an order that carried no
+    /// information at all.
+    fn better_victim(a: VictimAge, b: VictimAge, a_id: ContextId, b_id: ContextId) -> bool {
+        match (a, b) {
+            // A saved boundary is speculative future value; a live context is
+            // work in progress that needs its pages now. Snapshots first.
+            (VictimAge::Snapshot(_), VictimAge::Owned(_)) => true,
+            (VictimAge::Owned(_), VictimAge::Snapshot(_)) => false,
+            // Among snapshots: least recently used goes first.
+            (VictimAge::Snapshot(at), VictimAge::Snapshot(bt)) if at != bt => at < bt,
+            // Among live contexts: most recently spawned goes first (FCFS,
+            // i.e. protect the long-running work).
+            (VictimAge::Owned(at), VictimAge::Owned(bt)) if at != bt => at > bt,
+            // Identical timestamps: break on the stable context id so repeated
+            // calls on unchanged state agree.
+            _ => a_id > b_id,
+        }
+    }
+
+    /// How this context is ranked for eviction.
+    ///
+    /// A context whose owner has vanished is an orphan; rank it by recency like
+    /// a snapshot rather than inventing a spawn time for a process that no
+    /// longer exists.
+    fn victim_age(&self, ctx: &Context) -> VictimAge {
+        ctx.owner
+            .and_then(|pid| self.processes.get(&pid))
+            .map(|p| VictimAge::Owned(p.created_at))
+            .unwrap_or(VictimAge::Snapshot(ctx.last_access))
+    }
+
+    /// Context ids currently protected by an in-flight `retain-snapshot`.
+    ///
+    /// `active_snapshots` is keyed by `(username, name, owner)`; each key is
+    /// resolved through the `snapshots` name map to the context it protects.
+    ///
+    /// Why this is needed: `retain_snapshot` arrived together with
+    /// `enforce_snapshot_retention`, which **deletes**. The scheduler's eviction
+    /// path only **suspends**, and never consulted the map — so a snapshot
+    /// pinned by an in-flight request was safe from deletion but not from having
+    /// its pages taken. That is not free: the pages come back via replay forward
+    /// passes on the next open, which is the cost the retain was meant to avoid.
+    ///
+    /// Computed once per scan rather than per candidate; `active_snapshots`
+    /// holds only in-flight requests and is small.
+    fn retained_snapshot_ctx_ids(&self) -> std::collections::HashSet<ContextId> {
+        self.active_snapshots
+            .keys()
+            .filter_map(|(username, name, _)| {
+                self.snapshots
+                    .get(&(username.clone(), name.clone()))
+                    .copied()
+            })
+            .collect()
+    }
+
     /// Find the best eviction victim context on a driver.
     ///
-    /// Priority: defaulted contexts first (regardless of bid), then by
-    /// lowest bid, then by most-recently-spawned process (FCFS tiebreaker).
+    /// Priority: contexts NOT protected by an in-flight retain first, then
+    /// defaulted contexts (regardless of bid), then by lowest bid, then by
+    /// most-recently-spawned process (FCFS tiebreaker), then by context id so
+    /// the result is deterministic.
+    ///
+    /// Retention is a *preference*, not a veto: if every candidate on the driver
+    /// is retained, one is still chosen. A hard skip could leave a fully-retained
+    /// driver unable to free pages at all, trading a slow request for a stuck
+    /// one.
     ///
     /// Non-defaulted victims must have bid ≤ requester_bid.
     /// Defaulted victims are always eligible (they can't pay rent).
@@ -885,9 +979,12 @@ impl ContextManager {
         requester_bid: f64,
         requester: Option<ContextId>,
     ) -> Option<ContextId> {
-        // (defaulted, bid, spawn_time, ctx_id) — best victim has highest
-        // defaulted, lowest bid, latest spawn_time.
-        let mut best: Option<(bool, f64, Instant, ContextId)> = None;
+        let retained = self.retained_snapshot_ctx_ids();
+
+        // (retained, defaulted, bid, age, ctx_id) — best victim is un-retained
+        // first, then highest defaulted, lowest bid, then `better_victim` on
+        // the age.
+        let mut best: Option<(bool, bool, f64, VictimAge, ContextId)> = None;
 
         for (&ctx_id, ctx) in &self.contexts {
             if requester == Some(ctx_id) {
@@ -914,28 +1011,31 @@ impl ContextManager {
                 continue;
             }
 
-            let spawn_time = ctx
-                .owner
-                .and_then(|pid| self.processes.get(&pid))
-                .map(|p| p.created_at)
-                .unwrap_or_else(Instant::now);
+            let age = self.victim_age(ctx);
+            let is_retained = retained.contains(&ctx_id);
 
-            let dominated = if let Some((best_def, best_bid, best_time, _)) = best {
-                // Prefer defaulted over non-defaulted
-                (ctx.defaulted && !best_def)
-                // Same default status: prefer lower bid
-                || (ctx.defaulted == best_def && ctx.bid < best_bid)
-                // Same default + bid: prefer later spawn (FCFS)
-                || (ctx.defaulted == best_def && ctx.bid == best_bid && spawn_time > best_time)
+            let dominated = if let Some((best_ret, best_def, best_bid, best_age, best_id)) = best {
+                // Strongest preference: do not take pages from a snapshot an
+                // in-flight request is holding.
+                (!is_retained && best_ret)
+                    || (is_retained == best_ret
+                        // Prefer defaulted over non-defaulted
+                        && ((ctx.defaulted && !best_def)
+                        // Same default status: prefer lower bid
+                        || (ctx.defaulted == best_def && ctx.bid < best_bid)
+                        // Same default + bid: rank by age, ties on ctx_id
+                        || (ctx.defaulted == best_def
+                            && ctx.bid == best_bid
+                            && Self::better_victim(age, best_age, ctx_id, best_id))))
             } else {
                 true
             };
             if dominated {
-                best = Some((ctx.defaulted, ctx.bid, spawn_time, ctx_id));
+                best = Some((is_retained, ctx.defaulted, ctx.bid, age, ctx_id));
             }
         }
 
-        best.map(|(_, _, _, ctx_id)| ctx_id)
+        best.map(|(_, _, _, _, ctx_id)| ctx_id)
     }
 
     /// Helper: enqueue a context for restoration.
@@ -977,7 +1077,7 @@ impl ContextManager {
     ///
     /// Iterates all **Stashed** contexts (CPU-resident pages) on the driver.
     /// Returns the context with the lowest bid, using FCFS (latest spawn
-    /// time first) as tiebreaker.
+    /// time first) as tiebreaker, then context id for determinism.
     ///
     /// The requester is excluded. Only victims with bid ≤ `requester_bid`
     /// are eligible (a higher-bid context should not be evicted to make
@@ -988,7 +1088,9 @@ impl ContextManager {
         requester_bid: f64,
         requester: Option<ContextId>,
     ) -> Option<ContextId> {
-        let mut best: Option<(f64, Instant, ContextId)> = None;
+        // `spawn_time` is `None` for a context with no owning process; see
+        // `newer_for_eviction` for why this is not `Instant::now()`.
+        let mut best: Option<(f64, VictimAge, ContextId)> = None;
 
         for (&ctx_id, ctx) in &self.contexts {
             if requester == Some(ctx_id) {
@@ -1015,19 +1117,17 @@ impl ContextManager {
                 continue;
             }
 
-            let spawn_time = ctx
-                .owner
-                .and_then(|pid| self.processes.get(&pid))
-                .map(|p| p.created_at)
-                .unwrap_or_else(Instant::now);
+            let age = self.victim_age(ctx);
 
-            let dominated = if let Some((best_bid, best_time, _)) = best {
-                ctx.bid < best_bid || (ctx.bid == best_bid && spawn_time > best_time)
+            let dominated = if let Some((best_bid, best_age, best_id)) = best {
+                ctx.bid < best_bid
+                    || (ctx.bid == best_bid
+                        && Self::better_victim(age, best_age, ctx_id, best_id))
             } else {
                 true
             };
             if dominated {
-                best = Some((ctx.bid, spawn_time, ctx_id));
+                best = Some((ctx.bid, age, ctx_id));
             }
         }
 
@@ -1198,6 +1298,7 @@ impl ContextManager {
 mod tests {
     use super::*;
     use crate::context::{Context, RestoreEntry, State};
+    use std::time::Duration;
 
     /// Build a ContextManager with one driver and `num_pages` GPU pages.
     /// Installs one process (`pid`) and one GPU-resident context (`ctx_id`)
@@ -1778,5 +1879,198 @@ mod tests {
             mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();
         }
         assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());
+    }
+
+    // =========================================================================
+    // Eviction victim selection — determinism
+    // =========================================================================
+
+    /// Build a manager holding `n` ownerless, GPU-resident contexts with ids
+    /// `1..=n`, each on driver 0 with one working page and a zero bid. This is
+    /// the shape a *saved snapshot* has: `owner: None`, so no process backs it.
+    fn ownerless_ctx_fixture(n: u64) -> ContextManager {
+        let mut mgr = ContextManager::new(
+            0,
+            16,
+            &[100],
+            &[100],
+            1,
+            &[0],
+            &[false],
+            10,
+            None,
+            10000.0,
+            0.85,
+        );
+        for ctx_id in 1..=n {
+            let pages = mgr.gpu_stores[0].alloc(1).expect("alloc");
+            let mut ctx = Context::new(None);
+            ctx.driver = Some(0);
+            ctx.working_pages = pages;
+            ctx.bid = 0.0;
+            ctx.state = State::Active;
+            mgr.contexts.insert(ctx_id, ctx);
+        }
+        mgr
+    }
+
+    /// The FCFS tiebreaker must be a total, deterministic order.
+    ///
+    /// Regression: `spawn_time` used to fall back to `Instant::now()` evaluated
+    /// *inside* the victim-selection loop. Because `Instant::now()` increases
+    /// monotonically, every ownerless context dominated the previous best, so
+    /// the winner was simply whichever the `HashMap` happened to visit last —
+    /// and Rust randomises that order per process.
+    #[test]
+    fn better_victim_is_total_and_deterministic() {
+        use VictimAge::{Owned, Snapshot};
+        let early = Instant::now();
+        let late = early + Duration::from_secs(1);
+
+        // A snapshot is a better victim than a live context, whatever the
+        // clocks say — speculative future value loses to work in progress.
+        assert!(ContextManager::better_victim(
+            Snapshot(late),
+            Owned(early),
+            1,
+            2
+        ));
+        assert!(!ContextManager::better_victim(
+            Owned(early),
+            Snapshot(late),
+            1,
+            2
+        ));
+
+        // Among snapshots: LEAST recently used first. This is the direction
+        // that matters for prefix caching — the boundary the live conversation
+        // keeps reopening must outlive a stale one.
+        assert!(ContextManager::better_victim(
+            Snapshot(early),
+            Snapshot(late),
+            1,
+            2
+        ));
+        assert!(!ContextManager::better_victim(
+            Snapshot(late),
+            Snapshot(early),
+            1,
+            2
+        ));
+
+        // Among live contexts: most recently spawned first (FCFS), unchanged.
+        assert!(ContextManager::better_victim(
+            Owned(late),
+            Owned(early),
+            1,
+            2
+        ));
+        assert!(!ContextManager::better_victim(
+            Owned(early),
+            Owned(late),
+            1,
+            2
+        ));
+
+        // Identical timestamps resolve on ctx_id, and the relation is
+        // antisymmetric rather than dependent on visit order.
+        assert!(ContextManager::better_victim(
+            Snapshot(early),
+            Snapshot(early),
+            2,
+            1
+        ));
+        assert!(!ContextManager::better_victim(
+            Snapshot(early),
+            Snapshot(early),
+            1,
+            2
+        ));
+        assert!(ContextManager::better_victim(Owned(early), Owned(early), 2, 1));
+        assert!(!ContextManager::better_victim(Owned(early), Owned(early), 1, 2));
+    }
+
+    /// With every other key equal, the victim is a stable function of state.
+    ///
+    /// Asserting the *identity* of the winner matters: repeatedly calling on one
+    /// manager would iterate the same `HashMap` in the same order and so pass
+    /// even with the bug present. Under the old code the winner was the
+    /// last-visited context, which coincides with the highest id only by chance.
+    /// The fixture builds contexts 1..=8 in order, so ctx 1 has the oldest
+    /// `last_access` and ctx 8 the newest.
+    #[test]
+    fn eviction_evicts_the_least_recently_used_snapshot() {
+        let mgr = ownerless_ctx_fixture(8);
+        assert_eq!(
+            mgr.find_eviction_victim(0, 1.0, None),
+            Some(1),
+            "the stalest snapshot must go first, not an arbitrary one -- this is \
+             what keeps a live conversation's boundary alive while abandoned \
+             ones are reclaimed"
+        );
+    }
+
+    /// Independent managers built from identical logical state must agree,
+    /// even though each `HashMap` seeds its own iteration order.
+    #[test]
+    fn eviction_victim_agrees_across_independent_managers() {
+        let expected = ownerless_ctx_fixture(8).find_eviction_victim(0, 1.0, None);
+        for _ in 0..16 {
+            assert_eq!(
+                ownerless_ctx_fixture(8).find_eviction_victim(0, 1.0, None),
+                expected,
+                "victim must not depend on per-map hash seeding"
+            );
+        }
+    }
+
+    /// Name a fixture context as a snapshot and pin it with `retain_snapshot`,
+    /// the way an in-flight request does.
+    fn retain(mgr: &mut ContextManager, name: &str, ctx_id: ContextId) {
+        mgr.snapshots
+            .insert(("u".to_string(), name.to_string()), ctx_id);
+        mgr.retain_snapshot("u".to_string(), name.to_string(), ProcessId::new_v4())
+            .expect("retain_snapshot");
+    }
+
+    /// A snapshot pinned by an in-flight request must not be the victim while
+    /// any unretained candidate exists.
+    ///
+    /// `active_snapshots` previously guarded only `enforce_snapshot_retention`,
+    /// which DELETES. The scheduler SUSPENDS and ignored the map entirely, so a
+    /// retained snapshot was safe from deletion but not from losing its pages —
+    /// and those come back only via replay forward passes, which is exactly the
+    /// cost the retain was meant to prevent.
+    #[test]
+    fn retained_snapshot_is_spared_when_an_alternative_exists() {
+        let mut mgr = ownerless_ctx_fixture(3);
+        // Retain ctx 1 -- the one LRU would otherwise pick. Retaining a
+        // snapshot LRU was going to spare anyway would prove nothing.
+        retain(&mut mgr, "conv/pinned", 1);
+
+        let victim = mgr.find_eviction_victim(0, 1.0, None);
+        assert_ne!(victim, Some(1), "a retained snapshot must be spared");
+        assert_eq!(
+            victim,
+            Some(2),
+            "retention must override LRU, falling through to the next-stalest"
+        );
+    }
+
+    /// Retention is a preference, not a veto.
+    ///
+    /// If every candidate on the driver is retained, one must still be chosen —
+    /// a hard skip would leave the driver unable to free pages at all, trading a
+    /// slow request for a stuck one.
+    #[test]
+    fn retained_snapshot_is_still_evictable_when_it_is_the_only_candidate() {
+        let mut mgr = ownerless_ctx_fixture(1);
+        retain(&mut mgr, "conv/only", 1);
+
+        assert_eq!(
+            mgr.find_eviction_victim(0, 1.0, None),
+            Some(1),
+            "with no alternative, a retained snapshot must still be evictable"
+        );
     }
 }
