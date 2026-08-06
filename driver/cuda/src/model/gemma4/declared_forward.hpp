@@ -31,6 +31,10 @@ struct Gemma4DeclaredPlan {
 // disarms onto the hand-written pass.
 bool gemma4_declared_forward_enabled();
 
+// `PIE_DECLARED_FORWARD_GEMMA4` — whether the drive EXECUTES. Opt-in
+// while the arms are being finished; see the definition.
+bool gemma4_declared_drive_enabled();
+
 // Derive this deployment's facts and trace both classes.
 Gemma4DeclaredPlan build_gemma4_declared_plan(
     const HfConfig& cfg, const Gemma4Weights& w, int tp_size);

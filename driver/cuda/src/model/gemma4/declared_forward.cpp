@@ -1,10 +1,12 @@
 #include "model/gemma4/declared_forward.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
 
 #include "kernels/gather_rows.hpp"
+#include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/scalar_mul.hpp"
@@ -216,8 +218,44 @@ bool gemma4_forward_declared(
     // way that pass does rather than allocating an arena: `ws.y` is the
     // residual stream, `ws.norm_x` the block scratch.
     void* per_layer_token = moe_ws.ple_token.data();
+    void* per_layer_proj = moe_ws.ple_proj.data();
+    int lm_head_rows = N;
+
+    // Layer state the arms need, refreshed as the drive walks into a
+    // layer. The op's own `layer` field carries it, so nothing here
+    // counts.
+    int cur_layer = -1;
+    bool cur_full = false;
+    bool cur_shared = false;
+    int cur_d = 0;
+    int cur_hq = 0;
+    int cur_hk = 0;
+    const auto enter = [&](int l) {
+        if (l < 0 || l == cur_layer) return;
+        cur_layer = l;
+        cur_full = w.layers[static_cast<std::size_t>(l)].is_full;
+        cur_shared = w.layers[static_cast<std::size_t>(l)].is_shared;
+        cur_d = w.per_layer_head_dim[static_cast<std::size_t>(l)];
+        cur_hq = cfg.num_attention_heads * cur_d;
+        cur_hk = w.per_layer_num_kv_heads[static_cast<std::size_t>(l)] * cur_d;
+    };
+
+    // The FULL layers' partial-rotary width, the driver's derivation.
+    const auto rotary_of = [&](int l) {
+        const float f =
+            w.per_layer_partial_rotary_factor[static_cast<std::size_t>(l)];
+        const int d = w.per_layer_head_dim[static_cast<std::size_t>(l)];
+        return std::max(2, 2 * static_cast<int>(0.5f * f * d));
+    };
+
+    const auto gemm = [&](const void* act, std::string_view weight, void* out,
+                          int m, int n, int k, float beta) {
+        ops::gemm_act_x_wt_bf16(cublas.handle(), act, require(w, weight).data(),
+                                out, m, n, k, beta);
+    };
 
     const auto execute_op = [&](const PieForwardOp& op) {
+        enter(op.layer);
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
@@ -231,6 +269,268 @@ bool gemma4_forward_declared(
             }
             break;
         }
+        case PieForwardOpKind::Matmul: {
+            const std::string_view name = plan.weight_name(op);
+            const ParsedName nm = parse_name(name);
+            if (nm.field == "ple_model_proj") {
+                gemm(per_layer_token, name, per_layer_proj,
+                     N, L * ple_dim, H, 0.f);
+            } else if (nm.field == "qkv") {
+                gemm(ws.norm_x.data(), name, ws.qkv_fused.data(),
+                     N, cur_hq + 2 * cur_hk, H, 0.f);
+            } else if (nm.field == "q_proj") {
+                gemm(ws.norm_x.data(), name, ws.q.data(), N, cur_hq, H, 0.f);
+            } else if (nm.field == "k_proj") {
+                gemm(ws.norm_x.data(), name, ws.k.data(), N, cur_hk, H, 0.f);
+            } else if (nm.field == "v_proj") {
+                gemm(ws.norm_x.data(), name, ws.v.data(), N, cur_hk, H, 0.f);
+            } else if (nm.field == "o_proj") {
+                gemm(ws.attn_out.data(), name, ws.norm_x.data(),
+                     N, H, cur_hq, 0.f);
+            } else if (nm.field == "gate_up") {
+                gemm(ws.norm_x.data(), name, ws.gate_up_fused.data(),
+                     N, 2 * I, H, 0.f);
+            } else if (nm.field == "down") {
+                gemm(ws.gate.data(), name, ws.norm_x.data(), N, H, I, 0.f);
+            } else if (nm.field == "ple_gate") {
+                gemm(ws.y.data(), name, ws.norm_x.data(), N, ple_dim, H, 0.f);
+            } else if (nm.field == "ple_proj") {
+                gemm(ws.norm_x.data(), name, ws.norm_y.data(),
+                     N, H, ple_dim, 0.f);
+            } else {
+                throw_drift("matmul on '" + std::string(name) + "'");
+            }
+            break;
+        }
+        case PieForwardOpKind::Rmsnorm: {
+            const std::string_view name = plan.weight_name(op);
+            const ParsedName nm = parse_name(name);
+            if (nm.field == "attn_norm") {
+                // Layer 0's only: every later layer's input norm arrives
+                // fused into the previous layer's PLE landing.
+                kernels::launch_rmsnorm_gemma_bf16(
+                    ws.y.data(), require(w, name).data(), ws.norm_x.data(),
+                    N, H, eps, stream);
+            } else if (nm.field == "final_norm") {
+                kernels::launch_rmsnorm_gemma_bf16(
+                    ws.y.data(), require(w, name).data(), ws.norm_x.data(),
+                    N, H, eps, stream);
+            } else {
+                throw_drift("rmsnorm on '" + std::string(name) + "'");
+            }
+            break;
+        }
+        case PieForwardOpKind::RmsnormPerHead: {
+            const std::string_view name = plan.weight_name(op);
+            const ParsedName nm = parse_name(name);
+            if (nm.field == "ple_model_norm") {
+                kernels::launch_rmsnorm_gemma_bf16(
+                    per_layer_proj, require(w, name).data(), per_layer_proj,
+                    N * L, ple_dim, eps, stream);
+            } else if (nm.field == "q_norm") {
+                kernels::launch_rmsnorm_gemma_bf16(
+                    ws.q.data(), require(w, name).data(), ws.q.data(),
+                    N * cfg.num_attention_heads, cur_d, eps, stream);
+            } else if (nm.field == "k_norm") {
+                kernels::launch_rmsnorm_gemma_bf16(
+                    ws.k.data(), require(w, name).data(), ws.k.data(),
+                    N * (cur_hk / cur_d), cur_d, eps, stream);
+            } else {
+                throw_drift("per-head norm on '" + std::string(name) + "'");
+            }
+            break;
+        }
+        case PieForwardOpKind::SplitQkv:
+            kernels::launch_split_qkv_bf16(
+                ws.qkv_fused.data(), ws.q.data(), ws.k.data(), ws.v.data(),
+                N, cur_hq, cur_hk, stream);
+            break;
+        case PieForwardOpKind::Rope:
+            // Only the FULL layers reach the semantic kind: sliding
+            // layers state the fused rounded pair instead.
+            kernels::launch_rope_partial_bf16(
+                ws.q.data(), ws.k.data(), positions, N,
+                cfg.num_attention_heads, cur_hk / cur_d, cur_d,
+                static_cast<int>(op.param1),
+                w.per_layer_rope_theta[static_cast<std::size_t>(cur_layer)],
+                stream);
+            break;
+        case PieForwardOpKind::LmHead: {
+            const std::string_view name = plan.weight_name(op);
+            const void* input = ws.norm_x.data();
+            int rows = N;
+            if (logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+                num_logit_rows < N) {
+                kernels::launch_gather_bf16_rows(
+                    static_cast<const std::uint16_t*>(ws.norm_x.data()),
+                    logit_row_indices_d,
+                    static_cast<std::uint16_t*>(ws.norm_y.data()),
+                    num_logit_rows, H, stream);
+                input = ws.norm_y.data();
+                rows = num_logit_rows;
+            }
+            lm_head_rows = rows;
+            gemm(input, name, ws.logits.data(), rows, V, H, 0.f);
+            break;
+        }
+        case PieForwardOpKind::Launch: {
+            const std::string_view sym = plan.weight_name(op);
+            const auto names = plan.aux_names(op);
+            const auto aux = [&](std::size_t i) {
+                return plan.name(names[i]);
+            };
+            switch (resolve_g4_kernel(sym)) {
+            case G4Kernel::ScalarMul: {
+                const std::string_view which = aux(0);
+                if (which == "scale.sqrt_hidden") {
+                    kernels::launch_scalar_mul_bf16(
+                        ws.y.data(), std::sqrt(static_cast<float>(H)),
+                        static_cast<std::size_t>(N) * H, stream);
+                } else if (which == "scale.sqrt_ple_dim") {
+                    kernels::launch_scalar_mul_bf16(
+                        per_layer_token, std::sqrt(static_cast<float>(ple_dim)),
+                        static_cast<std::size_t>(N) * L * ple_dim, stream);
+                } else if (which == "scale.rsqrt_hidden") {
+                    kernels::launch_scalar_mul_bf16(
+                        per_layer_proj, 1.0f / std::sqrt(static_cast<float>(H)),
+                        static_cast<std::size_t>(N) * L * ple_dim, stream);
+                } else if (which == "scale.rsqrt_2") {
+                    kernels::launch_scalar_mul_bf16(
+                        per_layer_proj, 1.0f / std::sqrt(2.0f),
+                        static_cast<std::size_t>(N) * L * ple_dim, stream);
+                } else {
+                    throw_drift("scale '" + std::string(which) + "'");
+                }
+                break;
+            }
+            case G4Kernel::ResidualAdd:
+                kernels::launch_residual_add_bf16(
+                    per_layer_proj, per_layer_token,
+                    static_cast<std::size_t>(N) * L * ple_dim, stream);
+                break;
+            case G4Kernel::TransposeNldToLnd:
+                kernels::launch_transpose_bf16_nld_to_lnd(
+                    static_cast<const std::uint16_t*>(per_layer_proj),
+                    static_cast<std::uint16_t*>(per_layer_token),
+                    N, L, ple_dim, stream);
+                break;
+            case G4Kernel::QkvPackedPost: {
+                auto kv_view = cache.layer_view(cur_layer);
+                kernels::launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
+                    ws.qkv_fused.data(), ws.q.data(),
+                    kv_view.k_pages, kv_view.v_pages,
+                    require(w, aux(0)).data(), require(w, aux(1)).data(),
+                    positions, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, row_valid_d, N,
+                    cfg.num_attention_heads, cur_hk / cur_d, cur_d,
+                    cache.page_size(), kv_view.hnd_layout,
+                    w.per_layer_rope_theta[static_cast<std::size_t>(cur_layer)],
+                    eps, stream);
+                break;
+            }
+            case G4Kernel::QkRmsnormRopeRounded: {
+                const bool q_only = names.size == 1;
+                kernels::launch_qk_rmsnorm_rope_bf16_rounded(
+                    ws.q.data(), ws.k.data(), require(w, aux(0)).data(),
+                    q_only ? nullptr : require(w, aux(1)).data(),
+                    positions, N, cfg.num_attention_heads,
+                    q_only ? 0 : cur_hk / cur_d, cur_d,
+                    w.per_layer_rope_theta[static_cast<std::size_t>(cur_layer)],
+                    eps, stream);
+                break;
+            }
+            case G4Kernel::RopeQOnlyPartial:
+                kernels::launch_rope_partial_bf16(
+                    ws.q.data(), ws.q.data(), positions, N,
+                    cfg.num_attention_heads, /*num_kv_heads=*/0, cur_d,
+                    rotary_of(cur_layer),
+                    w.per_layer_rope_theta[static_cast<std::size_t>(cur_layer)],
+                    stream);
+                break;
+            case G4Kernel::RmsnormNoScale:
+                kernels::launch_rmsnorm_no_scale_bf16(
+                    ws.v.data(), ws.v.data(), N * (cur_hk / cur_d), cur_d,
+                    eps, stream);
+                break;
+            case G4Kernel::WriteKvToPages: {
+                auto kv_view = cache.layer_view(cur_layer);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(), nullptr,
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    N, R, stream);
+                break;
+            }
+            case G4Kernel::AttnFlashinferDecode: {
+                auto kv_view = cache.layer_view(cur_layer);
+                ops::DecodePlanCache* p =
+                    (cur_full ? moe_ws.decode_plan_full
+                              : moe_ws.decode_plan_sliding).get();
+                ops::DecodePlanCachePtr owned;
+                if (p == nullptr) {
+                    owned = ops::make_decode_plan();
+                    p = owned.get();
+                    ops::plan_attention_flashinfer_decode(
+                        *p, kv_page_indptr_h, R, cfg.num_attention_heads,
+                        cur_hk / cur_d, cur_d, cache.page_size(), attn_ws,
+                        stream, /*enable_cuda_graph=*/true,
+                        /*full_attention_variant=*/cur_full,
+                        cache.hnd_layout());
+                }
+                ops::dispatch_attention_flashinfer_decode(
+                    *p, ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream,
+                    w.per_layer_window_left[static_cast<std::size_t>(cur_layer)],
+                    /*logits_soft_cap=*/0.f, /*sm_scale=*/1.0f);
+                break;
+            }
+            case G4Kernel::ChunkedGegluTanh:
+                kernels::launch_chunked_geglu_tanh_bf16(
+                    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+                break;
+            case G4Kernel::GegluTanh: {
+                // The PLE gate: the "up" operand is this layer's slice.
+                const auto* signal =
+                    static_cast<const std::uint16_t*>(per_layer_token) +
+                    static_cast<std::size_t>(cur_layer) * N * ple_dim;
+                kernels::launch_geglu_tanh_bf16(
+                    ws.norm_x.data(), signal, ws.norm_x.data(),
+                    N * ple_dim, stream);
+                break;
+            }
+            case G4Kernel::NormResidualScaleNorm: {
+                const std::string_view first = aux(0);
+                const ParsedName nm = parse_name(first);
+                // Two sites: the attention landing (norm_x -> y, then the
+                // MLP's input norm) and the PLE landing (norm_y -> y, then
+                // the NEXT layer's input norm).
+                const bool ple = nm.field == "ple_norm";
+                kernels::launch_rmsnorm_residual_add_scale_rmsnorm_bf16(
+                    ple ? ws.norm_y.data() : ws.norm_x.data(),
+                    require(w, first).data(), ws.y.data(), 1.f,
+                    require(w, aux(1)).data(), ws.norm_x.data(),
+                    N, H, eps, stream);
+                break;
+            }
+            case G4Kernel::NormResidualAdd: {
+                const std::string_view first = aux(0);
+                const ParsedName nm = parse_name(first);
+                const bool ple = nm.field == "ple_norm";
+                kernels::launch_rmsnorm_residual_add_bf16(
+                    ple ? ws.norm_y.data() : ws.norm_x.data(),
+                    require(w, first).data(), ws.y.data(), N, H, eps, stream);
+                break;
+            }
+            case G4Kernel::LogitSoftcap:
+                kernels::launch_logit_softcap_bf16(
+                    ws.logits.data(), fwd_cfg.final_logit_softcap,
+                    static_cast<std::size_t>(lm_head_rows) * V, stream);
+                break;
+            case G4Kernel::AttnFlashinferPrefill:
+                throw_drift("prefill dispatch in the decode class");
+            }
+            break;
+        }
         default:
             throw_drift("op kind " +
                         std::to_string(static_cast<std::uint32_t>(op.kind)) +
@@ -238,25 +538,47 @@ bool gemma4_forward_declared(
         }
     };
 
-    (void)execute_op;
-    (void)fwd_cfg;
-    (void)attn_ws;
-    (void)cublas;
-    (void)positions;
-    (void)kv_page_indices;
-    (void)kv_page_indptr;
-    (void)kv_last_page_lens;
-    (void)kv_page_indptr_h;
-    (void)row_valid_d;
-    (void)logit_row_indices_d;
-    (void)num_logit_rows;
-    (void)R;
-    (void)I;
-    (void)eps;
-    (void)moe_ws;
-    // The arms below this line are the remaining work; until they exist
-    // the drive declines rather than half-executing a fire.
-    return false;
+    // Build the fire's rows, lower them, execute the list.
+    std::vector<pie_forward::PieForwardRow> rows(static_cast<std::size_t>(N));
+    for (int r = 0; r < N; ++r) {
+        auto& row = rows[static_cast<std::size_t>(r)];
+        row.multi_token = 0;
+        row.custom_mask = 0;
+        row.hooked = 0;
+        row.lora = 0;
+        row.write_desc = 0;
+        row.wants_scores = 0;
+        row.samples = 1;
+        row._pad = 0;
+        row.depth_k = -1;
+    }
+    if (logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+        num_logit_rows < N) {
+        for (int r = num_logit_rows; r < N; ++r) {
+            rows[static_cast<std::size_t>(r)].samples = 0;
+        }
+    }
+    const pie_forward::PieForwardLowered flat =
+        plan.lower(rows.data(), rows.size());
+    if (flat.uncovered != pie_forward::PieForwardUncovered::None) return false;
+
+    std::size_t next_site = 0;
+    std::size_t at = 0;
+    while (at < flat.launches_len || next_site < flat.structural_len) {
+        const bool site_first =
+            at >= flat.launches_len ||
+            (next_site < flat.structural_len &&
+             flat.structural[next_site].at_op < flat.launches[at].at_op);
+        if (site_first) {
+            execute_op(plan.op(flat.structural[next_site].at_op));
+            ++next_site;
+            continue;
+        }
+        const std::uint32_t at_op = flat.launches[at].at_op;
+        while (at < flat.launches_len && flat.launches[at].at_op == at_op) ++at;
+        execute_op(plan.op(at_op));
+    }
+    return true;
 }
 
 }  // namespace pie_cuda_driver::model

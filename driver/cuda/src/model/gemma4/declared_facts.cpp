@@ -59,12 +59,28 @@ bool uniform(const std::vector<int>& v, int& value) {
 }  // namespace
 
 bool gemma4_declared_forward_enabled() {
-    // llama_like's polarity: default ON, `=0` disarms.
+    // Tracing and VALIDATING the declaration follows llama_like's
+    // polarity — default ON, `=0` disarms — because it costs one trace
+    // at load and is what catches a drift loudly.
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_DECLARED_FORWARD");
         return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return enabled;
+}
+
+bool gemma4_declared_drive_enabled() {
+    // EXECUTING it is opt-in, and stays opt-in until the arms are right.
+    // They are written and they build; on a live E4B decode they fault
+    // (an illegal access that surfaces at the next device copy), so the
+    // buffer threading in at least one arm is wrong. Default-on would
+    // make that everyone's problem for the sake of a rung that is not
+    // finished.
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_DECLARED_FORWARD_GEMMA4");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
 }
 
 Gemma4DeclaredPlan build_gemma4_declared_plan(

@@ -95,6 +95,26 @@ void Gemma4Model::body(Workspace& ws,
         audio_in.num_clips             = in.num_clips;
         audio_in_ptr = &audio_in;
     }
+    // The declared drive gets the fire first. It answers false for
+    // anything outside what the decode class states — a prefill, a
+    // masked or hooked fire, a multimodal one, a deployment whose PLE
+    // buffers or cache format do not match — and the hand-written pass
+    // runs it unchanged. Eligibility is an ANSWER, not an error.
+    const bool declared_eligible =
+        gemma4_declared_drive_enabled() && declared_.usable && in.is_pure_decode &&
+        in.custom_mask_d == nullptr && in.stage_hooks == nullptr &&
+        in.num_images == 0 && in.num_clips == 0 &&
+        in.precomputed_embeddings.num_blocks == 0 &&
+        fwd_cfg_.tp_size == 1;
+    if (declared_eligible &&
+        gemma4_forward_declared(
+            declared_, weights_, hf_config_, fwd_cfg_, ws, moe_ws_, kv,
+            attn_ws, cublas, in.token_ids, in.positions,
+            in.kv_page_indices_d, in.kv_page_indptr_d, in.kv_last_page_lens_d,
+            in.kv_page_indptr_h, in.total_tokens, in.num_requests,
+            in.row_valid_d, in.logit_row_indices_d, in.num_logit_rows)) {
+        return;
+    }
     gemma4_forward_paged(
         weights_, hf_config_, fwd_cfg_,
         ws, moe_ws_, kv, attn_ws, cublas,
