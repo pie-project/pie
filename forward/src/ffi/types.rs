@@ -630,6 +630,13 @@ pub struct PieForwardLaunch {
     pub row_hi: u32,
     pub layer_lo: u16,
     pub layer_hi: u16,
+    /// Non-zero when `row_lo/row_hi` are the HOST's belief and the
+    /// executing form must read the fire's runtime split instead:
+    /// 1 = the hook-free prefix, 2 = the unmasked prefix. Set only
+    /// inside a captured fire's peel, which is the one place a
+    /// rectangle is not a pair of numbers.
+    pub rows_device: u8,
+    pub _pad: u8,
 }
 
 /// What [`crate::lower::Uncovered`] crosses as: zero is a lowering, and

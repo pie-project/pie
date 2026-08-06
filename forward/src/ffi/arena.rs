@@ -600,6 +600,7 @@ pub(crate) mod view {
 pub fn lower(
     header: &mut PieForwardPlan,
     rows: &[crate::lower::Row],
+    fire: crate::lower::Fire,
 ) -> PieForwardLowered {
     if header.owner.is_null() {
         return PieForwardLowered::default();
@@ -607,7 +608,7 @@ pub fn lower(
     // Borrowed, not taken: `release` still owns the box.
     let arena = unsafe { &mut *header.owner.cast::<PlanArena>() };
 
-    let lowered = match crate::lower::lower(&arena.plan, rows) {
+    let lowered = match crate::lower::lower(&arena.plan, rows, fire) {
         Ok(lowered) => lowered,
         Err(why) => {
             arena.shadow = None;
@@ -642,6 +643,12 @@ pub fn lower(
             row_hi: launch.rows.end,
             layer_lo: launch.layers.start,
             layer_hi: launch.layers.end,
+            rows_device: match launch.rows_device {
+                None => 0,
+                Some(crate::trace::PeelWindow::HookFreePrefix) => 1,
+                Some(crate::trace::PeelWindow::UnmaskedPrefix) => 2,
+            },
+            _pad: 0,
         });
     }
     arena.shadow_names.clear();

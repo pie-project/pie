@@ -85,6 +85,23 @@ pub struct Row {
     pub samples: bool,
 }
 
+/// How the fire will be EXECUTED, where that changes what runs.
+///
+/// Not row facts and not a guard: one thing the driver decides about the
+/// fire as a whole, which the lowering has to know because it changes
+/// the launch list rather than the launch arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Fire {
+    /// The fire is captured once and replayed across DIFFERENT row
+    /// splits, so a peel's regions cannot bake their row counts: both
+    /// regions launch and an empty one early-outs on a device word.
+    ///
+    /// Set, a peel emits BOTH regions even when one is empty here, and
+    /// their launches carry [`Launch::rows_device`]. Clear, the host's
+    /// counts are the truth and an empty region emits nothing.
+    pub captures_across_splits: bool,
+}
+
 /// One flat launch: a kernel over a rectangle of (rows × layers).
 ///
 /// `args` is an index into the frame's argument slots — the driver binds
@@ -103,6 +120,20 @@ pub struct Launch {
     pub rows: Range<u32>,
     pub layers: Range<u16>,
     pub args: u32,
+    /// Set when `rows` is the host's BELIEF and the executing form must
+    /// read the fire's runtime split for this peel instead.
+    ///
+    /// This is the one place a rectangle is not a pair of numbers, and
+    /// it is deliberately the only one: a captured fire replays across
+    /// splits, so the peel's two regions both launch and each early-outs
+    /// on a device word. Everything else in the list stays plain
+    /// counts — "mostly numbers, two of them runtime" is a list you can
+    /// still read, which "any of these might be runtime" would not be.
+    ///
+    /// `rows` still carries the host's count, because the arena sizing,
+    /// the rectangle count and the shadow all want a number and a
+    /// captured fire's split is bounded by the same window.
+    pub rows_device: Option<PeelWindow>,
 }
 
 /// Why a fire cannot be lowered against this trace.
@@ -172,6 +203,17 @@ pub struct Lowered {
     pub residue: Vec<Unlowered>,
 }
 
+impl Launch {
+    /// Whether this rectangle names `symbol`, against the lowering it
+    /// came from — the kernel table is per-`Lowered`, not global.
+    pub fn kernel_is(&self, lowered: &Lowered, symbol: &str) -> bool {
+        lowered
+            .kernels
+            .get(self.kernel as usize)
+            .is_some_and(|k| k == symbol)
+    }
+}
+
 impl Lowered {
     /// The fraction of executed statements the flat list carries. What
     /// the cutover is measured against; `1.0` is the gate.
@@ -187,7 +229,7 @@ impl Lowered {
 }
 
 /// Lower `plan` over `rows`, in the order the engine seriated them.
-pub fn lower(plan: &ForwardPlan, rows: &[Row]) -> Result<Lowered, Uncovered> {
+pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Uncovered> {
     let backend = Backend::of_family(&plan.family);
     let n = rows.len() as u32;
     let mut out = Lowerer {
@@ -199,6 +241,8 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row]) -> Result<Lowered, Uncovered> {
         kernel_ids: BTreeMap::new(),
         peel_tail: false,
         residue: Vec::new(),
+        fire,
+        peel_device: None,
     };
     out.region(0..plan.ops.len(), 0..n)?;
     let buffers = Buffers::assign(plan, rows);
@@ -224,6 +268,10 @@ struct Lowerer<'a> {
     /// asking, not the driver choosing — so the lowering knows it.
     peel_tail: bool,
     residue: Vec<Unlowered>,
+    fire: Fire,
+    /// The peel whose runtime split the launches being emitted must read
+    /// — set only inside a captured fire's peel regions.
+    peel_device: Option<PeelWindow>,
 }
 
 impl Lowerer<'_> {
@@ -269,16 +317,29 @@ impl Lowerer<'_> {
                     let tail = split..window.end;
                     let p = i + 1..i + 1 + *prefix_ops as usize;
                     let t = p.end..p.end + *tail_ops as usize;
-                    if !prefix.is_empty() {
-                        self.region(p, prefix)?;
+                    // A captured fire replays across splits, so BOTH
+                    // regions launch whatever this fire's split is and
+                    // each early-outs on the device word. Skipping an
+                    // empty one here would describe a graph that cannot
+                    // serve the next fire.
+                    let device = self.fire.captures_across_splits;
+                    let outer_device = self.peel_device;
+                    if device {
+                        self.peel_device = Some(*axis);
                     }
+                    let mut run = |me: &mut Self, span: Range<usize>, w: Range<u32>, tail_side: bool| {
+                        if !device && w.is_empty() {
+                            return Ok(());
+                        }
+                        let outer = std::mem::replace(&mut me.peel_tail, tail_side);
+                        let r = me.region(span, w);
+                        me.peel_tail = outer;
+                        r
+                    };
                     let next = t.end;
-                    if !tail.is_empty() {
-                        let outer = std::mem::replace(&mut self.peel_tail, true);
-                        let r = self.region(t, tail);
-                        self.peel_tail = outer;
-                        r?;
-                    }
+                    run(self, p, prefix, false)?;
+                    run(self, t, tail, true)?;
+                    self.peel_device = outer_device;
                     i = next;
                 }
                 OpKind::Launch { kernel, .. } => {
@@ -324,7 +385,7 @@ impl Lowerer<'_> {
         op: &Op,
         window: &Range<u32>,
     ) -> Result<(), Uncovered> {
-        if window.is_empty() {
+        if window.is_empty() && self.peel_device.is_none() {
             return Ok(());
         }
         let backend = self
@@ -362,6 +423,7 @@ impl Lowerer<'_> {
             rows: window.clone(),
             layers: layer..layer + 1,
             args: at as u32,
+            rows_device: self.peel_device,
         });
         Ok(())
     }
@@ -939,7 +1001,7 @@ mod tests {
             // Both epilogue shapes: a decode fire samples every row, a
             // prefill fire samples one row per request and gathers.
             for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
-                let out = lower(&plan, &rows).unwrap_or_else(|e| panic!("{name}/{shape}: {e:?}"));
+                let out = lower(&plan, &rows, Fire::default()).unwrap_or_else(|e| panic!("{name}/{shape}: {e:?}"));
                 assert!(
                     out.residue.is_empty(),
                     "{name}/{shape}: {} statements still owe a declaration: {:#?}",
@@ -953,6 +1015,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A CAPTURED fire emits both peel regions whatever its split is,
+    /// and says so on the launches — the one place a rectangle is not a
+    /// pair of numbers.
+    ///
+    /// The shadow comparison is what asked for this: the walk emits both
+    /// regions under device-window capture (an empty one early-outs on
+    /// the device word, so one graph replays across every split) and the
+    /// flat list described only the non-empty one.
+    #[test]
+    fn a_captured_fire_emits_both_peel_regions() {
+        let plan = decode_plan();
+        // fast_rows == 0: every row hooked, so the hook-free prefix is
+        // empty. Uncaptured, it contributes nothing.
+        let mut rows = sampled(4);
+        for r in &mut rows {
+            r.hooked = true;
+        }
+        let host = lower(&plan, &rows, Fire::default()).expect("coverable");
+        assert!(host.launches.iter().all(|l| l.rows_device.is_none()));
+        assert!(
+            !host
+                .launches
+                .iter()
+                .any(|l| l.kernel_is(&host, "launch_qkv_decode_qk_norm_rope_write_kv_bf16")),
+            "an empty prefix launches nothing when the host's count is the truth"
+        );
+
+        // Captured: the prefix's launches ARE in the list, marked as
+        // reading the fire's split rather than these counts.
+        let captured = lower(
+            &plan,
+            &rows,
+            Fire {
+                captures_across_splits: true,
+            },
+        )
+        .expect("coverable");
+        let fused: Vec<_> = captured
+            .launches
+            .iter()
+            .filter(|l| l.kernel_is(&captured, "launch_qkv_decode_qk_norm_rope_write_kv_bf16"))
+            .collect();
+        assert!(!fused.is_empty(), "the captured graph carries the prefix");
+        assert!(fused
+            .iter()
+            .all(|l| l.rows_device == Some(PeelWindow::HookFreePrefix)));
+
+        // And ONLY the peel's regions are marked: everything outside is
+        // still a plain count, which is what keeps the list readable.
+        assert!(captured
+            .launches
+            .iter()
+            .filter(|l| l.rows_device.is_some())
+            .count()
+            < captured.launches.len());
     }
 
     /// The epilogue is three statements over a ROW COUNT, and the two
@@ -971,7 +1090,7 @@ mod tests {
             .position(|op| matches!(op.kind, OpKind::LmHead { .. }))
             .expect("the class trace has an epilogue") as u32;
         let epilogue = |rows: &[Row]| -> Vec<(String, Range<u32>)> {
-            let out = lower(&plan, rows).expect("coverable");
+            let out = lower(&plan, rows, Fire::default()).expect("coverable");
             out.launches
                 .iter()
                 .filter(|l| l.args == at_op)
@@ -1006,7 +1125,7 @@ mod tests {
         // nobody reads): no rectangle at all, while the body still runs.
         let none = vec![Row::default(); 4];
         assert!(epilogue(&none).is_empty());
-        assert!(!lower(&plan, &none).unwrap().launches.is_empty());
+        assert!(!lower(&plan, &none, Fire::default()).unwrap().launches.is_empty());
     }
 
     /// A plain fire lowers, and every launch covers every row — the
@@ -1015,7 +1134,7 @@ mod tests {
     fn a_plain_fire_is_one_rectangle_per_statement() {
         let plan = decode_plan();
         let rows = plain(8);
-        let out = lower(&plan, &rows).expect("a plain fire is coverable");
+        let out = lower(&plan, &rows, Fire::default()).expect("a plain fire is coverable");
         assert!(out.rectangles > 0);
         assert!(out.launches.iter().all(|l| l.rows == (0..8)));
         // The frame's kernel table is what the driver would index.
@@ -1035,7 +1154,7 @@ mod tests {
         for r in &mut rows[6..] {
             r.custom_mask = true;
         }
-        let out = lower(&plan, &rows).expect("mask + plain is coverable");
+        let out = lower(&plan, &rows, Fire::default()).expect("mask + plain is coverable");
         let masked = out
             .launches
             .iter()
@@ -1046,7 +1165,7 @@ mod tests {
         assert!(plain_rows > 0, "and the plain rows theirs");
         // More rectangles than the unsplit fire — what the row order
         // costs, reported rather than acted on.
-        let flat = lower(&plan, &plain(8)).unwrap();
+        let flat = lower(&plan, &plain(8), Fire::default()).unwrap();
         assert!(out.rectangles > flat.rectangles);
     }
 
@@ -1060,7 +1179,7 @@ mod tests {
         rows[1].custom_mask = true;
         rows[5].custom_mask = true;
         assert!(matches!(
-            lower(&plan, &rows),
+            lower(&plan, &rows, Fire::default()),
             Err(Uncovered::Discontiguous { .. })
         ));
     }
@@ -1086,7 +1205,7 @@ mod tests {
             "this deployment states XQA"
         );
         // Whole fire: fine.
-        assert!(lower(&plan, &plain(8)).is_ok());
+        assert!(lower(&plan, &plain(8), Fire::default()).is_ok());
         // And a MASKED fire is fine too, which is the point: a guard is
         // a fire fact, so the mask arm takes the whole fire and XQA — in
         // the else arm — does not run at all. Nothing hands a kernel a
@@ -1099,7 +1218,7 @@ mod tests {
         for r in &mut rows[6..] {
             r.custom_mask = true;
         }
-        assert!(lower(&plan, &rows).is_ok());
+        assert!(lower(&plan, &rows, Fire::default()).is_ok());
     }
 
     /// Liveness reuse is the point of assigning buffers here: a
@@ -1147,7 +1266,7 @@ mod tests {
                 r.depth_k = Some(k);
             }
         }
-        let out = lower(&plan, &rows).expect("four bands is not a special case");
+        let out = lower(&plan, &rows, Fire::default()).expect("four bands is not a special case");
         // Layer 0 runs over everybody; layer 23 only over the rows whose
         // k is past it (the full-depth prefix plus the k=24 block).
         let at = |l: u16| {
@@ -1182,11 +1301,11 @@ mod tests {
             };
             4
         ];
-        let out = lower(&plan, &rows).unwrap();
+        let out = lower(&plan, &rows, Fire::default()).unwrap();
         assert!(out.launches.iter().all(|l| l.layers.start < 12
             || l.layers.start >= 28
             || l.rows.is_empty()));
-        let full = lower(&plan, &plain(4)).unwrap();
+        let full = lower(&plan, &plain(4), Fire::default()).unwrap();
         assert!(out.rectangles < full.rectangles, "truncation costs less");
     }
 

@@ -641,7 +641,11 @@ void shadow_report(
     const std::vector<pie_forward::PieForwardRow>& rows,
     const ShadowShape& shape)
 {
-    const pie_forward::PieForwardLowered lowered = plan.lower(rows.data(), rows.size());
+    // The capture decision travels WITH the fire: under device-window
+    // capture the walk emits both peel regions, so the lowering must
+    // describe both or it is describing a different graph.
+    const pie_forward::PieForwardLowered lowered =
+        plan.lower(rows.data(), rows.size(), shape.devwin);
     if (lowered.uncovered != pie_forward::PieForwardUncovered::None) {
         std::fprintf(stderr,
                      "[shadow] UNCOVERED reason=%u rows=%zu — the lowering "

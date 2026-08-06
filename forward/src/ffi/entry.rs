@@ -803,6 +803,7 @@ pub unsafe extern "C" fn pie_forward_lower(
     plan: *mut PieForwardPlan,
     rows: *const PieForwardRow,
     rows_len: usize,
+    captures_across_splits: u8,
     out: *mut PieForwardLowered,
 ) -> PieForwardStatus {
     abort_on_panic(|| {
@@ -831,7 +832,10 @@ pub unsafe extern "C" fn pie_forward_lower(
                 samples: r.samples != 0,
             })
             .collect();
-        unsafe { *out = arena::lower(&mut *plan, &rows) };
+        let fire = crate::lower::Fire {
+            captures_across_splits: captures_across_splits != 0,
+        };
+        unsafe { *out = arena::lower(&mut *plan, &rows, fire) };
         PieForwardStatus::Ok
     })
 }

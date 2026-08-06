@@ -614,6 +614,13 @@ struct PieForwardLaunch {
   uint32_t row_hi;
   uint16_t layer_lo;
   uint16_t layer_hi;
+  /// Non-zero when `row_lo/row_hi` are the HOST's belief and the
+  /// executing form must read the fire's runtime split instead:
+  /// 1 = the hook-free prefix, 2 = the unmasked prefix. Set only inside
+  /// a CAPTURED fire's peel, which is the one place a rectangle is not
+  /// a pair of numbers.
+  uint8_t rows_device;
+  uint8_t _pad;
 };
 
 /// Zero is a lowering; every other value is a group that should not have
@@ -806,9 +813,14 @@ void pie_forward_release(PieForwardPlan *plan);
 /// `plan` is null or points at a writable header built by a trace entry
 /// point and not yet released; `rows` is null or points at `rows_len`
 /// readable `PieForwardRow`s; `out` is null or a writable slot.
+/// `captures_across_splits` is non-zero when the fire is captured once
+/// and replayed across DIFFERENT row splits: a peel then emits BOTH
+/// regions whatever this fire's split is, and their launches carry
+/// `rows_device`.
 PieForwardStatus pie_forward_lower(PieForwardPlan *plan,
                                    const PieForwardRow *rows,
                                    size_t rows_len,
+                                   uint8_t captures_across_splits,
                                    PieForwardLowered *out);
 
 }  // extern "C"

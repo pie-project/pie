@@ -1257,7 +1257,7 @@ fn the_lowering_crosses_the_abi() {
     let rows = plain_c_rows(4);
     let mut out = PieForwardLowered::default();
     assert_eq!(
-        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), &mut out) },
+        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), 0, &mut out) },
         PieForwardStatus::Ok
     );
     assert_eq!(out.uncovered, PieForwardUncovered::None);
@@ -1292,7 +1292,7 @@ fn an_uncoverable_fire_crosses_as_a_reason() {
     rows[5].custom_mask = 1;
     let mut out = PieForwardLowered::default();
     assert_eq!(
-        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), &mut out) },
+        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), 0, &mut out) },
         PieForwardStatus::Ok
     );
     assert_eq!(out.uncovered, PieForwardUncovered::Discontiguous);
@@ -1313,7 +1313,7 @@ fn the_mask_split_crosses_as_rectangles() {
     }
     let mut out = PieForwardLowered::default();
     assert_eq!(
-        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), &mut out) },
+        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), 0, &mut out) },
         PieForwardStatus::Ok
     );
     let view = lowered_view(&out);
@@ -1332,7 +1332,7 @@ fn a_released_plan_lowers_to_nothing() {
     let rows = plain_c_rows(2);
     let mut out = PieForwardLowered::default();
     assert_eq!(
-        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), &mut out) },
+        unsafe { pie_forward_lower(&mut plan, rows.as_ptr(), rows.len(), 0, &mut out) },
         PieForwardStatus::Ok
     );
     assert_eq!(out.launches_len, 0);

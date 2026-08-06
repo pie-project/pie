@@ -216,10 +216,14 @@ class ForwardPlan {
     /// only mutation is that slot — a cache, in the sense `mutable`
     /// exists for — and because a shadow must not need a mutable handle
     /// to a plan the body reads.
-    PieForwardLowered lower(const PieForwardRow* rows, std::size_t rows_len) const {
+    PieForwardLowered lower(
+        const PieForwardRow* rows,
+        std::size_t rows_len,
+        bool captures_across_splits = false) const {
         PieForwardLowered out{};
         const PieForwardStatus status = pie_forward_lower(
-            const_cast<PieForwardPlan*>(&plan_), rows, rows_len, &out);
+            const_cast<PieForwardPlan*>(&plan_), rows, rows_len,
+            captures_across_splits ? 1 : 0, &out);
         if (status != PieForwardStatus::Ok) {
             throw std::runtime_error(
                 "forward plan: lower failed (" + status_name(status) + ")");
