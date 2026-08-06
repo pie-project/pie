@@ -700,6 +700,20 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         AddBias { .. } => Semantic::Kernels(&["launch_add_bias_bf16"]),
         ResidualAdd => Semantic::Kernels(&["launch_residual_add_bf16"]),
 
+        // The GDN and full-attention kinds. Each is ONE kernel with no
+        // branch — no fact to read, no variant to dispatch on, nothing
+        // chosen per fire. They were residue only because the rule was
+        // never written: the qwen3_5 executor walks, so nothing ever
+        // asked the lowering what they were.
+        //
+        // Their operand plumbing (the per-layer `la.*` scratch, the fp32
+        // parameter banks) is the EMITTER's, exactly as it is for the
+        // kinds above — naming the symbol is what the lowering owes.
+        GdnPrep { .. } => Semantic::Kernels(&["launch_qwen_gdn_post_conv_prep_bf16"]),
+        RmsnormGated { .. } => Semantic::Kernels(&["launch_rmsnorm_gated_fp32_in_bf16"]),
+        SplitQGate { .. } => Semantic::Kernels(&["launch_split_q_gate_bf16"]),
+        SigmoidGateMul => Semantic::Kernels(&["launch_sigmoid_gate_inplace_bf16"]),
+
         // Gemma folds `(1 + w)` — different arithmetic, so a different
         // kernel, but the same signature and the same row space. The
         // variant is already on the wire (`param0`), so naming the
@@ -1132,46 +1146,48 @@ mod tests {
 
     /// The ledger's current contents — see [`the_qwen3_5_residue_ledger`].
     /// One entry per (kind, reason), counted per DECODE fire.
-    const LEDGER_QWEN35_DECODE: &[&str] = &[
-        "  18  GdnPrep: no lowering rule for this kind",
-        "  18  RmsnormGated: no lowering rule for this kind",
-        "   6  SigmoidGateMul: no lowering rule for this kind",
-        "   6  SplitQGate: no lowering rule for this kind",
-    ];
+    const LEDGER_QWEN35_DECODE: &[&str] = &[];
 
-    /// Qwen3.6-27B owes NOTHING that Qwen3.5-0.8B does not already owe.
+    /// THE QWEN3_5 CUTOVER GATE, in the shape llama_like's takes: every
+    /// statement a live fire executes is a rectangle in the flat list,
+    /// on both geometries and in both classes.
     ///
-    /// The qwen3_5 family's flat list does not cover itself yet — its
-    /// executor still walks, and both geometries carry the same large
-    /// residue (the Gemma norms, the GDN prep/gated-norm pair, the
-    /// swiglu binding fact). So the claim worth pinning is not coverage
-    /// but CONTAINMENT: the 27B checkpoint needs its dims and no new
-    /// vocabulary, which is exactly "its residue is a subset of the one
-    /// already being worked".
+    /// This was a CONTAINMENT test while the ledger was non-empty — 27B
+    /// owes nothing 0.8B does not — because asserting coverage would
+    /// have asserted something false about 0.8B too. With the ledger
+    /// empty the stronger claim is available, so it is the one made.
     ///
-    /// It is the first geometry whose GDN half is GQA (48 value heads
-    /// over 16 key heads), so a NEW `why` here would most likely be the
-    /// head-repeat or the `_gqa` recurrence — something 0.8B cannot
-    /// prove either way. That is the case this test exists to catch.
+    /// 27B earns its own row: it is the first geometry whose GDN half is
+    /// GQA (48 value heads over 16 key heads), which 0.8B cannot prove
+    /// either way.
     #[test]
-    fn qwen3_6_27b_owes_nothing_new() {
+    fn the_qwen3_5_flat_list_covers_every_statement() {
         let cuda = crate::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
-        let whys = |facts: &crate::facts::Qwen35HybridFacts, class| {
-            let plan = family::qwen3_5_hybrid_cuda(facts, &cuda, class);
-            let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
-            out.residue
-                .into_iter()
-                .map(|u| format!("{}: {}", u.kind, u.why))
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        for class in [FireClass::Decode, FireClass::Prefill] {
-            let known = whys(&crate::facts::Qwen35HybridFacts::qwen3_5_0_8b(), class);
-            let fresh = whys(&crate::facts::Qwen35HybridFacts::qwen3_6_27b(), class);
-            let novel: Vec<_> = fresh.difference(&known).collect();
-            assert!(
-                novel.is_empty(),
-                "{class:?}: Qwen3.6-27B owes something 0.8B does not: {novel:#?}"
-            );
+        let geometries = [
+            ("0.8b", crate::facts::Qwen35HybridFacts::qwen3_5_0_8b()),
+            ("27b", crate::facts::Qwen35HybridFacts::qwen3_6_27b()),
+        ];
+        for (name, facts) in geometries {
+            for class in [FireClass::Decode, FireClass::Prefill] {
+                let plan = family::qwen3_5_hybrid_cuda(&facts, &cuda, class);
+                for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
+                    let out = lower(&plan, &rows, Fire::default())
+                        .unwrap_or_else(|e| panic!("{name}/{class:?}/{shape}: {e:?}"));
+                    assert!(
+                        out.residue.is_empty(),
+                        "{name}/{class:?}/{shape}: {} statements still owe a \
+                         declaration: {:#?}",
+                        out.residue.len(),
+                        out.residue
+                    );
+                    assert_eq!(out.coverage(), 1.0, "{name}/{class:?}/{shape}");
+                    assert!(
+                        !out.launches.is_empty(),
+                        "{name}/{class:?}/{shape}: a fire that executes nothing \
+                         is not a fire"
+                    );
+                }
+            }
         }
     }
 

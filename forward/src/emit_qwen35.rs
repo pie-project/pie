@@ -582,17 +582,6 @@ fn emit_op(
             b.stmt("kernels::launch_sigmoid_gate_inplace_bf16(");
             b.stmt("    ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);");
         }
-        OpKind::Swiglu { .. } => {
-            let layer = op.layer.expect("swiglu is a layer op");
-            b.stmt(&format!("if (gate_up_fused_{layer}) {{"));
-            b.stmt("    kernels::launch_chunked_swiglu_bf16(");
-            b.stmt("        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);");
-            b.stmt("} else {");
-            b.stmt("    kernels::launch_swiglu_bf16(");
-            b.stmt("        ws.gate.data(), ws.up.data(), ws.gate.data(),");
-            b.stmt("        N * I, stream);");
-            b.stmt("}");
-        }
         OpKind::HookSite { stage, layer } => {
             // qwen3_5 sites are observation-only (A4): the invoke with
             // the layer-kind buffer/width as constants.
