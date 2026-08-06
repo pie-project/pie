@@ -196,7 +196,6 @@ def measured_average(
 
 def build_config(args: argparse.Namespace):
     from pie.config import (
-        AuthConfig,
         Config,
         DriverConfig,
         ModelConfig,
@@ -388,7 +387,6 @@ def build_config(args: argparse.Namespace):
             verbose=True,
             max_concurrent_processes=max_concurrent_processes,
         ),
-        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
             # A pooling slot costs ~4 GiB of VIRTUAL address space (wasmtime
