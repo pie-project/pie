@@ -2219,11 +2219,23 @@ void llama_like_forward_declared(
             // sampled rows first, then final-norm just those; full emits
             // recompute the final norm from `ws.y` for the reason
             // llama_like.cpp's comment gives (§6.2 staleness).
+            //
+            // This arm reads `N_fire`, not the `N` parameter, and that
+            // is the whole of the epilogue's row-space wrinkle. Every
+            // other op's rectangle is in `Dim::Tokens`; the epilogue's
+            // is in `Dim::Requests` (`lower()` emits it over the
+            // SAMPLED rows). The number this arm wants is the height of
+            // `ws.y` — the fire's tokens — which `DepthWindow` hands
+            // the walk unchanged for an untagged op (`depth_role == 0`
+            // is never a tail op, so `n_ == n_fire_` here on every
+            // posture). Saying `N_fire` makes that provable at the
+            // point of use instead of leaving the drive to special-case
+            // one op kind.
             const bool compact_logits =
                 logit_row_indices_d != nullptr && num_logit_rows > 0 &&
-                num_logit_rows < N;
+                num_logit_rows < N_fire;
             const void* lm_head_input = nullptr;
-            int lm_head_rows = N;
+            int lm_head_rows = N_fire;
             if (compact_logits) {
                 kernels::launch_gather_bf16_rows(
                     static_cast<const std::uint16_t*>(ws.y.data()),
@@ -2238,7 +2250,7 @@ void llama_like_forward_declared(
             } else {
                 kernels::launch_rmsnorm_bf16(
                     ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
-                    N, H, eps, stream);
+                    N_fire, H, eps, stream);
                 lm_head_input = ws.norm_y.data();
             }
             ops::gemm_act_x_w(cublas.handle(),
@@ -2267,9 +2279,11 @@ void llama_like_forward_declared(
     // arguments, which is why it is a ~60-line block and not a rewrite:
     //
     //   win_start/win_len  the rectangle, directly
-    //   N                  its row count (the EPILOGUE excepted — its
-    //                      rows are Dim::Requests while its arm asks
-    //                      for the fire's tokens)
+    //   N                  its row count, with NO exception — the
+    //                      epilogue's rows are Dim::Requests, and its
+    //                      arm now names `N_fire` for the one thing it
+    //                      wanted from token space (the height of
+    //                      `ws.y`) instead of borrowing this parameter
     //   R                  rows == N_fire ? R_fire : rows — the WALK's
     //                      own rule (`depth_window.hpp` sets n_ and r_
     //                      to the same live count whenever it narrows,
@@ -2351,7 +2365,6 @@ void llama_like_forward_declared(
             values.begin_op(L.at_op);
             const PieForwardOp& op = plan.op(L.at_op);
             const int live = static_cast<int>(L.row_hi - L.row_lo);
-            const bool epilogue = op.kind == PieForwardOpKind::LmHead;
             // The mask peel has an UNPLANNED endpoint: when the driver
             // declined the split, its tail IS the fire-level custom
             // dispatch, full-N, and the walk marks that region `None`
@@ -2370,7 +2383,7 @@ void llama_like_forward_declared(
                     : L.peel_tail ? MaskRegion::Tail
                                   : MaskRegion::Prefix;
             execute_op(op,
-                       /*N=*/epilogue ? N_fire : live,
+                       /*N=*/live,
                        /*R=*/live == N_fire ? R_fire : live,
                        /*win_start=*/static_cast<int>(L.row_lo),
                        /*win_len=*/live,
