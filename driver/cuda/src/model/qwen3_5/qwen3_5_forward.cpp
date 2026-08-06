@@ -902,7 +902,18 @@ void linear_attn_layer_body(
     // prefill that is neither warp-tiled (N small) nor cached (env-gated, off
     // by default), i.e. exactly the c≥64 spec path. The branches are mutually
     // exclusive and chosen globally from N, so skipping is safe.
+    // Same STOPGAP as use_warp_tiled_recurrent above, for the same reason:
+    // this kernel is that one's GQA twin -- the identical single-block scan,
+    // differing only in deriving qk_h itself instead of reading a materialised
+    // repeat -- so it under-folds the persisted state in exactly the same way.
+    // The original fix gated only the non-GQA arm, which left every GQA model
+    // (V_h != K_h is this path's own entry condition) still routed into the
+    // bug. Qwen3.6-27B decoded pure punctuation from the first token; sending
+    // its state-persisting prefills down the proven chunk path fixes it at a
+    // cost of 0.1 tok/s. Frozen verify (write_state=false) persists nothing,
+    // so the fold cannot manifest there and keeps the faster kernel.
     const bool use_batched_fla_gqa =
+        !write_state &&
         !linear_decode &&
         slot_ids_d != nullptr &&
         qo_indptr_d != nullptr &&
@@ -938,6 +949,11 @@ void linear_attn_layer_body(
         (V_h == K_h) ? la.q_pre.data() : la.q_norm.data();
     const float* k_recur_full =
         (V_h == K_h) ? la.k_pre.data() : la.k_norm.data();
+    // The GQA kernels do their own repeat: they index q/k at the COMPACT
+    // K_h stride and derive the head themselves (qk_h = h / repeat). They
+    // must therefore be handed the compact buffers, never the *_full pair.
+    const float* q_recur_compact = la.q_pre.data();
+    const float* k_recur_compact = la.k_pre.data();
 
     // ── PIE_GDN_PREP_TRACE: FLA-fold probe ───────────────────────────
     // Dumps the recurrence INPUTS per prefill token (g_log = gating log-decay,
@@ -1090,14 +1106,18 @@ void linear_attn_layer_body(
                     // was a second copy of the same arithmetic, and the
                     // `V_h != K_h` test picked between identical results.
                     //
-                    // `q_recur_full`/`k_recur_full` already resolve to the
-                    // compact K_h-head buffers when the heads are equal, which
-                    // is what the GQA kernel wants, so one call covers both.
+                    // Feed it the compact buffers. `q_recur_full` happens to
+                    // BE compact when the heads are equal, which is why it read
+                    // as a safe argument here, but that is the degenerate case:
+                    // when the heads differ it is the V_h-expanded buffer, and
+                    // these paths skip the repeat_interleave that fills it. The
+                    // kernel then walked stale memory at a K_h stride, which is
+                    // what made Qwen3.6-27B (repeat 3) emit pure punctuation.
                     if (use_warp_tiled_recurrent) {
                         if (state_bf16) {
                             kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
-                                q_recur_full,
-                                k_recur_full,
+                                q_recur_compact,
+                                k_recur_compact,
                                 la.v_fp32.data(),
                                 la.g_log.data(),
                                 la.beta.data(),
@@ -1109,8 +1129,8 @@ void linear_attn_layer_body(
                                 stream, write_state, rs_write_state_mask);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
-                                q_recur_full,
-                                k_recur_full,
+                                q_recur_compact,
+                                k_recur_compact,
                                 la.v_fp32.data(),
                                 la.g_log.data(),
                                 la.beta.data(),
