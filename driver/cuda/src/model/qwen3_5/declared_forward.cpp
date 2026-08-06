@@ -78,7 +78,18 @@ const DeviceTensor* bind_qwen3_5_weight(
     if (nm.field == "q_proj") return l.fa_q_proj;
     if (nm.field == "k_proj") return l.fa_k_proj;
     if (nm.field == "v_proj") return l.fa_v_proj;
-    if (nm.field == "o_proj") return l.fa_o_proj;
+    // ONE traced name, resolved by the LAYER KIND — the hybrid's two
+    // attentions each land their output through the residual, and the
+    // declaration says "the output projection of this layer" rather
+    // than which family's bank holds it. The AOT emitter has always
+    // read it this way (`emit_qwen35`'s `is_full(layer)` branch); this
+    // binder did not, so every GDN layer resolved to the
+    // full-attention bank and came back null. That is why the declared
+    // path had never run a hybrid: layer 0 is Linear.
+    if (nm.field == "o_proj") {
+        return l.kind == Qwen3_5LayerWeights::Kind::FullAttn ? l.fa_o_proj
+                                                             : l.la_out_proj;
+    }
     if (nm.field == "q_norm") return l.fa_q_norm;
     if (nm.field == "k_norm") return l.fa_k_norm;
     if (nm.field == "qgkv") return l.fa_qgkv_proj_fused;
@@ -148,6 +159,8 @@ enum class Q35Kernel {
     AttnFlashinferPrefill,
     WriteKvExplicit,
     WriteKvToPages,
+    ChunkedSwiglu,
+    Swiglu,
 };
 
 Q35Kernel resolve_q35_kernel(std::string_view k) {
@@ -172,6 +185,8 @@ Q35Kernel resolve_q35_kernel(std::string_view k) {
     if (k == "dispatch_attention_flashinfer_prefill_bf16") return Q35Kernel::AttnFlashinferPrefill;
     if (k == "launch_write_kv_explicit_bf16") return Q35Kernel::WriteKvExplicit;
     if (k == "launch_write_kv_to_pages") return Q35Kernel::WriteKvToPages;
+    if (k == "launch_chunked_swiglu_bf16") return Q35Kernel::ChunkedSwiglu;
+    if (k == "launch_swiglu_bf16") return Q35Kernel::Swiglu;
     throw std::runtime_error(
         "declared qwen3_5: stated kernel '" + std::string(k) +
         "' is not in this executor's registry (the trace and the driver "
@@ -539,23 +554,12 @@ bool qwen3_5_forward_declared(
     // (the hand-written `replay_load` false branch — same launches, same
     // degenerate reliance on whatever norm_x holds).
 
-    const std::size_t op_count = plan.op_count();
-    // Guard skip state (class walk): when a chosen region ends, the rest
-    // of the chain's regions are dead and the walk jumps them (flat, no
-    // nesting — one pending skip suffices). And the repeat_interleave
-    // pair's operand order is fixed by the declaration (q then k), so a
-    // toggle binds them.
-    std::size_t guard_skip_at = SIZE_MAX;
-    std::size_t guard_skip_len = 0;
+    // The repeat_interleave pair's operand order is fixed by the
+    // declaration (q then k), so a toggle binds them. It is the ONE
+    // piece of state that crosses statements, and it belongs to the
+    // arms, not to a traversal.
     bool repeat_next_is_k = false;
-    for (std::size_t i = 0; i < op_count; ++i) {
-        if (i == guard_skip_at) {
-            guard_skip_at = SIZE_MAX;
-            i += guard_skip_len;
-            if (i >= op_count) break;
-        }
-        const PieForwardOp& op = plan.op(i);
-
+    const auto execute_op = [&](const PieForwardOp& op) {
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
@@ -1131,51 +1135,27 @@ case PieForwardOpKind::Launch: {
                     kv_last_page_lens, N, R, stream);
                 break;
             }
+            // The MLP activation. WHICH of the two runs is the
+            // checkpoint's gate_up binding, and the trace states it —
+            // the executor no longer reads a workspace to find out.
+            case Q35Kernel::ChunkedSwiglu:
+                kernels::launch_chunked_swiglu_bf16(
+                    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+                break;
+            case Q35Kernel::Swiglu:
+                kernels::launch_swiglu_bf16(
+                    ws.gate.data(), ws.up.data(), ws.gate.data(),
+                    N * I, stream);
+                break;
             }
             break;
         }
         case PieForwardOpKind::Guard: {
-            // The chain over runtime inputs — llama_like's decoding,
-            // verbatim (declared_forward.cpp there documents the wire).
-            const auto aux = plan.aux_names(op);
-            const std::uint32_t n_arms = op.param0;
-            if (aux.size != static_cast<std::size_t>(n_arms) * 3 + 1) {
-                throw_drift("Guard aux run has " +
-                            std::to_string(aux.size) + " entries for " +
-                            std::to_string(n_arms) + " arms");
-            }
-            const auto pred_holds = [&](std::uint32_t kind,
-                                        std::uint32_t payload) -> bool {
-                switch (kind) {
-                case 0: return has_write_desc;                      // HasWriteDesc
-                case 1: return N <= static_cast<int>(payload);      // TokensLE
-                case 2: return N > static_cast<int>(payload);       // TokensGT
-                default:
-                    throw_drift("guard predicate kind " +
-                                std::to_string(kind));
-                }
-            };
-            std::size_t chosen_start = SIZE_MAX;
-            std::uint32_t chosen_len = 0;
-            std::size_t cursor = i + 1;
-            for (std::uint32_t a = 0; a < n_arms; ++a) {
-                const std::uint32_t len = aux[a * 3 + 2];
-                if (chosen_start == SIZE_MAX &&
-                    pred_holds(aux[a * 3], aux[a * 3 + 1])) {
-                    chosen_start = cursor;
-                    chosen_len = len;
-                }
-                cursor += len;
-            }
-            const std::uint32_t else_len = aux[n_arms * 3];
-            if (chosen_start == SIZE_MAX) {
-                chosen_start = cursor;
-                chosen_len = else_len;
-            }
-            const std::size_t total_end = cursor + else_len;
-            guard_skip_at = chosen_start + chosen_len;
-            guard_skip_len = total_end - guard_skip_at;
-            i = chosen_start - 1;  // the loop's ++i lands on the region
+            // RUNG: the chain is resolved by `lower()`, which reads the
+            // fire's rows and returns only the regions that run. A Guard
+            // reaching an executor that drives the flat list means the
+            // declaration and the drive disagree about who chooses.
+            throw_drift("Guard op in a lowered drive");
             break;
         }
         case PieForwardOpKind::LmHead: {
@@ -1248,6 +1228,82 @@ case PieForwardOpKind::Launch: {
                 std::to_string(static_cast<std::uint32_t>(op.kind)) +
                 " has no emission rule");
         }
+    };
+
+    // ── WHAT A DECLARED FIRE RUNS ──────────────────────────────────
+    //
+    // Build the fire's rows, lower them, execute the list — llama_like's
+    // drive, at this family's much smaller vocabulary. Until this rung
+    // there was a WALK here instead: the same switch, reached by a loop
+    // that carried a guard-skip cursor and jumped dead regions itself.
+    // The switch is untouched; what is gone is the traversal.
+    //
+    // The row axes this family does NOT state are what makes the drive
+    // short. No peel (its hooks are observation-only and fire-wide), no
+    // spatial mask split, no depth bands, no lora lanes — so every
+    // rectangle is the whole fire, and the arms keep reading `N`. If any
+    // of those axes is ever declared here, this is where the rectangle's
+    // row count has to start reaching the arms, exactly as llama_like's
+    // does.
+    std::vector<pie_forward::PieForwardRow> rows(
+        static_cast<std::size_t>(N));
+    for (int r = 0; r < N; ++r) {
+        pie_forward::PieForwardRow& row = rows[static_cast<std::size_t>(r)];
+        row.multi_token = is_pure_decode ? 0 : 1;
+        row.custom_mask = 0;
+        row.hooked = stage_hooks != nullptr ? 1 : 0;
+        row.lora = 0;
+        row.write_desc = has_write_desc ? 1 : 0;
+        row.wants_scores =
+            (stage_hooks != nullptr && stage_hooks->wants_attn_score) ? 1 : 0;
+        // Which rows the epilogue reads. A compact-logit fire samples a
+        // subset; anything else samples every row.
+        row.samples =
+            (logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+             num_logit_rows < N)
+                ? 0
+                : 1;
+        row._pad = 0;
+        row.depth_k = -1;
+    }
+    if (logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+        num_logit_rows < N) {
+        // The sampled set is a COUNT here, not a membership test: the
+        // gather reads `logit_row_indices_d` itself, and the lowering
+        // only needs to know how many rows the epilogue covers.
+        for (int r = 0; r < num_logit_rows; ++r) {
+            rows[static_cast<std::size_t>(r)].samples = 1;
+        }
+    }
+    const pie_forward::PieForwardLowered flat =
+        plan.lower(rows.data(), rows.size());
+    if (flat.uncovered != pie_forward::PieForwardUncovered::None) {
+        throw std::runtime_error(
+            "declared qwen35 forward: the lowering refuses this fire, "
+            "reason " +
+            std::to_string(static_cast<std::uint32_t>(flat.uncovered)));
+    }
+    // Statements run in op order and both lists are in that order, so
+    // this is a merge. Several rectangles can share one statement (an
+    // arm that runs more than one kernel), and the arm runs them all
+    // itself — so a statement is executed ONCE, at its first rectangle.
+    std::size_t next_site = 0;
+    std::size_t at = 0;
+    while (at < flat.launches_len || next_site < flat.structural_len) {
+        const bool site_first =
+            at >= flat.launches_len ||
+            (next_site < flat.structural_len &&
+             flat.structural[next_site].at_op < flat.launches[at].at_op);
+        if (site_first) {
+            execute_op(plan.op(flat.structural[next_site].at_op));
+            ++next_site;
+            continue;
+        }
+        const std::uint32_t at_op = flat.launches[at].at_op;
+        while (at < flat.launches_len && flat.launches[at].at_op == at_op) {
+            ++at;
+        }
+        execute_op(plan.op(at_op));
     }
     return true;
 }
