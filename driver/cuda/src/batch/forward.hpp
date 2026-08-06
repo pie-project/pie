@@ -270,6 +270,10 @@ struct ForwardFn {
                      ops::CublasHandle& cublas,
                      const ForwardInputs& in);
     std::uint32_t invoke_graph_layout();
+    // Whether the fire just planned carries a prefill whose dispatch has
+    // content-independent launch geometry. Read by
+    // `forward_graph_replay_eligible` only when `PIE_PREFILL_GRAPH` is on.
+    bool invoke_prefill_graph_capturable() const;
 };
 
 struct NativeSystemCommitInputs {

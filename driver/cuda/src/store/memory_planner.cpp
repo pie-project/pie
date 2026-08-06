@@ -626,7 +626,7 @@ CudaMemoryPlan plan_cuda_memory(
             }
             const std::size_t attn_float_bytes =
                 pie_cuda_driver::attention_float_workspace_bytes(
-                    hf, cfg, prop);
+                    hf, cfg, prop, N, R0);
             arena += attn_float_bytes;     // AttentionWorkspace float section
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
             const std::size_t persistent_bytes =

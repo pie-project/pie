@@ -38,6 +38,10 @@ bool decode_plan_is_page_count_independent(const DecodePlanCache& cache) {
     return cache.valid && cache.page_count_independent;
 }
 
+bool prefill_plan_graph_capturable(const PrefillPlanCache& cache) {
+    return cache.valid && cache.graph_capturable;
+}
+
 std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {    if (!cache.valid) return 0;
     if (cache.use_sm90) {
         return 0x00800000u |

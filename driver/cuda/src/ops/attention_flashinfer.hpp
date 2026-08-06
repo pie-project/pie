@@ -46,6 +46,13 @@ PrefillPlanCachePtr make_prefill_plan();
 std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache);
 std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
 
+// Whether the plan ran in graph mode, i.e. whether its launch geometry is a
+// pure function of (total_tokens, num_requests) rather than of the KV content
+// it was planned against. Reads `PrefillPlanCache::graph_capturable`, which
+// only the `.cuh` defining the struct can see -- the callers that need the
+// answer are plain `.cpp` translation units.
+bool prefill_plan_graph_capturable(const PrefillPlanCache& cache);
+
 // Whether this plan's schedule is independent of the page counts it was
 // planned against, and therefore whether the launch may be handed a different
 // (compacted) page list than the plan saw. Only the static non-split decode
