@@ -62,6 +62,10 @@ enum class DeclineReason {
     /// because the body cannot honour it there.
     TruncatedAxisUnstated,
     FusedQkvUnstaged,
+    /// A banded step with a non-pure-decode fire. The bands' prefix
+    /// plans are DECODE plans; pairing one with a prefill attention call
+    /// is wrong whether or not the plan exists.
+    BandedPrefill,
     /// A banded decode fire with a live band whose prefix plan the
     /// prepare did not stamp — the 14B device-geometry envelope class.
     BandedPlanMissing,
@@ -77,6 +81,7 @@ const char* decline_name(DeclineReason r) {
     case DeclineReason::TruncatedAxisUnstated:
         return "truncated-axis-unstated";
     case DeclineReason::FusedQkvUnstaged:   return "fused-qkv-unstaged";
+    case DeclineReason::BandedPrefill:      return "banded-prefill";
     case DeclineReason::BandedPlanMissing:  return "banded-plan-missing";
     }
     return "?";
@@ -302,18 +307,28 @@ void LlamaLikeModel::body(Workspace& ws,
         // hand-written body. Without any term here the declared leg
         // silently demoted mixed-k fires to full depth (caught live at
         // 14B: R=8 co-fires, no [depth-bands], no DECLINE).
-        // A NON-pure-decode fire under a banded step is not refused, and
-        // the argument is the hand path's own: `bands_runnable`
-        // (llama_like.cpp) requires `is_pure_decode`, so THAT path
-        // ignores the step's bands for such a fire and runs it full
-        // depth — the demotion its own comment names. The declared
-        // executor does the same thing for the same reason from the
-        // other side: a prefill trace does not state the depth axis, so
-        // `depth_banded` is false and the band arrays are never read.
-        // Two paths, one behaviour, so refusing was refusing a fire both
-        // forms agree on. Measured: N=240 R=4 prefill fires under a
-        // bands=2 step, themselves untruncated (k=-1, full_rows=-1).
-        if (plan_.depth_band_count >= 2 && in.is_pure_decode) {
+        // A banded step, and this fire is not a pure decode: REFUSE.
+        //
+        // This refusal was dropped one commit and then restored one
+        // commit later, and the two-step is the lesson. The argument for
+        // dropping it was "a prefill trace does not state the depth
+        // axis, so `depth_banded` is false and the band arrays are never
+        // read" — true when written, and INVALIDATED BY THE VERY NEXT
+        // COMMIT, which taught the Prefill class to state the axis so a
+        // truncated prefill could be served. `depth_banded` then became
+        // true for prefill fires too, and the executor started
+        // validating bands it must not apply: those are DECODE prefix
+        // plans, and pairing one with a prefill attention call is wrong
+        // whether or not the plan exists.
+        //
+        // Qwen2.5-1.5B found it, 0.6B never did, and nothing in the
+        // 0.6B bar could have — the whole argument had moved out from
+        // under a correct-looking test. A gate that mirrors an
+        // executor's condition has to be re-read when the executor's
+        // condition changes; the mirror is not a proof, it is a
+        // duplicate.
+        if (plan_.depth_band_count >= 2) {
+            if (!in.is_pure_decode) return DeclineReason::BandedPrefill;
             for (std::uint32_t j = 0; j < plan_.depth_band_count; ++j) {
                 if (plan_.depth_band_rows[j] > 0 &&
                     !plan_.depth_band_plans[j]) {
