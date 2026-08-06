@@ -29,7 +29,8 @@ void plan_attention_flashinfer_prefill_sm90_bf16(
     cudaStream_t /*stream*/,
     bool /*enable_cuda_graph*/,
     bool /*causal*/,
-    int /*window_left*/) {
+    int /*window_left*/,
+    std::size_t /*int_base_bytes*/) {
     throw std::runtime_error("flashinfer sm90 prefill is not built for this CUDA architecture");
 }
 
@@ -44,8 +45,23 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
     cudaStream_t /*stream*/,
     float /*logits_soft_cap*/,
     float /*sm_scale*/,
-    float* /*lse_out*/) {
+    float* /*lse_out*/,
+    bool /*broadcast_q*/) {
     throw std::runtime_error("flashinfer sm90 prefill is not built for this CUDA architecture");
+}
+
+// Not Hopper-only in principle -- it wraps a cascade kernel that would build
+// anywhere -- but it lives in the Hopper translation unit because the KV split
+// that produces its inputs is the sm90 prefill's. Stubbed with the rest of
+// that unit; nothing on this arch can reach a call to it, because the only
+// caller runs after a dispatch that already threw.
+void merge_attention_states_bf16(
+    const void* /*v*/, const float* /*s*/,
+    void* /*v_merged*/, float* /*s_merged*/,
+    int /*num_index_sets*/, int /*seq_len*/, int /*num_heads*/,
+    int /*head_dim*/, cudaStream_t /*stream*/) {
+    throw std::runtime_error(
+        "flashinfer attention-state merge is not built for this CUDA architecture");
 }
 
 }  // namespace pie_cuda_driver::ops
