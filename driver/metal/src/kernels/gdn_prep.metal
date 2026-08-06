@@ -397,6 +397,16 @@ template <typename T>
     wb(v_off + hv_idx * Dv + dv);
 }
 
+// A sum across the 16 lanes that own one dv row.  The xor tree stays inside the
+// aligned 16-lane half, so the simdgroup's two rows reduce independently.
+METAL_FUNC float gdn_row_sum16(float v) {
+  v += simd_shuffle_xor(v, 1u);
+  v += simd_shuffle_xor(v, 2u);
+  v += simd_shuffle_xor(v, 4u);
+  v += simd_shuffle_xor(v, 8u);
+  return v;
+}
+
 template <typename T>
 [[kernel]] void gdn_core_recurrent_prefill(
     device float* rstate [[buffer(2)]], device T* core_out [[buffer(3)]],
@@ -406,9 +416,20 @@ template <typename T>
     constant int& row_pitch [[buffer(12)]], constant int& n_scan [[buffer(13)]],
     uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
   const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv;
-  const int hv_idx = int(tpig.z), dv_idx = int(tpig.y);
-  const int slot = int(slot_ids[0]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
+  // Two dv rows share a simdgroup.  Dropping the two per-token reductions from
+  // 32 lanes to 16 takes them from five shuffle rounds to four, and gives the
+  // simdgroup a second independent chain to interleave against the first --
+  // which is what this loop is short of: with the reductions removed entirely
+  // the kernel measured less than half its time, so it is waiting on them, not
+  // on arithmetic (7% of ALU peak) and not on bandwidth (staging q/k in
+  // threadgroup memory made it slower).  The dispatch halves grid.y to match.
+  const int hv_idx = int(tpig.z);
+  const int dv_idx = int(tpig.y) * 2 + (int(tpig.x) >> 4);
+  const int dk_idx = int(tpig.x) & 15;
+  const int slot = int(slot_ids[0]), n_per_t = Dk / 16;
   const size_t pitch_f = size_t(row_pitch) / 2;
+  const bool row_lead = dk_idx == 0;
+  if (dv_idx >= Dv) return;
 
   // This simdgroup owns the whole (slot, hv, dv) state row, so the scan runs in
   // registers with no ordering beyond the loop itself.
@@ -433,12 +454,12 @@ template <typename T>
     }
     float kv_mem = 0.0f;
     for (int i = 0; i < n_per_t; ++i) { st[i] *= g[0]; kv_mem += st[i] * k[i]; }
-    kv_mem = simd_sum(kv_mem);
+    kv_mem = gdn_row_sum16(kv_mem);
     const float delta = (vval - kv_mem) * g[1];
     float out = 0.0f;
     for (int i = 0; i < n_per_t; ++i) { st[i] += k[i] * delta; out += st[i] * q[i]; }
-    out = simd_sum(out);
-    if (simd_lane == 0)
+    out = gdn_row_sum16(out);
+    if (row_lead)
       core_out[row_t + size_t(hv_idx) * Dv + dv_idx] = static_cast<T>(out);
   }
   for (int i = 0; i < n_per_t; ++i) i_state[n_per_t * dk_idx + i] = st[i];
