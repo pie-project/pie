@@ -954,4 +954,40 @@ void launch_dequant_kv_cache_layer_to_bf16_active(
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+__global__ void gather_trailing_pages_kernel(
+    const std::uint32_t* __restrict__ src_indices,
+    const std::uint32_t* __restrict__ src_indptr,
+    const std::uint32_t* __restrict__ dst_indptr,
+    std::uint32_t* __restrict__ dst_indices,
+    int R)
+{
+    const int r = blockIdx.x;
+    if (r >= R) return;
+    const std::uint32_t src_end = src_indptr[r + 1];
+    const std::uint32_t dst_beg = dst_indptr[r];
+    const std::uint32_t keep    = dst_indptr[r + 1] - dst_beg;
+    // Trailing, so anchor both walks at the END of the source slice.
+    for (std::uint32_t i = threadIdx.x; i < keep; i += blockDim.x) {
+        dst_indices[dst_beg + i] = src_indices[src_end - keep + i];
+    }
+}
+
+}  // namespace
+
+void launch_gather_trailing_pages(
+    const std::uint32_t* src_indices,
+    const std::uint32_t* src_indptr,
+    const std::uint32_t* dst_indptr,
+    std::uint32_t* dst_indices,
+    int R,
+    cudaStream_t stream)
+{
+    if (R <= 0) return;
+    gather_trailing_pages_kernel<<<R, 128, 0, stream>>>(
+        src_indices, src_indptr, dst_indptr, dst_indices, R);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace pie_cuda_driver::kernels

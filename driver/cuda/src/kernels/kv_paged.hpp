@@ -99,4 +99,27 @@ void launch_copy_kv_cells_bf16(
     int N,
     cudaStream_t stream);
 
+// ── Sliding-window page trim ───────────────────────────────────────────
+// A paged decode kernel handed a `window_left` still WALKS every page it is
+// given and masks what falls outside; the window buys arithmetic, not traffic.
+// Measured on an H100 at gpt-oss's decode shape (8 kv heads, gqa 8, head_dim
+// 64, window 128), cost is perfectly linear in context -- 10.2us at 256, 136us
+// at 4096 -- for a window that never grows. The fix is to hand the kernel a
+// shorter page list, which is a PLAN-level change: a decode query sits at the
+// END of its range, so dropping whole pages off the FRONT leaves the last
+// `window+1` tokens exactly where they were and `window_left` keeps masking
+// correctly against the same absolute positions.
+//
+// Gathers, per request, the last `dst_indptr[r+1] - dst_indptr[r]` page ids of
+// that request's slice of `src_indices`. The caller decides how many to keep
+// (see `trimmed_window_pages`), which is why the count is read off the
+// destination indptr rather than recomputed here.
+void launch_gather_trailing_pages(
+    const std::uint32_t* src_indices,   // [src_indptr[R]] physical page ids
+    const std::uint32_t* src_indptr,    // [R+1] device
+    const std::uint32_t* dst_indptr,    // [R+1] device
+    std::uint32_t* dst_indices,         // [dst_indptr[R]] out
+    int R,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels
