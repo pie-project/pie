@@ -109,10 +109,10 @@ inline bool geometry_from_facts(const Facts& f, DecodeGeometry& out, std::string
                           std::to_string(shared_kernels::kRouterMaxExperts) +
                           " a single threadgroup can rank");
         }
-        if (!f.norm_topk_prob) {
-            return refuse("norm_topk_prob is false; the router normalizes over the "
-                          "selected experts only");
-        }
+        // Not refused any more: `RouterParams::softmax_over_all` gives the
+        // router the other denominator, so a config that wants the softmax
+        // over every expert gets it rather than being turned away.
+        out.norm_topk_prob = f.norm_topk_prob;
         // A shared expert runs beside the routed bank on every token. Every
         // released routed member of this family has one, so it is carried
         // rather than refused. A shared width that is not a multiple of the
