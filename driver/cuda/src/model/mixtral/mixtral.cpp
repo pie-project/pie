@@ -878,11 +878,13 @@ void mixtral_forward_paged(
         // residual-add into y. o_bias (replicated; e.g. GPT-OSS) only goes
         // in once on the leader so the all-reduce sums it exactly once.
         if (T == 1) {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
-                N, H, Hq, /*beta=*/1.f);
-            if (layer.o_bias) kernels::launch_add_bias_bf16(
-                ws.y.data(), layer.o_bias->data(), N, H, stream);
+            // beta = 1 accumulates into the residual and the bias rides the
+            // same epilogue, so what used to be a GEMM plus an `add_bias` plus
+            // a `residual_add` is one kernel.
+            ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+                ws.attn_out.data(), layer.o_proj->data(),
+                layer.o_bias ? layer.o_bias->data() : nullptr,
+                ws.y.data(), N, H, Hq, stream, /*beta=*/1.f);
         } else {
             ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
                 ws.attn_out.data(), layer.o_proj->data(),

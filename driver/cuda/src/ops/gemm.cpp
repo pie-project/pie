@@ -2328,7 +2328,8 @@ void gemm_act_x_wt_bias_bf16(
     cublasHandle_t handle,
     const void* act, const void* W, const void* bias, void* y,
     int M, int N, int K,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    float beta)
 {
     // Ask the tuner the same question `gemm_bf16_impl` would, rather than
     // peeking at what it has already decided: a shape is seen for the first
@@ -2344,15 +2345,15 @@ void gemm_act_x_wt_bias_bf16(
         // GEMV just to save a launch -- it falls through below.
         if (cublas_stream(handle, s) &&
             cudaStreamIsCapturing(s, &capturing) == cudaSuccess &&
-            dense_tactic_for(handle, W, M, N, K, /*beta=*/0.f, capturing,
+            dense_tactic_for(handle, W, M, N, K, beta, capturing,
                              &plan, &tactic) &&
             run_dense_tactic(handle, tactic, plan, act, W, y, M, N, K,
-                             /*beta=*/0.f, nullptr, 0, bias)) {
+                             beta, nullptr, 0, bias)) {
             return;
         }
         cudaGetLastError();
     }
-    gemm_bf16_impl(handle, act, W, y, M, N, K, /*beta=*/0.f);
+    gemm_bf16_impl(handle, act, W, y, M, N, K, beta);
     if (bias != nullptr) {
         kernels::launch_add_bias_bf16(y, bias, M, N, stream);
     }
