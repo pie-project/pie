@@ -2272,6 +2272,20 @@ void gemm_act_x_wt_bf16_cublas(
     int M, int N, int K,
     float beta)
 {
+    // The reason callers pin this entry is that cuBLASLt's heuristic loses on
+    // their *batched* shapes -- the note beside each of them names an N in the
+    // hundreds. None of that reasoning reaches M=1: a single activation row
+    // has no reuse for any tiled GEMM to exploit, Lt or classic, and the
+    // warp-per-row GEMV roughly doubles the bandwidth either of them reach
+    // (see `launch_gemv_bf16`). Without this, enabling gemma-4's fused
+    // gate/up bank moved its decode MLP onto a kernel tiled for an M it does
+    // not have -- 1.28 ms/token against 0.32 ms of weights.
+    cudaStream_t gemv_stream = nullptr;
+    if (M == 1 && beta == 0.f &&
+        cublas_stream(handle, gemv_stream) &&
+        kernels::launch_gemv_bf16(W, act, nullptr, y, N, K, gemv_stream)) {
+        return;
+    }
     gemm_bf16_cublas_impl(handle, act, W, y, M, N, K, beta);
 }
 
