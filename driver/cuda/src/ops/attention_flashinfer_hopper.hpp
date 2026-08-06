@@ -66,6 +66,20 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
     cudaStream_t stream,
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
-    float* lse_out = nullptr);
+    float* lse_out = nullptr,
+    // Every request reads the same Q row. Used by the KV split, whose
+    // pseudo-requests are one query against different slices of the pages --
+    // the outputs stay per-request, only the input is shared.
+    bool broadcast_q = false);
+
+// Folds `num_index_sets` partial attention outputs and their log-sum-exps into
+// one. Wraps flashinfer's cascade `MergeStates`; `v` is
+// [num_index_sets, seq_len, num_heads, head_dim] bf16 and `s` the matching
+// [num_index_sets, seq_len, num_heads] floats the dispatch writes to `lse_out`.
+void merge_attention_states_bf16(
+    const void* v, const float* s,
+    void* v_merged, float* s_merged,
+    int num_index_sets, int seq_len, int num_heads, int head_dim,
+    cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::ops

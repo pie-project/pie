@@ -185,6 +185,22 @@ struct Gemma4MoeMlpWorkspace {
     // fire beside the decode plans; `valid == false` means fall back.
     ops::HopperPrefillPlan hopper_decode_plan_sliding;
     std::vector<std::uint32_t> hopper_qo_indptr_h;
+    // The KV split, expressed as a batch: `kGemma4HopperSplits`
+    // pseudo-requests, one token of Q each (broadcast, not copied) over
+    // disjoint page ranges. One request times num_kv_heads is eight CTAs on an
+    // H100, which leaves the decode kernel idle; the split fills it and
+    // `merge_attention_states_bf16` folds the partials back.
+    int hopper_splits = 0;
+    // The layer window this plan was built FOR. The split rewrites
+    // `window_left` into a per-chunk value, so the plan's own field no longer
+    // identifies the layer it serves.
+    int hopper_plan_layer_window = -2;
+    std::vector<std::uint32_t> hopper_split_qo_h;
+    std::vector<std::uint32_t> hopper_split_kv_indptr_h;
+    std::vector<std::uint32_t> hopper_split_last_h;
+    DeviceBuffer<std::uint16_t> hopper_split_partial;
+    DeviceBuffer<float> hopper_split_lse;
+    DeviceBuffer<float> hopper_split_lse_merged;
     bool row_decode_prepared = false;
     int row_decode_prepared_tokens = 0;
     int row_decode_prepared_requests = 0;
