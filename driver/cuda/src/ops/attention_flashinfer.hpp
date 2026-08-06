@@ -151,7 +151,10 @@ void dispatch_attention_flashinfer_decode_bf16(
     int window_left = -1,
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
-    float* lse_out = nullptr);
+    float* lse_out = nullptr,
+    // Every request reads the same Q row -- the KV split issues one query
+    // against several page slices, so only the input is shared.
+    bool broadcast_q = false);
 
 // Score-observing decode (design doc §3): identical attention output, plus
 // `p[head, kv_idx]` written to `score_out` for every request in the batch.
