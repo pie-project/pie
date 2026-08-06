@@ -196,6 +196,15 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(norm_residual_add "launch_rmsnorm_residual_add_bf16"),
     kernel!(scalar_mul "launch_scalar_mul_bf16"),
     kernel!(logit_softcap "launch_logit_softcap_bf16"),
+    // Six statements in one launch; the only value that survives is q.
+    kernel!(qkv_packed_post "launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
+        sink = Some("kv.pages")),
+    // gemma-4 rounds where qwen3_5 does not, and bf16 rounding is which
+    // numbers come out — so the symbol IS the statement.
+    kernel!(qk_rmsnorm_rope_rounded "launch_qk_rmsnorm_rope_bf16_rounded"),
+    // The PLE relay: [N, L, D] -> [L, N, D], so a layer reads a
+    // contiguous slice. Addressing, not arithmetic.
+    kernel!(transpose_nld_to_lnd "launch_transpose_bf16_nld_to_lnd"),
 
     // ── MoE ────────────────────────────────────────────────────────
     // The router's top-k, then the decode GEMV leg's two routed

@@ -1703,6 +1703,102 @@ pub mod cuda {
         .expect("the softcap produces its value")
     }
 
+    /// `kernels::launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16`:
+    /// gemma-4's decode post — split the packed projection, norm q and
+    /// k, rope them, norm v, and write k/v straight to the pages. One
+    /// launch, six statements, and the only value that survives it is q.
+    ///
+    /// Its eligibility is a per-FIRE question in the hand-written pass
+    /// (`hooks == nullptr && !partial && !dump && native bf16 && a
+    /// decode path`), and the terms split cleanly: `partial` and the
+    /// cache format are load-time, hooks and the fire class are the
+    /// declaration's own class/guard vocabulary. So a class trace states
+    /// it or does not, and nothing reads a workspace to decide.
+    ///
+    /// Writes through the KV pages, so it carries the layer's cache
+    /// state the way every write-side statement here does.
+    pub fn qkv_packed_post(
+        packed: &Val,
+        q_norm: &NormW,
+        k_norm: &NormW,
+        kv: &Kv,
+        q_width: u32,
+    ) -> Val {
+        record(
+            &packed.t,
+            q_norm.layer,
+            "launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
+            vec![q_norm.name.clone(), k_norm.name.clone()],
+            kv_state(kv),
+            vec![packed.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
+        )
+        .expect("the fused post produces q")
+    }
+
+    /// `kernels::launch_qk_rmsnorm_rope_bf16_rounded`: the per-head q/k
+    /// norm + rope pair, in the ROUNDED form.
+    ///
+    /// gemma-4 rounds where qwen3_5 does not, and bf16 rounding is not
+    /// an implementation detail between two kernels that compute the
+    /// same function — it is which numbers come out. So the symbol is
+    /// the statement, and a family states the one its hand-written pass
+    /// fires. In place on q and k; SSA-wise two fresh values.
+    pub fn qk_rmsnorm_rope_rounded(
+        q: &Val,
+        k: &Val,
+        q_norm: &NormW,
+        k_norm: &NormW,
+    ) -> (Val, Val) {
+        let shapes = {
+            let b = q.t.inner.borrow();
+            vec![
+                (b.value_shape(q.id), DType::BF16),
+                (b.value_shape(k.id), DType::BF16),
+            ]
+        };
+        let ids = q.t.with(q_norm.layer, |b| {
+            b.launch(
+                "launch_qk_rmsnorm_rope_bf16_rounded",
+                vec![q_norm.name.clone(), k_norm.name.clone()],
+                None,
+                vec![q.id, k.id],
+                shapes,
+            )
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q_norm.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kernels::launch_transpose_bf16_nld_to_lnd`: relay the PLE table
+    /// from `[N, L, D]` to `[L, N, D]` so each layer reads a CONTIGUOUS
+    /// slice.
+    ///
+    /// The whole point of the statement is addressing, not arithmetic —
+    /// it replaces a per-layer slice-pack kernel with one relay per
+    /// fire, which is the driver's own comment at the call site. The
+    /// output's leading dim is the LAYER count, a load-time constant, so
+    /// the shape is `[Const(layers), Tokens, Const(dim)]`.
+    pub fn transpose_nld_to_lnd(x: &Val, layers: u32, dim: u32) -> Val {
+        record(
+            &x.t,
+            None,
+            "launch_transpose_bf16_nld_to_lnd",
+            vec![],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![Dim::Const(layers), Dim::Tokens, Dim::Const(dim)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the relay produces its value")
+    }
+
     /// `kernels::launch_topk_softmax_bf16`: the router's top-k + softmax +
     /// renormalize, one launch, two results — expert indices
     /// (`[Tokens, k]` i32, the `dyn` value every expert-indexed statement
