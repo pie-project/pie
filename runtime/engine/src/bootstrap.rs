@@ -304,16 +304,56 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // `rs_cache_slots` processes seats every one of them and leaves nothing to
     // buffer with. Measured on Qwen3.6-27B (24 slots): capping admission at 24
     // turned a loud failure into a 300 s hang, because every process is
-    // legitimately running and the planner is right to keep waiting. A useful
-    // bound here has to divide by the slots one seat actually consumes, which
-    // is context-dependent and not known at bootstrap.
-    let admission_cap = config.max_concurrent_processes.or_else(|| {
-        driver_configs
-            .iter()
-            .map(|d| d.limits.max_forward_requests)
-            .min()
-            .filter(|&r| r > 0)
-    });
+    // legitimately running and the planner is right to keep waiting.
+    //
+    // The divisor that bound is missing is `frame_dispatch_depth`: a lane
+    // keeps that many frames posted to the driver at once, and each posted
+    // frame holds a slot, so one admitted seat costs D slots, not one. When
+    // `lanes * D` exceeds the pool every lane ends up holding its first slot
+    // and waiting for a second that no one can return -- a resource deadlock,
+    // which the planner reports as `StarveCause::NoRsSlots` and fails rather
+    // than waits out, because it is right that it cannot be waited out.
+    // Measured on Qwen3.6-27B (24 slots, D=2, 32 requests of 64 tokens):
+    // c=12 completed 32/32 at 28.8 tok/s, c=16 failed 18 of 32 and delivered
+    // 0.10 tok/s, and c=16 with D=1 -- the same `lanes * D` -- completed
+    // 32/32 again. So the product is the bound, and both factors are known
+    // here.
+    //
+    // This clamp applies to an explicit operator setting too, unlike every
+    // other default in this block. Admission is documented below as "a
+    // physical safety cap only", and a seat count that cannot physically be
+    // seated is not a preference to honour -- it is a request failure with
+    // extra steps.
+    crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
+    let seat_cost = crate::scheduler::configured_dispatch_depth().max(1);
+    let rs_seat_cap = driver_configs
+        .iter()
+        .map(|d| d.rs_cache_slots)
+        .filter(|&slots| slots > 0)
+        .min()
+        .map(|slots| (slots / seat_cost).max(1));
+    let admission_cap = config
+        .max_concurrent_processes
+        .or_else(|| {
+            driver_configs
+                .iter()
+                .map(|d| d.limits.max_forward_requests)
+                .min()
+                .filter(|&r| r > 0)
+        })
+        .map(|cap| match rs_seat_cap {
+            Some(seats) if cap > seats => {
+                tracing::warn!(
+                    requested = cap,
+                    seated = seats,
+                    seat_cost,
+                    "admission: more lanes than the recurrent-state pool can seat; \
+                     capping, because each lane holds one slot per posted frame"
+                );
+                seats
+            }
+            _ => cap,
+        });
     process::init_admission(admission_cap);
 
     // RS working-set caps from the driver handshake (uniform across a model's

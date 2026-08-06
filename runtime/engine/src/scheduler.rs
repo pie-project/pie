@@ -291,6 +291,14 @@ pub fn set_dispatch_depth(depth: usize) {
     frame::set_dispatch_depth(depth);
 }
 
+/// Frames the engine keeps posted to the driver per lane, resolving `0` to the
+/// default. Bootstrap needs this before the scheduler exists, because a lane
+/// holds one recurrent-state slot per posted frame and the admission cap has
+/// to divide the slot pool by it.
+pub fn configured_dispatch_depth() -> usize {
+    frame::configured_dispatch_depth()
+}
+
 const DEFAULT_SUBMIT_DEPTH: usize = 3;
 /// `0` = never installed; see [`reconfigure`].
 static SUBMIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
