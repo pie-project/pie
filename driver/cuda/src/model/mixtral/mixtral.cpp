@@ -168,6 +168,16 @@ bool mxfp4_moe_grouped_choice(int routes, int num_experts) {
 //   N=128 per-route 2.745  grouped 1.735  marlin 0.146
 // At N=32 that is 1274 GB/s of weight traffic, i.e. the kernel is finally
 // bandwidth-bound instead of unpack-bound.
+// Rows below which the routed GEMV beats Marlin; see the table at the use.
+int mxfp4_marlin_moe_min_tokens() {
+    static const int n = [] {
+        const char* v = std::getenv("PIE_MXFP4_MARLIN_MOE_MIN_TOKENS");
+        const int parsed = (v != nullptr) ? std::atoi(v) : 8;
+        return parsed > 0 ? parsed : 8;
+    }();
+    return n;
+}
+
 bool mxfp4_marlin_moe_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_MXFP4_MARLIN_MOE");
@@ -580,9 +590,28 @@ void mixtral_forward_paged(
         w.layers[0].experts[0].format ==
             MixtralExpertWeightFormat::Mxfp4NativeGemm &&
         w.layers[0].experts[0].w_gate_mxfp4 != nullptr;
+    // Marlin wins by tiling weights across many rows of A, so it needs rows.
+    // At one token there are none to amortise over and its own microbench
+    // (`driver/cuda/bench/moe_bench.cu`, gpt-oss shape, H100) says so plainly:
+    //
+    //   N       1       8      32
+    //   route   0.0223  0.1231  0.4612   ms
+    //   marlin  0.0442  0.1044  0.1764
+    //
+    // -- it loses by 2x at N=1, crosses over around 6, and is 2.6x ahead by 32.
+    // In the model the same shape holds: single-stream decode measured MoE at
+    // 2.52 ms through Marlin against 1.30 through the routed GEMV, and 197 vs
+    // 253 tok/s end to end. Both paths read the same native slabs, so this is
+    // a per-fire choice, and `N` is part of the batch shape a captured graph is
+    // keyed on, so it is safe to make one.
     const bool use_marlin_moe =
         marlin_native_slabs && mxfp4_marlin_moe_enabled() &&
-        w.mxfp4_intermediate_padded > 0;
+        w.mxfp4_intermediate_padded > 0 &&
+        // ...but only stand aside for the routed GEMV when there IS one. When
+        // the weights arrive Marlin-only the alternative is not the GEMV, it is
+        // the materializing path, which is an order of magnitude worse than
+        // either (25 tok/s against 197).
+        (N >= mxfp4_marlin_moe_min_tokens() || !mxfp4_decode_gemv_available);
 #else
     constexpr bool use_marlin_moe = false;
 #endif
