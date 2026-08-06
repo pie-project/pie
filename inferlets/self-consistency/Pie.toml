@@ -1,0 +1,14 @@
+[package]
+name = "self-consistency"
+version = "0.1.0"
+description = "Self-consistency baseline: N parallel samples + numeric majority vote"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = {type = "string", optional = true, description = "The question to answer"}
+proposal_tokens = {type = "string", optional = true, description = "Max tokens per proposal sample; array length = number of proposals (must be even)"}
+aggregation_tokens = {type = "int", optional = true, description = "Reserved for schema compat; currently unused by voting"}

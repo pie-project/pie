@@ -1,0 +1,41 @@
+[
+  {
+    "question": "Jared is trying to increase his typing speed. He starts with 47 words per minute (WPM). After some lessons the next time he tests his typing speed it has increased to 52 WPM. If he continues to increase his typing speed once more by 5 words, what will be the average of the three measurements?",
+    "ground_truth": 52.0,
+    "baseline_pred": 52.0,
+    "baseline_correct": true,
+    "baseline_tokens": 831,
+    "sc_pred": 52.0,
+    "sc_correct": true,
+    "sc_tokens": 3068,
+    "got_pred": 52.0,
+    "got_correct": true,
+    "got_tokens": 3415
+  },
+  {
+    "question": "Jordan has 2 children who wear diapers.  Each child requires 5 diaper changes per day.  Jordan's wife changes half of the diapers.  How many diapers does Jordan change per day?",
+    "ground_truth": 5.0,
+    "baseline_pred": 15.0,
+    "baseline_correct": false,
+    "baseline_tokens": 182,
+    "sc_pred": 15.0,
+    "sc_correct": false,
+    "sc_tokens": 3417,
+    "got_pred": null,
+    "got_correct": false,
+    "got_tokens": 3395
+  },
+  {
+    "question": "A wooden bridge can carry no more than 5000 pounds. A delivery truck filled with identical boxes, each weighing 15 pounds, will pass over the bridge. The combined weight of the driver and the empty truck is 3755 pounds. What is the maximum number of boxes which can be loaded onto the truck while not exceeding the bridge's weight limit?",
+    "ground_truth": 83.0,
+    "baseline_pred": 83.0,
+    "baseline_correct": true,
+    "baseline_tokens": 1117,
+    "sc_pred": null,
+    "sc_correct": false,
+    "sc_tokens": 3584,
+    "got_pred": 83.0,
+    "got_correct": true,
+    "got_tokens": 3529
+  }
+]
