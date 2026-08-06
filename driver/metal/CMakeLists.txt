@@ -434,7 +434,12 @@ add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/src/batch
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/model/qwen3_5
   ${CMAKE_CURRENT_SOURCE_DIR}/src/loader)
+# The slot size is `scratch_slot_elems`, which asks the device tuning where the
+# mixture's batching threshold is -- so this stopped being a header-only test
+# the day the heap stopped deriving its own answer.
+target_link_libraries(heap_layout_slot_test PRIVATE pie_driver_metal_lib)
 add_test(NAME heap_layout_slot_test COMMAND heap_layout_slot_test)
 
 # The slab is a pointer and a stride, deliberately, so its eviction rule and

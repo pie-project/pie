@@ -29,9 +29,9 @@ struct RowGatherParams {    // row_gather.metal       (buffer 3)
     std::uint32_t count;
 };
 #include "../kernels/moe_params.h"
-static_assert(sizeof(RouterParams) == 12);
-static_assert(sizeof(ExpertCombineParams) == 8);
-static_assert(sizeof(MoeRouteParams) == 24);
+static_assert(sizeof(RouterParams) == 16);
+static_assert(sizeof(ExpertCombineParams) == 12);
+static_assert(sizeof(MoeRouteParams) == 28);
 
 /// Flat elementwise `dispatchThreads` grid: one thread per element, capped at a
 /// 256-wide threadgroup.

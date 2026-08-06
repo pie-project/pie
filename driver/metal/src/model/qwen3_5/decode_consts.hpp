@@ -47,14 +47,20 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g);
 // Returns the number of const slots allocated (for accounting / the heap budget check).
 int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                        const DecodeGeometry& g, int max_ctx, bool gdn_prep = false,
-                       int n_tokens = 1);
+                       int n_tokens = 1,
+                       /// Elements between one activation ROW and the next, or
+                       /// 0 when they are packed. Only the mixture reads it:
+                       /// a prefill lays every value's rows a uniform
+                       /// `scratch_widest_elems` apart, and the routing group
+                       /// is the one thing that runs over all of them at once.
+                       int row_pitch = 0);
 
 // Rebind ONLY the constants the batch width can change -- the mixture's routing.
 // `bind_decode_consts` calls this, so a freshly bound DAG is complete; the fire path
 // calls it alone when the token count changes, which is allocation-free (const slots
 // are cached by (ordinal, index) and overwritten in place).
 int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                      const DecodeGeometry& g, int n_tokens);
+                      const DecodeGeometry& g, int n_tokens, int row_pitch = 0);
 
 // Heap headroom (bytes) the const region needs on top of plan_heap().total. Conservative
 // upper bound (one 256-aligned slot per possible const buffer across the whole DAG).
