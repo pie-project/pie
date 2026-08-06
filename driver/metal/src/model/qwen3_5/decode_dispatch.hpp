@@ -37,7 +37,9 @@ inline void rms_dispatch(int row_size, int n_rows, Grid& g, Threadgroup& tg) {
     // Rounded UP: `rms_single_row` guards its own tail, but a truncating
     // thread count silently drops the last partial group of 4 for any row
     // width that is not a multiple of N_READS.
-    const uint32_t t = (uint32_t(row_size) + 3) / 4;  // N_READS = 4
+    // Capped at what Metal allows a threadgroup to be; see `rms_mb_dispatch`,
+    // which this one must agree with exactly at N == 1.
+    const uint32_t t = std::min<uint32_t>((uint32_t(row_size) + 3) / 4, 1024);  // N_READS = 4
     g  = Grid{t * uint32_t(n_rows), 1, 1};
     tg = Threadgroup{t, 1, 1};
 }

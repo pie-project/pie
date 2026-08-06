@@ -34,6 +34,7 @@
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/encode.hpp"
 #include "model/gemma4/geometry.hpp"
+#include "model_facts.hpp"
 #include "model/gemma4/kernels.hpp"
 #include "model/gemma4/scratch.hpp"
 
@@ -246,9 +247,43 @@ int main(int argc, char** argv) {
     }
     const int N = int(ids.size());
 
+    // Read the CHECKPOINT, not a copy of gemma-4-E2B's shape. The hardcoded
+    // `Facts{}` below is E2B's, so this harness answered about E2B whatever
+    // path it was given -- and asked for E2B's `embed_tokens_per_layer` on
+    // models that ship none, which is how it became unreachable on the two
+    // checkpoints whose numbers are wrong.
+    Facts facts{};
+    {
+        const pie::metal::ModelFacts mf = pie::metal::read_model_facts(ckpt);
+        if (mf.g4_num_hidden_layers > 0) {
+            facts.n_layers = mf.g4_num_hidden_layers;
+            facts.hidden = mf.g4_hidden_size;
+            facts.intermediate = mf.g4_intermediate_size;
+            facts.n_q_heads = mf.g4_num_attention_heads;
+            facts.n_kv_heads = mf.g4_num_key_value_heads;
+            facts.head_dim = mf.g4_head_dim;
+            facts.global_head_dim = mf.g4_global_head_dim;
+            facts.sliding_window = mf.g4_sliding_window;
+            facts.num_kv_shared_layers = mf.g4_num_kv_shared_layers;
+            facts.per_layer_emb_dim = mf.g4_per_layer_emb_dim;
+            facts.full_attn_interval = mf.g4_full_attn_interval;
+            facts.double_wide_mlp = mf.g4_double_wide_mlp;
+            facts.final_softcap = mf.g4_final_softcap;
+            facts.rope_theta_full = mf.g4_rope_theta_full;
+            facts.rope_theta_sliding = mf.g4_rope_theta_sliding;
+            facts.full_partial_rotary = mf.g4_full_partial_rotary;
+            facts.enable_moe = mf.g4_enable_moe;
+            facts.n_experts = mf.g4_num_experts;
+            facts.experts_per_token = mf.g4_experts_per_token;
+            facts.moe_intermediate = mf.g4_moe_intermediate;
+            facts.attention_k_eq_v = mf.g4_attention_k_eq_v;
+            facts.n_global_kv_heads = mf.g4_num_global_kv_heads;
+        }
+    }
+
     Gemma4Geometry g;
     std::string err;
-    if (!geometry_from_facts(Facts{}, g, &err)) {
+    if (!geometry_from_facts(facts, g, &err)) {
         std::printf("  FAIL  geometry: %s\n", err.c_str());
         return 1;
     }

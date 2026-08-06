@@ -2,10 +2,9 @@
 #define PIE_METAL_RMS_REDUCE_H
 
 template <typename T, int N_READS>
-METAL_FUNC float rms_lane_square_sum(
-    const device T* x, uint axis_size, uint lid) {
+METAL_FUNC float rms_lane_square_sum_at(
+    const device T* x, uint axis_size, uint start) {
   float acc = 0.0f;
-  const uint start = lid * N_READS;
   if (start + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; ++i) {
       const float xi = float(x[i]);
