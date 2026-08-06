@@ -643,11 +643,16 @@ pub fn lower(
             row_hi: launch.rows.end,
             layer_lo: launch.layers.start,
             layer_hi: launch.layers.end,
-            rows_device: match launch.rows_device {
+            // 0 = outside any peel; otherwise the axis, the side, and
+            // whether the rows are a device word — the three things an
+            // executing arm asks about where it is.
+            peel_axis: match launch.peel.map(|p| p.axis) {
                 None => 0,
                 Some(crate::trace::PeelWindow::HookFreePrefix) => 1,
                 Some(crate::trace::PeelWindow::UnmaskedPrefix) => 2,
             },
+            peel_tail: u8::from(launch.peel.is_some_and(|p| p.tail)),
+            rows_device: u8::from(launch.peel.is_some_and(|p| p.rows_device)),
             _pad: 0,
         });
     }

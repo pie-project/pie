@@ -120,20 +120,36 @@ pub struct Launch {
     pub rows: Range<u32>,
     pub layers: Range<u16>,
     pub args: u32,
-    /// Set when `rows` is the host's BELIEF and the executing form must
-    /// read the fire's runtime split for this peel instead.
+    /// Which peel region this rectangle sits in, when it sits in one.
+    ///
+    /// The executing arms read exactly four things about where they
+    /// are: the row count, the layer, which side of a row split they
+    /// serve, and which prepared plan to use. The first two are `rows`
+    /// and `layers`; the third is this; and the fourth stops being a
+    /// question — a prepared plan is found by the rectangle's ROW
+    /// COUNT, which is why the driver's band index, and its three-band
+    /// ceiling, has nothing left to index.
+    pub peel: Option<PeelRegion>,
+}
+
+/// A rectangle's place inside a row partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeelRegion {
+    pub axis: PeelWindow,
+    /// The SUFFIX region (hook-visible rows, masked rows) rather than
+    /// the prefix — what the executor calls its mask region, and what
+    /// decides whether a statement addresses rows at absolute offsets.
+    pub tail: bool,
+    /// `rows` is the host's BELIEF and the executing form must read the
+    /// fire's runtime split instead.
     ///
     /// This is the one place a rectangle is not a pair of numbers, and
-    /// it is deliberately the only one: a captured fire replays across
-    /// splits, so the peel's two regions both launch and each early-outs
-    /// on a device word. Everything else in the list stays plain
-    /// counts — "mostly numbers, two of them runtime" is a list you can
-    /// still read, which "any of these might be runtime" would not be.
-    ///
-    /// `rows` still carries the host's count, because the arena sizing,
-    /// the rectangle count and the shadow all want a number and a
-    /// captured fire's split is bounded by the same window.
-    pub rows_device: Option<PeelWindow>,
+    /// deliberately the only one: a captured fire replays across splits,
+    /// so both regions launch and each early-outs on a device word.
+    /// Everything else stays plain counts — "mostly numbers, two of them
+    /// runtime" is a list you can still read, which "any of these might
+    /// be runtime" would not be.
+    pub rows_device: bool,
 }
 
 /// Why a fire cannot be lowered against this trace.
@@ -242,7 +258,7 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Un
         peel_tail: false,
         residue: Vec::new(),
         fire,
-        peel_device: None,
+        peel_region: None,
     };
     out.region(0..plan.ops.len(), 0..n)?;
     let buffers = Buffers::assign(plan, rows);
@@ -269,9 +285,8 @@ struct Lowerer<'a> {
     peel_tail: bool,
     residue: Vec<Unlowered>,
     fire: Fire,
-    /// The peel whose runtime split the launches being emitted must read
-    /// — set only inside a captured fire's peel regions.
-    peel_device: Option<PeelWindow>,
+    /// The peel region the launches being emitted sit in.
+    peel_region: Option<PeelRegion>,
 }
 
 impl Lowerer<'_> {
@@ -323,14 +338,17 @@ impl Lowerer<'_> {
                     // empty one here would describe a graph that cannot
                     // serve the next fire.
                     let device = self.fire.captures_across_splits;
-                    let outer_device = self.peel_device;
-                    if device {
-                        self.peel_device = Some(*axis);
-                    }
+                    let outer_region = self.peel_region;
+                    let axis = *axis;
                     let mut run = |me: &mut Self, span: Range<usize>, w: Range<u32>, tail_side: bool| {
                         if !device && w.is_empty() {
                             return Ok(());
                         }
+                        me.peel_region = Some(PeelRegion {
+                            axis,
+                            tail: tail_side,
+                            rows_device: device,
+                        });
                         let outer = std::mem::replace(&mut me.peel_tail, tail_side);
                         let r = me.region(span, w);
                         me.peel_tail = outer;
@@ -339,7 +357,7 @@ impl Lowerer<'_> {
                     let next = t.end;
                     run(self, p, prefix, false)?;
                     run(self, t, tail, true)?;
-                    self.peel_device = outer_device;
+                    self.peel_region = outer_region;
                     i = next;
                 }
                 OpKind::Launch { kernel, .. } => {
@@ -385,7 +403,7 @@ impl Lowerer<'_> {
         op: &Op,
         window: &Range<u32>,
     ) -> Result<(), Uncovered> {
-        if window.is_empty() && self.peel_device.is_none() {
+        if window.is_empty() && !self.peel_region.is_some_and(|r| r.rows_device) {
             return Ok(());
         }
         let backend = self
@@ -423,7 +441,7 @@ impl Lowerer<'_> {
             rows: window.clone(),
             layers: layer..layer + 1,
             args: at as u32,
-            rows_device: self.peel_device,
+            peel: self.peel_region,
         });
         Ok(())
     }
@@ -1035,7 +1053,7 @@ mod tests {
             r.hooked = true;
         }
         let host = lower(&plan, &rows, Fire::default()).expect("coverable");
-        assert!(host.launches.iter().all(|l| l.rows_device.is_none()));
+        assert!(host.launches.iter().all(|l| l.peel.is_none_or(|p| !p.rows_device)));
         assert!(
             !host
                 .launches
@@ -1062,14 +1080,15 @@ mod tests {
         assert!(!fused.is_empty(), "the captured graph carries the prefix");
         assert!(fused
             .iter()
-            .all(|l| l.rows_device == Some(PeelWindow::HookFreePrefix)));
+            .all(|l| l.peel.is_some_and(|p| p.axis == PeelWindow::HookFreePrefix
+                && p.rows_device)));
 
         // And ONLY the peel's regions are marked: everything outside is
         // still a plain count, which is what keeps the list readable.
         assert!(captured
             .launches
             .iter()
-            .filter(|l| l.rows_device.is_some())
+            .filter(|l| l.peel.is_some_and(|p| p.rows_device))
             .count()
             < captured.launches.len());
     }

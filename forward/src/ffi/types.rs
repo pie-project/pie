@@ -630,11 +630,17 @@ pub struct PieForwardLaunch {
     pub row_hi: u32,
     pub layer_lo: u16,
     pub layer_hi: u16,
+    /// Which row partition this rectangle sits in: 0 = none,
+    /// 1 = the hook-free prefix's axis, 2 = the unmasked prefix's.
+    pub peel_axis: u8,
+    /// Non-zero for the SUFFIX region rather than the prefix — the
+    /// executor's mask region, and what decides whether a statement
+    /// addresses rows at absolute offsets.
+    pub peel_tail: u8,
     /// Non-zero when `row_lo/row_hi` are the HOST's belief and the
-    /// executing form must read the fire's runtime split instead:
-    /// 1 = the hook-free prefix, 2 = the unmasked prefix. Set only
-    /// inside a captured fire's peel, which is the one place a
-    /// rectangle is not a pair of numbers.
+    /// executing form must read the fire's runtime split instead. Set
+    /// only inside a CAPTURED fire's peel — the one place a rectangle
+    /// is not a pair of numbers.
     pub rows_device: u8,
     pub _pad: u8,
 }
