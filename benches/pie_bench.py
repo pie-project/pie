@@ -1560,6 +1560,12 @@ def refuse_if_a_wedged_pie_is_still_dying() -> None:
     """
     if sys.platform != "darwin":
         return
+    if os.environ.get("PIE_BENCH_ALLOW_WEDGED") == "1":
+        # The driver now refuses on host memory too, so a run on a wedged box
+        # ends in a sentence rather than a hang. This exists to exercise that
+        # refusal, which is otherwise only reachable on a machine already in
+        # the state we are trying to prevent.
+        return
     try:
         out = subprocess.run(["ps", "-eo", "pid,stat,comm"],
                              capture_output=True, text=True, timeout=10).stdout

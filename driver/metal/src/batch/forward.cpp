@@ -732,10 +732,11 @@ void write_u32(const SlotHandle& s, uint32_t v) {
 // first dispatch. The sizing is right to twenty megabytes. What is optimistic
 // is `recommendedMaxWorkingSetSize` itself -- on this M1 Max it is 24.96 GiB,
 // a flat 78% of the 32 GiB the machine has, taking no account of the 6 GiB the
-// kernel had wired down by the time prefill ran. So a plan can clear this bar
-// and still exhaust the machine. The bar is a ceiling, not a promise, and this
-// refusal is written to catch the models that are plainly over it rather than
-// to predict the ones that are close.
+// kernel had wired down by the time prefill ran. That is why the check below
+// asks the kernel a second question -- what is reclaimable right now -- and
+// refuses on whichever bound is tighter. The device ceiling catches models
+// that are plainly too big for the GPU; the host bound catches models that
+// would fit a quiet machine and not this one.
 // The elastic budget's four addends, kept apart so a refusal can name the one
 // that is large. Assembled by the caller because only it knows the scratch
 // pool, which the heap plan does not carry.
@@ -754,11 +755,49 @@ bool fits_on_this_gpu(std::size_t heap_bytes,
     const std::size_t limit = RawMetalContext::device_working_set_bytes();
     if (limit == 0) return true;  // the device would not say; do not invent one
     const std::size_t want = heap_bytes + elastic_bytes;
-    if (want <= limit) return true;
+
+    // The device ceiling is what this GPU would hold on an idle machine. What
+    // the machine will actually give us right now is a second, independent
+    // bound, and on unified memory it is usually the smaller one. Checking
+    // only the first is how a 14 GiB model was admitted onto a box with 18 GiB
+    // left, allocated its pools, and then hung: the command buffer never
+    // signalled, the context was abandoned as unsafe to release, and the
+    // process became unkillable. Every retry left another one, so free memory
+    // fell with each attempt while the ceiling being checked never moved.
+    //
+    // Refusing here is the only cheap moment. Afterwards there is no failure
+    // path -- the allocation does not fail, the dispatch does not return, and
+    // nothing short of a reboot recovers the memory.
+    //
+    // The margin is headroom for what the load itself adds beyond the plan:
+    // the mmap'd weights file leaves a file-backed copy roughly the size of
+    // the model, and the kernel needs room to keep running. It is deliberately
+    // a flat floor rather than a fraction, so that the refusal stays legible.
+    const std::size_t reclaimable =
+        RawMetalContext::device_working_set_is_forced()
+            ? 0  // a forced ceiling describes a device, not this machine
+            : RawMetalContext::host_reclaimable_bytes();
+    constexpr std::size_t kHostMargin = 2ull * 1024 * 1024 * 1024;
+    const bool host_bound =
+        reclaimable != 0 && want + kHostMargin > reclaimable && want <= limit;
+
+    if (want <= limit && !host_bound) return true;
     if (err) {
         const auto gib = [](std::size_t b) {
             return std::to_string(double(b) / (1024.0 * 1024.0 * 1024.0)).substr(0, 5);
         };
+        if (host_bound) {
+            *err = "this model does not fit the memory this machine has left: "
+                   "it needs " + gib(want) + " GiB resident (" +
+                   gib(resident_weights) + " GiB of weights, " +
+                   gib(elastic_bytes) + " GiB of KV, state and scratch) and only " +
+                   gib(reclaimable) + " GiB is reclaimable. The GPU itself would "
+                   "hold " + gib(limit) + " GiB, so this is the machine, not the "
+                   "device: something else already has the memory. On macOS a "
+                   "previously wedged run is the usual cause -- it survives "
+                   "kill -9, holds its pages, and is only cleared by a reboot.";
+            return false;
+        }
         *err = "this model does not fit this GPU: it needs " + gib(want) +
                " GiB resident (" + gib(resident_weights) + " GiB of weights, " +
                gib(elastic_bytes) + " GiB of KV, state and scratch) and the device "
