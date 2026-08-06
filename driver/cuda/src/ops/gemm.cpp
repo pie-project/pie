@@ -842,6 +842,19 @@ bool dense_tactic_for(cublasHandle_t caller, const void* W, int M, int N,
         tuner.disk.store(key, tactic.kind, tactic.algo);
     }
     tuner.chosen.emplace(key, tactic);
+    // PIE_GEMM_TUNE_LOG: which kernel a shape ended up on. Logged HERE rather
+    // than inside the tuner because the choice is cached on disk, so on any
+    // machine that has run the model once the tuner never executes again and a
+    // log inside it prints nothing.
+    static const bool tune_log = std::getenv("PIE_GEMM_TUNE_LOG") != nullptr;
+    if (tune_log) {
+        const char* kind =
+            tactic.kind == static_cast<int>(GemmKind::Gemv) ? "gemv"
+          : tactic.kind == static_cast<int>(GemmKind::Lt)   ? "lt"
+                                                            : "gemmex";
+        std::fprintf(stderr, "[gemm-tune] M=%d N=%d K=%d -> %s(algo=%d)\n",
+                     M, N, K, kind, tactic.algo);
+    }
     *out = tactic;
     return true;
 }

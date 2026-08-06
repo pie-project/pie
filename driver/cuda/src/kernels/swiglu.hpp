@@ -54,6 +54,9 @@ void launch_gpt_oss_glu_strided_bf16(
     float limit,
     float alpha = 1.702f);
 
+// `y_fp16`, when non-null, receives the same activation in fp16 -- what the
+// MXFP4 decode GEMV consumes -- so the separate cast kernel that used to
+// follow this one disappears.
 void launch_gpt_oss_glu_bf16(
     const void* gate,
     const void* up,
@@ -61,7 +64,8 @@ void launch_gpt_oss_glu_bf16(
     int num_elements,
     cudaStream_t stream,
     float limit,
-    float alpha = 1.702f);
+    float alpha = 1.702f,
+    void* y_fp16 = nullptr);
 
 // DeepSeek-V4 expert / shared-expert activation — vLLM's
 // `SiluAndMulWithClamp(swiglu_limit, alpha=1.0, beta=0.0)`:

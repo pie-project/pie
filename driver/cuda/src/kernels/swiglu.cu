@@ -26,6 +26,7 @@ __global__ void gpt_oss_glu_bf16_kernel(
     const __nv_bfloat16* __restrict__ gate,
     const __nv_bfloat16* __restrict__ up,
     __nv_bfloat16* __restrict__ y,
+    __half* __restrict__ y_fp16,
     int n,
     float limit,
     float alpha)
@@ -41,7 +42,14 @@ __global__ void gpt_oss_glu_bf16_kernel(
     u = fminf(fmaxf(u, -limit), limit);
     // QuickGELU-style: x * sigmoid(alpha * x), alpha = 1.702.
     const float glu = g / (1.f + expf(-alpha * g));
-    y[idx] = __float2bfloat16((u + 1.f) * glu);
+    const float out = (u + 1.f) * glu;
+    y[idx] = __float2bfloat16(out);
+    // The MXFP4 down-projection GEMV reads fp16, and the only thing standing
+    // between it and this value was a whole kernel that read the bf16 back and
+    // wrote it again. The activation is a few tens of KB, so that launch was
+    // essentially all overhead; emit both here instead. Rounded from the SAME
+    // fp32 the bf16 comes from, not from the bf16, so it is strictly no worse.
+    if (y_fp16 != nullptr) y_fp16[idx] = __float2half(out);
 }
 
 __global__ void swiglu_clamp_bf16_kernel(
@@ -170,7 +178,7 @@ void launch_gpt_oss_glu_strided_bf16(
 void launch_gpt_oss_glu_bf16(
     const void* gate, const void* up, void* y,
     int num_elements, cudaStream_t stream,
-    float limit, float alpha)
+    float limit, float alpha, void* y_fp16)
 {
     constexpr int BLOCK = 256;
     const int grid = (num_elements + BLOCK - 1) / BLOCK;
@@ -178,6 +186,7 @@ void launch_gpt_oss_glu_bf16(
         static_cast<const __nv_bfloat16*>(gate),
         static_cast<const __nv_bfloat16*>(up),
         static_cast<__nv_bfloat16*>(y),
+        static_cast<__half*>(y_fp16),
         num_elements, limit, alpha);
 }
 

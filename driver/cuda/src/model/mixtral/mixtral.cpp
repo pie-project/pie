@@ -55,6 +55,7 @@ struct MixtralPhaseProfile {
     cudaEvent_t a{}, b{};
     double attn = 0, router = 0, moe_gate_up = 0, moe_down = 0;
     double o_proj = 0, epilogue = 0;
+    double moe_align = 0, moe_act = 0, moe_reduce = 0, moe_prep = 0;
     int last_N = 0;
 
     // Intervals may nest, so opens are held on a stack and each close pairs
@@ -128,9 +129,12 @@ struct MixtralPhaseProfile {
             // gpt-oss's decode shape that remainder is the largest single
             // item left.
             "[MX-PROF] N=%d attn=%.3f o_proj=%.3f router=%.3f "
-            "moe_gate_up=%.3f moe_down=%.3f | sum=%.3f ms\n",
+            "moe_gate_up=%.3f moe_down=%.3f align=%.3f act=%.3f "
+            "reduce=%.3f prep=%.3f epi=%.3f | sum=%.3f ms\n",
             last_N, attn, o_proj, router, moe_gate_up, moe_down,
-            attn + o_proj + router + moe_gate_up + moe_down + epilogue);
+            moe_align, moe_act, moe_reduce, moe_prep, epilogue,
+            attn + o_proj + router + moe_gate_up + moe_down + moe_align +
+            moe_act + moe_reduce + moe_prep + epilogue);
         cudaEventDestroy(a);
         cudaEventDestroy(b);
         for (cudaEvent_t e : pool) cudaEventDestroy(e);
@@ -164,6 +168,16 @@ bool mxfp4_moe_grouped_choice(int routes, int num_experts) {
 //   N=128 per-route 2.745  grouped 1.735  marlin 0.146
 // At N=32 that is 1274 GB/s of weight traffic, i.e. the kernel is finally
 // bandwidth-bound instead of unpack-bound.
+// Rows below which the routed GEMV beats Marlin; see the table at the use.
+int mxfp4_marlin_moe_min_tokens() {
+    static const int n = [] {
+        const char* v = std::getenv("PIE_MXFP4_MARLIN_MOE_MIN_TOKENS");
+        const int parsed = (v != nullptr) ? std::atoi(v) : 8;
+        return parsed > 0 ? parsed : 8;
+    }();
+    return n;
+}
+
 bool mxfp4_marlin_moe_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_MXFP4_MARLIN_MOE");
@@ -576,9 +590,28 @@ void mixtral_forward_paged(
         w.layers[0].experts[0].format ==
             MixtralExpertWeightFormat::Mxfp4NativeGemm &&
         w.layers[0].experts[0].w_gate_mxfp4 != nullptr;
+    // Marlin wins by tiling weights across many rows of A, so it needs rows.
+    // At one token there are none to amortise over and its own microbench
+    // (`driver/cuda/bench/moe_bench.cu`, gpt-oss shape, H100) says so plainly:
+    //
+    //   N       1       8      32
+    //   route   0.0223  0.1231  0.4612   ms
+    //   marlin  0.0442  0.1044  0.1764
+    //
+    // -- it loses by 2x at N=1, crosses over around 6, and is 2.6x ahead by 32.
+    // In the model the same shape holds: single-stream decode measured MoE at
+    // 2.52 ms through Marlin against 1.30 through the routed GEMV, and 197 vs
+    // 253 tok/s end to end. Both paths read the same native slabs, so this is
+    // a per-fire choice, and `N` is part of the batch shape a captured graph is
+    // keyed on, so it is safe to make one.
     const bool use_marlin_moe =
         marlin_native_slabs && mxfp4_marlin_moe_enabled() &&
-        w.mxfp4_intermediate_padded > 0;
+        w.mxfp4_intermediate_padded > 0 &&
+        // ...but only stand aside for the routed GEMV when there IS one. When
+        // the weights arrive Marlin-only the alternative is not the GEMV, it is
+        // the materializing path, which is an order of magnitude worse than
+        // either (25 tok/s against 197).
+        (N >= mxfp4_marlin_moe_min_tokens() || !mxfp4_decode_gemv_available);
 #else
     constexpr bool use_marlin_moe = false;
 #endif
@@ -857,6 +890,7 @@ void mixtral_forward_paged(
         // routed set falls back to the per-expert loop rather than deadlock
         // against its own pins.
         if (prof.enabled) prof.close(stream);
+        if (prof.enabled) prof.open(&prof.moe_prep, stream);
         bool streamed_fused = false;
         // The routing table is read back at most once per layer. The fused
         // paged path below needs it to decide what to page in, and the generic
@@ -1007,6 +1041,7 @@ void mixtral_forward_paged(
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 layer.marlin_scales_ready = true;
             }
+            if (prof.enabled) prof.open(&prof.moe_align, stream);
             kernels::launch_moe_align_decode(
                 d_topk_idx.data(), d_marlin_sorted.data(),
                 d_marlin_expert_ids.data(), /*route_to_aligned_row=*/nullptr,
@@ -1032,12 +1067,14 @@ void mixtral_forward_paged(
                     marlin_block, num_experts, top_k_arg, mul_w,
                     prob_m_arg, prob_n, prob_k, stream);
             };
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_gate_up, stream); }
             moe_gemm(ws.norm_y.data(), e0.w_gate_mxfp4->data(),
                      layer.marlin_gate_scales.data(), d_marlin_gate.data(),
                      N, top_k, Ip_marlin, H, false);
             moe_gemm(ws.norm_y.data(), e0.w_up_mxfp4->data(),
                      layer.marlin_up_scales.data(), d_marlin_up.data(),
                      N, top_k, Ip_marlin, H, false);
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_act, stream); }
             // GPT-OSS publishes its expert biases at the UNPADDED width, which
             // is not the stride Marlin's own bias epilogue assumes.
             if (e0.b_gate != nullptr) {
@@ -1059,9 +1096,11 @@ void mixtral_forward_paged(
                     d_marlin_act.data(), routes, I, Ip_marlin, Ip_marlin,
                     stream, /*limit=*/0.f);
             }
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_down, stream); }
             moe_gemm(d_marlin_act.data(), e0.w_down_mxfp4->data(),
                      layer.marlin_down_scales.data(), d_mxfp4_route_out.data(),
                      routes, /*top_k=*/1, H, Ip_marlin, false);
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_reduce, stream); }
             if (e0.b_down != nullptr && tp_is_leader) {
                 kernels::launch_add_moe_route_bias_bf16(
                     d_mxfp4_route_out.data(), e0.b_down->data(),
@@ -1071,6 +1110,7 @@ void mixtral_forward_paged(
                 d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
                 static_cast<const float*>(d_topk_w.data()), N, top_k, H,
                 stream);
+            if (prof.enabled) prof.close(stream);   // moe_reduce
             if (T > 1) {
                 tp->all_reduce_bf16(d_mxfp4_moe_out.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -1084,9 +1124,11 @@ void mixtral_forward_paged(
             use_mxfp4_decode_gemv &&
             !layer.expert_gate_up_packed_ptrs.empty()) {
             const int routes = N * top_k;
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_align, stream); }
             kernels::launch_bf16_to_fp16(
                 ws.norm_y.data(), d_mxfp4_act_fp16.data(),
                 static_cast<std::size_t>(N) * H, stream);
+            if (prof.enabled) prof.close(stream);   // moe_align (act cast)
             mx_stage(prof, &prof.moe_gate_up, stream, [&]{
             // Group the routes by expert first: without it every route
             // re-streams its expert's slab, so weight traffic scales with
@@ -1116,23 +1158,33 @@ void mixtral_forward_paged(
                     N, top_k, H, I, stream);
             }
             });
+            if (prof.enabled) prof.open(&prof.moe_act, stream);
+            // The gpt-oss activation emits the fp16 copy the down GEMV wants
+            // as a second store, so the cast below is only needed on the plain
+            // swiglu branch, which no model with this activation takes.
+            bool act_fp16_ready = false;
             if (cfg.swiglu_limit > 0.f) {
                 kernels::launch_gpt_oss_glu_bf16(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
                     d_mxfp4_route_gate.data(),
                     static_cast<int>(static_cast<std::size_t>(routes) * I),
-                    stream, /*limit=*/cfg.swiglu_limit);
+                    stream, /*limit=*/cfg.swiglu_limit, /*alpha=*/1.702f,
+                    d_mxfp4_route_act_fp16.data());
+                act_fp16_ready = true;
             } else {
                 kernels::launch_swiglu_bf16(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
                     d_mxfp4_route_gate.data(),
                     static_cast<std::size_t>(routes) * I, stream);
             }
-            kernels::launch_bf16_to_fp16(
-                d_mxfp4_route_gate.data(), d_mxfp4_route_act_fp16.data(),
-                static_cast<std::size_t>(routes) * I, stream);
+            if (!act_fp16_ready) {
+                kernels::launch_bf16_to_fp16(
+                    d_mxfp4_route_gate.data(), d_mxfp4_route_act_fp16.data(),
+                    static_cast<std::size_t>(routes) * I, stream);
+            }
             // b_down is replicated across ranks, so only the leader adds it;
             // the all-reduce below would otherwise sum it T times.
+            if (prof.enabled) prof.close(stream);   // moe_act (glu + cast)
             mx_stage(prof, &prof.moe_down, stream, [&]{
             kernels::launch_mxfp4_moe_down_decode_bf16(
                 d_mxfp4_route_act_fp16.data(), d_topk_idx.data(),
@@ -1141,6 +1193,7 @@ void mixtral_forward_paged(
                 tp_is_leader ? layer.expert_down_bias_ptrs.data() : nullptr,
                 d_mxfp4_route_out.data(), N, top_k, H, I, stream);
             });
+            if (prof.enabled) prof.open(&prof.moe_reduce, stream);
             kernels::launch_token_batched_weighted_sum_bf16(
                 d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
                 static_cast<const float*>(d_topk_w.data()),
@@ -1149,6 +1202,7 @@ void mixtral_forward_paged(
                 tp->all_reduce_bf16(d_mxfp4_moe_out.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
             }
+            if (prof.enabled) prof.close(stream);   // moe_reduce
             kernels::launch_residual_add_bf16(
                 ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
             if (streamed_fused) {
