@@ -97,6 +97,28 @@ struct DeviceTuning {
     /// against the default, same binary, arms alternated, on a prefill-heavy
     /// shape where the GEMM is most of the fire.
     bool fp16_qmm = true;
+
+    /// Rows a request must contribute before its attention takes the tiled
+    /// kernel instead of the per-row one.
+    ///
+    /// M1 Max: 32, which is also the tile's height -- a fire earns the tiled
+    /// shape by filling a tile. The two are separate numbers even so: the
+    /// height is the simdgroup count and cannot move, while this is a
+    /// crossover. Measured on llama-1B, where a 32-request fleet of one-row
+    /// members runs 370 tok/s tiled against 728 per-row, so the threshold has
+    /// to keep the fleet off it; a machine whose shuffles are cheaper relative
+    /// to its FMAs wants it HIGHER, since the tiled kernel's whole advantage is
+    /// that it removes reductions.
+    int sdpa_tile_min_rows_per_request = 32;
+
+    /// Rows an expert's run must hold before the mixture sorts and batches at
+    /// all, rather than running the routed projections as matvecs.
+    ///
+    /// M1 Max: 8, i.e. half the narrow tile. Below it the sort's padding costs
+    /// more than the weight re-reads it saves -- a decode routing eight pairs
+    /// over a hundred and twenty-eight experts would make every tile one live
+    /// row in sixteen. Moves with the same thing `qmm_min_batch` does.
+    int moe_batch_min_per_expert = 8;
 };
 
 /// The platform query. `device_tuning_apple.mm` on Apple, a stub in
@@ -127,5 +149,11 @@ int moe_tile_wide_per();
 
 /// Whether the dense g64/b4 GEMM stages its input to FP16.
 bool fp16_qmm();
+
+/// The attention's tiled-vs-per-row crossover, in rows per request.
+int sdpa_tile_min_rows_per_request();
+
+/// The mixture's batch-vs-matvec crossover, in rows per expert.
+int moe_batch_min_per_expert();
 
 }  // namespace pie::metal

@@ -55,6 +55,10 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
     t.moe_tile_mid_per = env_int("PIE_METAL_MOE_TILE_MID_PER", t.moe_tile_mid_per);
     t.moe_tile_wide_per = env_int("PIE_METAL_MOE_TILE_WIDE_PER", t.moe_tile_wide_per);
     t.fp16_qmm = env_bool("PIE_METAL_FP16_QMM", t.fp16_qmm);
+    t.sdpa_tile_min_rows_per_request =
+        env_int("PIE_METAL_SDPA_TILE_MIN_ROWS", t.sdpa_tile_min_rows_per_request);
+    t.moe_batch_min_per_expert =
+        env_int("PIE_METAL_MOE_BATCH_MIN_PER_EXPERT", t.moe_batch_min_per_expert);
     return t;
 }
 
@@ -81,5 +85,9 @@ int qmm_bn_crossover_tg() { return device_tuning().qmm_bn_crossover_tg; }
 int moe_tile_mid_per() { return device_tuning().moe_tile_mid_per; }
 int moe_tile_wide_per() { return device_tuning().moe_tile_wide_per; }
 bool fp16_qmm() { return device_tuning().fp16_qmm; }
+int sdpa_tile_min_rows_per_request() {
+    return device_tuning().sdpa_tile_min_rows_per_request;
+}
+int moe_batch_min_per_expert() { return device_tuning().moe_batch_min_per_expert; }
 
 }  // namespace pie::metal

@@ -368,7 +368,10 @@ inline constexpr int kSdpaQueryTile = 32;
 /// plus a terminator.
 inline bool sdpa_should_tile(int rows, int requests) {
     const int r = requests > 0 ? requests : 1;
-    return rows / r >= kSdpaQueryTile;
+    // Not `kSdpaQueryTile`, though it is the same number on this machine. That
+    // one is the tile's HEIGHT and is the simdgroup count; this is a crossover
+    // and belongs to the machine. See `DeviceTuning`.
+    return rows / r >= sdpa_tile_min_rows_per_request();
 }
 
 // sdpa_paged_tiled: one threadgroup per (q_head, tile of kSdpaQueryTile rows).
