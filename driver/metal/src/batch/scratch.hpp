@@ -36,10 +36,15 @@ inline int scratch_widest_elems(const DecodeGeometry& g) {
     int widest = g.intermediate;                                   // MLP gate/up out
     widest = widest > g.gdn_conv_dim ? widest : g.gdn_conv_dim;    // GDN in-proj out
     // fp32 prep scratch shares the BF16 byte pitch. It holds two gate scalars
-    // per value head followed by the token-parallel V convolution.
+    // per value head followed by the token-parallel V convolution -- and, in
+    // the other two slots, the normalized q and k rows, Dk wide per value head.
+    // Dk and Dv are equal on every released member, so the V term alone covered
+    // it; stated separately because nothing makes them equal.
     const int gdn_prep_elems =
         2 * (2 * g.gdn_v_heads + g.gdn_v_heads * g.gdn_v_dim);
+    const int gdn_qk_elems = 2 * g.gdn_v_heads * g.gdn_k_dim;
     widest = widest > gdn_prep_elems ? widest : gdn_prep_elems;
+    widest = widest > gdn_qk_elems ? widest : gdn_qk_elems;
     const int q = g.n_q_heads * g.head_dim;                        // packed q projection
     widest = widest > q ? widest : q;
     // The mixture, whose activations are the one place in this family where a
