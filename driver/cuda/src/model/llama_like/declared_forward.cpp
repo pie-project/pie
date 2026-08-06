@@ -317,6 +317,49 @@ bool generated_forward_enabled() {
 
 }  // namespace
 
+namespace {
+
+// Why a DEPLOYMENT has no declared plan at all.
+//
+// The fire-level `DeclineReason` (`llama_like_model.cpp`) says which
+// fires fall back; this says which DEPLOYMENTS never had the choice.
+// They are different questions with different owners: a decline is
+// driver work, and one of these is DSL VOCABULARY — the trace has no way
+// to say the thing, so the hand-written body is the only executor there
+// and cannot be deleted until it does.
+//
+// It was a comment with an ellipsis in it ("TP, quantized projections,
+// non-standard rope, ..."), which is not a work list. Each `return out`
+// in the gate below now carries its name, and the name is printed once
+// per model load — loud, unconditional, and cheap, because a deployment
+// traces once.
+enum class NoPlanReason {
+    None,
+    RopeNotStandard,      // YaRN / M-RoPE
+    TensorParallel,       // all-reduces the trace does not state
+    LayerBinding,         // no layers, or a count that disagrees with the config
+    QuantizedProjection,  // QuantMeta WeightViews the trace does not describe
+    MixedFusedQkv,        // a per-layer split that makes the fused_qkv fact a lie
+    QkvBiasUnbound,       // the config says bias, the tensors did not arrive
+    QkNormConvention,     // a q/k-norm weight shape that names no convention
+};
+
+const char* no_plan_name(NoPlanReason r) {
+    switch (r) {
+    case NoPlanReason::None:                return "none";
+    case NoPlanReason::RopeNotStandard:     return "rope-not-standard";
+    case NoPlanReason::TensorParallel:      return "tensor-parallel";
+    case NoPlanReason::LayerBinding:        return "layer-binding";
+    case NoPlanReason::QuantizedProjection: return "quantized-projection";
+    case NoPlanReason::MixedFusedQkv:       return "mixed-fused-qkv";
+    case NoPlanReason::QkvBiasUnbound:      return "qkv-bias-unbound";
+    case NoPlanReason::QkNormConvention:    return "qk-norm-convention";
+    }
+    return "?";
+}
+
+}  // namespace
+
 LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     const HfConfig& cfg,
     const LlamaLikeForwardCfg& fwd_cfg,
@@ -324,11 +367,24 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     const KvCache& cache)
 {
     LlamaLikeDeclaredPlan out;
+    // An empty plan is not an error and never was — it means "the
+    // hand-written body is this deployment's executor". Saying WHICH
+    // rule sent it there costs one line at load and turns the gate into
+    // a work list.
+    const auto refuse = [](NoPlanReason reason) -> LlamaLikeDeclaredPlan {
+        std::fprintf(stderr,
+                     "[declared] no plan for this deployment: reason=%s "
+                     "(the hand-written body serves it)\n",
+                     no_plan_name(reason));
+        return LlamaLikeDeclaredPlan{};
+    };
 
     // Representability gate: everything the v0 trace has no vocabulary for
     // returns empty and the model keeps the hand-written path. Each line
     // names the hand-written feature it stands in for.
-    if (fwd_cfg.rope_kind != RopeKind::Standard) return out;   // YaRN/M-RoPE
+    if (fwd_cfg.rope_kind != RopeKind::Standard) {
+        return refuse(NoPlanReason::RopeNotStandard);  // YaRN/M-RoPE
+    }
     // Post-norm placement (olmo2/olmo3) is admitted: the trace carries the
     // matmul(beta=0) → rmsnorm → residual_add triplet and the executor
     // launches the hand-written post-norm block's kernels.
@@ -337,14 +393,16 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // before norms/rope, the executor launches the hand-written
     // `maybe_add_bias` kernels. Guarded below on the tensors actually
     // being bound.
-    if (fwd_cfg.tp_size > 1) return out;                       // all-reduces
+    if (fwd_cfg.tp_size > 1) {
+        return refuse(NoPlanReason::TensorParallel);   // all-reduces
+    }
     // Padded head_dim (Phi-3-mini, 96 → 128) is admitted: the pad/strip
     // launches around KV-write/attention are emitter knowledge (the trace
     // speaks the logical head_dim throughout), handled in the executor
     // exactly as the hand-written `head_dim_padded` branches.
     if (w.layers.empty() ||
         w.layers.size() != static_cast<std::size_t>(cfg.num_hidden_layers)) {
-        return out;
+        return refuse(NoPlanReason::LayerBinding);
     }
     const bool fused_qkv = w.layers[0].qkv_proj_fused != nullptr;
     for (const auto& layer : w.layers) {
@@ -354,16 +412,18 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         if (layer.q_proj_quant || layer.k_proj_quant || layer.v_proj_quant ||
             layer.o_proj_quant || layer.gate_proj_quant ||
             layer.up_proj_quant || layer.down_proj_quant) {
-            return out;
+            return refuse(NoPlanReason::QuantizedProjection);
         }
-        if ((layer.qkv_proj_fused != nullptr) != fused_qkv) return out;
+        if ((layer.qkv_proj_fused != nullptr) != fused_qkv) {
+            return refuse(NoPlanReason::MixedFusedQkv);
+        }
         // A bias config whose tensors did not bind would make the traced
         // AddBias ops unlaunchable; a bias-less config with stray bias
         // tensors would mean the fact lies the other way.
         if (fwd_cfg.use_qkv_bias &&
             (layer.q_bias == nullptr || layer.k_bias == nullptr ||
              layer.v_bias == nullptr)) {
-            return out;
+            return refuse(NoPlanReason::QkvBiasUnbound);
         }
     }
     // q/k-norm convention, from the bound tensor shape — the same evidence
@@ -388,11 +448,13 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
             return PieForwardQkNorm::Off;
         };
         qk_norm = convention_of(w.layers[0].q_norm, Hq_w);
-        if (qk_norm == PieForwardQkNorm::Off) return out;
+        if (qk_norm == PieForwardQkNorm::Off) {
+            return refuse(NoPlanReason::QkNormConvention);
+        }
         for (const auto& layer : w.layers) {
             if (convention_of(layer.q_norm, Hq_w) != qk_norm ||
                 convention_of(layer.k_norm, Hk_w) != qk_norm) {
-                return out;
+                return refuse(NoPlanReason::QkNormConvention);
             }
         }
     }
