@@ -699,7 +699,7 @@ struct PtirLogitsCopyParams {
     std::uint32_t reserved = 0;
 };
 
-inline constexpr int kPtirLogitsCopyOrdinal = 90000;
+
 // Rows one staging dispatch can carry. Bounded by the paged forward's row
 // capacity, which is what `LogitsOut::rows` is drawn from.
 inline constexpr std::size_t kPtirLogitsCopyMaxRows = kPagedMaxForwardTokensCeiling;
@@ -748,11 +748,49 @@ struct ElasticBreakdown {
     std::size_t scratch = 0;
 };
 
+// Say once, before anything is allocated, that this machine is carrying GPU
+// memory nobody owns.
+//
+// A model small enough to fit alongside the leak is admitted by the check
+// below and runs fine, so nothing on the path to a successful load would
+// otherwise mention it -- and the danger is not to the run. Wired pages
+// cannot be paged out and are charged to no live process, so `ps`, Activity
+// Monitor and free-memory readings all look ordinary while the window server
+// is one composite away from being unable to allocate. When it cannot, it
+// blocks in the kernel inside its own Metal submit, misses the 120-second
+// userspace watchdog, and the desktop dies. Observed here twice: once during
+// a run, and once **ten hours after** the run that leaked the memory, with no
+// pie process alive to connect it to.
+//
+// So this warns rather than refuses. The load is not what is unsafe; leaving
+// the machine up is. The threshold is half of RAM because a healthy idle Mac
+// sits near 3%, and the leaks seen here were 59% -- there is no ambiguous
+// middle to tune against.
+void warn_once_if_the_gpu_leaked_memory_before_this_run() {
+    [[maybe_unused]] static const bool said = [] {
+        const auto [wired, installed] =
+            RawMetalContext::host_wired_and_installed_bytes();
+        if (installed == 0 || wired * 2 <= installed) return true;
+        const auto gib = [](std::size_t b) { return double(b) / (1024.0 * 1024.0 * 1024.0); };
+        std::fprintf(stderr,
+                     "[pie-metal] warning: %.2f GiB of this machine's %.2f GiB is wired "
+                     "before this model is loaded. No process has to be holding it: a GPU "
+                     "context whose command buffer never signalled is abandoned rather "
+                     "than released, and its pages stay wired until reboot. They cannot "
+                     "be paged out, so the window server can be starved of memory hours "
+                     "later and take the desktop down with it. Reboot before leaving this "
+                     "machine unattended.\n",
+                     gib(wired), gib(installed));
+        return true;
+    }();
+}
+
 bool fits_on_this_gpu(std::size_t heap_bytes,
                       std::size_t elastic_bytes,
                       std::size_t resident_weights,
                       std::string* err,
                       const ElasticBreakdown* parts = nullptr) {
+    warn_once_if_the_gpu_leaked_memory_before_this_run();
     const std::size_t limit = RawMetalContext::device_working_set_bytes();
     if (limit == 0) return true;  // the device would not say; do not invent one
     const std::size_t want = heap_bytes + elastic_bytes;
@@ -1044,11 +1082,30 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // ── Build the decode DAG (shipped config: GdnPrep ON, no argmax dispatch — host samples). ──
     // Under the accuracy gate every activation value gets its own pool buffer, so a
     // tap's producer is still readable once the command buffer retires.
-    const bool taps = golden_taps_enabled();
+    const bool taps = golden_taps_enabled() && !golden_taps_recycle();
     dag_ = build_decode_dag(g_, /*with_argmax=*/false, fuse_residual_, gdn_prep_);
+    // Each DAG owns one region of the argument-table namespace. A DAG longer
+    // than its region reaches into the next one's, and the two then share
+    // tables silently -- see `ordinals_fit`.
+    if (!ordinals_fit(dag_.size())) {
+        if (err) {
+            *err = "this decoder emits " + std::to_string(dag_.size()) +
+                   " dispatches and one argument-table region holds " +
+                   std::to_string(kPrefillOrdinalStride);
+        }
+        return false;
+    }
     if (g_.paged_kv_enabled) {
         mb_dag_ = build_decode_dag_mb(g_, std::max(1, g_.max_tokens),
                                       kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
+        if (!ordinals_fit(mb_dag_.size())) {
+            if (err) {
+                *err = "this decoder's batched DAG emits " + std::to_string(mb_dag_.size()) +
+                       " dispatches and one argument-table region holds " +
+                       std::to_string(kPrefillOrdinalStride);
+            }
+            return false;
+        }
         mb_sched_ = build_scratch_schedule(mb_dag_, g_, /*no_recycle=*/taps);
         prefill_dags_ = build_decode_prefill_dags(g_, std::max(1, g_.max_tokens),
                                                    fuse_residual_, gdn_prep_);
@@ -1156,6 +1213,22 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
+    }
+    // The second quantized set. A checkpoint that spares its two routing
+    // projections at another width gets one more table, and only the two kinds
+    // that read it are taken from it -- everything else stays on the pipelines
+    // the model-wide format named. `mb_geometry` and the strided branch both
+    // keep those kinds on the matvec, so there is no batched shape to build.
+    if (g_.has_alt_quant()) {
+        DecodeStepPsos alt{};
+        if (!load_decode_psos(*ctx_, kernels_dir, alt, g_.alt_quant, &load_err,
+                              DecodePsoFeatures{.routing_only = true})) {
+            if (err) *err = "PSO load failed (second quantized set): " + load_err;
+            ctx_.reset();
+            return false;
+        }
+        psos_[Kernel::LlRouter] = alt[Kernel::LlRouter];
+        psos_[Kernel::LlSharedGateProj] = alt[Kernel::LlSharedGateProj];
     }
     if (g_.paged_kv_enabled &&
         !load_multibatch_psos(
@@ -1630,7 +1703,13 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
                              int(pool_.size()), t * prefill_scratch_row);
-                bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_);
+                // The row pitch reaches the mixture's params here: a prefill
+                // lays every value's rows a uniform `scratch_widest_elems`
+                // apart, and the routing group is the one thing that runs over
+                // all of them at once. At one row it is unread -- every index
+                // it multiplies is zero -- so the per-token walk is unaffected.
+                bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_,
+                                   1, scratch_widest_elems(g_));
                 // A scan launched off row t's argument table reads its own
                 // length, so every row carries one.
                 prefill_scan_rows_[t] = ctx_->create_standalone_buffer(sizeof(std::int32_t));
@@ -2352,6 +2431,14 @@ bool MetalExecutor::Impl::run_prefill_step(
     // Nothing failed and nothing was slow; the first token of every prompt was
     // simply the wrong one.
     std::string stage_err;
+    // The mixture's routing runs over the WHOLE prompt when it can, off row
+    // zero's argument tables, so row zero's `n` and `padded` have to be the
+    // fire's and not the one. Allocation-free: rebinding a const slot rewrites
+    // bytes at an address the table already holds.
+    if (g_.is_moe() && !prefill_dags_.empty() && schedule.N > 1) {
+        bind_token_consts(*ctx_, prefill_dags_.front(), g_, schedule.N,
+                          scratch_widest_elems(g_));
+    }
     bool stage_failed = false;
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
@@ -2622,6 +2709,41 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         // and read back here rather than decided a second time -- see
         // `plan_ties_embeddings`.
         geom.tied_embeddings = plan_ties_embeddings(load_plan);
+        // The routing projections' format, read off the checkpoint rather than
+        // the config: mlx_lm's quantization predicate singles out tensors by
+        // NAME, and `config.json` records only the model-wide choice beside a
+        // list of exceptions this driver does not parse. Both routing weights
+        // are read, and a disagreement between them is refused rather than
+        // resolved -- there is one alternate pipeline table.
+        {
+            const auto view = load_plan.view();
+            AffineFormat found{0, 0};
+            bool conflict = false;
+            for (std::size_t i = 0; i < view.tensors.len; ++i) {
+                const auto& t = view.tensors.ptr[i];
+                const std::string name(reinterpret_cast<const char*>(t.name.ptr), t.name.len);
+                const bool routing = name.find("mlp.gate.weight") != std::string::npos ||
+                                     name.find("mlp.shared_expert_gate.weight") != std::string::npos;
+                if (!routing) continue;
+                const AffineFormat f{int(t.quant_bits_per_element), int(t.quant_group_size)};
+                if (f.bits == 0 || f.group == 0) continue;
+                if (f.bits == geom.quant.bits && f.group == geom.quant.group) continue;
+                if (found.bits != 0 && (found.bits != f.bits || found.group != f.group)) {
+                    conflict = true;
+                    break;
+                }
+                found = f;
+            }
+            if (conflict) {
+                if (err != nullptr) {
+                    *err = "qwen3.5: the router and the shared expert's gate are quantized "
+                           "differently from each other, and this driver builds one "
+                           "alternate pipeline table";
+                }
+                return false;
+            }
+            geom.alt_quant = found;
+        }
     }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes
@@ -2763,6 +2885,23 @@ std::uint32_t MetalExecutor::rs_slots() const {
 
 std::uint64_t MetalExecutor::rs_slot_bytes() const {
     return ready() ? impl_->rs_slot_bytes() : 0u;
+}
+
+std::uint32_t MetalExecutor::max_forward_tokens() const {
+    if (!ready()) return 0u;
+    // The paged qwen3.5 path binds its rows at setup and refuses a wider fire.
+    // The simple families replay a prompt internally and carry no such cap --
+    // their `DecodeGeometry::max_tokens` is the field's default 1, which is not
+    // a fire width, and reporting it would make a caller chunk a prompt one
+    // token at a time (measured: gpt-oss's 2048-token prefill fell from 755 to
+    // 89 tok/s).  0 means "no cap to respect", which is the truth for them.
+    if (impl_->is_simple()) {
+        const int rows = impl_->simple_engine()->paged()
+                             ? impl_->simple_engine()->max_rows()
+                             : 0;
+        return rows > 0 ? static_cast<std::uint32_t>(rows) : 0u;
+    }
+    return static_cast<std::uint32_t>(impl_->geometry().max_tokens);
 }
 
 std::uint64_t MetalExecutor::elastic_page_bytes() const {
@@ -3933,6 +4072,8 @@ bool MetalExecutor::ready() const { return false; }
 std::uint32_t MetalExecutor::vocab() const { return 0; }
 
 std::uint32_t MetalExecutor::rs_slots() const { return 0; }
+
+std::uint32_t MetalExecutor::max_forward_tokens() const { return 0; }
 
 std::uint64_t MetalExecutor::rs_slot_bytes() const { return 0; }
 std::uint64_t MetalExecutor::elastic_page_bytes() const { return 0; }

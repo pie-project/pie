@@ -72,7 +72,7 @@ bool load_decode_psos(RawMetalContext& ctx,
         // Residual-epilogue GEMV variant for QmvO/QmvOut/QmvDown (adds buffer(7) residual).
         want("quantized_qmv.metal", qmv_residual_fn.c_str(), {});
     }
-    const size_t residual_at =
+    size_t residual_at =
         features.residual_qmv ? requests.size() - 1 : SIZE_MAX;
     if (features.gdn) {
         // Prep-dispatch split (PIE_GDN_PREP): GdnPrep computes the q/k path once/head;
@@ -146,6 +146,13 @@ bool load_decode_psos(RawMetalContext& ctx,
     if (features.argmax) {
         // Device argmax + EOS-compare (I3 sampling substrate). bf16 logits = lm_head out.
         want("argmax.metal", "argmax_logits_bfloat16", {Kernel::Argmax});
+    }
+    if (features.routing_only) {
+        requests.clear();
+        targets.clear();
+        residual_at = SIZE_MAX;
+        want("quantized_qmv.metal", qmv_fast_fn.c_str(),
+             {Kernel::LlRouter, Kernel::LlSharedGateProj});
     }
 
     std::vector<std::string> errors;

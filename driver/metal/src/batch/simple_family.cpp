@@ -323,22 +323,54 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             return false;
         }
 
-        // The dense FFN's format, read off the checkpoint rather than the
-        // config: mlx-lm's quantization predicate can single out tensors by
-        // NAME, and `config.json` records only the model-wide choice. Asked
-        // here because the PSO tables are built below and need the answer.
+        // The dense FFN's and the router's formats, read off the checkpoint
+        // rather than the config: mlx-lm's quantization predicate can single
+        // out tensors by NAME, and `config.json` records only the model-wide
+        // choice. Asked here because the PSO tables are built below and need
+        // the answer.
+        //
+        // Both groups, separately. They used to be one question answered by
+        // `mlp.down_proj` alone, on the assumption that a checkpoint sparing
+        // one spares the other -- true of lmstudio-community's QAT build and
+        // false of mlx-community's, which spares only the router. The router
+        // then ran the 4-bit pipeline over its 8-bit bytes and produced logits
+        // at cosine 0.10 to mlx-lm's, with every tensor feeding them at 0.9999.
         {
             const auto view = load_plan.view();
-            for (std::size_t i = 0; i < view.tensors.len; ++i) {
-                const auto& t = view.tensors.ptr[i];
-                const std::string name(reinterpret_cast<const char*>(t.name.ptr), t.name.len);
-                if (name.find("mlp.down_proj.weight") == std::string::npos) continue;
-                const int bits = int(t.quant_bits_per_element);
-                const int group = int(t.quant_group_size);
-                if (bits != g_.quant.bits || group != g_.quant.group) {
-                    g_.ffn_quant = AffineFormat{bits, group};
+            const auto format_of = [&](const char* suffix) -> AffineFormat {
+                for (std::size_t i = 0; i < view.tensors.len; ++i) {
+                    const auto& t = view.tensors.ptr[i];
+                    const std::string name(reinterpret_cast<const char*>(t.name.ptr),
+                                           t.name.len);
+                    if (name.find(suffix) == std::string::npos) continue;
+                    return AffineFormat{int(t.quant_bits_per_element),
+                                        int(t.quant_group_size)};
                 }
-                break;
+                return AffineFormat{0, 0};
+            };
+            const AffineFormat ffn = format_of("mlp.down_proj.weight");
+            const AffineFormat router = format_of("router.proj.weight");
+            const auto differs = [&](const AffineFormat& f) {
+                return f.bits != 0 && f.group != 0 &&
+                       (f.bits != g_.quant.bits || f.group != g_.quant.group);
+            };
+            g_.alt_quant_ffn = differs(ffn);
+            g_.alt_quant_router = differs(router);
+            if (g_.alt_quant_ffn) g_.ffn_quant = ffn;
+            if (g_.alt_quant_router) g_.ffn_quant = router;
+            // One alternate format is all there are pipelines for. Two would
+            // need a third table, and guessing which of them to build is how a
+            // dispatch ends up on a pipeline for someone else's bytes.
+            if (g_.alt_quant_ffn && g_.alt_quant_router &&
+                (ffn.bits != router.bits || ffn.group != router.group)) {
+                if (err) {
+                    *err = "gemma4: the dense FFN is " + std::to_string(ffn.bits) +
+                           "-bit at group " + std::to_string(ffn.group) + " and the router " +
+                           std::to_string(router.bits) + "-bit at group " +
+                           std::to_string(router.group) +
+                           ", and this driver builds one alternate pipeline table";
+                }
+                return false;
             }
         }
 

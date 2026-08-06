@@ -60,4 +60,34 @@ constexpr const char* attn_decode_gqa_list() {
         ;
 }
 
+/// Whether a native MXFP4 expert GEMM is the right way to serve an MXFP4 MoE
+/// on a device of this compute capability.
+///
+/// Not a hardware question. Blackwell has the FP4 unit, but on everything
+/// older the answer is decided by which Marlin the driver was built with:
+///
+///   * the expert-indexed MoE kernel serves a whole layer in one launch, and
+///     is sm80 -- with it the native path wins on Ampere onward;
+///   * the dense, single-problem kernel alone does not qualify. It reaches the
+///     tensor cores once per expert, so a 32-expert layer becomes 32 serial
+///     launches: measured 67 tok/s against 747 for the routed dequant path it
+///     would replace.
+///
+/// Two call sites must agree on this or a model fails to load with a message
+/// about the target's capabilities: `context.cpp` publishes it as the
+/// `native_mxfp4_moe` device fact the loader plans against, and
+/// `loaded_model.cpp` passes the same bit into `DeviceTarget`. They disagreed
+/// once already, and the symptom was a checkpoint that quietly took the slow
+/// path with the fast kernels compiled in and unused.
+constexpr bool device_supports_native_mxfp4_moe(int cc_major) {
+#if defined(PIE_CUDA_HAS_MARLIN_MOE)
+    return cc_major >= 8;
+#elif defined(PIE_CUDA_HAS_MARLIN)
+    return cc_major >= 10;
+#else
+    (void)cc_major;
+    return false;
+#endif
+}
+
 }  // namespace pie_cuda_driver

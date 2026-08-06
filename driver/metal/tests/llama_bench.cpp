@@ -206,6 +206,26 @@ int fire(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
     return want_token ? argmax_of(out, 0) : 0;
 }
 
+/// Fire a prompt, splitting it into fires the setup will actually accept.
+/// A paged family caps a forward at 1024 rows however wide the config asked,
+/// so a Tier 2 prompt is a refusal rather than a slow answer unless the caller
+/// chunks it -- which is what the scheduler does with a long prompt too, so
+/// chunking here measures the same thing the server would.  Returns the greedy
+/// token of the LAST chunk, or -1 on failure.
+int fire_prompt(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
+                std::uint32_t& next_free_page, bool want_token = false) {
+    const std::uint32_t cap = exec.max_forward_tokens();
+    const std::uint32_t step = (cap > 0 && cap < n) ? cap : n;
+    int last = 0;
+    for (std::uint32_t done = 0; done < n; done += step) {
+        const std::uint32_t take = std::min(step, n - done);
+        last = fire(exec, s, take, page_size, next_free_page,
+                    want_token && done + take >= n);
+        if (last < 0) return -1;
+    }
+    return last;
+}
+
 /// "The capital of France is Paris. The capital of Italy is".
 ///
 /// One prompt, used three ways: the greedy gate continues it, the golden-tap
@@ -459,7 +479,6 @@ int main(int argc, char** argv) {
     // checkpoint is the reference; the tokens are hard-coded because the point
     // is to detect a change here, not to re-derive the answer each run.
     {
-        const std::vector<std::uint32_t>& p = kGatePrompt;
         // Keyed by shape rather than by directory name, because the same
         // checkpoint lives under a different path on every machine. A model
         // this table does not know is BENCHED BUT NOT GATED, and says so --
@@ -486,7 +505,43 @@ int main(int argc, char** argv) {
             std::vector<int> want;
             /// The continuation of `long_gate_prompt()`, empty if unknown.
             std::vector<int> want_long;
+            /// The prompt this row's answers were recorded on, empty for
+            /// `kGatePrompt`.
+            ///
+            /// `kGatePrompt` is a sentence in the Qwen/Llama vocabulary, and
+            /// every family whose ids mean something else reads it as noise.
+            /// That is usually fine -- a gate is a bit-level agreement, not a
+            /// semantic one -- but noise leaves the model with nothing to be
+            /// confident about, and then the gate measures a coin flip. On
+            /// gemma-4-31b it did: the driver and mlx-lm's own forward BOTH put
+            /// 240017 first at step two, three tenths of a logit above 374, and
+            /// mlx-lm's cached decode picked the other one. Every tap agreed to
+            /// cosine 0.9985 or better. A row whose next token turns on a
+            /// quarter of a bf16 ulp is not evidence about anything.
+            ///
+            /// So a family may state a prompt of its own. Gemma's is the same
+            /// sentence through gemma's tokenizer, where every step of the
+            /// continuation wins by 2.5 logits or more.
+            std::vector<std::uint32_t> prompt;
         };
+        /// "1, 2, 3, 4, 5, 6, 7, 8," through gemma-4's tokenizer, and through
+        /// Qwen3.6's.
+        ///
+        /// Counting is what a family whose vocabulary is not Qwen's gets asked
+        /// instead of `kGatePrompt`. It was chosen by MEASURING the margin: the
+        /// same sentence `kGatePrompt` spells leaves gemma-4-26b at three
+        /// tenths of a logit between its top two at step four, where a gate is
+        /// a coin toss. Counting is the only one of four candidate prompts
+        /// whose narrowest step clears three logits on all four checkpoints
+        /// (26B 3.88, 31B 3.00, 27B 4.00, 35B-A3B 2.00 -- the last being the
+        /// worst of any of them, and still five times the gap that flipped).
+        const std::vector<std::uint32_t> kGemmaPrompt{
+            236770, 236764, 236743, 236778, 236764, 236743, 236800, 236764,
+            236743, 236812, 236764, 236743, 236810, 236764, 236743, 236825,
+            236764, 236743, 236832, 236764, 236743, 236828, 236764};
+        const std::vector<std::uint32_t> kQwen36Prompt{
+            16, 11, 220, 17, 11, 220, 18, 11, 220, 19, 11, 220,
+            20, 11, 220, 21, 11, 220, 22, 11, 220, 23, 11};
         const std::vector<Known> known{
             // " Tokyo. The capital of the", then "The capital of France is Paris"
             {"Qwen3-1.7B", 28, 0, 4, 2048, 64, {26194, 13, 576, 6722, 315, 279},
@@ -564,9 +619,29 @@ int main(int argc, char** argv) {
             // pipelines agree to 0.001 of 13.75, under a bf16 ulp, and on the
             // E2B -- whose reference is stable -- both still answer mlx-lm's 818.
             // The short answer below is untouched: a decode does not tile.
+            // Re-transcribed from mlx-lm on THIS checkpoint. The answer above
+            // it belonged to lmstudio-community's QAT build of the same model,
+            // which is 30 layers, 128 experts, 2816 hidden and a `quant_bits`
+            // of 4 -- every field of this key -- and is a different set of
+            // weights: it spares the FFN at 8 bits. Two checkpoints, one row.
+            // The mlx-community build answers as below, and the key cannot tell
+            // them apart, so only one of the two can be gated here at a time.
             {"Gemma-4-26B-A4B", 30, 128, 4, 2816, 64,
-             {246427, 243599, 243599, 243599, 243599, 243599},
-             {785, 6722, 244674, 237409, 236900, 28901}},
+             {236743, 236819, 236764, 236743, 236770, 236771},
+             {}, kGemmaPrompt},
+            // Gemma-4-31B, the largest dense member. It is here for the row
+            // that found the oversized-threadgroup bug: hidden 5376 wants 1344
+            // threads in `rms_single_row` and Metal allows 1024.
+            {"Gemma-4-31B", 60, 0, 4, 5376, 64,
+             {236743, 236828, 236764, 236743, 236828, 236764}, {}, kGemmaPrompt},
+            // The Qwen3.6 hybrids. Between them they are the only rows with a
+            // gated-delta-net whose key heads are REPEATED to its value heads
+            // (16 -> 48 on the 27B, 16 -> 32 on the 35B), and the 27B is the
+            // row that found the PSO table sized to one family's last kind.
+            {"Qwen3.6-27B", 64, 0, 4, 5120, 64,
+             {220, 24, 11, 220, 16, 15}, {}, kQwen36Prompt},
+            {"Qwen3.6-35B-A3B", 40, 256, 4, 2048, 64,
+             {220, 24, 11, 220, 16, 15}, {}, kQwen36Prompt},
             // gpt-oss-20b. The only MXFP4 checkpoint here, and the row that
             // says the driver reads openai's format rather than converting it:
             // until the expert bank was bound as the E2M1 nibbles and E8M0
@@ -579,21 +654,49 @@ int main(int argc, char** argv) {
             // affine g64. The key is what the config says, not what any one
             // tensor is, which is the same thing every other row's group means.
             //
-            // These answers are NOT mlx-lm's, whatever the Gemma-4-26B comment's
-            // "every other row" says. Fed the same twelve ids, mlx-lm greedy
-            // answers 13 279 410 12038 142760 1328 -- the same four tokens and
-            // then a different fifth. So this row is pinned to an arithmetic
-            // like the 26B's is, and the same care applies to moving it.
+            // On `kQwen36Prompt`, and for the reason the `want_prompt` field
+            // exists. gpt-oss is the only o200k vocabulary here, and it reads
+            // `kGatePrompt` as `िstenidikanل cloud.ultstenid oppل` -- not a
+            // sentence in any language, so the model has nothing to be
+            // confident about and the gate was measuring a coin flip. It was
+            // caught the way the gemma-4-31b row was, by a chip: this row is
+            // the only one of the five that failed on an M4 Pro, and mlx-lm's
+            // own top-2 margins on that prompt say why.
             //
-            // That is what stops the dense projections from taking the FP16
-            // GEMM the other families take. It is worth ~4.5% here, and the
-            // objection is measured rather than assumed: activation taps say
-            // FP16 costs about one bf16 ulp per projection, which is ordinary,
-            // but under it this checkpoint tracks mlx-lm for TWO tokens where
-            // BF16 tracks it for four. A ulp that halves the agreement with the
-            // only outside reference there is has not earned the 4.5%.
-            {"gpt-oss-20b", 24, 32, 4, 2880, 32, {13, 279, 410, 12038, 410, 25},
-             {785, 6722, 315, 9625, 1455, 12095}},
+            //     step        1     2     3     4      5      6
+            //     margin    0.50  1.25  0.25  0.00   2.88   1.75
+            //
+            // Step four is an EXACT tie, and step three is a quarter of a
+            // logit. Both engines duly disagree with themselves across
+            // machines: mlx-lm answered 13 279 410 12038 142760 1328 on the
+            // M1 Max and 13 279 410 16 13 410 on the M4, and this driver
+            // answered 13 279 410 12038 410 25 on the one and
+            // 13 279 3206 7890 484 290 on the other -- three tokens, four
+            // answers. Nothing about the arithmetic was wrong: the long gate
+            // below, which is 192 rows through the batched mixture, passes
+            // 6/6 on both machines unchanged.
+            //
+            // `kQwen36Prompt` reads as `1, 2, 3, 4, 5, 6, 7, 8,` in o200k as
+            // well -- the digit and space ids coincide -- so the row costs no
+            // new constant, and its margins are the ones a gate can stand on:
+            //
+            //     step        1     2     3     4      5      6
+            //     margin    3.81  5.19  2.81  3.00   3.00   2.81
+            //
+            // 2.81 is the floor, against 2.0 on Qwen3.6-35B-A3B, which is the
+            // tightest of the four rows that were passing already. The answer
+            // is mlx-lm's on this prompt, and this driver reproduces it on the
+            // M4; the continuation spells ` 9, 10,` and diverges from the
+            // Qwen3.6 rows at step five only because `10` is one token there
+            // and two here.
+            //
+            // The FP16 note this comment used to carry is now recorded where
+            // the switch is, in `device_tuning.hpp`: the dense projections do
+            // not take the FP16 GEMM here, and `PIE_METAL_FP16_QMM=0` and `=1`
+            // produce bit-identical continuations on this checkpoint, so it
+            // was never this row's evidence for anything.
+            {"gpt-oss-20b", 24, 32, 4, 2880, 32, {220, 24, 11, 220, 702, 11},
+             {785, 6722, 315, 9625, 1455, 12095}, kQwen36Prompt},
             // The same Llama-3.2-1B at 8 bits. It is here because it is the
             // only row that exercises a width other than 4 across a WHOLE
             // model -- the embedding gather, every projection, the batched
@@ -650,6 +753,9 @@ int main(int argc, char** argv) {
             }
         }
         const std::vector<int> want = ref != nullptr ? ref->want : std::vector<int>{};
+        // A row may bring its own prompt; see `Known::prompt`.
+        const std::vector<std::uint32_t>& p =
+            (ref != nullptr && !ref->prompt.empty()) ? ref->prompt : kGatePrompt;
         std::uint32_t page = 0;
         std::uint32_t next_id = 1;
 
@@ -660,13 +766,20 @@ int main(int argc, char** argv) {
         // the comparison to be subtly weaker.
         const auto gate = [&](const std::vector<std::uint32_t>& pr,
                               const std::vector<int>& expect, const char* what) {
+            // A row with no recorded answer still decodes, and for the same
+            // number of steps a gated one would. It used to decode `expect`
+            // tokens, which is none of them without a reference -- so the
+            // "produced:" the ungated line ends with was followed by nothing,
+            // and a checkpoint whose head wrote no logits at all was
+            // indistinguishable from one nobody had transcribed yet.
+            const std::size_t steps = expect.empty() ? 6 : expect.size();
             Seq c;
             c.id = next_id++;
             c.tokens = pr;
-            c.tokens.resize(pr.size() + expect.size(), 0u);
+            c.tokens.resize(pr.size() + steps, 0u);
             std::vector<int> got;
             int t = fire(exec, c, std::uint32_t(pr.size()), page_size, page, true);
-            for (std::size_t i = 0; i < expect.size() && t >= 0; ++i) {
+            for (std::size_t i = 0; i < steps && t >= 0; ++i) {
                 got.push_back(t);
                 c.tokens[pr.size() + i] = std::uint32_t(t);
                 t = fire(exec, c, 1, page_size, page, true);
@@ -929,7 +1042,7 @@ int main(int argc, char** argv) {
     s.tokens = prompt;
     s.tokens.resize(std::size_t(n_prompt + n_decode), 1u);
     const double t0 = now_s();
-    if (fire(exec, s, std::uint32_t(n_prompt), page_size, next_page) < 0) return 1;
+    if (fire_prompt(exec, s, std::uint32_t(n_prompt), page_size, next_page) < 0) return 1;
     const double prefill_s = now_s() - t0;
 
     // ── decode ──
@@ -970,7 +1083,7 @@ int main(int argc, char** argv) {
     s2.id = 5;
     s2.tokens = s.tokens;
     std::uint32_t next_page2 = 0;
-    if (fire(exec, s2, std::uint32_t(n_prompt), page_size, next_page2) < 0) return 1;
+    if (fire_prompt(exec, s2, std::uint32_t(n_prompt), page_size, next_page2) < 0) return 1;
     const double t2 = now_s();
     for (int i = 0; i < n_decode; ++i) {
         if (fire(exec, s2, 1, page_size, next_page2) < 0) return 1;

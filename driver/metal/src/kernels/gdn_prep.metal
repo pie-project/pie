@@ -54,6 +54,11 @@ METAL_FUNC void gdn_prep_body(
   const int n        = int(tpig.z);          // 0 .. R*Hv-1
   const int b_idx    = n / Hv;
   const int hv_idx   = n % Hv;
+  // See gdn_core.metal: q/k carry Hk heads and are repeated to Hv, so a value
+  // head reads key head hv/rep. rep==1 makes this the identity.
+  const int rep      = Hv / p.Hk;
+  const int hk_idx   = hv_idx / rep;
+  const bool hk_first = (hv_idx % rep) == 0;
   const int slot     = SLOTTED ? int(slot_ids[b_idx]) : b_idx;
   const int dk_idx   = int(tpig.x);          // 0..31 (== simd_lane; one simdgroup per head)
   const int n_per_t  = Dk / 32;              // 4
@@ -72,8 +77,8 @@ METAL_FUNC void gdn_prep_body(
   float qraw[8], kraw[8];                      // n_per_t<=8
   for (int i = 0; i < n_per_t; ++i) {
     int d = n_per_t * dk_idx + i;              // 0..Dk-1
-    qraw[i] = convsilu(q_off + hv_idx * Dk + d);
-    kraw[i] = convsilu(k_off + hv_idx * Dk + d);
+    qraw[i] = convsilu(q_off + hk_idx * Dk + d);
+    kraw[i] = convsilu(k_off + hk_idx * Dk + d);
   }
   float qsq = 0.0f, ksq = 0.0f;
   for (int i = 0; i < n_per_t; ++i) { qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i]; }
@@ -97,8 +102,8 @@ METAL_FUNC void gdn_prep_body(
   }
 
   // q/k conv_state writeback (shift + append) -> ping-pong new_conv_state.
-  // Each q/k channel written exactly once per head (was dv_idx==0-guarded in the
-  // fused kernel; here it is naturally once since prep runs once per head).
+  // Each q/k channel written exactly once: prep runs once per VALUE head, and
+  // `rep` value heads share a key head, so only the group's first writes.
   auto wb = [&](int c) {
     for (int j = 0; j < Kc - 1; ++j)
       new_conv_state[(slot * Kc + j) * CDIM + c] =
@@ -106,10 +111,12 @@ METAL_FUNC void gdn_prep_body(
     new_conv_state[(slot * Kc + (Kc - 1)) * CDIM + c] =
         float(mixed[b_idx * CDIM + c]);
   };
-  for (int i = 0; i < n_per_t; ++i) {
-    int d = n_per_t * dk_idx + i;
-    wb(q_off + hv_idx * Dk + d);
-    wb(k_off + hv_idx * Dk + d);
+  if (hk_first) {
+    for (int i = 0; i < n_per_t; ++i) {
+      int d = n_per_t * dk_idx + i;
+      wb(q_off + hk_idx * Dk + d);
+      wb(k_off + hk_idx * Dk + d);
+    }
   }
 }
 
@@ -312,6 +319,10 @@ template <typename T>
     uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
   const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
   const int n = int(tpig.z), t = n / Hv, hv_idx = n % Hv;
+  // See gdn_core.metal: q/k carry Hk heads repeated to Hv; rep==1 is identity.
+  const int rep = Hv / p.Hk;
+  const int hk_idx = hv_idx / rep;
+  const bool hk_first = (hv_idx % rep) == 0;
   const int slot = int(slot_ids[0]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
   const int q_off = p.q_off, k_off = p.k_off, v_off = p.v_off;
   const size_t pitch_t = size_t(row_pitch);
@@ -335,8 +346,8 @@ template <typename T>
   float qraw[8], kraw[8];
   for (int i = 0; i < n_per_t; ++i) {
     const int d = n_per_t * dk_idx + i;
-    qraw[i] = convsilu(q_off + hv_idx * Dk + d);
-    kraw[i] = convsilu(k_off + hv_idx * Dk + d);
+    qraw[i] = convsilu(q_off + hk_idx * Dk + d);
+    kraw[i] = convsilu(k_off + hk_idx * Dk + d);
   }
   float qsq = 0.0f, ksq = 0.0f;
   for (int i = 0; i < n_per_t; ++i) { qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i]; }
@@ -377,11 +388,23 @@ template <typename T>
   };
   for (int i = 0; i < n_per_t; ++i) {
     const int d = n_per_t * dk_idx + i;
-    wb(q_off + hv_idx * Dk + d);
-    wb(k_off + hv_idx * Dk + d);
+    if (hk_first) {
+      wb(q_off + hk_idx * Dk + d);
+      wb(k_off + hk_idx * Dk + d);
+    }
   }
   for (int dv = dk_idx; dv < Dv; dv += 32)
     wb(v_off + hv_idx * Dv + dv);
+}
+
+// A sum across the 16 lanes that own one dv row.  The xor tree stays inside the
+// aligned 16-lane half, so the simdgroup's two rows reduce independently.
+METAL_FUNC float gdn_row_sum16(float v) {
+  v += simd_shuffle_xor(v, 1u);
+  v += simd_shuffle_xor(v, 2u);
+  v += simd_shuffle_xor(v, 4u);
+  v += simd_shuffle_xor(v, 8u);
+  return v;
 }
 
 template <typename T>
@@ -393,9 +416,20 @@ template <typename T>
     constant int& row_pitch [[buffer(12)]], constant int& n_scan [[buffer(13)]],
     uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
   const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv;
-  const int hv_idx = int(tpig.z), dv_idx = int(tpig.y);
-  const int slot = int(slot_ids[0]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
+  // Two dv rows share a simdgroup.  Dropping the two per-token reductions from
+  // 32 lanes to 16 takes them from five shuffle rounds to four, and gives the
+  // simdgroup a second independent chain to interleave against the first --
+  // which is what this loop is short of: with the reductions removed entirely
+  // the kernel measured less than half its time, so it is waiting on them, not
+  // on arithmetic (7% of ALU peak) and not on bandwidth (staging q/k in
+  // threadgroup memory made it slower).  The dispatch halves grid.y to match.
+  const int hv_idx = int(tpig.z);
+  const int dv_idx = int(tpig.y) * 2 + (int(tpig.x) >> 4);
+  const int dk_idx = int(tpig.x) & 15;
+  const int slot = int(slot_ids[0]), n_per_t = Dk / 16;
   const size_t pitch_f = size_t(row_pitch) / 2;
+  const bool row_lead = dk_idx == 0;
+  if (dv_idx >= Dv) return;
 
   // This simdgroup owns the whole (slot, hv, dv) state row, so the scan runs in
   // registers with no ordering beyond the loop itself.
@@ -420,12 +454,12 @@ template <typename T>
     }
     float kv_mem = 0.0f;
     for (int i = 0; i < n_per_t; ++i) { st[i] *= g[0]; kv_mem += st[i] * k[i]; }
-    kv_mem = simd_sum(kv_mem);
+    kv_mem = gdn_row_sum16(kv_mem);
     const float delta = (vval - kv_mem) * g[1];
     float out = 0.0f;
     for (int i = 0; i < n_per_t; ++i) { st[i] += k[i] * delta; out += st[i] * q[i]; }
-    out = simd_sum(out);
-    if (simd_lane == 0)
+    out = gdn_row_sum16(out);
+    if (row_lead)
       core_out[row_t + size_t(hv_idx) * Dv + dv_idx] = static_cast<T>(out);
   }
   for (int i = 0; i < n_per_t; ++i) i_state[n_per_t * dk_idx + i] = st[i];

@@ -46,7 +46,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 MLX_PY = os.path.expanduser("~/.cache/pie-metal/mlxenv/bin/python")
-PIE_PY = "/tmp/pievenv/bin/python"
+# `/tmp` does not survive a reboot, and on a machine whose GPU wedges often
+# enough to need one that is a weekly event. Fall back to the MLX env, which
+# is the only interpreter here guaranteed to be new enough for pie_bench's
+# `tomllib`; a missing venv should not read as "pie scored nothing".
+PIE_PY = ("/tmp/pievenv/bin/python"
+          if os.path.exists("/tmp/pievenv/bin/python") else MLX_PY)
 
 
 def run_json(cmd: list[str], env: dict[str, str] | None = None) -> dict | None:

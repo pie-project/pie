@@ -118,6 +118,19 @@ public:
     // equivalent). 0 = a single graph variant suffices.
     virtual std::uint32_t graph_layout() { return 0; }
 
+    // Optional: whether the fire just planned by `prepare` carries a PREFILL
+    // whose dispatch has content-independent launch geometry, i.e. one the
+    // batch engine may capture and replay.
+    //
+    // `forward_graph_replay_eligible` gates on `is_pure_decode`, so a wave with
+    // a single arriving request loses replay for all of its decode lanes too --
+    // measured at 7.3 ms of host enqueue against 10 us for the same width when
+    // pure (see the campaign notes). The planner already computes the answer
+    // per fire (`PrefillPlanCache::graph_capturable`); this is the vtable seam
+    // that lets the gate read it. Default false keeps every arch that has not
+    // opted in on exactly the old path.
+    virtual bool prefill_graph_capturable() const { return false; }
+
     virtual bool encode_media(const MediaEncodeInputs&, cudaStream_t) { return false; }
 };
 

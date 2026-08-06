@@ -132,7 +132,7 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
 // the mixture's share of it. `const_slot` caches by (ordinal, index), so this
 // overwrites the same slots in place and allocates nothing after the first.
 int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                      const DecodeGeometry& g, int n_tokens) {
+                      const DecodeGeometry& g, int n_tokens, int row_pitch) {
     int count = 0;
     const int rows = n_tokens > 0 ? n_tokens : 1;
     const int pairs = rows * g.experts_per_token;
@@ -155,7 +155,8 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                        (uint32_t)g.experts_per_token,
                                        (uint32_t)shared_kernels::moe_tile_rows(pairs, g.n_experts),
                                        (uint32_t)sorted,
-                                       (uint32_t)g.hidden};
+                                       (uint32_t)g.hidden,
+                                       (uint32_t)row_pitch};
                 bind_const<MoeRouteParams>(ctx, ord,
                                            d.kind == Kernel::LlMoeSort
                                                ? (uint8_t)bind::MoeRouteSort::Params
@@ -172,11 +173,12 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 }
 
 int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const DecodeGeometry& g, int max_ctx, bool gdn_prep, int n_tokens) {
+                       const DecodeGeometry& g, int max_ctx, bool gdn_prep, int n_tokens,
+                       int row_pitch) {
     // The width-dependent ones first, so a DAG is never left half-bound: this
     // function is the complete binding, and the fire path's rebind is a subset
     // of it rather than a second, separate contract.
-    int count = bind_token_consts(ctx, dag, g, n_tokens);
+    int count = bind_token_consts(ctx, dag, g, n_tokens, row_pitch);
 
     // rope: x[h*head_dim + i], rotary half from grid.x. scale=1.0 (qwen3.6 default mrope),
     // base = log2(theta).
@@ -338,18 +340,20 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             // Width-INVARIANT, both of them: the router reads one row and
             // writes k logits whatever the batch is, and the combine sums k
             // slots into one row. Only the sort and the gather in between know
-            // how many rows there are.
+            // how many rows there are -- and, when a prefill runs the whole
+            // group at once, the pitch its rows are laid out at.
             case Kernel::GoRouterTopK:
                 bind_const<RouterParams>(
                     ctx, ord, (uint8_t)bind::GoRouterTopK::Params,
                     RouterParams{(uint32_t)g.n_experts, (uint32_t)g.experts_per_token,
-                                 g.norm_topk_prob ? 0u : 1u},
+                                 g.norm_topk_prob ? 0u : 1u, (uint32_t)row_pitch},
                     &count);
                 break;
             case Kernel::LlMoeCombine:
                 bind_const<ExpertCombineParams>(
                     ctx, ord, (uint8_t)bind::GoExpertCombine::Params,
-                    ExpertCombineParams{(uint32_t)g.hidden, (uint32_t)g.experts_per_token},
+                    ExpertCombineParams{(uint32_t)g.hidden, (uint32_t)g.experts_per_token,
+                                        (uint32_t)row_pitch},
                     &count);
                 break;
             case Kernel::LlSharedCombine:

@@ -176,6 +176,13 @@ void prepare_llama_like_decode_plan(
 std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state);
 
+// True when the fire the prepare hook just planned carries a PREFILL the
+// executor may capture: the FA2 causal path planned in graph mode, which is
+// exactly what `PrefillPlanCache::graph_capturable` records. A pure-decode
+// fire answers false here -- it is admitted by the pure-decode rules instead,
+// and conflating the two would hide which rule let a wave through.
+bool llama_like_prefill_graph_capturable(const LlamaLikePlanState& state);
+
 // Wire-driven forward body, plus a `cfg` knob block and an
 // externally-owned `LlamaLikePlanState`. The body never plans — it only
 // reads `state.decode_plan` (already populated by the prepare hook) which

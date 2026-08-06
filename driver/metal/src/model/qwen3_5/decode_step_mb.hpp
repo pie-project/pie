@@ -10,17 +10,43 @@
 
 namespace pie::metal {
 
-inline constexpr int kMultiBatchOrdinalBase = 1024;
-inline constexpr int kPrefillOrdinalBase = 2048;
-// Ordinals claimed by ONE prefill row's DAG. It must exceed the DAG's own
-// length, and the DAG's length is the model's: a 24-layer dense Qwen3.5 emits
-// about 260 dispatches per row, and the 40-layer 256-expert MoE emits 1083 --
-// which walked straight through a stride of 512 and refused to prefill at all.
-// Twenty-seven dispatches per layer is the rate, so 4096 holds a decoder of
-// about 150 layers. The space itself is free: argument tables live in a map
-// keyed by ordinal and are created on demand, so a wide stride costs nothing
-// that is not used. `qwen3_5_geometry_test` asserts the routed DAG fits.
+// Ordinals claimed by ONE DAG. It must exceed the DAG's own length, and the
+// DAG's length is the model's: a 24-layer dense Qwen3.5 emits about 260
+// dispatches, the 64-layer dense Qwen3.6-27B 1043, and the 40-layer 256-expert
+// MoE 1083 -- which walked straight through a stride of 512 and refused to
+// prefill at all. Twenty-seven dispatches per layer is the rate, so 4096 holds
+// a decoder of about 150 layers. The space itself is free: argument tables live
+// in a map keyed by ordinal and are created on demand, so a wide stride costs
+// nothing that is not used. `qwen3_5_geometry_test` asserts the routed DAG fits.
 inline constexpr int kPrefillOrdinalStride = 4096;
+
+// Every region is one stride wide, and every region's base is a multiple of it.
+//
+// They were 0 / 1024 / 2048 with a stride of 4096, which is three regions of a
+// thousand ordinals inside a namespace measured in four thousand. A decoder past
+// about thirty-eight layers emits more than 1024 dispatches, so the M=1 DAG ran
+// into the multi-batch DAG's base and the multi-batch DAG ran into prefill row
+// zero's. Nothing failed: the later binder simply overwrote the earlier one at
+// the overlapping ordinals, at whichever bind indices it happened to use, and
+// left the rest of the earlier DAG's bindings in place. Qwen3.6-35B-A3B (40
+// layers, 1083 dispatches) answered token 0, and its answer moved when the
+// SCRATCH COLOURING of a DAG the fire never encoded changed -- which is the
+// signature of two DAGs writing one table and nothing else.
+//
+// One stride for each, so a DAG that fits its region cannot reach another's,
+// and the fits are checked rather than assumed (`ordinals_fit`, below).
+inline constexpr int kDecodeOrdinalBase = 0;
+inline constexpr int kMultiBatchOrdinalBase = 1 * kPrefillOrdinalStride;
+// PTIR's logits staging binds one table of its own. It used to be the literal
+// 90000, which landed in whatever gap the prefill rows left at the time.
+inline constexpr int kPtirLogitsCopyOrdinal = 2 * kPrefillOrdinalStride;
+inline constexpr int kPrefillOrdinalBase = 3 * kPrefillOrdinalStride;
+
+/// Whether a DAG fits the region it was built into. Checked at setup, because
+/// the alternative is two DAGs quietly sharing argument tables.
+inline bool ordinals_fit(std::size_t dag_len) {
+    return dag_len <= std::size_t(kPrefillOrdinalStride);
+}
 // One past the highest ordinal a prefill row can claim.  The PTIR runtime
 // allocates its own ordinals and must start at or above this: the two spaces
 // were separated only by both being small, and raising the rows-per-fire bound

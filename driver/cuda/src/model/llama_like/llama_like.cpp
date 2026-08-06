@@ -293,6 +293,18 @@ std::uint32_t llama_like_decode_graph_layout(
     return ops::decode_plan_graph_layout(*state.decode_plan);
 }
 
+bool llama_like_prefill_graph_capturable(const LlamaLikePlanState& state)
+{
+    // `prefill_decode_plan` is the decode-shaped prefill plan (qo_len 1 per
+    // request routed through the prefill kernel); it is already reachable
+    // through the pure-decode rules, so only the true prefill plan is
+    // reported here.
+    if (state.use_prefill_plan && state.prefill_plan) {
+        return ops::prefill_plan_graph_capturable(*state.prefill_plan);
+    }
+    return false;
+}
+
 void llama_like_forward_paged(
     const Qwen3Weights& w,
     const HfConfig& cfg,

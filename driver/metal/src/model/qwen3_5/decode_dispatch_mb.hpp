@@ -30,7 +30,8 @@ namespace pie::metal {
 // block. grid threads = (32*N, out/4, 1) → N*(out/8) threadgroups, tg=(32,2,1). At N=1 this is
 // exactly qmv_dispatch (the sealed M=1 fast path). out%8==0 holds for every qwen3.6 projection.
 inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
-    g  = Grid{32u * uint32_t(N), uint32_t(out_vec) / 4, 1};
+    // Rounded UP, for the reason `qmv_dispatch` gives.
+    g  = Grid{32u * uint32_t(N), (uint32_t(out_vec) + 3u) / 4u, 1};
     tg = Threadgroup{32, 2, 1};
 }
 

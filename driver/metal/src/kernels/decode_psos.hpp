@@ -25,6 +25,14 @@ struct DecodePsoFeatures {
     bool sdpa_d256 = false;
     bool routed = false;
     bool untied = false;
+    /// Build ONLY the two routing projections, and nothing else.
+    ///
+    /// For a checkpoint whose `mlp.gate` and `mlp.shared_expert_gate` are in a
+    /// second affine format: those two need their own pipelines and nothing
+    /// else in the model does, so asking for the whole routed set instead would
+    /// demand `affine_qmv_routed` at a width no expert bank is in -- which is
+    /// not instantiated, and rightly.
+    bool routing_only = false;
 };
 
 // Compile the shared decode kernels plus the model's requested extensions.

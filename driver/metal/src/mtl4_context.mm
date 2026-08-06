@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <sys/sysctl.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -372,6 +373,21 @@ static inline std::uint32_t grid_threads(Threadgroup tg) {
 void StepEncoder::set_pso(Pso pso) {
     auto* s = static_cast<StepState*>(impl_);
     id<MTLComputePipelineState> p = (__bridge id<MTLComputePipelineState>)pso.obj;
+    // A pipeline that was never compiled is not an error Metal raises either:
+    // `setComputePipelineState:nil` leaves the previous one in place, so the
+    // next dispatch runs the WRONG kernel over this one's argument table --
+    // or, if there is no previous one, runs nothing. Both read as a model
+    // that answers zeros with every check green.
+    if (p == nil) {
+        static std::set<std::string> said;
+        if (said.insert(s->pso_label).second) {
+            std::fprintf(stderr,
+                         "[pie-metal] set_pso: no pipeline for the dispatch after '%s'; "
+                         "it runs the previous kernel or none at all\n",
+                         s->pso_label);
+        }
+        return;
+    }
     [s->en setComputePipelineState:p];
     s->pso_max_threads = std::uint32_t(p.maxTotalThreadsPerThreadgroup);
     s->pso_label = p.label != nil ? p.label.UTF8String : "<unlabelled>";
@@ -519,6 +535,24 @@ size_t RawMetalContext::host_reclaimable_bytes() {
     const uint64_t pages = uint64_t(vm.free_count) + vm.inactive_count +
                            vm.purgeable_count + vm.speculative_count;
     return size_t(pages * uint64_t(page));
+}
+
+std::pair<size_t, size_t> RawMetalContext::host_wired_and_installed_bytes() {
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return {0, 0};
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm),
+                          &count) != KERN_SUCCESS) {
+        return {0, 0};
+    }
+    uint64_t installed = 0;
+    size_t len = sizeof(installed);
+    if (sysctlbyname("hw.memsize", &installed, &len, nullptr, 0) != 0) {
+        return {0, 0};
+    }
+    return {size_t(uint64_t(vm.wire_count) * uint64_t(page)), size_t(installed)};
 }
 
 std::unique_ptr<RawMetalContext> RawMetalContext::create(

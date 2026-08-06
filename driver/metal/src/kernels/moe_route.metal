@@ -68,7 +68,7 @@ template <typename T, bool SCALED>
   constexpr float NEG_INF = -3.0e38f;
 
   const uint row = tgid.y;
-  logits += size_t(row) * size_t(n);
+  logits += size_t(row) * size_t(p.logits_pitch != 0u ? p.logits_pitch : n);
   expert_ids += size_t(row) * size_t(k);
   expert_weights += size_t(row) * size_t(k);
 
@@ -319,8 +319,9 @@ constant constexpr uint kMaxExperts = 1024;
     if (gid.x >= p.width || gid.y >= p.padded) return;
     const int sel = perm[gid.y];
     const uint k = p.experts_per_token < 1u ? 1u : p.experts_per_token;
+    const uint x_pitch = p.x_pitch != 0u ? p.x_pitch : p.width;
     out[uint(gid.y) * p.width + gid.x] =
-        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * p.width + gid.x];
+        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * x_pitch + gid.x];
 }
 
 /// Sum a token's k expert outputs, weighted by the router's softmax, reading
@@ -352,7 +353,7 @@ constant constexpr uint kMaxExperts = 1024;
     if (at < 0) continue;
     acc += float(expert_weights[row * k + e]) * float(y[uint(at) * p.width + c]);
   }
-  out[row * p.width + c] = static_cast<bfloat>(acc);
+  out[row * (p.out_pitch != 0u ? p.out_pitch : p.width) + c] = static_cast<bfloat>(acc);
 }
 
 // ── The shared expert ────────────────────────────────────────────────────────

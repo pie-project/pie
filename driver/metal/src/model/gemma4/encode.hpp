@@ -62,10 +62,12 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
 /// the model, not to the batch size -- differing only in shape and pipeline.
 /// Whether a dispatch's weights are in the geometry's SECOND affine format.
 ///
-/// Exactly the dense FFN's three projections and the router -- what mlx_lm's
-/// quantization predicate spares on gemma-4-26B. Asked in one place so the PSO
-/// choice cannot disagree with the fit check.
-bool gemma4_uses_alt_quant(Kind k);
+/// The candidates are the dense FFN's three projections and the router -- what
+/// mlx_lm's quantization predicate spares on gemma-4-26B -- but WHICH of them
+/// it spared is the checkpoint's to say, so the geometry is asked rather than
+/// the kind alone. Asked in one place so the PSO choice cannot disagree with
+/// the fit check.
+bool gemma4_uses_alt_quant(Kind k, const Gemma4Geometry& g);
 
 /// Whether this dispatch's GEMM reads an FP16 copy of its input, and whether it
 /// is the one that stages it. Public because the binding needs the same answer
