@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,23 @@ namespace {
 constexpr int kPageSize = 32;
 constexpr int kIters = 50;
 constexpr int kWarmup = 10;
+
+// bf16 noise, so a split's output can be compared against the unsplit one.
+void* device_randn(std::size_t bytes) {
+    std::vector<std::uint16_t> h(bytes / 2);
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> d(-1.f, 1.f);
+    for (auto& x : h) {
+        const float f = d(rng);
+        std::uint32_t bits;
+        std::memcpy(&bits, &f, 4);
+        x = static_cast<std::uint16_t>(bits >> 16);
+    }
+    void* p = nullptr;
+    CUDA_CHECK(cudaMalloc(&p, bytes));
+    CUDA_CHECK(cudaMemcpy(p, h.data(), bytes, cudaMemcpyHostToDevice));
+    return p;
+}
 
 void* device_zeros(std::size_t bytes) {
     void* p = nullptr;
@@ -76,7 +95,7 @@ int main(int argc, char** argv) {
                 window_left);
     const int splits = std::getenv("SPLITS") ? std::atoi(std::getenv("SPLITS")) : 8;
     std::printf("%8s %12s %12s %12s %10s\n",
-                "ctx", "flashinfer", "fa3_sm90", "fa3_split", "split_GB/s");
+                "ctx", "flashinfer", "fa3_sm90", "fa3_split", "max|diff|");
     std::printf("(split = %d-way KV split expressed as %d one-token requests, "
                 "each over its own page range)\n", splits, splits);
 
@@ -90,9 +109,9 @@ int main(int argc, char** argv) {
             static_cast<std::size_t>(kPageSize) * kv_heads * head_dim;
         const std::size_t kv_bytes = page_elems * pages * sizeof(std::uint16_t);
 
-        void* k_pages = device_zeros(kv_bytes);
-        void* v_pages = device_zeros(kv_bytes);
-        void* q = device_zeros(static_cast<std::size_t>(q_heads) * head_dim * 2);
+        void* k_pages = device_randn(kv_bytes);
+        void* v_pages = device_randn(kv_bytes);
+        void* q = device_randn(static_cast<std::size_t>(q_heads) * head_dim * 2);
         void* out = device_zeros(static_cast<std::size_t>(q_heads) * head_dim * 2);
 
         std::vector<std::uint32_t> idx_h(pages);
@@ -148,23 +167,43 @@ int main(int argc, char** argv) {
         // this needs. Merging the partials is `MergeStates` over `splits`
         // index sets, tiny next to the attention itself.
         float split_us = -1.f;
+        float max_abs_diff = -1.f;
         if (ops::hopper_prefill_supported(head_dim, -1, splits, splits) &&
             pages >= splits) {
-            const int chunk = (pages + splits - 1) / splits;
+            // Only the in-window tail is worth splitting. The oldest chunk
+            // gets one extra page and carries the window: with qo_len = 1 the
+            // kernel's first visible index is `kv_len - 1 - window_left`, so
+            // setting `window_left = kv_len_0 - 1 - skip` starts it exactly at
+            // the window, and the extra page keeps that same `window_left`
+            // from masking anything in the later (shorter) chunks.
+            const int win_start = (window_left >= 0)
+                ? std::max(0, ctx - window_left) : 0;
+            const int first_page = win_start / kPageSize;
+            const int skip = win_start - first_page * kPageSize;
+            const int live = pages - first_page;
+            const int chunk = std::max(1, (live + splits - 1) / splits);
             std::vector<std::uint32_t> sq(splits + 1), sindptr(splits + 1),
                 slast(splits);
             for (int i = 0; i <= splits; ++i) sq[i] = static_cast<std::uint32_t>(i);
-            sindptr[0] = 0;
+            sindptr[0] = static_cast<std::uint32_t>(first_page);
+            int cursor = first_page;
+            int split_window = -1;
             for (int i = 0; i < splits; ++i) {
-                const int lo = std::min(i * chunk, pages);
-                const int hi = std::min((i + 1) * chunk, pages);
+                const int extra = (i == 0 && skip > 0) ? 1 : 0;
+                const int lo = cursor;
+                const int hi = std::min(lo + chunk + extra, pages);
+                cursor = hi;
                 sindptr[i + 1] = static_cast<std::uint32_t>(hi);
                 const bool last = (hi == pages);
+                const int len = (hi > lo)
+                    ? ((hi - lo - 1) * kPageSize +
+                       (last ? (ctx - (pages - 1) * kPageSize) : kPageSize))
+                    : 0;
                 slast[i] = (hi > lo)
                     ? static_cast<std::uint32_t>(
                           last ? (ctx - (pages - 1) * kPageSize) : kPageSize)
                     : 1u;
-                (void)lo;
+                if (i == 0) split_window = len - 1 - skip;
             }
             auto* sindptr_d = upload(sindptr);
             auto* slast_d = upload(slast);
@@ -178,15 +217,43 @@ int main(int argc, char** argv) {
             ops::plan_attention_flashinfer_prefill_sm90_bf16(
                 sp, sq.data(), sindptr.data(), slast.data(), splits, splits,
                 q_heads, kv_heads, head_dim, kPageSize, workspace, stream,
-                /*enable_cuda_graph=*/true, /*causal=*/true, /*window_left=*/-1,
+                /*enable_cuda_graph=*/true, /*causal=*/true,
+                /*window_left=*/(skip > 0 ? split_window : -1),
                 workspace.int_bytes() / 2);
+            void* smerged = device_zeros(
+                static_cast<std::size_t>(q_heads) * head_dim * 2);
+            void* slse_m = device_zeros(
+                static_cast<std::size_t>(q_heads) * sizeof(float));
             if (sp.valid) {
                 split_us = time_us([&](cudaStream_t st) {
                     ops::dispatch_attention_flashinfer_prefill_sm90_bf16(
-                        sp, sq_dev, k_pages, v_pages, spart, idx_d, workspace,
-                        st, 0.f, 1.0f, static_cast<float*>(slse));
+                        sp, q, k_pages, v_pages, spart, idx_d, workspace,
+                        st, 0.f, 1.0f, static_cast<float*>(slse),
+                        /*broadcast_q=*/true);
+                    ops::merge_attention_states_bf16(
+                        spart, static_cast<float*>(slse), smerged,
+                        static_cast<float*>(slse_m), splits, 1, q_heads,
+                        head_dim, st);
                 }, stream);
+                // Correctness: the merged split must match the unsplit answer.
+                std::vector<std::uint16_t> a(
+                    static_cast<std::size_t>(q_heads) * head_dim), b(a.size());
+                CUDA_CHECK(cudaMemcpy(a.data(), out, a.size() * 2,
+                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b.data(), smerged, b.size() * 2,
+                                      cudaMemcpyDeviceToHost));
+                auto tof = [](std::uint16_t h) {
+                    std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+                    float f; std::memcpy(&f, &bits, 4); return f;
+                };
+                float worst = 0.f;
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    worst = std::max(worst, std::fabs(tof(a[i]) - tof(b[i])));
+                }
+                max_abs_diff = worst;
             }
+            CUDA_CHECK(cudaFree(smerged));
+            CUDA_CHECK(cudaFree(slse_m));
             for (void* p : {sq_dev, spart, slse}) CUDA_CHECK(cudaFree(p));
             for (void* p : {static_cast<void*>(sindptr_d),
                             static_cast<void*>(slast_d)}) CUDA_CHECK(cudaFree(p));
@@ -200,8 +267,8 @@ int main(int argc, char** argv) {
         auto gbs = [&](float us) {
             return us > 0.f ? useful_bytes / (us * 1e3) : 0.0;
         };
-        std::printf("%8d %10.1fus %10.1fus %10.1fus %10.0f\n",
-                    ctx, fi_us, fa3_us, split_us, gbs(split_us));
+        std::printf("%8d %10.1fus %10.1fus %10.1fus %10.4f\n",
+                    ctx, fi_us, fa3_us, split_us, max_abs_diff);
 
         for (void* p : {k_pages, v_pages, q, out}) CUDA_CHECK(cudaFree(p));
         for (void* p : {static_cast<void*>(idx_d), static_cast<void*>(indptr_d),

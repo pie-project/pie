@@ -392,7 +392,8 @@ struct AttnHd {
         int window_left,
         float logits_soft_cap,
         float sm_scale,
-        float* lse_out);
+        float* lse_out,
+        bool broadcast_q = false);
 
     /// Score-observing decode. Same kernel, same plan, plus a
     /// `[num_qo_heads, kv_len]` per-request score row written through the
@@ -459,7 +460,10 @@ private:
         float logits_soft_cap,
         float sm_scale,
         float* lse_out,
-        const DecodeScoreSink* sink = nullptr);
+        const DecodeScoreSink* sink = nullptr,
+        // Every request reads the same Q row: the KV split issues one query
+        // against several page slices, so only the input is shared.
+        bool broadcast_q = false);
 };
 
 // ── AttnHd definitions ─────────────────────────────────────────────────────
@@ -533,7 +537,8 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
     float logits_soft_cap,
     float sm_scale,
     float* lse_out,
-    const DecodeScoreSink* sink)
+    const DecodeScoreSink* sink,
+    bool broadcast_q)
 {
     ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
         static_cast<uint32_t>(cache.num_kv_heads),
@@ -555,7 +560,9 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
     params.lse = lse_out;
     params.maybe_alibi_slopes = nullptr;
     params.num_qo_heads = static_cast<uint32_t>(cache.num_q_heads);
-    params.q_stride_n = static_cast<IdType>(cache.num_q_heads * cache.head_dim);
+    params.q_stride_n = broadcast_q
+        ? IdType{0}
+        : static_cast<IdType>(cache.num_q_heads * cache.head_dim);
     params.q_stride_h = static_cast<IdType>(cache.head_dim);
     params.window_left = window_left;
     params.logits_soft_cap = logits_soft_cap;
@@ -648,24 +655,28 @@ cudaError_t AttnHd<HEAD_DIM>::dispatch_decode(
     int window_left,
     float logits_soft_cap,
     float sm_scale,
-    float* lse_out)
+    float* lse_out,
+    bool broadcast_q)
 {
     if (cache.full_attention_variant && window_left < 0 && logits_soft_cap <= 0.f) {
-        return run_decode<AttnVariantFull>(
+        return run_decode<AttnVariantFull, DecodeParams>(
             cache, q, k_pages, v_pages, o,
             kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
+            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out,
+            /*sink=*/nullptr, broadcast_q);
     }
     if (logits_soft_cap > 0.f) {
-        return run_decode<AttnVariantSoftcap>(
+        return run_decode<AttnVariantSoftcap, DecodeParams>(
             cache, q, k_pages, v_pages, o,
             kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
+            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out,
+            /*sink=*/nullptr, broadcast_q);
     }
-    return run_decode<AttnVariant>(
+    return run_decode<AttnVariant, DecodeParams>(
         cache, q, k_pages, v_pages, o,
         kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-        workspace, stream, window_left, /*soft_cap=*/0.f, sm_scale, lse_out);
+        workspace, stream, window_left, /*soft_cap=*/0.f, sm_scale, lse_out,
+        /*sink=*/nullptr, broadcast_q);
 }
 
 template <uint32_t HEAD_DIM>
