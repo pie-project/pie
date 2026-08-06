@@ -457,6 +457,8 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/nemotron_h/nemotron_h.cpp
   src/model/nemotron_h/nemotron_h_forward.cpp
   src/model/nemotron_h/nemotron_h_model.cpp
+  src/model/gemma4/declared_facts.cpp
+  src/model/gemma4/declared_forward.cpp
   src/model/qwen3_5/declared_facts.cpp
   src/model/qwen3_5/declared_forward.cpp
   src/model/qwen3_5/qwen3_5.cpp

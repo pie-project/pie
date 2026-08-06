@@ -38,6 +38,16 @@ Gemma4Model::Gemma4Model(
     caps_.supports_compact_logits = true;
     caps_.supports_small_prefill_graph =
         kv_cache_.format().is_native_bf16() && small_spec_graph_tokens > 0;
+
+    // Trace and VALIDATE the declaration at load. Nothing executes it
+    // yet — gemma-4's arms are the next rung — but building it here is
+    // what turns a drift between `family::gemma4_cuda` and this driver's
+    // launcher registry into a loud load-time refusal, on a real
+    // checkpoint, before any of it can become a wrong number.
+    if (gemma4_declared_forward_enabled()) {
+        declared_ = build_gemma4_declared_plan(hf_config_, weights_,
+                                               fwd_cfg_.tp_size);
+    }
 }
 
 void Gemma4Model::prepare(AttentionWorkspace& attn_ws,

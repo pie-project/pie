@@ -8,6 +8,8 @@
 
 namespace pie_forward {
 
+
+
 /// `PieForwardOp::weight_name` when the op references no weight.
 constexpr static const uint32_t PIE_FORWARD_NO_NAME = UINT32_MAX;
 
@@ -141,13 +143,27 @@ enum class PieForwardOpKind : uint32_t {
   HookSite = 25,
   /// Loop peeling (A3, the class-collapse amendment): two regions
   /// that BOTH run over complementary row ranges — prefix `[0,
-  /// fast_rows)`, tail `[fast_rows, N)`. Prefix-region op count in
-  /// `param0`, tail-region count in `param1`; the split is the
-  /// fire's hook-free prefix row count, a runtime input.
+  /// split)`, tail `[split, N)`. Prefix-region op count in `param0`,
+  /// tail-region count in `param1`; the split is a runtime input.
+  /// WHICH runtime row count ([`crate::trace::PeelWindow`]) rides
+  /// the aux run: EMPTY = the hook-free prefix (`fast_rows`, A3),
+  /// `[1]` = the unmasked prefix (the spatial mask split — prefix
+  /// region serves the plain decode rows, tail the masked suffix;
+  /// UNPLANNED collapses to tail-only full-N fire-level).
   Peel = 26,
   /// Broadcast bias add over `[rows, width]` (Qwen-2 family qkv
   /// biases): weight name in `name`, width from the value's shape.
   AddBias = 27,
+};
+
+/// What [`crate::lower::Uncovered`] crosses as: zero is a lowering, and
+/// every other value is a group that should not have been formed.
+enum class PieForwardUncovered : uint32_t {
+  None = 0,
+  Rows = 1,
+  WholeKernelSplit = 2,
+  Discontiguous = 3,
+  UnknownBackend = 4,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -377,8 +393,9 @@ struct PieForwardOp {
   /// the field's contract). Empty for every other kind.
   PieForwardIdRange aux_names;
   /// Values consumed, in operand order.
-  /// The op's role under the DEPTH axis (0 none, 1 windowed,
-  /// 2 prefix-plan-swap). Appended per the ABI discipline.
+  /// The op's role under the DEPTH axis ([`crate::trace::DepthRole`]
+  /// as wire values: 0 = none, 1 = windowed, 2 = prefix-plan-swap).
+  /// Appended per the ABI discipline; pre-role consumers read 0.
   uint32_t depth_role;
   PieForwardIdRange inputs;
   /// Values produced (`SplitQkv` produces three, `KvAppend` none).
@@ -430,9 +447,10 @@ struct PieForwardPlan {
   /// The tracer's content hash ([`crate::ffi::compiler_version`]), so two
   /// plans compare as stale-vs-fresh without re-tracing.
   uint64_t compiler_version;
-  /// STRUCTURAL S-3: non-zero when the declaration states the depth axis —
-  /// layer-tagged ops may run over the full-depth prefix window (or be
-  /// skipped on a uniform truncated fire), keyed on each op's layer tag.
+  /// STRUCTURAL S-3: non-zero when the declaration states the depth
+  /// axis ([`crate::trace::ForwardPlan::depth_window`]) — layer-tagged
+  /// ops may run over the full-depth prefix window (or be skipped on a
+  /// uniform truncated fire), keyed on each op's own layer tag.
   uint8_t depth_window;
   void *owner;
 };
@@ -462,8 +480,9 @@ struct PieForwardLlamaLikeCudaFacts {
   uint8_t head_dim_padded;
   /// The checkpoint bound a packed gate‖up bank, so the MLP activation
   /// is the chunked swiglu over one buffer rather than the pair form
-  /// over two. Appended field, same zero-init rule — and the default is
-  /// the UNFUSED form, the conservative one.
+  /// over two. Appended field, same zero-init rule — and note the
+  /// default is the UNFUSED form, which is the conservative one: it
+  /// reads the two narrow buffers a decliner writes.
   uint8_t gate_up_fused;
 };
 
@@ -546,6 +565,66 @@ struct PieForwardQwen35HybridFacts {
   PieForwardQwen35MoeMlpFacts moe;
 };
 
+/// Trace the LOWERED qwen3_5 hybrid — the same text as
+/// [`pie_forward_trace_qwen3_5_hybrid`], with the CUDA backend facts and
+/// a fire class in hand, so the class arms run and the traced form
+/// states its kernels as `Launch` ops with the recurrence three-way
+/// behind value-producing `Guard` chains (north-star-dsl.md rung 4c).
+/// Call once per class the deployment fires; the semantic entry remains
+/// the parity reference.
+///
+/// # Safety
+///
+/// `facts` / `cuda` are null or point at readable
+/// [`PieForwardQwen35HybridFacts`] / [`PieForwardQwen35CudaFacts`];
+/// `out_plan` is null or a writable slot. `class` is a
+/// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
+/// enum rule); anything else answers `InvalidArgument`. ALL FOUR classes
+/// are traceable here (4c-iv): the service classes CommitAdvance (2 —
+/// family `qwen3_5_hybrid.cuda.commit_advance`) and StateOnly (3 —
+/// `...state_only`) alongside Decode/Prefill. They remain qwen3_5's:
+/// the llama_like entry keeps refusing them.
+/// The gemma-4 facts, as C states them. Mirrors
+/// [`crate::facts::Gemma4Facts`] field for field; same input-side rules
+/// as every struct here (bools are `uint8_t`, non-zero is true).
+struct PieForwardGemma4Facts {
+  uint32_t hidden;
+  uint32_t layers;
+  /// Full attention every `interval`-th layer (`l % interval ==
+  /// interval - 1`).
+  uint32_t full_attn_interval;
+  uint32_t q_heads;
+  uint32_t kv_heads;
+  /// The SLIDING layers' head dim.
+  uint32_t head_dim;
+  /// The FULL layers' head dim — different from `head_dim` on E4B,
+  /// which is the per-layer axis this family exists for.
+  uint32_t global_head_dim;
+  /// Partial-rotary width on the FULL layers.
+  uint32_t global_rotary_dim;
+  uint32_t intermediate;
+  uint32_t vocab;
+  uint8_t tied_embeddings;
+  uint8_t _pad[3];
+  /// Count of TRAILING layers that reuse an earlier layer's pages.
+  uint32_t kv_shared_layers;
+  /// `hidden_size_per_layer_input`.
+  uint32_t ple_dim;
+  /// `final_logit_softcapping`; 0 means no cap.
+  float logit_softcap;
+};
+
+/// gemma-4's CUDA backend facts — three binding questions.
+struct PieForwardGemma4CudaFacts {
+  /// A packed `[Hq + 2*Hk, hidden]` projection is bound.
+  uint8_t fused_qkv;
+  /// A packed gate‖up bank is bound.
+  uint8_t gate_up_fused;
+  /// The KV cache is native bf16, so the fused decode post may write
+  /// pages directly.
+  uint8_t kv_native_bf16;
+};
+
 /// The CUDA backend facts for a LOWERED qwen3_5 hybrid trace, as C
 /// states them. Mirrors [`crate::facts::Qwen35CudaFacts`] field for
 /// field; same input-side rules as [`PieForwardLlamaLikeFacts`] (the
@@ -575,36 +654,28 @@ struct PieForwardQwen35CudaFacts {
   /// from the stash instead of re-running the GEMMs. Non-zero is true.
   /// Appended field (4c-iv) — the append-only struct discipline.
   uint8_t verify_stash;
-  /// The MoE block's row bound: `kFusedMoeMaxRows` (512) when
-  /// `ops::flashinfer_cutlass_moe_enabled()` sized a workspace, else 0.
-  /// The workspace is `min(max_tokens, 512)` rows and no fire exceeds
-  /// `max_tokens`, so 512 is the bound whatever `max_tokens` is. Zero
-  /// means the deployment has no fused leg and the MoE block is not
-  /// stated at all. Appended field — the append-only struct discipline.
+  /// The MoE block's row bound — `kFusedMoeMaxRows` (512) when the
+  /// CUTLASS workspace is sized, else 0 (no fused leg, no MoE text).
   uint32_t moe_cutlass_max_rows;
-  /// `add_to_residual`: tp==1, so the MoE output lands on the residual
-  /// stream inside this pass. Non-zero is true.
+  /// `add_to_residual` (tp==1). Non-zero is true.
   uint8_t moe_residual_fold;
-  /// The shared expert's gate weight is bound unquantized, so its
-  /// landing is the fused dot form. Non-zero is true.
+  /// The shared expert's gate takes the fused dot landing.
   uint8_t moe_shared_gate_dot;
-  /// `Lw.expert_cache != nullptr`: experts are paged one at a time, so
-  /// the pass takes the host-routed path. Non-zero is true.
+  /// The experts are paged, so the pass is host-routed.
   uint8_t moe_streamed_experts;
-  /// `qwen35_moe_force_general_path()`. Non-zero is true.
+  /// `qwen35_moe_force_general_path()`.
   uint8_t moe_force_general;
-  /// The dense MLP bound a packed gate_up bank
-  /// (`Lw.gate_up_proj_fused != nullptr`), so the activation is the
-  /// chunked swiglu. Non-zero is true.
+  /// The dense MLP bound a packed gate_up bank.
   uint8_t gate_up_fused;
 };
 
 /// One row of a fire as the engine's seriation ordered them — the input
-/// side of `lower`.
+/// side of [`crate::lower::lower`], as C states it.
 ///
 /// Flags rather than a bitfield because the driver fills this per row per
 /// fire and a named field is what keeps a filler honest; `depth_k` is
-/// negative for a full-depth row.
+/// negative for a full-depth row, which is the same "no truncation"
+/// spelling the wire already uses elsewhere.
 struct PieForwardRow {
   uint8_t multi_token;
   uint8_t custom_mask;
@@ -621,12 +692,12 @@ struct PieForwardRow {
 
 /// One rectangle of the flat launch list.
 ///
-/// `kernel_name` indexes the table handed back beside the launches, NOT
-/// the plan's name table: a lowering names launcher SYMBOLS, and the
-/// plan's names are weights.
+/// `kernel_name` indexes a table handed back beside the launches, NOT the
+/// plan's name table: a lowering names launcher SYMBOLS, and the plan's
+/// names are weights.
 ///
-/// `row_lo/row_hi` are read in the op's own row space — tokens for the
-/// body, requests for the epilogue.
+/// `rows` is read in the op's own row space — `Dim::Tokens` for the body,
+/// `Dim::Requests` for the epilogue (see [`crate::lower::Launch`]).
 struct PieForwardLaunch {
   /// The statement this rectangle came from — an index into the plan's
   /// ops, and what a shadow comparison keys on.
@@ -636,8 +707,8 @@ struct PieForwardLaunch {
   uint32_t row_hi;
   uint16_t layer_lo;
   uint16_t layer_hi;
-  /// Which row partition this rectangle sits in: 0 = none, 1 = the
-  /// hook-free prefix's axis, 2 = the unmasked prefix's.
+  /// Which row partition this rectangle sits in: 0 = none,
+  /// 1 = the hook-free prefix's axis, 2 = the unmasked prefix's.
   uint8_t peel_axis;
   /// Non-zero for the SUFFIX region rather than the prefix — the
   /// executor's mask region, and what decides whether a statement
@@ -645,8 +716,8 @@ struct PieForwardLaunch {
   uint8_t peel_tail;
   /// Non-zero when `row_lo/row_hi` are the HOST's belief and the
   /// executing form must read the fire's runtime split instead. Set
-  /// only inside a CAPTURED fire's peel — the one place a rectangle is
-  /// not a pair of numbers.
+  /// only inside a CAPTURED fire's peel — the one place a rectangle
+  /// is not a pair of numbers.
   uint8_t rows_device;
   uint8_t _pad;
 };
@@ -665,18 +736,8 @@ struct PieForwardSite {
   uint32_t _pad;
 };
 
-/// Zero is a lowering; every other value is a group that should not have
-/// been formed (an ADMISSION answer, not a runtime fire split).
-enum class PieForwardUncovered : uint32_t {
-  None = 0,
-  Rows = 1,
-  WholeKernelSplit = 2,
-  Discontiguous = 3,
-  UnknownBackend = 4,
-};
-
 /// The flat launch list for one fire, pointing into storage the plan owns
-/// until the next `pie_forward_lower` on the same plan.
+/// until the next [`crate::ffi::pie_forward_lower`] on the same plan.
 struct PieForwardLowered {
   const PieForwardLaunch *launches;
   size_t launches_len;
@@ -686,9 +747,9 @@ struct PieForwardLowered {
   size_t kernel_names_len;
   PieForwardBytes kernel_name_bytes;
   /// The STRUCTURAL statements inside live regions, in walk order. A
-  /// site launches no table kernel, so it has no rectangle, but it runs
-  /// guest programs and brackets a layer's sideband; a form driven by
-  /// this list runs these and only these.
+  /// site launches no table kernel, so it has no rectangle, but it
+  /// runs guest programs and brackets a layer's sideband; a form
+  /// driven by this list runs these and only these.
   const PieForwardSite *structural;
   size_t structural_len;
   /// Peak activation bytes the frame would need.
@@ -804,25 +865,17 @@ PieForwardStatus pie_forward_trace_qwen3_5_full_attn(const PieForwardQwen35FullA
 PieForwardStatus pie_forward_trace_qwen3_5_hybrid(const PieForwardQwen35HybridFacts *facts,
                                                   PieForwardPlan *out_plan);
 
-/// Trace the LOWERED qwen3_5 hybrid — the same text as
-/// [`pie_forward_trace_qwen3_5_hybrid`], with the CUDA backend facts and
-/// a fire class in hand, so the class arms run and the traced form
-/// states its kernels as `Launch` ops with the recurrence three-way
-/// behind value-producing `Guard` chains (north-star-dsl.md rung 4c).
-/// Call once per class the deployment fires; the semantic entry remains
-/// the parity reference.
+/// Trace one gemma-4 CLASS — the third family's entry point.
 ///
-/// # Safety
-///
-/// `facts` / `cuda` are null or point at readable
-/// [`PieForwardQwen35HybridFacts`] / [`PieForwardQwen35CudaFacts`];
-/// `out_plan` is null or a writable slot. `class` is a
-/// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
-/// enum rule); anything else answers `InvalidArgument`. ALL FOUR classes
-/// are traceable here (4c-iv): the service classes CommitAdvance (2 —
-/// family `qwen3_5_hybrid.cuda.commit_advance`) and StateOnly (3 —
-/// `...state_only`) alongside Decode/Prefill. They remain qwen3_5's:
-/// the llama_like entry keeps refusing them.
+/// Only the normal fire classes exist here today: gemma-4 has no
+/// recurrent state, so it has none of qwen3_5's service classes, and
+/// `class` outside {Decode, Prefill} is an argument error rather than a
+/// panic.
+PieForwardStatus pie_forward_trace_gemma4_cuda(const PieForwardGemma4Facts *facts,
+                                               const PieForwardGemma4CudaFacts *cuda,
+                                               uint32_t class_,
+                                               PieForwardPlan *out_plan);
+
 PieForwardStatus pie_forward_trace_qwen3_5_hybrid_cuda(const PieForwardQwen35HybridFacts *facts,
                                                        const PieForwardQwen35CudaFacts *cuda,
                                                        uint32_t class_,
@@ -847,24 +900,22 @@ void pie_forward_release(PieForwardPlan *plan);
 /// Rust half (`.wiki/tart/dsl.md` migration step 6).
 ///
 /// The driver walks a nested region IR; `lower` produces the flat launch
-/// list meant to replace it. Calling both on the same fire and comparing
-/// is how the replacement earns the right to happen.
+/// list that is meant to replace it. Calling both on the same fire and
+/// comparing is how the replacement earns the right to happen, and this
+/// is the entry point for the comparing.
 ///
-/// It EXECUTES NOTHING. The result describes what would run.
+/// It EXECUTES NOTHING. The result is a description of what would run.
 ///
-/// `*out` points into storage the plan owns, valid until the next call on
-/// the SAME plan (one slot). Copy or compare before calling again; do not
-/// free it — `pie_forward_release` does, with the plan.
+/// `*out` points into storage the plan owns, valid until the next call
+/// on the SAME plan (one slot). Copy or compare before calling again; do
+/// not free it — `pie_forward_release` does, with the plan.
 ///
 /// # Safety
 ///
-/// `plan` is null or points at a writable header built by a trace entry
-/// point and not yet released; `rows` is null or points at `rows_len`
-/// readable `PieForwardRow`s; `out` is null or a writable slot.
-/// `captures_across_splits` is non-zero when the fire is captured once
-/// and replayed across DIFFERENT row splits: a peel then emits BOTH
-/// regions whatever this fire's split is, and their launches carry
-/// `rows_device`.
+/// `plan` is null or points at a writable header built by one of the
+/// trace entry points and not yet released; `rows` is null or points at
+/// `rows_len` readable [`PieForwardRow`]s; `out` is null or a writable
+/// slot.
 PieForwardStatus pie_forward_lower(PieForwardPlan *plan,
                                    const PieForwardRow *rows,
                                    size_t rows_len,

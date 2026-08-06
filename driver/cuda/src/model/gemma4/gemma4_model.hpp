@@ -2,6 +2,7 @@
 
 #include <optional>
 
+#include "model/gemma4/declared_forward.hpp"
 #include "model/gemma4/gemma4.hpp"
 #include "model/imodel.hpp"
 
@@ -58,6 +59,12 @@ public:
 
 private:
     Gemma4Weights weights_;
+    // The declared plan, or an empty one with the reason it declined.
+    // Built once at construction; nothing consumes it yet (the arms are
+    // the next rung), but tracing and VALIDATING it here is what makes a
+    // drift between the declaration and this driver a load failure
+    // rather than a wrong number later.
+    Gemma4DeclaredPlan declared_;
     const HfConfig& hf_config_;
     Gemma4MoeMlpWorkspace& moe_ws_;
     KvCache& kv_cache_;
