@@ -724,7 +724,7 @@ int Context::Impl::initialize(
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
     const bool native_mxfp4_moe =
-        device_supports_native_mxfp4_moe(dev_prop.major);
+        native_mxfp4_moe_enabled(dev_prop.major);
     nlohmann::json facts = {
         {"abi_version", PIE_DRIVER_ABI_VERSION},
         {"backend", "cuda"},
