@@ -34,7 +34,7 @@ namespace pie::metal {
 // an out-of-bounds read the moment another family appends — which is exactly
 // what happened, as a segfault with nothing pointing at the cause. Anchored on
 // the enum's actual last member instead.
-inline constexpr int kKernelKindCount = static_cast<int>(Kernel::G4PleResidual) + 1;
+inline constexpr int kKernelKindCount = static_cast<int>(Kernel::KindCount);
 
 // One emitted dispatch in the per-token DAG.
 struct Dispatch {

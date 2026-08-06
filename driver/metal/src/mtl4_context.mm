@@ -372,6 +372,21 @@ static inline std::uint32_t grid_threads(Threadgroup tg) {
 void StepEncoder::set_pso(Pso pso) {
     auto* s = static_cast<StepState*>(impl_);
     id<MTLComputePipelineState> p = (__bridge id<MTLComputePipelineState>)pso.obj;
+    // A pipeline that was never compiled is not an error Metal raises either:
+    // `setComputePipelineState:nil` leaves the previous one in place, so the
+    // next dispatch runs the WRONG kernel over this one's argument table --
+    // or, if there is no previous one, runs nothing. Both read as a model
+    // that answers zeros with every check green.
+    if (p == nil) {
+        static std::set<std::string> said;
+        if (said.insert(s->pso_label).second) {
+            std::fprintf(stderr,
+                         "[pie-metal] set_pso: no pipeline for the dispatch after '%s'; "
+                         "it runs the previous kernel or none at all\n",
+                         s->pso_label);
+        }
+        return;
+    }
     [s->en setComputePipelineState:p];
     s->pso_max_threads = std::uint32_t(p.maxTotalThreadsPerThreadgroup);
     s->pso_label = p.label != nil ? p.label.UTF8String : "<unlabelled>";
