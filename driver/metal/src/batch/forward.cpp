@@ -2460,7 +2460,11 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     // slots are cached by (ordinal, index)) and moves no encoded byte, since
     // the argument table already holds the address whose contents change.
     if (g_.is_moe() && mb_bound_tokens_ != schedule.N) {
-        bind_token_consts(*ctx_, fire_dag, g_, schedule.N);
+        // The decode's routed projections do not batch; see
+        // `qwen35_routed_decode_batched`. Passing it here is what keeps the
+        // sort's padding off, and the padding is most of the cost.
+        bind_token_consts(*ctx_, fire_dag, g_, schedule.N, /*row_pitch=*/0,
+                          qwen35_routed_decode_batched());
         mb_bound_tokens_ = schedule.N;
     }
     // The FP16 staging buffer and, next to it, the element count the cast

@@ -96,10 +96,40 @@ inline bool qwen35_uses_alt_quant(Kernel k, const DecodeGeometry& g) {
 /// them, so it is asked in ONE place: five call sites each deriving it would
 /// be five chances to disagree, and a disagreement here is a read off the end
 /// of the routing rather than a wrong answer.
-inline int moe_sorted_rows(const DecodeGeometry& g, int n_tokens = 1) {
+///
+/// `batched` is whether the routed projections will run as MATMULS over this
+/// stack. Only then does the sort pad each touched expert's run to a whole
+/// tile, and the padding is not free: at 32 lanes on a 256-expert mixture it
+/// is 4096 rows carrying 256 real ones. A caller that will run the MATVEC must
+/// say so, or it pays a batched layout to walk it one row at a time -- which
+/// measured 41.6 tok/s against 284.0 for the same fire, both correct.
+inline int moe_sorted_rows(const DecodeGeometry& g, int n_tokens = 1, bool batched = true) {
     const int n = n_tokens > 0 ? n_tokens : 1;
-    return shared_kernels::moe_sorted_rows(n * g.experts_per_token, g.n_experts);
+    const int pairs = n * g.experts_per_token;
+    // Unbatched, the sort is a pure grouping: one row per (token, slot) pair
+    // and no padding, which is exactly what `moe_sorted_rows` returns at
+    // tile 1. Said here rather than by forcing the tile, so the two answers
+    // cannot drift.
+    if (!batched) return pairs;
+    return shared_kernels::moe_sorted_rows(pairs, g.n_experts);
 }
+
+/// The tile each expert's run is padded to, for the same `batched` question.
+inline int moe_tile_rows_for(const DecodeGeometry& g, int n_tokens, bool batched) {
+    if (!batched) return 1;
+    const int n = n_tokens > 0 ? n_tokens : 1;
+    return shared_kernels::moe_tile_rows(n * g.experts_per_token, g.n_experts);
+}
+
+/// Whether a DECODE fire's routed projections run batched.
+///
+/// False, and not as a tuning choice: qwen3.5's routed batched GEMM answers
+/// wrongly on a decode fleet. See the routed arm of `mb_geometry` for the
+/// bisection. Named rather than written as a literal `false` at each site
+/// because three places have to agree on the sorted count -- the dispatch
+/// shape, `MoeRouteParams` and the pool sizing -- and a disagreement between
+/// them is a read off the end of the routing.
+inline constexpr bool qwen35_routed_decode_batched() { return false; }
 
 // Build the ordered per-token DAG (~393 raw dispatches; 363 are golden-tapped) from
 // the geometry, with grid/tg filled per dispatch via delta's decode_dispatch.hpp

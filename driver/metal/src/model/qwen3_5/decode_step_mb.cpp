@@ -201,7 +201,9 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlExpertUp:
         case Kernel::LlExpertDown: {
             const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
-            const int sorted = moe_sorted_rows(g, n);
+            // Asked with the SAME answer `bind_token_consts` gives the sort, so
+            // the stack the dispatch walks is the stack the sort built.
+            const int sorted = moe_sorted_rows(g, n, qwen35_routed_decode_batched());
             // WRONG ANSWERS ON A DECODE FLEET, so this arm is currently shut.
             //
             // Qwen3.6-35B-A3B is 256 experts at top-8, so with
@@ -242,9 +244,8 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             // The prefill is deliberately unaffected: its routed batching is
             // `routed_group_shape`, a different call site, and these DAGs are
             // built at `n_tokens == 1` where the predicate is false anyway.
-            constexpr bool kQwen35RoutedDecodeGemmIsCorrect = false;
             if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
-                kQwen35RoutedDecodeGemmIsCorrect && bn > 0 &&
+                qwen35_routed_decode_batched() && bn > 0 &&
                 shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
                 d.qmm_bn = bn;
                 d.qmm_bm = shared_kernels::moe_tile_rows(n * g.experts_per_token, g.n_experts);
@@ -313,7 +314,9 @@ bool is_routed_group(Kernel k) {
 /// matmul reads another.
 bool routed_group_shape(const Dispatch& d, const DecodeGeometry& g, int rows,
                         const MultiBatchPsos& mb, Grid& grid, Threadgroup& tg, Pso& pso) {
-    const int sorted = moe_sorted_rows(g, rows);
+    // A PREFILL still batches, and correctly: the same kernel over 8192 pairs
+    // at 2048 tokens reproduces mlx-lm. Only the decode's is shut.
+    const int sorted = moe_sorted_rows(g, rows, /*batched=*/true);
     switch (d.kind) {
         case Kernel::GoRouterTopK:
             shared_kernels::router_topk_dispatch(g.n_experts, grid, tg, rows);
