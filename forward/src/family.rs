@@ -3201,6 +3201,8 @@ struct Gemma4LayerW {
     q_norm: NormW,
     k_norm: NormW,
     gate_up: MatW,
+    gate_proj: MatW,
+    up_proj: MatW,
     down: MatW,
     ple_gate: MatW,
     ple_proj: MatW,
@@ -3245,7 +3247,11 @@ impl Gemma4LayerW {
             o_proj: mat("o_proj", f.hidden),
             q_norm: head_norm("q_norm"),
             k_norm: head_norm("k_norm"),
-            gate_up: mat("gate_up", 2 * f.intermediate),
+            // The double-wide variant widens exactly the KV-shared
+            // layers, so the width is per-layer and erases here.
+            gate_up: mat("gate_up", 2 * f.intermediate_of(l)),
+            gate_proj: mat("gate_proj", f.intermediate_of(l)),
+            up_proj: mat("up_proj", f.intermediate_of(l)),
             down: mat("down", f.hidden),
             ple_gate: mat("ple_gate", f.ple_dim),
             ple_proj: mat("ple_proj", f.hidden),
@@ -3440,11 +3446,20 @@ pub fn gemma4_cuda(
             );
             y = landed;
 
-            let act = dsl::cuda::geglu_tanh(
-                &matmul(&mlp_in, &w.gate_up),
-                facts.intermediate,
-                cuda.gate_up_fused,
-            );
+            // The projection follows the BINDING, not just the
+            // activation: a deployment without the packed bank (E2B —
+            // the fuse is gated on E4B's exact dims) runs two gemms and
+            // the PAIR activation. Stating only the fused shape made the
+            // trace name a `gate_up` weight E2B never binds, which the
+            // executor caught at LOAD.
+            let inter = facts.intermediate_of(l);
+            let act = if cuda.gate_up_fused {
+                dsl::cuda::geglu_tanh(&matmul(&mlp_in, &w.gate_up), inter, true)
+            } else {
+                let gate = matmul(&mlp_in, &w.gate_proj);
+                let up = matmul(&mlp_in, &w.up_proj);
+                dsl::cuda::geglu_tanh_pair(&gate, &up, inter)
+            };
             let mlp_out = matmul(&act, &w.down);
             y = dsl::cuda::norm_residual_add(&mlp_out, &w.post_ffw_norm, hidden);
 

@@ -745,6 +745,10 @@ pub struct PieForwardGemma4Facts {
     pub kv_shared_layers: u32,
     /// `hidden_size_per_layer_input`.
     pub ple_dim: u32,
+    /// `use_double_wide_mlp`: the KV-shared layers' MLP is `2 *
+    /// intermediate`.
+    pub double_wide_shared: u8,
+    pub _pad2: [u8; 3],
     /// `final_logit_softcapping`; 0 means no cap.
     pub logit_softcap: f32,
 }
@@ -777,6 +781,7 @@ fn read_gemma4_facts(facts: &PieForwardGemma4Facts) -> Gemma4Facts {
         tied_embeddings: facts.tied_embeddings != 0,
         kv_shared_layers: facts.kv_shared_layers,
         ple_dim: facts.ple_dim,
+        double_wide_shared: facts.double_wide_shared != 0,
         logit_softcap: facts.logit_softcap,
     }
 }

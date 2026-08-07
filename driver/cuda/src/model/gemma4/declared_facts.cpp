@@ -119,12 +119,10 @@ Gemma4DeclaredPlan build_gemma4_declared_plan(
 
     // The per-layer geometry the driver already resolved. The trace's
     // axis is TWO head dims, so anything with more than two distinct
-    // values (or a per-layer intermediate / kv-head count that varies,
-    // which the double-wide-MLP variant produces) is outside it.
+    // values is outside it. The MLP WIDTH is derived below, once the
+    // KV-shared count is known — the double-wide variant keys on it.
     int intermediate = 0;
-    if (!uniform(w.per_layer_intermediate, intermediate)) {
-        G4_REFUSE("per-layer intermediate widths differ (double-wide MLP)");
-    }
+    bool double_wide = false;
     int kv_heads = 0;
     if (!uniform(w.per_layer_num_kv_heads, kv_heads)) {
         G4_REFUSE("per-layer kv head counts differ");
@@ -158,6 +156,30 @@ Gemma4DeclaredPlan build_gemma4_declared_plan(
         }
     }
 
+    // The MLP width, now that `shared` is known. One extra shape is
+    // admitted: the double-wide variant (E2B), where the KV-SHARED
+    // layers carry `2 * intermediate`. Admitted by DERIVING the narrow
+    // width and checking every layer against the predicate the trace
+    // will use, so a checkpoint that widens some other set of layers
+    // still refuses rather than being folded into a fact that does not
+    // describe it.
+    if (!uniform(w.per_layer_intermediate, intermediate)) {
+        if (shared <= 0 ||
+            static_cast<int>(w.per_layer_intermediate.size()) != L) {
+            G4_REFUSE("per-layer intermediate widths differ");
+        }
+        const int first_shared = L - shared;
+        intermediate = w.per_layer_intermediate[0];
+        for (int l = 0; l < L; ++l) {
+            const int want = (l >= first_shared) ? 2 * intermediate : intermediate;
+            if (w.per_layer_intermediate[static_cast<std::size_t>(l)] != want) {
+                G4_REFUSE("per-layer intermediate widths differ in a shape "
+                          "other than double-wide-on-shared");
+            }
+        }
+        double_wide = true;
+    }
+
     // Partial rope on the FULL layers, the driver's own derivation.
     int rotary = full_d;
     if (static_cast<int>(w.per_layer_partial_rotary_factor.size()) == L) {
@@ -179,6 +201,7 @@ Gemma4DeclaredPlan build_gemma4_declared_plan(
     facts.tied_embeddings = (w.lm_head == w.embed) ? 1 : 0;
     facts.kv_shared_layers = static_cast<std::uint32_t>(shared);
     facts.ple_dim = static_cast<std::uint32_t>(cfg.gemma_hidden_size_per_layer_input);
+    facts.double_wide_shared = double_wide ? 1 : 0;
     facts.logit_softcap = cfg.gemma_final_logit_softcap;
 
     if (facts.ple_dim == 0 || w.embed_per_layer == nullptr) {
@@ -216,6 +239,7 @@ Gemma4DeclaredPlan build_gemma4_declared_plan(
         "/i" + std::to_string(intermediate) +
         "/ple" + std::to_string(facts.ple_dim) +
         "/kvs" + std::to_string(shared) +
+        "/dw" + std::to_string(double_wide ? 1 : 0) +
         "/fq" + std::to_string(cuda.fused_qkv) +
         "/gu" + std::to_string(cuda.gate_up_fused);
 #undef G4_REFUSE

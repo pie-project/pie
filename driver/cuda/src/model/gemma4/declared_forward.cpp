@@ -163,6 +163,9 @@ const DeviceTensor* bind(const Gemma4Weights& w, std::string_view name) {
     if (nm.field == "q_norm") return l.q_norm;
     if (nm.field == "k_norm") return l.k_norm;
     if (nm.field == "gate_up") return l.gate_up_proj_fused;
+    // The unfused pair, for a deployment without the packed bank (E2B).
+    if (nm.field == "gate_proj") return l.gate_proj;
+    if (nm.field == "up_proj") return l.up_proj;
     if (nm.field == "down") return l.down_proj;
     if (nm.field == "ple_gate") return l.ple_input_gate;
     if (nm.field == "ple_proj") return l.ple_projection;
@@ -238,6 +241,10 @@ bool gemma4_forward_declared(
     const int N = total_tokens;
     const int R = num_requests;
     const int H = cfg.hidden_size;
+    // The NARROW MLP width. A double-wide deployment (E2B) doubles it
+    // on the KV-shared layers, so every MLP arm reads the layer's own
+    // width — `w.per_layer_intermediate` is what the binder measured off
+    // the gate_proj tensor, and it is the same number the trace baked in.
     const int I = cfg.intermediate_size;
     const int V = cfg.vocab_size;
     const int L = cfg.num_hidden_layers;
@@ -268,6 +275,7 @@ bool gemma4_forward_declared(
     int cur_d = 0;
     int cur_hq = 0;
     int cur_hk = 0;
+    int cur_inter = 0;
     const auto enter = [&](int l) {
         if (l < 0 || l == cur_layer) return;
         cur_layer = l;
@@ -276,6 +284,10 @@ bool gemma4_forward_declared(
         cur_d = w.per_layer_head_dim[static_cast<std::size_t>(l)];
         cur_hq = cfg.num_attention_heads * cur_d;
         cur_hk = w.per_layer_num_kv_heads[static_cast<std::size_t>(l)] * cur_d;
+        cur_inter =
+            (static_cast<std::size_t>(l) < w.per_layer_intermediate.size())
+                ? w.per_layer_intermediate[static_cast<std::size_t>(l)]
+                : I;
     };
 
     // The FULL layers' partial-rotary width, the driver's derivation.
@@ -329,9 +341,15 @@ bool gemma4_forward_declared(
                      N, H, cur_hq, 0.f);
             } else if (nm.field == "gate_up") {
                 gemm(ws.norm_x.data(), name, ws.gate_up_fused.data(),
-                     N, 2 * I, H, 0.f);
+                     N, 2 * cur_inter, H, 0.f);
+            } else if (nm.field == "gate_proj") {
+                gemm(ws.norm_x.data(), name, ws.gate.data(),
+                     N, cur_inter, H, 0.f);
+            } else if (nm.field == "up_proj") {
+                gemm(ws.norm_x.data(), name, ws.up.data(),
+                     N, cur_inter, H, 0.f);
             } else if (nm.field == "down") {
-                gemm(ws.gate.data(), name, ws.norm_x.data(), N, H, I, 0.f);
+                gemm(ws.gate.data(), name, ws.norm_x.data(), N, H, cur_inter, 0.f);
             } else if (nm.field == "ple_gate") {
                 gemm(ws.y.data(), name, ws.norm_x.data(), N, ple_dim, H, 0.f);
             } else if (nm.field == "ple_proj") {
@@ -530,16 +548,30 @@ bool gemma4_forward_declared(
             }
             case G4Kernel::ChunkedGegluTanh:
                 kernels::launch_chunked_geglu_tanh_bf16(
-                    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+                    ws.gate_up_fused.data(), ws.gate.data(), N, cur_inter, stream);
                 break;
             case G4Kernel::GegluTanh: {
-                // The PLE gate: the "up" operand is this layer's slice.
-                const auto* signal =
-                    static_cast<const std::uint16_t*>(per_layer_token) +
-                    static_cast<std::size_t>(cur_layer) * N * ple_dim;
-                kernels::launch_geglu_tanh_bf16(
-                    ws.norm_x.data(), signal, ws.norm_x.data(),
-                    N * ple_dim, stream);
+                // TWO sites for one kernel, told apart by the WIDTH the
+                // op declares — not by a counter. The PLE gate is
+                // `ple_dim` wide and its "up" operand is this layer's
+                // slice of the relay; the unfused MLP is `cur_inter`
+                // wide and its operands are the two projections.
+                const auto out = plan.outputs(op);
+                const auto& val = plan.value(out[0]);
+                const std::uint32_t width =
+                    val.dims[val.rank - 1].value;
+                if (static_cast<int>(width) == ple_dim) {
+                    const auto* signal =
+                        static_cast<const std::uint16_t*>(per_layer_token) +
+                        static_cast<std::size_t>(cur_layer) * N * ple_dim;
+                    kernels::launch_geglu_tanh_bf16(
+                        ws.norm_x.data(), signal, ws.norm_x.data(),
+                        N * ple_dim, stream);
+                } else {
+                    kernels::launch_geglu_tanh_bf16(
+                        ws.gate.data(), ws.up.data(), ws.gate.data(),
+                        N * cur_inter, stream);
+                }
                 break;
             }
             case G4Kernel::NormResidualScaleNorm: {

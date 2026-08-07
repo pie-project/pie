@@ -1022,6 +1022,12 @@ pub struct Gemma4Facts {
     pub kv_shared_layers: u32,
     /// `hidden_size_per_layer_input` — the PLE slice width per layer.
     pub ple_dim: u32,
+    /// `use_double_wide_mlp`: the KV-SHARED layers carry an MLP of
+    /// `2 * intermediate`. E2B sets it, E4B does not — the first
+    /// gemma-4 axis where two deployments of one family disagree about
+    /// a WIDTH rather than a count, so it is a fact and the widths it
+    /// implies erase at trace time.
+    pub double_wide_shared: bool,
     /// `final_logit_softcapping`; 0 means no cap.
     pub logit_softcap: f32,
 }
@@ -1039,6 +1045,17 @@ impl Gemma4Facts {
     /// writing none of its own.
     pub fn is_kv_shared(&self, l: u32) -> bool {
         l >= self.layers.saturating_sub(self.kv_shared_layers)
+    }
+
+    /// This layer's MLP width. The double-wide variant widens exactly
+    /// the KV-shared layers, which is why it keys on the same predicate
+    /// rather than on a second count.
+    pub fn intermediate_of(&self, l: u32) -> u32 {
+        if self.double_wide_shared && self.is_kv_shared(l) {
+            self.intermediate * 2
+        } else {
+            self.intermediate
+        }
     }
 
     /// The layer whose pages `l` attends through: the last EARLIER layer
@@ -1083,6 +1100,7 @@ impl Gemma4Facts {
             tied_embeddings: true,
             kv_shared_layers: 18,
             ple_dim: 256,
+            double_wide_shared: false,
             logit_softcap: 30.0,
         }
     }

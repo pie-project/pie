@@ -611,6 +611,10 @@ struct PieForwardGemma4Facts {
   uint32_t kv_shared_layers;
   /// `hidden_size_per_layer_input`.
   uint32_t ple_dim;
+  /// `use_double_wide_mlp`: the KV-shared layers' MLP is `2 *
+  /// intermediate`.
+  uint8_t double_wide_shared;
+  uint8_t _pad2[3];
   /// `final_logit_softcapping`; 0 means no cap.
   float logit_softcap;
 };

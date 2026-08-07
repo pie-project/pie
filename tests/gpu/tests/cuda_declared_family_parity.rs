@@ -69,6 +69,17 @@ const GEMMA4: Family = Family {
     gate: "PIE_DECLARED_FORWARD_GEMMA4",
 };
 
+/// gemma-4's SECOND geometry, and the reason it earns a row: 35 layers
+/// (odd), `kv_heads = 1` (MQA, where E4B has 2), 20 of 35 layers KV-shared,
+/// hidden 1536. The facts derivation's interval reduction, its trailing
+/// KV-shared run and the arms' per-layer head widths all get a different
+/// set of numbers than E4B can give them.
+const GEMMA4_E2B: Family = Family {
+    name: "gemma4_e2b",
+    hub_dir: "models--google--gemma-4-E2B-it",
+    gate: "PIE_DECLARED_FORWARD_GEMMA4",
+};
+
 const GPT_OSS: Family = Family {
     name: "gpt_oss",
     hub_dir: "models--openai--gpt-oss-20b",
@@ -239,4 +250,10 @@ async fn gemma4_declared_forward_parity() -> Result<()> {
 #[ignore = "needs a CUDA GPU + gpt-oss-20b; run gate-OFF then gate-ON"]
 async fn gpt_oss_declared_forward_parity() -> Result<()> {
     run_family(&GPT_OSS).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a CUDA GPU + gemma-4-E2B; run gate-OFF then gate-ON"]
+async fn gemma4_e2b_declared_forward_parity() -> Result<()> {
+    run_family(&GEMMA4_E2B).await
 }
