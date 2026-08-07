@@ -101,6 +101,13 @@ struct StepState {
     void* trace_heap = nullptr;
     std::uint32_t trace_slots = 0;
     std::uint32_t trace_n = 0;
+    // Dispatches this fire could not be timed because the timestamp heap ran
+    // out of slots. Counted rather than ignored: a table that silently covers
+    // the first n dispatches of a fire and is read as covering the fire is a
+    // profile that points at the wrong kernel, and the driver caps the heap at
+    // 8192 slots -- 4096 dispatches -- which a 1024-row prefill of a 40-layer
+    // model passes inside its first layer.
+    std::uint64_t trace_dropped = 0;
     std::vector<std::string> trace_labels;
     std::string trace_pso;
 };
@@ -438,6 +445,7 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
     // the same for all of them and so does not move the shares.
     const bool trace = dispatch_trace_every() > 0 && s->trace_heap != nullptr &&
                        2 * (s->trace_n + 1) <= s->trace_slots;
+    if (dispatch_trace_every() > 0 && !trace) ++s->trace_dropped;
     if (trace) mark_timestamp(s->trace_heap, 2 * s->trace_n, /*precise=*/true);
     // A threadgroup wider than the pipeline allows is not an error Metal
     // raises; the dispatch is simply not performed. Say it once per pipeline,
@@ -2083,6 +2091,7 @@ void* encode_one_command_buffer(void* ctx_impl, int ab,
         }
     }
     I.step.trace_n = 0;
+    I.step.trace_dropped = 0;
     I.step.trace_labels.clear();
     StepEncoder se(&I.step);
     encode_fn(se);
@@ -2120,6 +2129,10 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
     static double total_ticks = 0.0;
     static double total_gpu_ms = 0.0;
     static long fires = 0;
+    static std::uint64_t dropped = 0;
+    static std::uint32_t slots = 0;
+    dropped += I.step.trace_dropped;
+    slots = I.step.trace_slots;
     for (std::uint32_t i = 0; i < n; ++i) {
         const std::uint64_t a = ticks[2 * i], b = ticks[2 * i + 1];
         // A relaxed timestamp is not ordered against the dispatch it brackets,
@@ -2138,6 +2151,19 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
               [](const auto& x, const auto& y) { return x.second.first > y.second.first; });
     fprintf(stderr, "[trace] %ld fires, %.2f ms of GPU, %zu kernels\n", fires, total_gpu_ms,
             rows.size());
+    // Said before the table, because it invalidates it. The shares below are
+    // over the dispatches that FIT, so a truncated fire reports the kernels at
+    // the head of its DAG and none of the ones after -- which reads as "the
+    // embedding gather is 15% of a prefill" when the embedding gather is
+    // simply what the first 2048 slots happened to cover.
+    if (dropped > 0) {
+        fprintf(stderr,
+                "[trace] TRUNCATED: %llu dispatches went untimed (the timestamp heap holds "
+                "%u slots = %u dispatches). The shares below cover only the dispatches that "
+                "fit, which are the FIRST ones each fire encoded -- do not read them as the "
+                "fire's profile.\n",
+                (unsigned long long)dropped, slots, slots / 2);
+    }
     for (const auto& [name, v] : rows) {
         const double share = total_ticks > 0 ? v.first / total_ticks : 0.0;
         fprintf(stderr, "[trace]  %6.2f%%  %8.3f ms  n=%-6ld %s\n", 100.0 * share,
@@ -2146,6 +2172,7 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
     table.clear();
     total_ticks = 0.0;
     total_gpu_ms = 0.0;
+    dropped = 0;
 }
 
 StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,

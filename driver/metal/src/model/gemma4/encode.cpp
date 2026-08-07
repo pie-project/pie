@@ -63,70 +63,43 @@ bool is_routed(Kind k) {
 
 /// The routed matmul's column tile, or 0 when the batch stays a matvec.
 ///
-/// OPEN BUG, and it is reachable on shipped defaults. When this returns
-/// non-zero on a DECODE fleet, gemma-4-26b-a4b answers wrongly from the very
-/// first step. `moe_should_batch` admits the routed GEMM at
-/// `n_pairs >= n_experts * moe_batch_min_per_expert`, which for this
-/// checkpoint's 128 experts at top-8 is first true at SIXTY-FOUR lanes -- so
-/// nothing in the bench protocol's 8 and 16 ever reached it. Two reproductions,
-/// both `llama_bench` on mlx-community/gemma-4-26b-a4b-it-4bit:
+/// CLOSED BUG, recorded because the diagnosis that stood here for three
+/// sessions was wrong in a way worth not repeating. This GEMM was believed to
+/// answer wrongly on a decode fleet -- `PIE_BENCH_TPUT=64`, or 16 lanes with
+/// the crossover forced to 1, both "FAILED" -- and that belief is what kept
+/// `moe_batch_min_per_expert` pinned at 4 and cost up to 114% of gpt-oss's
+/// fleet throughput.
 ///
-///     PIE_BENCH_TPUT=64                                      -> FAIL
-///     PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=1 PIE_BENCH_TPUT=16 -> FAIL
+/// There was no defect. The evidence was an artefact of the harness, twice
+/// over:
 ///
-/// What is known, so the next reader does not re-measure it:
+///   * `llama_bench`'s fleet gate compared the fleet to THIS DRIVER'S OWN
+///     one-row decode. A one-row decode and an n-row decode take different
+///     kernels the whole way down -- `qmv` against `qmv_mb` or a GEMM, `rms`
+///     against `rms_mb`, sliding attention against tiled -- so they are not the
+///     same arithmetic and were never going to be bit-identical. Which step
+///     their greedy argmaxes first differ on is a fact about how sharp the
+///     logits are there, and the bench's own prompt is `kGatePrompt` repeated
+///     and then TRUNCATED, so at the default 128 it ends mid-sentence and the
+///     next token is close to a coin flip. The file already warned about
+///     exactly this trap one screen above the prompt it builds.
+///   * The reference token buffer was one element short, so at `n_decode == 1`
+///     the comparison never ran and the gate printed PASS having checked
+///     nothing. That produced a four-cell table in which 1-step runs "passed"
+///     and 64-step runs "failed", from which this comment concluded that the
+///     variable was the decode length of the run before -- a dirty scratch
+///     pool. Both halves of that table were measurement error.
 ///
-///   * The fleet members AGREE WITH EACH OTHER and disagree with the same
-///     prompt decoded alone. One consistently wrong batch, not row aliasing --
-///     which is what separates this from the qwen3.5 mixture's failure, where
-///     the members disagree among themselves.
-///   * The matvec arm is bit-perfect on the identical fleet:
-///     `PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=99999` gives 32 of 32 steps at 16
-///     lanes. So the router, the sort, the attention and the paging are all
-///     fine; only this GEMM is not.
-///   * THE SAME GEMM AT THE SAME SHAPE IS CORRECT IN A PREFILL. A 16-token
-///     prompt with the crossover forced to 1 batches the routed GEMM at the
-///     same tile (16) and the same sorted count (2048) and returns tokens
-///     identical to the matvec's. The kernel, the tiling, the PSO choice and
-///     the grid therefore all agree with each other; something the DECODE
-///     supplies does not.
-///   * Eliminated: the tile width (`PIE_METAL_MOE_TILE_MID_PER` -- 16 and 32
-///     both fail), the FP16 input staging (`PIE_METAL_FP16_QMM=0` still
-///     fails), and a missing pipeline (all nine `qmm_routed[tile][bn]` are
-///     compiled, and `kernels.cpp` refuses to load if any is not).
+/// What settles it, and what the gate now asks: force this GEMM onto EVERY
+/// fire with `PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=0` -- so even a one-row decode
+/// takes the batched path -- and gemma-4-26b-a4b still reproduces mlx-lm's
+/// recorded continuation token for token. An n-wide fleet reproduces it too, at
+/// 4, 8, 16 and 32 lanes, with and without the routed GEMM engaged. The kernel
+/// is correct; it was the ruler that was bent.
 ///
-/// The lead was that the DATA differs. It was the wrong lead, and the thing
-/// that replaced it is sharper: THE BUG NEEDS A DIRTY POOL. Three facts, each
-/// from a run on this file's own harness:
-///
-///   * `llama_bench <ckpt> 128 1` at the same 16 lanes and the same crossover
-///     PASSES, and so does `32 1`. `128 64` and `32 64` both FAIL, and they
-///     fail AT STEP 0 -- the same fire, with the same rows, the same routing
-///     and the same constants. The prompt length is not the variable and the
-///     fleet's own step index is not the variable; the DECODE LENGTH OF THE
-///     RUN BEFORE IT is. The longer run's latency and pipelined loops leave
-///     the scratch pool and the page ring holding sixty-four steps of another
-///     sequence, and the fleet's first fire reads that.
-///   * A golden dump used to be unable to see this at all, because taps colour
-///     the scratch `no_recycle` -- every value gets its own buffer -- and that
-///     is exactly the condition under which the bug does not happen. Dumping
-///     with `PIE_METAL_TAPS_RECYCLE=1`, which now reaches this family, the FAIL
-///     reproduces under taps.
-///   * Under `no_recycle` the two arms still differ, but only by 1.0e-2
-///     relative RMS at `0.g4_moe_out` -- an accumulation-order difference
-///     between a GEMM and a GEMV, with the router bit-identical and every tap
-///     upstream of the routed FFN bit-identical too. That difference is not
-///     the failure; it is what a correct batched GEMM looks like.
-///
-/// So the suspect is a WAR/WAW hazard: some value the routed batch reads is
-/// coloured onto a buffer a previous dispatch or a previous FIRE still owns,
-/// and the colouring reports itself hazard-free. The sort clears `perm`,
-/// `row_expert` and `tile_expert` over the full padded bound and the gather
-/// zeroes the padding rows, so the routing side is not it. The sizes are the
-/// place to look next: `moe_sorted_rows` is a bound that MOVES WITH THE ROW
-/// COUNT, so a colour sized for one fire's stack is read at another fire's
-/// height, and a prefill of 128 rows wants 2944 rows where a 16-lane decode
-/// wants 2048.
+/// The general lesson, which is why this is here and not in a commit message:
+/// a correctness gate must compare against something OUTSIDE the driver. Two
+/// of our own kernels disagreeing is the expected state of the world.
 int gemma4_moe_qmm_bn(Kind k, const Gemma4Geometry& g, int rows, int layer) {
     if (!is_routed(k) || gemma4_moe_tile_rows(g, rows) <= 1) return 0;
     const KN kn = qmv_kn(k, g, layer);

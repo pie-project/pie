@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sys/stat.h>
 #include <algorithm>
 
 namespace pie::metal {
@@ -117,7 +118,15 @@ void write_npy(const std::string& path, const std::vector<float>& data, int rows
 const std::string& golden_tap_dir() {
     static const std::string dir = [] {
         const char* e = std::getenv("PIE_METAL_GOLDEN_DIR");
-        return std::string(e == nullptr ? "" : e);
+        const std::string d(e == nullptr ? "" : e);
+        // Created here, once, rather than left to the caller. `write_npy` opens
+        // with `std::ofstream` and RETURNS SILENTLY if the open fails, so a
+        // directory that does not exist produced a run that looked like a
+        // successful dump and left nothing behind -- and the diff that was
+        // supposed to bisect a wrong answer then had no files to compare.
+        // Failing to create is not fatal: the run is still a valid benchmark.
+        if (!d.empty()) ::mkdir(d.c_str(), 0755);
+        return d;
     }();
     return dir;
 }

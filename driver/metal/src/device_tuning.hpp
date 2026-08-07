@@ -247,16 +247,21 @@ struct DeviceTuning {
     ///         2    160.5   379.4   359.9
     ///         1    220.3   383.8   357.3
     ///
-    /// At 1 gpt-oss passes every `llama_bench` gate including "fleet agrees
-    /// with the single-sequence decode for 32 of 32 steps", and 383.8 at 16
-    /// lanes is 1.86x mlx-lm's 206.4 where the shipped default is 0.89x.
+    /// At 1 gpt-oss passes every `llama_bench` gate, including the one that
+    /// matters: an n-wide fleet reproduces mlx-lm's recorded continuation
+    /// token for token.
     ///
-    /// NOT LOWERED, and the reason is not performance. This constant is
-    /// device-wide, and dropping it makes gemma-4-26b-a4b's routed batched GEMM
-    /// -- which is WRONG, see the long comment on `gemma4_moe_qmm_bn` --
-    /// reachable at 16 lanes instead of at 64. Fix that first; then this is a
-    /// one-line `tuning_for` entry for Apple9 with the table above as its
-    /// justification.
+    /// LOWERED TO 1 ON APPLE9 -- see `tuning_for`. The blocker recorded here
+    /// was that dropping it made gemma-4-26b-a4b's routed batched GEMM
+    /// reachable at 16 lanes instead of 64, and that GEMM was believed wrong.
+    /// It is not wrong. The evidence against it came from a fleet gate that
+    /// compared the fleet to this driver's OWN one-row decode, which is a
+    /// different kernel path, on a prompt whose continuation was ambiguous --
+    /// so the two greedy argmaxes parted company early and the gate read that
+    /// as a defect. Forcing the routed GEMM onto every fire
+    /// (`PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=0`, so even a one-row decode
+    /// batches) still reproduces mlx-lm's continuation exactly. The gate now
+    /// checks a fleet against mlx-lm rather than against ourselves.
     int moe_batch_min_per_expert = 4;
 };
 
