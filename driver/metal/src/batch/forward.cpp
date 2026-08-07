@@ -1701,7 +1701,9 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
             if (err) {
                 *err = "MetalExecutor::Impl::setup_kv_pool: sparse arena allocation failed "
                        "(layer " + std::to_string(L) + ", " + std::to_string(layer_bytes) +
-                       " bytes/buffer)";
+                       " bytes/buffer, against " +
+                       std::to_string(ctx_->elastic_budget_pages()) +
+                       " pages of elastic budget)";
             }
             release_pool(pool);
             return false;

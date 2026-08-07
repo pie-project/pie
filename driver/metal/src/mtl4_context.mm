@@ -192,6 +192,9 @@ struct RawMetalContext::Impl {
         void* buffer = nullptr;
         size_t virtual_bytes = 0;
         size_t committed_bytes = 0;
+        /// The part of `committed_bytes` the buffer cannot exist without, and
+        /// which a pressure signal is therefore not allowed to take back.
+        size_t mandatory_bytes = 0;
         std::vector<ElasticChunk> chunks;
     };
     struct PendingElasticRelease {
@@ -202,6 +205,7 @@ struct RawMetalContext::Impl {
     std::vector<PendingElasticRelease> pending_elastic_releases;
     size_t elastic_budget_bytes = 0;
     size_t elastic_pressure_floor_bytes = 0;
+    size_t elastic_mandatory_bytes = 0;
     size_t elastic_reserved_bytes = 0;
     size_t elastic_committed_bytes = 0;
     std::shared_ptr<std::atomic<std::uint32_t>> memory_pressure_level =
@@ -244,6 +248,24 @@ struct RawMetalContext::Impl {
     size_t effective_elastic_budget_bytes() const;
 };
 
+// Back off elastic growth when the OS says memory is tight -- but never below
+// what the pools already had to have.
+//
+// `elastic_pressure_floor_bytes` defaults to zero, and a floor of zero under
+// `DISPATCH_MEMORYPRESSURE_CRITICAL` is not a floor, it is an off switch: every
+// `ensure_elastic_buffer` fails, including the 2 MiB-per-layer commitment that
+// makes a KV pool exist at all. Qwen3.6-35B-A3B found this by loading. The
+// load's own mapping is what raises the pressure -- 18.16 GiB of clean file
+// cache takes free memory to 50 MiB on the way in -- so the signal arrives
+// while the pool is still being built, and the model is refused by the state
+// its own admission created.
+//
+// Refusing there also buys nothing. `fits_on_this_gpu` counted the whole
+// elastic budget before a byte was allocated, so the machine was already
+// checked against it; declining the mandatory part does not hand a page back,
+// it only turns an admitted model into an unusable one. What pressure should
+// throttle is GROWTH past that point -- KV pages for sequences that have not
+// arrived yet -- and that is still clamped.
 size_t RawMetalContext::Impl::effective_elastic_budget_bytes() const {
     const std::uint32_t level =
         memory_pressure_level->load(std::memory_order_acquire);
@@ -252,7 +274,8 @@ size_t RawMetalContext::Impl::effective_elastic_budget_bytes() const {
         level >= 2
             ? elastic_pressure_floor_bytes
             : std::max(elastic_pressure_floor_bytes, elastic_budget_bytes / 2);
-    return std::min(elastic_budget_bytes, pressure_limit);
+    return std::min(elastic_budget_bytes,
+                    std::max(elastic_mandatory_bytes, pressure_limit));
 }
 
 void RawMetalContext::Impl::collect_elastic_releases() {
@@ -812,10 +835,19 @@ SlotHandle RawMetalContext::create_elastic_buffer(
     h.gpu_address = buffer.gpuAddress;
     h.size = size;
     h.elastic = true;
-    if (initial_commit_bytes != 0 &&
-        !ensure_elastic_buffer(h, initial_commit_bytes)) {
-        release_elastic_buffer(h);
-        return {};
+    if (initial_commit_bytes != 0) {
+        // Declared mandatory BEFORE the ask, because the ask is what consults
+        // the pressure clamp: this is the commitment without which the buffer
+        // is not a buffer, and `fits_on_this_gpu` has already paid for it.
+        const size_t mandatory = align_up(
+            std::min(initial_commit_bytes, virtual_bytes),
+            Impl::kSparseTileBytes);
+        I.elastic_allocations[h.buffer].mandatory_bytes = mandatory;
+        I.elastic_mandatory_bytes += mandatory;
+        if (!ensure_elastic_buffer(h, initial_commit_bytes)) {
+            release_elastic_buffer(h);
+            return {};
+        }
     }
     return h;
 }
@@ -1010,6 +1042,8 @@ void RawMetalContext::release_elastic_buffer(const SlotHandle& h) {
     trim_elastic_buffer(h, 0);
     auto found = I.elastic_allocations.find(h.buffer);
     if (found == I.elastic_allocations.end()) return;
+    I.elastic_mandatory_bytes -=
+        std::min(I.elastic_mandatory_bytes, found->second.mandatory_bytes);
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)h.buffer;
     [I.rs removeAllocation:buffer];
     [I.rs commit];
