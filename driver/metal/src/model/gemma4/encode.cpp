@@ -24,6 +24,12 @@
 
 namespace pie::metal::gemma4 {
 
+/// Whether this checkpoint's GEMM reaches the FP16 matrix path. The GEMM
+/// crossover moves with it -- see `qmm_min_batch`.
+inline bool gemma4_fp16_format(const Gemma4Geometry& g) {
+    return fp16_gemm_format(g.quant.bits, g.quant.group);
+}
+
 int gemma4_qmm_rows(const Gemma4Geometry& g, int rows) {
     const int n = rows < 1 ? 1 : rows;
     // The GEMV/GEMM crossover, which `device_tuning.hpp` owns and which this
@@ -34,7 +40,7 @@ int gemma4_qmm_rows(const Gemma4Geometry& g, int rows) {
     // Max first, where lowering the single number to 4 (so the GEMM engaged at
     // 8 rows instead of 12) cost 17% on 8 lanes, 128.5 -> 106.5 tok/s; that
     // checkpoint was routed, which is the half of the split that kept 12.
-    if (n < qmm_min_batch(g.is_moe())) return n;
+    if (n < qmm_min_batch(g.is_moe(), gemma4_fp16_format(g))) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -106,7 +112,7 @@ int gemma4_moe_qmm_bn(Kind k, const Gemma4Geometry& g, int rows, int layer) {
     if (kn.N == 0) return 0;
     // Routed, so the routed crossover; `moe_should_batch` has already admitted
     // this batch and the sorted count clears either number regardless.
-    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows), qmm_min_batch(true));
+    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows), qmm_min_batch(true, gemma4_fp16_format(g)));
 }
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -298,7 +304,7 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
         // `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only
         // where split-K supplies the threadgroups the wide tile gives up, and
         // this family dispatches no split (see `launch_shape_mb`).
-        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe(), gemma4_fp16_format(g)));
         const int wide = qmm_bm_slot(bm);
         // No split-K here either; see `launch_shape_mb`.
         const int split = 0;
@@ -458,7 +464,7 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         // Same chooser as `pso_for_mb`, for the same reason -- and it has to be
         // the same one: the grid and the pipeline disagreeing about BN is a
         // dispatch that computes the wrong thing rather than one that refuses.
-        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe(), gemma4_fp16_format(g)));
         // NO split-K. The split GEMM accumulates partial sums into a split
         // buffer and needs a reduce pass to fold them; qwen3.5 has both, this
         // family has neither -- so a split dispatch here wrote partials nobody
@@ -833,7 +839,7 @@ bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
     const KN kn = qmv_kn(d.kind, g, d.layer);
     if (kn.N == 0) return false;
     return qmm_bn_unsplit(int(kn.N), gemma4_qmm_rows(g, m),
-                          qmm_min_batch(g.is_moe())) > 0;
+                          qmm_min_batch(g.is_moe(), gemma4_fp16_format(g))) > 0;
 }
 
 /// Which dispatches stage, as opposed to reading what an earlier one staged.

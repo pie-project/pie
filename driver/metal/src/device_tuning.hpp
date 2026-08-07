@@ -41,10 +41,27 @@ struct DeviceInfo {
 
 /// The tuned constants, defaulted to the M1 Max measurements.
 struct DeviceTuning {
-    /// The batch at which the ported steel GEMM overtakes the batched GEMV.
+    /// The batch at which the ported steel GEMM overtakes the batched GEMV,
+    /// for a checkpoint whose GEMM reaches the FP16 matrix path. See
+    /// `qmm_min_batch_emulated` for the one that does not.
     ///
-    /// M1 Max: 12. Measured -- pie's per-step cost beats mlx-lm's at every
-    /// batch up to 8 with the GEMV and only loses above it.
+    /// M1 Max: 8. This used to read 12, from a sweep taken when the batched
+    /// GEMM on this device was still emulating a bfloat matrix unit. It is
+    /// not any more -- the dense projections stage their input to FP16 and
+    /// use the instruction the hardware has -- and re-running the same sweep
+    /// against the same binary via the env override, arms alternated twice,
+    /// eight lanes, 128-token prompt, 64 decode steps, aggregate tok/s:
+    ///
+    ///     model                  12       8     delta
+    ///     Qwen3.6-27B          23.0    32.1     +40%
+    ///     gemma-4-31b          17.9    30.0     +68%
+    ///     gemma-4-26b-a4b     107.3   130.1     +21%
+    ///     gpt-oss-20b         108.2   116.2      +7%
+    ///
+    /// Every one of them prefers eight, and the two dense checkpoints prefer
+    /// it by more than the FP16 wiring alone accounts for: what moved is not
+    /// the GEMM's speed but which side of the crossover eight sits on. The
+    /// old number was measuring a GEMM the device could not really run.
     ///
     /// M4 Pro (Apple9, 20 cores): 8. Measured on gemma-4-E4B at the batch
     /// that discriminates -- concurrency 8, where 12 takes the GEMV and 8
@@ -72,8 +89,8 @@ struct DeviceTuning {
     /// cost gemma that, so the value is the one with no measured regression
     /// anywhere rather than the one with the highest mean.
     ///
-    /// DENSE only: see `qmm_min_batch_moe`, which the same sweep left at 12.
-    int qmm_min_batch = 12;
+    /// DENSE only: see `qmm_min_batch_moe`, which the same sweep also moved.
+    int qmm_min_batch = 8;
 
     /// The same crossover for a checkpoint whose FFN is ROUTED.
     ///
@@ -94,14 +111,32 @@ struct DeviceTuning {
     ///
     /// The GEMV wins or ties at every one of them: taking the dense value here
     /// would cost Qwen3-30B 8% and gemma-4-26B 12% at the batch it helps a
-    /// dense model most. So a routed checkpoint keeps the M1 number.
+    /// dense model most. So a routed checkpoint kept the M1 number.
     ///
-    /// This agrees with what the two routed families already recorded from
-    /// their own side on the M1 Max -- `gemma4_qmm_rows` measured a lowered
-    /// crossover at -17%, `gptoss_qmm_rows` at -1%. Those were read then as
-    /// "the inherited number holds"; they were the routed half of this split,
-    /// taken before there was a dense half to compare against.
-    int qmm_min_batch_moe = 12;
+    /// That reading has since been overturned on the M1 Max, and by the same
+    /// thing that overturned the dense number: those runs measured a routed
+    /// GEMM emulating a bfloat matrix unit. With the routed expert GEMM on
+    /// FP16 the M1 Max sweep reverses -- gemma-4-26b-a4b 107.3 -> 130.1 tok/s
+    /// (+21%) and gpt-oss-20b 108.2 -> 116.2 (+7%) at eight lanes, arms
+    /// alternated twice. The M2 table above stands as a measurement of the
+    /// binary it was taken on; nothing has re-run it since the FP16 wiring,
+    /// which is why the Apple8 entry still names its own number.
+    int qmm_min_batch_moe = 8;
+
+    /// The same two crossovers for a checkpoint whose quantization does NOT
+    /// reach the FP16 matrix path -- anything but 4-bit at group 64.
+    ///
+    /// Twelve, which is what this driver shipped for every checkpoint before
+    /// the matrix path existed, and it is the same measurement rather than a
+    /// leftover: on the M1 Max at eight lanes Llama-1B at group 128 turns in
+    /// 440.5 and 439.4 tok/s on the GEMV against 403.9 and 402.5 on the GEMM,
+    /// arms alternated, -8.4%. The GEMM it runs is the one the old sweep
+    /// measured, so it keeps the old sweep's answer.
+    ///
+    /// One number for dense and routed both, because nothing here has
+    /// measured them apart and inventing a split would be a guess with a
+    /// field to live in.
+    int qmm_min_batch_emulated = 12;
 
     /// The threadgroup count at which the unsplit GEMM's BN=32 tile overtakes
     /// BN=16.
@@ -291,7 +326,33 @@ const DeviceTuning& device_tuning();
 /// property of the machine AND of what the GEMM gets to cover: see
 /// `DeviceTuning::qmm_min_batch_moe`. A parameter and not two functions so
 /// that a caller cannot ask the question without answering it.
-int qmm_min_batch(bool is_moe);
+///
+/// `fp16_gemm` is the same rule, one level down. A crossover is where the GEMM
+/// overtakes the GEMV, so it moves with the GEMM's speed, and on a device with
+/// no bfloat matrix unit the GEMM's speed depends on whether the checkpoint
+/// can reach the FP16 one: 4-bit at group 64 stages its input to half and uses
+/// the instruction, and every other format keeps a sequence the compiler
+/// writes to stand in for one. Measured on the M1 Max at eight lanes,
+/// aggregate tok/s, GEMM against GEMV:
+///
+///     checkpoint             GEMV    GEMM   delta
+///     Qwen3.6-27B (g64)      23.0    32.1    +40%
+///     gemma-4-31b (g64)      17.9    30.0    +68%
+///     Llama-1B (g128)       440.0   403.2     -8%
+///
+/// Same device, same batch, same code path, opposite signs -- so the constant
+/// cannot be a property of the device alone. A checkpoint without the matrix
+/// unit keeps the crossover measured for the GEMM it actually runs.
+///
+/// Both parameters, and neither defaulted, for the same reason: a caller that
+/// could ask the question without answering it would get whichever answer the
+/// signature happened to prefer.
+int qmm_min_batch(bool is_moe, bool fp16_gemm);
+
+/// Whether this checkpoint's quantization reaches the FP16 matrix path, which
+/// is the `fp16_gemm` argument above. One function because four families ask
+/// it and a fifth answer would be a fifth thing to keep in step.
+bool fp16_gemm_format(int bits, int group);
 
 /// The unsplit GEMM's BN=16 -> BN=32 tile crossover, in threadgroups counted
 /// at BN=32. See `DeviceTuning::qmm_bn_crossover_tg`.

@@ -87,8 +87,8 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // Padded to a whole row tile: `qmm_mb_rows` explains why, and why the
         // padding is asked for the GEMM's three questions (does a tile exist,
         // which rung, what grid) and for nothing else in this dispatch.
-        const int qn = qmm_mb_rows(n, g.max_tokens, qmm_min_batch(g.is_moe()));
-        d.qmm_bn = qmm_bn_unsplit(out, qn, qmm_min_batch(g.is_moe()));
+        const int qn = qmm_mb_rows(n, g.max_tokens, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
+        d.qmm_bn = qmm_bn_unsplit(out, qn, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
         d.qmm_bm = qmm_bm(qn);
         // The second quantized set has a matvec and no GEMM: a checkpoint that
         // spares its two routing projections at 8 bits gets one extra pipeline
@@ -201,7 +201,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
             const int sorted = moe_sorted_rows(g, n);
             // Routed, so the routed crossover.
-            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true));
+            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
                 bn > 0 && shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
                 d.qmm_bn = bn;
                 d.qmm_bm = shared_kernels::moe_tile_rows(n * g.experts_per_token, g.n_experts);
@@ -293,7 +293,7 @@ bool routed_group_shape(const Dispatch& d, const DecodeGeometry& g, int rows,
         case Kernel::LlExpertDown: {
             const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
             const int pairs = rows * g.experts_per_token;
-            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true));
+            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
                 bn > 0 && shared_kernels::moe_should_batch(pairs, g.n_experts)) {
                 const int bm = shared_kernels::moe_tile_rows(pairs, g.n_experts);
                 const Pso& gemm = mb.qmm_routed[shared_kernels::moe_bm_slot(bm)]
@@ -392,7 +392,7 @@ int mb_fp16_cast_elems(const Dispatch& d, const MultiBatchPsos& mb,
     if (K <= 0) return 0;
     // The padded row count, matching what the host bound at buffer 13 and what
     // the GEMM's row tiles actually read.
-    return qmm_mb_rows(n_tokens, g->max_tokens, qmm_min_batch(g->is_moe())) * K;
+    return qmm_mb_rows(n_tokens, g->max_tokens, qmm_min_batch(g->is_moe(), qwen35_fp16_format(*g))) * K;
 }
 
 inline void bind_slot(RawMetalContext& ctx, int ord, uint8_t idx, const SlotHandle& slot) {

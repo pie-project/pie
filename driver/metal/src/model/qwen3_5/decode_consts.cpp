@@ -389,7 +389,7 @@ int bind_mb_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
     // The padded row count, not the fire's: the GEMM reads whole row tiles and
     // the tail of the last one has to hold a defined half of something. It is
     // the same bound the BF16 GEMM already reads through buffer 3.
-    const int rows = qmm_mb_rows(n_tokens, g.max_tokens, qmm_min_batch(g.is_moe()));
+    const int rows = qmm_mb_rows(n_tokens, g.max_tokens, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
     std::vector<std::pair<std::int32_t, SlotHandle>> counts;
     int bound = 0;
     for (const Dispatch& d : dag) {

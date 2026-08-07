@@ -15,6 +15,15 @@
 
 namespace pie::metal::gptoss {
 
+/// Whether this checkpoint's GEMM reaches the FP16 matrix path. The GEMM
+/// crossover moves with it -- see `qmm_min_batch`.
+///
+/// Unconditional here, unlike the other three families: gpt-oss is MXFP4 in
+/// every checkpoint there is, and the routed MXFP4 GEMM stages its tile as
+/// half on the way into the MMA whatever the projections are quantized at.
+/// There is no gpt-oss that runs the emulated kernel.
+inline bool gptoss_fp16_format() { return fp16_qmm(); }
+
 namespace {
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -233,7 +242,7 @@ int gptoss_qmm_rows(int rows) {
     // Inherited from qwen3.5 and measured here on the M1 Max: lowering it to 4
     // cost gpt-oss 1% (8 lanes, 55.5 -> 54.9 tok/s), and on an M2 Max the GEMV
     // still wins or ties at every batch the dense number would have switched.
-    if (n < qmm_min_batch(true)) return n;
+    if (n < qmm_min_batch(true, gptoss_fp16_format())) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -293,7 +302,7 @@ int gptoss_qmm_bn(Kind k, const GptOssGeometry& g, int rows) {
     if (!gptoss_is_dense_proj(k)) return 0;
     const KN kn = qmv_kn(k, g);
     if (kn.N == 0) return 0;
-    return qmm_bn_unsplit(int(kn.N), gptoss_qmm_rows(rows), qmm_min_batch(true));
+    return qmm_bn_unsplit(int(kn.N), gptoss_qmm_rows(rows), qmm_min_batch(true, gptoss_fp16_format()));
 }
 
 /// Whether a dense projection feeds its tile to the MMA as FP16.

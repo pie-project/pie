@@ -64,6 +64,12 @@ struct DecodeStepPsos {
     const Pso& operator[](Kernel k) const { return by_kind[static_cast<int>(k)]; }
 };
 
+/// Whether this checkpoint's GEMM reaches the FP16 matrix path. The GEMM
+/// crossover moves with it -- see `qmm_min_batch`.
+inline bool qwen35_fp16_format(const DecodeGeometry& g) {
+    return fp16_gemm_format(g.quant.bits, g.quant.group);
+}
+
 /// Whether this kind's weights are in the geometry's SECOND affine format.
 ///
 /// Exactly the two routing projections -- `mlp.gate` and
