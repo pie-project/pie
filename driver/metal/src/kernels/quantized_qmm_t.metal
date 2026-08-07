@@ -1380,6 +1380,14 @@ inline constexpr short get_bytes_per_pack() {
 
 
 // ── quantized.h dequantize ──
+//
+// Priced before optimising it, because a 4-bit GEMM at 53% of this GPU's fp32
+// peak invites the theory that unpacking is eating the other half. It is not.
+// One Ws tile is BN*BK elements at three ops each -- an AND, a multiply and an
+// add, with the nibble shift folded into `scale / 16` rather than issued --
+// against BM*BN*BK*2 flops of MMA over the same tile. That is 3 / (2 * BM),
+// or 2.3% at BM = 64. Deleting dequantization outright buys 2.3%; the missing
+// half of the peak is in the MMA, not in front of it.
 template <typename U, int N, int bits, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
@@ -1636,6 +1644,14 @@ METAL_FUNC void qmm_t_loaded_impl(
   // hand-pipelining one threadgroup does not pay for the two it evicted. The
   // loss shrinks with row count (-7.5%, -7.2%, -1.4%) exactly as that story
   // predicts. Not a tuning knob: there is no shape here where it wins.
+  //
+  // This also settles THE TWO FENCES below, which read like separate targets
+  // and are not. The first guards WAR (last iteration's `mma` still reading
+  // Xs/Ws) and the second RAW (this iteration's loads not landed yet), and
+  // the only way to drop the first is to give the next tile its own buffer --
+  // which is the double buffering the table above already priced and lost. A
+  // fence here is not a latency to remove; it is what lets three threadgroups
+  // share a core, and that sharing is worth more than the stall it costs.
   for (int k = 0; k < k_len; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     loader_x.load_unsafe();
