@@ -10,6 +10,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <deque>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -2180,12 +2181,131 @@ class EnqTimer {
     std::chrono::steady_clock::time_point start_;
 };
 
+// `PIE_DEVICE_BUSY=1`: per-fire DEVICE interval, bracketing the whole
+// enqueue+settle region on the compute stream.
+//
+// This is the quantity `analysis.md` §3.3 was built on and that dev no longer
+// records anywhere. Without it, `period - host_chain` is merely unattributed:
+// it cannot distinguish "the GPU is busy" from "the GPU is idle waiting", and
+// those imply opposite next moves.
+//
+// The events are read only once `cudaEventQuery` says the stop event has
+// already retired. `cudaEventElapsedTime` blocks until then, so draining
+// eagerly would stall the very fire being measured and manufacture the idle
+// it is looking for.
+class DeviceIntervalProbe {
+  public:
+    static bool enabled() {
+        static const bool value = [] {
+            const char* const env = std::getenv("PIE_DEVICE_BUSY");
+            return env != nullptr && *env != '\0' && env[0] != '0';
+        }();
+        return value;
+    }
+
+    static DeviceIntervalProbe& instance() {
+        static DeviceIntervalProbe probe;
+        return probe;
+    }
+
+    void begin(cudaStream_t stream) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        drain_locked();
+        Pair pair;
+        if (free_.empty()) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&pair.start, cudaEventDefault));
+            CUDA_CHECK(cudaEventCreateWithFlags(&pair.stop, cudaEventDefault));
+        } else {
+            pair = free_.back();
+            free_.pop_back();
+        }
+        CUDA_CHECK(cudaEventRecord(pair.start, stream));
+        open_.push_back(pair);
+    }
+
+    // Stamped right after the forward is enqueued, so `start -> mid` covers
+    // the H2D + forward kernels and `mid -> stop` the settlement kernels.
+    //
+    // On a graph-replayed decode fire the whole forward is ONE launch that the
+    // host issues in ~11 us, so `start -> mid` is very close to pure device
+    // time: there is no host work interleaved for the stream to drain against.
+    // That is what makes it a usable check on how much of the fire-wide
+    // interval is real device work versus intra-fire stall.
+    void mid(cudaStream_t stream) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (open_.empty()) return;
+        Pair& pair = open_.back();
+        if (pair.mid == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&pair.mid, cudaEventDefault));
+        }
+        CUDA_CHECK(cudaEventRecord(pair.mid, stream));
+        pair.has_mid = true;
+    }
+
+    void end(cudaStream_t stream, int requests, int tokens) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (open_.empty()) return;
+        Pair pair = open_.back();
+        open_.pop_back();
+        pair.requests = requests;
+        pair.tokens = tokens;
+        CUDA_CHECK(cudaEventRecord(pair.stop, stream));
+        pending_.push_back(pair);
+    }
+
+  private:
+    struct Pair {
+        cudaEvent_t start = nullptr;
+        cudaEvent_t mid = nullptr;
+        cudaEvent_t stop = nullptr;
+        bool has_mid = false;
+        int requests = 0;
+        int tokens = 0;
+    };
+
+    void drain_locked() {
+        while (!pending_.empty()) {
+            const Pair pair = pending_.front();
+            if (cudaEventQuery(pair.stop) != cudaSuccess) break;
+            pending_.pop_front();
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, pair.start, pair.stop) ==
+                cudaSuccess) {
+                float fwd_ms = -1.0f;
+                if (pair.has_mid) {
+                    float m = 0.0f;
+                    if (cudaEventElapsedTime(&m, pair.start, pair.mid) ==
+                        cudaSuccess) {
+                        fwd_ms = m;
+                    }
+                }
+                std::fprintf(stderr,
+                             "[devbusy] us=%.1f fwd_us=%.1f R=%d N=%d\n",
+                             static_cast<double>(ms) * 1000.0,
+                             static_cast<double>(fwd_ms) * 1000.0,
+                             pair.requests, pair.tokens);
+            }
+            Pair recycled = pair;
+            recycled.has_mid = false;
+            free_.push_back(recycled);
+        }
+    }
+
+    std::mutex mutex_;
+    std::vector<Pair> open_;
+    std::deque<Pair> pending_;
+    std::vector<Pair> free_;
+};
+
 }  // namespace
 
 void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     PreparedStep::Impl& s = *step.impl();
     const bool dbg_fire = s.timing.enabled;
     if (dbg_fire) s.timing.enqueue_start = fire_timing::Clock::now();
+    if (DeviceIntervalProbe::enabled()) {
+        DeviceIntervalProbe::instance().begin(engine.cublas.stream());
+    }
 
     auto& pi = engine.inputs;
     auto& cublas = engine.cublas;
@@ -2593,6 +2713,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         std::cerr.flush();
     }
     verify_timer.finish(cublas.stream());
+    if (DeviceIntervalProbe::enabled()) {
+        DeviceIntervalProbe::instance().mid(cublas.stream());
+    }
     if (dbg_fire) {
         s.timing.begin_breakdown = s.staged->begin_breakdown();
         s.timing.forward_enqueue_end = fire_timing::Clock::now();
@@ -2643,6 +2766,10 @@ void settle_step(
                       engine.ws.sampled_tokens.data())
                 : nullptr,
             dbg_fire ? &s.timing.finish_breakdown : nullptr);
+    }
+    if (DeviceIntervalProbe::enabled()) {
+        DeviceIntervalProbe::instance().end(
+            engine.cublas.stream(), s.forward_R, s.forward_N);
     }
     if (dbg_fire) {
         s.timing.settlement_enqueue_end = fire_timing::Clock::now();
