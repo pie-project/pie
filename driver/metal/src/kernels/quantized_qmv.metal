@@ -87,6 +87,13 @@ inline U qdot(
 // At 4 bits that is 512 for the two-pack default and 256 for one pack, which is
 // why gemma4's `per_layer_projection` (K=256) needs the narrow instantiation --
 // the fast one reads 512 elements of a 256-element row.
+//
+// Two is also the measured best for the models that use this path, which is not
+// the same answer the bounds-checked tail gives (see `qmv_gptoss_impl`, where
+// dense wants two and routed wants one). Decode GB/s at four:
+// gemma-4-31b 287.7 -> 283.4, Qwen3.6-27B 273.8 -> 267.5. Wider reads here buy
+// nothing because K is already a whole number of 512s by construction, so the
+// only thing the extra pack changes is how much state a lane carries.
 template <typename T, int group_size, int bits, int packs_per_thread_ = 2>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
@@ -101,6 +108,20 @@ METAL_FUNC void qmv_fast_impl(
     uint simd_lid) {
   constexpr int packs_per_thread = packs_per_thread_;
   constexpr int num_simdgroups = 2;
+  // Four is a measured peak, not an inherited default, and it is coupled to the
+  // `/ 4` in every host grid (`qmv_dispatch`, `qmv_mb_dispatch`,
+  // `routed_qmv_dispatch`) -- moving it means moving those in the same commit.
+  // Swept in both directions with the grids moved to match, decode GB/s:
+  //
+  //   rows/simdgroup |    2  |    4  |    8
+  //   gemma-4-31b    | 253.2 | 287.7 | 243.5
+  //   Qwen3.6-27B    | 258.2 | 273.8 | 258.0
+  //
+  // Both directions lose, which says the kernel is at the knee of a tradeoff
+  // and not on one side of it: eight rows costs the occupancy that hides the
+  // load latency (result[8] plus eight scale/bias pairs live across the whole
+  // reduction), two rows halves the outstanding weight loads a lane can have in
+  // flight. The remaining third of the memory roof is not in this tiling.
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();

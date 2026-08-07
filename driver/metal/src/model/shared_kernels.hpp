@@ -102,6 +102,8 @@ inline void routed_qmv_dispatch(int N, int experts_per_token, Grid& g, Threadgro
     // Rounded UP: the kernel writes four outputs a simdgroup and guards each
     // against `out_vec_size`, so a width that is not a multiple of four gets
     // a partial group rather than losing its tail. See `qmv_dispatch`.
+    // The 4 is `results_per_simdgroup` in `quantized_qmv.metal`, which was swept
+    // and is at a peak in both directions -- see the table there before moving it.
     g = Grid{32u * r, (std::uint32_t(N > 0 ? N : 1) + 3u) / 4u, slots};
     tg = Threadgroup{32, 2, 1};
 }

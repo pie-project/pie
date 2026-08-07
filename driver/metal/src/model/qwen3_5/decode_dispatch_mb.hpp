@@ -31,6 +31,8 @@ namespace pie::metal {
 // exactly qmv_dispatch (the sealed M=1 fast path). out%8==0 holds for every qwen3.6 projection.
 inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
     // Rounded UP, for the reason `qmv_dispatch` gives.
+    // The 4 is `results_per_simdgroup` in `quantized_qmv.metal`, which was swept
+    // and is at a peak in both directions -- see the table there before moving it.
     g  = Grid{32u * uint32_t(N), (uint32_t(out_vec) + 3u) / 4u, 1};
     tg = Threadgroup{32, 2, 1};
 }
