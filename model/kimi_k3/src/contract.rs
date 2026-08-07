@@ -171,13 +171,19 @@ const MXFP4_BLOCK: i64 = 32;
 
 /// State that a `weight_scale` holds the MXFP4 block exponents for `weight`.
 ///
-/// `channel_axis` is a parameter rather than a constant because K3's two
-/// halves are different ranks. `PerGroup` groups along the axis *after*
-/// `channel_axis`, and the grouped axis is whichever one the codes run along:
-/// `gate_up` is `[I, 2, L]` and groups on axis 2, so 1; `down` is `[L, I]` and
-/// groups on axis 1, so 0. GPT-OSS passes 1 for both of its halves, but both
-/// of those are rank 3 — that is the same rule, not a different one, and
-/// copying its literal would put K3's `down` scales on the wrong axis.
+/// `channel_axis` is a parameter rather than a constant. `PerGroup` groups
+/// along the axis *after* `channel_axis`, so the value names the tensor's row
+/// axis and the grouping lands on the next one. K3's two halves put their rows
+/// in different places: `gate_up` is `[I, 2, L]`, rows on axis 1 and codes on
+/// axis 2, so 1; `down` is `[L, I]`, rows on axis 0 and codes on axis 1, so 0.
+///
+/// GPT-OSS passes a literal 1 for every half of every one of its paths, and
+/// that is the same rule rather than a different one — its halves all keep
+/// their rows on axis 1, whatever their rank (its routed and streamed weights
+/// are rank 4 `[E, I, blocks, 16]` against a rank-3 `[E, I, blocks]` scale, its
+/// native ones rank 3 `[E, I, H]` against `[E, I, H/32]`). K3's `down` is the
+/// case that has no counterpart there, and copying the literal would put its
+/// scales on the wrong axis.
 ///
 /// `group_size` counts *codes*, not bytes, even though `of` names a `U8`
 /// tensor holding two codes per byte. That is the convention the resident
