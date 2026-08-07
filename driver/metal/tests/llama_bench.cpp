@@ -521,6 +521,14 @@ int main(int argc, char** argv) {
         prompt.insert(prompt.end(), kGatePrompt.begin(), kGatePrompt.end());
     prompt.resize(std::size_t(n_prompt));
 
+    // The prompt whose mlx-lm continuation is recorded, and that continuation.
+    // Hoisted out of the block below because the FLEET check far down this file
+    // needs them: comparing a fleet to this driver's own one-row decode only
+    // ever says the two took different kernels, which they did. Comparing it to
+    // mlx-lm says whether the fleet is RIGHT.
+    std::vector<std::uint32_t> gate_prompt;
+    std::vector<int> gate_want;
+
     // ── does it compute the right thing at all? ──
     //
     // A benchmark that does not check its own output measures how fast the
@@ -805,6 +813,8 @@ int main(int argc, char** argv) {
         // A row may bring its own prompt; see `Known::prompt`.
         const std::vector<std::uint32_t>& p =
             (ref != nullptr && !ref->prompt.empty()) ? ref->prompt : kGatePrompt;
+        gate_prompt = p;
+        gate_want = want;
         std::uint32_t page = 0;
         std::uint32_t next_id = 1;
 
@@ -1104,7 +1114,17 @@ int main(int argc, char** argv) {
     Seq s;
     s.id = 4;
     s.tokens = prompt;
-    s.tokens.resize(std::size_t(n_prompt + n_decode), 1u);
+    // n_decode + 1, not n_decode. Step i's SAMPLED token lands at index
+    // `n_prompt + 1 + i` -- the loop advances the position before it stores --
+    // so the last step wants index `n_prompt + n_decode`, one past a buffer
+    // sized `n_prompt + n_decode`. Both the store below and the fleet's
+    // reference lookup are bounds-guarded, so the short buffer did not crash;
+    // it silently dropped the reference the fleet gate needs, and AT
+    // `n_decode == 1` IT DROPPED EVERY ONE OF THEM -- `ref < size` is
+    // `n_prompt + 1 < n_prompt + 1`, false at the only step there is. The gate
+    // then compared nothing and printed PASS, which is how a single-step run
+    // came to look like evidence that a fleet was correct.
+    s.tokens.resize(std::size_t(n_prompt + n_decode + 1), 1u);
     const double t0 = now_s();
     if (fire_prompt(exec, s, std::uint32_t(n_prompt), page_size, next_page) < 0) return 1;
     const double prefill_s = now_s() - t0;
@@ -1197,13 +1217,111 @@ int main(int argc, char** argv) {
                         n_seqs, n_seqs, exec.rs_slots(), exec.rs_slots());
             return 0;
         }
+        // ── is the fleet RIGHT? ──
+        //
+        // The check further down compares the fleet to this file's own
+        // single-sequence decode. That comparison is worth having -- it is the
+        // only one available for a checkpoint nobody has transcribed -- but it
+        // cannot answer the question it looks like it answers. A one-row decode
+        // and an n-row decode take DIFFERENT KERNELS all the way down (`qmv`
+        // against `qmv_mb` or a GEMM, `rms` against `rms_mb`, the sliding
+        // attention against the tiled one), so the two are not the same
+        // arithmetic and are not expected to be bit-identical. Which step their
+        // greedy argmaxes first part company on is then a fact about how sharp
+        // the logits are at that step, not about whether either is correct --
+        // and on an ambiguous continuation they part company almost at once.
+        // That is the same trap the prompt above documents, where a flat-logit
+        // token stream read "1 of 64 steps" on a driver that was perfectly
+        // correct.
+        //
+        // So ask mlx-lm instead. Fire the recorded prompt as an n-wide fleet
+        // and compare the tokens to the recorded answer: that is ground truth,
+        // it is the same bar the single-sequence gate above clears, and a fleet
+        // meeting it is correct no matter which step it leaves our own decode.
+        //
+        // Untimed, on its own pages and its own sequence ids, and run before
+        // the measured fleet so it cannot perturb the number.
+        const bool have_ground_truth = !gate_want.empty() && !gate_prompt.empty();
+        if (have_ground_truth) {
+            const std::size_t steps = gate_want.size();
+            std::vector<Seq> gf(nf);
+            std::uint32_t gpage = 0;
+            bool gbad = false;
+            std::vector<int> got;
+            // The FIRST token comes from the prefill, exactly as the
+            // single-sequence gate above takes it -- `fire(..., want_token)`
+            // samples the prompt's own last position. Decoding a filler token
+            // instead would be continuing a different sequence, and the answer
+            // would rightly not be mlx-lm's.
+            for (int i = 0; i < n_seqs && !gbad; ++i) {
+                gf[std::size_t(i)].id = std::uint32_t(200 + i);
+                gf[std::size_t(i)].tokens = gate_prompt;
+                gf[std::size_t(i)].tokens.resize(gate_prompt.size() + steps + 1, 1u);
+                gf[std::size_t(i)].rs_slot =
+                    exec.rs_slots() > 0 ? std::uint32_t(i) % exec.rs_slots() : 0u;
+                const int t = fire(exec, gf[std::size_t(i)], std::uint32_t(gate_prompt.size()),
+                                   page_size, gpage, /*want_token=*/true, /*staged=*/nullptr,
+                                   /*greedy_token_only=*/true);
+                if (t < 0) {
+                    gbad = true;
+                    break;
+                }
+                if (i == 0) got.push_back(t);
+                Seq& m = gf[std::size_t(i)];
+                if (m.next_position < m.tokens.size())
+                    m.tokens[m.next_position] = std::uint32_t(t);
+            }
+            // One fewer fleet step than there are tokens: the prefill supplied
+            // the first.
+            for (std::size_t step = 1; step < steps && !gbad; ++step) {
+                std::vector<MemberForwardDesc> descs;
+                descs.reserve(nf);
+                for (int i = 0; i < n_seqs; ++i) {
+                    descs.push_back(desc_for(gf[std::size_t(i)], 1, page_size, gpage,
+                                             exec.rs_slots(), /*greedy_token_only=*/true));
+                }
+                std::vector<LogitsOut> outs(nf);
+                std::vector<std::uint8_t> ok(nf, 0);
+                std::vector<std::string> errs(nf);
+                exec.forward_batch(descs, outs, ok, errs);
+                for (int i = 0; i < n_seqs && !gbad; ++i) {
+                    if (ok[std::size_t(i)] == 0) {
+                        std::printf("  FAIL  fleet reference fire: %s\n",
+                                    errs[std::size_t(i)].c_str());
+                        gbad = true;
+                        break;
+                    }
+                    const int t = argmax_of(outs[std::size_t(i)], 0);
+                    if (i == 0) got.push_back(t);
+                    Seq& m = gf[std::size_t(i)];
+                    m.next_position += 1;
+                    if (m.next_position < m.tokens.size())
+                        m.tokens[m.next_position] = std::uint32_t(t);
+                }
+            }
+            if (gbad) return 1;
+            const bool good = got == gate_want;
+            std::printf("  %s  a %d-wide fleet reproduces mlx-lm's continuation:",
+                        good ? "PASS" : "FAIL", n_seqs);
+            for (const int v : got) std::printf(" %d", v);
+            if (!good) {
+                std::printf("\n        mlx-lm says:");
+                for (const int v : gate_want) std::printf(" %d", v);
+            }
+            std::printf("\n");
+            if (!good) return 1;
+        }
+
         std::vector<Seq> fleet(nf);
         std::uint32_t fpage = 0;
         bool bad = false;
         for (int i = 0; i < n_seqs && !bad; ++i) {
             fleet[std::size_t(i)].id = std::uint32_t(100 + i);
             fleet[std::size_t(i)].tokens = prompt;
-            fleet[std::size_t(i)].tokens.resize(std::size_t(n_prompt + n_decode), 1u);
+            // Same +1 as the reference sequence above, for the same reason:
+            // the member stores its own sampled token at the ADVANCED
+            // position.
+            fleet[std::size_t(i)].tokens.resize(std::size_t(n_prompt + n_decode + 1), 1u);
             fleet[std::size_t(i)].rs_slot =
                 exec.rs_slots() > 0 ? std::uint32_t(i) % exec.rs_slots() : 0u;
             // Prefilled one at a time and UNTIMED. What is being measured is
@@ -1222,6 +1340,11 @@ int main(int argc, char** argv) {
             // first step whose bf16 rows are not byte-identical is the step the
             // divergence was CREATED, and that is the one a bisect needs.
             std::vector<int> first_bitdiff(nf, -1);
+            // How many steps were actually COMPARED to the reference. A gate
+            // that silently skips its comparison and reports the skip as a
+            // pass is worse than no gate, because the pass is quoted as
+            // evidence later; see the resize above.
+            int ref_checked = 0;
             const double t3 = now_s();
             for (int step = 0; step < n_decode && !bad; ++step) {
                 std::vector<MemberForwardDesc> descs;
@@ -1278,9 +1401,12 @@ int main(int argc, char** argv) {
                     // member that leaves the reference in the first few steps
                     // is not.
                     const std::size_t ref = std::size_t(n_prompt + 1 + step);
-                    if (ref < s.tokens.size() && fleet_diverged[std::size_t(i)] < 0 &&
-                        std::uint32_t(t) != s.tokens[ref]) {
-                        fleet_diverged[std::size_t(i)] = step;
+                    if (ref < s.tokens.size()) {
+                        if (i == 0) ++ref_checked;
+                        if (fleet_diverged[std::size_t(i)] < 0 &&
+                            std::uint32_t(t) != s.tokens[ref]) {
+                            fleet_diverged[std::size_t(i)] = step;
+                        }
                     }
                     m.next_position += 1;
                     if (m.next_position < m.tokens.size()) m.tokens[m.next_position] = std::uint32_t(t);
@@ -1329,14 +1455,27 @@ int main(int argc, char** argv) {
                     if (d >= 0 && d < worst) worst = d;
                 }
                 // A fleet member that never matches the reference is a broken
-                // forward, not a rounding difference.
-                if (worst == 0) {
+                // forward, not a rounding difference -- UNLESS the fleet has
+                // already reproduced mlx-lm's continuation above, in which case
+                // it is demonstrably not broken and this only says the two
+                // kernel paths round differently on an ambiguous token. Ground
+                // truth outranks self-comparison; where there is none, this is
+                // the only signal there is and it still fails the run.
+                if (worst == 0 && !have_ground_truth) {
                     std::printf("  FAIL  the fleet decodes a different token than the "
-                                "same prompt does alone, from its very first step\n");
+                                "same prompt does alone, from its very first step, and "
+                                "no recorded answer exists to say which is right\n");
+                    bad = true;
+                } else if (ref_checked == 0) {
+                    // Never reachable with the sizing above, and said out loud
+                    // anyway: the whole point of the resize is that this gate
+                    // must not be able to pass by not running.
+                    std::printf("  FAIL  the fleet gate compared 0 of %d steps against the "
+                                "single-sequence reference and so proved nothing\n", n_decode);
                     bad = true;
                 } else {
-                    std::printf("  PASS  fleet agrees with the single-sequence decode for "
-                                "%d of %d steps\n", worst, n_decode);
+                    std::printf("  ....  fleet agrees with the single-sequence decode for "
+                                "%d of %d steps\n", std::min(worst, ref_checked), ref_checked);
                 }
             }
         }
