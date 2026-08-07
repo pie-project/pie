@@ -40,6 +40,11 @@ template <typename T>
     const constant int& n_kv_heads       [[buffer(12)]],  // NKvHeads
     const device uint* w_page            [[buffer(13)]],  // explicit/normalized physical destination
     const device uint* w_off             [[buffer(14)]],  // explicit/normalized in-page offset
+    // Elements between one token's k_new/v_new row and the next, 0 meaning the
+    // packed [N, n_kv_heads, head_dim] a batched decode hands over. A prefill's
+    // rows sit in the scratch arena at its one common pitch, which for this
+    // family is several times as wide as a kv row.
+    const constant int& src_row_stride   [[buffer(15)]],
     uint3 tid [[thread_position_in_grid]]) {
   const int d = int(tid.x);   // channel within head_dim
   const int h = int(tid.y);   // kv head
@@ -51,7 +56,8 @@ template <typename T>
 
   const size_t row_stride = size_t(n_kv_heads) * size_t(head_dim);  // NHD page row
   const size_t dst = slot * row_stride + size_t(h) * size_t(head_dim) + size_t(d);
-  const size_t src = size_t(i) * row_stride + size_t(h) * size_t(head_dim) + size_t(d);
+  const size_t src_row = src_row_stride > 0 ? size_t(src_row_stride) : row_stride;
+  const size_t src = size_t(i) * src_row + size_t(h) * size_t(head_dim) + size_t(d);
 
   k_pages[dst] = k_new[src];
   v_pages[dst] = v_new[src];
@@ -63,6 +69,6 @@ template <typename T>
       const device itype*, const device itype*, device itype*,    \
       device itype*, const constant int&, const constant int&,    \
       const constant int&, const device uint*,                    \
-      const device uint*, uint3);
+      const device uint*, const constant int&, uint3);
 
 instantiate_kv_append_paged(bfloat16, bfloat)

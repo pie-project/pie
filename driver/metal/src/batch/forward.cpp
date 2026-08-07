@@ -1894,6 +1894,28 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                         case Kernel::GdnInB:
                             ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
                             break;
+                        // The two gated-attention kernels. Both read and write
+                        // the scratch arena, whose rows share one pitch however
+                        // narrow the tensor is, so the 2x-wide q projection and
+                        // its two halves all take the same number.
+                        case Kernel::QSplit:
+                            ctx_->arg_bind_ordinal(
+                                d.ordinal, (std::uint8_t)bind::QSplit::QgRowStride,
+                                prefill_row_stride_);
+                            ctx_->arg_bind_ordinal(
+                                d.ordinal, (std::uint8_t)bind::QSplit::OutRowStride,
+                                prefill_row_stride_);
+                            break;
+                        case Kernel::AttnGate:
+                            ctx_->arg_bind_ordinal(
+                                d.ordinal, (std::uint8_t)bind::AttnGate::RowStride,
+                                prefill_row_stride_);
+                            break;
+                        case Kernel::KvAppendPaged:
+                            ctx_->arg_bind_ordinal(
+                                d.ordinal, (std::uint8_t)bind::KvAppendPaged::SrcRowStride,
+                                prefill_row_stride_);
+                            break;
 
                         default:
                             break;

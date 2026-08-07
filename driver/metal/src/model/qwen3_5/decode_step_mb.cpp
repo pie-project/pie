@@ -946,6 +946,30 @@ void encode_prefill_dags_mb(StepEncoder& se,
                         grid.z = uint32_t(n);
                     }
                     break;
+                case Kernel::QSplit:
+                    // z was always the token row; the prompt just never went
+                    // there, so a 1024-row prefill deinterleaved one row at a
+                    // time -- 2820 dispatches in the fire this was found in.
+                    if (d0.grid.z == 1) {
+                        strided = mb_pso(d0, base_psos, mb_psos);
+                        grid.z = uint32_t(n);
+                    }
+                    break;
+                case Kernel::AttnGate:
+                    if (d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_pso(d0, base_psos, mb_psos);
+                        grid.y = uint32_t(n);
+                    }
+                    break;
+                case Kernel::KvAppendPaged:
+                    // z is the token, and w_page/w_off are already arrays row
+                    // zero's table points at the front of. Only the source
+                    // pitch stood between this and the whole prompt.
+                    if (d0.grid.z == 1) {
+                        strided = mb_pso(d0, base_psos, mb_psos);
+                        grid.z = uint32_t(n);
+                    }
+                    break;
                 default:
                     break;
             }

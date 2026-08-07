@@ -275,6 +275,10 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 
             case Kernel::QSplit:
                 bind_const<int>(ctx, ord, (uint8_t)bind::QSplit::HeadDim, g.head_dim, &count);
+                // Packed by default; the prefill rebinds both to the arena's
+                // pitch on row zero's table when it runs the prompt at once.
+                bind_const<int>(ctx, ord, (uint8_t)bind::QSplit::QgRowStride, 0, &count);
+                bind_const<int>(ctx, ord, (uint8_t)bind::QSplit::OutRowStride, 0, &count);
                 break;
 
             case Kernel::Rope:
@@ -303,6 +307,9 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                 g.kv_page_size, &count);
                 bind_const<int>(ctx, ord, (uint8_t)bind::KvAppendPaged::NKvHeads,
                                 g.n_kv_heads, &count);
+                // Packed by default; the prefill rebinds this to the arena's
+                // pitch on row zero's table when it appends the whole prompt.
+                bind_const<int>(ctx, ord, (uint8_t)bind::KvAppendPaged::SrcRowStride, 0, &count);
                 break;
 
             case Kernel::Sdpa:
@@ -328,7 +335,11 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
 
             case Kernel::SiluMul:
+                break;
             case Kernel::AttnGate:
+                // Packed by default; the prefill rebinds this to the arena's
+                // pitch on row zero's table when it runs the prompt at once.
+                bind_const<int>(ctx, ord, (uint8_t)bind::AttnGate::RowStride, 0, &count);
                 break;
             case Kernel::LlExpertSiluMul:
             case Kernel::LlMoeSort:
