@@ -1095,6 +1095,45 @@ void linear_attn_layer_body(
                                 R, V_h, K_d, V_d,
                                 stream, write_state, rs_write_state_mask);
                         }
+                    } else {
+                        // THE PLAIN FLA PATH. This arm went missing when the
+                        // warp-tiled stopgap collapsed its guard to
+                        // `!write_state` (da3daf0e1) beside the deletion of
+                        // the cached-state arm as unreachable: between them
+                        // the lambda was left with NO arm for an ordinary
+                        // write_state prefill, so the GDN recurrence was
+                        // simply skipped — measured, on all 18 GDN layers of
+                        // a 2-token prefill. `core_out` then carried whatever
+                        // the buffer held and the state was never written.
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
+                                la.q_pre.data(),
+                                la.k_pre.data(),
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched(
+                                la.q_pre.data(),
+                                la.k_pre.data(),
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        }
                     }
                     };
                     if (fold_split != nullptr) {
