@@ -1268,17 +1268,28 @@ void mixtral_forward_paged(
                 d_mxfp4_route_out.data(), N, top_k, H, I, stream);
             });
             if (prof.enabled) prof.open(&prof.moe_reduce, stream);
-            kernels::launch_token_batched_weighted_sum_bf16(
-                d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
-                static_cast<const float*>(d_topk_w.data()),
-                N, top_k, H, stream);
-            if (T > 1) {
+            if (T == 1) {
+                // The combine already walks every element of the result; the
+                // residual is one more add on a value it is holding, so the
+                // separate `residual_add` was a full read and write of the
+                // hidden state to do what an epilogue could. Under TP the
+                // all-reduce has to see the combine's output alone, so that
+                // path keeps the two apart.
+                kernels::launch_token_batched_weighted_sum_add_bf16(
+                    ws.y.data(), d_mxfp4_route_out.data(),
+                    static_cast<const float*>(d_topk_w.data()),
+                    N, top_k, H, stream);
+            } else {
+                kernels::launch_token_batched_weighted_sum_bf16(
+                    d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
+                    static_cast<const float*>(d_topk_w.data()),
+                    N, top_k, H, stream);
                 tp->all_reduce_bf16(d_mxfp4_moe_out.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
+                kernels::launch_residual_add_bf16(
+                    ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
             }
             if (prof.enabled) prof.close(stream);   // moe_reduce
-            kernels::launch_residual_add_bf16(
-                ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
             if (streamed_fused) {
                 // Safe with the kernels above still queued: a page-in that
                 // wants one of these slots synchronizes `stream` before it
