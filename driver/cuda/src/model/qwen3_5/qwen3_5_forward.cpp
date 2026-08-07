@@ -1202,7 +1202,21 @@ void linear_attn_layer_body(
                         fla_pass(fold_split->segments, fold_split->slot_tail_d,
                                  fold_split->qo_d, /*write_state=*/false,
                                  nullptr);
-                    } else if (use_warp_tiled_recurrent) {
+                    } else if (use_warp_tiled_recurrent ||
+                               rs_write_state_mask != nullptr) {
+                        // A PER-ROW write-state mask cannot survive the
+                        // per-request path: `launch_chunk_gated_delta_prefill*`
+                        // takes neither `write_state` nor a mask, so every
+                        // row it walks persists its state. In a MIXED fire —
+                        // one request folding, another only buffering — that
+                        // persists the buffering row's state too, and its
+                        // next fire reads a state that should not exist.
+                        // Measured: row0 came out 18.0000 against a 14.1875
+                        // reference while the folding row matched exactly
+                        // (`one_fire_can_fold_one_request_while_another_only_buffers`).
+                        //
+                        // The batched FLA arm below takes both, so a fire
+                        // carrying a mask goes there instead.
                         fla_pass(R, slot_ids_d, qo_indptr_d, write_state,
                                  rs_write_state_mask);
                     } else {
