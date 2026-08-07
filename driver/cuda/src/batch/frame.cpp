@@ -2268,6 +2268,18 @@ class DeviceIntervalProbe {
             const Pair pair = pending_.front();
             if (cudaEventQuery(pair.stop) != cudaSuccess) break;
             pending_.pop_front();
+            // Device gap since the PREVIOUS fire finished: both events sit on
+            // the same stream, so this is exactly the idle the GPU spent
+            // waiting for the host to enqueue the next fire. Summed, it is the
+            // recoverable number; per fire it says which boundaries are slow.
+            float gap_ms = -1.0f;
+            if (have_prev_) {
+                float g = 0.0f;
+                if (cudaEventElapsedTime(&g, prev_stop_, pair.start) ==
+                    cudaSuccess) {
+                    gap_ms = g;
+                }
+            }
             float ms = 0.0f;
             if (cudaEventElapsedTime(&ms, pair.start, pair.stop) ==
                 cudaSuccess) {
@@ -2280,14 +2292,23 @@ class DeviceIntervalProbe {
                     }
                 }
                 std::fprintf(stderr,
-                             "[devbusy] us=%.1f fwd_us=%.1f R=%d N=%d\n",
+                             "[devbusy] us=%.1f fwd_us=%.1f gap_us=%.1f "
+                             "R=%d N=%d\n",
                              static_cast<double>(ms) * 1000.0,
                              static_cast<double>(fwd_ms) * 1000.0,
+                             static_cast<double>(gap_ms) * 1000.0,
                              pair.requests, pair.tokens);
             }
-            Pair recycled = pair;
-            recycled.has_mid = false;
-            free_.push_back(recycled);
+            // Hold this fire's stop event one extra round so the next drain
+            // can measure the gap against it; recycle the one it replaces.
+            if (have_prev_) {
+                Pair old = prev_pair_;
+                old.has_mid = false;
+                free_.push_back(old);
+            }
+            prev_pair_ = pair;
+            prev_stop_ = pair.stop;
+            have_prev_ = true;
         }
     }
 
@@ -2295,6 +2316,9 @@ class DeviceIntervalProbe {
     std::vector<Pair> open_;
     std::deque<Pair> pending_;
     std::vector<Pair> free_;
+    Pair prev_pair_{};
+    cudaEvent_t prev_stop_ = nullptr;
+    bool have_prev_ = false;
 };
 
 }  // namespace
