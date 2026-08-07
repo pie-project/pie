@@ -28,9 +28,9 @@ generation from the host, one token at a time. In 0.5 an inferlet defines a
 dataflow of tensor programs, submits passes onto a pipeline, and exchanges
 values with the running dataflow through channels.
 
-Parts I–III cover that model and what it makes expressible. Part IV covers the
-rest of the release — model loading, weight streaming, the Metal driver, the
-scheduler — which is independent of it.
+Parts I to III cover that model and what it makes expressible. Part IV covers
+the rest of the release: model loading, weight streaming, the Metal driver, and
+the scheduler, none of which depend on it.
 
 1,206 commits since 0.4.0. 3,195 files changed, +603,268 / −244,709 lines.
 Host workspace: 3 crates → 55.
@@ -38,37 +38,37 @@ Host workspace: 3 crates → 55.
 <nav className="pv-index" aria-label="On this page">
 <div className="pv-index-title">On this page</div>
 
-<div className="pv-index-part">I — The programming model</div>
+<div className="pv-index-part">I. The programming model</div>
 
 - [Forward pass programming](#forward-pass-programming)
 - [Stages](#stages)
 - [Channels](#channels)
 
-<div className="pv-index-part">II — What it enables</div>
+<div className="pv-index-part">II. What it enables</div>
 
 - [Attention scores](#attention-scores)
 - [What the model enables](#what-the-model-enables)
 - [Recurrent state](#recurrent-state)
 
-<div className="pv-index-part">III — Underneath</div>
+<div className="pv-index-part">III. Underneath</div>
 
 - [PTIR](#ptir)
-- [The runtime–driver boundary](#the-runtimedriver-boundary)
+- [The runtime-driver boundary](#the-runtime-driver-boundary)
 
-<div className="pv-index-part">IV — The rest of the release</div>
+<div className="pv-index-part">IV. The rest of the release</div>
 
 - [Model loading](#model-loading)
 - [Weight streaming](#weight-streaming)
 - [Metal](#metal)
 - [Scheduler and contention](#scheduler-and-contention)
 
-<div className="pv-index-part">V — Numbers</div>
+<div className="pv-index-part">V. Numbers</div>
 
 - [Performance](#performance)
 - [CUDA](#cuda)
 - [Apple silicon](#apple-silicon)
 
-<div className="pv-index-part">VI — Migrating</div>
+<div className="pv-index-part">VI. Migrating</div>
 
 - [Breaking changes](#breaking-changes)
 - [Smaller changes](#smaller-changes)
@@ -134,8 +134,8 @@ grows in relative terms as forward passes get faster.
 
 Two further limits followed from the same structure. Samplers were a closed WIT
 enum, so a new sampling method meant an engine change. And an inferlet could
-only compute on the host, which put tensor-level algorithms — KV eviction driven
-by attention scores, for instance — out of reach.
+only compute on the host. That put tensor-level algorithms out of reach, such as
+KV eviction driven by attention scores.
 
 ### The model in 0.5
 
@@ -281,7 +281,7 @@ token, the full vocabulary crossed the WebAssembly boundary so that the guest
 could add a bias and take an argmax:
 
 ```rust
-// 0.4 — inferlets/demo-watermark/src/lib.rs
+// 0.4: inferlets/demo-watermark/src/lib.rs
 for _ in 0..input.max_tokens {
     let mut pass = ctx.forward();
     pass.input(&pending);
@@ -300,7 +300,7 @@ In 0.5 the bias and the draw are tensor operations in the epilogue, so they run
 inside the pass. Only the sampled token is published to the host:
 
 ```rust
-// 0.5 — tests/inferlets/greenlist-watermarking/src/lib.rs
+// 0.5: tests/inferlets/greenlist-watermarking/src/lib.rs
 fn watermarked_sample(logits: &Tensor, green: &Tensor, rng: &Tensor,
                       delta: f32, vocab: u32) -> Tensor {
     let bias = select(green, broadcast(delta, [vocab]), broadcast(0.0f32, [vocab]));
@@ -341,7 +341,7 @@ while submitted < budget {
 The model does not remove round trips that the algorithm requires. What it
 removes is the vocabulary-sized transfer, the host-side arithmetic, and the
 round trips that were only an artifact of how generation was driven. Inferlets
-whose next input does not depend on the host — the common case — keep the
+whose next input does not depend on the host, which is the common case, keep the
 pipeline full through `run_ahead` and never park per token.
 
 ## Stages
@@ -412,7 +412,7 @@ b.stage(Stage::Epilogue, || {
 let traced = b.build()?;                   // canonical container bytes
 ```
 
-The token loop — `tok`, forward, sampler, `tok` — closes on the device. Adding a
+The token loop closes on the device: `tok`, forward, sampler, `tok`. Adding a
 sampling method is a new trace, not a new enum variant.
 
 ## Channels
@@ -505,7 +505,7 @@ the pass is still running.
   <text className="t2" x="740" y="170" textAnchor="middle">out proj</text>
 
   <path className="ln" d="M440,190 L440,222 L595,222 L595,192" markerEnd="url(#pv-a)" />
-  <text className="ts" x="517" y="240" textAnchor="middle">AttnScore — captured in the kernel, not recomputed</text>
+  <text className="ts" x="517" y="240" textAnchor="middle">AttnScore: captured in the kernel, not recomputed</text>
 
   <text className="ts" x="800" y="212" textAnchor="end">fires once per layer</text>
 </svg>
@@ -535,7 +535,7 @@ layers there are, so the layer loop folds into a device-carried channel that the
 epilogue publishes once per fire:
 
 ```rust
-// 0.5 — tests/inferlets/tova-attention/src/lib.rs
+// 0.5: tests/inferlets/tova-attention/src/lib.rs
 let acc = Channel::from(vec![0.0f32; kv_max as usize]).named("tova_acc");
 let layer_ct = Channel::from([0u32]).named("tova_layers");
 
@@ -623,7 +623,7 @@ so neither delivers the saving its paper reports. Both are bit-identical to
 
 Not a scores feature, but the other pass-level limit that moved to the guest.
 Chunking is now selected by the inferlet (`prefill_chunk`), which removes the
-previous one-shot prefill ceiling of `max_embed_length()` — 8192 tokens on the
+previous one-shot prefill ceiling of `max_embed_length()`, 8192 tokens on the
 tested configuration. Each chunk attends over the full prefix written so far, so
 chunking does not change results.
 
@@ -682,10 +682,10 @@ at any cost: they read a quantity that never left the attention kernel.
 
 | Method | LOC | Stages | Paper |
 |---|---:|---|---|
-| [H2O — heavy-hitter oracle](https://github.com/pie-project/pie/tree/dev/tests/inferlets/trackb-h2o) | 589 | `on_attn_proj`, `on_attn`, `epilogue` | [Zhang et al. 2023](https://arxiv.org/abs/2306.14048) |
-| [SnapKV — prompt compression from an observation window](https://github.com/pie-project/pie/tree/dev/tests/inferlets/trackb-snapkv) | 565 | `on_attn_proj`, `on_attn`, `epilogue` | [Li et al. 2024](https://arxiv.org/abs/2404.14469) |
-| [Quest — query-aware page criticality](https://github.com/pie-project/pie/tree/dev/tests/inferlets/quest-attention) | 491 | `on_attn_proj`, `epilogue` | [Tang et al. 2024](https://arxiv.org/abs/2406.10774) |
-| [TOVA — token-omission via attention](https://github.com/pie-project/pie/tree/dev/tests/inferlets/tova-attention) | 412 | `on_attn`, `epilogue` | [Oren et al. 2024](https://arxiv.org/abs/2401.06104) |
+| [H2O: heavy-hitter oracle](https://github.com/pie-project/pie/tree/dev/tests/inferlets/trackb-h2o) | 589 | `on_attn_proj`, `on_attn`, `epilogue` | [Zhang et al. 2023](https://arxiv.org/abs/2306.14048) |
+| [SnapKV: prompt compression from an observation window](https://github.com/pie-project/pie/tree/dev/tests/inferlets/trackb-snapkv) | 565 | `on_attn_proj`, `on_attn`, `epilogue` | [Li et al. 2024](https://arxiv.org/abs/2404.14469) |
+| [Quest: query-aware page criticality](https://github.com/pie-project/pie/tree/dev/tests/inferlets/quest-attention) | 491 | `on_attn_proj`, `epilogue` | [Tang et al. 2024](https://arxiv.org/abs/2406.10774) |
+| [TOVA: token-omission via attention](https://github.com/pie-project/pie/tree/dev/tests/inferlets/tova-attention) | 412 | `on_attn`, `epilogue` | [Oren et al. 2024](https://arxiv.org/abs/2401.06104) |
 | [Attention sink](https://github.com/pie-project/pie/tree/dev/tests/inferlets/attention-sink) | 208 | `epilogue` | [Xiao et al. 2023](https://arxiv.org/abs/2309.17453) |
 | [Sliding-window attention](https://github.com/pie-project/pie/tree/dev/tests/inferlets/sliding-window-attention) | 193 | `epilogue` | [Beltagy et al. 2020](https://arxiv.org/abs/2004.05150) |
 
@@ -697,8 +697,8 @@ epilogue, and the token loop stays on the device.
 
 | Method | LOC | Paper |
 |---|---:|---|
-| [SynthID-Text — keyed knockout tournament](https://github.com/pie-project/pie/tree/dev/tests/inferlets/synthid-tournament-sampling) | 583 | [Dathathri et al. 2024](https://doi.org/10.1038/s41586-024-08025-4) |
-| [Distortion-free watermarking — keyed Gumbel-max](https://github.com/pie-project/pie/tree/dev/tests/inferlets/gumbel-watermark) | 509 | [Kuditipudi et al. 2023](https://arxiv.org/abs/2307.15593) |
+| [SynthID-Text: keyed knockout tournament](https://github.com/pie-project/pie/tree/dev/tests/inferlets/synthid-tournament-sampling) | 583 | [Dathathri et al. 2024](https://doi.org/10.1038/s41586-024-08025-4) |
+| [Distortion-free watermarking: keyed Gumbel-max](https://github.com/pie-project/pie/tree/dev/tests/inferlets/gumbel-watermark) | 509 | [Kuditipudi et al. 2023](https://arxiv.org/abs/2307.15593) |
 | [Repetition, presence, and frequency penalties](https://github.com/pie-project/pie/tree/dev/tests/inferlets/repetition-penalty) | 421 | [Keskar et al. 2019](https://arxiv.org/abs/1909.05858) |
 | [Entropy-adaptive temperature](https://github.com/pie-project/pie/tree/dev/tests/inferlets/entropy-adaptive-temperature) | 368 | [Zhu et al. 2024](https://arxiv.org/abs/2403.14541) |
 | [Locally typical sampling](https://github.com/pie-project/pie/tree/dev/tests/inferlets/locally-typical-sampling) | 357 | [Meister et al. 2022](https://arxiv.org/abs/2202.00666) |
@@ -728,23 +728,23 @@ coordinating several requests from outside the engine.
 | [Classifier-free guidance](https://github.com/pie-project/pie/tree/dev/tests/inferlets/classifier-free-guidance) | 367 | [Sanchez et al. 2023](https://arxiv.org/abs/2306.17806) |
 | [Contrastive decoding](https://github.com/pie-project/pie/tree/dev/tests/inferlets/contrastive-decoding) | 361 | [Li et al. 2022](https://arxiv.org/abs/2210.15097) |
 | [Multi-token prediction](https://github.com/pie-project/pie/tree/dev/tests/inferlets/mtp-speculative-decoding) | 276 | [Gloeckle et al. 2024](https://arxiv.org/abs/2404.19737) |
-| [Cacheback — speculation from cache alone](https://github.com/pie-project/pie/tree/dev/tests/inferlets/cacheback-speculative-decoding) | 250 | [Ma et al. 2025](https://arxiv.org/abs/2511.21699) |
+| [Cacheback: speculation from cache alone](https://github.com/pie-project/pie/tree/dev/tests/inferlets/cacheback-speculative-decoding) | 250 | [Ma et al. 2025](https://arxiv.org/abs/2511.21699) |
 | [Radix-tree KV reuse](https://github.com/pie-project/pie/tree/dev/tests/inferlets/prefix-tree-kv-cache) | 218 | [Zheng et al. 2023](https://arxiv.org/abs/2312.07104) |
 
 ### Constrained decoding
 
 | Method | LOC | Paper |
 |---|---:|---|
-| [ASAp — grammar-aligned decoding](https://github.com/pie-project/pie/tree/dev/tests/inferlets/asap-grammar-aligned-decoding) | 533 | [Park et al. 2024](https://arxiv.org/abs/2405.21047) |
+| [ASAp: grammar-aligned decoding](https://github.com/pie-project/pie/tree/dev/tests/inferlets/asap-grammar-aligned-decoding) | 533 | [Park et al. 2024](https://arxiv.org/abs/2405.21047) |
 | [JSON-Schema constrained decoding](https://github.com/pie-project/pie/tree/dev/tests/inferlets/json-schema-constrained-decoding) | 200 | [Geng et al. 2023](https://arxiv.org/abs/2305.13971) |
 
 The tree also holds four inferlets with no published method behind them: a raw
 [sampling-primitives](https://github.com/pie-project/pie/tree/dev/tests/inferlets/sampling-primitives)
 reference, a [chat-completion](https://github.com/pie-project/pie/tree/dev/tests/inferlets/chat-completion)
 example, a [throughput harness](https://github.com/pie-project/pie/tree/dev/tests/inferlets/text-completion-bench),
-and [naive-baseline](https://github.com/pie-project/pie/tree/dev/tests/inferlets/naive-baseline) —
-temperature plus Gumbel-max and nothing else. The last is the control the others
-are measured against.
+and [naive-baseline](https://github.com/pie-project/pie/tree/dev/tests/inferlets/naive-baseline),
+which is temperature plus Gumbel-max and nothing else. The last is the control
+the others are measured against.
 
 ### What the suite dropped
 
@@ -862,8 +862,8 @@ program, so the kernels at the end are cached against it.
 The op set is closed and first-party. It was chosen so that a stage compiles to
 one fused kernel rather than a graph of small launches.
 Control flow resolves at trace time and shapes and dtypes are fixed at bind, so
-the compiler sees a straight-line, fully typed program. Emission is direct —
-there is no search and no autotuning.
+the compiler sees a straight-line, fully typed program. Emission is direct, with
+no search and no autotuning.
 
 <figure>
 <svg viewBox="0 0 880 225">
@@ -911,8 +911,8 @@ Implementation notes:
   NVRTC and `MTLLibrary` compilation stay in `driver/`.
 - `compiler/eval` is a tier-0 reference interpreter that pins semantics:
   integers bit-for-bit, floats to ULP, RNG fixed to SplitMix64. Backends are
-  diffed against it. It is also on a production path — the prefix cache folds
-  the geometry prologue through it instead of pattern-matching the trace.
+  diffed against it. It is also on a production path: the prefix cache folds the
+  geometry prologue through it instead of pattern-matching the trace.
 - One artifact crosses every language: the Rust host, the C++ CUDA driver, and
   the wasm SDKs.
 
@@ -923,7 +923,7 @@ interface rather than at runtime. Models also publish their own constraints:
 `frame-size`, `submit-deadline-us`, `channel-capacity`, `rs-state-size`,
 `rs-buffer-page-size`, `rs-fold-granularity`, `arena-block-size`.
 
-## The runtime–driver boundary
+## The runtime-driver boundary
 
 Bind happens once. The driver hands up three addresses; the runtime hands down
 opaque wake-slot ids.
@@ -1164,16 +1164,14 @@ stalling the device.
 - CUDA: NCCL for tensor-parallel collectives, kernel manifests for head-dim and
   MoE variants, quantization-width fixes.
 
-How much of this shows up in measurements is the next part.
-
 <div className="pv-part"><span>Part V</span> Numbers</div>
 
 ## Performance
 
 pie carries machinery the engines it is measured against do not: a scheduler, a
 paged KV cache, a multi-tenant admission path, and a forward pass that is
-programmable from user code. The question for 0.5 was what that costs. Two
-independent sets of runs, reported separately below, say it costs nothing.
+programmable from user code. In the runs below it still matches or beats them on
+throughput. The two sets of measurements are reported separately.
 
 **CUDA.** One L40S against vLLM and SGLang, five widths. pie is ahead of both
 at every width up to 64 and within 1% of the best at 256.
@@ -1256,9 +1254,9 @@ Output throughput at each width, drawn against vLLM so the differences
 are readable: all three engines scale about 54× from one request to 256,
 which on an absolute axis compresses every gap between them to a few
 pixels. pie's own throughput is printed above its markers. It leads both
-baselines at every width up to 64 — by 10.8% and 13.6% over vLLM at one
-and eight requests — and the margin narrows at 256, where the GPU is
-saturated and every engine's host work is hidden behind it.
+baselines at every width up to 64, by 10.8% and 13.6% over vLLM at one and
+eight requests. The margin narrows at 256, where the GPU is saturated and
+every engine's host work is hidden behind it.
 </figcaption>
 </figure>
 
@@ -1278,8 +1276,8 @@ at one request, +13.6% at eight, +3.8% at 32, +2.6% at 64. At 256 the GPU is
 saturated, every engine's host work is hidden behind it, and the three land
 within 1% of each other.
 
-Request latency, where the harness collects it — vLLM's offline API does not
-report per-request latency in throughput mode:
+The harness collects request latency for pie and SGLang. vLLM's offline API
+does not report per-request latency in throughput mode:
 
 | Width | pie p50 / p99 ms | SGLang 0.5.16 p50 / p99 ms |
 |---|---:|---:|
@@ -1361,9 +1359,9 @@ Single stream, greedy, 64 tokens.
 </svg>
 <figcaption>
 pie is ahead of mlx-lm on all five and ahead of llama.cpp on four. Gemma-4-31B
-is the exception at 15.3 against 15.5, and on the like-for-like pair — pie's
-no-readback figure, which synchronizes per step as llama.cpp's does — both are
-15.5.
+is the exception at 15.3 against 15.5. On the like-for-like pair both are 15.5,
+using pie's no-readback figure, which synchronizes per step as llama.cpp's
+does.
 </figcaption>
 </figure>
 
@@ -1442,7 +1440,7 @@ has not been changed on one row's evidence.
 
 Same protocol, same five models.
 
-M4 Pro — prefill / decode tok/s:
+M4 Pro, prefill / decode tok/s:
 
 | Model | mlx-lm 0.31.3 | pie | llama.cpp 10270 |
 |---|---:|---:|---:|
@@ -1452,7 +1450,7 @@ M4 Pro — prefill / decode tok/s:
 | Qwen3.6-27B | 120.8 / 14.6 | 114.3 / **15.2** | **124.7** / 13.3 |
 | Qwen3.6-35B-A3B | **598.1** / 72.4 | 472.4 / **77.6** | 451.2 / 44.5 |
 
-M2 Max — prefill / decode tok/s:
+M2 Max, prefill / decode tok/s:
 
 | Model | mlx-lm 0.31.3 | pie |
 |---|---:|---:|
@@ -1468,7 +1466,7 @@ and on prefill in thirteen.
 #### Against the memory roof
 
 Decode at batch 1 is bandwidth-bound, so the share of a machine's memory roof a
-model reaches is a ceiling on any engine, not just this one.
+model reaches is a ceiling on every engine.
 
 <figure>
 <svg viewBox="0 0 860 330">
@@ -1533,11 +1531,10 @@ model reaches is a ceiling on any engine, not just this one.
 <figcaption>
 How much of each machine a model can actually use, against measured streaming
 roofs of 389.5, 384.9 and 254.2 GB/s respectively. Dense models run close to
-the roof and no engine can win much there — llama.cpp and mlx-lm land within 5%
+the roof and no engine can win much there: llama.cpp and mlx-lm land within 5%
 of pie on those rows. Mixtures read too few bytes per token to hide their
 routing and dispatch, and the gap between them and the roof is headroom left on
-every machine tested. That is where most of pie's margin comes from, and it is
-the part that grows as models get sparser.
+every machine tested. Most of pie's margin comes from those rows.
 </figcaption>
 </figure>
 
@@ -1555,7 +1552,7 @@ the part that grows as models get sparser.
   step to the eager path.
 - llama.cpp reads 0.3% to 8.9% more bytes per row than pie, and decode is
   bandwidth-bound, so its decode figures are if anything flattered. Where pie
-  reports two decode numbers, the lower one — host argmax in the loop — is used
+  reports two decode numbers, the lower one (host argmax in the loop) is used
   throughout.
 - The mlx-lm figures come from an in-process batched forward rather than from
   mlx-lm's server, whose accept loop starves under load, so that column is an
