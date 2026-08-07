@@ -685,7 +685,28 @@ void encode_prefill_dags_mb(StepEncoder& se,
             d0.kind != Kernel::LmHeadUntied &&
             !qwen35_uses_alt_quant(d0.kind, *geometry)) {
             const int out = qmv_out_size(d0.kind, *geometry);
-            if (out == 16 && !d0.fuse_residual && mb_psos.qmv_wide_strided.valid()) {
+            // The GEMM below tiles the output 32 columns at a time, so it can
+            // only take a projection whose width is a whole number of tiles.
+            // Everything else needs a batched primitive of its own, and the
+            // wide matvec IS that primitive: it is parametric in N, guards its
+            // last partial row group, and reads each decoded weight chunk once
+            // for four token vectors instead of once per token.
+            //
+            // This used to ask `out == 16`, which is the value Qwen3-Next's
+            // `linear_num_value_heads` has, and every projection of any other
+            // width that the GEMM also declined fell through to ONE MATVEC PER
+            // TOKEN. Qwen3.6-27B has 48 value heads, so its two per-head decay
+            // projections did exactly that: 2 kinds x 48 GDN layers x N tokens,
+            // 3072 dispatches in a 32-token prefill, each moving a 123 KB
+            // weight -- and a 32-token prefill encoded 8435 dispatches where it
+            // now encodes 5459. Prefill tok/s: 67.4 -> 84.2 at 32 tokens, 81.1
+            // -> 90.0 at 64, 94.2 -> 94.0 at 128. It is a per-token cost, so it
+            // is the SHORT prompts it was taxing, and by 128 tokens the GEMMs
+            // have grown past it. The width the GEMM cannot take is the width
+            // that needs this path most, so the question to ask is the GEMM's,
+            // negated.
+            if (out != 0 && out % 32 != 0 && !d0.fuse_residual &&
+                mb_psos.qmv_wide_strided.valid()) {
                 constexpr int vecs = 4;
                 constexpr int lanes = 8;
                 se.set_pso(mb_psos.qmv_wide_strided);
@@ -698,11 +719,11 @@ void encode_prefill_dags_mb(StepEncoder& se,
                 se.barrier();
                 continue;
             }
-            // N=16 GDN projections deliberately stay matvecs. A BN16 strided
-            // GEMM replaced 768 dispatches with six, but end-to-end prefill fell
-            // from 1408 to 1396 tok/s. The wide matvec above is the intermediate
-            // primitive: five vectors reuse each decoded weight chunk without
-            // paying a matrix tile's setup.
+            // A GDN projection narrow enough to fit one tile stays a matvec
+            // even where the GEMM could take it. A BN16 strided GEMM replaced
+            // 768 dispatches with six and end-to-end prefill fell from 1408 to
+            // 1396 tok/s: at that width a matrix tile's setup costs more than
+            // the four-vector reuse above saves.
             if (out != 0 && out % 32 == 0) {
                 const bool wide = qmm_strided_bm(strided_rows) > kQmmBM &&
                                   mb_psos.qmm_t_strided_wide.valid();
@@ -838,11 +859,14 @@ void encode_prefill_dags_mb(StepEncoder& se,
                     if (d.kind == Kernel::GdnPrepSlotted) {
                         grid.z = d.grid.z * uint32_t(seg.rows);
                     } else {
-                        // The scan puts two dv rows in one simdgroup so its two
-                        // per-token reductions run 16 lanes wide instead of 32.
-                        // Its x extent therefore covers two rows, not one; an
-                        // odd Dv rounds up and the kernel masks the spare row.
-                        grid.y = (grid.y + 1) / 2;
+                        // The scan puts 32/`gdn_scan_lanes` dv rows in one
+                        // simdgroup so each token's two reductions run that
+                        // many lanes wide instead of 32. Its x extent therefore
+                        // covers that many rows, not one; a Dv the rows do not
+                        // divide rounds up and the kernel masks the spares.
+                        const uint32_t rows_per_simd =
+                            uint32_t(32 / gdn_scan_lanes());
+                        grid.y = (grid.y + rows_per_simd - 1) / rows_per_simd;
                     }
                     se.set_argtable(d.kind, d.ordinal);
                     se.dispatch(grid, d.tg);
