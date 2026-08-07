@@ -823,9 +823,8 @@ fn kimi_k3_streamed_cuda_tp1_of_2() {
 /// `stream_routed_experts` reaches the driver as a boolean, and the driver
 /// builds its slab only when the contract declared groups — so a family that
 /// declares none accepts the request, logs nothing, and loads the whole expert
-/// bank resident. For K3 that is 1.4465 TB packed against a 27.20 GB per-GPU
-/// trunk at tp=8, which is not a difference anyone discovers from a log line
-/// that was never printed.
+/// bank resident, at a size the refusal message itself states — this is not a
+/// difference anyone discovers from a log line that was never printed.
 ///
 /// All three ways of declaring nothing are refused, because they arrive
 /// differently: no expert names at all, and a config whose expert count is
