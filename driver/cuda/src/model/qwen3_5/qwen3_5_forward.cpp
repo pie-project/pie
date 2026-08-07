@@ -1034,6 +1034,42 @@ void linear_attn_layer_body(
                     }
                 }
             } else {
+                // The proven per-request chunk path, factored so both
+                // the slot-less fire and a plain slotted prefill can
+                // reach it — upstream's shape.
+                auto chunk_prefill_per_request = [&] {
+                    for (int r = 0; r < R; ++r) {
+                        const int t0 = static_cast<int>(qo_indptr_h[r]);
+                        const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                        if (Nr <= 0) continue;
+                        const std::size_t qk_off = static_cast<std::size_t>(t0) * qk_step;
+                        const std::size_t v_off  = static_cast<std::size_t>(t0) * v_step;
+                        const std::size_t gh_off = static_cast<std::size_t>(t0) * gh_step;
+                        void* state_slot = state_cache.recurrent_state_raw(
+                            layer_idx, slot_for(r));
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_state_bf16(
+                                q_recur_full + qk_off,
+                                k_recur_full + qk_off,
+                                la.v_fp32.data() + v_off,
+                                la.g_log.data()  + gh_off,
+                                la.beta.data()   + gh_off,
+                                state_slot,
+                                la.core_out.data() + v_off,
+                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill(
+                                q_recur_full + qk_off,
+                                k_recur_full + qk_off,
+                                la.v_fp32.data() + v_off,
+                                la.g_log.data()  + gh_off,
+                                la.beta.data()   + gh_off,
+                                static_cast<float*>(state_slot),
+                                la.core_out.data() + v_off,
+                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                        }
+                    }
+                };
                 if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
                     auto fla_pass = [&](int R, const std::int32_t* slot_ids_d,
                                         const std::uint32_t* qo_indptr_d,
@@ -1096,15 +1132,32 @@ void linear_attn_layer_body(
                                 stream, write_state, rs_write_state_mask);
                         }
                     } else {
-                        // THE PLAIN FLA PATH. This arm went missing when the
-                        // warp-tiled stopgap collapsed its guard to
+                        // THE PLAIN FLA PATH — the arm that went missing when
+                        // the warp-tiled stopgap collapsed its guard to
                         // `!write_state` (da3daf0e1) beside the deletion of
-                        // the cached-state arm as unreachable: between them
+                        // the cached-state arm as unreachable. Between them
                         // the lambda was left with NO arm for an ordinary
-                        // write_state prefill, so the GDN recurrence was
-                        // simply skipped — measured, on all 18 GDN layers of
-                        // a 2-token prefill. `core_out` then carried whatever
-                        // the buffer held and the state was never written.
+                        // write_state prefill, so the recurrence was simply
+                        // skipped — measured, on all 18 GDN layers of a
+                        // 2-token prefill.
+                        //
+                        // Upstream `github/dev` fixes this at the CALL SITE
+                        // instead, routing a plain slotted prefill to
+                        // `chunk_prefill_per_request` and leaving this arm a
+                        // documented hole ("not by adding a third spelling of
+                        // the recurrence here"). Its stated objections are to
+                        // the PER-REQUEST path standing in here: it walks the
+                        // fire's own `qo_indptr_h`, so it folds the wrong
+                        // ranges on a fold pass, and it cannot express the
+                        // tail's `write_state=false`. Neither objection
+                        // applies to the BATCHED kernel: it takes `slot_ids`
+                        // and `qo_indptr` as arguments — the fold's own,
+                        // whichever pass is calling — and it takes
+                        // `write_state`. Measured on `cuda_gdn_foldcommit`,
+                        // one test per process: upstream's shape 4/8, this
+                        // arm 7/8, and the eighth fails for an unrelated
+                        // PTIR channel-readiness reason on BOTH forward paths.
+                        // Both shapes give the same tokens on the parity gate.
                         if (state_bf16) {
                             kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
                                 la.q_pre.data(),
@@ -1151,37 +1204,7 @@ void linear_attn_layer_body(
                                  rs_write_state_mask);
                     }
                 } else {
-                    for (int r = 0; r < R; ++r) {
-                        const int t0 = static_cast<int>(qo_indptr_h[r]);
-                        const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
-                        if (Nr <= 0) continue;
-                        const std::size_t qk_off = static_cast<std::size_t>(t0) * qk_step;
-                        const std::size_t v_off  = static_cast<std::size_t>(t0) * v_step;
-                        const std::size_t gh_off = static_cast<std::size_t>(t0) * gh_step;
-                        void* state_slot = state_cache.recurrent_state_raw(
-                            layer_idx, slot_for(r));
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_state_bf16(
-                                q_recur_full + qk_off,
-                                k_recur_full + qk_off,
-                                la.v_fp32.data() + v_off,
-                                la.g_log.data()  + gh_off,
-                                la.beta.data()   + gh_off,
-                                state_slot,
-                                la.core_out.data() + v_off,
-                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill(
-                                q_recur_full + qk_off,
-                                k_recur_full + qk_off,
-                                la.v_fp32.data() + v_off,
-                                la.g_log.data()  + gh_off,
-                                la.beta.data()   + gh_off,
-                                static_cast<float*>(state_slot),
-                                la.core_out.data() + v_off,
-                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
-                        }
-                    }
+                    chunk_prefill_per_request();
                 }
             }
         }
