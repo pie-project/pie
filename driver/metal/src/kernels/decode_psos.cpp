@@ -215,6 +215,11 @@ bool load_multibatch_psos(RawMetalContext& ctx,
             if (features.bias)
                 want(qmm, "affine_qmm_t_bias" + suffix,
                      &out.qmm_t_bias[w][i]);
+            if (features.bias && features.fp16_precast && quant.group == 64 &&
+                quant.bits == 4) {
+                want(qmm, "affine_qmm_t_bias_fp16_precast" + suffix,
+                     &out.qmm_t_bias_fp16_precast[w][i]);
+            }
         }
         if (features.splitk) {
             want(qmm,

@@ -92,6 +92,11 @@ struct MultiBatchPsos {
     /// gpt-oss biases every projection, so without it the batched path is a
     /// GEMM plus a dispatch that rewrites the whole output to add one vector.
     Pso qmm_t_bias[3][3]{};
+    /// Both at once, which is the shape gpt-oss's dense projections are: a
+    /// bias to fold into the store and an FP16 tile to feed the MMA. Neither
+    /// of the two tables above can serve it, so it is a third rather than a
+    /// flag on either.
+    Pso qmm_t_bias_fp16_precast[3][3]{};
     // affine_qmm_t_strided: the same GEMM with an explicit row pitch, for the
     // prefill, whose scratch rows are laid at a uniform `scratch_widest_elems`
     // rather than packed at `K`.

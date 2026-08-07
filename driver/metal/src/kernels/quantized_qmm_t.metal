@@ -1707,13 +1707,15 @@ METAL_FUNC void qmm_t_aligned_impl(
       x, y, residual, Xs, Ws, K, N, K, tid, simd_gid, simd_lid, loader_w);
 }
 
-template <typename P, int group_size, int bits, int BM, int BK, int BN>
+template <typename P, int group_size, int bits, int BM, int BK, int BN,
+          bool WITH_BIAS = false>
 METAL_FUNC void qmm_t_fp16_precast_impl(
     const device uint32_t* w,
     const device bfloat* scales,
     const device bfloat* biases,
     const device half* x,
     device P* y,
+    const device P* bias,
     threadgroup half* Xs,
     threadgroup half* Ws,
     const constant int& K,
@@ -1738,8 +1740,8 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   scales += y_col * K_g;
   biases += y_col * K_g;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, false, false>(
-      x, y, nullptr, Xs, Ws, K, N, k_len,
+  qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, false, WITH_BIAS>(
+      x, y, bias, Xs, Ws, K, N, k_len,
       tid, simd_gid, simd_lid, loader_w);
 }
 
@@ -1770,7 +1772,34 @@ template <int group_size, int bits, int BM, int BK, int BN>
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN>(
-      w, scales, biases, x, y, Xs, Ws, K, K, N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, (const device bfloat*)nullptr, Xs, Ws, K, K, N,
+      tid, simd_gid, simd_lid);
+}
+
+/// The same GEMM with the projection's additive bias folded into the store.
+///
+/// gpt-oss biases every dense projection, so the plain precast kernel could
+/// not serve it: the bias would have needed a second pass over the output
+/// tile, which is exactly the trip `store_result_bias` exists to avoid. Buffer
+/// 7 is `bind::GoQmv::Bias`, already bound there by the matvec this replaces.
+template <int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_bias_fp16_precast(
+    const device uint32_t* w [[buffer(0)]],
+    const device bfloat* scales [[buffer(1)]],
+    const device bfloat* biases [[buffer(2)]],
+    device bfloat* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const device bfloat* bias [[buffer(7)]],
+    const device half* x [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN, true>(
+      w, scales, biases, x, y, bias, Xs, Ws, K, K, N, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
@@ -2116,6 +2145,24 @@ instantiate_qmm_t_fp16_precast(32, 64)
 instantiate_qmm_t_fp16_precast(64, 16)
 instantiate_qmm_t_fp16_precast(64, 32)
 instantiate_qmm_t_fp16_precast(64, 64)
+
+#define instantiate_qmm_t_bias_fp16_precast(bm, bn)                          \
+  template [[host_name("affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4"   \
+                       "_bm_" #bm "_bn_" #bn)]]                              \
+  [[kernel]] void affine_qmm_t_bias_fp16_precast<64, 4, bm, 32, bn>(         \
+      const device uint32_t*, const device bfloat*, const device bfloat*,    \
+      device bfloat*, const constant int&, const constant int&,              \
+      const device bfloat*, const device half*, uint3, uint, uint);
+
+instantiate_qmm_t_bias_fp16_precast(16, 16)
+instantiate_qmm_t_bias_fp16_precast(16, 32)
+instantiate_qmm_t_bias_fp16_precast(16, 64)
+instantiate_qmm_t_bias_fp16_precast(32, 16)
+instantiate_qmm_t_bias_fp16_precast(32, 32)
+instantiate_qmm_t_bias_fp16_precast(32, 64)
+instantiate_qmm_t_bias_fp16_precast(64, 16)
+instantiate_qmm_t_bias_fp16_precast(64, 32)
+instantiate_qmm_t_bias_fp16_precast(64, 64)
 
 // ── Strided form, for the prefill ────────────────────────────────────────────
 // Identical to the aligned kernel above except that the row pitch of `x`, `y`
@@ -2532,8 +2579,8 @@ template <typename P, int group_size, int bits, int BM, int BK, int BN>
   y += int64_t(tid.z) * split_k_partition_stride;
 
   qmm_t_fp16_precast_impl<P, group_size, bits, BM, BK, BN>(
-      (const device uint32_t*)wl, scales, biases, x, y, Xs, Ws, K,
-      k_partition_size, N, tid, simd_gid, simd_lid);
+      (const device uint32_t*)wl, scales, biases, x, y, (const device P*)nullptr,
+      Xs, Ws, K, k_partition_size, N, tid, simd_gid, simd_lid);
 }
 
 // Sum the split_k slices and write the activation type, folding in the block

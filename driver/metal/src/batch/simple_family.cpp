@@ -1029,10 +1029,34 @@ class GptOssEngine final : public SimpleFamilyEngine {
             return false;
         if (!load_multibatch_psos(
                 ctx, kernels_dir, mb_, kGptOssBase, err,
-                MultiBatchPsoFeatures{.bias = true}))
+                MultiBatchPsoFeatures{.bias = true,
+                                      .fp16_precast = fp16_qmm() && g_.proj_bits == 4}))
             return false;
 
+        // One buffer for every staged projection, sized at the widest input any
+        // of them reads times the rows the GEMM rounds up to. Asked of the DAG
+        // rather than of the geometry so that a checkpoint whose projections are
+        // not all eligible sizes it from the ones that are.
+        if (fp16_qmm() && g_.proj_bits == 4) {
+            std::size_t widest = 0;
+            for (const gptoss::Dispatch& d : dag_) {
+                if (!gptoss::gptoss_fp16_qmm(g_, d.kind, max_rows_)) continue;
+                widest = std::max(widest, std::size_t(gptoss::qmv_kn(d.kind, g_).K));
+            }
+            if (widest > 0) {
+                const std::size_t elems =
+                    std::size_t(gptoss::gptoss_qmm_pool_rows(max_rows_)) * widest;
+                fp16_input_ = ctx.heap_alloc(elems * sizeof(std::uint16_t));
+                if (!fp16_input_.valid()) {
+                    if (err) *err = "gpt-oss FP16 QMM input allocation failed";
+                    return false;
+                }
+            }
+        }
+
         gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
+        gptoss::bind_gptoss_fp16_qmm(ctx, dag_, g_, /*rows=*/1, /*head_rows=*/1,
+                                     fp16_input_, fp16_keep_);
         bound_rows_ = 1;
         bound_head_rows_ = 1;
         try {
@@ -1123,6 +1147,11 @@ class GptOssEngine final : public SimpleFamilyEngine {
         }
         if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
             gptoss::bind_gptoss_consts(ctx, dag_, g_, rows, /*paged=*/true, head_rows);
+            // The staged element count is a row count, so it moves with the
+            // fire. Rebound here and not in the encoder: the encoder writes a
+            // command buffer, and this writes an argument table.
+            gptoss::bind_gptoss_fp16_qmm(ctx, dag_, g_, rows, head_rows, fp16_input_,
+                                         fp16_keep_);
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
@@ -1205,6 +1234,10 @@ class GptOssEngine final : public SimpleFamilyEngine {
     int bound_rows_ = 0;
     int bound_head_rows_ = 0;
     SlotHandle logits_{};
+    /// The FP16 tile the dense projections read, and the element counts the
+    /// cast pass is told to fill. Owned here because both outlive a fire.
+    SlotHandle fp16_input_{};
+    std::vector<SlotHandle> fp16_keep_{};
 };
 
 /// Which values a llama layer publishes, under `tests/parity`'s names.
