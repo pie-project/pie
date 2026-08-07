@@ -160,6 +160,15 @@ fn a_log_bands(b: &mut Builder<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Elements per MXFP4 block: one E8M0 exponent covers this many E2M1 codes
+/// along the quantized axis.
+///
+/// One declaration, because this single number ties the packed widths, the
+/// scale widths and every shape assertion here together. Named for the layout
+/// rather than for the block, because at module scope a "group" in this file
+/// is a `GroupContract`.
+const MXFP4_BLOCK: i64 = 32;
+
 /// The six MXFP4 sources one routed expert ships, in the order every pass
 /// here reads them.
 const EXPERT_SOURCES: [&str; 6] = [
@@ -182,7 +191,6 @@ const EXPERT_SOURCES: [&str; 6] = [
 /// lived in each of them separately is a rule that can come to mean two
 /// different things.
 fn expert_dims(parts: &[&RawTensor], what: &str) -> Result<Option<(i64, i64)>, Error> {
-    const GROUP: i64 = 32;
     if parts
         .iter()
         .any(|part| !is_raw(&part.encoding, DType::U8) || part.shape.len() != 2)
@@ -195,8 +203,8 @@ fn expert_dims(parts: &[&RawTensor], what: &str) -> Result<Option<(i64, i64)>, E
     let latent = parts[0].shape[1] * 2;
     if parts[4].shape[0] != latent
         || parts[4].shape[1] * 2 != inter
-        || parts[1].shape[1] != latent / GROUP
-        || parts[5].shape[1] != inter / GROUP
+        || parts[1].shape[1] != latent / MXFP4_BLOCK
+        || parts[5].shape[1] != inter / MXFP4_BLOCK
     {
         return fail(format!("{what} has inconsistent MXFP4 shapes"));
     }
@@ -219,7 +227,6 @@ fn expert_dims(parts: &[&RawTensor], what: &str) -> Result<Option<(i64, i64)>, E
 /// worth four times its weight there. Both stay resident and the forward
 /// picks per step, the way Kimi-K2 does.
 fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Error> {
-    const GROUP: i64 = 32;
     let experts = i64::from(b.facts().num_experts);
     if experts <= 0 {
         return Ok(());
@@ -305,8 +312,8 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
             // `[up | gate]` is what flashinfer's grouped GEMM reads fc1 as.
             let w1 = packed(b, parts[0], vec![1, inter, latent], 1);
             let w3 = packed(b, parts[2], vec![1, inter, latent], 1);
-            let w1s = factors(b, parts[1], vec![1, inter, latent / GROUP], 1);
-            let w3s = factors(b, parts[3], vec![1, inter, latent / GROUP], 1);
+            let w1s = factors(b, parts[1], vec![1, inter, latent / MXFP4_BLOCK], 1);
+            let w3s = factors(b, parts[3], vec![1, inter, latent / MXFP4_BLOCK], 1);
             // The decode GEMV reads gate and up as *adjacent* rows — row 2i
             // is gate row i, row 2i+1 is up row i — because that is how
             // gpt-oss ships them, and it is what lets one warp pull a slab
@@ -341,14 +348,19 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
                 },
             ));
             down.push(packed(b, parts[4], vec![1, latent, inter], 2));
-            down_scales.push(factors(b, parts[5], vec![1, latent, inter / GROUP], 2));
+            down_scales.push(factors(
+                b,
+                parts[5],
+                vec![1, latent, inter / MXFP4_BLOCK],
+                2,
+            ));
 
             // Gate over up, always — `gate_second` reorders the *bf16* stack
             // for flashinfer's fc1, and this path reads its two halves by
             // name into separate outputs.
             let ep_out = format!("{moe}experts.{e}.");
             let gu_packed = pair(b, parts[0], parts[2], latent / 2);
-            let gu_scale = pair(b, parts[1], parts[3], latent / GROUP);
+            let gu_scale = pair(b, parts[1], parts[3], latent / MXFP4_BLOCK);
             let dn_packed = b.split(Expr::src(&parts[4].name), 1);
             let dn_scale = b.split(Expr::src(&parts[5].name), 1);
             let u8enc = Encoding::Raw(DType::U8);
@@ -362,7 +374,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
                 format!("{ep_out}gate_up.weight_scale"),
                 gu_scale,
                 u8enc.clone(),
-                Some(vec![local_inter, 2, latent / GROUP]),
+                Some(vec![local_inter, 2, latent / MXFP4_BLOCK]),
             );
             b.define(
                 format!("{ep_out}down.weight_packed"),
@@ -374,7 +386,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
                 format!("{ep_out}down.weight_scale"),
                 dn_scale,
                 u8enc,
-                Some(vec![latent, local_inter / GROUP]),
+                Some(vec![latent, local_inter / MXFP4_BLOCK]),
             );
             consumed.extend(parts.iter().map(|part| part.id));
         }
@@ -392,7 +404,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
             gu_scale.clone(),
             Expr::concat(0, gate_up_scales),
             e8m0.clone(),
-            Some(vec![experts, 2 * local_inter, latent / GROUP]),
+            Some(vec![experts, 2 * local_inter, latent / MXFP4_BLOCK]),
         ) {
             b.mark_internal(gu);
         }
@@ -400,7 +412,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
             dn_scale.clone(),
             Expr::concat(0, down_scales),
             e8m0,
-            Some(vec![experts, latent, local_inter / GROUP]),
+            Some(vec![experts, latent, local_inter / MXFP4_BLOCK]),
         ) {
             b.mark_internal(dn);
         }
@@ -451,7 +463,6 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
 /// the resident republish already uses, so the driver spells a slot and a
 /// resident expert the same way.
 fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
-    const GROUP: i64 = 32;
     let experts = i64::from(b.facts().num_experts);
     let mut pushed = 0usize;
 
@@ -464,9 +475,8 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
         // K3's leading layers are dense and simply have no expert names,
         // which is why this probes rather than reading
         // `first_k_dense_replace`.
-        if experts <= 0
-            || b.find(&format!("{prefix}experts.0.w1.weight_packed"))
-                .is_none()
+        if b.find(&format!("{prefix}experts.0.w1.weight_packed"))
+            .is_none()
         {
             continue;
         }
@@ -562,9 +572,9 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
                         b,
                         "experts.{}.w1.weight_scale",
                         "experts.{}.w3.weight_scale",
-                        latent / GROUP,
+                        latent / MXFP4_BLOCK,
                     ),
-                    vec![local_inter, 2, latent / GROUP],
+                    vec![local_inter, 2, latent / MXFP4_BLOCK],
                     u8enc.clone(),
                 ),
                 TensorContract::new(
@@ -576,7 +586,7 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
                 TensorContract::new(
                     "down.weight_scale",
                     down(b, "experts.{}.w2.weight_scale"),
-                    vec![latent, local_inter / GROUP],
+                    vec![latent, local_inter / MXFP4_BLOCK],
                     u8enc,
                 ),
             ],

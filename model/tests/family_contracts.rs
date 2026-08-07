@@ -17,6 +17,8 @@
 
 #![cfg(feature = "contract")]
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
@@ -66,17 +68,33 @@ impl Checkpoint {
         self
     }
 
-    /// The byte length is part of the file's name, not just of its contents.
-    /// A family may have more than one fixture — K3 has a narrow one and a
-    /// wide one, because a tp>1 slice of the narrow one has a zero-width axis
-    /// — and keying only on the family made those two share a path. The tests
+    /// Two fixtures that describe different tensors get different files.
+    ///
+    /// A family may have more than one — K3 has a narrow one and a wide one,
+    /// because a tp>1 slice of the narrow one has a zero-width axis — and
+    /// keying the path on the family alone made those two share it. The tests
     /// run in one process, so they took turns rewriting it and whichever
     /// compiled second was verified against the other's bytes.
+    ///
+    /// The key is what the fixture *says*, not how long it is: two layouts can
+    /// serialize to the same length and still describe different tensors, so a
+    /// length key would only have made that collision rarer. Distinct
+    /// descriptors therefore give distinct paths; identical descriptors are the
+    /// same fixture and are meant to share.
     fn finish(self, name: &str) -> CheckpointMetadata {
+        let mut hasher = DefaultHasher::new();
+        for tensor in &self.tensors {
+            tensor.name.hash(&mut hasher);
+            tensor.shape.hash(&mut hasher);
+            tensor.span_bytes.hash(&mut hasher);
+            // `Encoding` carries no `Hash`, and its `Debug` is what the rest of
+            // this harness already compares layouts by.
+            format!("{:?}", tensor.encoding).hash(&mut hasher);
+        }
         let path = std::env::temp_dir().join(format!(
-            "pie_model_family_{}_{}_{}.safetensors",
+            "pie_model_family_{}_{:016x}_{}.safetensors",
             name,
-            self.offset,
+            hasher.finish(),
             std::process::id()
         ));
         if std::fs::metadata(&path).map(|meta| meta.len()).ok() != Some(self.offset) {
@@ -693,6 +711,45 @@ fn kimi_k2_cuda() {
     );
 }
 
+/// Two fixtures that describe different tensors never share a file, even when
+/// they serialize to the same number of bytes.
+///
+/// The harness is shared by every family here, and a collision in it does not
+/// announce itself as a harness bug: the loser is verified against the
+/// winner's file and reports a plan/checkpoint size mismatch in whichever
+/// family lost the race. This is the assertion that keeps the doc comment on
+/// `finish` true.
+#[test]
+fn two_fixtures_of_one_family_share_a_file_only_when_they_are_the_same() {
+    let square = {
+        let mut ck = Checkpoint::new();
+        ck.push("w", &[4, 4], bf16());
+        ck.finish("collision_probe")
+    };
+    let flat = {
+        let mut ck = Checkpoint::new();
+        ck.push("w", &[16], bf16());
+        ck.finish("collision_probe")
+    };
+    let flat_again = {
+        let mut ck = Checkpoint::new();
+        ck.push("w", &[16], bf16());
+        ck.finish("collision_probe")
+    };
+    assert_eq!(
+        square.files[0].size_bytes, flat.files[0].size_bytes,
+        "the probe only means something if both are the same length"
+    );
+    assert_ne!(
+        square.files[0].path, flat.files[0].path,
+        "different tensors, same length: these must not share a file"
+    );
+    assert_eq!(
+        flat.files[0].path, flat_again.files[0].path,
+        "the same fixture twice is one file, not two"
+    );
+}
+
 // ── kimi_k3: A_log bands + MXFP4 stacks with GEMV republish ─────────
 
 /// `experts` of `None` is a dense-only K3, with no `block_sparse_moe` names at
@@ -803,25 +860,40 @@ fn kimi_k3_streamed_cuda_tp1_of_2() {
 /// trunk at tp=8, which is not a difference anyone discovers from a log line
 /// that was never printed.
 ///
-/// Both ways of declaring nothing are refused, because they fail differently:
-/// no expert names at all reaches the end of the pass having pushed nothing,
-/// while names that are not MXFP4 would otherwise leave *some* layers streamed
-/// and the rest resident.
+/// All three ways of declaring nothing are refused, because they arrive
+/// differently: no expert names at all, and a config whose expert count is
+/// zero, both reach the end of the pass having pushed nothing, while names
+/// that are not MXFP4 would otherwise leave *some* layers streamed and the
+/// rest resident. The zero-count case is here because the pass has no explicit
+/// test for it — an empty per-expert loop reads no shapes, so the layer is
+/// skipped and the same refusal catches it.
 #[test]
 fn kimi_k3_refuses_a_streaming_request_it_cannot_serve() {
-    for (case, checkpoint, names) in [
+    let no_experts = ModelFacts {
+        num_experts: 0,
+        ..kimi_k3_facts()
+    };
+    for (case, facts, checkpoint, names) in [
         (
             "no routed experts",
+            kimi_k3_facts(),
             kimi_k3_checkpoint_at(64, None),
             "no routed experts to stream",
         ),
         (
+            "a config that declares zero experts",
+            no_experts,
+            kimi_k3_checkpoint_at(64, Some(u8enc())),
+            "no routed experts to stream",
+        ),
+        (
             "experts that are not MXFP4",
+            kimi_k3_facts(),
             kimi_k3_checkpoint_at(64, Some(bf16())),
             "not MXFP4",
         ),
     ] {
-        let err = author(&kimi_k3_facts(), &checkpoint, &target(1, 2), &streamed())
+        let err = author(&facts, &checkpoint, &target(1, 2), &streamed())
             .expect_err(&format!("kimi_k3 with {case} must refuse the knob"));
         let text = err.to_string();
         assert!(
