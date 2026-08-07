@@ -154,6 +154,10 @@ struct MultiBatchPsos {
     // model they were ~80k dispatches in a 1024-row fire.
     Pso residual_add_strided{};
     Pso shared_expert_combine_strided{};
+    // The tiled attention with a row pitch for q and out, so a prefill can run
+    // its whole prompt in one dispatch instead of one per token. See
+    // `sdpa_paged_tiled_body`.
+    Pso sdpa_paged_tiled_strided{};
     // GDN over a whole prompt in one dispatch (prep is token-parallel, the
     // recurrent scan runs in registers) instead of one serialized pair per token.
     Pso gdn_prep_prefill{};

@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include "decode_step_mb.hpp"
@@ -841,6 +842,37 @@ void encode_prefill_dags_mb(StepEncoder& se,
                 se.barrier();
                 continue;
             }
+        }
+        // ── the attention, over the whole prompt at once ──
+        //
+        // Priced by ablation (`PIE_METAL_ABLATE=sdpa_paged`) at 8.2% of a
+        // 128-token Qwen3.6-35B-A3B prefill and 16.5% of a 2048-token one --
+        // and at 2048 it is the WHOLE remaining gap to mlx-lm, whose 847.5
+        // tok/s this fire meets at 840.7 with the attention taken out.
+        //
+        // Two wins, and the second is the larger. One dispatch replaces N, and
+        // the tiled kernel stages a key tile ONCE PER 32 ROWS where the per-row
+        // kernel reads it once per row. `sdpa_should_tile`'s own note is that a
+        // prefill "is all one run and wins outright" -- every row shares a key
+        // span -- which is the opposite of a fleet of decodes, where 32 rows
+        // are 32 runs and tiling loses badly. A prefill is exactly one request,
+        // so this asks the predicate rather than assuming.
+        if (strided_rows > 0 && geometry != nullptr && d0.kind == Kernel::SdpaPaged &&
+            mb_psos.sdpa_paged_tiled_strided.valid() &&
+            sdpa_should_tile(int(n), /*requests=*/1)) {
+            Grid grid;
+            Threadgroup tg;
+            // `geometry->n_q_heads`, not `d0.grid.x`: the per-token dispatch
+            // already folded the 1024-thread threadgroup into x, so grid.x is
+            // `n_q_heads * 1024`. The kernel reads its head count back out of
+            // `threadgroups_per_grid.x`, so handing this the wrong number is a
+            // wrong answer rather than a refusal.
+            sdpa_paged_tiled_dispatch(geometry->n_q_heads, int(n), grid, tg);
+            se.set_pso(mb_psos.sdpa_paged_tiled_strided);
+            se.set_argtable(d0.kind, d0.ordinal);
+            se.dispatch(grid, tg);
+            se.barrier();
+            continue;
         }
         // Row-independent kernels: the prefill's scratch rows are a uniform pitch
         // apart, so one dispatch over the whole prompt replaces one per token.

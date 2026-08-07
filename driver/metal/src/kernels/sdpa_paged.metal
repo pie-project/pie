@@ -263,30 +263,65 @@ template <
 // one iteration in the common case, and correct when a tile straddles a
 // request boundary. Simdgroups outside the current run sit out the scoring but
 // still reach every barrier, because the run bounds are threadgroup-uniform.
-template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LANE = false>
-[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_tiled(
-    const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
-    const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
-    const device T* v_pages     [[buffer(2)]],
-    device T* out               [[buffer(3)]],   // [N, n_q_heads, V]
-    const constant int& gqa_factor          [[buffer(4)]],
-    const device int* position_ids          [[buffer(5)]],
-    const device int* req_of_token          [[buffer(6)]],
-    const device uint* kv_page_indices      [[buffer(7)]],
-    const device uint* kv_page_indptr       [[buffer(8)]],
-    const constant int& page_size           [[buffer(9)]],
-    const constant int& n_kv_heads          [[buffer(10)]],
-    const constant float& scale             [[buffer(11)]],
-    const device uchar* attention_mask      [[buffer(12)]],
-    const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
-    const constant int& window                 [[buffer(15)]],
-    const device T* sinks                      [[buffer(16)]],  // [n_q_heads], WITH_SINK only
-    const constant int& n_rows                 [[buffer(17)]],  // N; the grid rounds up past it
-    uint3 tid       [[threadgroup_position_in_grid]],
-    uint3 tpg       [[threadgroups_per_grid]],
-    uint simd_gid   [[simdgroup_index_in_threadgroup]],
-    uint simd_lid   [[thread_index_in_simdgroup]]) {
+// The tiled kernel's shape constants. At file scope because Metal forbids a
+// non-kernel function from DECLARING threadgroup memory: the arrays have to be
+// declared in the entry point and handed down, so both need these sizes.
+constant constexpr int kSdpaQT = 32;                            // query rows per threadgroup
+template <int D> constexpr int sdpa_kt() { return 4096 / D; }
+template <int D, bool KPL> constexpr int sdpa_kq() { return KPL ? kSdpaQT * D : 1; }
+template <int D, bool KPL> constexpr int sdpa_kp_tile() {
+  return KPL ? kSdpaQT * sdpa_kt<D>() : 1;
+}
+// K's rows are read one per LANE in the lane-per-key shape, so a bare `D`
+// stride puts all thirty-two lanes in one bank; two elements of padding walks
+// them across banks instead.
+template <int D, bool KPL> constexpr int sdpa_kstride() { return KPL ? D + 2 : D; }
+
+/// The body, shared by the two entry points below.
+///
+/// `q_row_pitch` / `o_row_pitch` are the distance between one ROW of `queries`
+/// / `out` and the next, in elements, or 0 for the packed layout the batched
+/// decode uses. A prefill is the case that needs them: it lays every scratch
+/// value's rows a uniform `scratch_widest_elems` apart, which is wider than
+/// `n_q_heads * D`, so a kernel that assumed packed would walk into the next
+/// row's tensor and read plausible garbage rather than fail. The non-paged
+/// `Sdpa` kind has carried `QRowStride`/`ORowStride` for exactly this reason
+/// since the prefill first needed it; this is the paged twin.
+///
+/// Two entry points rather than one kernel with an extra buffer, because
+/// gemma4, gpt-oss and llama all run the packed pipeline: a buffer the kernel
+/// DECLARES and their bind tables do not set is not a slot they waste, it is
+/// their attention reading an unbound argument.
+template <typename T, int D, int V, bool WITH_SINK, bool KEY_PER_LANE>
+inline void sdpa_paged_tiled_body(
+    const device T* queries,
+    const device T* k_pages,
+    const device T* v_pages,
+    device T* out,
+    const int gqa_factor,
+    const device int* position_ids,
+    const device int* req_of_token,
+    const device uint* kv_page_indices,
+    const device uint* kv_page_indptr,
+    const int page_size,
+    const int n_kv_heads,
+    const float scale,
+    const device uchar* attention_mask,
+    const uint attention_mask_stride,
+    const device uchar* attention_mask_enabled,
+    const int window,
+    const device T* sinks,
+    const int n_rows,
+    const int q_row_pitch,
+    const int o_row_pitch,
+    threadgroup T* ktile,
+    threadgroup T* vtile,
+    threadgroup T* qtile,
+    threadgroup float* ptile,
+    uint3 tid,
+    uint3 tpg,
+    uint simd_gid,
+    uint simd_lid) {
   // One staged tile serves both sides, so V must equal D. Every instantiation
   // in this driver has square heads; the static_assert is here so that the day
   // one does not, it fails to compile rather than reading V's values out of a
@@ -324,18 +359,11 @@ template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LAN
   // only 62% of the arithmetic it sits on, against 250% at d=64. So the wide
   // heads keep the per-row shape, and this is compiled for the two widths where
   // it both fits and pays.
-  constexpr int kq = KEY_PER_LANE ? QT * D : 1;
-  constexpr int kp_tile = KEY_PER_LANE ? QT * KT : 1;
   // K's rows are read one per LANE in that shape, so a bare `D` stride puts all
   // thirty-two lanes in one bank. Two elements of padding walks them across
   // banks instead.
   constexpr int kstride = KEY_PER_LANE ? D + 2 : D;
   constexpr int kcols = KEY_PER_LANE ? (KT + 31) / 32 : 1;
-
-  threadgroup T ktile[KT * kstride];
-  threadgroup T vtile[KT * D];
-  threadgroup T qtile[kq];
-  threadgroup U ptile[kp_tile];
 
   const int q_head    = int(tid.x);
   const int n_q_heads = int(tpg.x);
@@ -350,7 +378,9 @@ template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LAN
   for (int i = 0; i < per_lane; i++) o[i] = 0;
   if (live) {
     const device T* qp =
-        queries + (size_t(row) * n_q_heads + q_head) * D + simd_lid * per_lane;
+        queries + (q_row_pitch > 0 ? size_t(row) * size_t(q_row_pitch)
+                                  : size_t(row) * size_t(n_q_heads) * size_t(D)) +
+        size_t(q_head) * size_t(D) + simd_lid * per_lane;
     for (int i = 0; i < per_lane; i++) q[i] = static_cast<U>(scale) * static_cast<U>(qp[i]);
     // The lane-per-key shape needs the WHOLE row where the lane owns a slice of
     // it, so the row goes to threadgroup memory once. Unscaled: these are the
@@ -512,12 +542,107 @@ template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LAN
     orescale = sdpa_merge_sink(sink, max_score, sum_exp_score);
   }
 
-  device T* op = out + (size_t(row) * n_q_heads + q_head) * V + simd_lid * per_lane;
+  device T* op = out +
+                 (o_row_pitch > 0 ? size_t(row) * size_t(o_row_pitch)
+                                  : size_t(row) * size_t(n_q_heads) * size_t(V)) +
+                 size_t(q_head) * size_t(V) + simd_lid * per_lane;
   for (int j = 0; j < per_lane; j++) {
     const U x = o[j] * orescale;
     op[j] = static_cast<T>(sum_exp_score == 0 ? x : x / sum_exp_score);
   }
 }
+
+template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LANE = false>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_tiled(
+    const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
+    const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],   // [N, n_q_heads, V]
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],  // [n_q_heads], WITH_SINK only
+    const constant int& n_rows                 [[buffer(17)]],  // N; the grid rounds up past it,
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  threadgroup T ktile[sdpa_kt<D>() * sdpa_kstride<D, KEY_PER_LANE>()];
+  threadgroup T vtile[sdpa_kt<D>() * D];
+  threadgroup T qtile[sdpa_kq<D, KEY_PER_LANE>()];
+  threadgroup float ptile[sdpa_kp_tile<D, KEY_PER_LANE>()];
+  sdpa_paged_tiled_body<T, D, V, WITH_SINK, KEY_PER_LANE>(
+      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
+      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      attention_mask, attention_mask_stride, attention_mask_enabled, window,
+      sinks, n_rows,
+      /*q_row_pitch=*/0, /*o_row_pitch=*/0,
+      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
+}
+
+/// The prefill's twin: q and out rows a uniform pitch apart. See the body.
+template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LANE = false>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_tiled_strided(
+    const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
+    const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],   // [N, n_q_heads, V]
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],  // [n_q_heads], WITH_SINK only
+    const constant int& n_rows                 [[buffer(17)]],  // N; the grid rounds up past it,
+    const constant int& q_row_pitch            [[buffer(18)]],
+    const constant int& o_row_pitch            [[buffer(19)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  threadgroup T ktile[sdpa_kt<D>() * sdpa_kstride<D, KEY_PER_LANE>()];
+  threadgroup T vtile[sdpa_kt<D>() * D];
+  threadgroup T qtile[sdpa_kq<D, KEY_PER_LANE>()];
+  threadgroup float ptile[sdpa_kp_tile<D, KEY_PER_LANE>()];
+  sdpa_paged_tiled_body<T, D, V, WITH_SINK, KEY_PER_LANE>(
+      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
+      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      attention_mask, attention_mask_stride, attention_mask_enabled, window,
+      sinks, n_rows,
+      q_row_pitch, o_row_pitch,
+      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
+}
+
+#define instantiate_sdpa_tiled_strided(fn, name, itype, d, v, sink, kpl)   \
+  template [[host_name(fn "_" #name "_d_" #d)]]                            \
+  [[kernel]] void sdpa_paged_tiled_strided<itype, d, v, sink, kpl>(        \
+      const device itype*, const device itype*, const device itype*,       \
+      device itype*, const constant int&, const device int*,               \
+      const device int*, const device uint*, const device uint*,           \
+      const constant int&, const constant int&, const constant float&,     \
+      const device uchar*, const device uint&, const device uchar*,        \
+      const constant int&, const device itype*, const constant int&,       \
+      const constant int&, const constant int&,                            \
+      uint3, uint3, uint, uint);
+
+// qwen3.5's head width; the only family whose prefill batches this kernel.
+instantiate_sdpa_tiled_strided("sdpa_paged_tiled_strided", bfloat16, bfloat, 256, 256, false, false)
 
 #define instantiate_sdpa_tiled_impl(fn, name, itype, d, v, sink, kpl)      \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \

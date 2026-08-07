@@ -360,6 +360,10 @@ bool load_multibatch_psos(RawMetalContext& ctx,
              &out.residual_add_strided);
         want("moe_route.metal", "shared_expert_combine_strided",
              &out.shared_expert_combine_strided);
+        if (features.sdpa_d256) {
+            want("sdpa_paged.metal", "sdpa_paged_tiled_strided_bfloat16_d_256",
+                 &out.sdpa_paged_tiled_strided);
+        }
     }
 
     std::vector<std::string> errors;

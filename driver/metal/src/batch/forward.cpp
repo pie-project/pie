@@ -1869,6 +1869,20 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                         case Kernel::LlSharedCombine:
                             ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
                             break;
+                        // The batched attention. `Rows` is what lets its grid
+                        // round up to whole query tiles and still retire the
+                        // partial one; the two pitches are what let it read a
+                        // prefill's scratch, whose rows are a uniform
+                        // `scratch_widest_elems` apart rather than packed.
+                        // Bound on the PACKED pipeline's kind too, because
+                        // which of the two runs is decided per fire, after
+                        // this table is written.
+                        case Kernel::SdpaPaged:
+                            if (prefill_rows_.valid())
+                                ctx_->arg_bind_ordinal(d.ordinal, 17, prefill_rows_);
+                            ctx_->arg_bind_ordinal(d.ordinal, 18, prefill_row_stride_);
+                            ctx_->arg_bind_ordinal(d.ordinal, 19, prefill_row_stride_);
+                            break;
                         case Kernel::Rope:
                         case Kernel::RopeK:
                             ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
