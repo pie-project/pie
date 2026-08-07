@@ -844,14 +844,28 @@ void kimi_k3_forward_paged(
                 // relaxing the bind's hard require without it would turn a
                 // loud load failure into a quiet prefill hole.
                 //
-                // THE COST, stated rather than discovered on a GPU: prefill
-                // stops being one batched GEMM across every active expert and
-                // becomes a serial loop over them -- at K3's shape up to 896
-                // experts on each of 93 layers. DeepSeek-V4 justifies that
-                // dispatch as noise against an SSD read, and that argument
-                // holds *here*, where the SSD read is paid anyway, and
-                // nowhere else. It is precisely why this branch is reached
-                // only when the contract published no stacks to batch.
+                // TWO COSTS, both stated here rather than discovered on a GPU.
+                //
+                // ONE: prefill stops being one batched GEMM across every
+                // active expert and becomes a serial loop over them -- at
+                // K3's shape up to 896 experts on each of its MoE layers.
+                // DeepSeek-V4 justifies that dispatch as noise against an SSD
+                // read, and that argument holds *here*, where the SSD read is
+                // paid anyway, and nowhere else. It is precisely why this
+                // branch is reached only when the contract published no
+                // stacks to batch.
+                //
+                // TWO: the routing has to come back to the host to drive the
+                // loop, so this branch spends a full `cudaStreamSynchronize`
+                // per MoE layer -- 92 of K3's 93 layers, layer 0 being the
+                // dense one. The three paths it replaces are enqueue-only, so
+                // this barrier is new, and it is not a rounding error: it
+                // converts a pipeline that ran the host ahead of the device
+                // into one that rendezvous 92 times a forward. Inherent to
+                // host-side per-expert dispatch rather than a defect of this
+                // implementation -- every family that pages experts pays it,
+                // and it is the second reason `graph_safe` goes off -- but
+                // #1609 should expect both costs, not just the loop.
                 if (ws.aligned_block_size <= 0 || ws.route_w.numel() == 0) {
                     throw std::runtime_error("kimi_k3: streamed MoE scratch missing");
                 }
