@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "../device_tuning.hpp"
 #include "../model/qwen3_5/decode_dispatch_mb.hpp"
 
 namespace pie::metal {
@@ -253,10 +254,19 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         // number the sort padded every expert's run to, and a tile that
         // disagreed with the padding would read one expert's weights for
         // another's rows.
+        //
+        // FP16 is a NAME choice: both forms take the same buffers, grid and
+        // `tile_expert` contract, so nothing downstream of here can tell. The
+        // one family that must NOT take it is llama, whose routed top-k moved
+        // under FP16 in `llama_numerics_test` -- and llama builds its own
+        // routed table in `model/llama/kernels.cpp`, so it never reaches this.
+        const bool fp16 = fp16_qmm() && quant.bits == 4 && quant.group == 64;
+        const std::string routed =
+            fp16 ? "affine_qmm_t_routed_fp16" + q : "affine_qmm_t_routed" + q;
         for (int t = 0; t < 3; ++t) {
             for (int i = 0; i < 3; ++i) {
                 want(qmm,
-                     "affine_qmm_t_routed" + q + "_bm_" +
+                     routed + "_bm_" +
                          std::to_string(shared_kernels::kMoeTileWidths[t]) + "_bn_" +
                          std::to_string(16 << i),
                      &out.qmm_routed[t][i]);
