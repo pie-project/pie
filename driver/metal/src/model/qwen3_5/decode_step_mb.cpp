@@ -725,25 +725,31 @@ void encode_prefill_dags_mb(StepEncoder& se,
             // 1396 tok/s: at that width a matrix tile's setup costs more than
             // the four-vector reuse above saves.
             if (out != 0 && out % 32 == 0) {
-                const bool wide = qmm_strided_bm(strided_rows) > kQmmBM &&
-                                  mb_psos.qmm_t_strided_wide.valid();
+                static_assert(kQmmBMCount == 3,
+                              "the strided PSO arrays in DecodeStepPsos are sized 3 "
+                              "and indexed by qmm_bm_slot; a fourth rung has to widen "
+                              "them in the same commit");
                 const bool fp16 = mb_psos.qmm_t_strided_cast.valid() &&
-                                  mb_psos.qmm_t_strided_fp16_precast.valid();
-                const Pso& gemm = fp16
-                    ? (wide ? (d0.fuse_residual
-                                   ? mb_psos.qmm_t_strided_fp16_precast_wide_residual
-                                   : mb_psos.qmm_t_strided_fp16_precast_wide)
-                            : (d0.fuse_residual
-                                   ? mb_psos.qmm_t_strided_fp16_precast_residual
-                                   : mb_psos.qmm_t_strided_fp16_precast))
-                    : (wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
-                                                : mb_psos.qmm_t_strided_wide)
-                            : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
-                                                : mb_psos.qmm_t_strided));
+                                  mb_psos.qmm_t_strided_fp16_precast[0].valid();
+                const Pso* rungs = fp16
+                    ? (d0.fuse_residual ? mb_psos.qmm_t_strided_fp16_precast_residual
+                                        : mb_psos.qmm_t_strided_fp16_precast)
+                    : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
+                                        : mb_psos.qmm_t_strided);
+                // The rung the row count earns, narrowed to one that actually
+                // loaded. Narrowing has to move the GRID with it -- the kernel
+                // takes no M and reaches its row count through grid.y alone, so
+                // a BM=64 pipeline dispatched on a BM=32 grid writes sixty-four
+                // rows into a thirty-two-row tile. A 32-row prefill did exactly
+                // that and fell from 84.2 tok/s to 51.7 while still answering
+                // correctly, because the rows it trampled were the padding.
+                int bm = qmm_strided_bm(strided_rows);
+                while (bm > kQmmBM && !rungs[qmm_bm_slot(bm)].valid()) bm /= 2;
+                const Pso& gemm = rungs[qmm_bm_slot(bm)];
                 if (gemm.valid()) {
                     Grid grid;
                     Threadgroup tg;
-                    qmm_t_strided_dispatch(out, strided_rows, grid, tg);
+                    qmm_t_strided_dispatch(out, strided_rows, bm, grid, tg);
                     if (fp16) {
                         se.set_pso(mb_psos.qmm_t_strided_cast);
                         se.set_argtable(d0.kind, d0.ordinal);

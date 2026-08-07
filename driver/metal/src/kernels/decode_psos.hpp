@@ -120,14 +120,20 @@ struct MultiBatchPsos {
     Pso qmm_cast_bf16_f16{};
     Pso qmm_splitk_reduce{};
     Pso qmm_splitk_reduce_f32{};
-    Pso qmm_t_strided{};
-    Pso qmm_t_strided_wide{};
-    Pso qmm_t_strided_wide_residual{};
-    Pso qmm_t_strided_residual{};
-    Pso qmm_t_strided_fp16_precast{};
-    Pso qmm_t_strided_fp16_precast_wide{};
-    Pso qmm_t_strided_fp16_precast_residual{};
-    Pso qmm_t_strided_fp16_precast_wide_residual{};
+    /// The prefill's batched projection, one entry per `kQmmBMs` rung
+    /// (16 / 32 / 64 rows a tile), indexed by `qmm_bm_slot`.
+    ///
+    /// This was a narrow/wide PAIR, and the pair was the reason a 128-row
+    /// prompt ran at BM=32: `qmm_strided_bm` capped itself at 32 because that
+    /// was the widest thing there was a slot for, while the decode GEMM beside
+    /// it had had a third rung since `kQmmBMs` became a list. The dimension is
+    /// 3 rather than `kQmmBMCount` for the reason `qmm_t_fp16_precast[3][3]`
+    /// is: this header must not depend on a model's dispatch header, so
+    /// `decode_step_mb.cpp` static_asserts the two agree.
+    Pso qmm_t_strided[3]{};
+    Pso qmm_t_strided_residual[3]{};
+    Pso qmm_t_strided_fp16_precast[3]{};
+    Pso qmm_t_strided_fp16_precast_residual[3]{};
     Pso qmm_t_strided_cast{};
     Pso qmv_wide_strided{};
     // Row-independent prefill kernels with an explicit row pitch, so a whole

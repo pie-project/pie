@@ -283,29 +283,28 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         want(qmm, "qmm_splitk_reduce_f32_bfloat16",
              &out.qmm_splitk_reduce_f32);
     }
+    // The three row-block rungs, in `kQmmBMs` order. A rung the checkpoint's
+    // quantization has no instantiation for stays invalid and the encoder falls
+    // back to the widest one that loaded.
+    static constexpr const char* kStridedBm[3] = {"_bm_16_bn_32", "_bm_32_bn_32",
+                                                  "_bm_64_bn_32"};
     if (features.strided) {
-        want(qmm, "affine_qmm_t_strided" + q + "_bm_16_bn_32",
-             &out.qmm_t_strided);
-        want(qmm, "affine_qmm_t_strided" + q + "_bm_32_bn_32",
-             &out.qmm_t_strided_wide);
-        if (features.residual) {
-            want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_16_bn_32",
-                 &out.qmm_t_strided_residual);
-            want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_32_bn_32",
-                 &out.qmm_t_strided_wide_residual);
+        for (int r = 0; r < 3; ++r) {
+            want(qmm, "affine_qmm_t_strided" + q + kStridedBm[r],
+                 &out.qmm_t_strided[r]);
+            if (features.residual) {
+                want(qmm, "affine_qmm_t_strided_residual" + q + kStridedBm[r],
+                     &out.qmm_t_strided_residual[r]);
+            }
         }
     }
     if (features.fp16_strided && quant.group == 64 && quant.bits == 4) {
-        want(qmm, "affine_qmm_t_strided_fp16_precast" + q + "_bm_16_bn_32",
-             &out.qmm_t_strided_fp16_precast);
-        want(qmm, "affine_qmm_t_strided_fp16_precast" + q + "_bm_32_bn_32",
-             &out.qmm_t_strided_fp16_precast_wide);
-        want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q +
-                     "_bm_16_bn_32",
-             &out.qmm_t_strided_fp16_precast_residual);
-        want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q +
-                     "_bm_32_bn_32",
-             &out.qmm_t_strided_fp16_precast_wide_residual);
+        for (int r = 0; r < 3; ++r) {
+            want(qmm, "affine_qmm_t_strided_fp16_precast" + q + kStridedBm[r],
+                 &out.qmm_t_strided_fp16_precast[r]);
+            want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q + kStridedBm[r],
+                 &out.qmm_t_strided_fp16_precast_residual[r]);
+        }
         want(qmm, "cast_qmm_input_strided_bfloat16_to_float16",
              &out.qmm_t_strided_cast);
         want(qmm, "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",

@@ -297,7 +297,8 @@ inline int qmm_strided_bm(int padded_rows) {
     static const bool off = std::getenv("PIE_METAL_NO_PREFILL_BM32") != nullptr;
     // The strided form is instantiated as a narrow/wide PAIR, not over
     // `kQmmBMs`, so it stops at 32 whatever the aligned table grew to.
-    return (!off && padded_rows >= 32) ? 32 : kQmmBM;
+    if (off) return kQmmBM;
+    return padded_rows >= 64 ? 64 : (padded_rows >= 32 ? 32 : kQmmBM);
 }
 
 inline int qmm_strided_rows(int N, int max_rows) {
@@ -306,10 +307,13 @@ inline int qmm_strided_rows(int N, int max_rows) {
     return padded <= max_rows ? padded : 0;
 }
 
-inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, Grid& g,
+/// `bm` is passed rather than recomputed: the encoder may have had to narrow it
+/// to a rung whose pipeline exists, and the grid is the ONLY thing that tells
+/// this kernel how many rows it has.
+inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, int bm, Grid& g,
                                    Threadgroup& tg) {
     g  = Grid{32u * (uint32_t(out_vec) / 32u),
-              2u * (uint32_t(padded_rows) / uint32_t(qmm_strided_bm(padded_rows))), 2};
+              2u * (uint32_t(padded_rows) / uint32_t(bm > 0 ? bm : kQmmBM)), 2};
     tg = Threadgroup{32, 2, 2};
 }
 

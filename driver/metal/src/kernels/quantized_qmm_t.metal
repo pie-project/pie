@@ -2531,6 +2531,12 @@ instantiate_qmm_t_strided(128, 32, 32, 32, 4)
 instantiate_qmm_t_strided(64, 32, 32, 32, 8)
 instantiate_qmm_t_strided(32, 32, 32, 32, 8)
 instantiate_qmm_t_strided(128, 32, 32, 32, 8)
+instantiate_qmm_t_strided(64, 64, 32, 32, 4)
+instantiate_qmm_t_strided(32, 64, 32, 32, 4)
+instantiate_qmm_t_strided(128, 64, 32, 32, 4)
+instantiate_qmm_t_strided(64, 64, 32, 32, 8)
+instantiate_qmm_t_strided(32, 64, 32, 32, 8)
+instantiate_qmm_t_strided(128, 64, 32, 32, 8)
 
 #define instantiate_qmm_t_strided_fp16_precast(bm, residual, name)           \
   template [[host_name("affine_qmm_t_strided_fp16_precast" name              \
@@ -2545,6 +2551,8 @@ instantiate_qmm_t_strided_fp16_precast(16, false, "")
 instantiate_qmm_t_strided_fp16_precast(32, false, "")
 instantiate_qmm_t_strided_fp16_precast(16, true, "_residual")
 instantiate_qmm_t_strided_fp16_precast(32, true, "_residual")
+instantiate_qmm_t_strided_fp16_precast(64, false, "")
+instantiate_qmm_t_strided_fp16_precast(64, true, "_residual")
 
 template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
 [[kernel]] void affine_qmv_wide_strided(
