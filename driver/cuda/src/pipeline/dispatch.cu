@@ -4,6 +4,8 @@
 
 #include "pipeline/dispatch.hpp"
 
+#include "kernels/pack_dense_mask.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -346,7 +348,11 @@ constexpr std::uint64_t kNoDescriptorReadyOffset =
 constexpr std::size_t kDescriptorCopiesPerBlock = 8;
 constexpr std::size_t kDescriptorCopyChunkBytes = 4096;
 constexpr std::size_t kFixedDecodeInitialLanes = 512;
-constexpr std::size_t kFixedDecodePortCount = 7;
+// Eight, not seven: the dense `AttnMask` cell is a lane SOURCE like any other
+// descriptor. It used to be the one device-carried port the compose could not
+// reach, which is the whole reason masked decode fell out of this class and
+// onto the host-readback path that cannot fuse k-deep.
+constexpr std::size_t kFixedDecodePortCount = 8;
 
 struct DescriptorPackCopy {
     std::uint64_t source = 0;
@@ -525,6 +531,11 @@ struct FixedDecodeLane {
     std::uint64_t kv_len = 0;
     std::uint64_t w_slot = 0;
     std::uint64_t w_off = 0;
+    // Dense [1, stride] bool mask cell for this lane; 0 = the program binds
+    // no mask. `mask_stride` is the DECLARED key extent of that cell, which
+    // is the row pitch the gather reads with — the LIVE extent is `kv_len`
+    // and is what the pack kernel bounds each row by.
+    std::uint64_t attn_mask = 0;
     std::uint64_t ready[kFixedDecodePortCount] = {};
     std::uint64_t pass_commit = 0;
     std::uint64_t translation = 0;
@@ -533,9 +544,18 @@ struct FixedDecodeLane {
         std::numeric_limits<std::uint64_t>::max();
     std::uint32_t translation_len = 0;
     std::uint32_t pages_capacity = 0;
+    std::uint32_t mask_stride = 0;
 };
 
 struct FixedDecodeOutputs {
+    // Dense mask gather target, [lanes, mask_stride] bytes, and the packed
+    // CSR the FlashInfer custom-mask ABI takes. `mask_klen` is the LIVE key
+    // extent per lane, which is exactly `kv_len` — the physical span
+    // `(pages - 1) * page_size + last_page_len` reduces to it — so the mask
+    // needs no derivation the compose was not already doing.
+    std::uint8_t* dense_mask = nullptr;
+    std::uint32_t* mask_klen = nullptr;
+    std::uint32_t mask_stride = 0;
     std::uint32_t* token_ids = nullptr;
     std::uint32_t* position_ids = nullptr;
     std::uint32_t* qo_indptr = nullptr;
@@ -603,6 +623,55 @@ enum FixedDecodeKillReason : std::uint32_t {
     kKillWriteBounds   = 1u << 6,   // write position outside [lower, upper)
     kKillTranslation   = 1u << 7,   // a translated page is past device_pages
 };
+
+// Copy each lane's dense mask cell into the contiguous [lanes, stride]
+// tensor `launch_pack_dense_mask` reads. One block per lane, threads across
+// the row — the cells are separate ring allocations, so a gather is what
+// makes them a tensor. A lane with no mask, or a dead one, leaves its row
+// zeroed (the caller pre-zeroes), which reads as "attends nothing" and is
+// only ever seen by a row `row_valid` already marked dead.
+// The mask CSR the pack kernel takes as input. `frame.cpp` builds this on the
+// host from host-known klens; here the klens are device-composed, so the
+// offsets are too. Lane counts are a batch width (tens), so one serial thread
+// is the right shape — a scan launch would cost more than it saves.
+__global__ void build_fixed_decode_mask_indptr(
+    const std::uint32_t* klen,
+    const std::uint32_t* qo_indptr,
+    std::int32_t* mask_indptr,
+    std::uint32_t lane_count) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    std::int32_t cursor = 0;
+    mask_indptr[0] = 0;
+    for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
+        const std::uint32_t queries =
+            qo_indptr[lane + 1] - qo_indptr[lane];
+        const std::uint64_t bits =
+            static_cast<std::uint64_t>(queries) * klen[lane];
+        cursor += static_cast<std::int32_t>((bits + 7) / 8);
+        mask_indptr[lane + 1] = cursor;
+    }
+}
+
+__global__ void gather_fixed_decode_masks(
+    const FixedDecodeLane* lanes,
+    std::uint32_t lane_count,
+    std::uint8_t* dense_mask,
+    std::uint32_t stride) {
+    const std::uint32_t lane_index = blockIdx.x;
+    if (lane_index >= lane_count) return;
+    const FixedDecodeLane& lane = lanes[lane_index];
+    if (lane.attn_mask == 0) return;
+    const std::uint32_t width =
+        lane.mask_stride < stride ? lane.mask_stride : stride;
+    const auto* source =
+        fixed_decode_pointer<std::uint8_t>(lane.attn_mask);
+    if (source == nullptr) return;
+    std::uint8_t* destination =
+        dense_mask + static_cast<std::size_t>(lane_index) * stride;
+    for (std::uint32_t i = threadIdx.x; i < width; i += blockDim.x) {
+        destination[i] = source[i];
+    }
+}
 
 __global__ void compose_fixed_decode(
     const FixedDecodeLane* lanes,
@@ -816,6 +885,12 @@ __global__ void compose_fixed_decode(
         active
             ? ((kv_len - 1) % output.page_size) + 1
             : 1;
+    // The mask's live key extent. `frame.cpp`'s host pack spells this as
+    // `(pages - 1) * page_size + last_page_len`; with `last_page_len`
+    // derived from `kv_len` one line above, that expression IS `kv_len`.
+    if (output.mask_klen != nullptr) {
+        output.mask_klen[request] = active ? kv_len : 0;
+    }
     output.w_page[row] = write_page;
     output.w_off[row] = write_offset;
     if (!active && output.rs_slot_ids != nullptr) {
@@ -1764,6 +1839,10 @@ struct StagedLaunch::State {
     std::vector<std::uint32_t> fixed_decode_translation_begin;
     std::vector<std::size_t> fixed_decode_position_offset;
     std::uint32_t fixed_decode_page_size = 0;
+    // Widest declared mask cell across this step's lanes — the gather's row
+    // pitch. Derived where the lanes are staged, so no caller has to know a
+    // channel's declared width to hand the compose its mask buffers.
+    std::uint32_t fixed_decode_mask_stride = 0;
     std::uint32_t fixed_decode_device_pages = 0;
     Dispatch::FixedDecodeScope fixed_decode_scope{};
     bool decode_envelopes_staged = false;
@@ -7937,9 +8016,15 @@ bool Dispatch::stage_fixed_decode(
             }
             program_ports.by_tag[binding.port] = &binding;
         }
-        if (program_ports.by_tag[kPortAttnMask] != nullptr) {
+        // A CONST mask is wire territory and the compose has no source cell
+        // to gather from; a CHANNEL one is the eighth lane source.
+        if (program_ports.by_tag[kPortAttnMask] != nullptr &&
+            program_ports.by_tag[kPortAttnMask]->is_const) {
             if (err != nullptr) {
-                *err = "ptir fixed decode cannot compose attention-mask ports";
+                *err = "ptir fixed decode cannot compose a CONST "
+                       "attention-mask port (a channel-bound dense mask is "
+                       "gathered and packed on device; a const one is a wire "
+                       "mask the host synthesizes rows for)";
             }
             return false;
         }
@@ -8083,6 +8168,7 @@ bool Dispatch::stage_fixed_decode(
             view.position_ids.data()[program_begin + lane_index]);
     }
     std::vector<FixedDecodeLane> lanes(programs);
+    std::uint32_t mask_stride = 0;
     for (std::size_t lane_index = 0; lane_index < programs; ++lane_index) {
         const std::size_t program = program_begin + lane_index;
         ProgramPorts& program_ports = ports[lane_index];
@@ -8101,6 +8187,7 @@ bool Dispatch::stage_fixed_decode(
             kPortKvLen,
             kPortWSlot,
             kPortWOff,
+            kPortAttnMask,
         };
         std::uint64_t* sources[] = {
             &lane.token,
@@ -8110,6 +8197,7 @@ bool Dispatch::stage_fixed_decode(
             &lane.kv_len,
             &lane.w_slot,
             &lane.w_off,
+            &lane.attn_mask,
         };
         for (std::size_t index = 0;
              index < kFixedDecodePortCount;
@@ -8141,6 +8229,14 @@ bool Dispatch::stage_fixed_decode(
                       channel_view.d_full() +
                       static_cast<std::size_t>(slot) * kMaxRing +
                       cursor.head_index);
+            if (ports_in_lane[index] == kPortAttnMask) {
+                // A [1, stride] bool cell is `stride` NATIVE bytes, so the
+                // cell width IS the row pitch. No host read of the mask
+                // anywhere on this path — the gather gets the same device
+                // address every other descriptor arrives as.
+                lane.mask_stride =
+                    static_cast<std::uint32_t>(cell_bytes);
+            }
         }
         lane.pass_commit = reinterpret_cast<std::uintptr_t>(
             staged.lanes[program]->snapshot->device);
@@ -8150,6 +8246,7 @@ bool Dispatch::stage_fixed_decode(
             lane.write_upper_bound =
                 view.ptir_kv_write_upper_bounds.data()[program];
         }
+        if (lane.mask_stride > mask_stride) mask_stride = lane.mask_stride;
         lane.translation_len = program_ports.translation_len;
         lane.pages_capacity = program_ports.pages_capacity;
     }
@@ -8163,6 +8260,7 @@ bool Dispatch::stage_fixed_decode(
         staged.fixed_decode_position_offset[lane_index] =
             ports[lane_index].wire_position_offset;
     }
+    staged.fixed_decode_mask_stride = mask_stride;
     staged.fixed_decode_lanes = std::move(lanes);
     staged.fixed_decode_upload_values = std::move(upload_values);
     staged.fixed_decode_page_size = page_size;
@@ -8294,7 +8392,15 @@ bool Dispatch::enqueue_fixed_decode(
             staged.fixed_decode_lanes,
             staged.fixed_decode_upload_values,
             staged.stream);
+    const bool compose_mask =
+        buffers.dense_mask != nullptr && buffers.mask_klen != nullptr &&
+        buffers.custom_mask != nullptr &&
+        buffers.custom_mask_indptr != nullptr &&
+        staged.fixed_decode_mask_stride != 0;
     const FixedDecodeOutputs outputs{
+        .dense_mask = compose_mask ? buffers.dense_mask : nullptr,
+        .mask_klen = compose_mask ? buffers.mask_klen : nullptr,
+        .mask_stride = staged.fixed_decode_mask_stride,
         .token_ids = buffers.token_ids,
         .position_ids = buffers.position_ids,
         .qo_indptr = buffers.qo_indptr,
@@ -8328,6 +8434,45 @@ bool Dispatch::enqueue_fixed_decode(
         static_cast<std::uint32_t>(programs),
         outputs);
     CUDA_CHECK(cudaGetLastError());
+    if (compose_mask) {
+        // Gather the lanes' mask cells into one tensor, then pack it with
+        // the SAME kernel the host path uses. Only the middle of the chain
+        // was ever missing: the cells were already device-resident and
+        // `launch_pack_dense_mask` already took device pointers, so the mask
+        // was making a D2H/H2D round trip to travel between two device
+        // buffers.
+        const std::size_t gather_bytes =
+            static_cast<std::size_t>(programs) *
+            staged.fixed_decode_mask_stride;
+        CUDA_CHECK(cudaMemsetAsync(
+            buffers.dense_mask, 0, gather_bytes, staged.stream));
+        CUDA_CHECK(cudaMemsetAsync(
+            buffers.custom_mask, 0, buffers.custom_mask_capacity,
+            staged.stream));
+        gather_fixed_decode_masks<<<
+            static_cast<std::uint32_t>(programs), 256, 0, staged.stream>>>(
+            device_lanes,
+            static_cast<std::uint32_t>(programs),
+            buffers.dense_mask,
+            staged.fixed_decode_mask_stride);
+        CUDA_CHECK(cudaGetLastError());
+        build_fixed_decode_mask_indptr<<<1, 1, 0, staged.stream>>>(
+            buffers.mask_klen,
+            buffers.qo_indptr,
+            buffers.custom_mask_indptr,
+            static_cast<std::uint32_t>(programs));
+        CUDA_CHECK(cudaGetLastError());
+        kernels::launch_pack_dense_mask(
+            buffers.dense_mask,
+            buffers.mask_klen,
+            buffers.qo_indptr,
+            buffers.custom_mask_indptr,
+            buffers.custom_mask,
+            static_cast<int>(programs),
+            static_cast<int>(staged.fixed_decode_mask_stride),
+            staged.stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
     CUDA_CHECK(cudaMemcpyAsync(
         state.h_fixed_decode_kills,
         state.d_fixed_decode_kills,
@@ -8724,8 +8869,11 @@ bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
                 if (slot != nullptr) return false;
                 slot = &binding;
             }
-            if (dynamic[kPortAttnMask] != nullptr ||
-                constants[kPortAttnMask] != nullptr ||
+            // A CONST mask is still wire territory; a CHANNEL one is a
+            // lane source the compose now gathers and packs, so it no longer
+            // disqualifies the template — which is what kept masked decode
+            // off the fusable path and on host readback.
+            if (constants[kPortAttnMask] != nullptr ||
                 (dynamic[kPortEmbedIndptr] == nullptr &&
                  !constant_is(
                      constants[kPortEmbedIndptr], default_indptr)) ||

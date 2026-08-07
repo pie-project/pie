@@ -2280,6 +2280,12 @@ void prepare_step(
             }
             const std::uint32_t request_base =
                 s.composed.prog_request_starts[envelope_begin];
+            // A DEVICE-carried mask: the guest bound `AttnMask` to a
+            // channel and the engine sent no wire rows for it. That is the
+            // whole condition — the cells are already device-resident, so
+            // the compose gathers and packs them without a host round trip.
+            const bool device_mask_compose =
+                view.has_user_mask && view.flattened_masks.empty();
             s.use_fixed_decode = true;
             s.fixed_buffers = pipeline::FixedDecodeDeviceBuffers{
                 .token_ids = pi.tokens.data(),
@@ -2296,12 +2302,30 @@ void prepare_step(
                 // The wire path uploads the whole step's sampling rows;
                 // the kernel must not rewrite them.
                 .sample_indices = nullptr,
+                .dense_mask = device_mask_compose
+                    ? pi.dense_mask.data() : nullptr,
+                .mask_klen = device_mask_compose
+                    ? pi.structured_mask_klen.data() : nullptr,
+                .custom_mask = device_mask_compose
+                    ? pi.custom_mask.data() : nullptr,
+                .custom_mask_indptr = device_mask_compose
+                    ? pi.custom_mask_indptr.data() : nullptr,
+                .custom_mask_capacity = device_mask_compose
+                    ? pi.custom_mask.size() : 0,
                 .token_capacity = pi.tokens.size(),
                 .request_capacity = pi.kv_last_page_lens.size(),
                 .page_capacity = pi.kv_page_indices.size(),
                 .dummy_page = static_cast<std::uint32_t>(
                     engine.graph_pad_page),
             };
+            if (device_mask_compose) {
+                // The compose fills `pi.custom_mask` on the stream, so the
+                // body's custom-mask arm is what must run — the same arm a
+                // host-packed mask takes. Nothing here stages bytes; the
+                // count the graph-pad path wants stays host-unknown and its
+                // padding is gated on `graph_pad_requests` anyway.
+                s.have_custom_mask = true;
+            }
             std::string mixed_error;
             staged_ok = engine.dispatch->stage_fixed_decode(
                 s.dispatch_view,
@@ -2324,6 +2348,12 @@ void prepare_step(
                 throw std::runtime_error(mixed_error);
             }
         } else if (engine.graph_pad_page >= 0 && s.rpg.device_composed) {
+            // A DEVICE-carried mask: the guest bound `AttnMask` to a
+            // channel and the engine sent no wire rows for it. That is the
+            // whole condition — the cells are already device-resident, so
+            // the compose gathers and packs them without a host round trip.
+            const bool device_mask_compose =
+                view.has_user_mask && view.flattened_masks.empty();
             s.use_fixed_decode = true;
             s.fixed_buffers = pipeline::FixedDecodeDeviceBuffers{
                 .token_ids = pi.tokens.data(),
@@ -2338,12 +2368,30 @@ void prepare_step(
                 .rs_slot_ids =
                     s.use_slots ? pi.slot_ids.data() : nullptr,
                 .sample_indices = pi.sample_idx.data(),
+                .dense_mask = device_mask_compose
+                    ? pi.dense_mask.data() : nullptr,
+                .mask_klen = device_mask_compose
+                    ? pi.structured_mask_klen.data() : nullptr,
+                .custom_mask = device_mask_compose
+                    ? pi.custom_mask.data() : nullptr,
+                .custom_mask_indptr = device_mask_compose
+                    ? pi.custom_mask_indptr.data() : nullptr,
+                .custom_mask_capacity = device_mask_compose
+                    ? pi.custom_mask.size() : 0,
                 .token_capacity = pi.tokens.size(),
                 .request_capacity = pi.kv_last_page_lens.size(),
                 .page_capacity = pi.kv_page_indices.size(),
                 .dummy_page = static_cast<std::uint32_t>(
                     engine.graph_pad_page),
             };
+            if (device_mask_compose) {
+                // The compose fills `pi.custom_mask` on the stream, so the
+                // body's custom-mask arm is what must run — the same arm a
+                // host-packed mask takes. Nothing here stages bytes; the
+                // count the graph-pad path wants stays host-unknown and its
+                // padding is gated on `graph_pad_requests` anyway.
+                s.have_custom_mask = true;
+            }
             std::string fixed_error;
             staged_ok = engine.dispatch->stage_fixed_decode(
                 s.dispatch_view,

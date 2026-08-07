@@ -141,6 +141,7 @@ inline bool is_decode_envelope_trace(const launch::Trace& trace) {
     const launch::PortBinding* page_indptr = nullptr;
     const launch::PortBinding* w_slot = nullptr;
     const launch::PortBinding* w_off = nullptr;
+    const launch::PortBinding* attn_mask = nullptr;
     for (const launch::PortBinding& binding : trace.ports) {
         switch (binding.port) {
             case kPortEmbedTokens:
@@ -193,6 +194,15 @@ inline bool is_decode_envelope_trace(const launch::Trace& trace) {
             case kPortWOff:
                 if (binding.is_const || w_off != nullptr) return false;
                 w_off = &binding;
+                break;
+            case kPortAttnMask:
+                // The dense device mask the compose gathers and packs. Only
+                // the EXECUTION invariants belong here: one binding, and a
+                // channel rather than a const (a const mask is wire
+                // territory — the host synthesizes rows for it and this
+                // class never sees it).
+                if (binding.is_const || attn_mask != nullptr) return false;
+                attn_mask = &binding;
                 break;
             default:
                 return false;

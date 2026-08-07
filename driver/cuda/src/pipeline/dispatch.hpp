@@ -136,6 +136,17 @@ struct FixedDecodeDeviceBuffers {
     std::uint8_t* row_valid = nullptr;
     std::int32_t* rs_slot_ids = nullptr;
     std::int32_t* sample_indices = nullptr;
+    // Device-carried dense `AttnMask`: `dense_mask` is the gather target the
+    // lanes' mask cells are collected into, `mask_klen` the live key extent
+    // per lane, and `custom_mask`/`custom_mask_indptr` FlashInfer's packed
+    // CSR. All four null = this fire carries no device mask. Nothing here
+    // round-trips the mask through the host, which is the point: a mask
+    // resolved on device is a mask a k-deep frame can still see.
+    std::uint8_t* dense_mask = nullptr;
+    std::uint32_t* mask_klen = nullptr;
+    std::uint8_t* custom_mask = nullptr;
+    std::int32_t* custom_mask_indptr = nullptr;
+    std::size_t custom_mask_capacity = 0;
     std::size_t token_capacity = 0;
     std::size_t request_capacity = 0;
     std::size_t page_capacity = 0;
