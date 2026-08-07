@@ -42,7 +42,21 @@ int Registry::bind_instance(
     PieInstanceBinding* binding,
     std::string* err) {
     auto pit = programs_.find(instance.program_id);
-    if (pit == programs_.end()) return PIE_STATUS_INVALID_ARGUMENT;
+    if (pit == programs_.end()) {
+        // The one rejection on this path that said NOTHING. Every sibling
+        // fills `err` and `Context::Impl::bind_instance` prints it, so a
+        // bind that failed here surfaced to the guest as a bare
+        // "pie_cuda_bind_instance failed with status -1" with no driver
+        // line at all — which is how a third of the GPU suite could fail
+        // for one reason without that reason ever being written down.
+        if (err) {
+            *err = "instance references program " +
+                   std::to_string(instance.program_id) +
+                   ", which is not registered (" +
+                   std::to_string(programs_.size()) + " registered)";
+        }
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
 
     std::vector<std::uint64_t> channel_ids(
         instance.channel_ids.ptr,
