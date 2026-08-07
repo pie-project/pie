@@ -138,6 +138,30 @@ fn parse_text(result: &str) -> Option<String> {
     None
 }
 
+/// Redirect fd 2 to a temp file for the duration, returning the original
+/// so it can be restored. The driver logs its declines and its first-fire
+/// lines on C++ stderr, and nothing else in this process can see them.
+fn capture_stderr(path: &Path) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::create(path).ok()?;
+    unsafe {
+        let saved = libc::dup(2);
+        if saved < 0 {
+            return None;
+        }
+        libc::dup2(file.as_raw_fd(), 2);
+        Some(saved)
+    }
+}
+
+fn restore_stderr(saved: i32) {
+    unsafe {
+        libc::fflush(std::ptr::null_mut());
+        libc::dup2(saved, 2);
+        libc::close(saved);
+    }
+}
+
 async fn run_family(family: &Family) -> Result<()> {
     common::init_trace();
     // MIRROR the driver's own polarity: these two gates are opt-in, so
@@ -150,6 +174,20 @@ async fn run_family(family: &Family) -> Result<()> {
 
     let snapshot = resolve_snapshot(family.hub_dir)?;
     let toml = common::cuda_standalone_toml(&snapshot);
+    // THE POINT OF THIS CAPTURE: a declared side that silently DECLINES
+    // produces a record identical to the hand-written side by
+    // construction, so the comparison below passes while proving nothing.
+    // That has happened three times in this work — an unbound weight, a
+    // refused geometry, and a validator that declined on a kernel symbol
+    // — and each time a green gate was the thing that hid it. The driver
+    // says which happened on its own stderr; this is the only way the
+    // test can hear it.
+    let log = std::env::temp_dir().join(format!(
+        "pie_declared_family_parity_{}_{}.log",
+        family.name,
+        if declared { "on" } else { "off" }
+    ));
+    let saved = capture_stderr(&log);
     let (controller, gateway, worker) = derive_standalone(&toml)?;
     let pie = run_standalone(controller, gateway, worker).await?;
     eprintln!(
@@ -208,6 +246,35 @@ async fn run_family(family: &Family) -> Result<()> {
     }
     // A record is the whole SEQUENCE; `\u{1}` cannot occur in sampled
     // text, so it is a safe joiner.
+    // Restore stderr before asserting, so a failure is readable.
+    if let Some(fd) = saved {
+        restore_stderr(fd);
+    }
+    let driver_log = std::fs::read_to_string(&log).unwrap_or_default();
+    eprint!("{driver_log}");
+    if declared {
+        anyhow::ensure!(
+            !driver_log.contains("declined:"),
+            "{}: the declared plan DECLINED, so this run compared the \
+             hand-written pass against itself. A gate that passes because \
+             it stopped asking is worse than a red one.\n{}",
+            family.name,
+            driver_log
+                .lines()
+                .filter(|l| l.contains("declined:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        anyhow::ensure!(
+            driver_log.contains("first DECODE fire")
+                || driver_log.contains("first PREFILL fire"),
+            "{}: the driver never logged a first-fire line, so the declared \
+             drive did not take a single fire. Either eligibility answered \
+             false for every one, or the executor is not wired in.",
+            family.name
+        );
+    }
+
     let record = texts.join("\u{1}");
     std::fs::write(record_path(family.name, declared), &record).context("write record")?;
 
