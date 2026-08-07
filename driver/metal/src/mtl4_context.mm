@@ -108,9 +108,29 @@ struct StepState {
     // 8192 slots -- 4096 dispatches -- which a 1024-row prefill of a 40-layer
     // model passes inside its first layer.
     std::uint64_t trace_dropped = 0;
+    /// Dispatches seen this fire, timed or not. A fire wider than the heap is
+    /// timed by STRIDE rather than by prefix -- see `dispatch`.
+    std::uint64_t trace_seen = 0;
     std::vector<std::string> trace_labels;
     std::string trace_pso;
 };
+
+// `PIE_METAL_TRACE_STRIDE=<k>` times one dispatch in every k rather than every
+// one. The heap is 4096 dispatches and the driver will not grow it, so a fire
+// wider than that used to be profiled by its PREFIX -- which for a batched
+// prefill is the first few layers and none of the wide GEMMs the later ones
+// reach. A stride samples the whole fire instead. Shares stay comparable
+// because every kernel is sampled at the same rate; absolute ms are 1/k of the
+// truth and the table says so.
+int dispatch_trace_stride() {
+    static const int n = [] {
+        const char* e = getenv("PIE_METAL_TRACE_STRIDE");
+        if (e == nullptr || *e == '\0') return 1;
+        const int v = atoi(e);
+        return v > 0 ? v : 1;
+    }();
+    return n;
+}
 
 // `PIE_METAL_DISPATCH_TRACE=<n>` prints the accumulated table every n fires.
 int dispatch_trace_every() {
@@ -443,7 +463,9 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
     // Relaxed granularity, so the pair costs no encoder split; the cost of the
     // marks themselves is charged to whichever dispatch they bracket, which is
     // the same for all of them and so does not move the shares.
-    const bool trace = dispatch_trace_every() > 0 && s->trace_heap != nullptr &&
+    const bool sampled = (s->trace_seen % std::uint64_t(dispatch_trace_stride())) == 0;
+    ++s->trace_seen;
+    const bool trace = dispatch_trace_every() > 0 && s->trace_heap != nullptr && sampled &&
                        2 * (s->trace_n + 1) <= s->trace_slots;
     if (dispatch_trace_every() > 0 && !trace) ++s->trace_dropped;
     if (trace) mark_timestamp(s->trace_heap, 2 * s->trace_n, /*precise=*/true);
@@ -2092,6 +2114,7 @@ void* encode_one_command_buffer(void* ctx_impl, int ab,
     }
     I.step.trace_n = 0;
     I.step.trace_dropped = 0;
+    I.step.trace_seen = 0;
     I.step.trace_labels.clear();
     StepEncoder se(&I.step);
     encode_fn(se);
@@ -2156,13 +2179,19 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
     // the head of its DAG and none of the ones after -- which reads as "the
     // embedding gather is 15% of a prefill" when the embedding gather is
     // simply what the first 2048 slots happened to cover.
-    if (dropped > 0) {
+    if (dropped > 0 && dispatch_trace_stride() <= 1) {
         fprintf(stderr,
                 "[trace] TRUNCATED: %llu dispatches went untimed (the timestamp heap holds "
                 "%u slots = %u dispatches). The shares below cover only the dispatches that "
                 "fit, which are the FIRST ones each fire encoded -- do not read them as the "
-                "fire's profile.\n",
+                "fire's profile. Set PIE_METAL_TRACE_STRIDE=<k> to sample the whole fire "
+                "instead of its head.\n",
                 (unsigned long long)dropped, slots, slots / 2);
+    } else if (dispatch_trace_stride() > 1) {
+        fprintf(stderr,
+                "[trace] SAMPLED 1 dispatch in %d: shares are the fire's, n and ms are 1/%d "
+                "of it.\n",
+                dispatch_trace_stride(), dispatch_trace_stride());
     }
     for (const auto& [name, v] : rows) {
         const double share = total_ticks > 0 ? v.first / total_ticks : 0.0;
