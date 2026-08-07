@@ -8494,6 +8494,9 @@ std::string describe_uncommitted_lane(
         roster += "/s" + std::to_string(ticket.slot);
         if ((ticket.flags & kTicketRequireInput) != 0) roster += " req";
         if ((ticket.flags & kTicketConsume) != 0) roster += " cons";
+        // PUBLISH matters next to `req`: an instance that both publishes a
+        // channel and requires input on it is requiring its own output.
+        if ((ticket.flags & kTicketPublish) != 0) roster += " pub";
         roster += " " + std::to_string(head) + "/" + std::to_string(tail);
     }
     if (!roster.empty()) message += " lane_tickets=[" + roster + "]";
