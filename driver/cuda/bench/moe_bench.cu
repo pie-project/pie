@@ -150,8 +150,9 @@ void run_shape(const Shape& sh, const std::vector<int>& batch_sizes) {
 
   std::printf("\n== %s  H=%d I=%d(pad %d) E=%d top_k=%d\n", sh.name, H,
               sh.inter, Ip, E, K);
-  std::printf("%6s %14s %14s %10s %13s %10s\n", "N", "per-route(ms)",
-              "grouped(ms)", "speedup", "marlin(ms)", "vs grouped");
+  std::printf("%6s %14s %14s %10s %13s %10s %13s %10s\n", "N",
+              "per-route(ms)", "grouped(ms)", "speedup", "marlin2x(ms)",
+              "vs grouped", "marlin1x(ms)", "vs 2x");
 
   for (int N : batch_sizes) {
     const int routes = N * K;
@@ -191,6 +192,7 @@ void run_shape(const Shape& sh, const std::vector<int>& batch_sizes) {
     const float t_pr = time_ms(per_route, stream);
     const float t_gr = time_ms(grouped, stream);
     float t_ml = 0.f;
+    float t_mf = 0.f;
 #ifdef WITH_MARLIN_MOE
     {
       // Marlin's own block-sorted metadata. Timing only: the weights are
@@ -227,14 +229,48 @@ void run_shape(const Shape& sh, const std::vector<int>& batch_sizes) {
         }
       };
       t_ml = time_ms(marlin, stream);
+      // The question the contract change turns on: GPT-OSS ships gate and up
+      // as ONE `[E, 2I, H]` slab and the contract splits them, so fc1 costs
+      // two launches. Concatenating the two repacked halves back along n is a
+      // valid Marlin packing (I is padded to a multiple of 128, and marlin
+      // tiles n by 64), so the same work is one launch at prob_n = 2*Ip.
+      // Worth doing only if one wide launch beats two narrow ones.
+      {
+        // The fused arm reads twice the rows, so it needs its own weight and
+        // scale stacks at `[E, 2*Ip, ...]` -- the shared ones above are sized
+        // for one projection.
+        std::vector<std::uint8_t> hw2(std::size_t(E) * (2 * Ip) * (H / 2));
+        std::vector<std::uint8_t> hs2(std::size_t(E) * (2 * Ip) * (H / 32),
+                                      std::uint8_t{127});
+        for (auto& x : hw2) x = static_cast<std::uint8_t>(byte_dist(rng));
+        void* d_w2 = dupload(hw2);
+        void* d_s2 = dupload(hs2);
+        void* d_wide = dalloc(std::size_t(routes) * (2 * Ip) * 2);
+        void* d_ws2 =
+            dalloc(marlin_moe::marlin_moe_workspace_bytes(2 * Ip, block));
+        auto marlin_fused = [&](cudaStream_t s) {
+          marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16(
+              d_act, d_w2, d_s2, nullptr, d_wide, nullptr, d_ws2,
+              static_cast<const std::int32_t*>(d_msorted),
+              static_cast<const std::int32_t*>(d_mexpert),
+              static_cast<const std::int32_t*>(d_npast), nullptr, block, E, K,
+              false, N, 2 * Ip, H, s);
+        };
+        t_mf = time_ms(marlin_fused, stream);
+        CHECK(cudaFree(d_wide));
+        CHECK(cudaFree(d_ws2));
+        CHECK(cudaFree(d_w2));
+        CHECK(cudaFree(d_s2));
+      }
       CHECK(cudaFree(d_msorted)); CHECK(cudaFree(d_mexpert));
       CHECK(cudaFree(d_npast)); CHECK(cudaFree(d_out));
       CHECK(cudaFree(d_out2)); CHECK(cudaFree(d_ws));
     }
 #endif
-    std::printf("%6d %14.4f %14.4f %9.2fx %13.4f %9.2fx\n", N, t_pr, t_gr,
-                t_gr > 0 ? t_pr / t_gr : 0.f, t_ml,
-                t_ml > 0 ? t_gr / t_ml : 0.f);
+    std::printf("%6d %14.4f %14.4f %9.2fx %13.4f %9.2fx %13.4f %9.2fx\n",
+                N, t_pr, t_gr, t_gr > 0 ? t_pr / t_gr : 0.f, t_ml,
+                t_ml > 0 ? t_gr / t_ml : 0.f, t_mf,
+                t_mf > 0 ? t_ml / t_mf : 0.f);
 
     CHECK(cudaFree(d_topk));
     CHECK(cudaFree(d_act));
