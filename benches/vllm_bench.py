@@ -139,6 +139,14 @@ def run(args: argparse.Namespace):
         llm_kwargs["block_size"] = args.block_size
     if getattr(args, "kv_cache_dtype", "auto") != "auto":
         llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
+    # Chunked prefill decides how much a prefill costs the decode it rides
+    # with, which is the axis that separates a uniform-output-length run from a
+    # fanned one: with uniform lengths completions synchronise and prefills
+    # arrive in bursts, so most steps are pure decode; fan them and most steps
+    # carry a prefill. Exposed so that attribution can be tested by toggling it
+    # rather than inferred from a correlation.
+    if getattr(args, "no_chunked_prefill", False):
+        llm_kwargs["enable_chunked_prefill"] = False
     speculative_config = None
     if args.speculative_config is not None:
         speculative_config = json.loads(args.speculative_config)
@@ -582,6 +590,11 @@ def main() -> None:
         add_output_dump_args(sp)
         sp.add_argument("--attention-backend", default=None)
         sp.add_argument("--enforce-eager", action="store_true")
+        sp.add_argument(
+            "--no-chunked-prefill", action="store_true",
+            help="disable vLLM's chunked prefill. Prefill then does not share "
+                 "a step with decode, which is the mechanism a fanned "
+                 "--output-spread is thought to tax.")
         sp.add_argument(
             "--num-gpu-blocks-override",
             type=int,
