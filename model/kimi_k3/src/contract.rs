@@ -18,9 +18,9 @@
 //!   character. State it rather than inherit it.
 
 use pie_loader::checkpoint::RawTensor;
-use pie_loader::contract::{Expr, GroupContract, TensorContract, TensorType};
+use pie_loader::contract::{Expr, GroupContract, Scales, TensorContract, TensorType};
 use pie_loader::error::Error;
-use pie_loader::types::{DType, Encoding, TensorId};
+use pie_loader::types::{DType, Encoding, QuantGranularity, ScaleForm, TensorId};
 
 use pie_model_common::builder::{Builder, is_raw, mxfp4_encoding};
 use pie_model_common::probe::hf_shard_axis;
@@ -168,6 +168,29 @@ fn a_log_bands(b: &mut Builder<'_>) -> Result<(), Error> {
 /// rather than for the block, because at module scope a "group" in this file
 /// is a `GroupContract`.
 const MXFP4_BLOCK: i64 = 32;
+
+/// State that a `weight_scale` holds the MXFP4 block exponents for `weight`.
+///
+/// `channel_axis` is a parameter rather than a constant because K3's two
+/// halves are different ranks. `PerGroup` groups along the axis *after*
+/// `channel_axis`, and the grouped axis is whichever one the codes run along:
+/// `gate_up` is `[I, 2, L]` and groups on axis 2, so 1; `down` is `[L, I]` and
+/// groups on axis 1, so 0. GPT-OSS passes 1 for both of its halves, but both
+/// of those are rank 3 — that is the same rule, not a different one, and
+/// copying its literal would put K3's `down` scales on the wrong axis.
+///
+/// `group_size` counts *codes*, not bytes, even though `of` names a `U8`
+/// tensor holding two codes per byte. That is the convention the resident
+/// GPT-OSS path already publishes and the dequant kernels already read.
+fn mxfp4_block_scales(weight: impl Into<String>, channel_axis: u32) -> Scales {
+    Scales {
+        of: weight.into(),
+        granularity: QuantGranularity::PerGroup,
+        group_size: MXFP4_BLOCK as u32,
+        channel_axis,
+        form: ScaleForm::RawE8M0,
+    }
+}
 
 /// The six MXFP4 sources one routed expert ships, in the order every pass
 /// here reads them.
@@ -370,24 +393,39 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
                 u8enc.clone(),
                 Some(vec![local_inter, 2, latent / 2]),
             );
-            b.define(
+            // Each `weight_scale` says which weight it scales. The streamed
+            // group states the same pairing on the same four leaves, and it
+            // has to: these are one set of bytes under two residencies, and a
+            // fact attached to only one of them is a fact that can come to
+            // differ between them.
+            if let Some(id) = b.define(
                 format!("{ep_out}gate_up.weight_scale"),
                 gu_scale,
                 u8enc.clone(),
                 Some(vec![local_inter, 2, latent / MXFP4_BLOCK]),
-            );
+            ) {
+                b.set_scales(
+                    id,
+                    mxfp4_block_scales(format!("{ep_out}gate_up.weight_packed"), 1),
+                );
+            }
             b.define(
                 format!("{ep_out}down.weight_packed"),
                 dn_packed,
                 u8enc.clone(),
                 Some(vec![latent, local_inter / 2]),
             );
-            b.define(
+            if let Some(id) = b.define(
                 format!("{ep_out}down.weight_scale"),
                 dn_scale,
                 u8enc,
                 Some(vec![latent, local_inter / MXFP4_BLOCK]),
-            );
+            ) {
+                b.set_scales(
+                    id,
+                    mxfp4_block_scales(format!("{ep_out}down.weight_packed"), 0),
+                );
+            }
             consumed.extend(parts.iter().map(|part| part.id));
         }
 
@@ -452,11 +490,16 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
 ///
 /// Slots stay PACKED. That is the whole economic case — at K3's widths a bf16
 /// slot is 3.765x a packed one, and the page-in is the cost this feature is
-/// paying. No `.scaling(...)` rides along, for the same reason the resident
-/// republish carries none: K3's expert kernels take the weight and its scale
-/// as two explicit pointers and never ask `quant_meta`, so a `Scales` here
-/// would state a fact nothing reads and give the two residencies somewhere to
-/// drift apart.
+/// paying.
+///
+/// Each `weight_scale` states which weight it scales, and the resident
+/// republish states the identical pairing on the identical leaves. K3's expert
+/// kernels do not read `quant_meta` today — they take the weight and its scale
+/// as two explicit pointers — so this is a declaration ahead of its only
+/// possible consumer. It is still declared on *both* sides rather than
+/// neither, because the two are one set of bytes under two residencies: a
+/// consumer that ever does read it must not be able to learn one thing from a
+/// slot and another from a resident expert.
 ///
 /// The declared names carry no layer and no expert — there is one plan, and it
 /// is the same plan for every instance of every layer. They are the leaf names
@@ -576,7 +619,8 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
                     ),
                     vec![local_inter, 2, latent / MXFP4_BLOCK],
                     u8enc.clone(),
-                ),
+                )
+                .scaling(mxfp4_block_scales("gate_up.weight_packed", 1)),
                 TensorContract::new(
                     "down.weight_packed",
                     down(b, "experts.{}.w2.weight_packed"),
@@ -588,7 +632,8 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
                     down(b, "experts.{}.w2.weight_scale"),
                     vec![latent, local_inter / MXFP4_BLOCK],
                     u8enc,
-                ),
+                )
+                .scaling(mxfp4_block_scales("down.weight_packed", 0)),
             ],
         });
         pushed += 1;

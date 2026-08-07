@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+use pie_loader::contract::Scales;
 use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, METAL_TILE_MAP_MASK, StorageTarget, compile as compile_load_plan,
 };
@@ -901,6 +902,78 @@ fn kimi_k3_refuses_a_streaming_request_it_cannot_serve() {
             "{case}: names the knob: {text}"
         );
         assert!(text.contains(names), "{case}: names the reason: {text}");
+    }
+}
+
+/// The two residencies say the same thing about the same bytes.
+///
+/// A `weight_scale` in the streamed group and the same leaf on a resident
+/// expert describe one set of checkpoint bytes under two residencies. K3's
+/// expert kernels take the weight and its scale as two explicit pointers and
+/// do not read `quant_meta`, so nothing in the driver would notice the two
+/// drifting apart — which is precisely why the agreement is asserted here
+/// rather than left to be observed once by whoever wrote it.
+///
+/// `of` is deliberately not compared: a group names its leaf relative to the
+/// group and a resident tensor names it in full, and that difference is the
+/// point of a group. Everything that describes the *quantization* must match.
+#[test]
+fn the_streamed_group_and_the_resident_experts_scale_alike() {
+    let checkpoint = kimi_k3_checkpoint_at(64, Some(u8enc()));
+    let resident = author(
+        &kimi_k3_facts(),
+        &checkpoint,
+        &target(1, 2),
+        &Policy::default(),
+    )
+    .expect("resident authoring")
+    .expect("kimi_k3 has an author");
+    let grouped = author(&kimi_k3_facts(), &checkpoint, &target(1, 2), &streamed())
+        .expect("streamed authoring")
+        .expect("kimi_k3 has an author");
+
+    let group = grouped.groups.first().expect("one routed-expert group");
+    let quantization = |s: &Scales| {
+        format!(
+            "{:?}/{}/{}/{:?}",
+            s.granularity, s.group_size, s.channel_axis, s.form
+        )
+    };
+    for leaf in ["gate_up.weight_scale", "down.weight_scale"] {
+        let weight = leaf.replace("weight_scale", "weight_packed");
+        let from_group = group
+            .tensors
+            .iter()
+            .find(|t| t.name == leaf)
+            .unwrap_or_else(|| panic!("the streamed group declares no {leaf}"));
+        let full = format!("model.layers.0.block_sparse_moe.experts.0.{leaf}");
+        let from_resident = resident
+            .tensors
+            .iter()
+            .find(|t| t.name == full)
+            .unwrap_or_else(|| panic!("the resident contract declares no {full}"));
+
+        let (g, r) = (
+            from_group
+                .scales
+                .as_ref()
+                .unwrap_or_else(|| panic!("group {leaf} carries no scales")),
+            from_resident
+                .scales
+                .as_ref()
+                .unwrap_or_else(|| panic!("resident {full} carries no scales")),
+        );
+        assert_eq!(
+            quantization(g),
+            quantization(r),
+            "{leaf}: the streamed slot and the resident expert disagree"
+        );
+        assert!(
+            g.of == weight && r.of.ends_with(&weight),
+            "{leaf}: each side must point at its own {weight}, got {:?} and {:?}",
+            g.of,
+            r.of
+        );
     }
 }
 

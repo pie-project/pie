@@ -212,7 +212,13 @@
           "encoding": {
             "Raw": "U8"
           },
-          "scales": null,
+          "scales": {
+            "of": "gate_up.weight_packed",
+            "granularity": "PerGroup",
+            "group_size": 32,
+            "channel_axis": 1,
+            "form": "RawE8M0"
+          },
           "visibility": "Public"
         },
         {
@@ -252,7 +258,13 @@
           "encoding": {
             "Raw": "U8"
           },
-          "scales": null,
+          "scales": {
+            "of": "down.weight_packed",
+            "granularity": "PerGroup",
+            "group_size": 32,
+            "channel_axis": 0,
+            "form": "RawE8M0"
+          },
           "visibility": "Public"
         }
       ]
