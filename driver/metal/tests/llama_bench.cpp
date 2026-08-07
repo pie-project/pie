@@ -1318,7 +1318,10 @@ int main(int argc, char** argv) {
                 for (const int v : gate_want) std::printf(" %d", v);
             }
             std::printf("\n");
-            if (!good) return 1;
+            // Same allowance the other gates get: an ablated run's tokens are
+            // wrong on purpose, and this one printing FAIL is the point. It
+            // must not also stop the wall clock the ablation exists to read.
+            if (!good && !ablating) return 1;
         }
 
         std::vector<Seq> fleet(nf);
