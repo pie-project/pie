@@ -635,3 +635,19 @@ fn gpt_oss_20b_cuda_decode() {
         ),
     );
 }
+
+/// gpt-oss's PREFILL reading. One statement apart from the decode golden
+/// — the dispatch — because the fused MXFP4 leg is admitted by ROUTES
+/// (`N * top_k <= max_routes`) and not by class, so a prefill under the
+/// cap runs the same seven rectangles the decode class does.
+#[test]
+fn gpt_oss_20b_cuda_prefill() {
+    check_plan(
+        "gpt_oss_20b_cuda_prefill",
+        &gpt_oss_cuda(
+            &GptOssFacts::gpt_oss_20b(),
+            &GptOssCudaFacts::gpt_oss_20b_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}

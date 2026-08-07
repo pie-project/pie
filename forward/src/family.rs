@@ -3623,6 +3623,7 @@ pub fn gpt_oss_cuda(
         "gpt_oss.cuda.{}",
         match class {
             FireClass::Decode => "decode",
+            FireClass::Prefill => "prefill",
             other => panic!("gpt_oss states no {other:?} class yet"),
         }
     );
@@ -3666,15 +3667,28 @@ pub fn gpt_oss_cuda(
             };
             dsl::cuda::write_kv_to_pages(&k, &v, &kv);
 
+            // The dispatch is the ONLY thing the two classes disagree
+            // about. The MoE leg below is admitted by ROUTES
+            // (`N * top_k <= max_routes`), not by class, so a prefill
+            // under the cap takes the same fused GEMVs — which is why
+            // this family has a prefill class at all.
+            //
             // The sink layers ask for the LSE; a layer without sinks
             // takes the one-value dispatch and saves the write.
             let a = if facts.attn_sinks {
-                let (o, lse) =
-                    dsl::cuda::attention_flashinfer_decode_lse(&q, &kv, facts.q_heads);
+                let (o, lse) = match class {
+                    FireClass::Decode => {
+                        dsl::cuda::attention_flashinfer_decode_lse(&q, &kv, facts.q_heads)
+                    }
+                    _ => dsl::cuda::attention_flashinfer_prefill_lse(&q, &kv, facts.q_heads),
+                };
                 dsl::cuda::attention_sink_rescale(&o, &lse, &w.sinks)
             } else {
-                dsl::cuda::attention_flashinfer_decode(&q, &kv)
-                    .expect("the decode class states its attention")
+                match class {
+                    FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&q, &kv),
+                    _ => dsl::cuda::attention_flashinfer_prefill_planless(&q, &kv),
+                }
+                .expect("the class states its attention")
             };
 
             // o_proj folds the RESIDUAL (beta=1) and not its bias: the

@@ -37,6 +37,7 @@ enum class GoKernel {
     GemmBias,
     WriteKvToPages,
     AttnFlashinferDecode,
+    AttnFlashinferPrefill,
     AttnSinkRescale,
     RopeYarnOriginal,
     TopkSoftmax,
@@ -53,6 +54,8 @@ GoKernel resolve_go_kernel(std::string_view k) {
     if (k == "launch_write_kv_to_pages") return GoKernel::WriteKvToPages;
     if (k == "dispatch_attention_flashinfer_decode")
         return GoKernel::AttnFlashinferDecode;
+    if (k == "ops::launch_attention_flashinfer_prefill")
+        return GoKernel::AttnFlashinferPrefill;
     if (k == "launch_attention_sink_rescale_bf16")
         return GoKernel::AttnSinkRescale;
     if (k == "launch_rope_yarn_original_bf16") return GoKernel::RopeYarnOriginal;
@@ -216,6 +219,7 @@ bool gpt_oss_forward_declared(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
     const std::uint32_t* kv_page_indptr_h,
     int total_tokens,
     int num_requests,
@@ -225,10 +229,14 @@ bool gpt_oss_forward_declared(
     int num_logit_rows)
 {
     if (!declared.usable) return false;
-    // The declaration is the DECODE class only, and `use_decode_path` is
-    // the hand pass's own test for it. Asking it here rather than
-    // restating it keeps the two from drifting apart.
-    if (!is_pure_decode || fwd_cfg.force_prefill_path) return false;
+    // WHICH CLASS — `use_decode_path` is the hand pass's own test, asked
+    // rather than restated. Both classes are stated now: the fused MXFP4
+    // leg is admitted by ROUTES and not by class, so a prefill under the
+    // cap runs the same MoE block the decode class does.
+    const bool decode_class = is_pure_decode && !fwd_cfg.force_prefill_path;
+    if (!decode_class && (qo_indptr_h == nullptr || kv_page_indptr_h == nullptr)) {
+        return false;  // the plan-free prefill dispatch reads host indptrs
+    }
 
     const int N = total_tokens;
     const int R = num_requests;
@@ -247,7 +255,8 @@ bool gpt_oss_forward_declared(
     const int routes = N * top_k;
     if (routes > declared.max_routes) return false;
 
-    const pie_forward::ForwardPlan& plan = declared.decode;
+    const pie_forward::ForwardPlan& plan =
+        decode_class ? declared.decode : declared.prefill;
 
     // Per-fire scratch, the same set and the same sizes
     // `mixtral_forward_paged` allocates. The drive threads the hand
@@ -275,7 +284,11 @@ bool gpt_oss_forward_declared(
     // The decode plan the dispatch's contract obligates. One per fire,
     // shared by every layer — mixtral's shape (one head geometry, so no
     // full/sliding split the way gemma-4 has).
-    ops::DecodePlanCachePtr decode_plan = ops::make_decode_plan();
+    // The prefill dispatch builds its own plan on the way in, so only the
+    // decode class owes one.
+    ops::DecodePlanCachePtr decode_plan;
+    if (decode_class) {
+    decode_plan = ops::make_decode_plan();
     ops::plan_attention_flashinfer_decode(
         *decode_plan, kv_page_indptr_h, R,
         cfg.num_attention_heads, cfg.num_key_value_heads, d,
@@ -283,6 +296,7 @@ bool gpt_oss_forward_declared(
         /*enable_cuda_graph=*/true,
         /*full_attention_variant=*/false,
         cache.hnd_layout());
+    }
 
     int lm_head_rows = N;
     int cur_layer = -1;
@@ -419,6 +433,20 @@ bool gpt_oss_forward_declared(
                     kv_last_page_lens, N, R, stream, row_valid_d);
                 break;
             }
+            case GoKernel::AttnFlashinferPrefill: {
+                auto kv_view = cache.layer_view(cur_layer);
+                // The plan-free wrapper, and it takes the LSE in the same
+                // last slot the decode dispatch does.
+                ops::launch_attention_flashinfer_prefill(
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
+                    N, R, cfg.num_attention_heads, attn_ws, stream,
+                    /*window_left=*/window_of(cur_layer),
+                    /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f,
+                    d_lse.data());
+                break;
+            }
             case GoKernel::AttnFlashinferDecode: {
                 auto kv_view = cache.layer_view(cur_layer);
                 // The LSE is the second OUTPUT, and asking for it is the
@@ -523,11 +551,12 @@ bool gpt_oss_forward_declared(
     // is evidence about the hand-written pass as easily as about this
     // one.
     {
-        static std::atomic<bool> said{false};
-        if (!said.exchange(true)) {
+        static std::atomic<bool> said[2] = {{false}, {false}};
+        if (!said[decode_class ? 0 : 1].exchange(true)) {
             std::fprintf(stderr,
-                         "[declared-gptoss] first DECODE fire: N=%d R=%d "
+                         "[declared-gptoss] first %s fire: N=%d R=%d "
                          "routes=%d ops=%zu\n",
+                         decode_class ? "DECODE" : "PREFILL",
                          N, R, routes, plan.op_count());
         }
     }
@@ -535,7 +564,7 @@ bool gpt_oss_forward_declared(
     std::vector<pie_forward::PieForwardRow> rows(static_cast<std::size_t>(N));
     for (int r = 0; r < N; ++r) {
         auto& row = rows[static_cast<std::size_t>(r)];
-        row.multi_token = 0;
+        row.multi_token = decode_class ? 0 : 1;
         row.custom_mask = 0;
         row.hooked = 0;
         row.lora = 0;

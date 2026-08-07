@@ -2303,6 +2303,31 @@ pub mod cuda {
         .expect("a biased projection produces its value")
     }
 
+    /// `ops::launch_attention_flashinfer_prefill` asked for its LSE —
+    /// the prefill twin of [`attention_flashinfer_decode_lse`], and the
+    /// same argument makes the difference.
+    pub fn attention_flashinfer_prefill_lse(q: &Val, kv: &Kv, q_heads: u32) -> (Val, Val) {
+        let shape = q.t.inner.borrow().value_shape(q.id);
+        let ids = q.t.with(Some(kv.l), |b| {
+            b.launch(
+                "ops::launch_attention_flashinfer_prefill",
+                vec![],
+                kv_state(kv),
+                vec![q.id],
+                vec![
+                    (shape, DType::BF16),
+                    (Shape(vec![Dim::Tokens, Dim::Const(q_heads)]), DType::F32),
+                ],
+            )
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
     /// `kernels::launch_attention_sink_rescale_bf16`: `o *= sigmoid(lse
     /// - sink_h)`, in place, per (token, head).
     ///

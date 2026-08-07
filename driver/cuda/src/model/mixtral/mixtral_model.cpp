@@ -48,7 +48,7 @@ void MixtralModel::body(Workspace& ws,
             declared_, weights_, hf_config_, fwd_cfg_, num_experts_, top_k_,
             ws, kv, attn_ws, cublas, in.token_ids, in.positions,
             in.qo_indptr_d, in.kv_page_indices_d, in.kv_page_indptr_d,
-            in.kv_last_page_lens_d, in.kv_page_indptr_h,
+            in.kv_last_page_lens_d, in.qo_indptr_h, in.kv_page_indptr_h,
             in.total_tokens, in.num_requests, in.is_pure_decode,
             in.row_valid_d, in.logit_row_indices_d, in.num_logit_rows)) {
         return;

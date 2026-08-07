@@ -1249,6 +1249,15 @@ mod tests {
     fn the_gpt_oss_residue_ledger() {
         let facts = crate::facts::GptOssFacts::gpt_oss_20b();
         let cuda = crate::facts::GptOssCudaFacts::gpt_oss_20b_synthetic();
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            let plan = family::gpt_oss_cuda(&facts, &cuda, class);
+            let out = lower(&plan, &sampled(4), Fire::default()).expect("lowers");
+            assert!(
+                out.residue.is_empty() && out.coverage() == 1.0,
+                "gpt-oss {class:?}: {:#?}",
+                out.residue
+            );
+        }
         let plan = family::gpt_oss_cuda(&facts, &cuda, FireClass::Decode);
         let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
         let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();

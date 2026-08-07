@@ -145,9 +145,13 @@ GptOssDeclaredPlan build_gpt_oss_declared_plan(
         out.decode = ForwardPlan::trace_gpt_oss_cuda(
             facts, cuda, pie_forward::PieForwardFireClass::Decode);
         gpt_oss_validate_stated_kernels(out.decode);
-        const std::string verdict =
-            gpt_oss_validate_stated_weights(out.decode, w);
-        if (!verdict.empty()) GO_REFUSE(verdict);
+        out.prefill = ForwardPlan::trace_gpt_oss_cuda(
+            facts, cuda, pie_forward::PieForwardFireClass::Prefill);
+        gpt_oss_validate_stated_kernels(out.prefill);
+        for (const ForwardPlan* pl : {&out.decode, &out.prefill}) {
+            const std::string verdict = gpt_oss_validate_stated_weights(*pl, w);
+            if (!verdict.empty()) GO_REFUSE(verdict);
+        }
     } catch (const std::exception& e) {
         GO_REFUSE(std::string("trace failed: ") + e.what());
     }
@@ -163,9 +167,10 @@ GptOssDeclaredPlan build_gpt_oss_declared_plan(
 #undef GO_REFUSE
     out.usable = true;
     std::fprintf(stderr,
-                 "[declared-gptoss] traced ops=%zu layers=%d experts=%d "
+                 "[declared-gptoss] traced ops=%zu/%zu layers=%d experts=%d "
                  "top_k=%d max_routes=%d validation=OK\n",
-                 out.decode.op_count(), cfg.num_hidden_layers, num_experts,
+                 out.decode.op_count(), out.prefill.op_count(),
+                 cfg.num_hidden_layers, num_experts,
                  top_k, max_routes);
     return out;
 }

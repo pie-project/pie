@@ -930,6 +930,7 @@ pub unsafe extern "C" fn pie_forward_trace_gpt_oss_cuda(
         }
         let class = match class {
             0 => FireClass::Decode,
+            1 => FireClass::Prefill,
             _ => return PieForwardStatus::InvalidArgument,
         };
         let plan = crate::family::gpt_oss_cuda(&f, &cuda, class);

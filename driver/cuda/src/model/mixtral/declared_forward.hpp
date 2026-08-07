@@ -22,6 +22,7 @@ namespace pie_cuda_driver::model {
 // is untouched either way.
 struct GptOssDeclaredPlan {
     pie_forward::ForwardPlan decode;
+    pie_forward::ForwardPlan prefill;
     std::string facts_digest;
     bool usable = false;
     // The fused leg's admission threshold in ROUTES, carried so the
@@ -65,6 +66,7 @@ bool gpt_oss_forward_declared(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
     const std::uint32_t* kv_page_indptr_h,
     int total_tokens,
     int num_requests,
