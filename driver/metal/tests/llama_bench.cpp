@@ -1392,8 +1392,14 @@ int main(int argc, char** argv) {
                                     " (the same prompt alone said %d)\n",
                                     step, i, t, first_tok,
                                     r < s.tokens.size() ? int(s.tokens[r]) : -1);
-                        bad = true;
-                        break;
+                        // Under ablation the members are EXPECTED to differ:
+                        // the skipped kind leaves its output buffer holding
+                        // whatever the pool did, which is per-row. Printing is
+                        // still right; stopping is not.
+                        if (!ablating) {
+                            bad = true;
+                            break;
+                        }
                     }
                     if (i > 0 && outs[0].device_contents != nullptr &&
                         outs[std::size_t(i)].device_contents != nullptr &&
