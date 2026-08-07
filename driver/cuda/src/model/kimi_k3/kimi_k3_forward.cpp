@@ -914,6 +914,32 @@ void kimi_k3_forward_paged(
                     Lw.expert_cache->prefetch(Lw.expert_group,
                                               static_cast<std::uint32_t>(e));
                 }
+                // The slot's geometry against the config's, which is the check
+                // the stacked path has at bind (`shape()[2] != latent`) and the
+                // group has nowhere: the contract derives the expert widths
+                // from the checkpoint while this code derives them from
+                // HfConfig, and `launch_dequant_mxfp4_to_bf16` takes raw
+                // `uint8*` and reads `out_dim * in_dim/2` bytes knowing
+                // nothing about how many there are. A `latent` larger than the
+                // slot reads off the end of it into the neighbouring slot --
+                // plausible logits, no fault -- so the disagreement has to be
+                // named here or it is never named at all.
+                const auto require_leaf = [&](const WeightStore& slot,
+                                              const char* name,
+                                              std::size_t want) {
+                    const DeviceTensor& t = slot.get(name);
+                    if (t.numel() != want) {
+                        throw std::runtime_error(
+                            std::string("kimi_k3: streamed expert leaf '") +
+                            name + "' holds " + std::to_string(t.numel()) +
+                            " elements, but the config's latent " +
+                            std::to_string(latent) + " and routed intermediate " +
+                            std::to_string(routed_I) + " want " +
+                            std::to_string(want) +
+                            " -- the contract and HfConfig disagree on the "
+                            "expert geometry");
+                    }
+                };
                 for (int e = 0; e < E; ++e) {
                     const auto& tok = routing.token_idx[static_cast<std::size_t>(e)];
                     const int Ne = static_cast<int>(tok.size());
@@ -927,6 +953,21 @@ void kimi_k3_forward_paged(
                     // E8M0 exponents, not bf16. cuBLAS cannot read them.
                     const WeightStore& slot = Lw.expert_cache->ensure_resident(
                         Lw.expert_group, static_cast<std::uint32_t>(e), stream);
+                    // Unpin where the loop leaves, not where it ends, so a
+                    // throw between here and the bottom cannot strand the pin.
+                    // A stranded pin is permanent: `end_batch` is the only
+                    // unpin, and with one slot every later step would then
+                    // throw from `acquire` instead of paging in.
+                    struct Unpin {
+                        GroupStreamCache* cache;
+                        ~Unpin() { cache->end_batch(); }
+                    } unpin{Lw.expert_cache};
+                    const auto I64 = static_cast<std::size_t>(routed_I);
+                    const auto L64 = static_cast<std::size_t>(latent);
+                    require_leaf(slot, "gate_up.weight_packed", 2 * I64 * (L64 / 2));
+                    require_leaf(slot, "gate_up.weight_scale", 2 * I64 * (L64 / 32));
+                    require_leaf(slot, "down.weight_packed", L64 * (I64 / 2));
+                    require_leaf(slot, "down.weight_scale", L64 * (I64 / 32));
                     kernels::launch_dequant_mxfp4_to_bf16(
                         static_cast<const std::uint8_t*>(
                             slot.get("gate_up.weight_packed").data()),
@@ -985,16 +1026,15 @@ void kimi_k3_forward_paged(
                         static_cast<const float*>(ws.route_w.data()), Ne, latent,
                         stream);
 
-                    // Unpin here rather than at the end of the layer, so the
-                    // pin covers exactly the launches that read the slot and
-                    // no more. Holding a whole layer's routed set pinned would
-                    // make the slab's minimum size the number of experts a
-                    // step happens to route to, which is not a number anyone
-                    // can budget for; this way one slot is enough to be
-                    // correct and more slots only buy hits. Nothing races:
-                    // these are queued on `stream`, and a later page-in that
-                    // wants this slot synchronizes `stream` before it writes.
-                    Lw.expert_cache->end_batch();
+                    // `unpin` fires here. The pin covers exactly the launches
+                    // that read the slot and no more: holding a whole layer's
+                    // routed set pinned would make the slab's minimum size the
+                    // number of experts a step happens to route to, which is
+                    // not a number anyone can budget for; this way one slot is
+                    // enough to be correct and more slots only buy hits.
+                    // Nothing races -- these are queued on `stream`, and a
+                    // later page-in that wants this slot synchronizes `stream`
+                    // before it writes.
                 }
             } else if (mxfp4_ok) {
                 kernels::launch_bf16_to_fp16(
