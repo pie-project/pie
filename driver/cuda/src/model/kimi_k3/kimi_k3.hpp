@@ -50,6 +50,7 @@
 #include <vector>
 
 #include "device_buffer.hpp"
+#include "loader/group_stream_cache.hpp"
 #include "model/loaded_model.hpp"
 #include "tensor.hpp"
 
@@ -126,9 +127,9 @@ struct KimiK3LayerWeights {
     const DeviceTensor* routed_down_proj = nullptr;         // [L, H]
     const DeviceTensor* routed_norm = nullptr;              // [L] or null
     const DeviceTensor* routed_up_proj = nullptr;           // [H, L]
-    // Routed experts, dequantised and stacked per layer. Required: the binder
-    // refuses a checkpoint the contract could not stack, because the prefill
-    // GEMM has no per-expert fallback.
+    // Routed experts, dequantised and stacked per layer. Optional: which of
+    // the two forms below is bound is the contract's answer, and the forward
+    // branches on whichever it got.
     const DeviceTensor* moe_gate_up_bf16 = nullptr;  // [E, 2*I_moe, L] bf16
     const DeviceTensor* moe_down_bf16    = nullptr;  // [E, L, I_moe] bf16
     // The MXFP4 originals, per expert, for the decode GEMV. Decode reads the
@@ -138,6 +139,19 @@ struct KimiK3LayerWeights {
     DeviceBuffer<const std::uint8_t*> expert_gate_up_scale_ptrs;
     DeviceBuffer<const std::uint8_t*> expert_down_packed_ptrs;
     DeviceBuffer<const std::uint8_t*> expert_down_scale_ptrs;
+
+    // Or the third form: the experts are not resident at all, but paged one
+    // at a time out of a slab shared with every other layer.
+    //
+    // Non-null excludes both forms above, the way they exclude each other --
+    // a streaming contract publishes a group *instead of* the stacks, not as
+    // well as. Unlike DeepSeek-V4's group, whose plan dequantises on the way
+    // in, K3's slots stay PACKED: at K3's widths a bf16 slot is 3.765x a
+    // packed one and the page-in is the cost this feature is paying. So the
+    // forward pays a dequantize per routed expert per layer per step, into
+    // the scratch on `KimiK3Weights` below.
+    GroupStreamCache* expert_cache = nullptr;
+    std::size_t expert_group = 0;
 
     // Shared expert: a full-width SiTU MLP over the pre-down-proj hidden.
     const DeviceTensor* shared_gate_proj = nullptr;      // [I_shared, H]
@@ -170,6 +184,25 @@ struct KimiK3Weights {
     // Hand-sliced bf16 tensors whose layout does not shard under the
     // contract's uniform axis policy.
     std::vector<DeviceTensor> owned_bf16_buffers;
+
+    // ── Streamed-expert dequantize scratch ─────────────────────────
+    //
+    // Empty unless some layer bound a group. One expert's worth, not one
+    // layer's and not one step's: the streamed forward dispatches experts
+    // serially and each expert's GEMMs are queued on the compute stream
+    // before the next dequantize overwrites these, so ordering -- not
+    // double-buffering -- is what makes the reuse safe.
+    //
+    // Sized against #1739's measured K3 facts (93 layers, 896 experts,
+    // hidden 7168, moe_intermediate 3072, latent 3584). At tp8, I_moe is
+    // 384: 5.25 MiB for the fused pair, 2.625 MiB each for the three
+    // singles, 13.125 MiB per rank for the whole model. At tp1 it is eight
+    // times that. Constant in the expert count, the layer count and the
+    // token count, which is the point.
+    mutable DeviceTensor moe_gate_up_dequant;  // [2*I_moe, L] bf16
+    mutable DeviceTensor moe_gate_dequant;     // [I_moe, L] bf16
+    mutable DeviceTensor moe_up_dequant;       // [I_moe, L] bf16
+    mutable DeviceTensor moe_down_dequant;     // [L, I_moe] bf16
 };
 
 KimiK3Weights bind_kimi_k3(const LoadedModel& engine);

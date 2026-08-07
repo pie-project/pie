@@ -32,6 +32,19 @@ KimiK3Model::KimiK3Model(
     // capture requires. The fresh-slot reset reads `is_fresh_h`, also host.
     caps_.graph_safe = true;
     caps_.graph_padding_kv_write_safe = true;
+
+    // Unless the experts are streamed. Then the MoE reads its routing table
+    // back off the device and synchronises on it, and page-in adds a
+    // host-chosen slot and a plan run on top -- none of it capturable. Only
+    // the capture cap is cleared: `graph_padding_kv_write_safe` is a property
+    // of this family's kernels, which is unchanged, and clearing it would
+    // make a streamed load fail outright rather than merely run ungraphed.
+    for (const auto& L : weights_.layers) {
+        if (L.expert_cache != nullptr) {
+            caps_.graph_safe = false;
+            break;
+        }
+    }
 }
 
 void KimiK3Model::prepare(AttentionWorkspace& attn_ws,

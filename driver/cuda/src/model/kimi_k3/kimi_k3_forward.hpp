@@ -109,6 +109,11 @@ struct KimiK3Workspace {
     DeviceTensor aligned_gate_up;     // [aligned_rows, 2*routed_I]
     DeviceTensor aligned_act;         // [aligned_rows, routed_I]
     DeviceTensor aligned_out;         // [aligned_rows, L]
+    // The streamed per-expert loop's routing weights, staged one expert at a
+    // time. The only buffer that path needs and the aligned one does not --
+    // everything else it wants is an `aligned_*` tensor it can borrow, and
+    // `aligned_rows >= N*K` by construction.
+    DeviceTensor route_w;             // [N*K] fp32
     // The MXFP4 decode GEMVs consume their activation as fp16 so their inner
     // loop is pure `__hfma2`; these stage it once per MoE layer.
     DeviceTensor mxfp4_act_fp16;        // [N, L] fp16

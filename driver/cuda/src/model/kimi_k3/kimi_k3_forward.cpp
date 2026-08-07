@@ -16,6 +16,7 @@
 #include "cuda_check.hpp"
 #include "kernels/attn_res.hpp"
 #include "kernels/causal_conv1d.hpp"
+#include "kernels/deinterleave.hpp"
 #include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_wna16.hpp"
 #include "kernels/embed.hpp"
@@ -52,6 +53,39 @@ constexpr int kKimiK3MoeGemvMaxTokens = 1;
 constexpr int kKimiK3MoeMxfp4MaxTokens = 8;
 
 int local_or_zero(int total, int tp) { return total > 0 ? total / tp : 0; }
+
+/// Which tokens each expert owns, and with what weight.
+///
+/// Only the streamed path needs this: every other path dispatches from
+/// `topk_idx` on the device and never reads the routing back. Kept local, as
+/// every other family's copy is -- K3's router is a genuine top-k selection
+/// (`launch_topk_sigmoid_bf16`), so unlike DeepSeek-V4's hash router it cannot
+/// name the same expert twice for one token and there are no duplicate rows to
+/// fold before `scatter_add_weighted_bf16`'s non-atomic read-modify-write.
+struct ExpertRouting {
+    std::vector<std::vector<std::int32_t>> token_idx;
+    std::vector<std::vector<float>> weights;
+};
+
+ExpertRouting build_routing(
+    const std::vector<std::int32_t>& topk_idx,
+    const std::vector<float>& topk_w,
+    int N, int K, int E)
+{
+    ExpertRouting r;
+    r.token_idx.resize(static_cast<std::size_t>(E));
+    r.weights.resize(static_cast<std::size_t>(E));
+    for (int n = 0; n < N; ++n) {
+        const std::size_t base = static_cast<std::size_t>(n) * K;
+        for (int k = 0; k < K; ++k) {
+            const int e = topk_idx[base + k];
+            if (e < 0 || e >= E) continue;
+            r.token_idx[static_cast<std::size_t>(e)].push_back(n);
+            r.weights[static_cast<std::size_t>(e)].push_back(topk_w[base + k]);
+        }
+    }
+    return r;
+}
 
 /// Turn a sticky launch error into an exception that names where it happened.
 /// A bad launch is otherwise reported by whatever synchronises next, which on
@@ -269,6 +303,7 @@ KimiK3Workspace KimiK3Workspace::allocate(
         ws.aligned_gate_up    = DeviceTensor::allocate(DType::BF16, {aligned_rows, 2 * routed_I});
         ws.aligned_act        = DeviceTensor::allocate(DType::BF16, {aligned_rows, routed_I});
         ws.aligned_out        = DeviceTensor::allocate(DType::BF16, {aligned_rows, latent});
+        ws.route_w            = DeviceTensor::allocate(DType::FP32, {routes});
         // Only the decode GEMV reads these, so they are sized off its token
         // cap rather than `max_tokens`; at the cap this is a few MB.
         const std::int64_t gemv_n =
@@ -782,7 +817,14 @@ void kimi_k3_forward_paged(
             // rows of arithmetic for eight. One warp per output row skips all
             // of it. Above that token count the batched GEMM's tiling starts
             // paying for itself, which is the same crossover GLM-5 measured.
+            // Which form the contract published. Every path but the streamed
+            // one indexes a stack by `base + e*stride`, so all three of them
+            // require `stacked` -- a statement about a slab holding every
+            // expert in routing order, which a paged slot is not.
+            const bool stacked  = Lw.moe_gate_up_bf16 != nullptr;
+            const bool streamed = Lw.expert_cache != nullptr;
             const bool gemv_ok =
+                stacked &&
                 total_tokens <= ops::moe_gemv_max_tokens(kKimiK3MoeGemvMaxTokens) &&
                 (latent % 8) == 0 && (routed_I % 8) == 0;
             // Four-bit weights if the binder found them. A decode step reads
@@ -796,7 +838,165 @@ void kimi_k3_forward_paged(
                 !Lw.expert_gate_up_packed_ptrs.empty() &&
                 ws.mxfp4_act_fp16.numel() > 0 &&
                 total_tokens <= ws.mxfp4_act_fp16.shape()[0];
-            if (mxfp4_ok) {
+            if (streamed) {
+                // Streamed experts take this path and only this path, at
+                // decode as at prefill. It is what the stacks used to be for:
+                // relaxing the bind's hard require without it would turn a
+                // loud load failure into a quiet prefill hole.
+                //
+                // THE COST, stated rather than discovered on a GPU: prefill
+                // stops being one batched GEMM across every active expert and
+                // becomes a serial loop over them -- at K3's shape up to 896
+                // experts on each of 93 layers. DeepSeek-V4 justifies that
+                // dispatch as noise against an SSD read, and that argument
+                // holds *here*, where the SSD read is paid anyway, and
+                // nowhere else. It is precisely why this branch is reached
+                // only when the contract published no stacks to batch.
+                if (ws.aligned_block_size <= 0 || ws.route_w.numel() == 0) {
+                    throw std::runtime_error("kimi_k3: streamed MoE scratch missing");
+                }
+                // `launch_dequant_mxfp4_to_bf16` returns silently on an input
+                // width that is not a multiple of the block, so say so here
+                // rather than let a layer produce zeros.
+                if ((latent % 32) != 0 || (routed_I % 32) != 0) {
+                    throw std::runtime_error(
+                        "kimi_k3: streamed experts need latent and the routed "
+                        "intermediate at a multiple of the MXFP4 block (32); "
+                        "got " + std::to_string(latent) + " and " +
+                        std::to_string(routed_I));
+                }
+
+                std::vector<std::int32_t> topk_idx_h(
+                    static_cast<std::size_t>(routes));
+                std::vector<float> topk_w_h(static_cast<std::size_t>(routes));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    topk_idx_h.data(), ws.topk_idx.data(),
+                    topk_idx_h.size() * sizeof(std::int32_t),
+                    cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    topk_w_h.data(), ws.topk_weights.data(),
+                    topk_w_h.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const auto routing =
+                    build_routing(topk_idx_h, topk_w_h, total_tokens, K, E);
+
+                // The other paths overwrite `latent_out` with a weighted sum;
+                // this one accumulates into it per expert, so it starts at
+                // zero -- and every token gets a row whether or not the
+                // router gave it a valid expert.
+                CUDA_CHECK(cudaMemsetAsync(
+                    ws.latent_out.data(), 0,
+                    static_cast<std::size_t>(total_tokens) * latent * 2, stream));
+
+                // Borrowed from the aligned path, which this branch excludes.
+                // `aligned_rows >= routes >= Ne` by construction, so each is
+                // big enough for the largest a single expert's slice can be;
+                // a second set would double the workspace's largest MoE
+                // tensor to hold the same rows.
+                const std::size_t aligned_rows =
+                    static_cast<std::size_t>(ws.aligned_gate_up.shape()[0]);
+                auto* expert_rows =
+                    static_cast<std::uint16_t*>(ws.aligned_expert_in.data());
+                auto* gate_buf =
+                    static_cast<std::uint16_t*>(ws.aligned_gate_up.data());
+                auto* up_buf = gate_buf + aligned_rows * routed_I;
+                auto* row_idx =
+                    static_cast<std::int32_t*>(ws.aligned_route_ids.data());
+
+                // The whole layer's routing is known before any of it runs and
+                // experts page in one at a time, so say which ones are wanted
+                // now: the read for the next overlaps the GEMMs for this one.
+                for (int e = 0; e < E; ++e) {
+                    if (routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                        continue;
+                    }
+                    Lw.expert_cache->prefetch(Lw.expert_group,
+                                              static_cast<std::uint32_t>(e));
+                }
+                for (int e = 0; e < E; ++e) {
+                    const auto& tok = routing.token_idx[static_cast<std::size_t>(e)];
+                    const int Ne = static_cast<int>(tok.size());
+                    if (Ne == 0) continue;
+                    const auto& wts = routing.weights[static_cast<std::size_t>(e)];
+
+                    // Page it in. The slot holds the four MXFP4 leaves the
+                    // resident per-expert republish would have held -- the
+                    // group's plan is that republish with the expert axis
+                    // fixed at one -- so these are packed nibbles and their
+                    // E8M0 exponents, not bf16. cuBLAS cannot read them.
+                    const WeightStore& slot = Lw.expert_cache->ensure_resident(
+                        Lw.expert_group, static_cast<std::uint32_t>(e), stream);
+                    kernels::launch_dequant_mxfp4_to_bf16(
+                        static_cast<const std::uint8_t*>(
+                            slot.get("gate_up.weight_packed").data()),
+                        static_cast<const std::uint8_t*>(
+                            slot.get("gate_up.weight_scale").data()),
+                        w.moe_gate_up_dequant.data(), 2 * routed_I, latent,
+                        stream);
+                    kernels::launch_dequant_mxfp4_to_bf16(
+                        static_cast<const std::uint8_t*>(
+                            slot.get("down.weight_packed").data()),
+                        static_cast<const std::uint8_t*>(
+                            slot.get("down.weight_scale").data()),
+                        w.moe_down_dequant.data(), latent, routed_I, stream);
+                    // The packed pair is interleaved as the checkpoint ships
+                    // it -- row 2i is gate row i, row 2i+1 is up row i -- and
+                    // the two GEMMs want each half contiguous. Split by
+                    // parity: there is no `+ I*latent` offset that works
+                    // here, unlike the bf16 stack. `kimi_k3_moe_gate_up_
+                    // swapped` does not reach this form; it reorders the
+                    // stack, and the group's halves are named, always gate
+                    // over up.
+                    kernels::launch_deinterleave_rows_bf16(
+                        w.moe_gate_up_dequant.data(), w.moe_gate_dequant.data(),
+                        w.moe_up_dequant.data(), routed_I, latent, stream);
+
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        row_idx, tok.data(),
+                        static_cast<std::size_t>(Ne) * sizeof(std::int32_t),
+                        cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        ws.route_w.data(), wts.data(),
+                        static_cast<std::size_t>(Ne) * sizeof(float),
+                        cudaMemcpyHostToDevice, stream));
+
+                    kernels::launch_gather_bf16_rows(
+                        static_cast<const std::uint16_t*>(expert_in), row_idx,
+                        expert_rows, Ne, latent, stream);
+                    ops::gemm_act_x_w(
+                        cublas.handle(), expert_rows,
+                        ops::WeightView::raw(w.moe_gate_dequant.data(), DType::BF16),
+                        gate_buf, Ne, routed_I, latent);
+                    ops::gemm_act_x_w(
+                        cublas.handle(), expert_rows,
+                        ops::WeightView::raw(w.moe_up_dequant.data(), DType::BF16),
+                        up_buf, Ne, routed_I, latent);
+                    kernels::launch_situ_bf16(
+                        gate_buf, up_buf, ws.aligned_act.data(),
+                        Ne * routed_I, cfg.situ_beta, cfg.situ_linear_beta,
+                        stream);
+                    ops::gemm_act_x_w(
+                        cublas.handle(), ws.aligned_act.data(),
+                        ops::WeightView::raw(w.moe_down_dequant.data(), DType::BF16),
+                        ws.expert_out.data(), Ne, latent, routed_I);
+                    kernels::launch_scatter_add_weighted_bf16(
+                        ws.latent_out.data(), ws.expert_out.data(), row_idx,
+                        static_cast<const float*>(ws.route_w.data()), Ne, latent,
+                        stream);
+
+                    // Unpin here rather than at the end of the layer, so the
+                    // pin covers exactly the launches that read the slot and
+                    // no more. Holding a whole layer's routed set pinned would
+                    // make the slab's minimum size the number of experts a
+                    // step happens to route to, which is not a number anyone
+                    // can budget for; this way one slot is enough to be
+                    // correct and more slots only buy hits. Nothing races:
+                    // these are queued on `stream`, and a later page-in that
+                    // wants this slot synchronizes `stream` before it writes.
+                    Lw.expert_cache->end_batch();
+                }
+            } else if (mxfp4_ok) {
                 kernels::launch_bf16_to_fp16(
                     expert_in, ws.mxfp4_act_fp16.data(),
                     static_cast<std::size_t>(total_tokens) * latent, stream);

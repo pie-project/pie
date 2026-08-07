@@ -8,6 +8,8 @@
 
 #include "cuda_check.hpp"
 #include "kernels/gated_delta_net.hpp"
+#include "loader/group_stream_cache.hpp"
+#include "model/kimi_k3/kimi_k3_expert_binding.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -182,6 +184,7 @@ KimiK3Weights bind_kimi_k3(const LoadedModel& engine) {
 
     int kv_slot = 0;
     int kda_slot = 0;
+    bool streamed_experts = false;
     for (int li = 0; li < cfg.num_hidden_layers; ++li) {
         const std::string lp = "model.layers." + std::to_string(li) + ".";
         const std::string ap = lp + "self_attn.";
@@ -329,27 +332,49 @@ KimiK3Weights bind_kimi_k3(const LoadedModel& engine) {
             }
         }
 
+        // Routed experts, in whichever form the contract published. A
+        // stacking contract publishes the two fused `[E, ...]` slabs; a
+        // streaming contract publishes neither and declares a group instead.
+        // It is never both, so there is no second copy to pay for.
         L.moe_gate_up_bf16 = maybe(engine, mp + "experts.gate_up_proj");
         L.moe_down_bf16    = maybe(engine, mp + "experts.down_proj");
-        if (L.moe_gate_up_bf16 == nullptr || L.moe_down_bf16 == nullptr) {
-            throw std::runtime_error(
-                "kimi_k3: the contract did not publish stacked routed experts at "
-                "layer " + std::to_string(li) +
-                "; per-expert MXFP4 GEMV is not implemented");
-        }
-        require_rank(*L.moe_gate_up_bf16, 3, mp + "experts.gate_up_proj");
-        require_rank(*L.moe_down_bf16, 3, mp + "experts.down_proj");
-        if (L.moe_gate_up_bf16->shape()[2] != latent ||
-            L.moe_down_bf16->shape()[1] != latent) {
-            throw std::runtime_error(
-                "kimi_k3: routed experts are not at the latent width at layer " +
-                std::to_string(li));
+        GroupStreamCache* cache = engine.group_cache();
+        const std::string group_name = mp + "experts";
+        // Only look when the stacks are absent: the two forms are alternatives
+        // and a contract publishes one of them, so a find on a stacked layer
+        // would be a question whose answer cannot matter.
+        const std::size_t g =
+            (L.moe_gate_up_bf16 == nullptr && cache != nullptr)
+                ? cache->find_group(group_name)
+                : GroupStreamCache::kNoGroup;
+        const bool group_found = g != GroupStreamCache::kNoGroup;
+        if (kimi_k3_use_streamed_experts(
+                L.moe_gate_up_bf16 != nullptr, L.moe_down_bf16 != nullptr,
+                group_found, group_found ? cache->arity(g) : 0u,
+                cfg.num_experts, li, group_name)) {
+            L.expert_cache = cache;
+            L.expert_group = g;
+            streamed_experts = true;
+        } else {
+            require_rank(*L.moe_gate_up_bf16, 3, mp + "experts.gate_up_proj");
+            require_rank(*L.moe_down_bf16, 3, mp + "experts.down_proj");
+            if (L.moe_gate_up_bf16->shape()[2] != latent ||
+                L.moe_down_bf16->shape()[1] != latent) {
+                throw std::runtime_error(
+                    "kimi_k3: routed experts are not at the latent width at layer " +
+                    std::to_string(li));
+            }
         }
 
         // The four-bit originals, per expert, for the decode GEMV. A decode
         // step reads the entire routed bank to produce one token, so at bf16
         // the MoE alone is four times the traffic it needs to be; the stacks
         // above stay for prefill, where the dequantized GEMM amortises.
+        //
+        // A streaming contract publishes neither of these: the same bytes are
+        // in the group instead, and both decode and prefill read them there.
+        // The loop below finds nothing and leaves the tables empty, which is
+        // what turns the mxfp4 fast path off in the forward.
         {
             std::vector<const std::uint8_t*> gu_w, gu_s, dn_w, dn_s;
             const int experts = cfg.num_experts;
@@ -392,6 +417,28 @@ KimiK3Weights bind_kimi_k3(const LoadedModel& engine) {
                     "layer " + std::to_string(li));
             }
         }
+    }
+
+    if (streamed_experts) {
+        // One expert's worth of bf16, reused serially by the streamed
+        // forward. cuBLAS cannot read the packed nibbles a slot holds, and
+        // the aligned prefill GEMM indexes a stack by `base + e*stride`,
+        // which is a statement about a slab holding every expert in routing
+        // order -- a slot holds whichever expert was asked for last. So the
+        // streamed path dequantizes here and dispatches one expert at a time.
+        if (cfg.moe_intermediate_size % T != 0) {
+            throw std::runtime_error(
+                "kimi_k3: tp_size " + std::to_string(T) +
+                " does not divide moe_intermediate_size " +
+                std::to_string(cfg.moe_intermediate_size) +
+                ", which the streamed expert group shards on");
+        }
+        const std::int64_t I = cfg.moe_intermediate_size / T;
+        const std::int64_t L = latent;
+        w.moe_gate_up_dequant = DeviceTensor::allocate(DType::BF16, {2 * I, L});
+        w.moe_gate_dequant    = DeviceTensor::allocate(DType::BF16, {I, L});
+        w.moe_up_dequant      = DeviceTensor::allocate(DType::BF16, {I, L});
+        w.moe_down_dequant    = DeviceTensor::allocate(DType::BF16, {L, I});
     }
 
     return w;

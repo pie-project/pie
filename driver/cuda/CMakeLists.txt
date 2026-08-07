@@ -507,6 +507,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/glm5/glm5_forward.cpp
   src/model/glm5/glm5_model.cpp
   src/model/kimi_k3/kimi_k3.cpp
+  src/model/kimi_k3/kimi_k3_expert_binding.cpp
   src/model/kimi_k3/kimi_k3_forward.cpp
   src/model/kimi_k3/kimi_k3_model.cpp
   src/model/kimi/kimi.cpp
@@ -1043,6 +1044,12 @@ pie_add_cuda_target(test_pack_dense_mask
 pie_add_cuda_target(test_kimi_k3_kernels
   SOURCES tests/kimi_k3_kernels_test.cu
   LIBS pie_driver_cuda_lib)
+# Which routed-expert form a K3 layer binds to. Names one src/ file and links
+# no CUDA at all, on purpose: whether a streamed contract is accepted, and on
+# what terms, is decided here, and that must be checkable without a device.
+pie_add_cuda_target(test_kimi_k3_expert_binding
+  SOURCES tests/kimi_k3_expert_binding_test.cpp
+          src/model/kimi_k3/kimi_k3_expert_binding.cpp)
 pie_add_cuda_target(test_envelope_dot
   SOURCES tests/test_envelope_dot.cu src/kernels/envelope.cu
   LIBS CUDA::cudart)
