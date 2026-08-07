@@ -341,10 +341,28 @@ struct DeviceTuning {
     /// traffic, and wins 3.6%.
     ///
     /// The win is still small next to the traffic removed: 32 lanes at 4 rows
-    /// reads an eighth of what 16 lanes at 1 row does and is 5% faster. The
-    /// scan is serialized on the token loop, not on bandwidth, and only the
-    /// chunked form of the delta rule -- where a chunk's transition is a
-    /// matmul -- changes that. This is the last of the cheap wins.
+    /// reads an eighth of what 16 lanes at 1 row does and is 5% faster. Two
+    /// more experiments say why, and both failed:
+    ///
+    ///   * Software-pipelining the token loop -- read t+1's q, k, v and gates
+    ///     into a second register set while t computes -- gives 96.7 tok/s at
+    ///     every lane/row pair against 104.5. If the scan were waiting on
+    ///     memory latency, issuing the loads an iteration early is exactly the
+    ///     repair, and it is 8% WORSE. The registers cost more than the
+    ///     latency they hide, which is another way of saying it was hidden.
+    ///   * Staging q and k in threadgroup memory made bandwidth worse, not
+    ///     better (recorded above).
+    ///
+    /// So the scan is not short of bandwidth, not short of reduction rounds,
+    /// and not waiting on load latency. It is short of nothing an
+    /// implementation of THIS recurrence can give it: 128 dependent steps at
+    /// 7% of ALU peak is what a serial scan costs.
+    ///
+    /// Ablating the dispatch entirely -- wrong answers, right wall clock --
+    /// puts the prefill at 118.1 tok/s against 104.5, so the scan is 11.5% of
+    /// the fire and 11.5% is the budget any replacement has to beat. Only the
+    /// chunked form, where a chunk's transition is a matmul and the token loop
+    /// is gone, is a different implementation.
     int gdn_scan_rows = 4;
 
     /// Rows an expert's run must hold before the mixture sorts and batches at
