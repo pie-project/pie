@@ -203,6 +203,8 @@ fn register_dummy_driver(
         has_mtp_drafts: true,
         has_value_head: true,
         has_attn_score: true,
+        // The dummy traces no forward plan, so it declares no expert sites.
+        model_site_summary: Default::default(),
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,

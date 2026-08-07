@@ -685,7 +685,18 @@ impl DummyDriver {
                         anyhow!("seed references unknown channel {}", seed.channel_id)
                     })?;
                 let ty = program.bound.channel_types[dense];
-                let value = decode_native_value(&seed.bytes, ty)
+                // Seeds cross the ABI in WIRE form, the width this driver
+                // itself reports as the endpoint binding's `cell_bytes`
+                // (`channel_wire_bytes`) — and for Bool that is bits. Reading
+                // them as NATIVE agreed for every dtype where the two are the
+                // same and was wrong by exactly eight for the one that packs:
+                //
+                //   seed channel 9: 16 bytes, expected 128
+                //
+                // The reference driver disagreeing with its own reported width
+                // is worse than a CUDA-only bug, because this is the driver
+                // every other one is checked against.
+                let value = decode_wire_value(&seed.bytes, ty)
                     .map_err(|err| anyhow!("seed channel {}: {err}", seed.channel_id))?;
                 Ok((dense as u32, value))
             })

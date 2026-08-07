@@ -61,6 +61,8 @@ fn dummy_driver_backend(
         has_mtp_drafts: true,
         has_value_head: true,
         has_attn_score: true,
+        // The dummy traces no forward plan, so it declares no expert sites.
+        model_site_summary: Default::default(),
         callback_delay_ms,
         reject_launches: false,
         reject_launches_remaining: 0,
@@ -174,6 +176,7 @@ impl MockEnv {
                 has_kv_envelopes: false,
                 has_attn_page_mask: false,
                 has_attn_score: false,
+                has_lora: false,
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
                 limits: SchedulerLimits {
                     max_forward_requests: 32,
