@@ -833,15 +833,25 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
 ///     448  6144  1536      4163     5794
 ///
 /// Storage and every surrounding kernel stay BF16; only the GEMM's input is
-/// staged to half, once per input rather than once per output tile. Routed
-/// models are excluded on purpose -- llama measured FP16 flipping expert top-k
-/// -- and so is the second quantized set, where a checkpoint ships one: those
-/// tables are 8-bit and have no FP16 pipeline.
+/// staged to half, once per input rather than once per output tile. The ROUTED
+/// projections are excluded -- their weight stack is indexed on the GPU and
+/// the precast kernel has no routed form -- and so is the second quantized
+/// set, where a checkpoint ships one: those tables are 8-bit and have no FP16
+/// pipeline. A mixture's DENSE projections are not excluded; they were, once,
+/// and that cost gemma-4-26b-a4b 37% of its prefill.
 bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
-    // `is_moe` covers the routed kinds too: the DAG emits them under the same
-    // condition, so a dense checkpoint has none to reach.
+    // `is_routed`, not `is_moe`. This used to refuse the whole checkpoint on
+    // the strength of a comment that read "`is_moe` covers the routed kinds
+    // too" -- true, and far too much: a mixture's q/k/v/o are ordinary dense
+    // projections and were being sent down the emulated BF16 MMA with them.
+    // On gemma-4-26b-a4b those are 37% of a 512-row prefill.
+    //
+    // What the routed kinds are actually kept away from is not rounding but
+    // the tile: their weight stack is indexed on the GPU and the precast
+    // kernel has no routed form to select. The router's own GEMV is 8-bit and
+    // excluded by the width test below, so no top-k decision changes here.
     if (!fp16_qmm()) return false;
-    if (g.is_moe() || g.quant.bits != 4 || g.quant.group != 64) return false;
+    if (is_routed(d.kind) || g.quant.bits != 4 || g.quant.group != 64) return false;
     // Only a checkpoint that really ships two formats has an 8-bit set to keep
     // away from, and only the tensors it actually spared. Reading the kind
     // alone would have excluded gate, up and down from every checkpoint, which

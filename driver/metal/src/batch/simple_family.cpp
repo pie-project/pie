@@ -469,7 +469,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
                 ctx, kernels_dir, mb_, g_.quant, err,
                 MultiBatchPsoFeatures{
                     .d512 = true, .sdpa_d256 = true,
-                    .fp16_precast = !g_.is_moe() && g_.quant.bits == 4 &&
+                    .fp16_precast = g_.quant.bits == 4 &&
                                     g_.quant.group == 64})) {
             return false;
         }
@@ -490,7 +490,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             }
         }
 
-        if (!g_.is_moe() && g_.quant.bits == 4 && g_.quant.group == 64) {
+        if (g_.quant.bits == 4 && g_.quant.group == 64) {
             // The widest input any staged projection reads, times the rows the
             // GEMM rounds up to. Asked of the DAG rather than of the geometry
             // because gemma4's `o_proj` K is per-layer -- a sliding layer's is
