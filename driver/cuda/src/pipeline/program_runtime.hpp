@@ -478,7 +478,19 @@ class PtirInstance {
             const std::size_t expected =
                 seeds ? view_.cell_bytes(dense) : view_.wire_bytes(dense);
             if (value.bytes.size() != expected) {
-                if (err) *err = "ptir: channel value byte length mismatch";
+                // Say WHICH channel and BY HOW MUCH. The bare sentence this
+                // replaces is the whole diagnosis a caller got, and a
+                // length mismatch is understood by its ratio: a factor of
+                // the dtype width is a dtype disagreement, a whole-cell
+                // multiple is a shape one.
+                if (err) {
+                    *err = "ptir: channel value byte length mismatch on " +
+                           std::string(seeds ? "seed" : "host put") +
+                           " chan#" + std::to_string(dense) +
+                           " (global " + std::to_string(view_.global_id(dense)) +
+                           "): got " + std::to_string(value.bytes.size()) +
+                           " bytes, expected " + std::to_string(expected);
+                }
                 return false;
             }
         }
