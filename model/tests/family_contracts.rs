@@ -24,8 +24,7 @@ use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, METAL_TILE_MAP_MASK, StorageTarget, compile as compile_load_plan,
 };
 use pie_loader::types::{
-    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, ScaleForm,
-    TensorId,
+    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, ScaleForm, TensorId,
 };
 use pie_loader::verify::ContractView;
 
@@ -736,7 +735,11 @@ fn kimi_k3_checkpoint_sized(
     // bounds the tp degrees a fixture can reach — the padding ratio is not
     // load-bearing, only that the band has to find its heads inside it.
     ck.push(&format!("{p}self_attn.A_log"), &[heads * 2], f32enc());
-    ck.push(&format!("{p}self_attn.b_proj.weight"), &[heads, hidden], bf16());
+    ck.push(
+        &format!("{p}self_attn.b_proj.weight"),
+        &[heads, hidden],
+        bf16(),
+    );
     if let Some(packed) = experts {
         let moe = format!("{p}block_sparse_moe.");
         for expert in 0..2 {
@@ -878,9 +881,12 @@ fn kimi_k3_refuses_a_streaming_request_it_cannot_serve() {
 /// mistakes agree. Here the expected extent is derived from the **weight's**
 /// shape, so a wrong axis fails on arithmetic and fails at generation time.
 ///
-/// Entries are `(name, shape, scales)` and must be the whole set a `scales.of`
-/// could name, so a dangling reference is caught rather than skipped.
-fn assert_scales_follow_their_weights(entries: &[pie_loader::contract::TensorContract], what: &str) {
+/// `entries` must be the whole set a `scales.of` could name — the group's own
+/// tensors, or the contract's — so a dangling reference is caught, not skipped.
+fn assert_scales_follow_their_weights(
+    entries: &[pie_loader::contract::TensorContract],
+    what: &str,
+) {
     let mut checked = 0;
     for entry in entries {
         let (name, shape) = (&entry.name, entry.shape.clone().expect("a declared shape"));
@@ -969,8 +975,14 @@ fn kimi_k3_streams_real_width_slots() {
         (16, 1_096_704),
     ];
 
-    let checkpoint =
-        kimi_k3_checkpoint_sized(HIDDEN, LATENT, INTERMEDIATE, HEADS, Some(u8enc()), "realwidth");
+    let checkpoint = kimi_k3_checkpoint_sized(
+        HIDDEN,
+        LATENT,
+        INTERMEDIATE,
+        HEADS,
+        Some(u8enc()),
+        "realwidth",
+    );
     for (tp, expected_bytes) in SLOT_BYTES {
         let rank = target(tp - 1, tp);
         let contract = author(&kimi_k3_facts(), &checkpoint, &rank, &streamed())
@@ -1040,7 +1052,11 @@ fn kimi_k3_streams_real_width_slots() {
         // see them swapped — and a swap gives a slot whose gate rows carry
         // up's scales, which is wrong output rather than a wrong size.
         for (leaf, gate, up) in [
-            ("gate_up.weight_packed", "w1.weight_packed", "w3.weight_packed"),
+            (
+                "gate_up.weight_packed",
+                "w1.weight_packed",
+                "w3.weight_packed",
+            ),
             ("gate_up.weight_scale", "w1.weight_scale", "w3.weight_scale"),
         ] {
             let expr = serde_json::to_string(
@@ -1064,6 +1080,20 @@ fn kimi_k3_streams_real_width_slots() {
             );
         }
 
+        // `assert_scales_follow_their_weights` skips a tensor that carries no
+        // scales, and its vacuity guard is satisfied by whichever leaf still
+        // has them — so name the two that must, or dropping one is invisible.
+        for leaf in ["gate_up.weight_scale", "down.weight_scale"] {
+            let got = group
+                .tensors
+                .iter()
+                .find(|t| t.name == leaf)
+                .expect("a declared leaf");
+            assert!(
+                got.scales.is_some(),
+                "tp{tp}: {leaf} declares no scales, so nothing says which weight it scales"
+            );
+        }
         assert_scales_follow_their_weights(&group.tensors, &format!("tp{tp} streamed"));
 
         // Declared shapes are a claim; the plan is whether the expressions can
@@ -1074,7 +1104,10 @@ fn kimi_k3_streams_real_width_slots() {
             pie_loader_capi::view::verify_marshalled(&plan, Some(&ContractView::of(&contract)))
         {
             let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
-            panic!("tp{tp}: the plan does not honour its contract:\n  {}", listed.join("\n  "));
+            panic!(
+                "tp{tp}: the plan does not honour its contract:\n  {}",
+                listed.join("\n  ")
+            );
         }
     }
 }
