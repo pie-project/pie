@@ -99,7 +99,17 @@ inline bool native_mxfp4_moe_opt_out() {
 }
 
 constexpr bool device_supports_native_mxfp4_moe(int cc_major) {
-#if defined(PIE_CUDA_HAS_MARLIN_MOE)
+// The expert-indexed MoE GEMM is only half of what this answer promises.
+// Saying yes makes the LOADER plan a marlin MXFP4 lowering, and that
+// lowering's repack lives behind `PIE_CUDA_HAS_MARLIN`
+// (`loader/transcode_engine.hpp`) with no MoE-specific alternative. The
+// two options default apart — `PIE_CUDA_BUILD_MARLIN_MOE` is ON,
+// `PIE_CUDA_BUILD_MARLIN` is OFF — so a DEFAULT build answered yes here
+// and then threw "MarlinMxfp4Weight Repack requires Marlin" at load,
+// which is to say it planned something it could not execute. Ask for
+// both, and a build with only the MoE half falls back to the routed
+// decode path instead of failing to load an MXFP4 checkpoint at all.
+#if defined(PIE_CUDA_HAS_MARLIN_MOE) && defined(PIE_CUDA_HAS_MARLIN)
     return cc_major >= 8;
 #elif defined(PIE_CUDA_HAS_MARLIN)
     return cc_major >= 10;

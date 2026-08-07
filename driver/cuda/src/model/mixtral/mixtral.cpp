@@ -517,8 +517,15 @@ void mixtral_forward_paged(
                             : fwd_cfg.sliding_window;
         if (w_l < 0) { has_full_layer = true; break; }
     }
+    // The split's partials are folded by `merge_attention_states_bf16`,
+    // which lives in the sm90 TU and is a THROWING STUB elsewhere. Unlike
+    // that unit's other callers this one reaches the merge after the
+    // ORDINARY decode dispatch, so nothing upstream of it has already
+    // failed on a non-Hopper card — the split simply has to not be taken.
+    // Without this, a gpt-oss decode on an L40S threw "attention-state
+    // merge is not built for this CUDA architecture" at the first fire.
     if (use_decode_path && has_full_layer && R == 1 && page_size > 0 &&
-        custom_mask_d == nullptr) {
+        custom_mask_d == nullptr && ops::merge_attention_states_supported()) {
         const int splits = kMixtralFullSplits;
         split_indptr = DeviceBuffer<std::uint32_t>::alloc(splits + 1);
         split_last = DeviceBuffer<std::uint32_t>::alloc(splits);

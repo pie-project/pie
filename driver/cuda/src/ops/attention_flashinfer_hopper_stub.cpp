@@ -55,6 +55,8 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
 // that produces its inputs is the sm90 prefill's. Stubbed with the rest of
 // that unit; nothing on this arch can reach a call to it, because the only
 // caller runs after a dispatch that already threw.
+bool merge_attention_states_supported() { return false; }
+
 void merge_attention_states_bf16(
     const void* /*v*/, const float* /*s*/,
     void* /*v_merged*/, float* /*s_merged*/,

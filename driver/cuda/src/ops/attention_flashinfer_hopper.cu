@@ -365,6 +365,8 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
 
 namespace pie_cuda_driver::ops {
 
+bool merge_attention_states_supported() { return true; }
+
 void merge_attention_states_bf16(
     const void* v, const float* s,
     void* v_merged, float* s_merged,

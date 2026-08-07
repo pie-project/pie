@@ -30,6 +30,14 @@ struct HopperPrefillPlan {
     bool valid = false;
 };
 
+// Whether `merge_attention_states_bf16` below is BUILT on this
+// architecture. The stub TU's comment asserts "nothing on this arch can
+// reach a call to it, because the only caller runs after a dispatch that
+// already threw" — true of the sm90 prefill's caller, and NOT true of a
+// caller that merges partials produced by the ordinary decode dispatch.
+// Such a caller has to ask.
+bool merge_attention_states_supported();
+
 bool hopper_prefill_supported(int head_dim,
                               int window_left,
                               int total_tokens,
