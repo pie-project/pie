@@ -8470,6 +8470,33 @@ std::string describe_uncommitted_lane(
         message += " refused=" + std::to_string(refused_count);
         message += " [" + refused + "])";
     }
+    // The REFUSED ticket alone names a channel but not its company, and a
+    // refusal is usually understood by where the channel sits among the
+    // lane's others — which of them are required inputs, which already
+    // carry data. Listing them turns "chan#0 slot=30 is empty" into a
+    // position in the fire's own construction order.
+    std::string roster;
+    std::size_t listed = 0;
+    for (const DeviceHostChannelTicket& ticket : lane.tickets) {
+        if (ticket.words == nullptr) continue;
+        if (++listed > 16) {
+            roster += ", ...";
+            break;
+        }
+        const std::uint64_t head =
+            std::atomic_ref<const std::uint64_t>(ticket.words[0])
+                .load(std::memory_order_acquire);
+        const std::uint64_t tail =
+            std::atomic_ref<const std::uint64_t>(ticket.words[1])
+                .load(std::memory_order_acquire);
+        if (!roster.empty()) roster += ", ";
+        roster += channel_label(ticket.slot);
+        roster += "/s" + std::to_string(ticket.slot);
+        if ((ticket.flags & kTicketRequireInput) != 0) roster += " req";
+        if ((ticket.flags & kTicketConsume) != 0) roster += " cons";
+        roster += " " + std::to_string(head) + "/" + std::to_string(tail);
+    }
+    if (!roster.empty()) message += " lane_tickets=[" + roster + "]";
     return message;
 }
 
