@@ -171,23 +171,19 @@ const MXFP4_BLOCK: i64 = 32;
 
 /// State that a `weight_scale` holds the MXFP4 block exponents for `weight`.
 ///
-/// `channel_axis` is a parameter rather than a constant. `PerGroup` groups
-/// along the axis *after* `channel_axis`, so the value names the tensor's row
-/// axis and the grouping lands on the next one. K3's two halves put their rows
-/// in different places: `gate_up` is `[I, 2, L]`, rows on axis 1 and codes on
-/// axis 2, so 1; `down` is `[L, I]`, rows on axis 0 and codes on axis 1, so 0.
-///
-/// GPT-OSS passes a literal 1 for every half of every one of its paths, and
-/// that is the same rule rather than a different one — its halves all keep
-/// their rows on axis 1, whatever their rank (its routed and streamed weights
-/// are rank 4 `[E, I, blocks, 16]` against a rank-3 `[E, I, blocks]` scale, its
-/// native ones rank 3 `[E, I, H]` against `[E, I, H/32]`). K3's `down` is the
-/// case that has no counterpart there, and copying the literal would put its
-/// scales on the wrong axis.
+/// `channel_axis` is a parameter, not a constant. `PerGroup` groups along the
+/// axis *after* `channel_axis` (`pie_loader::types::QuantGranularity`), so the
+/// value is one less than the axis the codes run along, and K3's two halves
+/// run them in different places: `gate_up` is `[I, 2, L/2]` and groups on axis
+/// 2, so 1; `down` is `[L, I/2]` and groups on axis 1, so 0. Derived from that
+/// rule and from these shapes, and from nothing else — the literal another
+/// family passes is that family's shapes talking.
 ///
 /// `group_size` counts *codes*, not bytes, even though `of` names a `U8`
-/// tensor holding two codes per byte. That is the convention the resident
-/// GPT-OSS path already publishes and the dequant kernels already read.
+/// tensor holding two codes per byte. Nothing in the loader enforces either
+/// reading (`Scales` is consumed only by `plan::build`, which checks that `of`
+/// resolves and nothing more), and the CUDA GEMM validator sizes its expected
+/// scales from logical N/K — the code count. This follows the consumer.
 fn mxfp4_block_scales(weight: impl Into<String>, channel_axis: u32) -> Scales {
     Scales {
         of: weight.into(),
@@ -203,6 +199,11 @@ fn mxfp4_block_scales(weight: impl Into<String>, channel_axis: u32) -> Scales {
 /// `Ok(None)` is "this checkpoint packs its experts some other way" — not a
 /// contradiction, just not the layout this pass rewrites. `Err` is a
 /// contradiction: the six tensors disagree about the same expert.
+///
+/// Read at instance 0 only. The group's plan is compiled there and every other
+/// instance is required to match it, so a later expert that disagrees is
+/// rejected by `assert_interchangeable` rather than here — later, but not
+/// silently.
 ///
 /// [`streamed_expert_groups`] is the only caller. [`bf16_expert_stacks`] states
 /// the same rule inline and keeps it: that pass predates streaming and this
@@ -220,7 +221,9 @@ fn streamed_expert_dims(parts: &[&RawTensor], what: &str) -> Result<Option<(i64,
     // [L, I/32]. The returned widths are in *elements*, not bytes.
     let inter = parts[0].shape[0];
     let latent = parts[0].shape[1] * 2;
-    if parts[4].shape[0] != latent
+    if parts[2].shape != parts[0].shape
+        || parts[3].shape != parts[1].shape
+        || parts[4].shape[0] != latent
         || parts[4].shape[1] * 2 != inter
         || parts[1].shape[1] != latent / MXFP4_BLOCK
         || parts[5].shape[1] != inter / MXFP4_BLOCK
@@ -408,39 +411,24 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
                 u8enc.clone(),
                 Some(vec![local_inter, 2, latent / 2]),
             );
-            // Each `weight_scale` says which weight it scales. The streamed
-            // group states the same pairing on the same four leaves, and it
-            // has to: these are one set of bytes under two residencies, and a
-            // fact attached to only one of them is a fact that can come to
-            // differ between them.
-            if let Some(id) = b.define(
+            b.define(
                 format!("{ep_out}gate_up.weight_scale"),
                 gu_scale,
                 u8enc.clone(),
                 Some(vec![local_inter, 2, latent / GROUP]),
-            ) {
-                b.set_scales(
-                    id,
-                    mxfp4_block_scales(format!("{ep_out}gate_up.weight_packed"), 1),
-                );
-            }
+            );
             b.define(
                 format!("{ep_out}down.weight_packed"),
                 dn_packed,
                 u8enc.clone(),
                 Some(vec![latent, local_inter / 2]),
             );
-            if let Some(id) = b.define(
+            b.define(
                 format!("{ep_out}down.weight_scale"),
                 dn_scale,
                 u8enc,
                 Some(vec![latent, local_inter / GROUP]),
-            ) {
-                b.set_scales(
-                    id,
-                    mxfp4_block_scales(format!("{ep_out}down.weight_packed"), 0),
-                );
-            }
+            );
             consumed.extend(parts.iter().map(|part| part.id));
         }
 

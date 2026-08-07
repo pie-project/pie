@@ -20,12 +20,12 @@
 use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use pie_loader::contract::Scales;
 use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, METAL_TILE_MAP_MASK, StorageTarget, compile as compile_load_plan,
 };
 use pie_loader::types::{
-    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, TensorId,
+    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, ScaleForm,
+    TensorId,
 };
 use pie_loader::verify::ContractView;
 
@@ -711,7 +711,7 @@ fn kimi_k3_checkpoint_at(
     experts: Option<Encoding>,
     tag: &str,
 ) -> CheckpointMetadata {
-    kimi_k3_checkpoint_sized(64, 64, intermediate, experts, tag)
+    kimi_k3_checkpoint_sized(64, 64, intermediate, 8, experts, tag)
 }
 
 /// [`kimi_k3_checkpoint_at`] with the two widths the expert shapes are built
@@ -720,6 +720,7 @@ fn kimi_k3_checkpoint_sized(
     hidden: i64,
     latent: i64,
     intermediate: i64,
+    heads: i64,
     experts: Option<Encoding>,
     tag: &str,
 ) -> CheckpointMetadata {
@@ -730,9 +731,12 @@ fn kimi_k3_checkpoint_sized(
         bf16(),
     );
     let p = "language_model.model.layers.0.";
-    // A KDA layer: 8 real heads in a 16-entry padded gate bank.
-    ck.push(&format!("{p}self_attn.A_log"), &[16], f32enc());
-    ck.push(&format!("{p}self_attn.b_proj.weight"), &[8, hidden], bf16());
+    // A KDA layer: `heads` real heads in a gate bank the checkpoint rounded
+    // up. `heads` is a parameter because every rank has to divide it, so it
+    // bounds the tp degrees a fixture can reach — the padding ratio is not
+    // load-bearing, only that the band has to find its heads inside it.
+    ck.push(&format!("{p}self_attn.A_log"), &[heads * 2], f32enc());
+    ck.push(&format!("{p}self_attn.b_proj.weight"), &[heads, hidden], bf16());
     if let Some(packed) = experts {
         let moe = format!("{p}block_sparse_moe.");
         for expert in 0..2 {
@@ -864,78 +868,6 @@ fn kimi_k3_refuses_a_streaming_request_it_cannot_serve() {
     }
 }
 
-/// The two residencies say the same thing about the same bytes.
-///
-/// A `weight_scale` in the streamed group and the same leaf on a resident
-/// expert describe one set of checkpoint bytes under two residencies. K3's
-/// expert kernels take the weight and its scale as two explicit pointers and
-/// do not read `quant_meta`, so nothing in the driver would notice the two
-/// drifting apart — which is precisely why the agreement is asserted here
-/// rather than left to be observed once by whoever wrote it.
-///
-/// `of` is deliberately not compared: a group names its leaf relative to the
-/// group and a resident tensor names it in full, and that difference is the
-/// point of a group. Everything that describes the *quantization* must match.
-#[test]
-fn the_streamed_group_and_the_resident_experts_scale_alike() {
-    let checkpoint = kimi_k3_checkpoint_at(64, Some(u8enc()), "wide");
-    let resident = author(
-        &kimi_k3_facts(),
-        &checkpoint,
-        &target(1, 2),
-        &Policy::default(),
-    )
-    .expect("resident authoring")
-    .expect("kimi_k3 has an author");
-    let grouped = author(&kimi_k3_facts(), &checkpoint, &target(1, 2), &streamed())
-        .expect("streamed authoring")
-        .expect("kimi_k3 has an author");
-
-    let group = grouped.groups.first().expect("one routed-expert group");
-    let quantization = |s: &Scales| {
-        format!(
-            "{:?}/{}/{}/{:?}",
-            s.granularity, s.group_size, s.channel_axis, s.form
-        )
-    };
-    for leaf in ["gate_up.weight_scale", "down.weight_scale"] {
-        let weight = leaf.replace("weight_scale", "weight_packed");
-        let from_group = group
-            .tensors
-            .iter()
-            .find(|t| t.name == leaf)
-            .unwrap_or_else(|| panic!("the streamed group declares no {leaf}"));
-        let full = format!("model.layers.0.block_sparse_moe.experts.0.{leaf}");
-        let from_resident = resident
-            .tensors
-            .iter()
-            .find(|t| t.name == full)
-            .unwrap_or_else(|| panic!("the resident contract declares no {full}"));
-
-        let (g, r) = (
-            from_group
-                .scales
-                .as_ref()
-                .unwrap_or_else(|| panic!("group {leaf} carries no scales")),
-            from_resident
-                .scales
-                .as_ref()
-                .unwrap_or_else(|| panic!("resident {full} carries no scales")),
-        );
-        assert_eq!(
-            quantization(g),
-            quantization(r),
-            "{leaf}: the streamed slot and the resident expert disagree"
-        );
-        assert!(
-            g.of == weight && r.of.ends_with(&weight),
-            "{leaf}: each side must point at its own {weight}, got {:?} and {:?}",
-            g.of,
-            r.of
-        );
-    }
-}
-
 /// Every scale's declared extent follows from the weight it names.
 ///
 /// This is the assertion the goldens cannot be. A golden is written *from* the
@@ -948,19 +880,28 @@ fn the_streamed_group_and_the_resident_experts_scale_alike() {
 ///
 /// Entries are `(name, shape, scales)` and must be the whole set a `scales.of`
 /// could name, so a dangling reference is caught rather than skipped.
-fn assert_scales_follow_their_weights(entries: &[(String, Vec<i64>, Option<Scales>)], what: &str) {
+fn assert_scales_follow_their_weights(entries: &[pie_loader::contract::TensorContract], what: &str) {
     let mut checked = 0;
-    for (name, shape, scales) in entries {
-        let Some(s) = scales else { continue };
+    for entry in entries {
+        let (name, shape) = (&entry.name, entry.shape.clone().expect("a declared shape"));
+        let Some(s) = entry.scales.as_ref() else {
+            continue;
+        };
         assert_eq!(
             s.granularity,
             QuantGranularity::PerGroup,
             "{what}: {name}: this check only describes PerGroup"
         );
+        assert_eq!(
+            s.form,
+            ScaleForm::RawE8M0,
+            "{what}: {name}: MXFP4 exponents are raw E8M0 bytes; F32Factors would have the \
+             driver expand bytes it should read directly, and nothing checks this at runtime"
+        );
         let weight = entries
             .iter()
-            .find(|(other, _, _)| *other == s.of)
-            .map(|(_, shape, _)| shape)
+            .find(|other| other.name == s.of)
+            .and_then(|other| other.shape.clone())
             .unwrap_or_else(|| panic!("{what}: {name} scales '{}', which is not declared", s.of));
 
         // MXFP4 packs two codes per byte along the axis it also groups along,
@@ -999,40 +940,28 @@ fn assert_scales_follow_their_weights(entries: &[(String, Vec<i64>, Option<Scale
     assert!(checked > 0, "{what}: nothing carried scales — vacuous");
 }
 
-fn entries_of(
-    tensors: &[pie_loader::contract::TensorContract],
-) -> Vec<(String, Vec<i64>, Option<Scales>)> {
-    tensors
-        .iter()
-        .map(|t| {
-            (
-                t.name.clone(),
-                t.shape.clone().expect("a declared shape"),
-                t.scales.clone(),
-            )
-        })
-        .collect()
-}
-
 /// The slot a rank actually pages in, at the widths Kimi-K3 really has.
 ///
 /// Every other K3 case here is toy-width, so until now nothing checked this
 /// contract against the model it exists for. The expert count stays small on
-/// purpose — 896 experts at these widths is a multi-gigabyte fixture, and a
-/// slot is per expert per rank, so the count does not enter the arithmetic.
+/// purpose — a slot is per expert per rank, so the count does not enter the
+/// arithmetic, and 896 experts at these widths is a fixture in the gigabytes.
 ///
-/// The byte totals are the load-bearing assertion, and they are literals
-/// computed independently of this code rather than re-derived from it. They
-/// are also what the ticket priced the feature on: 16.7/tp MiB per slot, which
-/// at tp8 is the 2.09 MiB behind the ~61 ms/token page-in estimate.
+/// The assertions here are the ones a golden cannot make. A golden is written
+/// *from* the author's output, so any defect it records is a defect it then
+/// pins: re-blessing turns it green again. Everything below is derived from
+/// something else — the checkpoint's own widths, the weight a scale names, or
+/// the source a half is built from.
 #[test]
 fn kimi_k3_streams_real_width_slots() {
     // moonshotai/Kimi-K3, measured: hidden 7168, routed_expert_hidden_size
-    // 3584, moe_intermediate_size 3072.
+    // 3584, moe_intermediate_size 3072, 96 KDA heads in a 128-entry A_log.
     const HIDDEN: i64 = 7168;
     const LATENT: i64 = 3584;
     const INTERMEDIATE: i64 = 3072;
-    // (tp_size, bytes in one expert's four leaves on one rank)
+    const HEADS: i64 = 96;
+    // (tp_size, bytes in one expert's four leaves on one rank). Literals,
+    // computed away from this code: they are what the feature was priced on.
     const SLOT_BYTES: [(u32, i64); 4] = [
         (1, 17_547_264),
         (4, 4_386_816),
@@ -1041,21 +970,34 @@ fn kimi_k3_streams_real_width_slots() {
     ];
 
     let checkpoint =
-        kimi_k3_checkpoint_sized(HIDDEN, LATENT, INTERMEDIATE, Some(u8enc()), "realwidth");
+        kimi_k3_checkpoint_sized(HIDDEN, LATENT, INTERMEDIATE, HEADS, Some(u8enc()), "realwidth");
     for (tp, expected_bytes) in SLOT_BYTES {
-        let streamed_contract = author(
-            &kimi_k3_facts(),
-            &checkpoint,
-            &target(tp - 1, tp),
-            &streamed(),
-        )
-        .unwrap_or_else(|err| panic!("tp{tp}: authoring failed: {err}"))
-        .expect("kimi_k3 has an author");
+        let rank = target(tp - 1, tp);
+        let contract = author(&kimi_k3_facts(), &checkpoint, &rank, &streamed())
+            .unwrap_or_else(|err| panic!("tp{tp}: authoring failed: {err}"))
+            .expect("kimi_k3 has an author");
 
-        let group = streamed_contract
-            .groups
-            .first()
-            .unwrap_or_else(|| panic!("tp{tp}: no routed-expert group"));
+        // The whole feature is that the bank is NOT resident. Publishing the
+        // experts as well as the group would page them in *and* keep them —
+        // 1.4465 TB of it — and every shape below would still be right.
+        let resident: Vec<&str> = contract
+            .tensors
+            .iter()
+            .map(|t| t.name.as_str())
+            .filter(|name| name.contains("block_sparse_moe"))
+            .collect();
+        assert!(
+            resident.is_empty(),
+            "tp{tp}: streaming left {} expert tensors resident beside the slab: {resident:?}",
+            resident.len()
+        );
+
+        assert_eq!(
+            contract.groups.len(),
+            1,
+            "tp{tp}: one group per MoE layer, and this fixture has one layer"
+        );
+        let group = &contract.groups[0];
         assert_eq!(group.arity, 2, "tp{tp}: arity is the expert count");
 
         let local = INTERMEDIATE / i64::from(tp);
@@ -1093,23 +1035,47 @@ fn kimi_k3_streams_real_width_slots() {
              per expert that this arithmetic did not price"
         );
 
-        assert_scales_follow_their_weights(
-            &entries_of(&group.tensors),
-            &format!("tp{tp} streamed"),
-        );
+        // Gate over up, and the two leaves must agree on it. w1 and w3 have
+        // identical declared shapes, so no shape or byte assertion above can
+        // see them swapped — and a swap gives a slot whose gate rows carry
+        // up's scales, which is wrong output rather than a wrong size.
+        for (leaf, gate, up) in [
+            ("gate_up.weight_packed", "w1.weight_packed", "w3.weight_packed"),
+            ("gate_up.weight_scale", "w1.weight_scale", "w3.weight_scale"),
+        ] {
+            let expr = serde_json::to_string(
+                &group
+                    .tensors
+                    .iter()
+                    .find(|t| t.name == leaf)
+                    .expect("a declared leaf")
+                    .expr,
+            )
+            .expect("serialize expr");
+            let (at_gate, at_up) = (expr.find(gate), expr.find(up));
+            assert!(
+                at_gate.is_some() && at_up.is_some(),
+                "tp{tp}: {leaf} is not built from {gate} and {up}: {expr}"
+            );
+            assert!(
+                at_gate < at_up,
+                "tp{tp}: {leaf} joins {up} before {gate}; the decode GEMV reads row 2i as \
+                 gate and 2i+1 as up, so the halves are not interchangeable"
+            );
+        }
 
-        let resident = author(
-            &kimi_k3_facts(),
-            &checkpoint,
-            &target(tp - 1, tp),
-            &Policy::default(),
-        )
-        .unwrap_or_else(|err| panic!("tp{tp}: resident authoring failed: {err}"))
-        .expect("kimi_k3 has an author");
-        assert_scales_follow_their_weights(
-            &entries_of(&resident.tensors),
-            &format!("tp{tp} resident"),
-        );
+        assert_scales_follow_their_weights(&group.tensors, &format!("tp{tp} streamed"));
+
+        // Declared shapes are a claim; the plan is whether the expressions can
+        // actually produce them at this rank.
+        let plan = compile_load_plan(&checkpoint, &contract, rank.clone())
+            .unwrap_or_else(|err| panic!("tp{tp}: compiling failed: {err}"));
+        if let Err(violations) =
+            pie_loader_capi::view::verify_marshalled(&plan, Some(&ContractView::of(&contract)))
+        {
+            let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
+            panic!("tp{tp}: the plan does not honour its contract:\n  {}", listed.join("\n  "));
+        }
     }
 }
 

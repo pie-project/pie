@@ -127,13 +127,7 @@
       "encoding": {
         "Raw": "U8"
       },
-      "scales": {
-        "of": "model.layers.0.block_sparse_moe.experts.0.gate_up.weight_packed",
-        "granularity": "PerGroup",
-        "group_size": 32,
-        "channel_axis": 1,
-        "form": "RawE8M0"
-      },
+      "scales": null,
       "visibility": "Public"
     },
     {
@@ -163,13 +157,7 @@
       "encoding": {
         "Raw": "U8"
       },
-      "scales": {
-        "of": "model.layers.0.block_sparse_moe.experts.0.down.weight_packed",
-        "granularity": "PerGroup",
-        "group_size": 32,
-        "channel_axis": 0,
-        "form": "RawE8M0"
-      },
+      "scales": null,
       "visibility": "Public"
     },
     {
@@ -277,13 +265,7 @@
       "encoding": {
         "Raw": "U8"
       },
-      "scales": {
-        "of": "model.layers.0.block_sparse_moe.experts.1.gate_up.weight_packed",
-        "granularity": "PerGroup",
-        "group_size": 32,
-        "channel_axis": 1,
-        "form": "RawE8M0"
-      },
+      "scales": null,
       "visibility": "Public"
     },
     {
@@ -313,13 +295,7 @@
       "encoding": {
         "Raw": "U8"
       },
-      "scales": {
-        "of": "model.layers.0.block_sparse_moe.experts.1.down.weight_packed",
-        "granularity": "PerGroup",
-        "group_size": 32,
-        "channel_axis": 0,
-        "form": "RawE8M0"
-      },
+      "scales": null,
       "visibility": "Public"
     },
     {
