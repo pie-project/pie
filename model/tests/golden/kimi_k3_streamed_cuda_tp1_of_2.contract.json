@@ -1,0 +1,261 @@
+{
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "model.layers.0.self_attn.A_log",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Slice": {
+              "src": {
+                "Src": "language_model.model.layers.0.self_attn.A_log"
+              },
+              "axis": 0,
+              "start": 0,
+              "len": 8
+            }
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        4
+      ],
+      "encoding": {
+        "Raw": "F32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "language_model.model.embed_tokens.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        64,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.layers.0.self_attn.b_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "language_model.model.layers.0.self_attn.b_proj.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        4,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
+      "name": "model.norm.weight",
+      "expr": {
+        "Src": "language_model.model.norm.weight"
+      },
+      "shape": [
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "scales": null,
+      "visibility": "Public"
+    }
+  ],
+  "groups": [
+    {
+      "name": "model.layers.0.block_sparse_moe.experts",
+      "arity": 2,
+      "tensors": [
+        {
+          "name": "gate_up.weight_packed",
+          "expr": {
+            "Concat": {
+              "axis": 1,
+              "parts": [
+                {
+                  "Transmute": {
+                    "src": {
+                      "Shard": {
+                        "src": {
+                          "SrcIndexed": "language_model.model.layers.0.block_sparse_moe.experts.{}.w1.weight_packed"
+                        },
+                        "axis": 0
+                      }
+                    },
+                    "to": {
+                      "shape": [
+                        32,
+                        1,
+                        32
+                      ],
+                      "encoding": {
+                        "Raw": "U8"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Transmute": {
+                    "src": {
+                      "Shard": {
+                        "src": {
+                          "SrcIndexed": "language_model.model.layers.0.block_sparse_moe.experts.{}.w3.weight_packed"
+                        },
+                        "axis": 0
+                      }
+                    },
+                    "to": {
+                      "shape": [
+                        32,
+                        1,
+                        32
+                      ],
+                      "encoding": {
+                        "Raw": "U8"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "shape": [
+            32,
+            2,
+            32
+          ],
+          "encoding": {
+            "Raw": "U8"
+          },
+          "scales": null,
+          "visibility": "Public"
+        },
+        {
+          "name": "gate_up.weight_scale",
+          "expr": {
+            "Concat": {
+              "axis": 1,
+              "parts": [
+                {
+                  "Transmute": {
+                    "src": {
+                      "Shard": {
+                        "src": {
+                          "SrcIndexed": "language_model.model.layers.0.block_sparse_moe.experts.{}.w1.weight_scale"
+                        },
+                        "axis": 0
+                      }
+                    },
+                    "to": {
+                      "shape": [
+                        32,
+                        1,
+                        2
+                      ],
+                      "encoding": {
+                        "Raw": "U8"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Transmute": {
+                    "src": {
+                      "Shard": {
+                        "src": {
+                          "SrcIndexed": "language_model.model.layers.0.block_sparse_moe.experts.{}.w3.weight_scale"
+                        },
+                        "axis": 0
+                      }
+                    },
+                    "to": {
+                      "shape": [
+                        32,
+                        1,
+                        2
+                      ],
+                      "encoding": {
+                        "Raw": "U8"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "shape": [
+            32,
+            2,
+            2
+          ],
+          "encoding": {
+            "Raw": "U8"
+          },
+          "scales": null,
+          "visibility": "Public"
+        },
+        {
+          "name": "down.weight_packed",
+          "expr": {
+            "Shard": {
+              "src": {
+                "SrcIndexed": "language_model.model.layers.0.block_sparse_moe.experts.{}.w2.weight_packed"
+              },
+              "axis": 1
+            }
+          },
+          "shape": [
+            64,
+            16
+          ],
+          "encoding": {
+            "Raw": "U8"
+          },
+          "scales": null,
+          "visibility": "Public"
+        },
+        {
+          "name": "down.weight_scale",
+          "expr": {
+            "Shard": {
+              "src": {
+                "SrcIndexed": "language_model.model.layers.0.block_sparse_moe.experts.{}.w2.weight_scale"
+              },
+              "axis": 1
+            }
+          },
+          "shape": [
+            64,
+            1
+          ],
+          "encoding": {
+            "Raw": "U8"
+          },
+          "scales": null,
+          "visibility": "Public"
+        }
+      ]
+    }
+  ]
+}

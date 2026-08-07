@@ -18,7 +18,7 @@
 //!   character. State it rather than inherit it.
 
 use pie_loader::checkpoint::RawTensor;
-use pie_loader::contract::{Expr, TensorType};
+use pie_loader::contract::{Expr, GroupContract, TensorContract, TensorType};
 use pie_loader::error::Error;
 use pie_loader::types::{DType, Encoding, TensorId};
 
@@ -40,10 +40,17 @@ pub fn author_kimi_k3(b: &mut Builder<'_>) -> Result<(), Error> {
     b.shard_axis_fn(kimi_k3_shard_axis);
     b.shard_embed_tokens();
     a_log_bands(b)?;
-    // Checkpoint order, matching `kimi_k3_moe_gate_up_swapped()` on the
-    // forward side. The two have to agree: a load that swaps the halves and
-    // a matmul that does not is silently wrong output.
-    bf16_expert_stacks(b, /*gate_second=*/ false)?;
+    if b.stream_routed_experts() {
+        // Streaming and stacking are alternatives, not layers: a stack is one
+        // slab per layer holding every expert, which is exactly the residency
+        // the slab is there to avoid.
+        streamed_expert_groups(b)?;
+    } else {
+        // Checkpoint order, matching `kimi_k3_moe_gate_up_swapped()` on the
+        // forward side. The two have to agree: a load that swaps the halves
+        // and a matmul that does not is silently wrong output.
+        bf16_expert_stacks(b, /*gate_second=*/ false)?;
+    }
     // Deliberately *not* `author_dense_contract`: its
     // `dense_fused_projection_joins` would join `self_attn.{q,k,v}_proj`
     // into one QKV weight, which is right for a llama-like layer and wrong
@@ -153,6 +160,49 @@ fn a_log_bands(b: &mut Builder<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// The six MXFP4 sources one routed expert ships, in the order every pass
+/// here reads them.
+const EXPERT_SOURCES: [&str; 6] = [
+    "w1.weight_packed",
+    "w1.weight_scale",
+    "w3.weight_packed",
+    "w3.weight_scale",
+    "w2.weight_packed",
+    "w2.weight_scale",
+];
+
+/// One expert's `(intermediate, latent)` widths, read off its six sources.
+///
+/// `Ok(None)` is "this checkpoint packs its experts some other way" — not a
+/// contradiction, just not the layout these passes rewrite. `Err` is a
+/// contradiction: the six tensors disagree about the same expert.
+///
+/// Shared rather than restated, because the resident stack and the streamed
+/// group publish the *same* bytes under two residencies. A shape rule that
+/// lived in each of them separately is a rule that can come to mean two
+/// different things.
+fn expert_dims(parts: &[&RawTensor], what: &str) -> Result<Option<(i64, i64)>, Error> {
+    const GROUP: i64 = 32;
+    if parts
+        .iter()
+        .any(|part| !is_raw(&part.encoding, DType::U8) || part.shape.len() != 2)
+    {
+        return Ok(None);
+    }
+    // w1/w3 are [I, L/2] packed with [I, L/32] scales; w2 is [L, I/2] with
+    // [L, I/32]. The returned widths are in *elements*, not bytes.
+    let inter = parts[0].shape[0];
+    let latent = parts[0].shape[1] * 2;
+    if parts[4].shape[0] != latent
+        || parts[4].shape[1] * 2 != inter
+        || parts[1].shape[1] != latent / GROUP
+        || parts[5].shape[1] != inter / GROUP
+    {
+        return fail(format!("{what} has inconsistent MXFP4 shapes"));
+    }
+    Ok(Some((inter, latent)))
+}
+
 /// Dequantize K3's routed experts and stack them, at load time.
 ///
 /// Each expert ships MXFP4: `weight_packed` is `U8 [out, in/2]` holding two
@@ -223,17 +273,9 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
 
         for e in 0..experts {
             let ep = format!("{prefix}experts.{e}.");
-            let names = [
-                format!("{ep}w1.weight_packed"),
-                format!("{ep}w1.weight_scale"),
-                format!("{ep}w3.weight_packed"),
-                format!("{ep}w3.weight_scale"),
-                format!("{ep}w2.weight_packed"),
-                format!("{ep}w2.weight_scale"),
-            ];
             let mut parts = Vec::with_capacity(6);
-            for name in &names {
-                let Some(part) = b.find(name) else {
+            for suffix in EXPERT_SOURCES {
+                let Some(part) = b.find(&format!("{ep}{suffix}")) else {
                     return fail(format!(
                         "kimi_k3 expert stack: layer {layer} expert {e} is missing a \
                          weight or scale"
@@ -244,28 +286,13 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
             // A checkpoint that packs its experts some other way is not this
             // pass's to rewrite — leave the whole model alone rather than
             // half of it.
-            if parts
-                .iter()
-                .any(|part| !is_raw(&part.encoding, DType::U8) || part.shape.len() != 2)
-            {
+            let Some((inter, latent_here)) = expert_dims(
+                &parts,
+                &format!("kimi_k3 expert stack: layer {layer} expert {e}"),
+            )?
+            else {
                 return Ok(());
-            }
-
-            // w1/w3 are [I, L/2] packed with [I, L/32] scales; w2 is
-            // [L, I/2] with [L, I/32]. The declared shapes below are in
-            // *elements*, not bytes.
-            let inter = parts[0].shape[0];
-            let latent_here = parts[0].shape[1] * 2;
-            if parts[4].shape[0] != latent_here
-                || parts[4].shape[1] * 2 != inter
-                || parts[1].shape[1] != latent_here / GROUP
-                || parts[5].shape[1] != inter / GROUP
-            {
-                return fail(format!(
-                    "kimi_k3 expert stack: layer {layer} expert {e} has inconsistent \
-                     MXFP4 shapes"
-                ));
-            }
+            };
             if e == 0 {
                 latent = latent_here;
                 local_inter = b.local_extent(inter);
@@ -392,6 +419,193 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
         for id in consumed {
             b.consume(id);
         }
+    }
+    Ok(())
+}
+
+/// The same routed experts, declared as a group instead of a resident bank.
+///
+/// [`bf16_expert_stacks`] does two things: it republishes each expert in the
+/// four-bit shape the decode GEMV addresses, and it dequantizes all of them
+/// into one bf16 slab per layer for the prefill GEMM. This declares the first
+/// half only, once, with the expert index left standing — the same four
+/// expressions with each `Expr::src` replaced by the `Expr::src_indexed` it
+/// was a member of. Everything that made the republish correct is still here
+/// in the same order; a group's plan is a whole plan, so all of it runs on the
+/// page-in path.
+///
+/// There is no streamed counterpart to the bf16 slab, on purpose: a slab is
+/// one tensor per layer holding every expert, which is exactly the residency
+/// a group exists to avoid.
+///
+/// Slots stay PACKED. That is the whole economic case — at K3's widths a bf16
+/// slot is 3.765x a packed one, and the page-in is the cost this feature is
+/// paying. No `.scaling(...)` rides along, for the same reason the resident
+/// republish carries none: K3's expert kernels take the weight and its scale
+/// as two explicit pointers and never ask `quant_meta`, so a `Scales` here
+/// would state a fact nothing reads and give the two residencies somewhere to
+/// drift apart.
+///
+/// The declared names carry no layer and no expert — there is one plan, and it
+/// is the same plan for every instance of every layer. They are the leaf names
+/// the resident republish already uses, so the driver spells a slot and a
+/// resident expert the same way.
+fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
+    const GROUP: i64 = 32;
+    let experts = i64::from(b.facts().num_experts);
+    let mut pushed = 0usize;
+
+    for layer in 0..b.facts().num_hidden_layers {
+        let moe = format!(
+            "{}{layer}.block_sparse_moe.",
+            b.decoder_layer_prefix_value()
+        );
+        let prefix = b.source_name(&moe);
+        // K3's leading layers are dense and simply have no expert names,
+        // which is why this probes rather than reading
+        // `first_k_dense_replace`.
+        if experts <= 0
+            || b.find(&format!("{prefix}experts.0.w1.weight_packed"))
+                .is_none()
+        {
+            continue;
+        }
+
+        // Instance 0 is the shape oracle. It has to be: the group's plan is
+        // compiled at index 0 and every other instance is then required to
+        // match it, so a shape read anywhere else would be a shape the loader
+        // is about to reject anyway. The other instances are still walked —
+        // a group reads through a template, so the sources it consumes are
+        // named by no node and `publish_remaining` would otherwise publish
+        // every one of them resident, which is the bank this is replacing.
+        let mut consumed: Vec<TensorId> = Vec::new();
+        let mut dims = None;
+        for e in 0..experts {
+            let ep = format!("{prefix}experts.{e}.");
+            let mut parts = Vec::with_capacity(6);
+            for suffix in EXPERT_SOURCES {
+                let Some(part) = b.find(&format!("{ep}{suffix}")) else {
+                    return fail(format!(
+                        "kimi_k3 expert group: layer {layer} expert {e} is missing a \
+                         weight or scale"
+                    ));
+                };
+                parts.push(part);
+            }
+            if e == 0 {
+                let Some(read) = expert_dims(
+                    &parts,
+                    &format!("kimi_k3 expert group: layer {layer} expert 0"),
+                )?
+                else {
+                    // The resident pass leaves such a checkpoint alone and
+                    // publishes it some other way. Streaming has no such
+                    // fallback: there would be nothing to page, and the knob
+                    // that asked for it would go quiet. Say so instead.
+                    return fail(format!(
+                        "kimi_k3: stream_routed_experts was requested, but layer {layer}'s \
+                         routed experts are not MXFP4 weight_packed / weight_scale pairs, \
+                         so there is nothing to stream"
+                    ));
+                };
+                dims = Some(read);
+            }
+            consumed.extend(parts.iter().map(|part| part.id));
+        }
+        let Some((inter, latent)) = dims else {
+            continue;
+        };
+        let local_inter = b.local_extent(inter);
+
+        // The decode GEMV reads gate and up as *adjacent* rows — row 2i is
+        // gate row i, row 2i+1 is up row i. K3 ships them as two tensors, so
+        // the interleaving is built here, exactly as the resident republish
+        // builds it: reshape each to `[I, 1, cols]` and join on the new middle
+        // axis, which is a rename plus a concatenation rather than a
+        // permutation. Gate over up, always.
+        let pair = |b: &Builder<'_>, gate: &str, up: &str, cols: i64| {
+            let u8enc = Encoding::Raw(DType::U8);
+            let shape = vec![local_inter, 1, cols];
+            let gn = b
+                .split(Expr::src_indexed(format!("{prefix}{gate}")), 0)
+                .transmute(TensorType::new(shape.clone(), u8enc.clone()));
+            let un = b
+                .split(Expr::src_indexed(format!("{prefix}{up}")), 0)
+                .transmute(TensorType::new(shape, u8enc));
+            Expr::concat(1, vec![gn, un])
+        };
+        // w2 shards on its *input* axis, which is the intermediate the gate
+        // and up halves shard on their output axis — the same split, seen
+        // from the other side of the expert.
+        let down =
+            |b: &Builder<'_>, tmpl: &str| b.split(Expr::src_indexed(format!("{prefix}{tmpl}")), 1);
+
+        let u8enc = Encoding::Raw(DType::U8);
+        b.push_group(GroupContract {
+            name: format!("{moe}experts"),
+            arity: experts as u32,
+            tensors: vec![
+                TensorContract::new(
+                    "gate_up.weight_packed",
+                    pair(
+                        b,
+                        "experts.{}.w1.weight_packed",
+                        "experts.{}.w3.weight_packed",
+                        latent / 2,
+                    ),
+                    vec![local_inter, 2, latent / 2],
+                    u8enc.clone(),
+                ),
+                TensorContract::new(
+                    "gate_up.weight_scale",
+                    pair(
+                        b,
+                        "experts.{}.w1.weight_scale",
+                        "experts.{}.w3.weight_scale",
+                        latent / GROUP,
+                    ),
+                    vec![local_inter, 2, latent / GROUP],
+                    u8enc.clone(),
+                ),
+                TensorContract::new(
+                    "down.weight_packed",
+                    down(b, "experts.{}.w2.weight_packed"),
+                    vec![latent, local_inter / 2],
+                    u8enc.clone(),
+                ),
+                TensorContract::new(
+                    "down.weight_scale",
+                    down(b, "experts.{}.w2.weight_scale"),
+                    vec![latent, local_inter / GROUP],
+                    u8enc,
+                ),
+            ],
+        });
+        pushed += 1;
+
+        for id in consumed {
+            b.consume(id);
+        }
+    }
+
+    // The knob that lies, refused where it is asked. `stream_routed_experts`
+    // reaches the driver as a boolean and the driver builds a slab only when
+    // the contract declared groups, so a family that declares none accepts the
+    // request, logs nothing, and loads the entire expert bank resident. For K3
+    // that is 1.4465 TB packed — 5.4455 TB once the resident pass dequantizes
+    // it — against a 27.20 GB per-GPU trunk at tp=8. A request this expensive
+    // to misread is not one to answer with silence.
+    //
+    // Scoped to this family deliberately: the same check in `Builder::finish`
+    // would turn today's quiet no-op into a hard load failure for every family
+    // that declares no groups, which is a decision about kimi_k2,
+    // deepseek_v2/v3, nemotron_h and mixtral, not about K3.
+    if pushed == 0 {
+        return fail(
+            "kimi_k3: stream_routed_experts was requested, but this checkpoint declares \
+             no routed experts to stream — the request would be silently ignored and the \
+             whole expert bank would load resident",
+        );
     }
     Ok(())
 }

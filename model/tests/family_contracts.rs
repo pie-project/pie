@@ -66,10 +66,17 @@ impl Checkpoint {
         self
     }
 
+    /// The byte length is part of the file's name, not just of its contents.
+    /// A family may have more than one fixture — K3 has a narrow one and a
+    /// wide one, because a tp>1 slice of the narrow one has a zero-width axis
+    /// — and keying only on the family made those two share a path. The tests
+    /// run in one process, so they took turns rewriting it and whichever
+    /// compiled second was verified against the other's bytes.
     fn finish(self, name: &str) -> CheckpointMetadata {
         let path = std::env::temp_dir().join(format!(
-            "pie_model_family_{}_{}.safetensors",
+            "pie_model_family_{}_{}_{}.safetensors",
             name,
+            self.offset,
             std::process::id()
         ));
         if std::fs::metadata(&path).map(|meta| meta.len()).ok() != Some(self.offset) {
@@ -688,8 +695,17 @@ fn kimi_k2_cuda() {
 
 // ── kimi_k3: A_log bands + MXFP4 stacks with GEMV republish ─────────
 
-fn kimi_k3_checkpoint() -> CheckpointMetadata {
-    let (hidden, latent, intermediate) = (64, 64, 32);
+/// `experts` of `None` is a dense-only K3, with no `block_sparse_moe` names at
+/// all; `Some(enc)` gives it two routed experts whose packed tensors carry
+/// `enc` — `u8enc()` for the MXFP4 layout the family really ships, anything
+/// else for a checkpoint that spells the names and means something different.
+///
+/// `intermediate` is a parameter because the streamed group shards *inside*
+/// the expert: at 32 the tp=2 slice is 16, and `down.weight_scale`'s
+/// `[latent, local_inter / 32]` collapses to a zero-width axis. Any tp>1 case
+/// needs at least 64.
+fn kimi_k3_checkpoint_at(intermediate: i64, experts: Option<Encoding>) -> CheckpointMetadata {
+    let (hidden, latent) = (64, 64);
     let mut ck = Checkpoint::new();
     ck.push(
         "language_model.model.embed_tokens.weight",
@@ -700,47 +716,120 @@ fn kimi_k3_checkpoint() -> CheckpointMetadata {
     // A KDA layer: 8 real heads in a 16-entry padded gate bank.
     ck.push(&format!("{p}self_attn.A_log"), &[16], f32enc());
     ck.push(&format!("{p}self_attn.b_proj.weight"), &[8, hidden], bf16());
-    let moe = format!("{p}block_sparse_moe.");
-    for expert in 0..2 {
-        let e = format!("{moe}experts.{expert}.");
-        for half in ["w1", "w3"] {
+    if let Some(packed) = experts {
+        let moe = format!("{p}block_sparse_moe.");
+        for expert in 0..2 {
+            let e = format!("{moe}experts.{expert}.");
+            for half in ["w1", "w3"] {
+                ck.push(
+                    &format!("{e}{half}.weight_packed"),
+                    &[intermediate, latent / 2],
+                    packed.clone(),
+                );
+                ck.push(
+                    &format!("{e}{half}.weight_scale"),
+                    &[intermediate, latent / 32],
+                    packed.clone(),
+                );
+            }
             ck.push(
-                &format!("{e}{half}.weight_packed"),
-                &[intermediate, latent / 2],
-                u8enc(),
+                &format!("{e}w2.weight_packed"),
+                &[latent, intermediate / 2],
+                packed.clone(),
             );
             ck.push(
-                &format!("{e}{half}.weight_scale"),
-                &[intermediate, latent / 32],
-                u8enc(),
+                &format!("{e}w2.weight_scale"),
+                &[latent, intermediate / 32],
+                packed.clone(),
             );
         }
-        ck.push(
-            &format!("{e}w2.weight_packed"),
-            &[latent, intermediate / 2],
-            u8enc(),
-        );
-        ck.push(
-            &format!("{e}w2.weight_scale"),
-            &[latent, intermediate / 32],
-            u8enc(),
-        );
     }
     ck.push("language_model.model.norm.weight", &[hidden], bf16());
     ck.finish("kimi_k3")
 }
 
-#[test]
-fn kimi_k3_cuda() {
+fn kimi_k3_checkpoint() -> CheckpointMetadata {
+    kimi_k3_checkpoint_at(32, Some(u8enc()))
+}
+
+fn kimi_k3_facts() -> ModelFacts {
     let mut facts = facts("kimi_k3", 1);
     facts.num_experts = 2;
+    facts
+}
+
+fn streamed() -> Policy {
+    Policy {
+        stream_routed_experts: true,
+        ..Policy::default()
+    }
+}
+
+#[test]
+fn kimi_k3_cuda() {
     check(
         "kimi_k3_cuda",
         &kimi_k3_checkpoint(),
-        &facts,
+        &kimi_k3_facts(),
         &target(0, 1),
         &Policy::default(),
     );
+}
+
+/// Streaming *and* a TP split, which no other streamed golden covers.
+///
+/// The two existing streamed goldens run tp_size=1, so nothing until now
+/// pinned what a group does to the rank's slice. K3's group shards inside the
+/// expert — gate/up on their output axis, down on its input axis — so at
+/// tp 1-of-2 every declared shape here is a half-width one, and a group that
+/// forgot to shard would pin as a full-width slot instead of failing.
+#[test]
+fn kimi_k3_streamed_cuda_tp1_of_2() {
+    check(
+        "kimi_k3_streamed_cuda_tp1_of_2",
+        &kimi_k3_checkpoint_at(64, Some(u8enc())),
+        &kimi_k3_facts(),
+        &target(1, 2),
+        &streamed(),
+    );
+}
+
+/// The knob stops lying: a K3 that cannot stream says so at authoring time.
+///
+/// `stream_routed_experts` reaches the driver as a boolean, and the driver
+/// builds its slab only when the contract declared groups — so a family that
+/// declares none accepts the request, logs nothing, and loads the whole expert
+/// bank resident. For K3 that is 1.4465 TB packed against a 27.20 GB per-GPU
+/// trunk at tp=8, which is not a difference anyone discovers from a log line
+/// that was never printed.
+///
+/// Both ways of declaring nothing are refused, because they fail differently:
+/// no expert names at all reaches the end of the pass having pushed nothing,
+/// while names that are not MXFP4 would otherwise leave *some* layers streamed
+/// and the rest resident.
+#[test]
+fn kimi_k3_refuses_a_streaming_request_it_cannot_serve() {
+    for (case, checkpoint, names) in [
+        (
+            "no routed experts",
+            kimi_k3_checkpoint_at(64, None),
+            "no routed experts to stream",
+        ),
+        (
+            "experts that are not MXFP4",
+            kimi_k3_checkpoint_at(64, Some(bf16())),
+            "not MXFP4",
+        ),
+    ] {
+        let err = author(&kimi_k3_facts(), &checkpoint, &target(1, 2), &streamed())
+            .expect_err(&format!("kimi_k3 with {case} must refuse the knob"));
+        let text = err.to_string();
+        assert!(
+            text.contains("stream_routed_experts was requested"),
+            "{case}: names the knob: {text}"
+        );
+        assert!(text.contains(names), "{case}: names the reason: {text}");
+    }
 }
 
 // ── deepseek_v4: E8M0 block scales, expert stacks and groups ────────
