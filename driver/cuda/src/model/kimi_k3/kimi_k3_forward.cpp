@@ -811,18 +811,18 @@ void kimi_k3_forward_paged(
                           expert_in, total_tokens, latent, stream);
 
             const int routes = total_tokens * K;
+            // Which form the contract published. Every path but the streamed
+            // one indexes a stack by `base + e*stride`, so all of them require
+            // `stacked` -- a statement about a slab holding every expert in
+            // routing order, which a paged slot is not.
+            const bool stacked  = Lw.moe_gate_up_bf16 != nullptr;
+            const bool streamed = Lw.expert_cache != nullptr;
             // At one token per request the routed GEMMs are pure streaming
             // reads with no weight reuse, and the aligned path has to pad 8
             // real rows out to a whole block per active expert -- hundreds of
             // rows of arithmetic for eight. One warp per output row skips all
             // of it. Above that token count the batched GEMM's tiling starts
             // paying for itself, which is the same crossover GLM-5 measured.
-            // Which form the contract published. Every path but the streamed
-            // one indexes a stack by `base + e*stride`, so all three of them
-            // require `stacked` -- a statement about a slab holding every
-            // expert in routing order, which a paged slot is not.
-            const bool stacked  = Lw.moe_gate_up_bf16 != nullptr;
-            const bool streamed = Lw.expert_cache != nullptr;
             const bool gemv_ok =
                 stacked &&
                 total_tokens <= ops::moe_gemv_max_tokens(kKimiK3MoeGemvMaxTokens) &&
