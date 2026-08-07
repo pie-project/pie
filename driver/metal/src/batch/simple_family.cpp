@@ -208,6 +208,24 @@ std::vector<std::size_t> g4_pool_elems(const std::vector<gemma4::Dispatch>& dag,
     return elems;
 }
 
+/// Whether a tap dump has to give every value its own pool buffer.
+///
+/// Not simply "are taps on". A dump normally colours `no_recycle` so a later
+/// dispatch cannot overwrite the value being published -- but that CHANGES THE
+/// PROGRAM, and a bug that only shows up when two values share a buffer then
+/// cannot be dumped at all, which is precisely the shape of bug a dump is most
+/// wanted for. `PIE_METAL_TAPS_RECYCLE` is the escape hatch, and honouring it
+/// is the difference between being able to bisect such a bug and not.
+///
+/// `forward.cpp` has always honoured it; the five call sites below did not, so
+/// the hatch silently did nothing for gemma4, gpt-oss and llama -- the three
+/// families whose fleet decodes are the only place the open wrong-answer bugs
+/// reproduce. Reading the flag in one place is what keeps the two paths from
+/// drifting apart again.
+static bool taps_no_recycle() {
+    return golden_taps_enabled() && !golden_taps_recycle();
+}
+
 /// Publish every tapped value in a DAG under `PIE_METAL_GOLDEN_DIR`.
 ///
 /// Only a colour's FINAL writer is named. The in-place kinds (the ropes above
@@ -399,7 +417,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         const gemma4::ScratchPlan& sp = plan_;
         // Under a tap dump every value needs its own buffer, or a later
         // dispatch overwrites the one being read.
-        coloring_ = gemma4::color_gemma4_scratch(dag_, sp, /*no_recycle=*/golden_taps_enabled());
+        coloring_ = gemma4::color_gemma4_scratch(dag_, sp, /*no_recycle=*/taps_no_recycle());
         if (!coloring_.hazard_free) {
             if (err) *err = "gemma4's activation colouring is not hazard-free";
             return false;
@@ -961,7 +979,7 @@ class GptOssEngine final : public SimpleFamilyEngine {
         const gptoss::ScratchPlan& sp = plan_;
         // Under a tap dump every value needs its own buffer, or a later
         // dispatch overwrites the one being read.
-        coloring_ = gptoss::color_gptoss_scratch(dag_, sp, /*no_recycle=*/golden_taps_enabled());
+        coloring_ = gptoss::color_gptoss_scratch(dag_, sp, /*no_recycle=*/taps_no_recycle());
         if (!coloring_.hazard_free) {
             if (err) *err = "gpt-oss's activation colouring is not hazard-free";
             return false;
@@ -1365,7 +1383,7 @@ class LlamaEngine final : public SimpleFamilyEngine {
         plan_ = llama::build_llama_scratch(dag_, g_);
         // Under a tap dump every value needs its own buffer, or a later
         // dispatch overwrites the one being read.
-        coloring_ = llama::color_llama_scratch(dag_, plan_, /*no_recycle=*/golden_taps_enabled());
+        coloring_ = llama::color_llama_scratch(dag_, plan_, /*no_recycle=*/taps_no_recycle());
         if (!coloring_.hazard_free) {
             if (err) *err = "llama's activation colouring is not hazard-free";
             return false;
@@ -1845,7 +1863,7 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         const auto dag = gemma4::build_gemma4_dag_mb(pg, 0, /*with_argmax=*/false);
         const gemma4::ScratchPlan sp = gemma4::build_gemma4_scratch(dag, pg);
         const gemma4::ScratchColoring col =
-            gemma4::color_gemma4_scratch(dag, sp, /*no_recycle=*/golden_taps_enabled());
+            gemma4::color_gemma4_scratch(dag, sp, /*no_recycle=*/taps_no_recycle());
         rows = gemma4::gemma4_qmm_pool_rows(rows);
         sampled = gemma4::gemma4_qmm_pool_rows(sampled);
         for (const std::size_t e : g4_pool_elems(dag, sp, pg, col, rows, sampled)) bytes += e * 2;
@@ -1863,7 +1881,7 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         const auto dag = gptoss::build_gptoss_dag(g, /*with_argmax=*/false);
         const gptoss::ScratchPlan sp = gptoss::build_gptoss_scratch(dag, g);
         const gptoss::ScratchColoring col =
-            gptoss::color_gptoss_scratch(dag, sp, /*no_recycle=*/golden_taps_enabled());
+            gptoss::color_gptoss_scratch(dag, sp, /*no_recycle=*/taps_no_recycle());
         rows = gptoss::gptoss_qmm_pool_rows(rows);
         sampled = gptoss::gptoss_qmm_pool_rows(sampled);
         for (const std::size_t e : go_pool_elems(dag, g, col, rows, sampled)) bytes += e * 2;
@@ -1891,7 +1909,7 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         const auto dag = llama::build_llama_dag(pg, /*with_argmax=*/false);
         const llama::ScratchPlan plan = llama::build_llama_scratch(dag, pg);
         const model::ScratchColoring col =
-            llama::color_llama_scratch(dag, plan, /*no_recycle=*/golden_taps_enabled());
+            llama::color_llama_scratch(dag, plan, /*no_recycle=*/taps_no_recycle());
         for (const std::size_t e : llama::llama_pool_elems(dag, plan, col, pg, rows, sampled)) {
             bytes += e * 2;
         }

@@ -95,15 +95,38 @@ bool is_routed(Kind k) {
 ///     fails), and a missing pipeline (all nine `qmm_routed[tile][bn]` are
 ///     compiled, and `kernels.cpp` refuses to load if any is not).
 ///
-/// The lead: `rows` is 16 in BOTH the passing prefill and the failing decode,
-/// so the constants are bound with the same row count. What differs is
-/// `head_rows`, `requests` -- and THE DATA. A fleet of n copies of one prompt
-/// routes every row to the same 8 experts, so a few experts hold long runs and
-/// 120 are untouched, where a prefill of distinct tokens spreads thinly over
-/// many. `gemma4_moe_sorted_rows` is a worst-case bound
-/// (`n_pairs + touched * (tile - 1)`) and the tiles past the routing are meant
-/// to decline at `tile_expert < 0`. That decline, under a routing that touches
-/// far fewer experts than the bound assumes, is the next thing to test.
+/// The lead was that the DATA differs. It was the wrong lead, and the thing
+/// that replaced it is sharper: THE BUG NEEDS A DIRTY POOL. Three facts, each
+/// from a run on this file's own harness:
+///
+///   * `llama_bench <ckpt> 128 1` at the same 16 lanes and the same crossover
+///     PASSES, and so does `32 1`. `128 64` and `32 64` both FAIL, and they
+///     fail AT STEP 0 -- the same fire, with the same rows, the same routing
+///     and the same constants. The prompt length is not the variable and the
+///     fleet's own step index is not the variable; the DECODE LENGTH OF THE
+///     RUN BEFORE IT is. The longer run's latency and pipelined loops leave
+///     the scratch pool and the page ring holding sixty-four steps of another
+///     sequence, and the fleet's first fire reads that.
+///   * A golden dump used to be unable to see this at all, because taps colour
+///     the scratch `no_recycle` -- every value gets its own buffer -- and that
+///     is exactly the condition under which the bug does not happen. Dumping
+///     with `PIE_METAL_TAPS_RECYCLE=1`, which now reaches this family, the FAIL
+///     reproduces under taps.
+///   * Under `no_recycle` the two arms still differ, but only by 1.0e-2
+///     relative RMS at `0.g4_moe_out` -- an accumulation-order difference
+///     between a GEMM and a GEMV, with the router bit-identical and every tap
+///     upstream of the routed FFN bit-identical too. That difference is not
+///     the failure; it is what a correct batched GEMM looks like.
+///
+/// So the suspect is a WAR/WAW hazard: some value the routed batch reads is
+/// coloured onto a buffer a previous dispatch or a previous FIRE still owns,
+/// and the colouring reports itself hazard-free. The sort clears `perm`,
+/// `row_expert` and `tile_expert` over the full padded bound and the gather
+/// zeroes the padding rows, so the routing side is not it. The sizes are the
+/// place to look next: `moe_sorted_rows` is a bound that MOVES WITH THE ROW
+/// COUNT, so a colour sized for one fire's stack is read at another fire's
+/// height, and a prefill of 128 rows wants 2944 rows where a 16-lane decode
+/// wants 2048.
 int gemma4_moe_qmm_bn(Kind k, const Gemma4Geometry& g, int rows, int layer) {
     if (!is_routed(k) || gemma4_moe_tile_rows(g, rows) <= 1) return 0;
     const KN kn = qmv_kn(k, g, layer);
