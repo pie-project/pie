@@ -293,7 +293,13 @@ struct DeviceTuning {
     /// not walk one token at a time -- the chunked form of the delta rule,
     /// where a chunk's transitions are a matmul -- and no lane count reaches
     /// it.
-    int gdn_scan_lanes = 16;
+    ///
+    /// That conclusion was drawn from a sweep that only ever went DOWN. Going
+    /// up is where the win is -- see `gdn_scan_rows`, whose table has 32 lanes
+    /// beating 16 by 3.6% once the two knobs are swept together. A full
+    /// simdgroup per dv row is the shortest q and k row a lane can read, and
+    /// the extra xor round it costs is cheaper than the reads it removes.
+    int gdn_scan_lanes = 32;
 
     /// Value rows one lane group of that scan walks, sharing the q and k it
     /// read for all of them.
@@ -309,22 +315,37 @@ struct DeviceTuning {
     ///
     /// Same model and prompt, sweeping both axes:
     ///
-    ///   lanes | rows | tok/s
-    ///   ------|------|-------
-    ///     16  |   1  |  99.4
-    ///     16  |   2  | 100.9
-    ///     16  |   4  |  97.0
-    ///      8  |   1  |  89.3
-    ///      8  |   2  |  94.6
+    ///   lanes | rows | rows/simd | float/lane | tok/s
+    ///   ------|------|-----------|------------|-------
+    ///      8  |   1  |     4     |     16     |  89.3
+    ///      8  |   2  |     8     |     32     |  94.6
+    ///     16  |   1  |     2     |      8     |  99.4
+    ///     16  |   2  |     4     |     16     | 100.9
+    ///     16  |   4  |     8     |     32     |  97.0
+    ///     32  |   2  |     2     |      8     | 103.8
+    ///     32  |   4  |     4     |     16     | 104.5
+    ///     32  |   8  |     8     |     32     | 102.7
     ///
-    /// Two rows halves the q/k traffic for one more accumulator per lane and
-    /// wins 1.5%. Four does not: the scan's state is `rows * Dk/LANES` floats
-    /// per lane, so the third doubling spends the occupancy that was hiding
-    /// the reduction latency the table above measured. The win is small next
-    /// to the traffic it removes because the scan is not purely bandwidth
-    /// bound -- it is serialized on the token loop, and only the chunked form
-    /// changes that.
-    int gdn_scan_rows = 2;
+    /// Read the table down the `float/lane` column and the two knobs separate
+    /// cleanly. At a FIXED register cost -- (8,2), (16,4) and (32,8) all carry
+    /// 32 floats a lane, as do (8,1), (16,2), (32,4) at 16 -- more lanes is
+    /// always faster, because `Dk/LANES` is how much q and k a lane reads and
+    /// nothing else changes. Along the other axis, 16 floats a lane beats both
+    /// 8 and 32 at every lane count: too few rows and the reads are not
+    /// amortized, too many and the occupancy that hides them is gone.
+    ///
+    /// So the earlier sweep's conclusion -- that the scan is not short of
+    /// reduction rounds -- was right, and the direction it searched was wrong.
+    /// It went down from 16 lanes, paying `Dk/LANES` registers to save an xor
+    /// round, and lost. Going up pays an xor round to save registers AND
+    /// traffic, and wins 3.6%.
+    ///
+    /// The win is still small next to the traffic removed: 32 lanes at 4 rows
+    /// reads an eighth of what 16 lanes at 1 row does and is 5% faster. The
+    /// scan is serialized on the token loop, not on bandwidth, and only the
+    /// chunked form of the delta rule -- where a chunk's transition is a
+    /// matmul -- changes that. This is the last of the cheap wins.
+    int gdn_scan_rows = 4;
 
     /// Rows an expert's run must hold before the mixture sorts and batches at
     /// all, rather than running the routed projections as matvecs.
