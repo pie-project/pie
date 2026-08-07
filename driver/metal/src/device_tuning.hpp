@@ -228,6 +228,35 @@ struct DeviceTuning {
     ///
     /// A DECODE still never batches: one row is `experts_per_token` pairs, and
     /// 8 pairs over 128 experts is nowhere near 4 rows an expert.
+    ///
+    /// THAT LAST PARAGRAPH IS THE COST, and on a serving engine it is large.
+    /// It is true of a batch-one decode and stops being true of a FLEET, which
+    /// is the shape Tier 3 measures and the shape a server runs. gpt-oss-20b is
+    /// 32 experts at top-4, so `4 * n >= 32 * 4` first holds at exactly 32
+    /// lanes -- and until it does, the largest weights in the model run as a
+    /// per-row matvec. The throughput curve shows it as a step function
+    /// (aggregate tok/s, 128-token prompt, M4 Pro 20-core):
+    ///
+    ///     lanes        8     16     24     32
+    ///     default  156.0  178.6  176.2  460.7
+    ///
+    /// Swept on the same machine, same binary, via the env override below:
+    ///
+    ///     min_per      8      16      24
+    ///         4    153.6   177.2   176.6
+    ///         2    160.5   379.4   359.9
+    ///         1    220.3   383.8   357.3
+    ///
+    /// At 1 gpt-oss passes every `llama_bench` gate including "fleet agrees
+    /// with the single-sequence decode for 32 of 32 steps", and 383.8 at 16
+    /// lanes is 1.86x mlx-lm's 206.4 where the shipped default is 0.89x.
+    ///
+    /// NOT LOWERED, and the reason is not performance. This constant is
+    /// device-wide, and dropping it makes gemma-4-26b-a4b's routed batched GEMM
+    /// -- which is WRONG, see the long comment on `gemma4_moe_qmm_bn` --
+    /// reachable at 16 lanes instead of at 64. Fix that first; then this is a
+    /// one-line `tuning_for` entry for Apple9 with the table above as its
+    /// justification.
     int moe_batch_min_per_expert = 4;
 };
 

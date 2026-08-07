@@ -62,6 +62,48 @@ bool is_routed(Kind k) {
 }
 
 /// The routed matmul's column tile, or 0 when the batch stays a matvec.
+///
+/// OPEN BUG, and it is reachable on shipped defaults. When this returns
+/// non-zero on a DECODE fleet, gemma-4-26b-a4b answers wrongly from the very
+/// first step. `moe_should_batch` admits the routed GEMM at
+/// `n_pairs >= n_experts * moe_batch_min_per_expert`, which for this
+/// checkpoint's 128 experts at top-8 is first true at SIXTY-FOUR lanes -- so
+/// nothing in the bench protocol's 8 and 16 ever reached it. Two reproductions,
+/// both `llama_bench` on mlx-community/gemma-4-26b-a4b-it-4bit:
+///
+///     PIE_BENCH_TPUT=64                                      -> FAIL
+///     PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=1 PIE_BENCH_TPUT=16 -> FAIL
+///
+/// What is known, so the next reader does not re-measure it:
+///
+///   * The fleet members AGREE WITH EACH OTHER and disagree with the same
+///     prompt decoded alone. One consistently wrong batch, not row aliasing --
+///     which is what separates this from the qwen3.5 mixture's failure, where
+///     the members disagree among themselves.
+///   * The matvec arm is bit-perfect on the identical fleet:
+///     `PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=99999` gives 32 of 32 steps at 16
+///     lanes. So the router, the sort, the attention and the paging are all
+///     fine; only this GEMM is not.
+///   * THE SAME GEMM AT THE SAME SHAPE IS CORRECT IN A PREFILL. A 16-token
+///     prompt with the crossover forced to 1 batches the routed GEMM at the
+///     same tile (16) and the same sorted count (2048) and returns tokens
+///     identical to the matvec's. The kernel, the tiling, the PSO choice and
+///     the grid therefore all agree with each other; something the DECODE
+///     supplies does not.
+///   * Eliminated: the tile width (`PIE_METAL_MOE_TILE_MID_PER` -- 16 and 32
+///     both fail), the FP16 input staging (`PIE_METAL_FP16_QMM=0` still
+///     fails), and a missing pipeline (all nine `qmm_routed[tile][bn]` are
+///     compiled, and `kernels.cpp` refuses to load if any is not).
+///
+/// The lead: `rows` is 16 in BOTH the passing prefill and the failing decode,
+/// so the constants are bound with the same row count. What differs is
+/// `head_rows`, `requests` -- and THE DATA. A fleet of n copies of one prompt
+/// routes every row to the same 8 experts, so a few experts hold long runs and
+/// 120 are untouched, where a prefill of distinct tokens spreads thinly over
+/// many. `gemma4_moe_sorted_rows` is a worst-case bound
+/// (`n_pairs + touched * (tile - 1)`) and the tiles past the routing are meant
+/// to decline at `tile_expert < 0`. That decline, under a routing that touches
+/// far fewer experts than the bound assumes, is the next thing to test.
 int gemma4_moe_qmm_bn(Kind k, const Gemma4Geometry& g, int rows, int layer) {
     if (!is_routed(k) || gemma4_moe_tile_rows(g, rows) <= 1) return 0;
     const KN kn = qmv_kn(k, g, layer);
