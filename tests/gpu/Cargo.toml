@@ -46,6 +46,8 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# `cuda_grammar_r2` reads RSS out of the live process to bound the
-# grammar cache's growth, which is a libc call.
+# `cuda_declared_family_parity` captures fd 2 to assert on what the driver
+# printed during a fire (no `declined:`, a first-fire line), which is a libc
+# call. Upstream dropped this dependency when it deleted the three tests that
+# were its only users there; here the parity gate still needs it.
 libc = "0.2"
