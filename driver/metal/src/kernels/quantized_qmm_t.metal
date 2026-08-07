@@ -2681,10 +2681,33 @@ METAL_FUNC void qmm_t_splitk_impl(
 // quarter of the parallelism they had room for.
 //
 // Each threadgroup takes one K partition and writes its own [M, N] slice; the
-// reduce below sums the slices. Most projections use bf16 partials because the
-// side-buffer traffic is otherwise a visible second pass over the output. The
-// V projection uses the float instantiation: rounding each partition there
-// moved a routed model's next-layer top-k choice in llama_numerics_test.
+// reduce below sums the slices, in float, whatever the partials are stored as.
+//
+// The partials are FLOAT for every projection, and that is a correctness
+// requirement rather than a preference. A bfloat partial carries seven mantissa
+// bits, so each partition's accumulated dot product is rounded to about 0.4%
+// before anything sums it, and the error on the total is that times
+// `sum|p_i| / |sum p_i|` -- the cancellation factor. For a projection whose
+// partitions largely cancel, which is the ordinary case for an attention
+// output, that factor is one to two orders of magnitude and the split GEMM
+// simply returns a different answer from the unsplit one.
+//
+// It shipped with bf16 partials for every kind but V, on the reading that the
+// side-buffer traffic is otherwise a visible second pass over the output and
+// that V was special because rounding it "moved a routed model's next-layer
+// top-k choice in llama_numerics_test". V was not special. It was the first
+// place the effect was large enough to cross a gate. The others cross it too:
+// `llama_numerics_test`'s eight-row mixture diverges at layer 1's O projection
+// at 0.0999 rel_l2 against a 0.06 tolerance, and a sixteen-wide llama-1b fleet
+// generates visibly wrong text -- both only once the batch is wide enough to
+// take this kernel at all, which is why lowering the GEMM crossover is what
+// exposed it rather than what caused it.
+//
+// The traffic the bf16 partials were saving is real and is now paid in full.
+// It is `split_k * M * N` extra bytes written and read once each, against a
+// GEMM that reads `M * K * N / BN`; measured end to end it is inside the
+// run-to-run spread on every checkpoint here.
+//
 // The K sum is reassociated into `split_k` contiguous blocks -- pairwise rather
 // than strictly sequential, which is the better-conditioned order, but it does
 // mean this is not bit-identical to the unsplit kernel.

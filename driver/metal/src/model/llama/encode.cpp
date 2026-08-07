@@ -203,13 +203,12 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             // the plain one is not and writes the output, so disagreeing here
             // leaves the projection's real buffer untouched.
             if (split > 1) {
-                const Pso split_pso =
-                    fp16 ? (d.kind == Kind::QmvV
-                                  ? mb->qmm_t_splitk_fp16_precast_f32[wide]
-                                  : mb->qmm_t_splitk_fp16_precast[wide])
-                         : (d.kind == Kind::QmvV
-                                  ? mb->qmm_t_splitk_f32[wide]
-                                  : mb->qmm_t_splitk[wide]);
+                // Float partials for every kind. See the comment on
+                // `affine_qmm_t_splitk`: a bfloat partial is rounded before
+                // anything sums it, and a projection whose partitions cancel
+                // amplifies that rounding by however much they cancel.
+                const Pso split_pso = fp16 ? mb->qmm_t_splitk_fp16_precast_f32[wide]
+                                           : mb->qmm_t_splitk_f32[wide];
                 if (split_pso.valid()) return split_pso;
             }
             // No bias table: llama's projections have no bias tensor, which is
@@ -716,11 +715,8 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const 
         // already built, and nothing there can insert a dispatch.
         if (mb != nullptr) {
             if (llama_qmm_split(d.kind, g, m, requests) > 1) {
-                const Pso reduce = d.kind == Kind::QmvV
-                                       ? mb->qmm_splitk_reduce_f32
-                                       : mb->qmm_splitk_reduce;
                 se.barrier();
-                se.set_pso(reduce);
+                se.set_pso(mb->qmm_splitk_reduce_f32);
                 se.set_argtable_ordinal(ordinal_base + d.ordinal);
                 Grid rg;
                 Threadgroup rtg;
