@@ -1138,31 +1138,58 @@ void linear_attn_layer_body(
                                 stream, write_state, rs_write_state_mask);
                         }
                     } else {
-                        // KNOWN HOLE, and the only one left in this dispatch.
+                        // The hole upstream documents, filled — with the
+                        // BATCHED kernel, not the per-request one its note
+                        // rules out.
                         //
-                        // `chunk_prefill_per_request` cannot stand in here:
-                        // it walks the fire's own `qo_indptr_h`, and a fold
-                        // pass is segmented differently, so it would fold the
-                        // wrong token ranges into the wrong slots. Nor can it
-                        // express the tail pass's `write_state=false` -- the
-                        // per-token chunk path accumulates the state in
-                        // place, so running it would move the boundary the
-                        // head just set.
+                        // Both of that note's objections are to
+                        // `chunk_prefill_per_request` standing in here: it
+                        // walks the fire's own `qo_indptr_h`, so on a fold
+                        // pass it folds the wrong ranges into the wrong
+                        // slots, and it cannot express the tail pass's
+                        // `write_state=false`. Neither is true of this
+                        // kernel: it takes `slot_ids` and `qo_indptr` as
+                        // ARGUMENTS — the fold's own, whichever pass is
+                        // calling — and it takes `write_state`. So the fold
+                        // head and tail get a real recurrence instead of
+                        // nothing.
                         //
-                        // Throwing here was tried and is wrong: a fold fire
-                        // that the runtime is about to refuse for a *better*
-                        // reason gets refused for this one instead, and
-                        // `two_chunks_need_the_buffer_read_path` exists to
-                        // catch exactly that ("refused BECAUSE of the buffer,
-                        // not incidentally").
+                        // Compact buffers, for the reason the comment above
+                        // gives: `q_recur_full` is the V_h-expanded one when
+                        // the heads differ, and this path skips the
+                        // repeat_interleave that fills it.
                         //
-                        // So this arm still computes nothing, and four of the
-                        // eight `cuda_gdn_foldcommit` cases still disagree. It
-                        // is unblocked by making the warp-tiled kernel
-                        // available to a state-persisting fire -- i.e. by
-                        // settling the stopgap on `use_warp_tiled_recurrent`
-                        // with a measurement rather than a note -- not by
-                        // adding a third spelling of the recurrence here.
+                        // Measured on `cuda_gdn_foldcommit`, one test per
+                        // process (`pie_engine::bootstrap` is single-use).
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        }
                     }
                     };
                     if (fold_split != nullptr) {
