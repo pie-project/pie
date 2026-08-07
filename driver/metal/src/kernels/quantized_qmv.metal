@@ -379,7 +379,7 @@ struct Mxfp4 {
 // stride is derivable from K and N, so routing costs one index buffer and no
 // extra constants. `tid.z` selects which of the k slots this threadgroup serves;
 // all of them read the same x and write disjoint rows of y.
-template <typename T, typename Codec, bool BIASED, bool ROUTED>
+template <typename T, typename Codec, bool BIASED, bool ROUTED, int PPT>
 METAL_FUNC void qmv_gptoss_impl(
     const device uint32_t* w,
     const device typename Codec::scale_t* scales,
@@ -398,7 +398,7 @@ METAL_FUNC void qmv_gptoss_impl(
     uint simd_lid) {
   constexpr int bits = Codec::bits;
   constexpr int group_size = Codec::group_size;
-  constexpr int packs_per_thread = 1;
+  constexpr int packs_per_thread = PPT;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -484,7 +484,33 @@ METAL_FUNC void qmv_gptoss_impl(
 // macro, so a kernel's SHAPE (biased? routed?) and its ENCODING are chosen
 // independently. That is what lets the same `qmv_bias` serve the 4-bit
 // attention projections and the 8-bit router.
-#define gptoss_qmv_kernel(name, BIASED, ROUTED)                                \
+//
+// `PPT` is the third axis and it is the one a decode step is priced by. A
+// thread reads `PPT` packs of a row per iteration -- four bytes each at 4 bits
+// -- so it is the load width, and a matvec that reads the whole checkpoint per
+// token is a bandwidth problem before it is anything else. It could not be a
+// constant here because the two shapes want OPPOSITE values, which is only
+// visible once both are measured. M1 Max, single-sequence decode tok/s:
+//
+//   model                       | 1     | 2     | 4
+//   ----------------------------|-------|-------|------
+//   gemma-4-31b   (dense)       | 15.6  | 16.4  | 15.2
+//   gpt-oss-20b   (routed)      | 81.5  | 77.6  | -
+//   gemma-4-26b-a4b (routed)    | 67.9  | 57.4  | -
+//
+// Two wins the dense rows and loses the routed ones by more, and four loses
+// everywhere -- past two the block outruns the row. The reason the shapes
+// disagree is that they read different amounts of a row: a dense projection
+// walks a whole 5376- or 21504-wide input, so a wider load is a longer
+// contiguous run, while a routed one walks a slice per expert and a wider
+// block leaves lanes idle at the end of every one of them.
+//
+// Split -- dense at 2, routed at 1 -- every model gains or holds: gemma-4-31b
+// 15.5 -> 16.4 (+6%, and 260 -> 284 GB/s against a 389 GB/s streaming roof),
+// gemma-4-26b-a4b 65.8 -> 70.2 (+7%), gpt-oss-20b and Qwen3.6-27B flat, the
+// latter because hidden 5120 is a whole 512-block and it never reaches this
+// kernel at all.
+#define gptoss_qmv_kernel(name, BIASED, ROUTED, PPT)                                \
   template <typename T, template <typename> class Codec>                       \
   [[kernel]] void name(                                                        \
       const device uint32_t* w   [[buffer(0)]],                                \
@@ -502,18 +528,18 @@ METAL_FUNC void qmv_gptoss_impl(
       uint3 tid       [[threadgroup_position_in_grid]],                        \
       uint simd_gid   [[simdgroup_index_in_threadgroup]],                      \
       uint simd_lid   [[thread_index_in_simdgroup]]) {                         \
-    qmv_gptoss_impl<T, Codec<T>, BIASED, ROUTED>(                              \
+    qmv_gptoss_impl<T, Codec<T>, BIASED, ROUTED, PPT>(                              \
         w, scales, biases, x, y, bias, expert_ids, in_vec_size, out_vec_size,  \
         x_slot_stride, x_row_stride, slots_per_row, tid, simd_gid, simd_lid);  \
   }
 
-gptoss_qmv_kernel(qmv_tail, false, false)
-gptoss_qmv_kernel(qmv_tail_bias, true, false)
+gptoss_qmv_kernel(qmv_tail, false, false, 2)
+gptoss_qmv_kernel(qmv_tail_bias, true, false, 2)
 // Qwen3-MoE's experts carry no bias. Everything else about the routed path --
 // the stacked weights indexed by `expert_ids`, `tid.z` selecting the slot -- is
 // identical, so it is the same template with BIASED off rather than a kernel.
-gptoss_qmv_kernel(qmv_routed_bias, true, true)
-gptoss_qmv_kernel(qmv_routed, false, true)
+gptoss_qmv_kernel(qmv_routed_bias, true, true, 1)
+gptoss_qmv_kernel(qmv_routed, false, true, 1)
 
 #define instantiate_gptoss_qmv(host, fn, codec, name, itype, gs, b)           \
   template [[host_name(#host "_" #name "_gs_" #gs "_b_" #b)]]                 \
