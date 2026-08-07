@@ -144,27 +144,25 @@ inline bool moe_should_batch(int n_pairs, int n_experts) {
 /// Priced instead off ROWS PER EXPERT, because that is what decides how much of
 /// a tile a run fills, and measured end to end rather than modelled -- a model
 /// built on the probe's rates picked 64 at 448 rows where the machine prefers
-/// 32. Prefill tok/s, best of each row starred:
+/// 32. The thresholds themselves live in `DeviceTuning::moe_tile_mid_per` and
+/// `moe_tile_wide_per`, which carries the current sweep; what belongs here is
+/// why the sweep has to be redone whenever the routed GEMM changes.
 ///
-///     per   model            BM=16    BM=32    BM=64
-///      12   26B    192       407.5   *416.5*     --
-///      16   gptoss 128      *409.0*   406.3      --
-///      28   26B    448       454.3   *493.3*   462.7
-///      56   gptoss 448       471.0   *531.1*   509.4
-///      64   26B   1024       443.5   *495.8*   493.7
-///      80   gptoss 640         --     545.3    545.2
-///      96   gptoss 768         --     549.9   *554.1*
-///     128   gptoss 1024        --     548.7   *558.6*
+/// It has been redone once already. The first sweep put the crossovers at 12
+/// and 88 with the routed GEMM emulating a bfloat matrix unit; on the FP16
+/// instruction the same machine wants 32 and never, because making a tile's
+/// arithmetic 40% cheaper does not make the rows it pads any cheaper. The
+/// padding is the whole trade and the trade moved.
 ///
 /// A width past 64 was tried and is not compiled. `roofline_probe` puts the
 /// MXFP4 kernel at 4504 GFLOP/s at BM=64 and 5057 at BM=128, and in a real
 /// mixture BM=128 is SLOWER: 558.5 -> 545.5 tok/s at 1024 rows, where 128 rows
 /// an expert makes it exactly one tile with no padding to blame. That is the
-/// second time the probe has over-promised here -- it also prefers 64 at 448
-/// rows where the machine wants 32 -- and the reason is the same both times.
+/// second time the probe has over-promised here -- it also preferred 64 at 448
+/// rows where the machine wanted 32 -- and the reason is the same both times.
 /// The probe reads ONE expert with a hot cache; a mixture's threadgroups read
 /// thirty-two and would rather be many and small than few and large. Which is
-/// why what follows is a table of measurements and not a curve.
+/// why the thresholds are a table of measurements and not a curve.
 ///
 /// The other shape of the same idea was tried too and is not here either:
 /// swapping the routed grid's axes so that row tiles run in x, which makes
@@ -172,12 +170,6 @@ inline bool moe_should_batch(int n_pairs, int n_experts) {
 /// SAME weight slice where before they were `out_vec/bn` apart and shared
 /// nothing. Correct -- the answers do not move -- and 558.6 -> 557.5 tok/s. So
 /// the reuse is real on paper and the machine does not pay for it either way.
-///
-/// So 32 almost always, 64 once a run fills one, and 16 only where a run is too
-/// short to fill even a 32 -- which `moe_should_batch` already keeps to a sliver,
-/// since it admits nothing below eight rows an expert. The thresholds sit in the
-/// gaps the sweep leaves: 32 wins at twelve, and 64 ties at eighty and wins at
-/// ninety-six.
 inline int moe_tile_rows(int n_pairs, int n_experts) {
     if (!moe_should_batch(n_pairs, n_experts)) return 1;
     const int per = n_pairs / n_experts;

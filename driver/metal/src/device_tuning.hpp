@@ -195,18 +195,40 @@ struct DeviceTuning {
     /// Rows an expert's run must hold before the mixture's GEMM takes a wider
     /// row tile: 32 above `moe_tile_mid_per`, 64 above `moe_tile_wide_per`.
     ///
-    /// M1 Max: 12 and 88. Measured end to end over eight (rows, expert count)
-    /// pairs on gpt-oss-20b and gemma-4-26B; the table is in
-    /// `shared_kernels.hpp`. Measured END TO END on purpose --
-    /// `roofline_probe` predicts the dense tile correctly and this one wrong
-    /// three times over, because its single hot expert cannot show what
-    /// thirty-two cold ones cost.
+    /// M1 Max: 32, and 64 never. These were 12 and 88, measured end to end
+    /// over eight (rows, expert count) pairs, and they moved for the same
+    /// reason `qmm_min_batch` did: the routed expert GEMM now gets the FP16
+    /// matrix unit instead of an emulated bfloat one. A tile's ARITHMETIC got
+    /// ~40% cheaper and the rows it pads did not, so the padding a wide tile
+    /// wastes buys less than it used to, and the balance moves toward narrow.
+    /// Re-swept on the same machine, prefill tok/s, arms alternated twice
+    /// where the margin was under 2%:
+    ///
+    ///     per   model            rows    BM=16    BM=32    BM=64
+    ///      12   26b               192   *642.4*   616.0       --
+    ///      16   gptoss            128   *594.8*   551.8       --
+    ///      24   gptoss            192   *642.3*   622.9       --
+    ///      32   gptoss            256     654.2  *664.2*      --
+    ///      64   gptoss            512        --  *721.4*      --
+    ///     128   gptoss           1024        --  *725.1*   716.6
+    ///     256   gptoss           2048        --  *656.1*   654.0
+    ///
+    /// So the mid threshold moves 12 -> 32, and the wide one has nowhere left
+    /// to fire: 64 loses at 128 rows an expert and ties at 256, which is
+    /// already past any batch this driver sees. It is set out of reach rather
+    /// than deleted, because the field is what a device with a different
+    /// matrix throughput would answer differently, and no other device has
+    /// been re-measured since the routed GEMM changed underneath it.
+    ///
+    /// Measured END TO END on purpose -- `roofline_probe` predicts the dense
+    /// tile correctly and this one wrong three times over, because its single
+    /// hot expert cannot show what thirty-two cold ones cost.
     ///
     /// These move with per-core matrix throughput the way `qmm_min_batch`
     /// does: a machine that runs a wide tile relatively faster wants both
     /// thresholds LOWER.
-    int moe_tile_mid_per = 12;
-    int moe_tile_wide_per = 88;
+    int moe_tile_mid_per = 32;
+    int moe_tile_wide_per = 1 << 24;
 
     /// Whether a dense g64/b4 projection stages its input to FP16 and feeds
     /// native FP16 simdgroup MMA instead of BF16.
