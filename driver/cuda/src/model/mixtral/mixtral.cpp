@@ -899,8 +899,12 @@ void mixtral_forward_paged(
         // ── Sparse-MoE block ──
         if (prof.enabled) prof.close(stream);   // o_proj
         if (prof.enabled) prof.open(&prof.router, stream);
-        kernels::launch_rmsnorm_bf16(
+        // The MoE input is wanted in fp16 by the decode GEMV, and this norm is
+        // where it is produced; emitting both here retires the cast kernel
+        // that used to read it straight back.
+        kernels::launch_rmsnorm_bf16_with_fp16(
             ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
+            d_mxfp4_act_fp16.data(),
             N, H, eps, stream);
 
         // 1. Router logits, top-K + softmax + renormalize. We piggy-back
@@ -1190,6 +1194,13 @@ void mixtral_forward_paged(
             kernels::launch_bf16_to_fp16(
                 ws.norm_y.data(), d_mxfp4_act_fp16.data(),
                 static_cast<std::size_t>(N) * H, stream);
+            // The activation rides the gate/up epilogue when this model uses
+            // the gpt-oss GLU and the routes are not bucketed by expert (the
+            // grouped kernel has its own epilogue). Then the glu kernel and
+            // the cast after it have nothing left to do.
+            const bool fuse_glu =
+                cfg.swiglu_limit > 0.f &&
+                !mxfp4_moe_grouped_choice(routes, num_experts);
             if (prof.enabled) prof.close(stream);   // moe_align (act cast)
             mx_stage(prof, &prof.moe_gate_up, stream, [&]{
             // Group the routes by expert first: without it every route
@@ -1217,10 +1228,14 @@ void mixtral_forward_paged(
                     layer.expert_gate_bias_ptrs.data(),
                     layer.expert_up_bias_ptrs.data(),
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
-                    N, top_k, H, I, stream);
+                    N, top_k, H, I, stream,
+                    /*act_out_fp16=*/fuse_glu
+                        ? d_mxfp4_route_act_fp16.data() : nullptr,
+                    /*glu_limit=*/cfg.swiglu_limit);
             }
             });
             if (prof.enabled) prof.open(&prof.moe_act, stream);
+            if (!fuse_glu) {
             // The gpt-oss activation emits the fp16 copy the down GEMV wants
             // as a second store, so the cast below is only needed on the plain
             // swiglu branch, which no model with this activation takes.
@@ -1244,6 +1259,7 @@ void mixtral_forward_paged(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_act_fp16.data(),
                     static_cast<std::size_t>(routes) * I, stream);
             }
+            }
             // b_down is replicated across ranks, so only the leader adds it;
             // the all-reduce below would otherwise sum it T times.
             if (prof.enabled) prof.close(stream);   // moe_act (glu + cast)
@@ -1256,17 +1272,28 @@ void mixtral_forward_paged(
                 d_mxfp4_route_out.data(), N, top_k, H, I, stream);
             });
             if (prof.enabled) prof.open(&prof.moe_reduce, stream);
-            kernels::launch_token_batched_weighted_sum_bf16(
-                d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
-                static_cast<const float*>(d_topk_w.data()),
-                N, top_k, H, stream);
-            if (T > 1) {
+            if (T == 1) {
+                // The combine already walks every element of the result; the
+                // residual is one more add on a value it is holding, so the
+                // separate `residual_add` was a full read and write of the
+                // hidden state to do what an epilogue could. Under TP the
+                // all-reduce has to see the combine's output alone, so that
+                // path keeps the two apart.
+                kernels::launch_token_batched_weighted_sum_add_bf16(
+                    ws.y.data(), d_mxfp4_route_out.data(),
+                    static_cast<const float*>(d_topk_w.data()),
+                    N, top_k, H, stream);
+            } else {
+                kernels::launch_token_batched_weighted_sum_bf16(
+                    d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
+                    static_cast<const float*>(d_topk_w.data()),
+                    N, top_k, H, stream);
                 tp->all_reduce_bf16(d_mxfp4_moe_out.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
+                kernels::launch_residual_add_bf16(
+                    ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
             }
             if (prof.enabled) prof.close(stream);   // moe_reduce
-            kernels::launch_residual_add_bf16(
-                ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
             if (streamed_fused) {
                 // Safe with the kernels above still queued: a page-in that
                 // wants one of these slots synchronizes `stream` before it

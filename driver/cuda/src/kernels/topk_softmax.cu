@@ -85,15 +85,27 @@ __device__ inline void block_argmax(
 // One block per token. Phase 1: thread-local max-reduce + exp+sum-reduce
 // for softmax. Phase 2: K iterations of argmax-with-exclusion to pick the
 // top-K probs. Phase 3: thread 0 renormalizes and writes back.
+// `FUSED_GEMV` computes the router logits here instead of reading them: one
+// warp per expert, walking that expert's weight row. The router is a
+// [num_experts, hidden] projection of ONE token, so as a standalone GEMV it is
+// 32 blocks on 132 SMs and costs what a launch costs whatever it does -- the
+// tuner measures 5.5 us for 0.18 MB. Folding it into the consumer that was
+// going to read its output anyway removes the launch and the round trip
+// through HBM, and the logits never leave shared memory.
+template <bool FUSED_GEMV>
 __global__ void topk_softmax_bf16_kernel(
-    const __nv_bfloat16* __restrict__ logits,
+    const __nv_bfloat16* __restrict__ logits,   // FUSED_GEMV: the weight
+    const __nv_bfloat16* __restrict__ act,      // FUSED_GEMV only
+    const __nv_bfloat16* __restrict__ bias,     // FUSED_GEMV only, may be null
     std::int32_t* __restrict__ topk_idx,
     float* __restrict__ topk_w,
-    int num_experts, int K)
+    int num_experts, int K, int hidden)
 {
     const int n = blockIdx.x;
     const int tid = threadIdx.x;
-    const __nv_bfloat16* row = logits + static_cast<long long>(n) * num_experts;
+    const __nv_bfloat16* row =
+        FUSED_GEMV ? logits
+                   : logits + static_cast<long long>(n) * num_experts;
 
     __shared__ float probs[MAX_EXPERTS];
     __shared__ float buf[BLOCK];
@@ -101,10 +113,38 @@ __global__ void topk_softmax_bf16_kernel(
 
     // 1. Stage row into shared memory + find max.
     float local_max = -FLT_MAX;
+    if constexpr (FUSED_GEMV) {
+        const __nv_bfloat16* x =
+            act + static_cast<long long>(n) * hidden;
+        const int warp = tid >> 5;
+        const int lane = tid & 31;
+        constexpr int kWarps = BLOCK / 32;
+        for (int e = warp; e < num_experts; e += kWarps) {
+            const __nv_bfloat16* w =
+                row + static_cast<long long>(e) * hidden;
+            float acc = 0.f;
+            for (int i = lane; i < hidden; i += 32) {
+                acc += __bfloat162float(w[i]) * __bfloat162float(x[i]);
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_down_sync(0xffffffffu, acc, off);
+            }
+            if (lane == 0) {
+                if (bias != nullptr) acc += __bfloat162float(bias[e]);
+                probs[e] = acc;
+            }
+        }
+        __syncthreads();
+        for (int j = tid; j < num_experts; j += BLOCK) {
+            if (probs[j] > local_max) local_max = probs[j];
+        }
+    } else {
     for (int j = tid; j < num_experts; j += BLOCK) {
         const float v = __bfloat162float(row[j]);
         probs[j] = v;
         if (v > local_max) local_max = v;
+    }
     }
     buf[tid] = local_max;
     __syncthreads();
@@ -168,10 +208,31 @@ void launch_topk_softmax_bf16(
     if (num_experts > MAX_EXPERTS) {
         throw std::runtime_error("topk_softmax_bf16: num_experts exceeds MAX_EXPERTS");
     }
-    topk_softmax_bf16_kernel<<<N, BLOCK, 0, stream>>>(
+    topk_softmax_bf16_kernel</*FUSED_GEMV=*/false><<<N, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits),
-        topk_idx, topk_w,
-        num_experts, K);
+        nullptr, nullptr, topk_idx, topk_w,
+        num_experts, K, 0);
+}
+
+void launch_router_topk_softmax_bf16(
+    const void* act,
+    const void* router_weight,
+    const void* router_bias,
+    std::int32_t* topk_idx,
+    float* topk_w,
+    int N, int num_experts, int K, int hidden,
+    cudaStream_t stream)
+{
+    if (N <= 0 || num_experts <= 0 || K <= 0 || hidden <= 0) return;
+    if (num_experts > MAX_EXPERTS) {
+        throw std::runtime_error(
+            "router_topk_softmax_bf16: num_experts exceeds MAX_EXPERTS");
+    }
+    topk_softmax_bf16_kernel</*FUSED_GEMV=*/true><<<N, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(router_weight),
+        static_cast<const __nv_bfloat16*>(act),
+        static_cast<const __nv_bfloat16*>(router_bias),
+        topk_idx, topk_w, num_experts, K, hidden);
 }
 
 namespace {

@@ -75,7 +75,14 @@ void launch_mxfp4_moe_gate_up_decode_bf16(
     int                  top_k,
     int                  hidden,
     int                  intermediate,
-    cudaStream_t         stream);
+    cudaStream_t         stream,
+    // When non-null the gpt-oss GLU is applied in the epilogue and written
+    // here as fp16 -- what the down projection reads -- and `gate_out`/
+    // `up_out` are left alone. That removes a glu kernel and a cast that
+    // between them read and wrote this tensor three more times.
+    void*                act_out_fp16 = nullptr,
+    float                glu_limit = 0.f,
+    float                glu_alpha = 1.702f);
 
 void launch_mxfp4_moe_down_decode_bf16(
     const void*          act_fp16,      // [routes, intermediate] fp16

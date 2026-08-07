@@ -908,7 +908,22 @@ int main(int argc, char** argv) {
         // when taps are asked for, this is the whole run -- and the dump then
         // corresponds to exactly the token list printed here, rather than to
         // whichever synthetic fire happened to go last.
-        if (dumping) {
+        //
+        // ONE EXCEPTION, and it is the whole reason the fleet bugs stayed
+        // unbisectable. `PIE_BENCH_TPUT=n` is the only thing in this harness
+        // that fires n rows of DECODE, and two open wrong-answer bugs live
+        // exactly there and nowhere else -- both reproduce only when the fire
+        // is a fleet, and both are invisible to a dump of a prefill or of a
+        // one-row step. Returning here made the taps and the only reproduction
+        // mutually exclusive. So when a fleet was asked for, fall through: the
+        // executor already publishes whatever fire it just ran at that fire's
+        // row count (`fire_simple` passes `csr.token_ids.size()`, not 1), so
+        // the fleet's per-row activations land with no plumbing at all. Each
+        // step overwrites the last, so point `PIE_BENCH_DECODE` at 1 to keep
+        // step 0 -- which is where a from-the-first-step divergence is made --
+        // and diff it against a second run with `PIE_BENCH_TPUT` unset into a
+        // different directory.
+        if (dumping && n_seqs <= 1) {
             // One more prefill, on its own pages, so what lands in the dump is
             // the PROMPT's fire rather than the last of the gate's one-row
             // decodes. The gate above has already run; this only re-publishes.
@@ -1153,6 +1168,7 @@ int main(int argc, char** argv) {
     // live in the KV pages and two members sharing a slot compute each other's
     // history.
     double tput_tps = 0.0;
+    const bool taps_dump = std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr;
     if (n_seqs > 1) {
         const std::size_t nf = std::size_t(n_seqs);
         // A recurrent family cannot run a fleet wider than the slots the device
@@ -1269,6 +1285,24 @@ int main(int argc, char** argv) {
                     m.next_position += 1;
                     if (m.next_position < m.tokens.size()) m.tokens[m.next_position] = std::uint32_t(t);
                 }
+                // Under a dump, STOP at the fire that first went wrong. Each
+                // step republishes over the last, so running to the end would
+                // leave the taps holding step n-1 -- a fire whose inputs are
+                // already the wrong tokens, which is the contamination and not
+                // the cause. Breaking here makes the dump the offending fire
+                // itself, and it is what turns "the fleet is wrong" into a
+                // per-layer bisect.
+                if (taps_dump) {
+                    bool diverged_now = false;
+                    for (int i = 0; i < n_seqs; ++i) {
+                        if (fleet_diverged[std::size_t(i)] == step) diverged_now = true;
+                    }
+                    if (diverged_now) {
+                        std::printf("  ....  taps hold the fleet fire at step %d, the first "
+                                    "that left the reference\n", step);
+                        break;
+                    }
+                }
             }
             {
                 int earliest = -1;
@@ -1318,9 +1352,15 @@ int main(int argc, char** argv) {
                 "scheduler's ceiling, NOT comparable]\n",
                 n_decode, pipelined_s, double(n_decode) / pipelined_s,
                 1000.0 * pipelined_s / double(n_decode));
-    if (tput_tps > 0.0) {
+    if (tput_tps > 0.0 && std::getenv("PIE_METAL_GOLDEN_DIR") == nullptr) {
         std::printf("  tput   : %d seqs x %d tok  =  %.1f tok/s  (%.1f tok/s per seq)\n", n_seqs,
                     n_decode, tput_tps, tput_tps / double(n_seqs));
+    } else if (tput_tps > 0.0) {
+        // Deliberately not printed as a measurement. Taps turn pool recycling
+        // off, so the fleet above ran against a different allocation than the
+        // shipped one; the fire is the right ARITHMETIC to dump and the wrong
+        // program to time.
+        std::printf("  tput   : not reported -- golden taps disable pool recycling\n");
     }
 
     // Decode at batch one reads (almost) every weight once per token, so
