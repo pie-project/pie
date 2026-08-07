@@ -4,9 +4,45 @@
 #include "decode_timing.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace pie::metal {
+
+bool kernel_ablated(Kernel k) {
+    // Parsed once into a fixed table: this is asked per dispatch per fire, and
+    // a strcmp walk over an env string there would be measuring the ablation.
+    static const std::array<bool, kKernelKindCount> table = [] {
+        std::array<bool, kKernelKindCount> t{};
+        t.fill(false);
+        const char* e = std::getenv("PIE_METAL_ABLATE");
+        if (e == nullptr || *e == '\0') return t;
+        const std::string spec(e);
+        for (int i = 0; i < kKernelKindCount; ++i) {
+            const char* n = kernel_name(static_cast<Kernel>(i));
+            if (n == nullptr) continue;
+            // Whole-token match, so `rms` does not also ablate `ffn_rms`.
+            std::size_t at = 0;
+            while ((at = spec.find(n, at)) != std::string::npos) {
+                const bool lok = at == 0 || spec[at - 1] == ',';
+                const std::size_t end = at + std::strlen(n);
+                const bool rok = end == spec.size() || spec[end] == ',';
+                if (lok && rok) { t[std::size_t(i)] = true; break; }
+                at = end;
+            }
+        }
+        std::fprintf(stderr,
+                     "[ablate] PIE_METAL_ABLATE=%s -- these kinds are NOT "
+                     "DISPATCHED. The tokens are wrong on purpose; only the "
+                     "wall clock means anything.\n", e);
+        return t;
+    }();
+    const int i = static_cast<int>(k);
+    return i >= 0 && i < kKernelKindCount && table[std::size_t(i)];
+}
 
 const char* kernel_name(Kernel k) {
     switch (k) {

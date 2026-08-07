@@ -10,6 +10,7 @@
 #include "decode_dispatch_mb.hpp"
 #include "heap_bind.hpp"
 #include "batch/scratch.hpp"
+#include "batch/decode_timing.hpp"
 
 namespace pie::metal {
 namespace {
@@ -682,6 +683,10 @@ void encode_prefill_dags_mb(StepEncoder& se,
     }
     for (size_t i = 0; i < length; ++i) {
         const Dispatch& d0 = dags[0][i];
+        // Priced by ablation rather than by the trace; see `kernel_ablated`.
+        // Skipping the WHOLE kind here -- not one token's copy of it -- is what
+        // makes the wall-clock difference the kind's serial cost.
+        if (kernel_ablated(d0.kind)) continue;
         // ── the alternate affine format ──
         //
         // A checkpoint may spare individual tensors from the model-wide format
