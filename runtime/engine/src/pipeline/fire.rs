@@ -1744,6 +1744,19 @@ fn validate_frame<C: FireContext>(
         }
         rs_host_resolved.push(buffered);
     }
+    // A pooled device-geometry pass is the OTHER shape the device-composed
+    // template refuses, and it lands in exactly the same place: its
+    // descriptors — including the dense `AttnMask` cell — are read back on the
+    // HOST at frame entry, so a slot chained behind an earlier slot of the
+    // same frame asks for a value no one has produced yet. The rule below was
+    // written for the RS shapes and describes this one word for word; it just
+    // never looked at it.
+    let mut host_resolved: Vec<bool> = Vec::with_capacity(fired.len());
+    for (index, &(_, rep)) in fired.iter().enumerate() {
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        let devgeo = ctx.resources().get(&fwd)?.devgeo.is_some();
+        host_resolved.push(devgeo || rs_host_resolved[index]);
+    }
     for (slot, &(_, rep)) in fired.iter().enumerate() {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
         let pass = ctx.resources().get(&fwd)?;
@@ -1781,7 +1794,7 @@ fn validate_frame<C: FireContext>(
         // that named neither the slot nor the cause. Refuse it here, where
         // both are known. See `live_slots()` in the SDK, which keeps a linear
         // lane from building this frame in the first place.
-        if rs_host_resolved[slot] && first_rs_slot.is_none() {
+        if host_resolved[slot] && first_rs_slot.is_none() {
             first_rs_slot = Some(slot);
         }
         if first_rs_slot.is_some() {
@@ -1791,14 +1804,20 @@ fn validate_frame<C: FireContext>(
                 }
                 let key = Arc::as_ptr(&bound.cells[channel]) as usize;
                 if published_before.contains(&key) {
+                    let blame = first_rs_slot.expect("set just above");
                     return Ok(Err(format!(
                         "pipeline: frame slot {slot} consumes channel {channel}, which an \
-earlier slot of the same frame publishes, and slot {} binds recurrent state the \
-driver must resolve on the host (a buffered row, or a device-resident fold \
-length) — those descriptors are resolved at frame entry, before any slot has \
-run, so they cannot see that value. Submit the chained fire in a LATER frame \
-(a linear lane should size its run-ahead with `live_slots()`).",
-                        first_rs_slot.expect("set just above")
+earlier slot of the same frame publishes, and slot {} resolves its descriptors \
+on the HOST ({}) — those are resolved at frame entry, before any slot has run, \
+so they cannot see that value. Submit the chained fire in a LATER frame (a \
+linear lane should size its run-ahead with `live_slots()`).",
+                        blame,
+                        if rs_host_resolved[blame] {
+                            "recurrent state: a buffered row, or a device-resident fold length"
+                        } else {
+                            "a pooled device-geometry pass: every descriptor port, and any \
+dense AttnMask cell, is read back per fire"
+                        }
                     )));
                 }
             }
