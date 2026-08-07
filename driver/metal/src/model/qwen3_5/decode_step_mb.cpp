@@ -202,9 +202,50 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlExpertDown: {
             const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
             const int sorted = moe_sorted_rows(g, n);
-            // Routed, so the routed crossover.
+            // WRONG ANSWERS ON A DECODE FLEET, so this arm is currently shut.
+            //
+            // Qwen3.6-35B-A3B is 256 experts at top-8, so with
+            // `moe_batch_min_per_expert` at 1 the routed GEMM first engages at
+            // exactly 32 lanes -- and there it FAILS the recorded-answer gate:
+            // a 32-wide fleet answers `220 0 0 0 0 0` where mlx-lm says
+            // `220 24 11 220 16 15`, and the fleet's own members disagree
+            // ("member 18 says 20988, member 0 says 0", 6 of 31 members leaving
+            // member 0's arithmetic). Some rows are not written; it is not a
+            // rounding difference.
+            //
+            // Bisected, so the next reader does not repeat it:
+            //   * 30 and 31 lanes PASS, 32 FAILS. That is exactly the width at
+            //     which `n_pairs >= n_experts` first holds (30 -> 240 pairs,
+            //     31 -> 248, 32 -> 256), i.e. the first fire that takes this
+            //     branch rather than the matvec below.
+            //   * `PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=2` (which moves the
+            //     crossover to 64 lanes) makes 32 lanes PASS. The crossover is
+            //     the variable; nothing else about the fire changed.
+            //   * NOT the recurrent state: ablating `gdn_core_slotted` and
+            //     `gdn_prep_slotted` leaves the zeros in place.
+            //   * NOT the dense GEMM: `PIE_METAL_QMM_MIN_BATCH=64` does not
+            //     help.
+            //   * NOT scale, and NOT this GEMM in general. Forced on at 8 lanes
+            //     with `MIN_PER=0` it reproduces mlx-lm exactly, and the
+            //     PREFILL runs the same kernel over 8192 pairs at 2048 tokens
+            //     and matches mlx-lm too. What the failing case has that both
+            //     passing ones lack is REQUESTS: a fleet is 32 of them where a
+            //     prefill is one.
+            //
+            // Shutting it costs a mixture's fleet decode the batched form above
+            // 32 lanes and costs nothing below, because below is where the
+            // matvec already ran. That is a throughput loss on one family and
+            // it is the correct trade against a wrong answer -- and this driver
+            // has now twice been talked out of a real bug by a gate, so the
+            // evidence is written down rather than the conclusion.
+            //
+            // The prefill is deliberately unaffected: its routed batching is
+            // `routed_group_shape`, a different call site, and these DAGs are
+            // built at `n_tokens == 1` where the predicate is false anyway.
+            constexpr bool kQwen35RoutedDecodeGemmIsCorrect = false;
             if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
-                bn > 0 && shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
+                kQwen35RoutedDecodeGemmIsCorrect && bn > 0 &&
+                shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
                 d.qmm_bn = bn;
                 d.qmm_bm = shared_kernels::moe_tile_rows(n * g.experts_per_token, g.n_experts);
                 d.qmm_split = 1;
