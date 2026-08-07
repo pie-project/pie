@@ -356,6 +356,10 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         want("rope.metal", "rope_neox_strided_bfloat16", &out.rope_strided);
         want("silu_mul.metal", "silu_mul_strided_bfloat16",
              &out.silu_mul_strided);
+        want("residual_add.metal", "residual_add_strided_bfloat16",
+             &out.residual_add_strided);
+        want("moe_route.metal", "shared_expert_combine_strided",
+             &out.shared_expert_combine_strided);
     }
 
     std::vector<std::string> errors;

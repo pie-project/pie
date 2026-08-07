@@ -884,6 +884,25 @@ void encode_prefill_dags_mb(StepEncoder& se,
                         grid.y = uint32_t(n);
                     }
                     break;
+                // `elementwise_mb_dispatch` folds the row count onto x, so at
+                // the per-token DAG's n==1 the grid is exactly one row wide and
+                // the strided form only has to add the row axis.
+                case Kernel::Residual:
+                case Kernel::LayerOut:
+                    if (d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_psos.residual_add_strided;
+                        grid.y = uint32_t(n);
+                    }
+                    break;
+                // Already (width, 1, 1) from `expert_combine_dispatch`, which
+                // reads its row from gid.y -- so this one was ALREADY row-aware
+                // and only lacked the pitch.
+                case Kernel::LlSharedCombine:
+                    if (d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_psos.shared_expert_combine_strided;
+                        grid.y = uint32_t(n);
+                    }
+                    break;
                 case Kernel::GatedRms:
                     if (d0.grid.z == 1) {
                         strided = mb_psos.gated_rms_strided;

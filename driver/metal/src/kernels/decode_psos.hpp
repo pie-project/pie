@@ -148,6 +148,12 @@ struct MultiBatchPsos {
     Pso rope_strided{};
     Pso silu_mul_strided{};
     Pso gated_rms_strided{};
+    // The two per-token elementwise lines a prefill was still dispatching once
+    // per row: the post-attention/post-FFN residual add, and the shared
+    // expert's gated fold. One of each per layer per token, so on a 40-layer
+    // model they were ~80k dispatches in a 1024-row fire.
+    Pso residual_add_strided{};
+    Pso shared_expert_combine_strided{};
     // GDN over a whole prompt in one dispatch (prep is token-parallel, the
     // recurrent scan runs in registers) instead of one serialized pair per token.
     Pso gdn_prep_prefill{};

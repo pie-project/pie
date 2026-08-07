@@ -1860,6 +1860,15 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                         case Kernel::KNorm:
                             ctx_->arg_bind_ordinal(d.ordinal, 4, prefill_row_stride_);
                             break;
+                        // `residual_add` takes three buffers, so its pitch is
+                        // the fourth; `shared_expert_combine` takes five.
+                        case Kernel::Residual:
+                        case Kernel::LayerOut:
+                            ctx_->arg_bind_ordinal(d.ordinal, 3, prefill_row_stride_);
+                            break;
+                        case Kernel::LlSharedCombine:
+                            ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
+                            break;
                         case Kernel::Rope:
                         case Kernel::RopeK:
                             ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
