@@ -82,6 +82,24 @@ const char* kernel_name(Kernel k) {
         case Kernel::SdpaPaged: return "sdpa_paged";
         case Kernel::GdnCoreSlotted: return "gdn_core_slotted";
         case Kernel::GdnPrepSlotted: return "gdn_prep_slotted";
+        // The mixture. Unnamed until now, which meant every routed kind
+        // reported as `unknown` -- so the attribution report said nothing about
+        // the half of a MoE fire that IS the mixture, and `PIE_METAL_ABLATE`
+        // could not single any of them out.
+        case Kernel::LlRouter:        return "ll_router";
+        case Kernel::LlExpertGate:    return "ll_expert_gate";
+        case Kernel::LlExpertUp:      return "ll_expert_up";
+        case Kernel::LlExpertDown:    return "ll_expert_down";
+        case Kernel::LlExpertSiluMul: return "ll_expert_silu_mul";
+        case Kernel::LlMoeSort:       return "ll_moe_sort";
+        case Kernel::LlMoeGather:     return "ll_moe_gather";
+        case Kernel::LlMoeCombine:    return "ll_moe_combine";
+        case Kernel::LlSharedGate:      return "ll_shared_gate";
+        case Kernel::LlSharedUp:        return "ll_shared_up";
+        case Kernel::LlSharedDown:      return "ll_shared_down";
+        case Kernel::LlSharedGateProj:  return "ll_shared_gate_proj";
+        case Kernel::LlSharedCombine:   return "ll_shared_combine";
+        default: break;
     }
     return "unknown";
 }
