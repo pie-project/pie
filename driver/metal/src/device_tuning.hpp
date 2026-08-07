@@ -308,18 +308,37 @@ struct DeviceTuning {
     /// matters: an n-wide fleet reproduces mlx-lm's recorded continuation
     /// token for token.
     ///
-    /// LOWERED TO 1 ON APPLE9 -- see `tuning_for`. The blocker recorded here
-    /// was that dropping it made gemma-4-26b-a4b's routed batched GEMM
-    /// reachable at 16 lanes instead of 64, and that GEMM was believed wrong.
-    /// It is not wrong. The evidence against it came from a fleet gate that
-    /// compared the fleet to this driver's OWN one-row decode, which is a
-    /// different kernel path, on a prompt whose continuation was ambiguous --
-    /// so the two greedy argmaxes parted company early and the gate read that
-    /// as a defect. Forcing the routed GEMM onto every fire
-    /// (`PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=0`, so even a one-row decode
-    /// batches) still reproduces mlx-lm's continuation exactly. The gate now
-    /// checks a fleet against mlx-lm rather than against ourselves.
-    int moe_batch_min_per_expert = 4;
+    /// The blocker recorded here was that dropping it made gemma-4-26b-a4b's
+    /// routed batched GEMM reachable at 16 lanes instead of 64, and that GEMM
+    /// was believed wrong. It is not wrong. The evidence against it came from
+    /// a fleet gate that compared the fleet to this driver's OWN one-row
+    /// decode, which is a different kernel path, on a prompt whose
+    /// continuation was ambiguous -- so the two greedy argmaxes parted company
+    /// early and the gate read that as a defect. Forcing the routed GEMM onto
+    /// every fire (`PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=0`, so even a one-row
+    /// decode batches) still reproduces mlx-lm's continuation exactly. The
+    /// gate now checks a fleet against mlx-lm rather than against ourselves.
+    ///
+    /// The M1 Max agreed once it was asked. It had been left at the shipped 4
+    /// because the M4 Pro's table was another machine's, and the sweep that
+    /// finally ran here says the same thing louder -- aggregate tok/s,
+    /// 128-token prompt, 64 decode steps, arms alternated:
+    ///
+    ///     model              lanes       4        1     delta
+    ///     gpt-oss-20b            4   103.5    103.3       -0%
+    ///     gpt-oss-20b            8   116.9    174.7      +49%
+    ///     gpt-oss-20b           16   134.1    310.7     +132%
+    ///     gemma-4-26b-a4b        8   128.9    130.3       +1%
+    ///     gemma-4-26b-a4b       16   174.3    269.3      +55%
+    ///
+    /// The two neutral rows are neutral for a reason that is worth reading off
+    /// the arithmetic rather than the table: `moe_should_batch` compares
+    /// `n_pairs` to `n_experts * this`, and at 4 lanes gpt-oss routes 16 pairs
+    /// over 32 experts while gemma-4-26b at 8 lanes routes 64 over 128. Both
+    /// are below the threshold at ANY positive value, so neither arm batches
+    /// and the rows are a control. Every row where the two arms actually
+    /// choose differently is a large win, and none is a loss.
+    int moe_batch_min_per_expert = 1;
 };
 
 /// The platform query. `device_tuning_apple.mm` on Apple, a stub in

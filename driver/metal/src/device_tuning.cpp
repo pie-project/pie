@@ -49,31 +49,6 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
             // machine sooner, so the tile crossover moves down. Measured with
             // `roofline_probe`; the table is in `device_tuning.hpp`.
             t.qmm_bn_crossover_tg = 96;
-            // A fleet's routed FFN batches far earlier than the shipped 4.
-            // `moe_should_batch` wants `n_pairs >= n_experts * this`, and until
-            // it is met the largest weights in a mixture run as a per-row
-            // matvec that re-reads the whole expert stack for every row -- so
-            // the constant is really "how many lanes before a server stops
-            // paying that", and at 4 the answer was 32 lanes for gpt-oss and 64
-            // for gemma-4-26b-a4b. Measured on this M4 Pro, aggregate tok/s,
-            // 128-token prompt, 32 decode steps, arms alternated:
-            //
-            //     model                lanes      4        1      delta
-            //     gpt-oss-20b              8   158.2    214.6      +36%
-            //     gpt-oss-20b             16   180.5    386.9     +114%
-            //     gpt-oss-20b             32   470.1    473.2       +1%
-            //     gemma-4-26b-a4b         16   247.4    309.7      +25%
-            //     gemma-4-26b-a4b         32   279.6    384.4      +37%
-            //     Qwen3.6-35B-A3B          8   196.5    195.1       -1%
-            //
-            // No arm regresses and every one of them reproduces mlx-lm's
-            // recorded continuation as an n-wide fleet. The padding the wide
-            // sort adds is real -- at 16 gemma4 lanes it sorts 2048 rows to
-            // carry 128 live ones -- and it is still cheaper than re-reading
-            // the weights, because the surplus tiles decline at
-            // `tile_expert < 0` and cost a threadgroup launch rather than a
-            // GEMM. Which is why this is a measurement and not a model.
-            t.moe_batch_min_per_expert = 1;
             break;
         case 8:
             // M2 generation. The DENSE crossover here is eight, which is now
