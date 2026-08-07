@@ -2133,20 +2133,24 @@ int Context::Impl::load_model(
         {"has_lora", has_lora},
         {"model_site_summary",
          nlohmann::json{{"expert_sites", std::move(expert_sites)}}},
-        // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
-        // The runtime classifies masked device-carried decode into the
-        // DecodeEnvelope class exactly when this mask claims the port, but
-        // this driver cannot execute that class: the envelope verifier
-        // (is_decode_envelope_trace) has no AttnMask arm and both envelope
-        // compose paths (enqueue_fixed_decode / enqueue_decode_envelopes)
-        // carry no per-lane mask state — so a claimed mask port turned the
-        // classifier's loud Host fallback into a bind error. Re-advertise
-        // only together with all three: a verifier arm for the port,
-        // per-lane mask state through both composes, and per-row mask
-        // application in the composed decode attention. (The general
-        // resolved path does consume masks, but an envelope-class batch
-        // must compose — there is no per-fire fallback past composition.)
-        {"device_geometry_port_mask", PIE_DEVICE_GEOMETRY_PORTS},
+        // PIE_DEVICE_PORT_ATTN_MASK says the DESCRIPTOR RESOLVER consumes a
+        // dense device `AttnMask` channel pre-forward, which this driver does
+        // (`descriptor_resolve.hpp` reads the bool cells; `pack_dense_mask`
+        // packs them into flashinfer's ragged custom-mask CSR; the body's
+        // custom-mask arm and the generated supergraph's
+        // `dispatch_attention_flashinfer_prefill_custom` execute it).
+        //
+        // It was withheld for a year-of-the-tree's worth of good reason: the
+        // runtime used to route masked device-carried decode into the
+        // DecodeEnvelope class exactly when a driver claimed this bit, and
+        // the envelope compose has no per-lane mask state — on ANY backend —
+        // so claiming it turned a loud Host fallback into a bind error. The
+        // classifier now declines a channel-bound mask outright, sending it
+        // to the pool-owned device-geometry class that
+        // `detect_pooled_device_geometry` was written for, so the bit means
+        // what it says again.
+        {"device_geometry_port_mask",
+         PIE_DEVICE_GEOMETRY_PORTS | PIE_DEVICE_PORT_ATTN_MASK},
         {"max_forward_tokens", mem_plan.capacity.max_forward_tokens},
         {"max_forward_requests", max_forward_requests_caps},
         {"max_page_refs", mem_plan.capacity.max_page_refs},

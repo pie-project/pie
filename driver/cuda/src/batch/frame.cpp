@@ -1599,10 +1599,31 @@ void prepare_step(
     // collision is a composition bug that must fail loud, not silently
     // drop the structured lanes' masks.
     if (pack_structured_mask && s.have_custom_mask) {
+        // Name BOTH sides. "They collided" is the one fact a reader already
+        // has; which structure and which dense source is the fact that says
+        // whether two lanes really composed or one lane reported itself
+        // twice — the descriptor resolver publishes a structured descriptor
+        // AND a dense cell for the same port when it cannot take the direct
+        // structured route.
+        std::string structured = "none";
+        if (effective_first != effective_structured_masks.end()) {
+            structured =
+                "kind=" +
+                std::to_string(static_cast<int>(effective_first->kind)) +
+                " sink=" + std::to_string(effective_first->sink) +
+                " window=" + std::to_string(effective_first->window) +
+                " key_len=" + std::to_string(effective_first->key_len);
+        }
         throw std::runtime_error(
             "ptir: structured mask pack collides with staged wire custom "
             "masks (wire-masked and structured-masked lanes must not "
-            "compose)");
+            "compose): structured=[" + structured + "] descriptors=" +
+            std::to_string(effective_structured_masks.size()) +
+            " filled_causal=" + (filled_causal_coverage ? "yes" : "no") +
+            " runtime_window_supported=" +
+            (engine.forward_fn.supports_runtime_window ? "yes" : "no") +
+            " dense_mask_bytes=" + std::to_string(s.mask_bytes) +
+            " lanes=" + std::to_string(R));
     }
     if (pack_structured_mask && !s.have_custom_mask) {
         const int lanes = static_cast<int>(qo_view.size()) - 1;

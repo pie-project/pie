@@ -2720,17 +2720,35 @@ async fn fire_device_geometry<C: FireContext>(
         .mapping_version()
         .expect("device-geometry fire always holds a KV transaction");
 
-    // Device geometry and mask provenance are independent. A seed or
-    // host-staged mask still lowers through the wire BRLE path on this fire;
-    // after an epilogue device put advances the shadow, the same channel
-    // classifies as dense device-derived on the next fire.
+    // Device geometry and mask provenance are NOT independent, which is what
+    // the previous version of this comment had wrong. For a device-geometry
+    // instance the driver's descriptor resolver reads the `AttnMask` channel
+    // cell on EVERY fire — that is what the class means — so lowering a
+    // host-KNOWN mask to wire BRLE here reports the same mask twice, and the
+    // driver fails the step loud:
+    //
+    //   ptir: structured mask pack collides with staged wire custom masks
+    //   structured=[kind=3 sink=2 window=4 key_len=48] dense_mask_bytes=4
+    //
+    // Fire 0 is exactly where it bites: the mask arrives as a SEED, so the
+    // host shadow knows it and took the wire path, while the seed is already
+    // in the device cell for the resolver to read. Bind the whole pass to the
+    // channel instead — one mask, one reader.
     let mask_qo_indptr: Vec<u32> = (0..resolved_qo_indptr.len() as u32).collect();
     let attn_mask = {
         let p = ctx.resources().get(&fwd)?;
         let bound = &p.instance.program.bound;
-        let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
-        let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-        geometry::evaluate_attn_mask(bound, &mut known, &mask_qo_indptr)
+        let channel_bound_mask = bound.container.ports.iter().any(|binding| {
+            binding.port == pie_ir::registry::Port::AttnMask
+                && matches!(binding.source, pie_ir::container::PortSource::Channel(_))
+        });
+        if channel_bound_mask {
+            Ok(geometry::FireAttnMask::Device)
+        } else {
+            let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
+            let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
+            geometry::evaluate_attn_mask(bound, &mut known, &mask_qo_indptr)
+        }
     };
     let attn_mask = match attn_mask {
         Ok(mask) => mask,

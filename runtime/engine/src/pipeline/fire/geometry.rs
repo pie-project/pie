@@ -33,10 +33,6 @@ pub struct DecodeEnvelope {
     /// `Positions` binds a channel (device-carried) rather than a const —
     /// executing the class demands the positions device port.
     pub device_positions: bool,
-    /// `AttnMask` binds a channel (dense device-carried bool mask) —
-    /// executing the class demands the mask descriptor port, and the fire
-    /// is marked mask-carrying so the scheduler keeps it solo.
-    pub has_mask: bool,
 }
 
 impl DecodeEnvelope {
@@ -241,7 +237,6 @@ pub fn classify_decode_envelope_why(
     }
 
     let mut device_positions = false;
-    let mut has_mask = false;
     for binding in &container.ports {
         match (&binding.port, &binding.source) {
             (Port::EmbedTokens | Port::KvLen, PortSource::Channel(_)) => {}
@@ -356,11 +351,18 @@ pub fn classify_decode_envelope_why(
                 }
             }
             (Port::AttnMask, PortSource::Channel(channel)) => {
-                // A dense device-carried mask: the driver resolves the bool
-                // cells pre-forward (sink/sliding-window decode). The shape's
-                // key extent evolves with the KV, so only the element type is
-                // checked here; the driver derives key_len from the cell.
-                has_mask = true;
+                // NOT this class. `detect_pooled_device_geometry`'s doc is the
+                // ruling: a decode loop carrying a dense device mask has its
+                // ONLY executable home in the pool-owned device-geometry
+                // class, because the envelope composes batched lanes and has
+                // no per-lane mask state — on any backend, not just this one.
+                //
+                // Claiming it here and demanding an ATTN_MASK capability bit
+                // asked drivers to advertise a thing none of them can do, and
+                // the pooled route is guarded on `decode_envelope.is_none()`,
+                // so a driver that DID advertise won the wrong class and its
+                // envelope verifier rejected the bind. Decline instead, and
+                // the trace falls to the class written for it.
                 let declaration = container
                     .channels
                     .get(*channel as usize)
@@ -371,6 +373,12 @@ pub fn classify_decode_envelope_why(
                 ) {
                     return Err("device attention mask must be a bool channel".to_string());
                 }
+                return decline(
+                    "a channel-bound dense AttnMask belongs to the pool-owned \
+                     device-geometry class; the envelope compose carries no \
+                     per-lane mask state"
+                        .to_string(),
+                );
             }
             (Port::AttnMask, _) => {
                 // A host-known (const) mask is wire territory: the host
@@ -391,7 +399,6 @@ pub fn classify_decode_envelope_why(
         token_indptr: qo_indptr,
         loop_carried,
         device_positions,
-        has_mask,
     }))
 }
 
@@ -403,9 +410,12 @@ pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> u32 {
     if envelope.device_positions {
         required |= pie_driver_abi::PIE_DEVICE_PORT_POSITIONS;
     }
-    if envelope.has_mask {
-        required |= pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK;
-    }
+    // No `PIE_DEVICE_PORT_ATTN_MASK` clause: the classifier declines a
+    // channel-bound mask outright, so no envelope reaches here carrying one.
+    // Demanding the bit asked every backend to advertise per-lane mask state
+    // in the envelope compose, which none has — and the one that advertised
+    // it thereby won this class away from the pooled device-geometry class
+    // that can actually execute the mask.
     required
 }
 
@@ -1183,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_envelope_accepts_a_device_carried_bool_mask() {
+    fn a_device_carried_bool_mask_is_declined_to_the_pooled_class() {
         let mut container = section3_container();
         container.stages[0].ops = vec![
             Op::ChanTake(0),
@@ -1201,34 +1211,29 @@ mod tests {
             source: PortSource::Channel(mask),
         });
 
-        let envelope = classify_decode_envelope(&container)
-            .unwrap()
-            .expect("masked loop-carried decode classifies as an envelope");
-        assert!(envelope.has_mask);
-        assert_ne!(
-            envelope_required_ports(&envelope) & pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
-            0,
-            "a masked envelope demands the mask descriptor port"
+        // The envelope compose carries no per-lane mask state on ANY
+        // backend, so a masked decode loop is not this class — it is the
+        // pool-owned device-geometry class, whose detector requires exactly
+        // this mask (`detect_pooled_device_geometry`). Declining here is what
+        // lets it get there: the pooled route is guarded on the envelope
+        // having declined.
+        let mut why = String::new();
+        let classified = classify_decode_envelope_why(&container, &mut why).unwrap();
+        assert!(
+            classified.is_none(),
+            "a channel-bound dense mask must not classify as a decode envelope"
         );
-        // RV-26: the geometry ports alone must NOT satisfy a masked
-        // envelope. A driver that advertises geometry ports but cannot
-        // execute per-lane masks in its envelope compose (CUDA today)
-        // routes masked envelopes through the loud Host fallback — a
-        // driver that CLAIMS the mask port turns that fallback into a
-        // bind error, which is why claiming it demands real execution.
-        let required = envelope_required_ports(&envelope);
-        assert_ne!(
-            required & pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
-            required,
-            "geometry ports alone must not admit a masked envelope"
+        assert!(
+            why.contains("pool-owned device-geometry"),
+            "the decline must name where the trace belongs, got {why:?}"
         );
 
-        // A non-bool mask channel is a classification error, not a fallback.
+        // A non-bool mask channel is a classification error, not a fallback —
+        // checked BEFORE the decline, so a malformed mask is still loud.
         let bad = container.channels.len() as u32 - 1;
         container.channels[bad as usize].dtype = ChanDType::Concrete(DType::U32);
         assert!(classify_decode_envelope(&container).is_err());
     }
-
     #[test]
     fn decode_envelope_accepts_seeded_prefill_tokens() {
         let mut container = section3_container();
