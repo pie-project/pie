@@ -295,8 +295,13 @@ inline void qmm_splitk_reduce_dispatch(int out_vec, int N, Grid& g, Threadgroup&
 // weight thirty-two times.
 inline int qmm_strided_bm(int padded_rows) {
     static const bool off = std::getenv("PIE_METAL_NO_PREFILL_BM32") != nullptr;
-    // The strided form is instantiated as a narrow/wide PAIR, not over
-    // `kQmmBMs`, so it stops at 32 whatever the aligned table grew to.
+    // 128 was instantiated and measured and is not here: Qwen3.6-27B prefill
+    // gives 103.0 tok/s at 128 rows against 64's 104.5, and 106.5 against 106.7
+    // at 512. A 128-row block is 12.8 KiB of threadgroup memory against 64's
+    // 7.7, which takes a core from four resident threadgroups to two -- and
+    // overlapping one threadgroup's weight read with another's MMA is the only
+    // thing hiding either, per the note in `qmm_t_loaded_impl`. Halving the
+    // dequantizations does not pay for it. The rung stops here.
     if (off) return kQmmBM;
     return padded_rows >= 64 ? 64 : (padded_rows >= 32 ? 32 : kQmmBM);
 }

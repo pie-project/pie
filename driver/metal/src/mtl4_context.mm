@@ -2149,7 +2149,9 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
         for (std::size_t i = 0; i < ticks.size() && i < got; ++i) ticks[i] = e[i].timestamp;
     }
     static std::map<std::string, std::pair<double, long>> table;
+    static std::map<std::string, double> wall_table;
     static double total_ticks = 0.0;
+    static double total_wall_ticks = 0.0;
     static double total_gpu_ms = 0.0;
     static long fires = 0;
     static std::uint64_t dropped = 0;
@@ -2167,11 +2169,55 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
         slot.second += 1;
         total_ticks += double(b - a);
     }
+    // The column above is a SUM of [start, end] intervals, so if dispatches
+    // overlap it double-counts and its shares are occupancy rather than time.
+    // Sweep the intervals to find out: at every instant divide that instant
+    // among the dispatches running in it, and the result sums to their UNION.
+    //
+    // It always comes back 1.0x -- the union equals the sum, nothing overlaps
+    // anything. That is not what the GPU does; it is what the trace does to
+    // it. See the note the report prints.
+    {
+        struct Ev {
+            std::uint64_t t;
+            int delta;
+            std::uint32_t idx;
+        };
+        std::vector<Ev> ev;
+        ev.reserve(std::size_t(2) * n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const std::uint64_t a = ticks[2 * i], b = ticks[2 * i + 1];
+            if (b <= a) continue;
+            ev.push_back({a, +1, i});
+            ev.push_back({b, -1, i});
+        }
+        std::sort(ev.begin(), ev.end(), [](const Ev& x, const Ev& y) {
+            return x.t != y.t ? x.t < y.t : x.delta > y.delta;
+        });
+        std::map<std::string, int> live;
+        int live_n = 0;
+        std::uint64_t prev = ev.empty() ? 0 : ev.front().t;
+        for (const Ev& e : ev) {
+            if (live_n > 0 && e.t > prev) {
+                const double span = double(e.t - prev);
+                const double each = span / double(live_n);
+                for (const auto& [name, c] : live)
+                    if (c > 0) wall_table[name] += each * double(c);
+                total_wall_ticks += span;
+            }
+            prev = e.t;
+            const std::string& name = I.step.trace_labels[e.idx];
+            live[name] += e.delta;
+            live_n += e.delta;
+        }
+    }
     total_gpu_ms += gpu_ms;
     if (++fires % every != 0) return;
     std::vector<std::pair<std::string, std::pair<double, long>>> rows(table.begin(), table.end());
-    std::sort(rows.begin(), rows.end(),
-              [](const auto& x, const auto& y) { return x.second.first > y.second.first; });
+    std::sort(rows.begin(), rows.end(), [&](const auto& x, const auto& y) {
+        (void)wall_table;
+        return x.second.first > y.second.first;
+    });
     fprintf(stderr, "[trace] %ld fires, %.2f ms of GPU, %zu kernels\n", fires, total_gpu_ms,
             rows.size());
     // Said before the table, because it invalidates it. The shares below are
@@ -2193,13 +2239,38 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
                 "of it.\n",
                 dispatch_trace_stride(), dispatch_trace_stride());
     }
+    // THE SHARES BELOW ARE OF A FIRE THE TRACE SERIALIZED. Every dispatch is
+    // bracketed by two timestamps, and the pair is a scheduling boundary: the
+    // intervals come back non-overlapping (%.2fx below is the sum over the
+    // union, and it is 1.00) because with the marks in, nothing overlaps.
+    //
+    // Untraced they do. Qwen3.6-27B, 128-token prefill, same binary: 1.226 s
+    // with no trace, 1.332 s at stride 1, 1.487 s at stride 4 -- the stride is
+    // SLOWER because a stride-1 trace stops marking once the heap fills and
+    // lets the rest of the fire run free, while a stride spreads the marks
+    // over all of it. Twenty-one percent of that fire is concurrency, and this
+    // table cannot see any of it.
+    //
+    // What that costs the reader: a small kernel dispatched per token reads
+    // far larger here than it is worth, because untraced it runs under its
+    // neighbours. Batching 3696 dispatches of q/k-norm and rope away -- 33% of
+    // this table -- was worth 0.2% of the fire. Use the table to find WHICH
+    // kernel to look at, never to decide what a change will be worth. Only an
+    // A/B of the real thing decides that.
+    fprintf(stderr,
+            "[trace] SERIALIZED BY THE MARKS: intervals sum to %.2fx their union, i.e. "
+            "the trace let nothing overlap. Untraced this fire overlaps ~21%%. Shares "
+            "point at kernels; they do not price changes -- A/B does.\n",
+            total_wall_ticks > 0 ? total_ticks / total_wall_ticks : 0.0);
     for (const auto& [name, v] : rows) {
         const double share = total_ticks > 0 ? v.first / total_ticks : 0.0;
         fprintf(stderr, "[trace]  %6.2f%%  %8.3f ms  n=%-6ld %s\n", 100.0 * share,
                 share * total_gpu_ms, v.second, name.c_str());
     }
     table.clear();
+    wall_table.clear();
     total_ticks = 0.0;
+    total_wall_ticks = 0.0;
     total_gpu_ms = 0.0;
     dropped = 0;
 }
