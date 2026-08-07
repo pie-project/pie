@@ -791,26 +791,47 @@ void warn_once_if_the_gpu_leaked_memory_before_this_run() {
     }();
 }
 
-// What a weight that is COPIED into the heap costs the host while it is being
-// copied: the heap byte it becomes, and the mmap byte it is read from, at the
-// same time. Both are resident, so the process peaks at twice what the GPU
-// ends up holding, and it peaks there during load -- before the first
-// dispatch, and before anything else here has had a chance to refuse.
+// What a weight that is COPIED into the heap costs the host WHILE it is being
+// copied, on top of the heap byte it becomes.
 //
-// Measured rather than assumed, because the doubling is not obvious from any
-// one number this file computes: Llama-3.2-1B is 0.65 GiB of weights and
-// peaks at 1.42 GiB (2.19x), gemma-4-e2b is 2.43 GiB and peaks at 4.90 GiB
-// (2.02x). Weights bound where they lie are exempt -- there is no second copy
-// of a tensor the GPU reads out of the mapping -- which is why the caller
-// passes the copied bytes and not the model.
+// The obvious answer -- the whole mapping, so the peak is twice the model --
+// is what RSS says and it is not what the machine feels. `copy_storage_bytes`
+// walks a tensor in `max_tile_bytes` chunks and `madvise(MADV_DONTNEED)`s each
+// chunk behind it, and `with_mapped_span` does the same once per strided
+// selection. On Darwin that call deactivates rather than discards, so the page
+// stays counted in RSS while moving to the queue the kernel reclaims from
+// first. Both numbers are real; only one of them is a demand.
 //
-// This is what six kernel panics on the 48 GiB M4 Pro were: a checkpoint of
-// 18.16 GiB passed a check that compared ~19 GiB against a quiet machine's
-// free memory and then peaked at 40.5 GiB, which took free memory to 60 MiB.
-// The panics differed -- a data abort on a PAC-mangled pointer, a WindowServer
-// watchdog, an assertion inside IOGPUGroupMemory -- and every one of them had
-// free memory under 200 MiB. The kernel dies of this in whatever way it
-// happens to die; what it does not do is give the byte back.
+// gpt-oss-20b, 10.41 GiB of weights, all copied, measured with `time -l`:
+//
+//     maximum resident set size  20.84 GiB   <- the mapping is in here
+//     peak memory footprint      10.84 GiB   <- and not in here
+//     swaps                      0
+//
+// `peak memory footprint` is `phys_footprint`, which is the number the kernel
+// itself bills a process for and the one jetsam reads. It is the heap plus
+// change. Sampling `vm_stat` through that load says the same thing from the
+// other side: free memory does bottom out at 50 MiB, but the inactive queue
+// holds steady at 11.8 GiB the whole way down and no page is ever swapped.
+// Free is not the resource; reclaimable is, and the mapping funds itself out
+// of it -- every tile it faults in, it hands back before taking the next.
+//
+// So the transient is one window, not one model, and the window is whatever a
+// single release covers: a 64 MiB tile on the bulk path, one source tensor on
+// the strided one. It is capped rather than derived because the two paths
+// disagree and the larger of them is a property of the checkpoint's biggest
+// tensor, which this file cannot see. Under the cap the whole model IS the
+// window, which is the right answer for a checkpoint that small.
+//
+// The cap is not the guard. The guard is that `want` -- the heap, which
+// `make_resident` wires and nothing can reclaim -- has to fit in what the
+// machine will give back, with `kHostMargin` to spare. That is the check the
+// six kernel panics on the 48 GiB M4 Pro were missing: an 18.16 GiB checkpoint
+// passed a test that compared it against *free* memory on a quiet machine,
+// which says nothing, and the panics -- a data abort on a PAC-mangled pointer,
+// a WindowServer watchdog, an assertion inside IOGPUGroupMemory -- all landed
+// with free under 200 MiB. Comparing against reclaimable is what fixed that.
+// Adding the mapping on top of it only ever refused models that fit.
 bool fits_on_this_gpu(std::size_t heap_bytes,
                       std::size_t elastic_bytes,
                       std::size_t resident_weights,
@@ -844,11 +865,11 @@ bool fits_on_this_gpu(std::size_t heap_bytes,
             ? 0  // a forced ceiling describes a device, not this machine
             : RawMetalContext::host_reclaimable_bytes();
     constexpr std::size_t kHostMargin = 2ull * 1024 * 1024 * 1024;
-    // The host bound is about the PEAK, not the steady state. The device
-    // ceiling above is right to ignore the copy -- the GPU never holds it --
-    // but the machine does hold it, and it is the larger of the two numbers
-    // for any checkpoint that has to be copied at all.
-    const std::size_t host_want = want + transient_copy_bytes;
+    // The host bound is about the PEAK, not the steady state -- but the peak
+    // is the heap plus one copy window, not the heap plus the checkpoint. See
+    // the note above this function for the measurement.
+    constexpr std::size_t kCopyWindow = 2ull * 1024 * 1024 * 1024;
+    const std::size_t host_want = want + std::min(transient_copy_bytes, kCopyWindow);
     const bool host_bound =
         reclaimable != 0 && host_want + kHostMargin > reclaimable && want <= limit;
 
@@ -862,12 +883,11 @@ bool fits_on_this_gpu(std::size_t heap_bytes,
                    "it needs " + gib(want) + " GiB resident (" +
                    gib(resident_weights) + " GiB of weights, " +
                    gib(elastic_bytes) + " GiB of KV, state and scratch)" +
-                   (transient_copy_bytes != 0
-                        ? " and " + gib(transient_copy_bytes) +
-                              " GiB more while it loads, because a weight that is copied "
-                              "into the heap is resident twice -- once in the heap and "
-                              "once in the mapping it is read from -- so the peak is " +
-                              gib(host_want) + " GiB and not " + gib(want) + " GiB"
+                   (host_want != want
+                        ? " and " + gib(host_want - want) +
+                              " GiB more while it loads, for the window of the "
+                              "checkpoint that is mapped and not yet copied, so the "
+                              "peak is " + gib(host_want) + " GiB"
                         : "") +
                    ", and only " + gib(reclaimable) + " GiB is reclaimable. The GPU "
                    "itself would hold " + gib(limit) + " GiB, so this is the machine, "
@@ -1007,10 +1027,10 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // mmap the GPU never sees, so they are neither allocated nor resident, and
     // adding them here would refuse exactly the models this exists to run.
     //
-    // What IS resident twice is whatever had to be copied into the heap, and
-    // for these checkpoints that is nearly the whole model -- `extra` is KV and
-    // scratch, which is built rather than read, and a slab's budget is filled
-    // from the mapping a band at a time rather than all at once.
+    // What comes off the mapping is whatever had to be copied into the heap --
+    // `extra` is KV and scratch, which is built rather than read, and a slab's
+    // budget is filled from the mapping a band at a time. `fits_on_this_gpu`
+    // caps it at one copy window; passing the total lets it do that.
     const std::size_t copied =
         heap_bytes >= extra + (slab ? std::size_t(cfg.expert_slab_bytes) : 0)
             ? heap_bytes - extra - (slab ? std::size_t(cfg.expert_slab_bytes) : 0)
@@ -1206,8 +1226,8 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                      mb(elastic_parts.state), mb(elastic_parts.scratch));
     }
     // `resident_weights` is exactly what gets copied: the model minus whatever
-    // is bound where it lies. Every one of those bytes is resident twice while
-    // the copy runs -- see `fits_on_this_gpu`.
+    // is bound where it lies. Only a window of it is off the mapping at once --
+    // see `fits_on_this_gpu`.
     if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err,
                           &elastic_parts, resident_weights))
         return false;

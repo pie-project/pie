@@ -449,22 +449,26 @@ int main(int argc, char** argv) {
     // The device ceiling is not the bound that killed this machine. Six kernel
     // panics on the 48 GiB M4 Pro all had free memory under 200 MiB, and the
     // run that caused the last one had passed every check above: an 18.16 GiB
-    // checkpoint, a device that would hold far more, and a process that peaked
-    // at 40.5 GiB. A weight copied into the heap is resident TWICE while the
-    // copy runs -- once in the heap and once in the mapping it is read from --
-    // and nothing checked the second one.
+    // checkpoint and a device that would hold far more. What nothing checked
+    // was the heap against what the machine would actually give back --
+    // `make_resident` wires the heap, and a wired page is not reclaimable at
+    // any price.
     //
-    // So this probe gives the driver room for the checkpoint and the whole
-    // margin, and nothing for the second copy.
+    // So this probe leaves the machine exactly the checkpoint and not one byte
+    // of the margin the driver insists on. It must refuse, and it must refuse
+    // for the host and not for the device: the device ceiling here is untouched
+    // and would admit the model happily, which is what makes the clause named
+    // below the assertion and not the refusal itself.
     //
-    // The assertion is on the MESSAGE and not merely on the refusal, and that
-    // is what makes this a regression gate rather than a coincidence: the
-    // clause named below is emitted only when the copy is actually counted, so
-    // deleting that term fails this test whether the driver then refuses for
-    // some other reason or admits the model outright.
+    // The load window is deliberately NOT what this gates. It used to be -- the
+    // term was the whole checkpoint on the theory that a copied weight is
+    // resident twice -- and that theory was measuring RSS. `time -l` on a
+    // 10.41 GiB gpt-oss load reports 20.84 GiB of resident set and 10.84 GiB of
+    // peak footprint, with zero swaps, because `copy_storage_bytes` hands each
+    // tile back to the kernel before it takes the next. Gating the discredited
+    // number here is how it survived being wrong.
     {
-        const std::size_t kMargin = 2ull << 30;
-        const std::size_t left = std::size_t(weight_bytes) + kMargin;
+        const std::size_t left = std::size_t(weight_bytes);
         RawMetalContext::set_host_reclaimable_bytes_for_test(left);
         MetalExecutor probe;
         std::string why;
@@ -472,18 +476,15 @@ int main(int argc, char** argv) {
         RawMetalContext::set_host_reclaimable_bytes_for_test(0);
         if (set_up) {
             std::printf("  FAIL  setup succeeded on a machine with only %.2f GiB left, "
-                        "against %.2f GiB of weights that are resident twice while they "
-                        "load\n",
+                        "against %.2f GiB of weights it has to wire\n",
                         double(left) / (1 << 30), double(weight_bytes) / (1 << 30));
             return 1;
         }
-        if (why.find("does not fit the memory this machine has left") == std::string::npos ||
-            why.find("resident twice") == std::string::npos) {
-            std::printf("  FAIL  refused, but not for the load-time peak: %s\n", why.c_str());
+        if (why.find("does not fit the memory this machine has left") == std::string::npos) {
+            std::printf("  FAIL  refused, but not for the host: %s\n", why.c_str());
             return 1;
         }
-        std::printf("  PASS  refused a model whose load-time peak the machine could not "
-                    "hold: %s\n", why.c_str());
+        std::printf("  PASS  refused a model the machine could not hold: %s\n", why.c_str());
     }
 
     MetalExecutor exec;
