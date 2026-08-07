@@ -227,10 +227,35 @@ class PtirInstance {
         }
         for (const ChannelValue& s : seeds) {
             const ChannelId dense = dense_channel(s.channel);
-            view_.seed_cell_async(dense, s.bytes.data(), s.bytes.size());
+            // Seeds cross the ABI in the WIRE form — the width the endpoint
+            // binding reports as `cell_bytes` — and for Bool that is bits,
+            // `(numel + 7) / 8`. Every surface below this line speaks the
+            // NATIVE cell (one byte per bool: that is what `dtype_size`
+            // says, what the device ring is sized to, and what
+            // `publish_host_seed` packs FROM), so the unpack belongs here,
+            // at the boundary, and nothing downstream changes its contract.
+            // `pull_writer_ring` does the same conversion for the host-writer
+            // ring; the seed path is the one arrival that never did.
+            const void* data = s.bytes.data();
+            std::size_t bytes = s.bytes.size();
+            if (trace.channels[dense].type.dtype == DType::Bool) {
+                // Owned by the instance, not by this loop: the copy is
+                // ASYNC on the initialization stream and settles later, so a
+                // buffer scoped to the iteration would be freed out from
+                // under an in-flight DMA.
+                seed_staging_.emplace_back(view_.cell_bytes(dense), 0);
+                auto& native = seed_staging_.back();
+                const auto* packed = static_cast<const std::uint8_t*>(data);
+                for (std::size_t i = 0; i < native.size(); ++i) {
+                    native[i] =
+                        static_cast<std::uint8_t>((packed[i / 8] >> (i % 8)) & 1u);
+                }
+                data = native.data();
+                bytes = native.size();
+            }
+            view_.seed_cell_async(dense, data, bytes);
             if (trace.channels[dense].host_reader) {
-                view_.publish_host_seed(
-                    dense, s.bytes.data(), s.bytes.size());
+                view_.publish_host_seed(dense, data, bytes);
             }
         }
         // Seed copies (and the runner's baked-list upload) stay pending on the
@@ -475,8 +500,12 @@ class PtirInstance {
                 }
                 return false;
             }
-            const std::size_t expected =
-                seeds ? view_.cell_bytes(dense) : view_.wire_bytes(dense);
+            // Both arrivals are WIRE-form: a seed and a host put cross the
+            // same ABI and are sized by the same `cell_bytes` the endpoint
+            // binding reported. Seeds asked for the NATIVE width instead,
+            // which agreed for every dtype where native == wire and was
+            // wrong by exactly eight for the one that packs.
+            const std::size_t expected = view_.wire_bytes(dense);
             if (value.bytes.size() != expected) {
                 // Say WHICH channel and BY HOW MUCH. The bare sentence this
                 // replaces is the whole diagnosis a caller got, and a
@@ -506,6 +535,9 @@ class PtirInstance {
     DeviceChannelRegistry* reg_;
     ChannelView view_;
     Tier0Runner runner_;
+    // Unpacked Bool seeds, kept alive for the async seed copies (see the
+    // seed loop). One mask-sized buffer per bool-seeded channel.
+    std::vector<std::vector<std::uint8_t>> seed_staging_;
     bool ok_ = true;
     std::vector<ChannelId> host_reader_output_channels_;
 };
