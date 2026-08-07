@@ -1,4 +1,4 @@
-// Expert-major reordering for a routed FFN.
+// Generic MoE routing: select experts, group rows by expert, and combine them.
 //
 // A mixture's problem at prefill is not arithmetic, it is that every (token,
 // slot) pair reads a DIFFERENT expert's weight matrix. The matvec form pays
@@ -11,8 +11,7 @@
 // The fix is not a wider kernel. It is to put the rows that share an expert
 // NEXT TO EACH OTHER, at which point the projection is an ordinary batched
 // matmul over a contiguous block of rows against one weight slice -- the
-// `affine_qmm_t` this driver already has. These three kernels are that
-// reordering and nothing else:
+// `affine_qmm_t` this driver already has. The reordering is:
 //
 //   sort    -- a counting sort of the (row, slot) pairs by expert id, laid out
 //              so each expert's run starts on a tile boundary.
@@ -25,7 +24,7 @@
 // dispatch and a full-width buffer spent to make an index arithmetic look
 // simpler.
 //
-// Both run at M=1. A decode sorts eight pairs and gathers eight rows, which is
+// Sort and gather also run at M=1. A decode handles eight pairs, which is
 // microseconds -- and it means the routed
 // dataflow has ONE shape rather than a decode shape and a prefill shape that
 // have to be kept agreeing. The batched and unbatched paths differ in exactly
@@ -37,22 +36,141 @@
 
 using namespace metal;
 
-// Mirrors `shared_kernels::MoeRouteParams`.
-struct MoeRouteParams {
-    // Live (row, slot) pairs: `rows * experts_per_token`.
-    uint n;
-    uint n_experts;
-    uint experts_per_token;
-    // The row granularity each expert's run is padded to. 1 for the matvec
-    // path, the matmul's BM for the batched one.
-    uint tile_rows;
-    // Capacity of `perm` and `row_expert`, in rows. The host sizes this at the
-    // worst case -- `n + min(n, n_experts) * (tile_rows - 1)` -- so the sort
-    // can never need a bound it was not given.
-    uint padded;
-    // Row width, for the gather and the scatter.
-    uint width;
-};
+#include "moe_params.h"
+
+// Top-k over each router-logit row, then a softmax over only the selected
+// values. One threadgroup owns one row and one lane owns one expert.
+//
+// The reduction is threadgroup-wide. Qwen MoE has 128 experts, so reducing
+// independently inside each simdgroup would select four quarter-local maxima;
+// the explicit second level keeps the result correct beyond GPT-OSS's 32.
+constant constexpr uint kRouterMaxTopK = 16;
+constant constexpr uint kRouterMaxSimdgroups = 32;
+
+// SCALED applies Gemma 4's learned per-expert gain after the top-k softmax.
+// Separate instantiations avoid requiring an otherwise-unused scale binding.
+template <typename T, bool SCALED>
+[[kernel]] void router_topk(
+    const device T* logits     [[buffer(0)]],
+    device int* expert_ids     [[buffer(1)]],
+    device T* expert_weights   [[buffer(2)]],
+    constant RouterParams& p   [[buffer(3)]],
+    const device T* per_expert_scale [[buffer(4)]],
+    uint3 lid3 [[thread_position_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint3 tgsize [[threads_per_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]]) {
+  const uint lid = lid3.x;
+  const uint n = p.n_experts;
+  const uint k = min(p.experts_per_token, kRouterMaxTopK);
+  const uint n_simd = min((tgsize.x + 31u) / 32u, kRouterMaxSimdgroups);
+  constexpr float NEG_INF = -3.0e38f;
+
+  const uint row = tgid.y;
+  logits += size_t(row) * size_t(p.logits_pitch != 0u ? p.logits_pitch : n);
+  expert_ids += size_t(row) * size_t(k);
+  expert_weights += size_t(row) * size_t(k);
+
+  float v = lid < n ? float(logits[lid]) : NEG_INF;
+
+  threadgroup float part_v[kRouterMaxSimdgroups];
+  threadgroup float part_s[kRouterMaxSimdgroups];
+  threadgroup float all_max;
+  threadgroup float all_sum;
+  threadgroup uint part_i[kRouterMaxSimdgroups];
+  threadgroup float chosen[kRouterMaxTopK];
+  threadgroup uint winner_of_round;
+
+  // `norm_topk_prob: false` wants the softmax taken over EVERY expert and the
+  // top-k read out of it, so the k weights sum to less than one. Take that
+  // denominator here, before the selection loop consumes `v` -- each lane
+  // still holds its own logit and nothing has been knocked out yet.
+  if (p.softmax_over_all != 0u) {
+    const float m0 = simd_max(v);
+    if (simd_lid == 0) part_v[simd_gid] = m0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float best = NEG_INF;
+      for (uint sg = 0; sg < n_simd; ++sg) best = max(best, part_v[sg]);
+      all_max = best;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float e = lid < n ? fast::exp(v - all_max) : 0.0f;
+    const float s0 = simd_sum(e);
+    if (simd_lid == 0) part_s[simd_gid] = s0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float total = 0.0f;
+      for (uint sg = 0; sg < n_simd; ++sg) total += part_s[sg];
+      all_sum = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (uint r = 0; r < k; ++r) {
+    const float m = simd_max(v);
+    const uint w = simd_min(v == m ? lid : 0xFFFFFFFFu);
+    if (simd_lid == 0) {
+      part_v[simd_gid] = m;
+      part_i[simd_gid] = w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+      float best = NEG_INF;
+      uint best_i = 0xFFFFFFFFu;
+      for (uint sg = 0; sg < n_simd; ++sg) {
+        if (part_v[sg] > best) {
+          best = part_v[sg];
+          best_i = part_i[sg];
+        }
+      }
+      expert_ids[r] = int(best_i);
+      chosen[r] = best;
+      winner_of_round = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == winner_of_round) v = NEG_INF;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (lid == 0) {
+    // Either denominator, one shape: exponentiate against a max and divide by
+    // a sum. Which max and which sum is the whole of `norm_topk_prob`.
+    float mx = all_max;
+    float sum = all_sum;
+    if (p.softmax_over_all == 0u) {
+      mx = NEG_INF;
+      for (uint r = 0; r < k; ++r) mx = max(mx, chosen[r]);
+      sum = 0.0f;
+      for (uint r = 0; r < k; ++r) sum += fast::exp(chosen[r] - mx);
+    }
+    for (uint r = 0; r < k; ++r) {
+      chosen[r] = fast::exp(chosen[r] - mx);
+    }
+    for (uint r = 0; r < k; ++r) {
+      float weight = chosen[r] / sum;
+      if (SCALED) weight *= float(per_expert_scale[uint(expert_ids[r])]);
+      expert_weights[r] = static_cast<T>(weight);
+    }
+  }
+}
+
+#define instantiate_router_topk(name, itype)                       \
+  template [[host_name("router_topk_" #name)]]                     \
+  [[kernel]] void router_topk<itype, false>(                       \
+      const device itype*, device int*, device itype*,             \
+      constant RouterParams&, const device itype*,                 \
+      uint3, uint, uint, uint3, uint3);                            \
+  template [[host_name("router_topk_scaled_" #name)]]              \
+  [[kernel]] void router_topk<itype, true>(                        \
+      const device itype*, device int*, device itype*,             \
+      constant RouterParams&, const device itype*,                 \
+      uint3, uint, uint, uint3, uint3);
+
+instantiate_router_topk(bfloat16, bfloat)
 
 // One lane per expert during the prefix scan, so this is the widest expert
 // count this shape serves. `shared_kernels::kRouterMaxExperts` is the same
@@ -201,28 +319,23 @@ constant constexpr uint kMaxExperts = 1024;
     if (gid.x >= p.width || gid.y >= p.padded) return;
     const int sel = perm[gid.y];
     const uint k = p.experts_per_token < 1u ? 1u : p.experts_per_token;
+    const uint x_pitch = p.x_pitch != 0u ? p.x_pitch : p.width;
     out[uint(gid.y) * p.width + gid.x] =
-        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * p.width + gid.x];
+        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * x_pitch + gid.x];
 }
 
 /// Sum a token's k expert outputs, weighted by the router's softmax, reading
 /// them where the SORT left them.
 ///
 /// The same arithmetic as `expert_combine`, and deliberately a separate kernel
-/// rather than that one taught an optional index: gpt-oss does not sort, so
-/// giving it a buffer it must bind and never reads would be the bias slot
-/// problem again.
+/// rather than that one taught an optional index: every sorted family binds the
+/// inverse, while an unsorted caller should not carry a buffer it never reads.
 ///
 /// A slot whose pair never got a position contributes zero. That cannot happen
 /// for a routing the geometry accepted -- every id is in range and every pair
 /// is placed -- but reading `y` at -1 if it ever did would be a wild load, and
 /// the whole reason the sort is a permutation rather than a filter is that a
 /// silently dropped expert is a silently wrong answer.
-struct ExpertCombineParams {
-    uint width;
-    uint experts_per_token;
-};
-
 [[kernel]] void moe_combine_sorted(
     const device bfloat* y              [[buffer(0)]],
     const device bfloat* expert_weights [[buffer(1)]],
@@ -240,7 +353,7 @@ struct ExpertCombineParams {
     if (at < 0) continue;
     acc += float(expert_weights[row * k + e]) * float(y[uint(at) * p.width + c]);
   }
-  out[row * p.width + c] = static_cast<bfloat>(acc);
+  out[row * (p.out_pitch != 0u ? p.out_pitch : p.width) + c] = static_cast<bfloat>(acc);
 }
 
 // ── The shared expert ────────────────────────────────────────────────────────

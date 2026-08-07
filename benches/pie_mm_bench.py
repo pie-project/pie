@@ -66,7 +66,6 @@ def bench_inferlet_paths(inferlet_dir: str) -> tuple[Path, Path, str]:
 
 def build_config(args: argparse.Namespace, port: int):
     from pie.config import (
-        AuthConfig,
         Config,
         DriverConfig,
         ModelConfig,
@@ -84,7 +83,7 @@ def build_config(args: argparse.Namespace, port: int):
 
     driver_options = {
         "gpu_mem_utilization": args.gpu_mem_util,
-        "ready_timeout_s": float(args.server_startup_timeout),
+        "ready_timeout": f"{int(args.server_startup_timeout)}s",
     }
     requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
@@ -105,7 +104,6 @@ def build_config(args: argparse.Namespace, port: int):
             verbose=True,
             max_concurrent_processes=max_concurrent,
         ),
-        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
             # See pie_bench.py: a pooling slot costs ~4 GiB of virtual address

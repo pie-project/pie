@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include "../../device_tuning.hpp"
+
 namespace pie::metal::gemma4 {
 
 bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir,
@@ -55,18 +57,29 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir,
                          "affine_qmv_tail" + g.ffn_quant.kernel_suffix(), &out.qmv_tail_alt});
     }
     if (g.is_moe()) {
-        extra.push_back({"gptoss.metal", "router_topk_scaled_bfloat16", &out.router_topk});
+        extra.push_back({"moe_route.metal", "router_topk_scaled_bfloat16", &out.router_topk});
         extra.push_back({"quantized_qmv.metal", "affine_qmv_routed" + q, &out.qmv_routed});
         extra.push_back({"moe_route.metal", "moe_route_sort", &out.moe_sort});
         extra.push_back({"moe_route.metal", "moe_route_gather", &out.moe_gather});
         extra.push_back({"moe_route.metal", "moe_combine_sorted", &out.moe_combine});
         extra.push_back({"residual_add.metal", "residual_add_bfloat16", &out.residual_add});
-        const std::string routed_bm =
-            "affine_qmm_t_routed" + q + "_bm_" + std::to_string(shared_kernels::kMoeTileRows);
-        for (int i = 0; i < 3; ++i) {
-            extra.push_back({"quantized_qmm_t.metal",
-                             routed_bm + "_bn_" + std::to_string(16 << i),
-                             &out.qmm_routed[i]});
+        for (int t = 0; t < 3; ++t) {
+            // The routed GEMM is a NAME choice and nothing else: the FP16 form
+            // takes the same buffers, the same grid and the same `tile_expert`
+            // contract, so the dispatch path never learns which one it got.
+            // It is the largest term in a 26B prefill -- 47.9% of it -- and on
+            // a device with no bfloat matrix unit the BF16 form is emulated.
+            const std::string routed =
+                fp16_qmm() && g.quant.bits == 4 && g.quant.group == 64
+                    ? "affine_qmm_t_routed_fp16" + q
+                    : "affine_qmm_t_routed" + q;
+            const std::string bm =
+                routed + "_bm_" + std::to_string(shared_kernels::kMoeTileWidths[t]);
+            for (int i = 0; i < 3; ++i) {
+                extra.push_back({"quantized_qmm_t.metal",
+                                 bm + "_bn_" + std::to_string(16 << i),
+                                 &out.qmm_routed[t][i]});
+            }
         }
     }
     for (const Spec& spec : extra) {

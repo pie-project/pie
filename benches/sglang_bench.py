@@ -47,6 +47,15 @@ def build_engine(args: argparse.Namespace, max_running_requests: int):
             "--sglang-disable-piecewise-cuda-graph: installed SGLang has no "
             "such server arg"
         )
+    if "disable_hybrid_swa_memory" in supported:
+        engine_kwargs["disable_hybrid_swa_memory"] = (
+            args.sglang_disable_hybrid_swa_memory
+        )
+    elif args.sglang_disable_hybrid_swa_memory:
+        raise SystemExit(
+            "--sglang-disable-hybrid-swa-memory: installed SGLang has no "
+            "such server arg"
+        )
     if args.sglang_attention_backend:
         engine_kwargs["attention_backend"] = args.sglang_attention_backend
     if args.sglang_sampling_backend:
@@ -289,6 +298,7 @@ def run(args: argparse.Namespace):
         config={
             "disable_cuda_graph": args.sglang_disable_cuda_graph,
             "disable_piecewise_cuda_graph": args.sglang_disable_piecewise_cuda_graph,
+            "disable_hybrid_swa_memory": args.sglang_disable_hybrid_swa_memory,
             "disable_radix_cache": True,
             "attention_backend": args.sglang_attention_backend,
             "sampling_backend": args.sglang_sampling_backend,

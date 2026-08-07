@@ -73,13 +73,7 @@ void check_launch(const char* where, int layer) {
 /// enabled run reorders nothing and a disabled one is a load and a branch.
 class PhaseProfiler {
   public:
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_K3_PHASE_PROFILE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
+    static constexpr bool enabled() { return false; }
 
     // Decode fires are captured into a graph, and a capturing stream may not
     // be synchronised -- `report` would turn a profiling run into a failed
@@ -878,7 +872,7 @@ void kimi_k3_forward_paged(
                 static_cast<std::int32_t*>(ws.aligned_route_ids.data()),
                 static_cast<std::int32_t*>(ws.aligned_expert_ids.data()),
                 /*route_to_aligned_row=*/nullptr, routes, E, block, nblocks,
-                stream);
+                /*num_tokens_past_padded=*/nullptr, stream);
             kernels::launch_gather_moe_aligned_inputs_bf16(
                 expert_in,
                 static_cast<const std::int32_t*>(ws.aligned_route_ids.data()),

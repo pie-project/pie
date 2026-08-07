@@ -114,8 +114,9 @@ void the_step_is_this_many_dispatches() {
     for (Kind k : {Kind::AttnNorm, Kind::QmvQ, Kind::QmvK, Kind::QmvV, Kind::RopeQ,
                    Kind::RopeK, Kind::KvAppend, Kind::SdpaSink, Kind::QmvO,
                    Kind::AttnResidual, Kind::FfnNorm, Kind::RouterGemv, Kind::RouterTopK,
-                   Kind::ExpertGate, Kind::ExpertUp, Kind::ExpertSwiGlu, Kind::ExpertDown,
-                   Kind::ExpertCombine, Kind::FfnResidual}) {
+                   Kind::ExpertSort, Kind::ExpertGather, Kind::ExpertGate, Kind::ExpertUp,
+                   Kind::ExpertSwiGlu, Kind::ExpertDown, Kind::ExpertCombine,
+                   Kind::FfnResidual}) {
         expect_eq(count(dag, k), g.n_layers, "one per layer");
     }
 
@@ -126,7 +127,7 @@ void the_step_is_this_many_dispatches() {
     expect_eq(count(dag, Kind::LmHead), 1, "one logits matvec");
     expect_eq(count(dag, Kind::Argmax), 0, "argmax is opt-in");
 
-    const int per_layer = 19;
+    const int per_layer = 21;
     // Tail: the row gather, the final norm and the LM head.
     expect_eq(s.total, 1 + g.n_layers * per_layer + 3,
               "the whole step is exactly this many dispatches");

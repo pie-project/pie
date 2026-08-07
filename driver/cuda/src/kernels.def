@@ -110,6 +110,13 @@ PIE_MARLIN_SHAPE(bfloat16, fe2m1f, bfloat16)  // MXFP4 (gpt_oss)
 PIE_MOE_ACTIVATION(Relu2)     // nemotron_h
 PIE_MOE_ACTIVATION(Swiglu)    // qwen3_5_moe fc1 (qwen3.5 / qwen3.6),
                               // glm5 / kimi / deepseek_v4 routed experts (fc1)
+// Gemma-4 26B-A4B's routed experts. Upstream's `Geglu` IS the tanh
+// approximation -- it dispatches to `EpilogueOpDefaultFtGelu`, the
+// FasterTransformer GELU -- so it is the same function as pie's
+// `launch_chunked_geglu_tanh_bf16`, not the erf form. `GegluTanh` is a
+// separate upstream enumerator that `supportsFusedGatedActivation` does not
+// accept, so routing Gemma-4 through it would silently lose the fused gate.
+PIE_MOE_ACTIVATION(Geglu)     // gemma4 routed experts (fc1)
 // A gated activation splits across the two grouped GEMMs: fc1 carries the
 // gate (Swiglu above), and fc2's epilogue is plain Identity. Reaching one
 // without the other throws at load time.

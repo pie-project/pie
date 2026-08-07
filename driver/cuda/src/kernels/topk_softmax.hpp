@@ -26,6 +26,24 @@ void launch_topk_softmax_bf16(
     int K,
     cudaStream_t stream);
 
+// MEASURED DEAD END, kept because the reasoning is not obvious and someone
+// will try it again: fusing the router projection into the top-K that consumes
+// it costs 2x. The top-K has to see every expert to pick from them, so it is
+// one block per token -- and folding the projection in drags it down to that
+// same one block, from the 32 the standalone GEMV gets. Trading 32 SMs for a
+// saved launch is not a trade. gpt-oss measured 291 -> 134 tok/s.
+void launch_router_topk_softmax_bf16(
+    const void* act,            // [N, hidden] bf16
+    const void* router_weight,  // [num_experts, hidden] bf16
+    const void* router_bias,    // [num_experts] bf16, or null
+    std::int32_t* topk_idx,     // [N, K]
+    float* topk_w,              // [N, K]
+    int N,
+    int num_experts,
+    int K,
+    int hidden,
+    cudaStream_t stream);
+
 // Gemma-4 26B-A4B's router applies a per-expert scalar gain *after*
 // the renormalised top-K weights. Multiplies `topk_w[n, k] *=
 // per_expert_scale[topk_idx[n, k]]` in place. `per_expert_scale` is

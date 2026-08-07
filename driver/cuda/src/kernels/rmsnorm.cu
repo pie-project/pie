@@ -1,4 +1,5 @@
 #include "kernels/rmsnorm.hpp"
+#include "kernels/dequant_wna16.hpp"
 
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -91,11 +92,16 @@ __global__ void rmsnorm_bf16_kernel(
 //
 // Requires hidden % 8 == 0 and 16-byte-aligned rows; the launcher falls back to
 // the scalar kernel otherwise.
-template <int BLOCK, bool WEIGHT_PLUS_ONE>
+template <int BLOCK, bool WEIGHT_PLUS_ONE, bool EMIT_FP16 = false>
 __global__ void rmsnorm_bf16_vec8_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ y,
+    // Optional fp16 copy of the same result. The MXFP4 decode GEMV reads fp16,
+    // and the only thing between it and this store was a kernel that read the
+    // bf16 back and wrote it again -- a few tens of KB, so essentially all
+    // launch. Compile-time flag, so the bf16-only instantiation is unchanged.
+    __half* __restrict__ y_fp16,
     int hidden,
     int x_row_stride,
     int y_row_stride,
@@ -142,6 +148,16 @@ __global__ void rmsnorm_bf16_vec8_kernel(
                                           a.y * inv_rms * b.y);
         }
         yr[i] = o;
+        if constexpr (EMIT_FP16) {
+            // Rounded from the bf16 that was just stored, not from the fp32
+            // behind it, so this is exactly what the cast kernel produced.
+            const __nv_bfloat16* ob =
+                reinterpret_cast<const __nv_bfloat16*>(&o);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                y_fp16[i * 8 + j] = __float2half(__bfloat162float(ob[j]));
+            }
+        }
     }
 }
 
@@ -380,23 +396,13 @@ __global__ void rmsnorm_residual_add_scale_rmsnorm_bf16_kernel(
 
 // True when every row of a [num_rows, hidden] bf16 view starts on a 16-byte
 // boundary and is a whole number of 8-element vectors.
-inline bool rmsnorm_vec8_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_RMSNORM_VEC8");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
 inline bool rmsnorm_vec8_ok(const void* x, const void* y, const void* weight,
                             int hidden, int x_row_stride, int y_row_stride)
 {
     auto aligned = [](const void* p) {
         return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0;
     };
-    return rmsnorm_vec8_enabled() &&
-           hidden % 8 == 0 && x_row_stride % 8 == 0 && y_row_stride % 8 == 0 &&
+    return hidden % 8 == 0 && x_row_stride % 8 == 0 && y_row_stride % 8 == 0 &&
            aligned(x) && aligned(y) && aligned(weight);
 }
 
@@ -408,6 +414,37 @@ void launch_rmsnorm_bf16(
 {
     launch_rmsnorm_strided_bf16(
         x, weight, y, num_rows, hidden, hidden, hidden, eps, stream);
+}
+
+// RMSNorm that also writes an fp16 copy of its output, for a consumer that
+// wants fp16 -- the MXFP4 decode GEMV. Falls back to the plain launcher plus a
+// cast when the vectorised path does not apply, so the caller never has to ask
+// whether its shape qualifies.
+void launch_rmsnorm_bf16_with_fp16(
+    const void* x, const void* weight, void* y, void* y_fp16,
+    int num_rows, int hidden, float eps, cudaStream_t stream)
+{
+    if (y_fp16 == nullptr) {
+        launch_rmsnorm_bf16(x, weight, y, num_rows, hidden, eps, stream);
+        return;
+    }
+    if (!rmsnorm_vec8_ok(x, y, weight, hidden, hidden, hidden)) {
+        launch_rmsnorm_bf16(x, weight, y, num_rows, hidden, eps, stream);
+        launch_bf16_to_fp16(y, y_fp16,
+                            static_cast<std::size_t>(num_rows) * hidden,
+                            stream);
+        return;
+    }
+    constexpr int VBLOCK = 512;
+    dim3 grid(num_rows);
+    rmsnorm_bf16_vec8_kernel<VBLOCK, /*WEIGHT_PLUS_ONE=*/false,
+                             /*EMIT_FP16=*/true>
+        <<<grid, VBLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x),
+            static_cast<const __nv_bfloat16*>(weight),
+            static_cast<__nv_bfloat16*>(y),
+            static_cast<__half*>(y_fp16),
+            hidden, hidden, hidden, eps);
 }
 
 void launch_rmsnorm_strided_bf16(
@@ -423,7 +460,7 @@ void launch_rmsnorm_strided_bf16(
             <<<grid, VBLOCK, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x),
                 static_cast<const __nv_bfloat16*>(weight),
-                static_cast<__nv_bfloat16*>(y),
+                static_cast<__nv_bfloat16*>(y), nullptr,
                 hidden, x_row_stride, y_row_stride, eps);
         return;
     }
@@ -548,7 +585,7 @@ void launch_rmsnorm_gemma_bf16(
             <<<grid, VBLOCK, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x),
                 static_cast<const __nv_bfloat16*>(weight),
-                static_cast<__nv_bfloat16*>(y),
+                static_cast<__nv_bfloat16*>(y), nullptr,
                 hidden, hidden, hidden, eps);
         return;
     }

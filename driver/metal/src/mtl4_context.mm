@@ -15,11 +15,16 @@
 #import <dispatch/dispatch.h>
 
 #include "mtl4_context.hpp"
+#include <set>
+#include <string>
 #include "observability.hpp"
 #include "elastic.hpp"
 
 #include <chrono>
 #include <sys/stat.h>
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <sys/sysctl.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -86,9 +91,23 @@ struct StepState {
     // with a timestamp and reports the shares. It lives in the encoder rather
     // than in a family's encode function so that one implementation covers
     // every model and every kernel.
+    /// The bound pipeline's `maxTotalThreadsPerThreadgroup`, so `dispatch` can
+    /// say when a threadgroup is larger than the pipeline it is about to run
+    /// on. Metal does not refuse such a dispatch -- it does not happen, the
+    /// destination keeps whatever it held, and the wrong numbers travel. One
+    /// model shipped like that for as long as its hidden was over 4096.
+    std::uint32_t pso_max_threads = 0;
+    const char* pso_label = "<unset>";
     void* trace_heap = nullptr;
     std::uint32_t trace_slots = 0;
     std::uint32_t trace_n = 0;
+    // Dispatches this fire could not be timed because the timestamp heap ran
+    // out of slots. Counted rather than ignored: a table that silently covers
+    // the first n dispatches of a fire and is read as covering the fire is a
+    // profile that points at the wrong kernel, and the driver caps the heap at
+    // 8192 slots -- 4096 dispatches -- which a 1024-row prefill of a 40-layer
+    // model passes inside its first layer.
+    std::uint64_t trace_dropped = 0;
     std::vector<std::string> trace_labels;
     std::string trace_pso;
 };
@@ -180,6 +199,9 @@ struct RawMetalContext::Impl {
         void* buffer = nullptr;
         size_t virtual_bytes = 0;
         size_t committed_bytes = 0;
+        /// The part of `committed_bytes` the buffer cannot exist without, and
+        /// which a pressure signal is therefore not allowed to take back.
+        size_t mandatory_bytes = 0;
         std::vector<ElasticChunk> chunks;
     };
     struct PendingElasticRelease {
@@ -190,6 +212,7 @@ struct RawMetalContext::Impl {
     std::vector<PendingElasticRelease> pending_elastic_releases;
     size_t elastic_budget_bytes = 0;
     size_t elastic_pressure_floor_bytes = 0;
+    size_t elastic_mandatory_bytes = 0;
     size_t elastic_reserved_bytes = 0;
     size_t elastic_committed_bytes = 0;
     std::shared_ptr<std::atomic<std::uint32_t>> memory_pressure_level =
@@ -232,6 +255,24 @@ struct RawMetalContext::Impl {
     size_t effective_elastic_budget_bytes() const;
 };
 
+// Back off elastic growth when the OS says memory is tight -- but never below
+// what the pools already had to have.
+//
+// `elastic_pressure_floor_bytes` defaults to zero, and a floor of zero under
+// `DISPATCH_MEMORYPRESSURE_CRITICAL` is not a floor, it is an off switch: every
+// `ensure_elastic_buffer` fails, including the 2 MiB-per-layer commitment that
+// makes a KV pool exist at all. Qwen3.6-35B-A3B found this by loading. The
+// load's own mapping is what raises the pressure -- 18.16 GiB of clean file
+// cache takes free memory to 50 MiB on the way in -- so the signal arrives
+// while the pool is still being built, and the model is refused by the state
+// its own admission created.
+//
+// Refusing there also buys nothing. `fits_on_this_gpu` counted the whole
+// elastic budget before a byte was allocated, so the machine was already
+// checked against it; declining the mandatory part does not hand a page back,
+// it only turns an admitted model into an unusable one. What pressure should
+// throttle is GROWTH past that point -- KV pages for sequences that have not
+// arrived yet -- and that is still clamped.
 size_t RawMetalContext::Impl::effective_elastic_budget_bytes() const {
     const std::uint32_t level =
         memory_pressure_level->load(std::memory_order_acquire);
@@ -240,7 +281,8 @@ size_t RawMetalContext::Impl::effective_elastic_budget_bytes() const {
         level >= 2
             ? elastic_pressure_floor_bytes
             : std::max(elastic_pressure_floor_bytes, elastic_budget_bytes / 2);
-    return std::min(elastic_budget_bytes, pressure_limit);
+    return std::min(elastic_budget_bytes,
+                    std::max(elastic_mandatory_bytes, pressure_limit));
 }
 
 void RawMetalContext::Impl::collect_elastic_releases() {
@@ -353,11 +395,32 @@ id<MTL4ArgumentTable> RawMetalContext::Impl::argtable_for(int ordinal, bool crea
     return t;
 }
 
+static inline std::uint32_t grid_threads(Threadgroup tg) {
+    return std::uint32_t(tg.x) * std::uint32_t(tg.y) * std::uint32_t(tg.z);
+}
+
 // ── StepEncoder bridges ───────────────────────────────────────────────────────
 void StepEncoder::set_pso(Pso pso) {
     auto* s = static_cast<StepState*>(impl_);
     id<MTLComputePipelineState> p = (__bridge id<MTLComputePipelineState>)pso.obj;
+    // A pipeline that was never compiled is not an error Metal raises either:
+    // `setComputePipelineState:nil` leaves the previous one in place, so the
+    // next dispatch runs the WRONG kernel over this one's argument table --
+    // or, if there is no previous one, runs nothing. Both read as a model
+    // that answers zeros with every check green.
+    if (p == nil) {
+        static std::set<std::string> said;
+        if (said.insert(s->pso_label).second) {
+            std::fprintf(stderr,
+                         "[pie-metal] set_pso: no pipeline for the dispatch after '%s'; "
+                         "it runs the previous kernel or none at all\n",
+                         s->pso_label);
+        }
+        return;
+    }
     [s->en setComputePipelineState:p];
+    s->pso_max_threads = std::uint32_t(p.maxTotalThreadsPerThreadgroup);
+    s->pso_label = p.label != nil ? p.label.UTF8String : "<unlabelled>";
     if (dispatch_trace_every() > 0) {
         s->trace_pso = p.label != nil ? p.label.UTF8String : "<unlabelled>";
     }
@@ -382,7 +445,23 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
     // the same for all of them and so does not move the shares.
     const bool trace = dispatch_trace_every() > 0 && s->trace_heap != nullptr &&
                        2 * (s->trace_n + 1) <= s->trace_slots;
+    if (dispatch_trace_every() > 0 && !trace) ++s->trace_dropped;
     if (trace) mark_timestamp(s->trace_heap, 2 * s->trace_n, /*precise=*/true);
+    // A threadgroup wider than the pipeline allows is not an error Metal
+    // raises; the dispatch is simply not performed. Say it once per pipeline,
+    // because the alternative is a model that answers nonsense with every
+    // check green -- which is exactly how this went unnoticed.
+    if (const std::uint32_t threads = grid_threads(tg);
+        s->pso_max_threads != 0 && threads > s->pso_max_threads) {
+        static std::set<std::string> said;
+        if (said.insert(s->pso_label).second) {
+            std::fprintf(stderr,
+                         "[pie-metal] dispatch: '%s' asked for %u threads a "
+                         "threadgroup and the pipeline allows %u; this dispatch "
+                         "does not run and its output keeps whatever it held\n",
+                         s->pso_label, threads, s->pso_max_threads);
+        }
+    }
     [s->en dispatchThreads:MTLSizeMake(grid.x, grid.y, grid.z)
         threadsPerThreadgroup:MTLSizeMake(tg.x, tg.y, tg.z)];
     if (trace) {
@@ -397,10 +476,6 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
 // wins (beta's per-edge hazard model: Device for true heap-RAW, None for ordering-only).
 static MTL4VisibilityOptions resolve_barrier_vis(BarrierVisibility req) {
     static const int override_mode = [] {
-        const char* e = getenv("PIE_BARRIER_VIS");
-        if (!e) return -1;
-        if (strcasecmp(e, "none") == 0 || strcmp(e, "0") == 0) return 0;
-        if (strcasecmp(e, "device") == 0 || strcmp(e, "1") == 0) return 1;
         return -1;
     }();
     const int mode = override_mode >= 0
@@ -457,6 +532,78 @@ size_t RawMetalContext::device_working_set_bytes() {
     }
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     return dev == nil ? 0 : size_t(dev.recommendedMaxWorkingSetSize);
+}
+
+static std::atomic<size_t> g_reclaimable_override{0};
+
+bool RawMetalContext::device_working_set_is_forced() {
+    return g_working_set_override.load(std::memory_order_relaxed) != 0;
+}
+
+void RawMetalContext::set_host_reclaimable_bytes_for_test(size_t bytes) {
+    g_reclaimable_override.store(bytes, std::memory_order_relaxed);
+}
+
+size_t RawMetalContext::host_reclaimable_bytes() {
+    if (const size_t forced = g_reclaimable_override.load(std::memory_order_relaxed);
+        forced != 0) {
+        return forced;
+    }
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return 0;
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm),
+                          &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    // What the kernel can hand back without swapping. The queues -- active,
+    // inactive, speculative, wired -- partition non-free memory and are
+    // disjoint; `external_page_count` (file-backed) and `purgeable_count` are
+    // ATTRIBUTES cutting across them, not queues of their own.
+    //
+    // So `inactive` and `external` overlap and cannot simply be added. This
+    // used to resolve that by dropping `external` entirely and keeping only
+    // the file pages parked as speculative -- which throws away every clean
+    // file page the kernel has parked as ACTIVE, and a clean file page is the
+    // cheapest memory on the machine to reclaim: it is dropped, not written.
+    // On a box that has just read sixty gigabytes of checkpoints, which is any
+    // box that has loaded one model and is about to load another, that is
+    // gigabytes of real headroom made invisible. Measured on a 32 GiB M1 Max
+    // with 15.73 GiB free: 6.89 GiB inactive against 8.30 GiB file-backed, so
+    // 1.4 GiB of it was hidden, and the fit check refused a 10.9 GiB model.
+    //
+    // `max` rather than a sum, because that is the union bound that cannot
+    // over-count: both sets live inside active+inactive+speculative, so their
+    // union is at least the larger and at most the total, and only the larger
+    // is safe to claim without knowing the split -- which Mach does not
+    // report. `speculative` is file-backed read-ahead and therefore already
+    // inside `external`; it is added to the inactive arm alone, where it is
+    // disjoint and would otherwise be lost.
+    const uint64_t evictable =
+        std::max<uint64_t>(uint64_t(vm.inactive_count) + vm.speculative_count,
+                           vm.external_page_count);
+    const uint64_t pages = uint64_t(vm.free_count) + vm.purgeable_count + evictable;
+    return size_t(pages * uint64_t(page));
+}
+
+std::pair<size_t, size_t> RawMetalContext::host_wired_and_installed_bytes() {
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return {0, 0};
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm),
+                          &count) != KERN_SUCCESS) {
+        return {0, 0};
+    }
+    uint64_t installed = 0;
+    size_t len = sizeof(installed);
+    if (sysctlbyname("hw.memsize", &installed, &len, nullptr, 0) != 0) {
+        return {0, 0};
+    }
+    return {size_t(uint64_t(vm.wire_count) * uint64_t(page)), size_t(installed)};
 }
 
 std::unique_ptr<RawMetalContext> RawMetalContext::create(
@@ -696,10 +843,19 @@ SlotHandle RawMetalContext::create_elastic_buffer(
     h.gpu_address = buffer.gpuAddress;
     h.size = size;
     h.elastic = true;
-    if (initial_commit_bytes != 0 &&
-        !ensure_elastic_buffer(h, initial_commit_bytes)) {
-        release_elastic_buffer(h);
-        return {};
+    if (initial_commit_bytes != 0) {
+        // Declared mandatory BEFORE the ask, because the ask is what consults
+        // the pressure clamp: this is the commitment without which the buffer
+        // is not a buffer, and `fits_on_this_gpu` has already paid for it.
+        const size_t mandatory = align_up(
+            std::min(initial_commit_bytes, virtual_bytes),
+            Impl::kSparseTileBytes);
+        I.elastic_allocations[h.buffer].mandatory_bytes = mandatory;
+        I.elastic_mandatory_bytes += mandatory;
+        if (!ensure_elastic_buffer(h, initial_commit_bytes)) {
+            release_elastic_buffer(h);
+            return {};
+        }
     }
     return h;
 }
@@ -894,6 +1050,8 @@ void RawMetalContext::release_elastic_buffer(const SlotHandle& h) {
     trim_elastic_buffer(h, 0);
     auto found = I.elastic_allocations.find(h.buffer);
     if (found == I.elastic_allocations.end()) return;
+    I.elastic_mandatory_bytes -=
+        std::min(I.elastic_mandatory_bytes, found->second.mandatory_bytes);
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)h.buffer;
     [I.rs removeAllocation:buffer];
     [I.rs commit];
@@ -997,6 +1155,10 @@ size_t RawMetalContext::elastic_page_bytes() const {
 size_t RawMetalContext::elastic_budget_pages() const {
     return pie::elastic::pages_for_bytes(
         impl_->effective_elastic_budget_bytes());
+}
+
+std::uint32_t RawMetalContext::memory_pressure_level() const {
+    return impl_->memory_pressure_level->load(std::memory_order_acquire);
 }
 
 size_t RawMetalContext::elastic_committed_pages() const {
@@ -1869,12 +2031,16 @@ static void apply_commit_feedback(const RawMetalContext& ctx,
     // asynchronously. Normal inference does not put that CPU scheduling delay
     // on every token: the handler logs an error immediately, and run_steps
     // promotes a late error to a sticky failure before the next submission.
-    // Tracing and the GPU meter do wait because their output specifically asks
-    // for this event's calibrated GPU timestamps.
+    // Tracing and the sync-feedback probe do wait because their output
+    // specifically asks for this event's calibrated GPU timestamps.
+    //
+    // `PIE_METAL_GPU_METER` used to be a third reason and is not one any more:
+    // all three of the meters it fed are `if constexpr (false)` in
+    // `forward.cpp`, so arming it here bought a spin of up to 200 x 50us per
+    // fire for output that cannot be printed.
     GpuCommitFeedback fb = ctx.last_commit_feedback();
     const bool synchronous =
-        dispatch_trace_every() > 0 || getenv("PIE_METAL_GPU_METER") != nullptr ||
-        getenv("PIE_METAL_SYNC_FEEDBACK") != nullptr;
+        dispatch_trace_every() > 0 || getenv("PIE_METAL_SYNC_FEEDBACK") != nullptr;
     if (synchronous) {
         for (int spin = 0; fb.event_value != event_value && spin < 200; ++spin) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -1925,6 +2091,7 @@ void* encode_one_command_buffer(void* ctx_impl, int ab,
         }
     }
     I.step.trace_n = 0;
+    I.step.trace_dropped = 0;
     I.step.trace_labels.clear();
     StepEncoder se(&I.step);
     encode_fn(se);
@@ -1962,6 +2129,10 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
     static double total_ticks = 0.0;
     static double total_gpu_ms = 0.0;
     static long fires = 0;
+    static std::uint64_t dropped = 0;
+    static std::uint32_t slots = 0;
+    dropped += I.step.trace_dropped;
+    slots = I.step.trace_slots;
     for (std::uint32_t i = 0; i < n; ++i) {
         const std::uint64_t a = ticks[2 * i], b = ticks[2 * i + 1];
         // A relaxed timestamp is not ordered against the dispatch it brackets,
@@ -1980,6 +2151,19 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
               [](const auto& x, const auto& y) { return x.second.first > y.second.first; });
     fprintf(stderr, "[trace] %ld fires, %.2f ms of GPU, %zu kernels\n", fires, total_gpu_ms,
             rows.size());
+    // Said before the table, because it invalidates it. The shares below are
+    // over the dispatches that FIT, so a truncated fire reports the kernels at
+    // the head of its DAG and none of the ones after -- which reads as "the
+    // embedding gather is 15% of a prefill" when the embedding gather is
+    // simply what the first 2048 slots happened to cover.
+    if (dropped > 0) {
+        fprintf(stderr,
+                "[trace] TRUNCATED: %llu dispatches went untimed (the timestamp heap holds "
+                "%u slots = %u dispatches). The shares below cover only the dispatches that "
+                "fit, which are the FIRST ones each fire encoded -- do not read them as the "
+                "fire's profile.\n",
+                (unsigned long long)dropped, slots, slots / 2);
+    }
     for (const auto& [name, v] : rows) {
         const double share = total_ticks > 0 ? v.first / total_ticks : 0.0;
         fprintf(stderr, "[trace]  %6.2f%%  %8.3f ms  n=%-6ld %s\n", 100.0 * share,
@@ -1988,6 +2172,7 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
     table.clear();
     total_ticks = 0.0;
     total_gpu_ms = 0.0;
+    dropped = 0;
 }
 
 StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,

@@ -2,7 +2,8 @@ function(add_rawmetal_tool target)
   add_executable(${target} ${ARGN})
   target_link_libraries(${target} PRIVATE pie_driver_metal_lib)
   target_compile_definitions(${target} PRIVATE
-    PIE_METAL_TOOL_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernels")
+    PIE_METAL_TOOL_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernels"
+    PIE_METAL_TOOL_LOCAL_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
 endfunction()
 
 # `decoder_smoke` was removed with `NativeAccess`. It was the standalone gate
@@ -26,6 +27,10 @@ endif()
 add_rawmetal_tool(gptosscontract_probe gptosscontract_probe.cpp)
 if(PIE_LOADER_STATICLIB)
   target_link_libraries(gptosscontract_probe PRIVATE ${PIE_LOADER_STATICLIB})
+endif()
+add_rawmetal_tool(plan_cost_probe plan_cost_probe.cpp)
+if(PIE_LOADER_STATICLIB)
+  target_link_libraries(plan_cost_probe PRIVATE ${PIE_LOADER_STATICLIB})
 endif()
 add_rawmetal_tool(sparse_probe sparse_probe.mm)
 add_rawmetal_tool(sparse_probe2 sparse_probe2.mm)

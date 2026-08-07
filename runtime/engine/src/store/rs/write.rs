@@ -149,26 +149,36 @@ pub struct RsPendingFold {
 
 /// The receipt for one fire's published RS rows. The mapping is already
 /// authoritative when this exists; it only carries what settlement needs —
-/// the submission sequence and how many prepared rows to release from the
-/// store's in-flight hold on pool retirement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// the submission sequences this fire holds open, so settling can release
+/// exactly them from the store's outstanding set.
+///
+/// The individual sequences are kept rather than just the newest one because
+/// retirement is bounded by the OLDEST sequence still outstanding across all
+/// fires. Fires settle out of order, so a receipt that only remembered its
+/// maximum could not say which sequences its settlement actually released,
+/// and the watermark would have to fall back to "nothing is in flight".
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsPublished {
-    seq: u64,
-    rows: usize,
+    seqs: Vec<u64>,
 }
 
 impl RsPublished {
-    pub(super) fn new(seq: u64, rows: usize) -> Self {
-        Self { seq, rows }
+    pub(super) fn new(seqs: Vec<u64>) -> Self {
+        Self { seqs }
     }
 
     /// Submission sequence of the newest row in the batch.
     pub fn seq(&self) -> u64 {
-        self.seq
+        self.seqs.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Every submission sequence this receipt holds open.
+    pub fn seqs(&self) -> &[u64] {
+        &self.seqs
     }
 
     /// Prepared rows this receipt covers.
     pub fn rows(&self) -> usize {
-        self.rows
+        self.seqs.len()
     }
 }

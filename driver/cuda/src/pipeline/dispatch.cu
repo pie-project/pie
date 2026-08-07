@@ -193,13 +193,6 @@ class LaneWorkPool {
 
     static std::size_t worker_count() {
         static const std::size_t count = [] {
-            if (const char* raw = std::getenv("PIE_CUDA_LANE_WORKERS")) {
-                char* end = nullptr;
-                const long parsed = std::strtol(raw, &end, 10);
-                if (end != raw && parsed >= 0 && parsed <= 64) {
-                    return static_cast<std::size_t>(parsed);
-                }
-            }
             // Derivation: the per-lane tasks are short and memory-bound, so
             // wake latency (~10 us/worker) must stay well under the serial
             // pool being split (~0.7 ms at 256 lanes). A quarter of the
@@ -340,11 +333,7 @@ struct NotifyContext;
 
 namespace {
 
-// PIE_DEBUG_PULL_VALIDATE=1 makes the pull-validate kernel name the ticket
-// that vetoed a fire, which is otherwise reported only as the generic
-// "ptir prologue or channel readiness did not commit".
-const std::uint32_t kDiagnosePullValidate =
-    std::getenv("PIE_DEBUG_PULL_VALIDATE") != nullptr ? 1u : 0u;
+constexpr std::uint32_t kDiagnosePullValidate = 0u;
 
 constexpr std::uint64_t kNoDescriptorReadyOffset =
     std::numeric_limits<std::uint64_t>::max();
@@ -555,6 +544,23 @@ struct FixedDecodeOutputs {
     // Monotonic device counter of fail-stopped lanes (chain kills); the
     // host mirrors it after each batch and reports growth loudly.
     std::uint32_t* chain_kills = nullptr;
+    // OR of `FixedDecodeKillReason` bits over every kill since boot. The
+    // counter alone says a lane was fail-stopped but not which of the eight
+    // containment predicates rejected it, and they fail for unrelated
+    // reasons -- a missing commit word is a lifecycle bug, `page_count !=
+    // expected_pages` a CSR/kv_len disagreement, a write outside
+    // [lower, upper) an endowment overrun. Without this the message names
+    // the check and not the cause.
+    std::uint32_t* kill_reasons = nullptr;
+    // Per-reason kill counts (8 slots, indexed by the bit position of
+    // `FixedDecodeKillReason`). A count rather than an OR because the kill
+    // cascades: a fail-stopped lane writes `commit[0]=0` for its successors,
+    // which then fail the commit check themselves. An OR cannot tell the one
+    // originating cause from the many derived ones; the counts can.
+    std::uint32_t* kill_reason_counts = nullptr;
+    // OR of the port indices that were not ready, so the message can say
+    // which of the seven inputs the producer had not published.
+    std::uint32_t* kill_ports = nullptr;
     std::uint32_t dummy_page = 0;
     std::uint32_t page_size = 0;
     std::uint32_t device_pages = 0;
@@ -578,6 +584,20 @@ __device__ const T* fixed_decode_pointer(std::uint64_t address) {
         static_cast<std::uintptr_t>(address));
 }
 
+// Why a lane failed containment. Reported as an OR across kills, so a run
+// that trips two different predicates is not mistaken for one cause seen
+// twice. Kept next to the checks that set them.
+enum FixedDecodeKillReason : std::uint32_t {
+    kKillCommit        = 1u << 0,   // pass_commit missing or zero
+    kKillPortNotReady  = 1u << 1,   // an input port's ready byte is 0
+    kKillTokenNull     = 1u << 2,   // token pointer null
+    kKillNullPointer   = 1u << 3,   // a geometry pointer null, or indptr[0] != 0
+    kKillPageCount     = 1u << 4,   // page_count zero, over capacity, or != ceil(kv_len)
+    kKillWriteSlot     = 1u << 5,   // w_slot past translation, or w_off past page
+    kKillWriteBounds   = 1u << 6,   // write position outside [lower, upper)
+    kKillTranslation   = 1u << 7,   // a translated page is past device_pages
+};
+
 __global__ void compose_fixed_decode(
     const FixedDecodeLane* lanes,
     std::uint32_t lane_count,
@@ -585,6 +605,8 @@ __global__ void compose_fixed_decode(
     extern __shared__ std::uint32_t page_offsets[];
     const std::uint32_t lane = threadIdx.x;
     bool valid = lane < lane_count;
+    std::uint32_t kill_reason = 0;
+    std::uint32_t not_ready_ports = 0;
     bool sentinel = false;
     std::uint32_t token = 0;
     const FixedDecodeLane* descriptor =
@@ -595,18 +617,28 @@ __global__ void compose_fixed_decode(
             fixed_decode_pointer<std::uint32_t>(
             descriptor->pass_commit);
         valid = commit != nullptr && *commit != 0;
+        if (!valid) kill_reason |= kKillCommit;
         for (std::size_t port = 0;
              port < kFixedDecodePortCount;
              ++port) {
             const auto* ready =
                 fixed_decode_pointer<std::uint8_t>(
                     descriptor->ready[port]);
-            if (ready != nullptr && *ready == 0) valid = false;
+            if (ready != nullptr && *ready == 0) {
+                valid = false;
+                kill_reason |= kKillPortNotReady;
+                // Which port, in the order `ports_in_lane` binds them:
+                // 0 embed_tokens, 1 positions, 2 pages, 3 page_indptr,
+                // 4 kv_len, 5 w_slot, 6 w_off. A kill that names the port
+                // names the producer, and the seven have different ones.
+                not_ready_ports |= 1u << port;
+            }
         }
         const auto* token_source =
             fixed_decode_pointer<std::uint32_t>(descriptor->token);
         if (token_source == nullptr) {
             valid = false;
+            kill_reason |= kKillTokenNull;
         } else {
             token = *token_source;
             sentinel =
@@ -642,6 +674,7 @@ __global__ void compose_fixed_decode(
             w_slot == nullptr || w_off == nullptr ||
             page_indptr[0] != 0) {
             valid = false;
+            kill_reason |= kKillNullPointer;
         } else {
             page_count = page_indptr[1];
             kv_len = *kv_len_source;
@@ -659,16 +692,29 @@ __global__ void compose_fixed_decode(
             if (page_count == 0 ||
                 page_count > descriptor->pages_capacity ||
                 page_count > descriptor->translation_len ||
-                page_count != expected_pages ||
-                logical_write_page >= descriptor->translation_len ||
-                write_offset >= output.page_size ||
-                logical_write_position < descriptor->write_lower_bound ||
+                page_count != expected_pages) {
+                valid = false;
+                kill_reason |= kKillPageCount;
+            }
+            if (logical_write_page >= descriptor->translation_len ||
+                write_offset >= output.page_size) {
+                valid = false;
+                kill_reason |= kKillWriteSlot;
+            }
+            if (logical_write_position < descriptor->write_lower_bound ||
                 logical_write_position >=
                     descriptor->write_upper_bound) {
                 valid = false;
+                kill_reason |= kKillWriteBounds;
+            }
+            if (!valid) {
+                // fall through to the fail-stop below
             } else {
                 write_page = translation[logical_write_page];
-                if (write_page >= output.device_pages) valid = false;
+                if (write_page >= output.device_pages) {
+                    valid = false;
+                    kill_reason |= kKillTranslation;
+                }
                 for (std::uint32_t page = 0;
                      page < page_count;
                      ++page) {
@@ -676,6 +722,7 @@ __global__ void compose_fixed_decode(
                     if (logical_page >= descriptor->translation_len ||
                         translation[logical_page] >= output.device_pages) {
                         valid = false;
+                        kill_reason |= kKillTranslation;
                         break;
                     }
                 }
@@ -696,6 +743,19 @@ __global__ void compose_fixed_decode(
         }
         if (output.chain_kills != nullptr) {
             atomicAdd(output.chain_kills, 1u);
+        }
+        if (output.kill_reasons != nullptr && kill_reason != 0) {
+            atomicOr(output.kill_reasons, kill_reason);
+        }
+        if (output.kill_ports != nullptr && not_ready_ports != 0) {
+            atomicOr(output.kill_ports, not_ready_ports);
+        }
+        if (output.kill_reason_counts != nullptr) {
+            for (std::uint32_t bit = 0; bit < 8; ++bit) {
+                if ((kill_reason >> bit) & 1u) {
+                    atomicAdd(&output.kill_reason_counts[bit], 1u);
+                }
+            }
         }
         page_count = 1;
         kv_len = 1;
@@ -780,6 +840,116 @@ __global__ void compose_fixed_decode(
 // EXCEED the scheduler's run-ahead, not match it — a depth-equal pool
 // blocks every submit in cudaEventSynchronize once the pipe is full).
 using pie_cuda_driver::kUploadStagingDepth;
+
+// Per-step staging for the pipeline kernels' parameter arrays (pull-validate
+// tickets/lanes, commit-bump, publish scatter, settle). Each helper used to
+// carry its own cudaMallocAsync + PAGEABLE cudaMemcpyAsync + cudaFreeAsync;
+// the pageable copies each stage through a driver bounce buffer, and the
+// compute queue stalled 5-12 us at every one — ~15 stalls, 120-186 us of
+// device idle per step at c256. One slot per wave, appended into from the
+// lane thread, flushed as at most one PINNED H2D per launch site.
+//
+// Single-threaded by construction: claim/stage/flush/release all run on the
+// driver lane (the same serialization StagedLaunch already relies on).
+// A slot is reusable once its wave's settle kernel retired; the ring is
+// event-guarded and sized past the scheduler's in-flight depth so the
+// claim's cudaEventSynchronize never blocks in steady state.
+class PipelineParamArena {
+  public:
+    static constexpr std::size_t kSlots = 8;
+    static constexpr std::size_t kSlotBytes = 1u << 20;  // 1 MiB
+    static constexpr std::size_t kAlign = 128;
+
+    PipelineParamArena() {
+        for (Slot& slot : slots_) {
+            CUDA_CHECK(cudaHostAlloc(
+                reinterpret_cast<void**>(&slot.host),
+                kSlotBytes,
+                cudaHostAllocDefault));
+            CUDA_CHECK(cudaMalloc(
+                reinterpret_cast<void**>(&slot.device), kSlotBytes));
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &slot.reuse_ready, cudaEventDisableTiming));
+        }
+    }
+    ~PipelineParamArena() noexcept {
+        for (Slot& slot : slots_) {
+            if (slot.host != nullptr) cudaFreeHost(slot.host);
+            if (slot.device != nullptr) cudaFree(slot.device);
+            if (slot.reuse_ready != nullptr) {
+                cudaEventDestroy(slot.reuse_ready);
+            }
+        }
+    }
+    PipelineParamArena(const PipelineParamArena&) = delete;
+    PipelineParamArena& operator=(const PipelineParamArena&) = delete;
+
+    // Claim the next ring slot for one wave. Returns the slot index.
+    int claim() {
+        const int index = static_cast<int>(next_ % kSlots);
+        next_ += 1;
+        Slot& slot = slots_[index];
+        if (slot.pending) {
+            CUDA_CHECK(cudaEventSynchronize(slot.reuse_ready));
+            slot.pending = false;
+        }
+        slot.used = 0;
+        slot.flushed = 0;
+        return index;
+    }
+
+    // Copy `bytes` of host params into the slot; returns the DEVICE address
+    // they will live at after the next flush. Returns nullptr when the slot
+    // cannot hold them (caller falls back to the legacy per-launch path).
+    void* stage(int index, const void* host_src, std::size_t bytes) {
+        Slot& slot = slots_[static_cast<std::size_t>(index)];
+        const std::size_t at = (slot.used + kAlign - 1) & ~(kAlign - 1);
+        if (bytes == 0 || at + bytes > kSlotBytes) return nullptr;
+        std::memcpy(slot.host + at, host_src, bytes);
+        slot.used = at + bytes;
+        return slot.device + at;
+    }
+
+    // Enqueue ONE pinned H2D for everything staged since the last flush.
+    // Must precede the launches that consume it, on their stream.
+    void flush(int index, cudaStream_t stream) {
+        Slot& slot = slots_[static_cast<std::size_t>(index)];
+        if (slot.used == slot.flushed) return;
+        const std::size_t from = slot.flushed & ~(kAlign - 1);
+        CUDA_CHECK(cudaMemcpyAsync(
+            slot.device + from,
+            slot.host + from,
+            slot.used - from,
+            cudaMemcpyHostToDevice,
+            stream));
+        slot.flushed = slot.used;
+    }
+
+    // The wave's last consumer is enqueued: guard reuse behind it.
+    void release_after(int index, cudaStream_t stream) {
+        Slot& slot = slots_[static_cast<std::size_t>(index)];
+        CUDA_CHECK(cudaEventRecord(slot.reuse_ready, stream));
+        slot.pending = true;
+    }
+
+    // Abort/teardown path: the caller has fully synchronized the stream,
+    // so the slot is idle regardless of what was enqueued.
+    void release_synced(int index) {
+        slots_[static_cast<std::size_t>(index)].pending = false;
+    }
+
+  private:
+    struct Slot {
+        std::uint8_t* host = nullptr;
+        std::uint8_t* device = nullptr;
+        cudaEvent_t reuse_ready = nullptr;
+        std::size_t used = 0;
+        std::size_t flushed = 0;
+        bool pending = false;
+    };
+    std::array<Slot, kSlots> slots_{};
+    std::uint64_t next_ = 0;
+};
 
 class FixedDecodeUploadArena {
   public:
@@ -1320,6 +1490,7 @@ struct Dispatch::Impl {
     DescriptorReadbackArena descriptor_readback;
     FixedDecodeUploadArena fixed_decode_upload;
     DecodeEnvelopeUploadArena decode_envelope_upload;
+    PipelineParamArena pipeline_params;
     std::vector<cudaEvent_t> available_publish_events;
     // W6: per-wave launch events (source_ready, phase_done, signature_*)
     // are acquired here and returned at StagedLaunch teardown — event
@@ -1415,6 +1586,12 @@ struct Dispatch::Impl {
     // each batch and reported loudly when it grows.
     std::uint32_t* d_fixed_decode_kills = nullptr;
     std::uint32_t* h_fixed_decode_kills = nullptr;
+    std::uint32_t* d_fixed_decode_kill_reasons = nullptr;
+    std::uint32_t* h_fixed_decode_kill_reasons = nullptr;
+    std::uint32_t* d_fixed_decode_kill_counts = nullptr;
+    std::uint32_t* h_fixed_decode_kill_counts = nullptr;
+    std::uint32_t* d_fixed_decode_kill_ports = nullptr;
+    std::uint32_t* h_fixed_decode_kill_ports = nullptr;
     std::uint32_t fixed_decode_kills_reported = 0;
     // Same diagnostic for the decode-envelope compose path (RV-16).
     std::uint32_t* d_envelope_kills = nullptr;
@@ -1505,6 +1682,13 @@ struct StagedLaunch::State {
     std::size_t decode_envelope_lane_count = 0;
     std::uint32_t decode_envelope_template_pages = 0;
     std::uint32_t* device_layer = nullptr;
+    // Ring slot in `Impl::pipeline_params` holding this wave's pipeline
+    // kernel parameters (tickets, commit/settle/publish tables). −1 when
+    // the wave fell back to the legacy per-launch upload path.
+    int param_slot = -1;
+    bool param_slot_released = false;
+    // `device_tickets` points into the param slot (do NOT cudaFree it).
+    bool tickets_in_arena = false;
     cudaEvent_t source_ready = nullptr;
     cudaEvent_t phase_done[2] = {nullptr, nullptr};
     cudaEvent_t signature_ready = nullptr;
@@ -1531,12 +1715,36 @@ StagedLaunch::~StagedLaunch() {
     // stream-ordered frees and pool returns instead of the old plain
     // cudaFree (potentially device-synchronizing) + event destroys.
     if (state_->device_tickets != nullptr) {
-        if (state_->stream != nullptr) {
+        if (state_->tickets_in_arena) {
+            // Arena-backed: memory belongs to the param slot below.
+        } else if (state_->stream != nullptr) {
             cudaFreeAsync(state_->device_tickets, state_->stream);
         } else {
             cudaFree(state_->device_tickets);
         }
         state_->device_tickets = nullptr;
+    }
+    if (state_->param_slot >= 0 && !state_->param_slot_released &&
+        state_->owner != nullptr) {
+        // Failure/abort path only (settlement records the reuse event on
+        // the happy path). Drain the stream so the slot is provably idle.
+        if (state_->stream != nullptr) {
+            cudaStreamSynchronize(state_->stream);
+        }
+        // The slot has TWO possible consumer streams. With the batched
+        // host-publish transport the settle kernel, the publish copies and
+        // their `flush` all run on `output_copy_stream`, not on
+        // `state_->stream` (see `finish`: `settlement_stream` switches when
+        // `batch_copies`). If we get here between that launch and `finish`'s
+        // `release_after`, syncing only `state_->stream` leaves the slot
+        // marked idle while the settle kernel is still reading it — the next
+        // wave's `claim()` then hands it out and `stage()`/`flush` overwrite
+        // live device memory. Silent corruption, not a crash, so drain both.
+        if (state_->owner->output_copy_stream != nullptr) {
+            cudaStreamSynchronize(state_->owner->output_copy_stream);
+        }
+        state_->owner->pipeline_params.release_synced(state_->param_slot);
+        state_->param_slot_released = true;
     }
     if (state_->device_layer != nullptr) {
         if (state_->stream != nullptr) {
@@ -1711,6 +1919,24 @@ struct NotifyContext {
 };
 
 Dispatch::Impl::~Impl() {
+    if (d_fixed_decode_kill_ports != nullptr) {
+        cudaFree(d_fixed_decode_kill_ports);
+    }
+    if (h_fixed_decode_kill_ports != nullptr) {
+        cudaFreeHost(h_fixed_decode_kill_ports);
+    }
+    if (d_fixed_decode_kill_counts != nullptr) {
+        cudaFree(d_fixed_decode_kill_counts);
+    }
+    if (h_fixed_decode_kill_counts != nullptr) {
+        cudaFreeHost(h_fixed_decode_kill_counts);
+    }
+    if (d_fixed_decode_kill_reasons != nullptr) {
+        cudaFree(d_fixed_decode_kill_reasons);
+    }
+    if (h_fixed_decode_kill_reasons != nullptr) {
+        cudaFreeHost(h_fixed_decode_kill_reasons);
+    }
     if (d_fixed_decode_kills != nullptr) {
         cudaFree(d_fixed_decode_kills);
     }
@@ -1997,7 +2223,9 @@ HostPublishTransport select_host_publish_transport(
 void enqueue_host_publish_copies(
     NotifyContext& context,
     cudaStream_t stream,
-    HostPublishTransport transport) {
+    HostPublishTransport transport,
+    PipelineParamArena* param_arena = nullptr,
+    int param_slot = -1) {
     if (context.copy_destinations.empty()) return;
     if (transport == HostPublishTransport::Scatter) {
         context.publish_copies.clear();
@@ -2011,8 +2239,24 @@ void enqueue_host_publish_copies(
                     static_cast<std::uint32_t>(context.copy_sizes[index]),
             });
         }
-        launch_scatter_host_publish_copies(
-            context.publish_copies.values(), stream);
+        const auto copies = context.publish_copies.values();
+        const HostPublishCopy* device =
+            param_arena == nullptr || param_slot < 0
+                ? nullptr
+                : static_cast<const HostPublishCopy*>(
+                      param_arena->stage(
+                          param_slot,
+                          copies.data(),
+                          copies.size() * sizeof(HostPublishCopy)));
+        if (device != nullptr) {
+            param_arena->flush(param_slot, stream);
+            launch_scatter_host_publish_copies_prestaged(
+                device,
+                static_cast<std::uint32_t>(copies.size()),
+                stream);
+        } else {
+            launch_scatter_host_publish_copies(copies, stream);
+        }
         return;
     }
 #if CUDART_VERSION >= 12080
@@ -2758,8 +3002,7 @@ void refill_commit_snapshot_pool(Dispatch::Impl& owner) {
             static_cast<void>(cudaGetLastError());
             return false;
         }
-        return properties.canMapHostMemory != 0 &&
-               std::getenv("PIE_CUDA_DISABLE_MAPPED_COMMITS") == nullptr;
+        return properties.canMapHostMemory != 0;
     }();
 
     void* host_slab = nullptr;
@@ -4404,22 +4647,31 @@ void execute_declared_phase(
             }
         };
 
+        // The slot census below can only ever clear `independent`, so it is
+        // dead work whenever the seed is already false. That is the common
+        // case, not a corner: signature grouping folds every lane of a
+        // homogeneous decode wave into ONE group, and a single group is
+        // trivially not "independent" (there is nothing to overlap with).
+        // Measured on a 512-way decode wave, the census walked ~300 lanes'
+        // slot sets through two `unordered_set`s to re-derive a constant.
         bool independent = groups.size() > 1;
-        std::unordered_set<std::uint32_t> prior_group_slots;
-        for (const auto& group : groups) {
-            std::unordered_set<std::uint32_t> group_slots;
-            for (const auto& binding : group.bindings) {
-                group_slots.insert(
-                    binding.instance->view().slots().begin(),
-                    binding.instance->view().slots().end());
-            }
-            for (const std::uint32_t slot : group_slots) {
-                if (prior_group_slots.contains(slot)) {
-                    independent = false;
+        if (independent) {
+            std::unordered_set<std::uint32_t> prior_group_slots;
+            for (const auto& group : groups) {
+                std::unordered_set<std::uint32_t> group_slots;
+                for (const auto& binding : group.bindings) {
+                    group_slots.insert(
+                        binding.instance->view().slots().begin(),
+                        binding.instance->view().slots().end());
                 }
+                for (const std::uint32_t slot : group_slots) {
+                    if (prior_group_slots.contains(slot)) {
+                        independent = false;
+                    }
+                }
+                prior_group_slots.insert(
+                    group_slots.begin(), group_slots.end());
             }
-            prior_group_slots.insert(
-                group_slots.begin(), group_slots.end());
         }
         const auto t_execute_begin = probing
             ? fire_timing::Clock::now()
@@ -4756,10 +5008,50 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
                 stream, lane->bound->publish_done, 0));
         }
     }
-    state.device_tickets = launch_pull_validate_host_channels_batch(
-        state.ticket_staging,
-        state.pull_staging,
-        stream);
+    state.param_slot = impl_->pipeline_params.claim();
+    {
+        auto& arena = impl_->pipeline_params;
+        DeviceHostChannelTicket* device_tickets = nullptr;
+        PullValidateHostChannelLane* device_lanes = nullptr;
+        bool staged = state.pull_staging.empty();
+        if (!staged) {
+            device_tickets = static_cast<DeviceHostChannelTicket*>(
+                state.ticket_staging.empty()
+                    ? nullptr
+                    : arena.stage(
+                          state.param_slot,
+                          state.ticket_staging.data(),
+                          state.ticket_staging.size() *
+                              sizeof(DeviceHostChannelTicket)));
+            device_lanes = static_cast<PullValidateHostChannelLane*>(
+                arena.stage(
+                    state.param_slot,
+                    state.pull_staging.data(),
+                    state.pull_staging.size() *
+                        sizeof(PullValidateHostChannelLane)));
+            staged = device_lanes != nullptr &&
+                (state.ticket_staging.empty() || device_tickets != nullptr);
+        }
+        if (staged) {
+            arena.flush(state.param_slot, stream);
+            if (!state.pull_staging.empty()) {
+                launch_pull_validate_host_channels_batch_prestaged(
+                    device_tickets,
+                    device_lanes,
+                    static_cast<std::uint32_t>(state.pull_staging.size()),
+                    stream);
+            }
+            state.device_tickets = device_tickets;
+            state.tickets_in_arena = device_tickets != nullptr;
+        } else {
+            // Oversized wave: legacy per-launch upload path.
+            state.device_tickets = launch_pull_validate_host_channels_batch(
+                state.ticket_staging,
+                state.pull_staging,
+                stream);
+            state.tickets_in_arena = false;
+        }
+    }
     for (const auto& lane : state.lanes) {
         if (lane->snapshot != nullptr) lane->snapshot->ever_validated = true;
     }
@@ -5143,7 +5435,25 @@ bool Dispatch::finish(
             .commit = lane.snapshot->device,
         });
     }
-    launch_commit_bump_batch(notify->commit_lanes.values(), stream);
+    {
+        const auto commit_lanes = notify->commit_lanes.values();
+        const CommitBumpLane* device = commit_lanes.empty() || state.param_slot < 0
+            ? nullptr
+            : static_cast<const CommitBumpLane*>(
+                  impl_->pipeline_params.stage(
+                      state.param_slot,
+                      commit_lanes.data(),
+                      commit_lanes.size() * sizeof(CommitBumpLane)));
+        if (device != nullptr) {
+            impl_->pipeline_params.flush(state.param_slot, stream);
+            launch_commit_bump_batch_prestaged(
+                device,
+                static_cast<std::uint32_t>(commit_lanes.size()),
+                stream);
+        } else {
+            launch_commit_bump_batch(commit_lanes, stream);
+        }
+    }
     notify->settlement_lanes.reserve(program_count);
     for (auto& lane_ptr : state.lanes) {
         StagedLane& lane = *lane_ptr;
@@ -5266,16 +5576,48 @@ bool Dispatch::finish(
             0));
     }
     enqueue_host_publish_copies(
-        *notify, settlement_stream, publish_transport);
-    launch_settle_host_channels_batch(
-        notify->settlement_lanes.values(), settlement_stream);
+        *notify, settlement_stream, publish_transport,
+        state.param_slot >= 0 ? &impl_->pipeline_params : nullptr,
+        state.param_slot);
+    {
+        const auto settle_lanes = notify->settlement_lanes.values();
+        const HostChannelSettlementLane* device =
+            settle_lanes.empty() || state.param_slot < 0
+                ? nullptr
+                : static_cast<const HostChannelSettlementLane*>(
+                      impl_->pipeline_params.stage(
+                          state.param_slot,
+                          settle_lanes.data(),
+                          settle_lanes.size() *
+                              sizeof(HostChannelSettlementLane)));
+        if (device != nullptr) {
+            impl_->pipeline_params.flush(state.param_slot, settlement_stream);
+            launch_settle_host_channels_batch_prestaged(
+                device,
+                static_cast<std::uint32_t>(settle_lanes.size()),
+                settlement_stream);
+        } else {
+            launch_settle_host_channels_batch(
+                settle_lanes, settlement_stream);
+        }
+    }
     if (state.device_tickets != nullptr) {
-        CUDA_CHECK(cudaFreeAsync(
-            state.device_tickets, settlement_stream));
+        if (!state.tickets_in_arena) {
+            CUDA_CHECK(cudaFreeAsync(
+                state.device_tickets, settlement_stream));
+        }
         state.device_tickets = nullptr;
         for (auto& lane : state.lanes) {
             lane->device_tickets = nullptr;
         }
+    }
+    // The settle kernel is the wave's LAST consumer of the param slot
+    // (tickets included — their stream-ordered free above made the same
+    // lifetime claim); reuse is safe behind it.
+    if (state.param_slot >= 0 && !state.param_slot_released) {
+        impl_->pipeline_params.release_after(
+            state.param_slot, settlement_stream);
+        state.param_slot_released = true;
     }
     if (batch_copies) {
         CUDA_CHECK(cudaEventRecord(
@@ -5405,7 +5747,18 @@ void Dispatch::abort(
         state.owner->publications_recorded = true;
     }
     if (state.device_tickets != nullptr) {
-        cudaFreeAsync(state.device_tickets, stream);
+        // Arena-backed tickets point INTO the param slot (see
+        // `State::tickets_in_arena`): freeing that interior pointer returns
+        // `cudaErrorInvalidValue`, and because this path is `noexcept` the
+        // status is discarded and the sticky last-error is then reported by
+        // whatever `cudaGetLastError()` runs next — typically a prestaged
+        // launcher in a LATER wave, as a bogus launch failure. The slot is
+        // released through `pipeline_params` below (destructor path), not
+        // here. Reached on the ordinary ticket-miss retry, so this must
+        // mirror `~StagedLaunch` exactly.
+        if (!state.tickets_in_arena) {
+            cudaFreeAsync(state.device_tickets, stream);
+        }
         state.device_tickets = nullptr;
         for (auto& lane : state.lanes) {
             lane->device_tickets = nullptr;
@@ -6214,6 +6567,28 @@ bool Dispatch::enqueue_fixed_decode(
         CUDA_CHECK(cudaMemset(state.d_fixed_decode_kills, 0, sizeof(std::uint32_t)));
         CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kills, sizeof(std::uint32_t)));
         *state.h_fixed_decode_kills = 0;
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kill_reasons,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kill_reasons, 0,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kill_reasons,
+                                  sizeof(std::uint32_t)));
+        *state.h_fixed_decode_kill_reasons = 0;
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kill_counts,
+                              8 * sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kill_counts, 0,
+                              8 * sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kill_counts,
+                                  8 * sizeof(std::uint32_t)));
+        std::memset(state.h_fixed_decode_kill_counts, 0,
+                    8 * sizeof(std::uint32_t));
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kill_ports,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kill_ports, 0,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kill_ports,
+                                  sizeof(std::uint32_t)));
+        *state.h_fixed_decode_kill_ports = 0;
     }
     if (const std::uint32_t seen = *state.h_fixed_decode_kills;
         seen > state.fixed_decode_kills_reported) {
@@ -6221,9 +6596,45 @@ bool Dispatch::enqueue_fixed_decode(
         state.fixed_decode_kills_reported = seen;
         std::lock_guard<std::mutex> lock(state.stats_mutex);
         state.stats.fixed_decode_chain_kills += fresh;
+        const std::uint32_t why = *state.h_fixed_decode_kill_reasons;
+        std::string reasons;
+        const std::uint32_t* counts = state.h_fixed_decode_kill_counts;
+        const auto note = [&](std::uint32_t bit, const char* text) {
+            if ((why & bit) == 0) return;
+            if (!reasons.empty()) reasons += ", ";
+            reasons += text;
+            if (counts != nullptr) {
+                unsigned index = 0;
+                while ((bit >> index) != 1u) ++index;
+                reasons += " x" + std::to_string(counts[index]);
+            }
+        };
+        note(kKillCommit, "pass_commit missing/zero");
+        note(kKillPortNotReady, "input port not ready");
+        note(kKillTokenNull, "token pointer null");
+        note(kKillNullPointer, "geometry pointer null or indptr[0]!=0");
+        note(kKillPageCount, "page_count != ceil(kv_len/page_size) or over capacity");
+        note(kKillWriteSlot, "w_slot/w_off outside the translation or page");
+        note(kKillWriteBounds, "write position outside [lower, upper)");
+        note(kKillTranslation, "translated page >= device_pages");
+        if (const std::uint32_t ports = *state.h_fixed_decode_kill_ports;
+            ports != 0) {
+            static const char* const kPortNames[] = {
+                "embed_tokens", "positions", "pages", "page_indptr",
+                "kv_len", "w_slot", "w_off"};
+            reasons += " [ports:";
+            for (std::size_t i = 0; i < 7; ++i) {
+                if ((ports >> i) & 1u) {
+                    reasons += " ";
+                    reasons += kPortNames[i];
+                }
+            }
+            reasons += "]";
+        }
+        if (reasons.empty()) reasons = "unattributed";
         std::cerr << "[pie-driver-cuda] fixed-decode compose FAIL-STOPPED "
-                  << fresh << " lane(s): geometry/containment inconsistency; "
-                  << "the affected chains are killed (successors dummy-run)\n";
+                  << fresh << " lane(s): " << reasons
+                  << "; the affected chains are killed (successors dummy-run)\n";
     }
 
     const FixedDecodeLane* device_lanes =
@@ -6244,6 +6655,9 @@ bool Dispatch::enqueue_fixed_decode(
         .rs_slot_ids = buffers.rs_slot_ids,
         .sample_indices = buffers.sample_indices,
         .chain_kills = state.d_fixed_decode_kills,
+        .kill_reasons = state.d_fixed_decode_kill_reasons,
+        .kill_reason_counts = state.d_fixed_decode_kill_counts,
+        .kill_ports = state.d_fixed_decode_kill_ports,
         .dummy_page = buffers.dummy_page,
         .page_size = staged.fixed_decode_page_size,
         .device_pages = staged.fixed_decode_device_pages,
@@ -6268,6 +6682,24 @@ bool Dispatch::enqueue_fixed_decode(
         sizeof(std::uint32_t),
         cudaMemcpyDeviceToHost,
         staged.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        state.h_fixed_decode_kill_reasons,
+        state.d_fixed_decode_kill_reasons,
+        sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost,
+        staged.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        state.h_fixed_decode_kill_counts,
+        state.d_fixed_decode_kill_counts,
+        8 * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost,
+        staged.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        state.h_fixed_decode_kill_ports,
+        state.d_fixed_decode_kill_ports,
+        sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost,
+        staged.stream));
     state.fixed_decode_upload.mark_used(staged.stream);
     {
         std::lock_guard<std::mutex> lock(state.stats_mutex);
@@ -6281,12 +6713,7 @@ bool Dispatch::enqueue_fixed_decode(
     // NOT taken, which no assertion downstream can see. If the RS guard above
     // is ever re-tightened, this is what says so.
     //
-    // The env read is a function-local static, not a per-batch `getenv`: this
-    // runs once per decode step on the latency path, and reading the
-    // environment there measurably costs (~1.5% of single-request tok/s).
-    static const bool trace_template =
-        std::getenv("PIE_FIXED_DECODE_TRACE") != nullptr;
-    if (trace_template) {
+    if constexpr (false) {
         static std::once_flag once;
         std::call_once(once, [&] {
             std::cerr << "[pie-driver-cuda] fixed-decode template active: "
@@ -6453,10 +6880,7 @@ bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
         // resolve a chained descriptor: the host readback fallback cannot see a
         // value the producing fire has not committed yet, so a decode step that
         // reads the prefill's sampled token never became ready.
-        const bool trace_compose = [] {
-            const char* v = std::getenv("PIE_TRACE_DEVICE_COMPOSE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
+        constexpr bool trace_compose = false;
         auto refuse = [&](const std::string& why) {
             if (trace_compose) {
                 std::fprintf(stderr, "[compose] refused: %s\n", why.c_str());

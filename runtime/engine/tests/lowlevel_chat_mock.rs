@@ -2,7 +2,7 @@
 //! The device-resident run-ahead carrier (`next_inputs` retain→inject→free) is
 //! NOT implemented by the mock, and the mock sampler is input-independent, so
 //! TOKEN-IDENTITY of the explicit run-ahead + EOS-rollback loop is a 4090 gate
-//! (`bin/pie/tests/cuda_lowlevel_chat.rs`). This host-only smoke asserts the
+//! (`tests/gpu/tests/cuda_lowlevel_chat.rs`). This host-only smoke asserts the
 //! property the mock CAN prove: the hand-written low-level decode loop — including
 //! the speculate-past-stop + `drain_discard` rollback path — runs to completion
 //! without panic/hang and returns a well-formed self-report (`MATCH` degenerate on
@@ -83,7 +83,7 @@ fn spawn_and_capture(s: &TestState, name: &str, input: String) -> Result<String,
 /// input-independent, so this proves the explicit decode loop drives the raw WIT
 /// surface (`ForwardPass` / `KvWorkingSet` / greedy `Program` / `pie:instruct/chat`)
 /// to completion without panic/hang — NOT token identity (that is the 4090 gate,
-/// `bin/pie/tests/cuda_lowlevel_chat.rs`). The forced-stop DISCARD probe is skipped
+/// `tests/gpu/tests/cuda_lowlevel_chat.rs`). The forced-stop DISCARD probe is skipped
 /// here (`no-rollback-probe`): draining a speculated-then-discarded consumer trips
 /// the runtime's fail-closed next-input finalize, a device-resident carrier
 /// property the mock cannot complete (exactly why `runahead`'s decode is

@@ -34,7 +34,7 @@ namespace pie::metal {
 // an out-of-bounds read the moment another family appends — which is exactly
 // what happened, as a segfault with nothing pointing at the cause. Anchored on
 // the enum's actual last member instead.
-inline constexpr int kKernelKindCount = static_cast<int>(Kernel::G4PleResidual) + 1;
+inline constexpr int kKernelKindCount = static_cast<int>(Kernel::KindCount);
 
 // One emitted dispatch in the per-token DAG.
 struct Dispatch {
@@ -63,6 +63,28 @@ struct DecodeStepPsos {
     Pso&       operator[](Kernel k)       { return by_kind[static_cast<int>(k)]; }
     const Pso& operator[](Kernel k) const { return by_kind[static_cast<int>(k)]; }
 };
+
+/// Whether this checkpoint's GEMM reaches the FP16 matrix path. The GEMM
+/// crossover moves with it -- see `qmm_min_batch`.
+inline bool qwen35_fp16_format(const DecodeGeometry& g) {
+    return fp16_gemm_format(g.quant.bits, g.quant.group);
+}
+
+/// Whether this kind's weights are in the geometry's SECOND affine format.
+///
+/// Exactly the two routing projections -- `mlp.gate` and
+/// `mlp.shared_expert_gate` -- which mlx_lm's quantization predicate
+/// spares at 8 bits inside Qwen3.6-35B-A3B's 4-bit body. Asked in one
+/// place so the pipeline choice and the launch shape cannot disagree
+/// about which table a dispatch reads: the alternate table has only the
+/// MATVEC, so a kind that reads it must not be given a GEMM.
+///
+/// It lives here rather than on `DecodeGeometry` because that struct is a
+/// leaf `decode_abi.hpp` includes before `Kernel` exists.
+inline bool qwen35_uses_alt_quant(Kernel k, const DecodeGeometry& g) {
+    return g.has_alt_quant() &&
+           (k == Kernel::LlRouter || k == Kernel::LlSharedGateProj);
+}
 
 /// Rows the mixture's sort produces for a batch of `n_tokens`.
 ///

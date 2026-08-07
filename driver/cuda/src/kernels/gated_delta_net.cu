@@ -54,50 +54,16 @@ __device__ __forceinline__ float warp_sum(float x) {
     return __shfl_sync(0xffffffffu, x, 0);
 }
 
-bool qwen_gdn_gqa_ilp2_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_GQA_ILP2");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool qwen_gdn_gqa_ilp2_enabled() { return false; }
 
-bool qwen_gdn_k_last_state_enabled() {
-    // Default OFF: storing state as [k, v] (V-last) — the layout used
-    // when KLast=false — lets threads indexed by v_idx access state at
-    // contiguous offsets within a warp (stride 1, fully coalesced).
-    // KLast=true stores [v, k] which forces a stride of K_d floats
-    // between adjacent threads' state reads, fracturing every warp's
-    // memory transaction into 32 cache-line accesses and amplifying
-    // HBM traffic by ~30x on the recurrent step.
-    //
-    // Measured on Qwen/Qwen3.5-4B (cuda_native, H100 PCIe, 512 reqs x
-    // 128 tok decode): KLast=true -> 1,414 tok/s; KLast=false -> 5,242
-    // tok/s (+271%). Prefill-heavy workload (1k-tok prompts, 8-tok
-    // output): KLast=true -> 29 tok/s; KLast=false -> 258 tok/s (+790%).
-    // Output is bit-identical under both layouts (sha256 matches).
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_K_LAST_STATE");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool qwen_gdn_k_last_state_enabled() { return false; }
 
 // Use the fused recurrent step kernel that caches state values in
 // registers across the two analytical phases, halving HBM traffic on
 // the state slab (2R+2W -> 1R+1W per element). Default OFF until
 // parity is verified across all (K_d, V_d) combinations the kernel is
 // instantiated for; turn ON for benchmarking the new path.
-bool qwen_gdn_fused_step_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_FUSED_STEP");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool qwen_gdn_fused_step_enabled() { return false; }
 
 // SMEM read-only step kernel: stages the BF16 state slab into shared
 // memory once, reads it from SMEM in both analytical phases, and
@@ -662,103 +628,6 @@ __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
         __syncthreads();
         for (int i = threadIdx.x; i < state_elems; i += blockDim.x) {
             state_store(state + i, s_state[i]);
-        }
-    }
-}
-
-template <typename StateT, bool KLast>
-__global__ void chunk_gated_delta_prefill_batched_warp_tiled_kernel(
-    const float* __restrict__ q_norm,
-    const float* __restrict__ k_norm,
-    const float* __restrict__ v,
-    const float* __restrict__ g_log,
-    const float* __restrict__ beta,
-    StateT*      __restrict__ state_base,
-    const int*       __restrict__ slot_ids,
-    const std::uint32_t* __restrict__ qo_indptr,
-    long long slot_stride_elems,
-    float*       __restrict__ out,
-    int V_h, int K_d, int V_d,
-    bool write_state,
-    const std::uint8_t* __restrict__ write_state_mask)
-{
-    constexpr int WARPS = 4;
-    constexpr int MAX_K_PER_LANE = 8;  // supports K_d <= 256 with 32 lanes
-    const int r = blockIdx.x;
-    const int h = blockIdx.y;
-    const int v_tile = blockIdx.z * WARPS;
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int v_idx = v_tile + warp;
-    if (warp >= WARPS || v_idx >= V_d) return;
-
-    const int t0 = static_cast<int>(qo_indptr[r]);
-    const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
-    if (T <= 0) return;
-
-    const int slot = slot_ids[r];
-    if (slot < 0) return;
-    StateT* state = state_base
-        + (long long)slot * slot_stride_elems
-        + (long long)h * K_d * V_d;
-
-    float s_vals[MAX_K_PER_LANE];
-    int k_vals[MAX_K_PER_LANE];
-    int n_k = 0;
-    for (int k_idx = lane; k_idx < K_d && n_k < MAX_K_PER_LANE; k_idx += 32) {
-        k_vals[n_k] = k_idx;
-        s_vals[n_k] = state_load(
-            state + state_offset<KLast>(k_idx, v_idx, K_d, V_d));
-        ++n_k;
-    }
-
-    for (int t = 0; t < T; ++t) {
-        const long long bh = (long long)(t0 + t) * V_h + h;
-        const float* q_h = q_norm + bh * K_d;
-        const float* k_h = k_norm + bh * K_d;
-        const float* v_h = v + bh * V_d;
-        const float g_h = __expf(g_log[bh]);
-        const float beta_h = beta[bh];
-
-        float kv_part = 0.f;
-        #pragma unroll
-        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
-            if (i < n_k) {
-                const int k_idx = k_vals[i];
-                const float s = s_vals[i] * g_h;
-                s_vals[i] = s;
-                kv_part += s * k_h[k_idx];
-            }
-        }
-        const float kv_mem = warp_sum(kv_part);
-        const float delta = (v_h[v_idx] - kv_mem) * beta_h;
-
-        float out_part = 0.f;
-        #pragma unroll
-        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
-            if (i < n_k) {
-                const int k_idx = k_vals[i];
-                const float s = s_vals[i] + k_h[k_idx] * delta;
-                s_vals[i] = s;
-                out_part += s * q_h[k_idx];
-            }
-        }
-        const float out_v = warp_sum(out_part);
-        if (lane == 0) {
-            out[bh * (long long)V_d + v_idx] = out_v;
-        }
-    }
-
-    // Frozen verify (write_state=false): persist nothing.
-    if (write_state && row_persists(write_state_mask, r)) {
-        #pragma unroll
-        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
-            if (i < n_k) {
-                state_store(
-                    state + state_offset<KLast>(
-                        k_vals[i], v_idx, K_d, V_d),
-                    s_vals[i]);
-            }
         }
     }
 }
@@ -1714,15 +1583,7 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
     }
 }
 
-// Opt-in FLA-port path (PIE_QWEN35_GDN_FLA_STEP=1).
-inline bool qwen_gdn_fla_step_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_FLA_STEP");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool qwen_gdn_fla_step_enabled() { return false; }
 
 // ── FLA-style chunked prefill kernel (KLast=false / V-last storage) ──
 // State stays in per-thread registers across the whole T-token chunk,
@@ -2006,17 +1867,9 @@ __global__ void chunk_gated_delta_prefill_batched_gqa_fla_kernel(
     }
 }
 
-inline bool qwen_gdn_fla_prefill_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_FLA_PREFILL");
-        // Default ON: 9x speedup, bit-identical to the legacy kernel
-        // at production shapes (V_d=128, K_d<=128). Set the env var
-        // to '0' to fall back to the legacy per-token HBM kernel.
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+// 9x speedup over the legacy per-token HBM kernel, bit-identical at
+// production shapes (V_d=128, K_d<=128).
+constexpr bool qwen_gdn_fla_prefill_enabled() { return true; }
 
 }  // namespace
 
@@ -2546,85 +2399,7 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     }
 }
 
-void launch_chunk_gated_delta_prefill_batched_warp_tiled(
-    const float* q_norm, const float* k_norm, const float* v,
-    const float* g_log, const float* beta,
-    float* state_base,
-    const std::int32_t* slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long slot_stride_elems,
-    float* out,
-    int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state,
-    const std::uint8_t* write_state_mask)
-{
-    if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    if (K_d > 256) {
-        launch_chunk_gated_delta_prefill_batched(
-            q_norm, k_norm, v, g_log, beta, state_base,
-            slot_ids, qo_indptr, slot_stride_elems, out,
-            R, V_h, V_h, K_d, V_d, stream);
-        return;
-    }
-    constexpr int WARPS = 4;
-    constexpr int BLOCK = WARPS * 32;
-    dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
-    dim3 block(BLOCK);
-    if (qwen_gdn_k_last_state_enabled()) {
-        chunk_gated_delta_prefill_batched_warp_tiled_kernel<float, true><<<
-            grid, block, 0, stream>>>(
-            q_norm, k_norm, v, g_log, beta, state_base,
-            slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state, write_state_mask);
-    } else {
-        chunk_gated_delta_prefill_batched_warp_tiled_kernel<float, false><<<
-            grid, block, 0, stream>>>(
-            q_norm, k_norm, v, g_log, beta, state_base,
-            slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state, write_state_mask);
-    }
-}
 
-void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
-    const float* q_norm, const float* k_norm, const float* v,
-    const float* g_log, const float* beta,
-    void* state_base,
-    const std::int32_t* slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long slot_stride_elems,
-    float* out,
-    int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state,
-    const std::uint8_t* write_state_mask)
-{
-    if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    if (K_d > 256) {
-        launch_chunk_gated_delta_prefill_batched_state_bf16(
-            q_norm, k_norm, v, g_log, beta, state_base,
-            slot_ids, qo_indptr, slot_stride_elems, out,
-            R, V_h, V_h, K_d, V_d, stream);
-        return;
-    }
-    constexpr int WARPS = 4;
-    constexpr int BLOCK = WARPS * 32;
-    dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
-    dim3 block(BLOCK);
-    if (qwen_gdn_k_last_state_enabled()) {
-        chunk_gated_delta_prefill_batched_warp_tiled_kernel<__nv_bfloat16, true><<<
-            grid, block, 0, stream>>>(
-            q_norm, k_norm, v, g_log, beta,
-            static_cast<__nv_bfloat16*>(state_base),
-            slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state, write_state_mask);
-    } else {
-        chunk_gated_delta_prefill_batched_warp_tiled_kernel<__nv_bfloat16, false><<<
-            grid, block, 0, stream>>>(
-            q_norm, k_norm, v, g_log, beta,
-            static_cast<__nv_bfloat16*>(state_base),
-            slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state, write_state_mask);
-    }
-}
 
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     const float* q_norm_kh, const float* k_norm_kh, const float* v,

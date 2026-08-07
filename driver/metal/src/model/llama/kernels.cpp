@@ -43,21 +43,24 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // compiling them anyway would let an unrelated shader error fail a load
     // that would otherwise have worked.
     if (g.is_moe()) {
-        specs.push_back({"gptoss.metal", "router_topk_bfloat16", &out.router_topk});
+        specs.push_back({"moe_route.metal", "router_topk_bfloat16", &out.router_topk});
         specs.push_back({"quantized_qmv.metal", "affine_qmv_routed" + q, &out.qmv_routed});
         specs.push_back({"moe_route.metal", "moe_route_sort", &out.moe_sort});
         specs.push_back({"moe_route.metal", "moe_route_gather", &out.moe_gather});
         specs.push_back({"moe_route.metal", "moe_combine_sorted", &out.moe_combine});
-        // The batched form's three column tiles. `bm` is `kMoeTileRows`, which
-        // is what the sort padded every expert's run to -- naming it here would
-        // be a second statement of the same number, so it is spelled from the
-        // constant.
-        const std::string routed_bm =
-            "affine_qmm_t_routed" + q + "_bm_" + std::to_string(shared_kernels::kMoeTileRows);
-        for (int i = 0; i < 3; ++i) {
-            specs.push_back({"quantized_qmm_t.metal",
-                             routed_bm + "_bn_" + std::to_string(16 << i),
-                             &out.qmm_routed[i]});
+        // The batched form's three column tiles, at each of the two tile
+        // widths `moe_tile_rows` can pick. `bm` is what the sort padded every
+        // expert's run to -- naming it here would be a second statement of the
+        // same number, so it is spelled from the shared table.
+        for (int t = 0; t < 3; ++t) {
+            const std::string routed_bm =
+                "affine_qmm_t_routed" + q + "_bm_" +
+                std::to_string(shared_kernels::kMoeTileWidths[t]);
+            for (int i = 0; i < 3; ++i) {
+                specs.push_back({"quantized_qmm_t.metal",
+                                 routed_bm + "_bn_" + std::to_string(16 << i),
+                                 &out.qmm_routed[t][i]});
+            }
         }
     }
     for (const Spec& spec : specs) {

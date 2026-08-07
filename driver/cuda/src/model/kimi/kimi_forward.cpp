@@ -44,39 +44,13 @@ constexpr int kKimiMoeGemvMaxTokens = 1;
 
 namespace {
 
-bool kimi_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_KIMI_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool kimi_profile_enabled() { return false; }
 
-std::uint64_t kimi_profile_print_limit() {
-    static const std::uint64_t limit = [] {
-        const char* v = std::getenv("PIE_KIMI_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{8};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return limit;
-}
+constexpr std::uint64_t kimi_profile_print_limit() { return 8; }
 
-bool kimi_profile_all_ranks() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_KIMI_PROFILE_ALL_RANKS");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool kimi_profile_all_ranks() { return false; }
 
-bool kimi_dump_logits_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_KIMI_DUMP_LOGITS");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool kimi_dump_logits_enabled() { return false; }
 
 void dump_top_logits(const void* logits_bf16, int rows, int cols,
                      int tp_rank, int vocab_offset, cudaStream_t stream) {
@@ -861,10 +835,7 @@ void kimi_forward_paged(
                 cfg.routed_scaling_factor, stream);
         });
 
-        static const bool force_prefill_moe = [] {
-            const char* v = std::getenv("PIE_CUDA_KIMI_FORCE_PREFILL_MOE");
-            return v != nullptr && v[0] != '\0';
-        }();
+        constexpr bool force_prefill_moe = false;
 
         // The W4A16 GEMVs dequantise int4 with scalar FP32 ALU and re-read
         // every routed expert once per token; the batched path materialises a
@@ -927,7 +898,7 @@ void kimi_forward_paged(
                     static_cast<std::int32_t*>(kimi_ws.aligned_route_ids.data()),
                     static_cast<std::int32_t*>(kimi_ws.aligned_expert_ids.data()),
                     /*route_to_aligned_row=*/nullptr,
-                    routes, E, block, max_blocks, stream);
+                    routes, E, block, max_blocks, /*num_tokens_past_padded=*/nullptr, stream);
                 kernels::launch_gather_moe_aligned_inputs_bf16(
                     kimi_ws.norm_y.data(),
                     static_cast<const std::int32_t*>(kimi_ws.aligned_route_ids.data()),

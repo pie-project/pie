@@ -8,7 +8,7 @@
 //!
 //! CUDA and `WeightStore` ownership stay on the C++ side. Reading a checkpoint
 //! is `crate::checkpoint`'s alone, and the compiler below it opens nothing —
-//! `crate::testkit::host_executor` does, which is exactly why it is not the
+//! `crate::executor::host` does, which is exactly why it is not the
 //! compiler.
 
 pub mod cache_key;
@@ -16,8 +16,8 @@ pub mod checkpoint;
 pub mod contract;
 pub mod dump;
 pub mod error;
+pub mod executor;
 pub mod extent;
-pub mod ffi;
 pub mod plan;
 #[cfg(feature = "testkit")]
 pub mod testkit;
@@ -25,7 +25,3 @@ pub mod types;
 pub mod verify;
 pub mod weight_store;
 
-/// Single source for the planner's debug-logging gate (`PIE_LOAD_PLANNER_DEBUG`).
-pub(crate) fn planner_debug_enabled() -> bool {
-    std::env::var_os("PIE_LOAD_PLANNER_DEBUG").is_some()
-}

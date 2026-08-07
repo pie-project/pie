@@ -38,6 +38,7 @@ using pie::metal::RawMetalContext;
 using pie::metal::SlotHandle;
 using pie::metal::Threadgroup;
 using pie::metal::gptoss::router_topk_dispatch;
+using pie::metal::shared_kernels::RouterParams;
 
 namespace {
 
@@ -60,11 +61,6 @@ float from_bf16(std::uint16_t value) {
     std::memcpy(&result, &bits, sizeof(result));
     return result;
 }
-
-struct RouterParams {
-    std::uint32_t n_experts;
-    std::uint32_t experts_per_token;
-};
 
 /// What the kernel is supposed to compute, in the clearest possible form: sort
 /// by value (ties to the lower index), take k, softmax those k.
@@ -199,7 +195,8 @@ int main() {
 
     std::string err;
     const Pso pso =
-        ctx->compile_pso_from_file(kernels_dir + "/gptoss.metal", "router_topk_bfloat16", &err);
+        ctx->compile_pso_from_file(kernels_dir + "/moe_route.metal",
+                                   "router_topk_bfloat16", &err);
     if (!expect(pso.valid(), "router_topk_bfloat16 compiles: " + err)) return 1;
 
     // ── Qwen3-MoE: 128 experts, 8 per token. Four simdgroups. ──

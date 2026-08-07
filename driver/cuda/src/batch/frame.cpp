@@ -23,6 +23,7 @@
 #include "batch/brle.hpp"
 #include "batch/fire_timing.hpp"
 #include "batch/forward.hpp"
+#include "batch/forward_graph.hpp"
 #include "batch/tp.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
@@ -94,40 +95,37 @@ struct TpFireCommit {
 // Bounded TP fire pipeline.
 //
 // Rank 0 may NOT run arbitrarily far ahead of the follower: `pi.*` and the
-// NCCL communicator are one shared set, and with `PIE_FRAME_SIZE` > 1 a frame's
+// NCCL communicator are one shared set, and with k > 1 a frame's
 // steps are enqueued back to back with no rendezvous, so rank 0 would post fire
 // N+1's payload group while the follower is still inside fire N's forward on
 // that same communicator. That deadlocked the pair (the follower's decode
 // attention kernel never retired).
 //
-// Debug lever, disabled by default. Before posting fire N's collectives, wait
-// for fire N-D to have retired; D=0 means no bound. This existed to work around
-// a TP hang at `PIE_FRAME_SIZE` > 1 that turned out to be the follower skipping
-// the attention plan-staging protocol — fixed there instead. Retained because
-// forcing D=1 collapses a whole class of cross-rank overlap bug into a clean
-// yes/no answer, which is how that one was isolated.
-int tp_fire_runahead_depth() {
-    static const int depth = [] {
-        if (const char* v = std::getenv("PIE_TP_RUNAHEAD_DEPTH")) {
-            const int parsed = std::atoi(v);
-            if (parsed >= 0 && parsed <= 8) return parsed;
-        }
-        // Depth 1 (one TP fire in flight on the device).
-        //
-        // The follower's missing attention plan-staging slot was ONE cause of
-        // the k>1 TP deadlock and is fixed at its source, but it was not the
-        // only one: with bind-time projection packing enabled the hang comes
-        // back at k=1 and k=2 (and not at k=4), which is the signature of a
-        // second overlap hazard that packing's different timing exposes. Until
-        // that one is found too, keep the bound.
-        //
-        // Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4),
-        // small because rank 0 is the rank with slack — the follower is
-        // reactive and already waits inside the payload broadcast.
-        return 1;
-    }();
-    return depth;
-}
+// ONE TP fire in flight on the device: before posting fire N's collectives,
+// wait for fire N-1 to have retired.
+//
+// This is NOT a debug lever, whatever its history says. It is a live
+// workaround for a deadlock nobody has found yet. The follower's missing
+// attention plan-staging slot was ONE cause of the k>1 TP hang and is fixed at
+// its source, but it was not the only one: with bind-time projection packing
+// enabled the hang comes back at k=1 and k=2 — and not at k=4 — which is the
+// signature of a second overlap hazard that packing's different timing
+// exposes. Until that one is found too, the bound stays.
+//
+// Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4), small
+// because rank 0 is the rank with slack: the follower is reactive and already
+// waits inside the payload broadcast.
+//
+// A constant rather than `PIE_TP_RUNAHEAD_DEPTH`, because 0 meant "no bound"
+// and no bound is the hang. A value that hangs the engine must not be a
+// supported input — the same rule that retired `PIE_FRAME_REBIND_ESCAPE`,
+// whose mode 0 was the pre-fix behaviour that wedged. Raising it when the
+// second hazard is found is a code change, and should be: it needs the
+// measurement that justifies it.
+//
+// The ring below is left generic (`kMaxDepth` slots) so that change is a
+// one-line edit here rather than a rewrite.
+constexpr int tp_fire_runahead_depth() { return 1; }
 
 // Two halves: WAIT before this fire's collectives are posted, RECORD after its
 // forward has been enqueued. Waiting on the event `depth` fires back means rank
@@ -175,13 +173,7 @@ void record_slot(cudaStream_t stream) {
 
 }  // namespace tp_runahead
 
-bool tp_device_compose_disabled() {
-    static const bool off = [] {
-        const char* v = std::getenv("PIE_TP_DISABLE_DEVICE_COMPOSE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return off;
-}
+constexpr bool tp_device_compose_disabled() { return false; }
 
 MtpDraftPlan preflight_mtp_draft_logits(
     BatchEngine& engine,
@@ -752,6 +744,10 @@ struct PreparedStep::Impl {
     std::vector<std::uint32_t> plan_kv_page_indptr;
     std::vector<std::uint32_t> plan_kv_last_lens;
     int graph_pad_requests = 0;
+    // Total tokens the pad lanes carry. Equals `graph_pad_requests` on the
+    // decode path (one token each) and exceeds it when a prefill wave pads N
+    // to the token lattice.
+    int graph_pad_tokens = 0;
     int pad_real_mask_bytes = 0;
     std::vector<std::uint32_t> pad_qo_indptr;
     std::vector<std::uint32_t> pad_kv_page_indices;
@@ -1570,9 +1566,24 @@ void prepare_step(
     s.has_attention_stages =
         engine.dispatch->launch_has_attention_stages(s.dispatch_view);
     {
+        // The padding decision runs BEFORE `prepare()` plans this wave, so it
+        // cannot ask whether the plan came out capturable -- that answer
+        // belongs to the previous fire, and on this workload the previous fire
+        // is pure decode 84% of the time, which is why every prefill wave read
+        // back "not capturable" and never padded. Capturability is also
+        // downstream of the shape this decision chooses, so consulting it here
+        // would be circular.
+        //
+        // Pad on geometry alone instead. Over-padding is cheap and safe: a
+        // wave that the plan later demotes just runs eager over a few percent
+        // of extra rows, exactly as it would have unpadded. Under-padding is
+        // what costs -- it is what leaves the shape off-lattice and forces the
+        // one-off capture.
+        const bool prefill_pad_ok =
+            prefill_graph_enabled() && !s.have_custom_mask;
         const bool eligible = forward_graph_replay_eligible(
             engine,
-            is_pure_decode,
+            is_pure_decode || prefill_pad_ok,
             s.have_custom_mask,
             s.rs_is_write,
             s.rs_is_fold,
@@ -1587,15 +1598,68 @@ void prepare_step(
         if (eligible && engine.graph_pad_page >= 0) {
             const int max_requests = std::min(
                 engine.max_forward_requests, engine.max_workspace_tokens);
-            const int bucket =
+            int bucket =
                 forward_graph_request_bucket(s.fR_real, max_requests);
-            const int padding = bucket - s.fR_real;
+            int padding = bucket - s.fR_real;
+            // Decode pads one token per lane, so N follows R for free.
+            int pad_tokens = std::max(padding, 0);
+
+            // A prefill-carrying wave has to bucket N as well, and N is not
+            // pinned to R the way decode pins it. One pad lane can absorb up
+            // to a page of tokens -- holding kv_len == qo_len == tok_j gives
+            // the lane the same causal geometry a real fresh prefill has -- so
+            // the two lattices are solved together: pick N's bucket, take
+            // enough lanes to carry the tokens, and buy more tokens if the
+            // lane count outran them (every lane needs at least one token; a
+            // zero-length lane has no valid qo range).
+            //
+            // Custom-mask waves stay on the one-token-per-lane path: the
+            // packed mask is per (qo, kv) pair, so a multi-token lane would
+            // have to synthesize a mask block, and structured decoding does
+            // not carry a prefill through here.
+            const int page = kv_cache.page_size();
+            if (!is_pure_decode && !s.have_custom_mask && page > 0) {
+                int n_bucket = forward_graph_token_bucket(
+                    s.fN_real, engine.max_workspace_tokens);
+                bool solved = false;
+                for (int iter = 0; iter < 8 && n_bucket > 0; ++iter) {
+                    const int want = n_bucket - s.fN_real;
+                    const int lanes_needed =
+                        want > 0 ? (want + page - 1) / page : 0;
+                    const int r_bucket = forward_graph_request_bucket(
+                        s.fR_real + lanes_needed, max_requests);
+                    if (r_bucket <= 0) break;
+                    const int lanes = r_bucket - s.fR_real;
+                    if (lanes <= want && want <= lanes * page) {
+                        bucket = r_bucket;
+                        padding = lanes;
+                        pad_tokens = want;
+                        solved = true;
+                        break;
+                    }
+                    if (lanes > want) {
+                        n_bucket = forward_graph_token_bucket(
+                            s.fN_real + lanes, engine.max_workspace_tokens);
+                        continue;
+                    }
+                    break;
+                }
+                // No feasible pair (N at the workspace ceiling, R at the
+                // request ceiling): leave the wave unpadded and let it capture
+                // its exact shape, exactly as it did before this path existed.
+                if (!solved) {
+                    padding = 0;
+                    pad_tokens = 0;
+                }
+            }
+
             const std::size_t padded_tokens =
                 static_cast<std::size_t>(s.fN_real) +
-                static_cast<std::size_t>(std::max(padding, 0));
-            const bool fits = padding > 0 &&
+                static_cast<std::size_t>(std::max(pad_tokens, 0));
+            const bool fits = padding > 0 && pad_tokens >= padding &&
                 padded_tokens <= pi.tokens.size() &&
                 padded_tokens <= pi.row_valid.size() &&
+                padded_tokens <= pi.positions.size() &&
                 padded_tokens <=
                     static_cast<std::size_t>(tensor_rows(ws.logits)) &&
                 static_cast<std::size_t>(bucket) + 1 <=
@@ -1611,6 +1675,7 @@ void prepare_step(
                       pi.custom_mask_indptr.size()));
             if (fits) {
                 s.graph_pad_requests = padding;
+                s.graph_pad_tokens = pad_tokens;
             }
         }
     }
@@ -2002,13 +2067,25 @@ void prepare_step(
             s.h_kvpi_forward, s.h_kvpi_forward + pages);
         s.pad_kv_last_page_lens.assign(
             s.h_kvlpl_forward, s.h_kvlpl_forward + s.fR_real);
-        for (int r = 0; r < s.graph_pad_requests; ++r) {
-            s.pad_qo_indptr.push_back(s.pad_qo_indptr.back() + 1);
+        // Tokens spread as evenly as the lanes allow; the first
+        // `pad_tokens % lanes` lanes carry one extra. The device kernel
+        // recomputes this from the same two integers rather than reading a
+        // host array, so the two cannot drift.
+        const int lanes = s.graph_pad_requests;
+        const int base = s.graph_pad_tokens / lanes;
+        const int extra = s.graph_pad_tokens % lanes;
+        for (int r = 0; r < lanes; ++r) {
+            const int tok = base + (r < extra ? 1 : 0);
+            s.pad_qo_indptr.push_back(
+                s.pad_qo_indptr.back() + static_cast<std::uint32_t>(tok));
             s.pad_kv_page_indices.push_back(
                 static_cast<std::uint32_t>(engine.graph_pad_page));
             s.pad_kv_page_indptr.push_back(
                 s.pad_kv_page_indptr.back() + 1);
-            s.pad_kv_last_page_lens.push_back(1);
+            // kv_len == qo_len for the lane: one page holds `tok` tokens
+            // because `tok <= kv_cache.page_size()` by construction.
+            s.pad_kv_last_page_lens.push_back(
+                static_cast<std::uint32_t>(tok));
         }
         s.h_qo_forward = s.pad_qo_indptr.data();
         s.h_kvpi_forward = s.pad_kv_page_indices.data();
@@ -2016,7 +2093,7 @@ void prepare_step(
         s.h_kvpp_forward = s.pad_kv_page_indptr.data();
         s.h_kvlpl_forward = s.pad_kv_last_page_lens.data();
         s.forward_R = s.fR_real + s.graph_pad_requests;
-        s.forward_N = s.fN_real + s.graph_pad_requests;
+        s.forward_N = s.fN_real + s.graph_pad_tokens;
     }
 
     // Compact-logit direct rows for settlement (the epilogue slices each
@@ -2038,7 +2115,6 @@ void prepare_step(
     // already covers this one — mark the hook skippable.
     if (previous != nullptr) {
         s.skip_plan = plan_inputs_identical(s, *previous->impl());
-        if (std::getenv("PIE_DISABLE_SKIP_PLAN")) s.skip_plan = false;
     }
 
     if (dbg_fire) s.timing.prepare_end = fire_timing::Clock::now();
@@ -2059,21 +2135,8 @@ struct EnqProfile {
     // rotation) that swamp the per-step averages and made `enq.attn_plan`
     // read as a 2.5ms steady cost when its steady value is ~2us.
     std::uint64_t steps = 0;
-    static std::uint64_t warmup() {
-        static const std::uint64_t n = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE_WARMUP");
-            return (v != nullptr && v[0] != '\0')
-                ? std::strtoull(v, nullptr, 10) : 32ull;
-        }();
-        return n;
-    }
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
+    static constexpr std::uint64_t warmup() { return 32ull; }
+    static constexpr bool enabled() { return false; }
     static EnqProfile& instance() { static EnqProfile p; return p; }
     ~EnqProfile() {
         if (!enabled()) return;
@@ -2290,6 +2353,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             s.fR_real,
             s.fN_real,
             s.graph_pad_requests,
+            s.graph_pad_tokens,
             static_cast<std::uint32_t>(engine.graph_pad_page),
             cublas.stream());
     }
@@ -2333,7 +2397,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         // One TP fire in flight on the device at a time.
         //
         // The persistent input buffers (`pi.*`) and the NCCL communicator are
-        // a SINGLE set shared by every fire. With `PIE_FRAME_SIZE` > 1 a frame
+        // a SINGLE set shared by every fire. With k > 1 a frame
         // holds several steps and `launch` enqueues them back to back with no
         // rendezvous between them, so rank 0 would post fire N+1's payload
         // group while the follower is still executing fire N's forward — whose
@@ -2404,8 +2468,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         std::cerr.flush();
     }
     auto dump_rs = [&](const char* tag) {
-        if (!std::getenv("PIE_RS_TRACE") || engine.rs_cache == nullptr ||
-            !s.use_slots || s.R < 1) return;
+        return;
         const int slot = static_cast<int>(s.rs_slot_view[0]);
         std::uint32_t rw[4] = {0, 0, 0, 0}, cw[4] = {0, 0, 0, 0};
         cudaMemcpy(rw, engine.rs_cache->recurrent_state_raw(0, slot),

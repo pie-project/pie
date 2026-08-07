@@ -67,10 +67,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
 
     async fn page_len(&mut self, this: Resource<KvWorkingSet>) -> Result<u32> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        let ws = self.ctx().table.get(&this)?.clone();
-        let stores = store_registry::get(ws.model, ws.driver as usize);
-        let len =
-            store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| kv.page_len(ws.id));
+        let len = self.ctx().table.get(&this)?.page_len();
         Ok(len.map_err(anyhow::Error::from)? as u32)
     }
 

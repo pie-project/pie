@@ -43,6 +43,13 @@ bool mxfp4_experts_from_weights(const std::unordered_map<std::string, SlotHandle
 
 int router_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights);
 
+/// The attention projections' quantization width, solved off
+/// `layers.0.self_attn.q_proj.{weight,scales}` by the same arithmetic --
+/// they are affine group-64 at whatever width the checkpoint chose. Returns 0
+/// when the tensors are missing or the ratio is not a width these kernels
+/// have, so the caller refuses rather than guessing.
+int proj_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights);
+
 /// Everything staged before a step can be bound.
 struct BoundGptOss {
     std::unordered_map<std::string, SlotHandle> weights;
@@ -84,8 +91,9 @@ inline std::size_t gptoss_kv_bytes_per_layer(const GptOssGeometry& g, int max_ct
 
 /// The widest activation any pool buffer must hold, in elements.
 ///
-/// NOT `hidden`: the MoE's operands are a k-wide stack, so the expert gate/up
-/// are `experts_per_token * intermediate` and the logits are the vocabulary.
+/// At M=1 the sorted MoE has one row per selected expert, so its floor remains
+/// `experts_per_token * intermediate`; M>1 padding is accounted by
+/// `go_pool_elems`, where the row count is known.
 inline int gptoss_widest_elems(const GptOssGeometry& g) {
     int widest = g.hidden;
     widest = widest < g.vocab ? g.vocab : widest;

@@ -183,7 +183,7 @@ fn a_converted_artifact_carries_the_normalized_model_config() {
     );
 }
 
-/// The same read path against an artifact `pie model convert` actually wrote,
+/// The same read path against an artifact `pie model import` actually wrote,
 /// checked against the `tokenizer.json` it was built from.
 ///
 /// Hermetic tests use `from_vocab`, which is the fixture pipeline: no merges,

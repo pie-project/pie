@@ -24,7 +24,7 @@
 //!     its first token equals the sync-gen-1 reference context's gen-2.
 //!  3. **Scenario C** (`DEEP_MATCH` / `DEEP4_MATCH`): the depth-`k`
 //!     submit-ahead chain (k=2 asserted, k=4 observed — run with
-//!     `PIE_SCHED_MAX_IN_FLIGHT=4` to exercise true 4-in-flight) is
+//!     `[model.scheduler] frame_dispatch_depth = 4` to exercise true 4-in-flight) is
 //!     byte-identical to the synchronous stream.
 //!  4. **Scenario D** (`DEEP_STOP_MATCH`): the depth-`k` EOS-rollback —
 //!     over-shoot a mid-stream stop by ≤`depth`−1 fires, DRAIN (finalize, not
@@ -400,7 +400,7 @@ async fn main(input: String) -> Result<String> {
     // ── Scenario C — DEEP chain byte-identity: depth-k submit-ahead == sync ──
     //  - depth=2 (`DEEP_MATCH`): asserted by the harness.
     //  - depth=4 (`DEEP4_MATCH`, observed, not asserted): run with
-    //    `PIE_SCHED_MAX_IN_FLIGHT=4` to exercise true 4-in-flight.
+    //    `[model.scheduler] frame_dispatch_depth = 4` to exercise true 4-in-flight.
     let mut d_d2 = Decoder::new(cap)?;
     let tokens_d2 = generate(&mut d_d2, &prompt, deep_budget, &[], 2, false).await?;
     let deep_matched = tokens_d2.as_slice() == &tokens_s[..deep_budget.min(tokens_s.len())];

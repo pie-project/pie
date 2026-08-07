@@ -39,7 +39,8 @@ inline void bind_const(RawMetalContext& ctx, int ord, std::uint8_t idx, const V&
 /// an earlier Gemma's, and applying it here is an ~80% error per norm that the
 /// residual stream compounds.
 RmsParams rms_params(const Gemma4Geometry& g, int axis) {
-    return RmsParams{g.eps, std::uint32_t(axis), 1u, g.norm_plus_one ? 1u : 0u};
+    return RmsParams{
+        g.eps, std::uint32_t(axis), 1u, g.norm_plus_one ? 1u : 0u, 1.0f};
 }
 
 /// The KV cache is [n_kv_heads, max_ctx, head_dim] per owning layer, so the head
@@ -135,7 +136,7 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             // The padded row count, matching `launch_shape_mb`: the GEMM is
             // dispatched over whole tiles, and M is what bounds its inner loop.
             const std::uint32_t m = std::uint32_t(
-                gemma4_qmm_rows(int(d.kind == Kind::LmHead ? S : R)));
+                gemma4_qmm_rows(g, int(d.kind == Kind::LmHead ? S : R)));
             // The GEMM shares Qmv's ordinals 0-6 and appends M. Bound
             // unconditionally: at rows==1 the matvec simply never reads slot 7,
             // and an unbound slot on the prefill path is a row count read out of
@@ -229,6 +230,14 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                     bind_const<float>(ctx, ord, (std::uint8_t)P::Scale, 1.0f, &count);
                     bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Window,
                                              d.sliding ? g.sliding_window : 0, &count);
+                    // N, for the tiled pipeline's partial last tile. Bound
+                    // whether or not this fire tiles: the bind table is per
+                    // Kind and the pipeline choice is per row count. Unbound,
+                    // the tiled kernel reads a stale ordinal for N and decides
+                    // which of its rows exist from it -- wrong attention, not
+                    // a crash.
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Rows,
+                                             std::int32_t(R), &count);
                     break;
                 }
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Sdpa::GqaFactor, gqa,
@@ -330,8 +339,6 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             }
             // The one add this family does not fuse into a norm.
             case Kind::BranchAdd:
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Residual::Width,
-                                         std::int32_t(R * std::uint32_t(g.hidden)), &count);
                 break;
 
             // ── elementwise ──
@@ -411,6 +418,48 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         }
     }
     return count;
+}
+
+
+/// Bind the FP16 staging buffer to every projection that reads one.
+///
+/// Slot 12 is the staged input the FP16 GEMM reads instead of slot 3, and slot
+/// 13 is how many elements the staging pass writes. Both are bound on the
+/// PROJECTION's table rather than a table of their own, because the staging
+/// pass has no DAG entry to own one.
+int bind_gemma4_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                         const Gemma4Geometry& g, int rows, int head_rows,
+                         const SlotHandle& staging, std::vector<SlotHandle>& keep) {
+    keep.clear();
+    if (!staging.valid()) return 0;
+    const int R = rows < 1 ? 1 : rows;
+    const int S = head_rows < 1 ? R : std::min(head_rows, R);
+    std::vector<std::pair<std::int32_t, SlotHandle>> counts;
+    int bound = 0;
+    for (const Dispatch& d : dag) {
+        const int m = d.kind == Kind::LmHead ? S : R;
+        if (!gemma4_fp16_qmm(g, d, m)) continue;
+        const std::int32_t elems = std::int32_t(gemma4_qmm_rows(g, m)) *
+                                   std::int32_t(qmv_kn(d.kind, g, d.layer).K);
+        SlotHandle count;
+        for (const auto& entry : counts) {
+            if (entry.first == elems) {
+                count = entry.second;
+                break;
+            }
+        }
+        if (!count.valid()) {
+            count = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            if (!count.valid()) continue;
+            *static_cast<std::int32_t*>(count.contents()) = elems;
+            counts.push_back({elems, count});
+            keep.push_back(count);
+        }
+        ctx.arg_bind_ordinal(d.ordinal, 12, staging);
+        ctx.arg_bind_ordinal(d.ordinal, 13, count);
+        ++bound;
+    }
+    return bound;
 }
 
 }  // namespace pie::metal::gemma4

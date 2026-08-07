@@ -15,6 +15,15 @@
 
 namespace pie::metal::gptoss {
 
+/// Whether this checkpoint's GEMM reaches the FP16 matrix path. The GEMM
+/// crossover moves with it -- see `qmm_min_batch`.
+///
+/// Unconditional here, unlike the other three families: gpt-oss is MXFP4 in
+/// every checkpoint there is, and the routed MXFP4 GEMM stages its tile as
+/// half on the way into the MMA whatever the projections are quantized at.
+/// There is no gpt-oss that runs the emulated kernel.
+inline bool gptoss_fp16_format() { return fp16_qmm(); }
+
 namespace {
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -83,11 +92,13 @@ Kernel shared_kind(Kind k) {
         case Kind::AttnResidual:  return Kernel::Residual;
         case Kind::RouterGemv:    return Kernel::GoRouter;
         case Kind::RouterTopK:    return Kernel::GoRouterTopK;
+        case Kind::ExpertSort:    return Kernel::LlMoeSort;
+        case Kind::ExpertGather:  return Kernel::LlMoeGather;
         case Kind::ExpertGate:    return Kernel::GoExpertGate;
         case Kind::ExpertUp:      return Kernel::GoExpertUp;
         case Kind::ExpertSwiGlu:  return Kernel::GoSwiGlu;
         case Kind::ExpertDown:    return Kernel::GoExpertDown;
-        case Kind::ExpertCombine: return Kernel::GoExpertCombine;
+        case Kind::ExpertCombine: return Kernel::LlMoeCombine;
         case Kind::FfnResidual:   return Kernel::LayerOut;
         case Kind::LmHead:        return Kernel::LmHeadUntied;
         case Kind::Argmax:        return Kernel::Argmax;
@@ -109,9 +120,11 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const GptOssPsos& go)
         case Kind::ExpertGate: case Kind::ExpertUp: case Kind::ExpertDown:
             return go.qmv_routed_bias;
         case Kind::RouterTopK:    return go.router_topk;
+        case Kind::ExpertSort:    return go.moe_sort;
+        case Kind::ExpertGather:  return go.moe_gather;
         case Kind::RowGather:     return go.row_gather;
         case Kind::ExpertSwiGlu:  return go.swiglu;
-        case Kind::ExpertCombine: return go.expert_combine;
+        case Kind::ExpertCombine: return go.moe_combine;
         case Kind::SdpaSink:      return go.sdpa_sink;
         case Kind::RopeQ: case Kind::RopeK: return go.rope_freqs;
         // The shared table only has entries for qwen3.5's kinds, so the norms
@@ -130,11 +143,10 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const GptOssPsos& go)
 
 void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Threadgroup& tg) {
     if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
-        // A routed projection gets one grid plane per selected expert; a dense
-        // one gets a single plane. Same kernel, same shape otherwise.
         const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
                             d.kind == Kind::ExpertDown;
-        qmv_dispatch(kn.N, routed ? g.experts_per_token : 1, grid, tg);
+        qmv_dispatch(kn.N, 1, grid, tg,
+                     routed ? gptoss_moe_sorted_rows(g, 1) : 1);
         return;
     }
 
@@ -170,10 +182,20 @@ void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Thread
         case Kind::RouterTopK:
             router_topk_dispatch(g.n_experts, grid, tg);
             return;
+        case Kind::ExpertSort:
+            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            return;
+        case Kind::ExpertGather:
+            shared_kernels::moe_route_rows_dispatch(
+                g.hidden, gptoss_moe_sorted_rows(g, 1), grid, tg);
+            return;
         case Kind::ExpertSwiGlu:
-            elementwise_dispatch(g.experts_per_token * g.intermediate, grid, tg);
+            elementwise_dispatch(
+                gptoss_moe_sorted_rows(g, 1) * g.intermediate, grid, tg);
             return;
         case Kind::ExpertCombine:
+            shared_kernels::expert_combine_dispatch(g.hidden, grid, tg);
+            return;
         case Kind::AttnResidual:
         case Kind::FfnResidual:
             elementwise_dispatch(g.hidden, grid, tg);
@@ -215,9 +237,12 @@ Pso pso_for_paged(const Dispatch& d, const DecodeStepPsos& base, const MultiBatc
 
 int gptoss_qmm_rows(int rows) {
     const int n = rows < 1 ? 1 : rows;
-    // Inherited from qwen3.5 and measured here: lowering it to 4 costs gpt-oss
-    // 1% (8 lanes, 55.5 -> 54.9 tok/s), so the inherited number holds.
-    if (n < kQmmMinBatch) return n;
+    // gpt-oss is a mixture in every checkpoint there is, so the ROUTED
+    // crossover, unconditionally -- there is no dense gpt-oss to ask about.
+    // Inherited from qwen3.5 and measured here on the M1 Max: lowering it to 4
+    // cost gpt-oss 1% (8 lanes, 55.5 -> 54.9 tok/s), and on an M2 Max the GEMV
+    // still wins or ties at every batch the dense number would have switched.
+    if (n < qmm_min_batch(true, gptoss_fp16_format())) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -225,6 +250,37 @@ int gptoss_qmm_rows(int rows) {
 int gptoss_qmm_pool_rows(int max_rows) {
     const int n = max_rows < 1 ? 1 : max_rows;
     return ((n + kQmmBMWide - 1) / kQmmBMWide) * kQmmBMWide;
+}
+
+int gptoss_moe_pairs(const GptOssGeometry& g, int rows) {
+    return (rows < 1 ? 1 : rows) * g.experts_per_token;
+}
+
+int gptoss_moe_tile_rows(const GptOssGeometry& g, int rows) {
+    return shared_kernels::moe_tile_rows(
+        gptoss_moe_pairs(g, rows), g.n_experts);
+}
+
+int gptoss_moe_sorted_rows(const GptOssGeometry& g, int rows) {
+    return shared_kernels::moe_sorted_rows(
+        gptoss_moe_pairs(g, rows), g.n_experts);
+}
+
+int gptoss_moe_qmm_bn(Kind k, const GptOssGeometry& g, int rows) {
+    const bool routed = k == Kind::ExpertGate || k == Kind::ExpertUp ||
+                        k == Kind::ExpertDown;
+    if (!routed || !g.mxfp4_experts || gptoss_moe_tile_rows(g, rows) <= 1)
+        return 0;
+    const KN kn = qmv_kn(k, g);
+    // The widest tile that divides, and here that IS right: the sorted mixture
+    // supplies the threadgroups a wide tile gives up, because every expert with
+    // rows contributes its own. Measured at 448 rows -- BN=16 374.7 tok/s,
+    // BN=32 420.8, BN=64 457.9 -- which is the opposite ordering to the dense
+    // projections above, and the reason they get a different rule.
+    int bn = 0;
+    for (const int candidate : {16, 32, 64})
+        if (kn.N % candidate == 0) bn = candidate;
+    return bn;
 }
 
 /// The dense projections, which are the ones a batched GEMM can serve.
@@ -238,12 +294,45 @@ bool gptoss_is_dense_proj(Kind k) {
 }
 
 /// The GEMM's tile for a dense projection, or 0 to keep the matvec.
+///
+/// `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only where
+/// split-K supplies the threadgroups the wide tile gives up, and this family
+/// dispatches no split at all.
 int gptoss_qmm_bn(Kind k, const GptOssGeometry& g, int rows) {
     if (!gptoss_is_dense_proj(k)) return 0;
     const KN kn = qmv_kn(k, g);
     if (kn.N == 0) return 0;
-    return qmm_bn(kn.N, gptoss_qmm_rows(rows));
+    return qmm_bn_unsplit(int(kn.N), gptoss_qmm_rows(rows), qmm_min_batch(true, gptoss_fp16_format()));
 }
+
+/// Whether a dense projection feeds its tile to the MMA as FP16.
+///
+/// M1 and M2 have no native BF16 matrix instruction and emulate it; the FP16
+/// one is real, and casting the tile on the way in is worth about 40% of the
+/// GEMM. The mechanism was already here for llama and gemma-4 and gpt-oss had
+/// never been wired to it -- its dense projections are a fifth of a prefill.
+///
+/// The LM head is excluded rather than special-cased: it is the one dense
+/// projection with no bias, and at `head_rows` rows it is a matvec anyway, so
+/// it would have wanted a fourth PSO table to buy nothing.
+///
+/// `proj_bits` and not a literal: a mixed checkpoint leaves the projections at
+/// 8 bits, and only the g64/b4 entrypoints are compiled with an FP16 tile.
+bool gptoss_fp16_qmm(const GptOssGeometry& g, Kind k, int m) {
+    if (!fp16_qmm() || g.proj_bits != 4) return false;
+    if (k != Kind::QmvQ && k != Kind::QmvK && k != Kind::QmvV && k != Kind::QmvO) {
+        return false;
+    }
+    return gptoss_qmm_bn(k, g, m) > 0;
+}
+
+/// Which dispatches stage, as opposed to reading what an earlier one staged.
+///
+/// One staging buffer serves the whole step, so a projection casts only when
+/// its input is not already there. `build_gptoss_scratch` has q, k and v all
+/// reading `AttnNorm`'s row and o reading the attention's, so those are the
+/// two groups and their firsts are the two that cast.
+bool gptoss_fp16_cast_before(Kind k) { return k == Kind::QmvQ || k == Kind::QmvO; }
 
 Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
                const GptOssPsos& go) {
@@ -256,20 +345,43 @@ Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPs
     }
 }
 
+/// Whether this fire's attention runs the tiled pipeline.
+///
+/// One predicate, read by `pso_for_mb_rows` and `launch_shape_mb` both: they
+/// must agree or the grid describes a different kernel than the one that runs,
+/// and that is wrong numbers rather than a crash. `requests == 0` is a caller
+/// that did not say, and an unknown fire does not tile -- the tiled kernel
+/// loses badly on a fleet of decodes, so the safe default is the per-row shape.
+bool sdpa_tile_this_fire(int rows, int requests) {
+    return requests > 0 && sdpa_should_tile(rows, requests);
+}
+
 /// The pipeline for a dispatch whose tiling depends on the batch. Split from
 /// `pso_for_mb` because the tile choice must mirror `launch_shape_mb`'s
 /// EXACTLY: a grid computed for one tiling against a pipeline compiled for
 /// another is not a crash, it is wrong numbers.
 Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
                     const DecodeStepPsos& base, const MultiBatchPsos& mb,
-                    const GptOssPsos& go, int head_rows) {
+                    const GptOssPsos& go, int head_rows, int requests) {
     const int N = rows < 1 ? 1 : rows;
+    if (d.kind == Kind::SdpaSink && sdpa_tile_this_fire(N, requests)) {
+        return go.sdpa_sink_paged_tiled;
+    }
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
     const int m = d.kind == Kind::LmHead ? S : N;
+    if (const int bn = gptoss_moe_qmm_bn(d.kind, g, N); bn > 0) {
+        const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
+        const int bm = shared_kernels::moe_bm_slot(gptoss_moe_tile_rows(g, N));
+        if (go.qmm_routed_bias[bm][slot].valid()) return go.qmm_routed_bias[bm][slot];
+    }
     if (const int bn = gptoss_qmm_bn(d.kind, g, m); bn > 0) {
         const int wide = qmm_bm_slot(qmm_bm(m));
         const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
         // The LM head has no bias; every other projection here does.
+        if (gptoss_fp16_qmm(g, d.kind, m) &&
+            mb.qmm_t_bias_fp16_precast[wide][slot].valid()) {
+            return mb.qmm_t_bias_fp16_precast[wide][slot];
+        }
         const auto& table = d.kind == Kind::LmHead ? mb.qmm_t : mb.qmm_t_bias;
         if (table[wide][slot].valid()) return table[wide][slot];
     }
@@ -277,7 +389,7 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
 }
 
 void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid& grid,
-                     Threadgroup& tg, int head_rows) {
+                     Threadgroup& tg, int head_rows, int requests) {
     const int N = rows < 1 ? 1 : rows;
     // The tail runs on the rows the fire will SAMPLE, which `RowGather`
     // compacted. The LM head is `hidden * vocab` per row, so on a prefill it is
@@ -288,6 +400,11 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
         const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
                             d.kind == Kind::ExpertDown;
         const int m = d.kind == Kind::LmHead ? S : N;
+        if (const int bn = gptoss_moe_qmm_bn(d.kind, g, N); bn > 0) {
+            qmm_t_dispatch(kn.N, gptoss_moe_sorted_rows(g, N), bn,
+                           gptoss_moe_tile_rows(g, N), grid, tg);
+            return;
+        }
         // A dense projection becomes a matmul once the batch fills a tile: the
         // matvec re-reads the whole weight PER ROW, which on this checkpoint is
         // 318 MB a layer.
@@ -298,7 +415,8 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
             qmm_t_dispatch(kn.N, gptoss_qmm_rows(m), bn, qmm_bm(m), grid, tg);
             return;
         }
-        qmv_dispatch(kn.N, routed ? g.experts_per_token : 1, grid, tg, m);
+        qmv_dispatch(kn.N, 1, grid, tg,
+                     routed ? gptoss_moe_sorted_rows(g, N) : m);
         return;
     }
 
@@ -330,19 +448,28 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
             kv_append_mb_dispatch(g.head_dim, g.n_kv_heads, N, grid, tg);
             return;
         case Kind::SdpaSink:
-            sdpa_sink_dispatch(g.n_q_heads, grid, tg, N);
+            // Same predicate as `pso_for_mb_rows`, for the same reason.
+            if (sdpa_tile_this_fire(N, requests))
+                sdpa_paged_tiled_dispatch(g.n_q_heads, N, grid, tg);
+            else
+                sdpa_sink_dispatch(g.n_q_heads, grid, tg, N);
             return;
         case Kind::RouterTopK:
             router_topk_dispatch(g.n_experts, grid, tg, N);
             return;
+        case Kind::ExpertSort:
+            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            return;
+        case Kind::ExpertGather:
+            shared_kernels::moe_route_rows_dispatch(
+                g.hidden, gptoss_moe_sorted_rows(g, N), grid, tg);
+            return;
         case Kind::ExpertSwiGlu:
-            elementwise_mb_dispatch(g.experts_per_token * g.intermediate, N, grid, tg);
+            elementwise_dispatch(
+                gptoss_moe_sorted_rows(g, N) * g.intermediate, grid, tg);
             return;
         case Kind::ExpertCombine:
-            // One thread per (channel, row): `y` is [rows, k, hidden], so the
-            // row is a real axis rather than a fold onto x.
-            grid = Grid{std::uint32_t(g.hidden), std::uint32_t(N), 1};
-            tg = Threadgroup{256, 1, 1};
+            shared_kernels::expert_combine_dispatch(g.hidden, grid, tg, N);
             return;
         case Kind::AttnResidual:
         case Kind::FfnResidual:
@@ -357,7 +484,7 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
 void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const GptOssGeometry& g, int rows, const DecodeStepPsos& base,
                            const MultiBatchPsos& mb, const GptOssPsos& go, int ordinal_base,
-                           int head_rows, std::size_t begin, std::size_t end) {
+                           int head_rows, int requests, std::size_t begin, std::size_t end) {
     // Deliberately the same walk as `encode_gptoss_step`: the DAG, its order
     // and its concurrency runs belong to the MODEL, not to the batch size.
     // Off the WHOLE dag, not the slice: a run's extent is the model's, and
@@ -366,10 +493,27 @@ void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
     if (end == 0 || end > dag.size()) end = dag.size();
     for (std::size_t i = begin; i < end; ++i) {
         const Dispatch& d = dag[i];
+        const int m = d.kind == Kind::LmHead
+                          ? (head_rows < 1 ? (rows < 1 ? 1 : rows)
+                                           : std::min(head_rows, rows < 1 ? 1 : rows))
+                          : (rows < 1 ? 1 : rows);
+        // The staging pass, ahead of the group that reads it. It rides the
+        // GEMM's own argument table -- the source is already bound at
+        // `GoQmv::In` -- so it needs no DAG entry, and the barrier after it is
+        // what makes the cast visible to the tile loader.
+        if (gptoss_fp16_qmm(g, d.kind, m) && gptoss_fp16_cast_before(d.kind) &&
+            mb.qmm_cast_bf16_f16.valid()) {
+            se.set_pso(mb.qmm_cast_bf16_f16);
+            se.set_argtable_ordinal(ordinal_base + d.ordinal);
+            const std::uint32_t count = std::uint32_t(gptoss_qmm_rows(m)) *
+                                        std::uint32_t(qmv_kn(d.kind, g).K);
+            se.dispatch(Grid{count, 1, 1}, Threadgroup{256, 1, 1});
+            se.barrier();
+        }
         Grid grid;
         Threadgroup tg;
-        launch_shape_mb(d, g, rows, grid, tg, head_rows);
-        se.set_pso(pso_for_mb_rows(d, g, rows, base, mb, go, head_rows));
+        launch_shape_mb(d, g, rows, grid, tg, head_rows, requests);
+        se.set_pso(pso_for_mb_rows(d, g, rows, base, mb, go, head_rows, requests));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
         if (i + 1 >= end || run_ends[i] == static_cast<int>(i)) se.barrier();

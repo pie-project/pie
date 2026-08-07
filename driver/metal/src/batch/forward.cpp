@@ -17,7 +17,7 @@
 
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"
@@ -538,14 +538,27 @@ struct MetalExecutor::Impl {
     // The prefill's uniform scratch row pitch, in elements, for the batched
     // projection (`affine_qmm_t_strided` reads it at buffer 8).
     SlotHandle prefill_row_stride_{};
+    SlotHandle prefill_rows_{};
+    SlotHandle prefill_fp16_input_{};
+    // The batched decode stages into the same buffer the prefill does -- the
+    // two never encode in one fire and the prefill's size bounds both -- but
+    // its element counts are the fire's, so they are their own slots.
+    std::vector<SlotHandle> mb_fp16_keep_{};
+    int mb_fp16_tokens_ = 0;
     // One scan-length buffer per prompt row.  A grouped prefill carries several
     // requests, each with its own scan length, and the row's argument table is
     // what selects the segment -- so the length has to be per row too.
     std::vector<SlotHandle> prefill_scan_rows_{};
-    // A slot whose conv history was last written by the prefill's ping-pong may
-    // hold it in ConvStateOut; the paged decode writes in place and always
-    // leaves it in ConvState, so only the handover needs a copy.
+    // Which half of the GDN conv ping-pong holds each slot's history: 0 for
+    // `conv_state`, 1 for `conv_state_out`. THE record of that fact -- the
+    // prefill's per-token parity and the decode's per-fire one are both read
+    // from and written back to here, so a copy that moves a slot's history
+    // between the halves cannot desynchronize them.
     std::vector<std::uint8_t> conv_in_out_{};
+    // Which half `mb_dag_`'s GDN dispatches are currently bound to READ. One
+    // batched fire runs every row through one pair of dispatches, so every slot
+    // in it reads the same half and this is per-DAG rather than per-slot.
+    std::uint8_t mb_conv_parity_ = 0;
     Pso ptir_logits_copy_pso_{};
     std::uint32_t ptir_logits_capacity_rows_ = 0;
     std::uint32_t ptir_logits_next_row_ = 0;
@@ -602,6 +615,7 @@ struct MetalExecutor::Impl {
         const pie_loader::LoadPlan& load_plan,
         std::size_t storage_page_size,
         bool stream_routed_experts,
+        std::uint32_t max_ctx_tokens,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
     int vocab() const { return simple_ ? simple_->vocab() : g_.vocab; }
@@ -696,7 +710,7 @@ struct PtirLogitsCopyParams {
     std::uint32_t reserved = 0;
 };
 
-inline constexpr int kPtirLogitsCopyOrdinal = 90000;
+
 // Rows one staging dispatch can carry. Bounded by the paged forward's row
 // capacity, which is what `LogitsOut::rows` is drawn from.
 inline constexpr std::size_t kPtirLogitsCopyMaxRows = kPagedMaxForwardTokensCeiling;
@@ -730,27 +744,186 @@ void write_u32(const SlotHandle& s, uint32_t v) {
 // first dispatch. The sizing is right to twenty megabytes. What is optimistic
 // is `recommendedMaxWorkingSetSize` itself -- on this M1 Max it is 24.96 GiB,
 // a flat 78% of the 32 GiB the machine has, taking no account of the 6 GiB the
-// kernel had wired down by the time prefill ran. So a plan can clear this bar
-// and still exhaust the machine. The bar is a ceiling, not a promise, and this
-// refusal is written to catch the models that are plainly over it rather than
-// to predict the ones that are close.
+// kernel had wired down by the time prefill ran. That is why the check below
+// asks the kernel a second question -- what is reclaimable right now -- and
+// refuses on whichever bound is tighter. The device ceiling catches models
+// that are plainly too big for the GPU; the host bound catches models that
+// would fit a quiet machine and not this one.
+// The elastic budget's four addends, kept apart so a refusal can name the one
+// that is large. Assembled by the caller because only it knows the scratch
+// pool, which the heap plan does not carry.
+struct ElasticBreakdown {
+    std::size_t kv_ring = 0;
+    std::size_t kv_pool = 0;
+    std::size_t state = 0;
+    std::size_t scratch = 0;
+};
+
+// Say once, before anything is allocated, that this machine is carrying GPU
+// memory nobody owns.
+//
+// A model small enough to fit alongside the leak is admitted by the check
+// below and runs fine, so nothing on the path to a successful load would
+// otherwise mention it -- and the danger is not to the run. Wired pages
+// cannot be paged out and are charged to no live process, so `ps`, Activity
+// Monitor and free-memory readings all look ordinary while the window server
+// is one composite away from being unable to allocate. When it cannot, it
+// blocks in the kernel inside its own Metal submit, misses the 120-second
+// userspace watchdog, and the desktop dies. Observed here twice: once during
+// a run, and once **ten hours after** the run that leaked the memory, with no
+// pie process alive to connect it to.
+//
+// So this warns rather than refuses. The load is not what is unsafe; leaving
+// the machine up is. The threshold is half of RAM because a healthy idle Mac
+// sits near 3%, and the leaks seen here were 59% -- there is no ambiguous
+// middle to tune against.
+void warn_once_if_the_gpu_leaked_memory_before_this_run() {
+    [[maybe_unused]] static const bool said = [] {
+        const auto [wired, installed] =
+            RawMetalContext::host_wired_and_installed_bytes();
+        if (installed == 0 || wired * 2 <= installed) return true;
+        const auto gib = [](std::size_t b) { return double(b) / (1024.0 * 1024.0 * 1024.0); };
+        std::fprintf(stderr,
+                     "[pie-metal] warning: %.2f GiB of this machine's %.2f GiB is wired "
+                     "before this model is loaded. No process has to be holding it: a GPU "
+                     "context whose command buffer never signalled is abandoned rather "
+                     "than released, and its pages stay wired until reboot. They cannot "
+                     "be paged out, so the window server can be starved of memory hours "
+                     "later and take the desktop down with it. Reboot before leaving this "
+                     "machine unattended.\n",
+                     gib(wired), gib(installed));
+        return true;
+    }();
+}
+
+// What a weight that is COPIED into the heap costs the host WHILE it is being
+// copied, on top of the heap byte it becomes.
+//
+// The obvious answer -- the whole mapping, so the peak is twice the model --
+// is what RSS says and it is not what the machine feels. `copy_storage_bytes`
+// walks a tensor in `max_tile_bytes` chunks and `madvise(MADV_DONTNEED)`s each
+// chunk behind it, and `with_mapped_span` does the same once per strided
+// selection. On Darwin that call deactivates rather than discards, so the page
+// stays counted in RSS while moving to the queue the kernel reclaims from
+// first. Both numbers are real; only one of them is a demand.
+//
+// gpt-oss-20b, 10.41 GiB of weights, all copied, measured with `time -l`:
+//
+//     maximum resident set size  20.84 GiB   <- the mapping is in here
+//     peak memory footprint      10.84 GiB   <- and not in here
+//     swaps                      0
+//
+// `peak memory footprint` is `phys_footprint`, which is the number the kernel
+// itself bills a process for and the one jetsam reads. It is the heap plus
+// change. Sampling `vm_stat` through that load says the same thing from the
+// other side: free memory does bottom out at 50 MiB, but the inactive queue
+// holds steady at 11.8 GiB the whole way down and no page is ever swapped.
+// Free is not the resource; reclaimable is, and the mapping funds itself out
+// of it -- every tile it faults in, it hands back before taking the next.
+//
+// So the transient is one window, not one model, and the window is whatever a
+// single release covers: a 64 MiB tile on the bulk path, one source tensor on
+// the strided one. It is capped rather than derived because the two paths
+// disagree and the larger of them is a property of the checkpoint's biggest
+// tensor, which this file cannot see. Under the cap the whole model IS the
+// window, which is the right answer for a checkpoint that small.
+//
+// The cap is not the guard. The guard is that `want` -- the heap, which
+// `make_resident` wires and nothing can reclaim -- has to fit in what the
+// machine will give back, with `kHostMargin` to spare. That is the check the
+// six kernel panics on the 48 GiB M4 Pro were missing: an 18.16 GiB checkpoint
+// passed a test that compared it against *free* memory on a quiet machine,
+// which says nothing, and the panics -- a data abort on a PAC-mangled pointer,
+// a WindowServer watchdog, an assertion inside IOGPUGroupMemory -- all landed
+// with free under 200 MiB. Comparing against reclaimable is what fixed that.
+// Adding the mapping on top of it only ever refused models that fit.
 bool fits_on_this_gpu(std::size_t heap_bytes,
                       std::size_t elastic_bytes,
                       std::size_t resident_weights,
-                      std::string* err) {
+                      std::string* err,
+                      const ElasticBreakdown* parts = nullptr,
+                      std::size_t transient_copy_bytes = 0) {
+    warn_once_if_the_gpu_leaked_memory_before_this_run();
     const std::size_t limit = RawMetalContext::device_working_set_bytes();
     if (limit == 0) return true;  // the device would not say; do not invent one
     const std::size_t want = heap_bytes + elastic_bytes;
-    if (want <= limit) return true;
+
+    // The device ceiling is what this GPU would hold on an idle machine. What
+    // the machine will actually give us right now is a second, independent
+    // bound, and on unified memory it is usually the smaller one. Checking
+    // only the first is how a 14 GiB model was admitted onto a box with 18 GiB
+    // left, allocated its pools, and then hung: the command buffer never
+    // signalled, the context was abandoned as unsafe to release, and the
+    // process became unkillable. Every retry left another one, so free memory
+    // fell with each attempt while the ceiling being checked never moved.
+    //
+    // Refusing here is the only cheap moment. Afterwards there is no failure
+    // path -- the allocation does not fail, the dispatch does not return, and
+    // nothing short of a reboot recovers the memory.
+    //
+    // The margin is headroom for what the load itself adds beyond the plan:
+    // the mmap'd weights file leaves a file-backed copy roughly the size of
+    // the model, and the kernel needs room to keep running. It is deliberately
+    // a flat floor rather than a fraction, so that the refusal stays legible.
+    const std::size_t reclaimable =
+        RawMetalContext::device_working_set_is_forced()
+            ? 0  // a forced ceiling describes a device, not this machine
+            : RawMetalContext::host_reclaimable_bytes();
+    constexpr std::size_t kHostMargin = 2ull * 1024 * 1024 * 1024;
+    // The host bound is about the PEAK, not the steady state -- but the peak
+    // is the heap plus one copy window, not the heap plus the checkpoint. See
+    // the note above this function for the measurement.
+    constexpr std::size_t kCopyWindow = 2ull * 1024 * 1024 * 1024;
+    const std::size_t host_want = want + std::min(transient_copy_bytes, kCopyWindow);
+    const bool host_bound =
+        reclaimable != 0 && host_want + kHostMargin > reclaimable && want <= limit;
+
+    if (want <= limit && !host_bound) return true;
     if (err) {
         const auto gib = [](std::size_t b) {
             return std::to_string(double(b) / (1024.0 * 1024.0 * 1024.0)).substr(0, 5);
         };
+        if (host_bound) {
+            *err = "this model does not fit the memory this machine has left: "
+                   "it needs " + gib(want) + " GiB resident (" +
+                   gib(resident_weights) + " GiB of weights, " +
+                   gib(elastic_bytes) + " GiB of KV, state and scratch)" +
+                   (host_want != want
+                        ? " and " + gib(host_want - want) +
+                              " GiB more while it loads, for the window of the "
+                              "checkpoint that is mapped and not yet copied, so the "
+                              "peak is " + gib(host_want) + " GiB"
+                        : "") +
+                   ", and only " + gib(reclaimable) + " GiB is reclaimable. The GPU "
+                   "itself would hold " + gib(limit) + " GiB, so this is the machine, "
+                   "not the device: something else already has the memory. On macOS a "
+                   "previously wedged run is the usual cause -- it survives "
+                   "kill -9, holds its pages, and is only cleared by a reboot.";
+            return false;
+        }
         *err = "this model does not fit this GPU: it needs " + gib(want) +
                " GiB resident (" + gib(resident_weights) + " GiB of weights, " +
                gib(elastic_bytes) + " GiB of KV, state and scratch) and the device "
-               "will hold " + gib(limit) + " GiB. A shorter context shrinks the KV; "
-               "the weights do not shrink.";
+               "will hold " + gib(limit) + " GiB.";
+        // Which region to shrink, and with which knob. "A shorter context
+        // shrinks the KV" was the whole of the old advice, and on a paged
+        // family it is wrong twice: the operator reaches for `total_pages`,
+        // the number does not move, and nothing says why. It does not move
+        // because a paged model allocates BOTH the paged pool that
+        // `total_pages` sizes AND the M=1 contiguous ring that `max_ctx`
+        // sizes -- two KV regions, one knob each. Naming them separately is
+        // the difference between a refusal an operator can act on and one
+        // they can only read.
+        if (parts != nullptr) {
+            *err += " Of that: " + gib(parts->kv_ring) +
+                    " GiB M=1 KV ring (from max_model_len), " +
+                    gib(parts->kv_pool) +
+                    " GiB paged KV pool (total_pages x kv_page_size), " +
+                    gib(parts->state) +
+                    " GiB recurrent state (max_forward_requests), " +
+                    gib(parts->scratch) + " GiB scratch.";
+        }
+        *err += " The weights do not shrink.";
     }
     return false;
 }
@@ -832,9 +1005,18 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // is the one case that matters most: it re-reserved the entire model
     // alongside its own mapping and the first command buffer came back out of
     // memory.
+    const std::size_t extra = SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
     const std::size_t heap_bytes = (weights >= streamed ? weights - streamed : 0) +
-                                   (slab ? std::size_t(cfg.expert_slab_bytes) : 0) +
-                                   SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
+                                   (slab ? std::size_t(cfg.expert_slab_bytes) : 0) + extra;
+    // These families carry their KV inside `extra_heap_bytes` rather than in
+    // an elastic budget, so the breakdown the other path traces is one number
+    // here -- but it is the number `max_model_len` moves, and a knob whose
+    // effect cannot be observed is a knob nobody can tune.
+    if (std::getenv("PIE_METAL_LOAD_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[pie-metal] load: ctx %d tokens; kv, state and scratch %.1f MB\n",
+                     max_ctx_, double(extra) / (1024.0 * 1024.0));
+    }
     // What to ALLOCATE and what must be RESIDENT are two numbers, and this
     // refusal is about the second. Weights bound where they lie leave the heap
     // but not the working set -- `wrap_host_memory` puts them in the residency
@@ -849,8 +1031,17 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // A slab makes `streamed` mean something else: those bytes are read from an
     // mmap the GPU never sees, so they are neither allocated nor resident, and
     // adding them here would refuse exactly the models this exists to run.
+    //
+    // What comes off the mapping is whatever had to be copied into the heap --
+    // `extra` is KV and scratch, which is built rather than read, and a slab's
+    // budget is filled from the mapping a band at a time. `fits_on_this_gpu`
+    // caps it at one copy window; passing the total lets it do that.
+    const std::size_t copied =
+        heap_bytes >= extra + (slab ? std::size_t(cfg.expert_slab_bytes) : 0)
+            ? heap_bytes - extra - (slab ? std::size_t(cfg.expert_slab_bytes) : 0)
+            : 0;
     if (!fits_on_this_gpu(slab ? heap_bytes : heap_bytes + streamed, 0,
-                          slab ? heap_bytes : weights, err)) {
+                          slab ? heap_bytes : weights, err, nullptr, copied)) {
         return false;
     }
     // Two marks, because between them lies the answer to "why is loading slow"
@@ -936,8 +1127,17 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                             const pie_loader::LoadPlan& load_plan,
                             std::size_t storage_page_size,
                             bool stream_routed_experts,
+                            std::uint32_t max_ctx_tokens,
                             std::string* err) {
     g_ = geom;
+    // The same line `setup_simple` has, for the same reason: `max_ctx_` sizes
+    // the M=1 ring `plan_heap` reserves, and this path used to leave it at the
+    // ceiling. So `max_model_len` moved nothing here while the refusal that
+    // printed the ring named `max_model_len` as its knob -- an operator could
+    // set it to 512, watch 8 GiB not move, and have nothing to read.
+    if (max_ctx_tokens > 0) {
+        max_ctx_ = int(std::min<std::uint32_t>(max_ctx_tokens, kMetalMaxCtxTokens));
+    }
 
     // The mmap is transient: the LoadPlan copies each finalized tensor
     // once into the resident weights region.
@@ -955,11 +1155,30 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // ── Build the decode DAG (shipped config: GdnPrep ON, no argmax dispatch — host samples). ──
     // Under the accuracy gate every activation value gets its own pool buffer, so a
     // tap's producer is still readable once the command buffer retires.
-    const bool taps = golden_taps_enabled();
+    const bool taps = golden_taps_enabled() && !golden_taps_recycle();
     dag_ = build_decode_dag(g_, /*with_argmax=*/false, fuse_residual_, gdn_prep_);
+    // Each DAG owns one region of the argument-table namespace. A DAG longer
+    // than its region reaches into the next one's, and the two then share
+    // tables silently -- see `ordinals_fit`.
+    if (!ordinals_fit(dag_.size())) {
+        if (err) {
+            *err = "this decoder emits " + std::to_string(dag_.size()) +
+                   " dispatches and one argument-table region holds " +
+                   std::to_string(kPrefillOrdinalStride);
+        }
+        return false;
+    }
     if (g_.paged_kv_enabled) {
         mb_dag_ = build_decode_dag_mb(g_, std::max(1, g_.max_tokens),
                                       kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
+        if (!ordinals_fit(mb_dag_.size())) {
+            if (err) {
+                *err = "this decoder's batched DAG emits " + std::to_string(mb_dag_.size()) +
+                       " dispatches and one argument-table region holds " +
+                       std::to_string(kPrefillOrdinalStride);
+            }
+            return false;
+        }
         mb_sched_ = build_scratch_schedule(mb_dag_, g_, /*no_recycle=*/taps);
         prefill_dags_ = build_decode_prefill_dags(g_, std::max(1, g_.max_tokens),
                                                    fuse_residual_, gdn_prep_);
@@ -997,7 +1216,25 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
 
     // Heap plus mapping: see `setup_simple`. What leaves the heap does not
     // leave the working set.
-    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err))
+    const ElasticBreakdown elastic_parts{
+        plan_.kv_bytes, plan_.kv_pool_bytes, plan_.state_bytes,
+        plan_.scratch_bytes + (taps ? 0u : scratch_pool_bytes)};
+    // The same four numbers the refusal prints, printed on the path that
+    // SUCCEEDS too. A knob whose effect is only visible when the model fails
+    // to load is a knob nobody can tune.
+    if (std::getenv("PIE_METAL_LOAD_TRACE") != nullptr) {
+        const auto mb = [](std::size_t b) { return double(b) / (1024.0 * 1024.0); };
+        std::fprintf(stderr,
+                     "[pie-metal] load: ctx %d tokens; kv ring %.1f MB, kv pool %.1f MB, "
+                     "state %.1f MB, scratch %.1f MB\n",
+                     max_ctx_, mb(elastic_parts.kv_ring), mb(elastic_parts.kv_pool),
+                     mb(elastic_parts.state), mb(elastic_parts.scratch));
+    }
+    // `resident_weights` is exactly what gets copied: the model minus whatever
+    // is bound where it lies. Only a window of it is off the mapping at once --
+    // see `fits_on_this_gpu`.
+    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err,
+                          &elastic_parts, resident_weights))
         return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
@@ -1040,16 +1277,53 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
 
     // ── Compile the kernel PSOs. ──
     std::string load_err;
-    if (!load_decode_psos(*ctx_, kernels_dir, psos_, g_.quant, /*with_argmax=*/false, &load_err,
-                          fuse_residual_, gdn_prep_, g_.is_moe(),
-                          /*untied=*/!g_.tied_embeddings)) {
+    if (!load_decode_psos(
+            *ctx_, kernels_dir, psos_, g_.quant, &load_err,
+            DecodePsoFeatures{
+                .residual_qmv = fuse_residual_,
+                .gdn = gdn_prep_,
+                .gated_attention = true,
+                .sdpa_d256 = true,
+                .routed = g_.is_moe(),
+                .untied = !g_.tied_embeddings})) {
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
     }
+    // The second quantized set. A checkpoint that spares its two routing
+    // projections at another width gets one more table, and only the two kinds
+    // that read it are taken from it -- everything else stays on the pipelines
+    // the model-wide format named. `mb_geometry` and the strided branch both
+    // keep those kinds on the matvec, so there is no batched shape to build.
+    if (g_.has_alt_quant()) {
+        DecodeStepPsos alt{};
+        if (!load_decode_psos(*ctx_, kernels_dir, alt, g_.alt_quant, &load_err,
+                              DecodePsoFeatures{.routing_only = true})) {
+            if (err) *err = "PSO load failed (second quantized set): " + load_err;
+            ctx_.reset();
+            return false;
+        }
+        psos_[Kernel::LlRouter] = alt[Kernel::LlRouter];
+        psos_[Kernel::LlSharedGateProj] = alt[Kernel::LlSharedGateProj];
+    }
     if (g_.paged_kv_enabled &&
-        !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, g_.quant, /*with_d512=*/false,
-                              &load_err, g_.is_moe())) {
+        !load_multibatch_psos(
+            *ctx_, kernels_dir, mb_psos_, g_.quant, &load_err,
+            MultiBatchPsoFeatures{
+                .sdpa_d256 = true,
+                .gdn = true,
+                .residual = fuse_residual_,
+                .routed = g_.is_moe(),
+                .strided = true,
+                // Neither of these excludes a mixture. They both used to, on
+                // the reading that a routed checkpoint has nothing dense worth
+                // staging -- but q, k, v, o and the shared expert are ordinary
+                // dense projections whatever the FFN is, and on a device with
+                // no bfloat matrix unit they were the last GEMMs in this
+                // family still emulating one. The ROUTED projections are kept
+                // off by the tables they select, not by these flags.
+                .fp16_precast = g_.quant.bits == 4 && g_.quant.group == 64,
+                .fp16_strided = g_.quant.bits == 4 && g_.quant.group == 64})) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -1062,9 +1336,20 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         ctx_->create_standalone_buffer(
             sizeof(PtirLogitsCopyParams) * kPtirLogitsCopyMaxRows);
     prefill_row_stride_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+    prefill_rows_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
     if (prefill_row_stride_.valid()) {
         *static_cast<std::int32_t*>(prefill_row_stride_.contents()) =
             static_cast<std::int32_t>(scratch_widest_elems(g_));
+    }
+    if (g_.quant.bits == 4 && g_.quant.group == 64) {
+        prefill_fp16_input_ = ctx_->heap_alloc(
+            std::size_t(std::max(1, g_.max_tokens)) *
+            std::size_t(scratch_widest_elems(g_)) * sizeof(std::uint16_t));
+        if (!prefill_fp16_input_.valid()) {
+            if (err) *err = "allocating Qwen prefill FP16 input staging";
+            ctx_.reset();
+            return false;
+        }
     }
     prefill_scan_rows_.clear();
     if (!ptir_logits_copy_pso_.valid() ||
@@ -1107,6 +1392,7 @@ void MetalExecutor::Impl::reset_state() {
         ctx_->zero_buffer_range(ks.k_pages, 0, ks.k_pages.size);
         ctx_->zero_buffer_range(ks.v_pages, 0, ks.v_pages.size);
     }
+    std::fill(conv_in_out_.begin(), conv_in_out_.end(), std::uint8_t{0});
     linear_state_slots_.reset_all();
 }
 
@@ -1148,6 +1434,7 @@ void MetalExecutor::Impl::reset_state(uint32_t slot) {
         ctx_->zero_buffer_range(
             gs.recurrent_state, recur_off, recur_stride);
     }
+    if (slot < conv_in_out_.size()) conv_in_out_[slot] = 0;
     linear_state_slots_.reset(slot);
 }
 
@@ -1219,6 +1506,8 @@ bool MetalExecutor::Impl::copy_state_slot(uint32_t src_slot, uint32_t dst_slot, 
     // (silently correct only when src/dst happened to share the same
     // parity by coincidence).
     linear_state_slots_.copy(src_slot, dst_slot);
+    if (src_slot < conv_in_out_.size() && dst_slot < conv_in_out_.size())
+        conv_in_out_[dst_slot] = conv_in_out_[src_slot];
     return true;
 }
 
@@ -1249,16 +1538,39 @@ std::uint64_t rs_slot_bytes_for(const DecodeGeometry& g) {
     return gdn_layers * (2 * conv + recur);
 }
 
+std::uint64_t rs_slot_budget_bytes() {
+    const std::uint64_t working_set =
+        static_cast<std::uint64_t>(RawMetalContext::device_working_set_bytes());
+    return std::max<std::uint64_t>(kRsSlotBudgetBytes, working_set / 10);
+}
+
 std::uint32_t rs_slots_for_budget(const DecodeGeometry& g, std::uint64_t budget_bytes,
-                                  std::uint32_t floor_slots) {
+                                  std::uint32_t requested_slots) {
     const std::uint64_t per_slot = rs_slot_bytes_for(g);
     // A geometry with no linear-attention layers has no state to slot; the
     // count is then whatever the caller needs, at no cost.
-    if (per_slot == 0) return std::max<std::uint32_t>(floor_slots, 1);
+    if (per_slot == 0) return std::max<std::uint32_t>(requested_slots, 1);
     const std::uint64_t affordable = budget_bytes / per_slot;
+    // `requested_slots` is a CEILING, not a floor. It used to be applied as
+    // `max(slots, requested)`, which made `budget_bytes` decorative: the
+    // request count is `kPagedMaxForwardRequests`, a constant, so every
+    // checkpoint reserved 64 slots at whatever they cost. Qwen3.6-27B's slots
+    // are 170 MiB, so that is 10.6 GiB of recurrent state -- which put the
+    // model 5.2 GiB over this device and, at the batch sizes that did load,
+    // returned `kIOGPUCommandBufferCallbackErrorOutOfMemory` from the command
+    // queue. That arrived as a command buffer which never ran, so every PTIR
+    // lane's status still held its zero fill, and the runtime read the zeros
+    // back as every lane faulting -- deterministic above concurrency 4, and
+    // naming neither memory nor the batch it came from.
+    //
+    // Reserving fewer slots than the driver ADVERTISES would hang rather than
+    // queue, so the two are kept equal: `context.cpp` derives the advertised
+    // `max_forward_requests` from this same call. Fewer admitted requests
+    // queue; a device that is overrun does not.
     std::uint64_t slots = std::min<std::uint64_t>(affordable, kPhase1bRsSlots);
-    slots = std::max<std::uint64_t>(slots, std::max<std::uint32_t>(floor_slots, 1));
-    return std::uint32_t(slots);
+    slots = std::min<std::uint64_t>(
+        slots, std::max<std::uint32_t>(requested_slots, 1));
+    return std::uint32_t(std::max<std::uint64_t>(slots, 1));
 }
 
 uint64_t MetalExecutor::Impl::rs_slot_bytes() const {
@@ -1337,7 +1649,14 @@ bool MetalExecutor::Impl::ensure_elastic_storage(
     }
     if (ctx_->ensure_elastic_buffers_atomically(targets)) return true;
     if (err != nullptr) {
-        *err = "Metal elastic physical budget exhausted";
+        // Which of the two it is decides what an operator does about it. A full
+        // pool is a sizing problem; a clamped one is the OS having said the
+        // machine is tight, which passes on its own.
+        *err = "Metal elastic physical budget exhausted (" +
+               std::to_string(ctx_->elastic_committed_pages()) + " of " +
+               std::to_string(ctx_->elastic_budget_pages()) +
+               " pages committed, memory pressure level " +
+               std::to_string(ctx_->memory_pressure_level()) + ")";
     }
     return false;
 }
@@ -1401,7 +1720,9 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
             if (err) {
                 *err = "MetalExecutor::Impl::setup_kv_pool: sparse arena allocation failed "
                        "(layer " + std::to_string(L) + ", " + std::to_string(layer_bytes) +
-                       " bytes/buffer)";
+                       " bytes/buffer, against " +
+                       std::to_string(ctx_->elastic_budget_pages()) +
+                       " pages of elastic budget)";
             }
             release_pool(pool);
             return false;
@@ -1453,6 +1774,10 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             v_pages[size_t(L)] = kv_pool_.layers[size_t(L)].v_pages;
         }
         bind_decode_dag_mb(*ctx_, b_, mb_dag_, g_, k_pages, v_pages, gdn_prep_);
+        // That bind put the conv ping-pong back at its even half, so the
+        // decode's record of which half it is pointing at has to go back too --
+        // this runs again whenever the KV pool is resized, mid-serve.
+        mb_conv_parity_ = 0;
         const size_t prefill_scratch_row = size_t(scratch_widest_elems(g_)) * 2u;
         const size_t prefill_logits_row = size_t(g_.vocab) * 2u;
         for (size_t t = 0; t < prefill_dags_.size(); ++t) {
@@ -1468,17 +1793,17 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_,
                                std::max(1, g_.max_tokens));
             mb_bound_tokens_ = std::max(1, g_.max_tokens);
-            // Decode writes the shifted conv history straight back over the one
-            // it read.  Safe because each channel is read and written by the
-            // same thread, in that order, and prep and recurrent touch disjoint
-            // channels -- which saves copying every slot's whole conv slab back
-            // on the host after every single token.
-            alias_decode_conv_state_out(*ctx_, b_, mb_dag_);
             prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
                              int(pool_.size()), t * prefill_scratch_row);
-                bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_);
+                // The row pitch reaches the mixture's params here: a prefill
+                // lays every value's rows a uniform `scratch_widest_elems`
+                // apart, and the routing group is the one thing that runs over
+                // all of them at once. At one row it is unread -- every index
+                // it multiplies is zero -- so the per-token walk is unaffected.
+                bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_,
+                                   1, scratch_widest_elems(g_));
                 // A scan launched off row t's argument table reads its own
                 // length, so every row carries one.
                 prefill_scan_rows_[t] = ctx_->create_standalone_buffer(sizeof(std::int32_t));
@@ -1500,6 +1825,10 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                 for (const Dispatch& d : prefill_dags_[0]) {
                     if (qmv_out_size(d.kind, g_) != 0) {
                         ctx_->arg_bind_ordinal(d.ordinal, 8, prefill_row_stride_);
+                        if (prefill_rows_.valid())
+                            ctx_->arg_bind_ordinal(d.ordinal, 9, prefill_rows_);
+                        if (prefill_fp16_input_.valid())
+                            ctx_->arg_bind_ordinal(d.ordinal, 12, prefill_fp16_input_);
                         continue;
                     }
                     // The row-blocked elementwise/norm kernels take the same pitch,
@@ -1991,51 +2320,57 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     copy_to(IoSlot::SeqLen, seq_len);
 
     const auto step_t0 = std::chrono::steady_clock::now();
-    if (!schedule.is_pure_decode) {
-        if (std::getenv("PIE_METAL_PREFILL_TRACE") == nullptr)
-            return run_prefill_step(schedule, in, err, ptir);
-        // Whether prompts are spread out in time or arriving together and just
-        // not being grouped is the difference between a scheduler problem and a
-        // budget one, and only the arrival pattern separates them.
-        using clock = std::chrono::steady_clock;
-        static const auto t_origin = clock::now();
-        const auto t0 = clock::now();
-        const bool ok = run_prefill_step(schedule, in, err, ptir);
-        const auto t1 = clock::now();
-        std::fprintf(
-            stderr, "[pf] at=%.1f ms N=%d R=%d took=%.1f ms\n",
-            std::chrono::duration<double, std::milli>(t0 - t_origin).count(), schedule.N,
-            schedule.R, std::chrono::duration<double, std::milli>(t1 - t0).count());
-        return ok;
-    }
+    if (!schedule.is_pure_decode) return run_prefill_step(schedule, in, err, ptir);
 
     std::vector<uint32_t> active_slots;
     active_slots.reserve(size_t(schedule.R));
+    if (conv_in_out_.size() < size_t(g_.max_slots))
+        conv_in_out_.assign(size_t(g_.max_slots), 0);
     for (const RequestSpan& sp : schedule.spans) {
         if (sp.rs_is_new) reset_state(sp.rs_slot);
         if (std::find(active_slots.begin(), active_slots.end(), sp.rs_slot) == active_slots.end())
             active_slots.push_back(sp.rs_slot);
     }
-    // The paged decode shifts the conv history in place -- each channel of each
-    // slot is read by exactly one thread before that same thread writes it, and
-    // a pure-decode fire gives every request its own slot -- so there is nothing
-    // to fold back afterwards.  The prefill still ping-pongs per prompt token,
-    // so a slot handed over mid-parity is copied once, here.
+    // One fire, one binding: every row of a batched decode goes through the
+    // same pair of GDN dispatches, so every slot in it has to read the same
+    // half of the ping-pong. A steady fleet already agrees -- its members
+    // stepped together -- and the copies below are the price of a member that
+    // joined at the other parity, which is a prompt-length-dependent fact about
+    // that member alone.
+    //
+    // The majority's half, not the first slot's: picking the first would let
+    // one arriving member move fourteen resident ones instead of itself.
+    std::size_t at_out = 0;
+    for (uint32_t slot : active_slots)
+        if (conv_in_out_[slot] != 0) ++at_out;
+    const std::uint8_t parity = at_out * 2 > active_slots.size() ? 1u : 0u;
     for (uint32_t slot : active_slots) {
-        if (slot >= conv_in_out_.size() || conv_in_out_[slot] == 0) continue;
-        conv_in_out_[slot] = 0;
+        if (conv_in_out_[slot] == parity) continue;
+        conv_in_out_[slot] = parity;
         const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
-        // copy C -> A (different handles, same offset). A full-attention layer
-        // has no GDN slab; skip it exactly as the commit below does.
+        // A full-attention layer has no GDN slab; skip it exactly as the commit
+        // below does.
         for (auto& gs : b_.gdn) {
-            if (!gs.conv_state.valid() && !gs.conv_state_out.valid()) continue;
-            if (!gs.conv_state.valid() ||
-                !ctx_->copy_buffer_range(
-                    gs.conv_state, off,
-                    gs.conv_state_out, off,
-                    g_.gdn_conv_stride_bytes()))
+            if (!gs.conv_state.valid() || !gs.conv_state_out.valid()) continue;
+            const SlotHandle& dst = parity == 0 ? gs.conv_state : gs.conv_state_out;
+            const SlotHandle& src = parity == 0 ? gs.conv_state_out : gs.conv_state;
+            if (!ctx_->copy_buffer_range(dst, off, src, off, g_.gdn_conv_stride_bytes()))
                 return fail("failed to normalize GDN ping-pong state");
         }
+    }
+    // This used to alias ConvStateOut onto ConvState and shift the history in
+    // place, on the claim that each channel is read and written by the same
+    // thread. It is not: `gdn_prep` runs one threadgroup per VALUE head and
+    // `rep = Hv/Hk` value heads share a key head, so that head's window is read
+    // by `rep` threadgroups and written by one of them. In place, the writer
+    // shifts the window out from under its siblings. Both outcomes are finite
+    // numbers, so it surfaced as a fleet member disagreeing with its identical
+    // neighbours -- deterministic values, and which member lost varying run to
+    // run. Qwen3.6-27B is rep=3 and showed it from fifteen lanes; Qwen3.6-35B-
+    // A3B is rep=1 and never could.
+    if (mb_conv_parity_ != parity) {
+        bind_gdn_conv_parity(*ctx_, b_, mb_dag_, parity == 0);
+        mb_conv_parity_ = parity;
     }
 
     // Alternate the two arms fire by fire so both see the same machine.
@@ -2059,12 +2394,21 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         bind_token_consts(*ctx_, fire_dag, g_, schedule.N);
         mb_bound_tokens_ = schedule.N;
     }
+    // The FP16 staging buffer and, next to it, the element count the cast
+    // kernel walks. The count is the only thing here that depends on the
+    // fire's width, so it is rebound when the width moves and left alone when
+    // a serving loop settles.
+    if (prefill_fp16_input_.valid() && mb_fp16_tokens_ != schedule.N) {
+        bind_mb_fp16_qmm(*ctx_, fire_dag, g_, schedule.N, prefill_fp16_input_,
+                         mb_fp16_keep_);
+        mb_fp16_tokens_ = schedule.N;
+    }
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.pre_forward) callbacks.pre_forward(se);
         }
-        encode_decode_step_mb(se, fire_dag, psos_, mb_psos_, force_barriers_);
+        encode_decode_step_mb(se, fire_dag, psos_, mb_psos_, force_barriers_, &g_, schedule.N);
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
@@ -2083,7 +2427,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     // driver's per-step CPU with nothing else folded in.  It reads 0.013ms at 32
     // lanes, which is how the search for a throughput gap was steered away from
     // the driver and into the engine.
-    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+    if constexpr (false) {
         static double sum[2][33] = {};
         static double wall[33] = {};
         static double enc[33] = {};
@@ -2138,6 +2482,8 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     }
 
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
+    // The fire wrote every active slot's shifted history into the other half.
+    for (uint32_t slot : active_slots) conv_in_out_[slot] = std::uint8_t(parity ^ 1u);
     return true;
 }
 
@@ -2155,16 +2501,22 @@ bool MetalExecutor::Impl::run_prefill_step(
 
     // Reset once per request, before its first encoded token.  Do not reset in
     // the token loop: later prompt rows must consume the preceding GDN/KV state.
+    if (conv_in_out_.size() < size_t(g_.max_slots))
+        conv_in_out_.assign(size_t(g_.max_slots), 0);
     for (const RequestSpan& sp : schedule.spans)
         if (sp.rs_is_new) reset_state(sp.rs_slot);
 
-    std::vector<int> next_step(size_t(g_.max_slots), 0);
-    for (int s = 0; s < g_.max_slots; ++s) next_step[size_t(s)] = step_count_for(uint32_t(s));
+    // The parity comes from `conv_in_out_`, not from the slot's step count.
+    // They agree while nothing but stepping moves a slot's history, and the
+    // decode's normalizing copy is exactly the thing that does: a slot the
+    // decode moved between the halves has a step count that no longer predicts
+    // which one it is in, and a continuation prefill bound off that count would
+    // read the half it did not write.
+    std::vector<std::uint8_t> next_parity(conv_in_out_.begin(), conv_in_out_.end());
     for (int t = 0; t < schedule.N; ++t) {
         const uint32_t slot = schedule.slot_of_token[size_t(t)];
-        bind_prefill_gdn_state(*ctx_, b_, prefill_dags_[size_t(t)], slot,
-                               (next_step[slot] & 1) == 0);
-        ++next_step[slot];
+        bind_gdn_conv_parity(*ctx_, b_, prefill_dags_[size_t(t)], next_parity[slot] == 0);
+        next_parity[slot] ^= 1u;
     }
 
     // The GDN scan replaces the per-token chain only when the prompt is one
@@ -2200,6 +2552,8 @@ bool MetalExecutor::Impl::run_prefill_step(
     // Alternate the arms fire by fire so both see the same machine, exactly as
     // the decode step does -- prefill fires are few, so without interleaving a
     // single contended window decides the answer.
+    if (prefill_rows_.valid())
+        *static_cast<std::int32_t*>(prefill_rows_.contents()) = schedule.N;
     static bool prefill_ab_flip = false;
     if (ab_enabled()) ab_set_arm(prefill_ab_flip = !prefill_ab_flip);
     // The staging copy rides this command buffer, exactly as it rides the
@@ -2210,6 +2564,14 @@ bool MetalExecutor::Impl::run_prefill_step(
     // Nothing failed and nothing was slow; the first token of every prompt was
     // simply the wrong one.
     std::string stage_err;
+    // The mixture's routing runs over the WHOLE prompt when it can, off row
+    // zero's argument tables, so row zero's `n` and `padded` have to be the
+    // fire's and not the one. Allocation-free: rebinding a const slot rewrites
+    // bytes at an address the table already holds.
+    if (g_.is_moe() && !prefill_dags_.empty() && schedule.N > 1) {
+        bind_token_consts(*ctx_, prefill_dags_.front(), g_, schedule.N,
+                          scratch_widest_elems(g_));
+    }
     bool stage_failed = false;
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
@@ -2230,13 +2592,13 @@ bool MetalExecutor::Impl::run_prefill_step(
     if (stage_failed) return fail(stage_err);
     // Prefill meter.  Prefill fires are few and long, so the per-row cost is what
     // compares across arms -- a raw total confuses "faster" with "shorter prompt".
-    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+    if constexpr (false) {
         static double ms[2] = {};
         static double rows[2] = {};
         static double enc[2] = {};
         static int n[2] = {};
         const int arm = ab_enabled() && ab_arm() ? 1 : 0;
-        ms[arm] += timing.gpu_exec_ms;
+        ms[arm] += timing.gpu_ms > 0.0 ? timing.gpu_ms : timing.gpu_exec_ms;
         enc[arm] += timing.encode_ms;
         rows[arm] += double(schedule.N);
         ++n[arm];
@@ -2261,12 +2623,8 @@ bool MetalExecutor::Impl::run_prefill_step(
             schedule.N);
     }
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
-    // The prompt's last token decides which half of the ping-pong holds the
-    // history; the paged decode reads ConvState, so record an odd handover.
-    if (conv_in_out_.size() < size_t(g_.max_slots))
-        conv_in_out_.assign(size_t(g_.max_slots), 0);
-    for (uint32_t slot : schedule.slot_of_token)
-        conv_in_out_[slot] = std::uint8_t(step_count_for(slot) & 1);
+    // Each token of a slot's prompt flipped that slot's half once.
+    for (uint32_t slot : schedule.slot_of_token) conv_in_out_[slot] ^= 1u;
     return true;
 }
 
@@ -2413,8 +2771,33 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
                 : cfg.llama.tied_embeddings;
         contract_facts.quant_bits = cfg.quant_bits;
         contract_facts.quant_group_size = cfg.quant_group_size;
-        load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type,
-                                      contract_facts);
+        // Gemma4's KV sharing, which the author asks for and this path was
+        // sending as zeros. A layer past `n_layers - num_kv_shared_layers`
+        // attends the KV an earlier layer wrote, so the author declines to
+        // declare its k/v/k_norm.
+        //
+        // Measured, so the change is not mistaken for a saving: the MLX
+        // conversions we gate already ship only the KV-OWNING layers' k/v
+        // (e2b has `self_attn.k_proj` for layers 0-14 and nothing for 15-34),
+        // so the authored plan is byte-identical either way -- 1096 tensors
+        // with the truthful 35/20 and with 0/0 -- and resident weights stay
+        // 2.43 GiB. What this fixes is the request, not the plan: a conversion
+        // that does ship the dead tensors would have them staged and never
+        // bound, because the skip branch it is asking about was unreachable.
+        if (model::model_family_of(cfg.model_type) == model::ModelFamily::Gemma4) {
+            contract_facts.num_hidden_layers = std::uint32_t(cfg.gemma4.n_layers);
+            contract_facts.num_kv_shared_layers =
+                std::uint32_t(cfg.gemma4.num_kv_shared_layers);
+        }
+        // A serving boot forwards the document it was handed; a test harness
+        // that set up `SetupConfig` by hand states the facts its family needs
+        // and gets a synthesized one. The branch is on which of the two this
+        // is, and nothing else.
+        load_plan = compile_load_plan(
+            cfg.snapshot_dir, metal_device_target(),
+            cfg.descriptor_json.empty()
+                ? descriptor_for_testing(cfg.model_type, contract_facts)
+                : cfg.descriptor_json);
     } catch (const std::exception& error) {
         if (err != nullptr) {
             *err = std::string("LoadPlan compile failed: ") + error.what();
@@ -2452,26 +2835,44 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         // the config, before any of this is built.
 
         // Whether the head is its own tensor is decided ONCE, by the contract,
-        // and read back here rather than decided a second time. The contract's
-        // rule is that a shipped `lm_head` beats whatever the config says --
-        // and the config can say nothing at all: Qwen3.5-35B-A3B is a
-        // multimodal wrapper that spells `tie_word_embeddings` at the TOP
-        // level, outside the `text_config` this family parses, so the facts
-        // defaulted to tied. The contract staged `embed_tokens` and `lm_head`;
-        // the DAG asked for `shared_embedding`; the load stopped on "unstaged
-        // weight shared_embedding.weight" -- two opinions about one fact. The
-        // plan's own tensor list is the only opinion that can be wrong in a
-        // way the binding survives, so it is the one the DAG follows.
-        const auto plan_view = load_plan.view();
-        bool plan_ties = false;
-        for (std::size_t i = 0; i < plan_view.tensors.len; ++i) {
-            if (pie_loader::bytes_to_string(plan_view.tensors.ptr[i].name) ==
-                "shared_embedding.weight") {
-                plan_ties = true;
-                break;
+        // and read back here rather than decided a second time -- see
+        // `plan_ties_embeddings`.
+        geom.tied_embeddings = plan_ties_embeddings(load_plan);
+        // The routing projections' format, read off the checkpoint rather than
+        // the config: mlx_lm's quantization predicate singles out tensors by
+        // NAME, and `config.json` records only the model-wide choice beside a
+        // list of exceptions this driver does not parse. Both routing weights
+        // are read, and a disagreement between them is refused rather than
+        // resolved -- there is one alternate pipeline table.
+        {
+            const auto view = load_plan.view();
+            AffineFormat found{0, 0};
+            bool conflict = false;
+            for (std::size_t i = 0; i < view.tensors.len; ++i) {
+                const auto& t = view.tensors.ptr[i];
+                const std::string name(reinterpret_cast<const char*>(t.name.ptr), t.name.len);
+                const bool routing = name.find("mlp.gate.weight") != std::string::npos ||
+                                     name.find("mlp.shared_expert_gate.weight") != std::string::npos;
+                if (!routing) continue;
+                const AffineFormat f{int(t.quant_bits_per_element), int(t.quant_group_size)};
+                if (f.bits == 0 || f.group == 0) continue;
+                if (f.bits == geom.quant.bits && f.group == geom.quant.group) continue;
+                if (found.bits != 0 && (found.bits != f.bits || found.group != f.group)) {
+                    conflict = true;
+                    break;
+                }
+                found = f;
             }
+            if (conflict) {
+                if (err != nullptr) {
+                    *err = "qwen3.5: the router and the shared expert's gate are quantized "
+                           "differently from each other, and this driver builds one "
+                           "alternate pipeline table";
+                }
+                return false;
+            }
+            geom.alt_quant = found;
         }
-        geom.tied_embeddings = plan_ties;
     }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes
@@ -2485,7 +2886,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // floor is the concurrency the caller asked for: a driver that reserves
     // fewer slots than it accepts requests hangs rather than queues.
     geom.max_slots = int(rs_slots_for_budget(
-        geom, kRsSlotBudgetBytes,
+        geom, rs_slot_budget_bytes(),
         std::min(cfg.max_forward_requests, kPagedMaxForwardRequests)));
     // Bounded, actually allocated/bound multi-batch capacity.  The paged path
     // has no hidden ring fallback: every advertised row/request has an IO,
@@ -2550,6 +2951,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             load_plan,
             cfg.storage_page_size,
             cfg.stream_routed_experts,
+            cfg.max_ctx_tokens,
             &derr)) {
         if (err != nullptr) *err = "Metal forward setup failed: " + derr;
         return false;
@@ -2612,6 +3014,23 @@ std::uint32_t MetalExecutor::rs_slots() const {
 
 std::uint64_t MetalExecutor::rs_slot_bytes() const {
     return ready() ? impl_->rs_slot_bytes() : 0u;
+}
+
+std::uint32_t MetalExecutor::max_forward_tokens() const {
+    if (!ready()) return 0u;
+    // The paged qwen3.5 path binds its rows at setup and refuses a wider fire.
+    // The simple families replay a prompt internally and carry no such cap --
+    // their `DecodeGeometry::max_tokens` is the field's default 1, which is not
+    // a fire width, and reporting it would make a caller chunk a prompt one
+    // token at a time (measured: gpt-oss's 2048-token prefill fell from 755 to
+    // 89 tok/s).  0 means "no cap to respect", which is the truth for them.
+    if (impl_->is_simple()) {
+        const int rows = impl_->simple_engine()->paged()
+                             ? impl_->simple_engine()->max_rows()
+                             : 0;
+        return rows > 0 ? static_cast<std::uint32_t>(rows) : 0u;
+    }
+    return static_cast<std::uint32_t>(impl_->geometry().max_tokens);
 }
 
 std::uint64_t MetalExecutor::elastic_page_bytes() const {
@@ -3309,6 +3728,12 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         schedule, in, &batch_err, dispatch_callbacks);
     impl_->pending_logits_stage_.clear();
     if (!ran) {
+        // The only account of why a paged batch was refused. Without it the
+        // caller sees a poison epoch, and any PTIR group riding this forward
+        // reports lanes that never dispatched -- neither of which names the
+        // reason. The simple-family path already prints its rejections.
+        std::cerr << "[pie-driver-metal] paged batch forward rejected: "
+                  << batch_err << "\n";
         for (const std::size_t member : accepted_members) {
             errors[member] = batch_err;
         }
@@ -3568,7 +3993,7 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
     // Without it a question like "what bounds gpt-oss in a batch" can only be
     // answered from the outside, where the driver's time and the engine's are
     // added together.
-    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+    if constexpr (false) {
         static double gpu[33] = {};
         static double rep[33] = {};
         static double enc[33] = {};
@@ -3776,6 +4201,8 @@ bool MetalExecutor::ready() const { return false; }
 std::uint32_t MetalExecutor::vocab() const { return 0; }
 
 std::uint32_t MetalExecutor::rs_slots() const { return 0; }
+
+std::uint32_t MetalExecutor::max_forward_tokens() const { return 0; }
 
 std::uint64_t MetalExecutor::rs_slot_bytes() const { return 0; }
 std::uint64_t MetalExecutor::elastic_page_bytes() const { return 0; }

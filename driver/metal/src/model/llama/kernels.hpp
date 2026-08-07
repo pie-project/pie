@@ -16,10 +16,8 @@
 ///     (gpt-oss). Llama and every Qwen use 128, so that is one instantiation
 ///     each, not a kernel.
 ///   * `row_gather`, for the prefill tail.
-///   * the routed FFN, which is entirely borrowed: `router_topk` and
-///     `expert_combine` from `gptoss.metal` -- both generic, neither
-///     gpt-oss-specific -- and the unbiased routed matvec, which is
-///     `qmv_gptoss_impl` with BIASED off.
+///   * the routed FFN, built from the generic `moe_route.metal` kernels and
+///     the unbiased routed matvec (`qmv_gptoss_impl` with BIASED off).
 ///
 /// Notably NOT borrowed: `gptoss_swiglu`. That kernel bakes in gpt-oss's
 /// asymmetric clamp, its `alpha`, and its `(up + 1)` term. Qwen3-MoE uses plain
@@ -36,9 +34,7 @@
 
 namespace pie::metal::llama {
 
-// The routing kernels and their launch shapes are shared: `gptoss.metal` is
-// where they live, but nothing in `router_topk` or `expert_combine` is
-// gpt-oss-specific, and this family dispatches both.
+// Routing kernels and launch shapes are shared across every MoE family.
 using shared_kernels::ExpertCombineParams;
 using shared_kernels::MoeRouteParams;
 using shared_kernels::RouterParams;
@@ -84,10 +80,11 @@ struct LlamaPsos {
     Pso moe_sort{};
     Pso moe_gather{};
     Pso moe_combine{};
-    /// The routed matmul, one column tile per entry: bn 16, 32, 64. The row
-    /// tile does not vary -- `kMoeTileRows` is what the sort padded to, and a
-    /// second row tile would be a second thing for the sort to agree with.
-    Pso qmm_routed[3]{};
+    /// The routed matmul: one entry per (row tile, column tile), bn 16/32/64
+    /// at each of the two widths `moe_tile_rows` can pick. The row tile is
+    /// whatever the sort padded to and the two must agree, which is why both
+    /// are compiled rather than one chosen here.
+    Pso qmm_routed[3][3]{};  // [tile width][bn]
 
     bool dense_valid() const {
         return sdpa.valid() && sdpa_paged.valid() &&
@@ -99,7 +96,12 @@ struct LlamaPsos {
     bool moe_valid() const {
         return router_topk.valid() && qmv_routed.valid() &&
                moe_sort.valid() && moe_gather.valid() && moe_combine.valid() &&
-               qmm_routed[0].valid() && qmm_routed[1].valid() && qmm_routed[2].valid();
+               [&] {
+                   for (int t = 0; t < 3; ++t)
+                       for (int i = 0; i < 3; ++i)
+                           if (!qmm_routed[t][i].valid()) return false;
+                   return true;
+               }();
     }
     /// A dense checkpoint must not be held to the MoE PSOs: compiling them for
     /// a model that never dispatches them would make an unrelated shader error

@@ -10,6 +10,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -41,6 +42,12 @@
 
 namespace pie_cuda_driver {
 namespace {
+
+// Every candidate layout must hold at least this much KV, independent of the
+// request cap: below it a boot would admit so few sequences that admission and
+// eviction cannot recover. Named because the "no viable layout" diagnostic
+// reports it back to the operator.
+constexpr std::size_t kMinKvTokensFloor = 32768;
 
 std::size_t align_up(std::size_t n, std::size_t a) {
     return (n + a - 1) / a * a;
@@ -141,8 +148,13 @@ std::vector<std::string> planner_policy_profiles(const std::string& profile) {
     if (!is_auto_memory_profile(profile)) {
         return {profile};
     }
-    // `auto` is not a fifth concrete layout. It evaluates the concrete
-    // policy families and chooses by the unified objective below.
+    // `auto` is not a third concrete layout. It evaluates the concrete policy
+    // families and chooses by the unified objective below.
+    //
+    // Four families, three nameable profiles: "balanced" and "capacity" stay
+    // in this search but can no longer be pinned from config. Keeping them
+    // here is what makes the value reduction free -- `auto` is the default, so
+    // narrowing its search would have changed what every deployment does.
     return {"latency", "balanced", "throughput", "capacity"};
 }
 
@@ -164,11 +176,10 @@ std::vector<int> derive_kv_page_size_candidates(
     const pie_cuda_driver::Config& cfg,
     const pie_cuda_driver::HfConfig& /*hf*/,
     const cudaDeviceProp& /*prop*/) {
-    if (const char* forced = std::getenv("PIE_CUDA_KV_PAGE_SIZE")) {
-        const int v = std::atoi(forced);
-        if (v > 0) {
-            return {v};
-        }
+    // A pinned page size is a single-candidate lattice: the operator has
+    // already made the choice this search exists to make.
+    if (cfg.batching.kv_page_size > 0) {
+        return {static_cast<int>(cfg.batching.kv_page_size)};
     }
     std::vector<int> xs;
     const int tp_size = std::max(1, cfg.distributed.tp_size);
@@ -258,15 +269,6 @@ int prefill_candidate_cap(const cudaDeviceProp& prop) {
     return prop.major >= 12 ? 16384 : 8192;
 }
 
-int forced_prefill_tokens() {
-    static const int tokens = [] {
-        const char* v = std::getenv("PIE_CUDA_PREFILL_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 0;
-        return std::max(0, std::atoi(v));
-    }();
-    return tokens;
-}
-
 
 }  // namespace
 
@@ -288,6 +290,7 @@ CudaMemoryPlan plan_cuda_memory(
     int max_Hk,
     bool gemma4_selected,
     const std::vector<int>& gemma4_per_layer_head_dim,
+    const std::vector<int>& gemma4_per_layer_num_kv_heads,
     const std::vector<int>& gemma4_kv_source_layer,
     bool qwen3_5_selected,
     bool qwen3_5_moe_selected,
@@ -327,6 +330,9 @@ CudaMemoryPlan plan_cuda_memory(
             std::to_string(safety / (1024 * 1024)) + " MiB");
     }
     const std::size_t budget = usable - current_used - safety;
+    // Published before anything reads it, so a calibration sweep can record the
+    // budget it ran inside alongside the shape it chose.
+    set_planner_budget_bytes(budget);
 
     const int tp_size = std::max(1, cfg.distributed.tp_size);
     const bool auto_profile = is_auto_memory_profile(cfg.batching.memory_profile);
@@ -338,6 +344,9 @@ CudaMemoryPlan plan_cuda_memory(
         policy_profiles = {"latency"};
     }
     const bool score_as_auto = auto_profile && !narrow_latency_auto;
+    // Read once: this boot either measures or serves, and the answer decides
+    // both which candidates exist and which one gets built.
+    const bool calibrating = planner_calibration_requested();
     const std::vector<int> kv_page_sizes =
         derive_kv_page_size_candidates(cfg, hf, prop);
 
@@ -357,6 +366,7 @@ CudaMemoryPlan plan_cuda_memory(
                           kv_format, 1, 1, 1)
             : gemma4_selected
             ? pie_cuda_driver::kv_page_bytes_per_layer(hf, gemma4_per_layer_head_dim,
+                                      gemma4_per_layer_num_kv_heads,
                                       gemma4_kv_source_layer, tp_size,
                                       kv_format)
             : nemotron_h_selected
@@ -373,7 +383,7 @@ CudaMemoryPlan plan_cuda_memory(
         global_per_kv_token_bytes >= 192ull * 1024ull;
     const int auto_decode_target =
         std::min(kv_heavy_auto_model ? 256 : 512, throughput_decode_target);
-    const int forced_prefill = forced_prefill_tokens();
+    constexpr int forced_prefill = 0;
     // Qwen3-8B on L40-class TP1 has a measured prefill-shape knee above the
     // generic 8k cap: 12k keeps the initial 512-request prompt wave in a
     // faster two-chunk cadence without shrinking decode residency below R=512.
@@ -507,8 +517,39 @@ CudaMemoryPlan plan_cuda_memory(
     if (policy_profile == "latency") {
         Rs.push_back(std::max(1, decode_target / 4));
     }
-    uniq_clip_desc(Ns, prefill_cap);
+    // A calibration boot searches the space the DEVICE allows, not the space
+    // the score prefers. `Ns` and `Rs` above are generated from this profile's
+    // targets and then clipped by `prefill_cap` -- which is the analytic model
+    // both proposing the candidates and bounding them, so a measurement taken
+    // inside it can trim the model's answer but never overrule it. That is the
+    // circularity: `prefer_qwen3_8b_prefill_shape` claims the budget should be
+    // HIGHER than the generic cap, and a sweep confined below the cap cannot
+    // evaluate that claim in either direction.
+    //
+    // So widen both ladders to a geometric sweep and let the only real
+    // boundary do the cutting: `arena + persistent_bytes >= budget` below,
+    // which is memory, not preference.
+    if (calibrating) {
+        for (int n = 256; n <= 131072; n *= 2) Ns.push_back(n);
+        for (int r = 16; r <= 4096; r *= 2) Rs.push_back(r);
+    }
+    uniq_clip_desc(Ns, calibrating ? 131072 : prefill_cap);
     uniq_clip_desc(Rs, 4096);
+
+    // A pinned axis is a single-candidate lattice. This is the point of
+    // `pie config tune` writing what it measured: with the shape pinned,
+    // the analytic score and every per-(model, GPU) special case below stop
+    // running at all, because there is nothing left for them to choose between.
+    //
+    // Not honoured during a calibration boot -- that boot exists to search, and
+    // seeding a search from its own previous answer makes the value a one-way
+    // ratchet. Same argument as the profile cache at the bottom of this file.
+    if (!calibrating && cfg.batching.max_forward_tokens > 0) {
+        Ns.assign(1, static_cast<int>(cfg.batching.max_forward_tokens));
+    }
+    if (!calibrating && cfg.batching.max_forward_requests > 0) {
+        Rs.assign(1, static_cast<int>(cfg.batching.max_forward_requests));
+    }
     // Quest key envelopes are `[num_pages, kv_heads, head_dim]` bf16 x2 per
     // layer, i.e. per PAGE rather than per token, so they do not scale with
     // `kv_page_size`. They live in the same arena as the pages and must be
@@ -585,7 +626,7 @@ CudaMemoryPlan plan_cuda_memory(
             }
             const std::size_t attn_float_bytes =
                 pie_cuda_driver::attention_float_workspace_bytes(
-                    hf, cfg, prop);
+                    hf, cfg, prop, N, R0);
             arena += attn_float_bytes;     // AttentionWorkspace float section
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
             const std::size_t persistent_bytes =
@@ -639,8 +680,25 @@ CudaMemoryPlan plan_cuda_memory(
                               : 608.0;
             const double score_kv_horizon =
                 score_as_auto ? (low_horizon_kv_heavy ? 384.0 : 544.0) : 608.0;
+            // `kMinKvTokensFloor` is the absolute half of the viability
+            // floor, in context tokens. `kv_tokens` is a function of the budget and the page size only —
+            // no term of the (N, R) shape enters it — so this absolute floor
+            // cannot choose between candidates. It either admits every shape
+            // or refuses the model outright, and refusing is what it does to
+            // a KV-heavy architecture: gemma-4-31B spends 1120 KiB per context
+            // token across its 60 layers, so 32768 tokens is 35 GiB of KV,
+            // which no budget on an 80 GiB card can reach once the model's
+            // 58 GiB of weights are resident. The driver then declines a model
+            // it can otherwise serve, with an error naming a budget the
+            // operator cannot raise far enough to matter.
+            //
+            // Clamp it to what the budget can actually supply. Nothing changes
+            // for a model that can reach 32768 tokens; one that cannot now
+            // plans instead of failing, and the `R * min_kv_horizon` term
+            // below — the shape-aware half of this floor — still rejects a
+            // decode width that this KV pool would starve.
             const std::size_t min_kv_tokens = std::max<std::size_t>(
-                32768,
+                std::min<std::size_t>(kMinKvTokensFloor, kv_tokens),
                 static_cast<std::size_t>(
                     std::ceil(static_cast<double>(R) * min_kv_horizon)));
             if (kv_tokens < min_kv_tokens) continue;
@@ -833,9 +891,60 @@ CudaMemoryPlan plan_cuda_memory(
     }
 
     if (candidates.empty()) {
-        throw std::runtime_error(
+        std::string why =
             "cuda memory planner: no viable forward/KV layout fits budget " +
-            std::to_string(budget / (1024 * 1024)) + " MiB");
+            std::to_string(budget / (1024 * 1024)) + " MiB";
+        // Which of the lattice's filters emptied it is not recoverable from
+        // the message otherwise, and the KV side is the one an operator can
+        // act on: the surviving floor is `decode width x horizon`, so a
+        // KV-heavy checkpoint fails here when even the narrowest decode shape
+        // the ladder offers cannot be kept resident.
+        const std::size_t kv_tokens_at_budget =
+            per_kv_token_bytes > 0 ? budget / per_kv_token_bytes : 0;
+        why += " (per-token KV " +
+               std::to_string(per_kv_token_bytes / 1024) + " KiB — at most " +
+               std::to_string(kv_tokens_at_budget) +
+               " KV tokens in this budget)";
+        // A pin is the likeliest reason a lattice that normally has hundreds of
+        // candidates has none -- and the operator can act on that, where they
+        // cannot act on "no layout fits".
+        if (cfg.batching.max_forward_tokens > 0 ||
+            cfg.batching.max_forward_requests > 0) {
+            why +=
+                ". [driver] max_forward_tokens/max_forward_requests pin the "
+                "shape to a single candidate; unset them to let the planner "
+                "choose, or re-run `pie config tune` on this machine";
+        } else if (per_kv_token_bytes > 0) {
+            // Unpinned, the usual reason is simply that the weights left too
+            // little behind to clear the KV floor every candidate must meet.
+            // "No layout fits" is not something an operator can act on; the
+            // shortfall and the utilization that would cover it are.
+            const std::size_t have_tokens = budget / per_kv_token_bytes;
+            const std::size_t need_bytes =
+                kMinKvTokensFloor * per_kv_token_bytes;
+            // Round the advice UP to the next hundredth: truncating it hands
+            // back a utilization that still lands under the floor, which is
+            // worse than no advice at all.
+            const double need_util =
+                total_bytes > 0
+                    ? std::ceil(
+                          static_cast<double>(
+                              need_bytes + current_used + safety) /
+                          static_cast<double>(total_bytes) * 100.0) / 100.0
+                    : 0.0;
+            char util_text[8] = {};
+            std::snprintf(util_text, sizeof(util_text), "%.2f", need_util);
+            why += ". KV needs " +
+                   std::to_string(per_kv_token_bytes / 1024) +
+                   " KiB/token, so this budget holds ~" +
+                   std::to_string(have_tokens) + " tokens, short of the "
+                   + std::to_string(kMinKvTokensFloor) + " a layout wants "
+                   "before its decode width is the binding term. Raise [driver] gpu_mem_utilization (>= " +
+                   std::string(util_text) +
+                   " here), shrink the weights (`kv_cache_dtype`/quantization), "
+                   "or add a GPU";
+        }
+        throw std::runtime_error(why);
     }
 
     // A measured shape beats a scored one. `calibrate_memory_planner` times the
@@ -859,7 +968,7 @@ CudaMemoryPlan plan_cuda_memory(
         auto_profile && forced_prefill == 0 && !planner_calibration_requested();
     if (use_profile_cache) {
         std::string cache_error;
-        const auto measured =
+        auto measured =
             planner_profile_cache_lookup(
                 make_planner_profile_key(prop, hf, tp_size, kv_format),
                 &cache_error);
@@ -867,6 +976,32 @@ CudaMemoryPlan plan_cuda_memory(
             std::cerr << "[pie-driver-cuda] memory planner: ignored profile "
                       << "cache " << planner_profile_cache_path().string()
                       << ": " << cache_error << "\n";
+        }
+        // A shape is only an answer to the budget it was measured under. The
+        // key pins the device and the model, and neither notices that this boot
+        // has materially more or less memory to give than the sweep did --
+        // another process holding VRAM, or a checkpoint requantized offline by
+        // `pie model build`. Left unchecked this fails in the quiet
+        // direction: with a LARGER budget the measured shape is still feasible,
+        // so it is selected, and the extra memory is simply never used.
+        if (measured.has_value() && measured->budget_bytes > 0) {
+            const double drift =
+                std::abs(static_cast<double>(budget) -
+                         static_cast<double>(measured->budget_bytes)) /
+                static_cast<double>(measured->budget_bytes);
+            if (drift > kPlannerBudgetTolerance) {
+                std::cerr << "[pie-driver-cuda] memory planner: profile cache "
+                          << "was measured against a "
+                          << (measured->budget_bytes / (1024 * 1024))
+                          << " MiB budget and this boot has "
+                          << (budget / (1024 * 1024)) << " MiB ("
+                          << static_cast<int>(drift * 100.0)
+                          << "% apart); the measurement does not describe this "
+                          << "machine, so the scored rule decides. Re-run "
+                          << "`pie config tune` if the change is "
+                          << "permanent, or free the device if it is not.\n";
+                measured.reset();
+            }
         }
         if (measured.has_value()) {
             for (auto it = candidates.begin(); it != candidates.end(); ++it) {                if (!measured->policy_profile.empty() &&
@@ -908,6 +1043,54 @@ CudaMemoryPlan plan_cuda_memory(
             }
         }
     }
+    // A calibration boot builds the CEILING of the feasible region rather than
+    // the score's pick, because a bigger arena can run a smaller shape and not
+    // the other way round. With the ceiling built, the sweep's downward-only
+    // ladder stops being a restriction and becomes the correct direction.
+    //
+    // The ceiling is the largest explorable rectangle: the sweep runs shapes
+    // with `requests <= max_requests` and `tokens <= max_workspace_tokens`, so
+    // the box it can cover is the product. This is one point on a frontier, not
+    // the frontier -- a taller box is a narrower one -- and covering the whole
+    // frontier would take more than one calibration boot. Worth saying rather
+    // than implying.
+    //
+    // The small KV pool this leaves is free here: a calibration boot serves
+    // nothing, so pages it does not have are pages nothing wanted.
+    if (calibrating) {
+        best_it = std::max_element(
+            candidates.begin(), candidates.end(),
+            [](const Candidate& a, const Candidate& b) {
+                const auto area = [](const Candidate& c) {
+                    return static_cast<std::int64_t>(c.plan.max_workspace_tokens) *
+                           static_cast<std::int64_t>(c.plan.max_requests);
+                };
+                return area(a) < area(b);
+            });
+        std::cerr << "[pie-driver-cuda] memory planner: calibration boot -- "
+                  << candidates.size() << " candidates fit the "
+                  << (budget / (1024 * 1024)) << " MiB budget; building the "
+                  << "largest at N=" << best_it->plan.max_workspace_tokens
+                  << " R=" << best_it->plan.max_requests
+                  << " page_size=" << best_it->plan.kv_page_size
+                  << " (score would have picked N="
+                  << std::max_element(
+                         candidates.begin(), candidates.end(),
+                         [](const Candidate& a, const Candidate& b) {
+                             return a.score < b.score;
+                         })->plan.max_workspace_tokens
+                  << ")\n";
+        // The paragraph above justifies the starved KV pool with "a
+        // calibration boot serves nothing" -- and nothing in this process
+        // enforces that. Calibration does not exit; when it is done this
+        // arena is what serves. Say so here, because the symptom on the far
+        // side (a small page pool, and the sweep's seconds on every start)
+        // reads as a hardware limit rather than as a flag left on.
+        std::cerr << "[pie-driver-cuda] memory planner: this arena is built to "
+                     "be MEASURED, not to serve -- its KV pool is the smallest "
+                     "the largest forward shape leaves. Unset [driver] "
+                     "calibrate_planner before serving from this config.\n";
+    }
     if (best_it == candidates.end()) {
         if (prefer_qwen3_8b_prefill_shape) {
             const int preferred_tokens = prefill_cap;
@@ -937,8 +1120,8 @@ CudaMemoryPlan plan_cuda_memory(
     // Planner introspection: the selected plan alone cannot tell you WHY it
     // won, nor what the score-ranked runner-up was. Both are needed to judge
     // whether an override is load-bearing or dead weight.
-    if (const char* dump = std::getenv("PIE_CUDA_PLANNER_DUMP")) {
-        const int want = std::max(1, std::atoi(dump));
+    if constexpr (false) {
+        const int want = 1;
         std::vector<const Candidate*> ranked;
         ranked.reserve(candidates.size());
         for (const auto& c : candidates) ranked.push_back(&c);

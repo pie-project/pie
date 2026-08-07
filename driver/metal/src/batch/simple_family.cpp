@@ -208,6 +208,24 @@ std::vector<std::size_t> g4_pool_elems(const std::vector<gemma4::Dispatch>& dag,
     return elems;
 }
 
+/// Whether a tap dump has to give every value its own pool buffer.
+///
+/// Not simply "are taps on". A dump normally colours `no_recycle` so a later
+/// dispatch cannot overwrite the value being published -- but that CHANGES THE
+/// PROGRAM, and a bug that only shows up when two values share a buffer then
+/// cannot be dumped at all, which is precisely the shape of bug a dump is most
+/// wanted for. `PIE_METAL_TAPS_RECYCLE` is the escape hatch, and honouring it
+/// is the difference between being able to bisect such a bug and not.
+///
+/// `forward.cpp` has always honoured it; the five call sites below did not, so
+/// the hatch silently did nothing for gemma4, gpt-oss and llama -- the three
+/// families whose fleet decodes are the only place the open wrong-answer bugs
+/// reproduce. Reading the flag in one place is what keeps the two paths from
+/// drifting apart again.
+static bool taps_no_recycle() {
+    return golden_taps_enabled() && !golden_taps_recycle();
+}
+
 /// Publish every tapped value in a DAG under `PIE_METAL_GOLDEN_DIR`.
 ///
 /// Only a colour's FINAL writer is named. The in-place kinds (the ropes above
@@ -323,22 +341,54 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             return false;
         }
 
-        // The dense FFN's format, read off the checkpoint rather than the
-        // config: mlx-lm's quantization predicate can single out tensors by
-        // NAME, and `config.json` records only the model-wide choice. Asked
-        // here because the PSO tables are built below and need the answer.
+        // The dense FFN's and the router's formats, read off the checkpoint
+        // rather than the config: mlx-lm's quantization predicate can single
+        // out tensors by NAME, and `config.json` records only the model-wide
+        // choice. Asked here because the PSO tables are built below and need
+        // the answer.
+        //
+        // Both groups, separately. They used to be one question answered by
+        // `mlp.down_proj` alone, on the assumption that a checkpoint sparing
+        // one spares the other -- true of lmstudio-community's QAT build and
+        // false of mlx-community's, which spares only the router. The router
+        // then ran the 4-bit pipeline over its 8-bit bytes and produced logits
+        // at cosine 0.10 to mlx-lm's, with every tensor feeding them at 0.9999.
         {
             const auto view = load_plan.view();
-            for (std::size_t i = 0; i < view.tensors.len; ++i) {
-                const auto& t = view.tensors.ptr[i];
-                const std::string name(reinterpret_cast<const char*>(t.name.ptr), t.name.len);
-                if (name.find("mlp.down_proj.weight") == std::string::npos) continue;
-                const int bits = int(t.quant_bits_per_element);
-                const int group = int(t.quant_group_size);
-                if (bits != g_.quant.bits || group != g_.quant.group) {
-                    g_.ffn_quant = AffineFormat{bits, group};
+            const auto format_of = [&](const char* suffix) -> AffineFormat {
+                for (std::size_t i = 0; i < view.tensors.len; ++i) {
+                    const auto& t = view.tensors.ptr[i];
+                    const std::string name(reinterpret_cast<const char*>(t.name.ptr),
+                                           t.name.len);
+                    if (name.find(suffix) == std::string::npos) continue;
+                    return AffineFormat{int(t.quant_bits_per_element),
+                                        int(t.quant_group_size)};
                 }
-                break;
+                return AffineFormat{0, 0};
+            };
+            const AffineFormat ffn = format_of("mlp.down_proj.weight");
+            const AffineFormat router = format_of("router.proj.weight");
+            const auto differs = [&](const AffineFormat& f) {
+                return f.bits != 0 && f.group != 0 &&
+                       (f.bits != g_.quant.bits || f.group != g_.quant.group);
+            };
+            g_.alt_quant_ffn = differs(ffn);
+            g_.alt_quant_router = differs(router);
+            if (g_.alt_quant_ffn) g_.ffn_quant = ffn;
+            if (g_.alt_quant_router) g_.ffn_quant = router;
+            // One alternate format is all there are pipelines for. Two would
+            // need a third table, and guessing which of them to build is how a
+            // dispatch ends up on a pipeline for someone else's bytes.
+            if (g_.alt_quant_ffn && g_.alt_quant_router &&
+                (ffn.bits != router.bits || ffn.group != router.group)) {
+                if (err) {
+                    *err = "gemma4: the dense FFN is " + std::to_string(ffn.bits) +
+                           "-bit at group " + std::to_string(ffn.group) + " and the router " +
+                           std::to_string(router.bits) + "-bit at group " +
+                           std::to_string(router.group) +
+                           ", and this driver builds one alternate pipeline table";
+                }
+                return false;
             }
         }
 
@@ -367,7 +417,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         const gemma4::ScratchPlan& sp = plan_;
         // Under a tap dump every value needs its own buffer, or a later
         // dispatch overwrites the one being read.
-        coloring_ = gemma4::color_gemma4_scratch(dag_, sp, /*no_recycle=*/golden_taps_enabled());
+        coloring_ = gemma4::color_gemma4_scratch(dag_, sp, /*no_recycle=*/taps_no_recycle());
         if (!coloring_.hazard_free) {
             if (err) *err = "gemma4's activation colouring is not hazard-free";
             return false;
@@ -412,13 +462,15 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
 
         if (!gemma4::build_gemma4_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/false, err,
-                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false)) {
+        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, err)) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/true, err,
-                                  /*routed=*/false)) {
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, g_.quant, err,
+                MultiBatchPsoFeatures{
+                    .d512 = true, .sdpa_d256 = true,
+                    .fp16_precast = g_.quant.bits == 4 &&
+                                    g_.quant.group == 64})) {
             return false;
         }
         // A checkpoint may quantize the dense FFN and the router at a DIFFERENT
@@ -428,18 +480,40 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         // `gemma4_uses_alt_quant` picks between them per dispatch. One table for
         // both would run a 4-bit kernel over 8-bit bytes: fast, and wrong.
         if (g_.has_alt_quant()) {
-            if (!load_decode_psos(ctx, kernels_dir, base_alt_, g_.ffn_quant,
-                                  /*with_argmax=*/false, err, /*fuse_residual=*/false,
-                                  /*gdn_prep=*/false, /*routed=*/false, /*untied=*/false)) {
+            if (!load_decode_psos(ctx, kernels_dir, base_alt_, g_.ffn_quant, err)) {
                 return false;
             }
-            if (!load_multibatch_psos(ctx, kernels_dir, mb_alt_, g_.ffn_quant,
-                                      /*with_d512=*/true, err, /*routed=*/false)) {
+            if (!load_multibatch_psos(
+                    ctx, kernels_dir, mb_alt_, g_.ffn_quant, err,
+                    MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
                 return false;
             }
         }
 
+        if (g_.quant.bits == 4 && g_.quant.group == 64) {
+            // The widest input any staged projection reads, times the rows the
+            // GEMM rounds up to. Asked of the DAG rather than of the geometry
+            // because gemma4's `o_proj` K is per-layer -- a sliding layer's is
+            // 8x256 where a full layer's is 8x512, and only one of those is
+            // `hidden`.
+            std::size_t widest = 0;
+            for (const gemma4::Dispatch& d : dag_) {
+                if (!gemma4::gemma4_fp16_qmm(g_, d, max_rows_)) continue;
+                widest = std::max(widest, std::size_t(gemma4::qmv_kn(d.kind, g_, d.layer).K));
+            }
+            if (widest > 0) {
+                const std::size_t elems =
+                    std::size_t(gemma4::gemma4_qmm_pool_rows(max_rows_)) * widest;
+                fp16_input_ = ctx.heap_alloc(elems * sizeof(std::uint16_t));
+                if (!fp16_input_.valid()) {
+                    if (err) *err = "gemma4 FP16 QMM input allocation failed";
+                    return false;
+                }
+            }
+        }
         gemma4::bind_gemma4_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
+        gemma4::bind_gemma4_fp16_qmm(ctx, dag_, g_, /*rows=*/1, /*head_rows=*/1,
+                                     fp16_input_, fp16_keep_);
         bound_rows_ = 1;
         bound_head_rows_ = 1;
         try {
@@ -546,17 +620,28 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
         if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
             gemma4::bind_gemma4_consts(ctx, dag_, g_, rows, /*paged=*/true, head_rows);
+            // The staged element count is a row count, so it moves with the
+            // fire. Rebound here and not in the encoder: the encoder writes a
+            // command buffer, and this writes an argument table.
+            gemma4::bind_gemma4_fp16_qmm(ctx, dag_, g_, rows, head_rows, fp16_input_,
+                                         fp16_keep_);
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
-        const auto walk = [this, rows, head_rows, &pre, &post](StepEncoder& se,
-                                                               std::size_t begin,
-                                                               std::size_t end) {
+        // Rows alone cannot tell a prefill from a fleet of decodes -- both can
+        // be 32 rows. The CSR can: `qo_indptr` is one entry per request plus a
+        // terminator.
+        const int requests =
+            csr.qo_indptr.empty() ? 0 : int(csr.qo_indptr.size()) - 1;
+        const auto walk = [this, rows, head_rows, requests, &pre, &post](StepEncoder& se,
+                                                                        std::size_t begin,
+                                                                        std::size_t end) {
             if (begin == 0 && pre) pre(se);
             gemma4::encode_gemma4_step_mb(se, dag_, g_, rows, base_, mb_, psos_,
                                           /*ordinal_base=*/0, head_rows,
                                           g_.has_alt_quant() ? &base_alt_ : nullptr,
-                                          g_.has_alt_quant() ? &mb_alt_ : nullptr, begin, end);
+                                          g_.has_alt_quant() ? &mb_alt_ : nullptr,
+                                          requests, begin, end);
             if (end == dag_.size() && post) post(se);
         };
         if (paging_.active()) return paging_.fire(ctx, rows, walk);
@@ -633,6 +718,10 @@ class Gemma4Engine final : public SimpleFamilyEngine {
     /// has a second affine format.
     DecodeStepPsos base_alt_{};
     MultiBatchPsos mb_alt_{};
+    // The FP16 staging buffer every dense projection's GEMM reads, and the
+    // element-count buffers the staging pass bounds itself with.
+    SlotHandle fp16_input_{};
+    std::vector<SlotHandle> fp16_keep_{};
     std::vector<SlotHandle> kpages_{};
     std::vector<SlotHandle> vpages_{};
     SlotHandle logits_{};
@@ -677,9 +766,30 @@ bool go_tap_for(const gptoss::Dispatch& d, const GptOssGeometry& g, GoTap& out) 
 void dump_go_taps(const std::vector<gptoss::Dispatch>& dag, const GptOssGeometry& g,
                   const gptoss::ScratchColoring& col, const std::vector<SlotHandle>& pool,
                   const SlotHandle& logits, int rows, int head_rows) {
+    std::vector<const std::int32_t*> perm_of(std::size_t(g.n_layers), nullptr);
+    for (std::size_t di = 0; di < dag.size() && di < col.per_dispatch.size(); ++di) {
+        const gptoss::Dispatch& d = dag[di];
+        if (d.kind != gptoss::Kind::ExpertSort || d.layer < 0) continue;
+        for (const auto& sb : col.per_dispatch[di]) {
+            if (sb.bind_index != (std::uint8_t)bind::MoeRouteSort::Perm) continue;
+            if (sb.color < 0 || std::size_t(sb.color) >= pool.size()) continue;
+            perm_of[std::size_t(d.layer)] =
+                static_cast<const std::int32_t*>(pool[std::size_t(sb.color)].contents());
+        }
+    }
     dump_taps_from(
         dag, col, pool, logits, rows, head_rows,
-        [&](const gptoss::Dispatch& d, Tap& t) { return go_tap_for(d, g, t); },
+        [&](const gptoss::Dispatch& d, Tap& t) {
+            if (!go_tap_for(d, g, t)) return false;
+            if (gptoss::is_expert_sorted(d.kind) && d.layer >= 0 &&
+                std::size_t(d.layer) < perm_of.size() &&
+                perm_of[std::size_t(d.layer)] != nullptr) {
+                t.perm = perm_of[std::size_t(d.layer)];
+                t.perm_rows = gptoss::gptoss_moe_sorted_rows(g, rows);
+                t.slots = g.experts_per_token;
+            }
+            return true;
+        },
         [](const gptoss::Dispatch& d) { return gptoss::is_tail(d.kind); });
 }
 
@@ -700,6 +810,10 @@ int go_kind_width(gptoss::Kind k, const GptOssGeometry& g) {
         case K::RouterGemv:               return std::max(g.hidden, g.n_experts);
         // The ids are 4-byte ints, so they count double against a bf16 slot.
         case K::RouterTopK:               return std::max(g.n_experts, 2 * g.experts_per_token);
+        case K::ExpertSort:               return 2 * g.experts_per_token;
+        case K::ExpertGather:             return g.hidden;
+        // The exact sorted-row extent is applied in `go_pool_elems`; these are
+        // the per-row widths used for the M=1 floor.
         case K::ExpertGate: case K::ExpertUp: return std::max(g.hidden, stack);
         case K::ExpertSwiGlu:             return stack;
         case K::ExpertDown:               return std::max(stack, down);
@@ -733,8 +847,37 @@ std::vector<std::size_t> go_pool_elems(const std::vector<gptoss::Dispatch>& dag,
         // The tail's tensors have one row per SAMPLED row; the body's have one
         // per token.
         const bool tail = gptoss::is_tail(kind);
-        const std::size_t need = std::size_t(tail ? head_rows : rows) *
-                                 std::size_t(go_kind_width(kind, g));
+        const std::size_t sorted =
+            std::size_t(gptoss::gptoss_moe_sorted_rows(g, rows));
+        std::size_t need = std::size_t(tail ? head_rows : rows) *
+                           std::size_t(go_kind_width(kind, g));
+        switch (kind) {
+            case K::ExpertSort:
+                need = 2 * std::max(sorted,
+                                    std::size_t(rows * g.experts_per_token));
+                break;
+            case K::ExpertGather:
+                need = sorted * std::size_t(g.hidden);
+                break;
+            case K::ExpertGate:
+            case K::ExpertUp:
+                need = sorted *
+                       std::size_t(std::max(g.hidden, g.intermediate));
+                break;
+            case K::ExpertSwiGlu:
+                need = sorted * std::size_t(g.intermediate);
+                break;
+            case K::ExpertDown:
+                need = sorted *
+                       std::size_t(std::max(g.intermediate, g.hidden));
+                break;
+            case K::ExpertCombine:
+                need = std::max(sorted * std::size_t(g.hidden),
+                                std::size_t(rows) * std::size_t(g.hidden));
+                break;
+            default:
+                break;
+        }
         for (const auto& sb : col.per_dispatch[di]) {
             if (sb.color < 0 || sb.color >= col.colors_used) continue;
             elems[std::size_t(sb.color)] = std::max(elems[std::size_t(sb.color)], need);
@@ -792,12 +935,20 @@ class GptOssEngine final : public SimpleFamilyEngine {
             }
             return false;
         }
+        // And the projections', which is a third width again -- refused on the
+        // same grounds, because reading 8-bit rows with a 4-bit matvec is the
+        // failure that produces fluent noise rather than an error.
+        g_.proj_bits = gptoss::proj_bits_from_weights(b_.weights);
+        if (g_.proj_bits == 0) {
+            if (err) {
+                *err = "gpt-oss: could not solve the projections' quantization width from "
+                       "`layers.0.self_attn.q_proj.{weight,scales}`";
+            }
+            return false;
+        }
 
-        // Paged KV. gpt-oss has no M>1 path -- its MoE picks experts per ROW,
-        // so a batched routed matmul is a different kernel rather than a wider
-        // launch -- but paging is orthogonal to that: what it buys is SEVERAL
-        // SEQUENCES, each attending its own page list, instead of one ring that
-        // the second sequence clobbers.
+        // Paged KV. The sorted MoE is a true M>1 path: rows are grouped by
+        // expert, then the native MXFP4 routed GEMM serves each run.
         g_.paged_kv_enabled = true;
         g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : 32;
         const int ps = g_.kv_page_size;
@@ -828,7 +979,7 @@ class GptOssEngine final : public SimpleFamilyEngine {
         const gptoss::ScratchPlan& sp = plan_;
         // Under a tap dump every value needs its own buffer, or a later
         // dispatch overwrites the one being read.
-        coloring_ = gptoss::color_gptoss_scratch(dag_, sp, /*no_recycle=*/golden_taps_enabled());
+        coloring_ = gptoss::color_gptoss_scratch(dag_, sp, /*no_recycle=*/taps_no_recycle());
         if (!coloring_.hazard_free) {
             if (err) *err = "gpt-oss's activation colouring is not hazard-free";
             return false;
@@ -864,19 +1015,48 @@ class GptOssEngine final : public SimpleFamilyEngine {
         }
 
         if (!gptoss::build_gptoss_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        // b4/g64, NOT the (mxfp4, 32) pair gpt-oss's config declares globally.
+        // The checkpoint's projection width at g64, NOT the (mxfp4, 32) pair
+        // gpt-oss's config declares globally.
         // That global is overridden back to affine g64 by nearly every tensor,
         // and this shared table only ever compiles the affine entrypoints --
         // gpt-oss's own mxfp4 kernels are named explicitly in `gptoss/kernels.cpp`.
-        // This used to be the parameter's default, which meant the driver was
-        // making the same choice without saying so.
-        const AffineFormat kGptOssBase{/*bits=*/4, /*group=*/64};
-        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, /*with_argmax=*/false, err))
+        // The width used to be a literal 4 here, which was right for a
+        // uniformly-4-bit checkpoint and silently wrong for a mixed one --
+        // and this table builds the PREFILL GEMMs, so it was the more
+        // damaging of the two hardcodings.
+        const AffineFormat kGptOssBase{/*bits=*/g_.proj_bits, /*group=*/64};
+        if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, err))
             return false;
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, kGptOssBase, /*with_d512=*/false, err))
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, kGptOssBase, err,
+                MultiBatchPsoFeatures{.bias = true,
+                                      .fp16_precast = fp16_qmm() && g_.proj_bits == 4}))
             return false;
 
+        // One buffer for every staged projection, sized at the widest input any
+        // of them reads times the rows the GEMM rounds up to. Asked of the DAG
+        // rather than of the geometry so that a checkpoint whose projections are
+        // not all eligible sizes it from the ones that are.
+        if (fp16_qmm() && g_.proj_bits == 4) {
+            std::size_t widest = 0;
+            for (const gptoss::Dispatch& d : dag_) {
+                if (!gptoss::gptoss_fp16_qmm(g_, d.kind, max_rows_)) continue;
+                widest = std::max(widest, std::size_t(gptoss::qmv_kn(d.kind, g_).K));
+            }
+            if (widest > 0) {
+                const std::size_t elems =
+                    std::size_t(gptoss::gptoss_qmm_pool_rows(max_rows_)) * widest;
+                fp16_input_ = ctx.heap_alloc(elems * sizeof(std::uint16_t));
+                if (!fp16_input_.valid()) {
+                    if (err) *err = "gpt-oss FP16 QMM input allocation failed";
+                    return false;
+                }
+            }
+        }
+
         gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
+        gptoss::bind_gptoss_fp16_qmm(ctx, dag_, g_, /*rows=*/1, /*head_rows=*/1,
+                                     fp16_input_, fp16_keep_);
         bound_rows_ = 1;
         bound_head_rows_ = 1;
         try {
@@ -932,10 +1112,9 @@ class GptOssEngine final : public SimpleFamilyEngine {
     }
 
     bool paged() const override { return true; }
-    /// A fire of R rows is R PASSES, not one wider one: gpt-oss has no M>1
-    /// path, because its MoE picks experts per row. So the row budget costs
-    /// time rather than memory, and what paging buys is that those passes may
-    /// belong to different sequences.
+    /// A fire of R rows is one wider pass. The routed bank sorts its
+    /// (row, expert) pairs before the GEMM, while paging keeps each request's
+    /// KV history independent.
     int max_rows() const override { return max_rows_; }
     int max_sampled_rows() const override { return max_sampled_; }
     int page_size() const override { return g_.kv_page_size; }
@@ -968,15 +1147,26 @@ class GptOssEngine final : public SimpleFamilyEngine {
         }
         if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
             gptoss::bind_gptoss_consts(ctx, dag_, g_, rows, /*paged=*/true, head_rows);
+            // The staged element count is a row count, so it moves with the
+            // fire. Rebound here and not in the encoder: the encoder writes a
+            // command buffer, and this writes an argument table.
+            gptoss::bind_gptoss_fp16_qmm(ctx, dag_, g_, rows, head_rows, fp16_input_,
+                                         fp16_keep_);
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
-        const auto walk = [this, rows, head_rows, &pre, &post](StepEncoder& se,
-                                                               std::size_t begin,
-                                                               std::size_t end) {
+        // Rows alone cannot tell a prefill from a fleet of decodes -- both can
+        // be 32 rows. The CSR can: `qo_indptr` is one entry per request plus a
+        // terminator.
+        const int requests =
+            csr.qo_indptr.empty() ? 0 : int(csr.qo_indptr.size()) - 1;
+        const auto walk = [this, rows, head_rows, requests, &pre, &post](StepEncoder& se,
+                                                                        std::size_t begin,
+                                                                        std::size_t end) {
             if (begin == 0 && pre) pre(se);
             gptoss::encode_gptoss_step_mb(se, dag_, g_, rows, base_, mb_, psos_,
-                                          /*ordinal_base=*/0, head_rows, begin, end);
+                                          /*ordinal_base=*/0, head_rows, requests, begin,
+                                          end);
             if (end == dag_.size() && post) post(se);
         };
         if (paging_.active()) return paging_.fire(ctx, rows, walk);
@@ -1044,6 +1234,10 @@ class GptOssEngine final : public SimpleFamilyEngine {
     int bound_rows_ = 0;
     int bound_head_rows_ = 0;
     SlotHandle logits_{};
+    /// The FP16 tile the dense projections read, and the element counts the
+    /// cast pass is told to fill. Owned here because both outlive a fire.
+    SlotHandle fp16_input_{};
+    std::vector<SlotHandle> fp16_keep_{};
 };
 
 /// Which values a llama layer publishes, under `tests/parity`'s names.
@@ -1164,6 +1358,9 @@ class LlamaEngine final : public SimpleFamilyEngine {
     bool init(RawMetalContext& ctx, const std::string& kernels_dir, const SetupConfig& cfg,
               const pie_loader::LoadPlan& load_plan, int max_ctx, std::string* err) {
         if (!llama_geometry(cfg, g_, max_ctx, err)) return false;
+        // The contract already decided this, and a config can disagree with the
+        // tensors it ships in either direction; see `plan_ties_embeddings`.
+        g_.tied_embeddings = plan_ties_embeddings(load_plan);
         max_ctx_ = max_ctx;
         g_.paged_kv_enabled = true;
         g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : 32;
@@ -1219,7 +1416,7 @@ class LlamaEngine final : public SimpleFamilyEngine {
         plan_ = llama::build_llama_scratch(dag_, g_);
         // Under a tap dump every value needs its own buffer, or a later
         // dispatch overwrites the one being read.
-        coloring_ = llama::color_llama_scratch(dag_, plan_, /*no_recycle=*/golden_taps_enabled());
+        coloring_ = llama::color_llama_scratch(dag_, plan_, /*no_recycle=*/taps_no_recycle());
         if (!coloring_.hazard_free) {
             if (err) *err = "llama's activation colouring is not hazard-free";
             return false;
@@ -1281,15 +1478,17 @@ class LlamaEngine final : public SimpleFamilyEngine {
         ap->vocab = std::uint32_t(g_.vocab);
 
         if (!llama::build_llama_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, g_.quant, /*with_argmax=*/true, err,
-                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
-                              /*untied=*/false)) {
+        if (!load_decode_psos(
+                ctx, kernels_dir, base_, g_.quant, err,
+                DecodePsoFeatures{.argmax = true})) {
             return false;
         }
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, g_.quant, /*with_d512=*/false, err,
-                                  /*routed=*/false,
-                                  /*fp16_precast=*/!g_.is_moe() &&
-                                      g_.quant.bits == 4 && g_.quant.group == 64)) {
+        if (!load_multibatch_psos(
+                ctx, kernels_dir, mb_, g_.quant, err,
+                MultiBatchPsoFeatures{
+                    .splitk = true,
+                    .fp16_precast = !g_.is_moe() &&
+                        g_.quant.bits == 4 && g_.quant.group == 64})) {
             return false;
         }
 
@@ -1697,7 +1896,7 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         const auto dag = gemma4::build_gemma4_dag_mb(pg, 0, /*with_argmax=*/false);
         const gemma4::ScratchPlan sp = gemma4::build_gemma4_scratch(dag, pg);
         const gemma4::ScratchColoring col =
-            gemma4::color_gemma4_scratch(dag, sp, /*no_recycle=*/golden_taps_enabled());
+            gemma4::color_gemma4_scratch(dag, sp, /*no_recycle=*/taps_no_recycle());
         rows = gemma4::gemma4_qmm_pool_rows(rows);
         sampled = gemma4::gemma4_qmm_pool_rows(sampled);
         for (const std::size_t e : g4_pool_elems(dag, sp, pg, col, rows, sampled)) bytes += e * 2;
@@ -1715,7 +1914,7 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         const auto dag = gptoss::build_gptoss_dag(g, /*with_argmax=*/false);
         const gptoss::ScratchPlan sp = gptoss::build_gptoss_scratch(dag, g);
         const gptoss::ScratchColoring col =
-            gptoss::color_gptoss_scratch(dag, sp, /*no_recycle=*/golden_taps_enabled());
+            gptoss::color_gptoss_scratch(dag, sp, /*no_recycle=*/taps_no_recycle());
         rows = gptoss::gptoss_qmm_pool_rows(rows);
         sampled = gptoss::gptoss_qmm_pool_rows(sampled);
         for (const std::size_t e : go_pool_elems(dag, g, col, rows, sampled)) bytes += e * 2;
@@ -1743,7 +1942,7 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         const auto dag = llama::build_llama_dag(pg, /*with_argmax=*/false);
         const llama::ScratchPlan plan = llama::build_llama_scratch(dag, pg);
         const model::ScratchColoring col =
-            llama::color_llama_scratch(dag, plan, /*no_recycle=*/golden_taps_enabled());
+            llama::color_llama_scratch(dag, plan, /*no_recycle=*/taps_no_recycle());
         for (const std::size_t e : llama::llama_pool_elems(dag, plan, col, pg, rows, sampled)) {
             bytes += e * 2;
         }

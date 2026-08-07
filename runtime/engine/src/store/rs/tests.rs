@@ -263,7 +263,7 @@ fn retirement_waits_for_every_in_flight_write() {
     assert_eq!(
         s.available_slots(),
         free_after_publish,
-        "retirement is gated on the global in-flight count"
+        "retirement waits for the write whose epoch the free is tagged with"
     );
 
     s.settle(held);
@@ -271,6 +271,31 @@ fn retirement_waits_for_every_in_flight_write() {
         s.available_slots() > free_after_publish,
         "the displaced slot returns once nothing is in flight"
     );
+}
+
+#[test]
+fn a_completed_free_retires_while_a_newer_write_is_outstanding() {
+    let mut s = store();
+    let doomed = store_with_state(&mut s);
+    let other = s.create_working_set(geom());
+
+    // Nothing is outstanding, so this free is tagged with an epoch that has
+    // already completed on the device.
+    s.release_working_set(doomed, s.current_epoch());
+
+    // Now a NEWER write goes in flight. Its sequence is above the free's tag,
+    // so it was prepared after the slot became unreachable and cannot be
+    // touching it. Retirement must not wait for it.
+    let held = s.prepare_write(other, true, None).unwrap();
+    let held = s.publish_prepared(held).unwrap();
+    let under_load = s.available_slots();
+
+    s.retire_idle();
+    assert!(
+        s.available_slots() > under_load,
+        "a free whose epoch has completed retires even under sustained load"
+    );
+    s.settle(held);
 }
 
 #[test]

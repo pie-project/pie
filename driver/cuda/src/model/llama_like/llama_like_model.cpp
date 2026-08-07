@@ -90,4 +90,8 @@ std::uint32_t LlamaLikeModel::graph_layout() {
     return llama_like_decode_graph_layout(plan_);
 }
 
+bool LlamaLikeModel::prefill_graph_capturable() const {
+    return llama_like_prefill_graph_capturable(plan_);
+}
+
 }  // namespace pie_cuda_driver::model

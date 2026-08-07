@@ -9,7 +9,9 @@
 #include <stdexcept>
 
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg}
+#include "decode_dispatch_mb.hpp"
 #include "mtl4_context.hpp"
+#include "../../kernels/gdn_params.h"
 #include "../shared_kernels.hpp"
 
 namespace pie::metal {
@@ -18,17 +20,27 @@ namespace {
 
 // ── Kernel param structs, replicated EXACTLY from the .metal sources ──
 using shared_kernels::ExpertCombineParams;
+using shared_kernels::GatedRmsParams;
 using shared_kernels::MoeRouteParams;
 using shared_kernels::RmsParams;
 using shared_kernels::RouterParams;
-struct GatedRmsParams {  // gated_rms.metal:20  (buffer 4)
-    float eps;
-    uint32_t vd;         // value-head dim (reduction axis)
-};
-struct GdnCoreParams {   // gdn_core.metal:39  (buffer 11)
-    int32_t Dk, Dv, Hk, Hv, conv_dim, Kc, q_off, k_off, v_off;
-    float   eps, inv_sqrt_dk;
-};
+static_assert(sizeof(GdnCoreParams) == 44);
+
+GdnCoreParams gdn_core_params(const DecodeGeometry& g) {
+    return {
+        g.gdn_k_dim,
+        g.gdn_v_dim,
+        g.gdn_k_heads,
+        g.gdn_v_heads,
+        g.gdn_conv_dim,
+        g.gdn_conv_k,
+        0,
+        g.gdn_k_heads * g.gdn_k_dim,
+        2 * g.gdn_k_heads * g.gdn_k_dim,
+        g.eps,
+        1.0f / std::sqrt(float(g.gdn_k_dim)),
+    };
+}
 
 // Bind a POD constant value into a fresh resident slot at (ordinal, bind_index).
 template <class V>
@@ -121,7 +133,7 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
 // the mixture's share of it. `const_slot` caches by (ordinal, index), so this
 // overwrites the same slots in place and allocates nothing after the first.
 int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                      const DecodeGeometry& g, int n_tokens) {
+                      const DecodeGeometry& g, int n_tokens, int row_pitch) {
     int count = 0;
     const int rows = n_tokens > 0 ? n_tokens : 1;
     const int pairs = rows * g.experts_per_token;
@@ -131,14 +143,6 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         const int ord = d.ordinal;
         switch (d.kind) {
             case Kernel::LlExpertSiluMul:
-                // The routed stack's gate and up are `moe_intermediate` wide
-                // and there is one row per sorted (token, slot) pair, padding
-                // included -- the padding rows are real rows of the buffers
-                // this reads. This is the one SwiGLU whose extent moves with
-                // the batch; the shared expert's does not, which is why only
-                // this one is here.
-                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
-                                sorted * g.moe_intermediate, &count);
                 break;
 
             case Kernel::LlMoeSort:
@@ -152,7 +156,8 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                        (uint32_t)g.experts_per_token,
                                        (uint32_t)shared_kernels::moe_tile_rows(pairs, g.n_experts),
                                        (uint32_t)sorted,
-                                       (uint32_t)g.hidden};
+                                       (uint32_t)g.hidden,
+                                       (uint32_t)row_pitch};
                 bind_const<MoeRouteParams>(ctx, ord,
                                            d.kind == Kernel::LlMoeSort
                                                ? (uint8_t)bind::MoeRouteSort::Params
@@ -169,11 +174,12 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 }
 
 int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const DecodeGeometry& g, int max_ctx, bool gdn_prep, int n_tokens) {
+                       const DecodeGeometry& g, int max_ctx, bool gdn_prep, int n_tokens,
+                       int row_pitch) {
     // The width-dependent ones first, so a DAG is never left half-bound: this
     // function is the complete binding, and the fire path's rebind is a subset
     // of it rather than a second, separate contract.
-    int count = bind_token_consts(ctx, dag, g, n_tokens);
+    int count = bind_token_consts(ctx, dag, g, n_tokens, row_pitch);
 
     // rope: x[h*head_dim + i], rotary half from grid.x. scale=1.0 (qwen3.6 default mrope),
     // base = log2(theta).
@@ -225,40 +231,30 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kernel::FfnRms:
             case Kernel::FinalRms:
                 bind_const<RmsParams>(ctx, ord, (uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, (uint32_t)g.hidden, 1u, 0u}, &count);
+                                      RmsParams{g.eps, (uint32_t)g.hidden, 1u, 0u, 1.0f},
+                                      &count);
                 break;
             case Kernel::QNorm:
             case Kernel::KNorm:
                 bind_const<RmsParams>(ctx, ord, (uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, (uint32_t)g.head_dim, 1u, 0u}, &count);
+                                      RmsParams{g.eps, (uint32_t)g.head_dim, 1u, 0u, 1.0f},
+                                      &count);
                 break;
 
             case Kernel::GdnPrep: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       /*q_off*/0, /*k_off*/g.gdn_k_heads * g.gdn_k_dim,
-                                       /*v_off*/2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnPrep::Params, gp, &count);
                 break;
             }
 
             case Kernel::GdnPrepSlotted: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       0, g.gdn_k_heads * g.gdn_k_dim,
-                                       2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnPrep::Params, gp, &count);
                 break;
             }
 
             case Kernel::GdnCore: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       /*q_off*/0, /*k_off*/g.gdn_k_heads * g.gdn_k_dim,
-                                       /*v_off*/2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 const uint8_t pbuf = gdn_prep ? (uint8_t)bind::GdnCoreRecurrent::Params
                                               : (uint8_t)bind::GdnCore::Params;
                 bind_const<GdnCoreParams>(ctx, ord, pbuf, gp, &count);
@@ -266,11 +262,7 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             }
 
             case Kernel::GdnCoreSlotted: {
-                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                       g.gdn_conv_dim, g.gdn_conv_k,
-                                       0, g.gdn_k_heads * g.gdn_k_dim,
-                                       2 * g.gdn_k_heads * g.gdn_k_dim,
-                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const GdnCoreParams gp = gdn_core_params(g);
                 bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnCoreRecurrent::Params,
                                           gp, &count);
                 break;
@@ -335,16 +327,8 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<int>(ctx, ord, (uint8_t)bind::SdpaPaged::Window, 0, &count);
                 break;
 
-            case Kernel::AttnGate:
-                bind_const<int>(ctx, ord, (uint8_t)bind::AttnGate::Width,
-                                g.n_q_heads * g.head_dim, &count);
-                break;
             case Kernel::SiluMul:
-                // Dense, the FFN's own SwiGLU; routed, the SHARED expert's --
-                // one row per token either way, so the width does not move
-                // with the batch and this stays out of `bind_token_consts`.
-                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
-                                g.is_moe() ? g.shared_intermediate : g.intermediate, &count);
+            case Kernel::AttnGate:
                 break;
             case Kernel::LlExpertSiluMul:
             case Kernel::LlMoeSort:
@@ -357,16 +341,20 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             // Width-INVARIANT, both of them: the router reads one row and
             // writes k logits whatever the batch is, and the combine sums k
             // slots into one row. Only the sort and the gather in between know
-            // how many rows there are.
+            // how many rows there are -- and, when a prefill runs the whole
+            // group at once, the pitch its rows are laid out at.
             case Kernel::GoRouterTopK:
                 bind_const<RouterParams>(
                     ctx, ord, (uint8_t)bind::GoRouterTopK::Params,
-                    RouterParams{(uint32_t)g.n_experts, (uint32_t)g.experts_per_token}, &count);
+                    RouterParams{(uint32_t)g.n_experts, (uint32_t)g.experts_per_token,
+                                 g.norm_topk_prob ? 0u : 1u, (uint32_t)row_pitch},
+                    &count);
                 break;
             case Kernel::LlMoeCombine:
                 bind_const<ExpertCombineParams>(
                     ctx, ord, (uint8_t)bind::GoExpertCombine::Params,
-                    ExpertCombineParams{(uint32_t)g.hidden, (uint32_t)g.experts_per_token},
+                    ExpertCombineParams{(uint32_t)g.hidden, (uint32_t)g.experts_per_token,
+                                        (uint32_t)row_pitch},
                     &count);
                 break;
             case Kernel::LlSharedCombine:
@@ -376,15 +364,8 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                      (uint32_t)g.hidden, &count);
                 break;
 
-            // Both residual adds. `LayerOut` is the fused one and `Residual`
-            // the standalone; they are the same kernel and take the same
-            // width. Do not let anything be inserted between these two labels:
-            // `bind::Residual::Width` and `bind::GoRouterTopK::Params` are
-            // both index 3, so a kind that falls into the wrong arm here is
-            // bound to a plausible slot with the wrong TYPE in it.
             case Kernel::Residual:
             case Kernel::LayerOut:
-                bind_const<int>(ctx, ord, (uint8_t)bind::Residual::Width, g.hidden, &count);
                 break;
 
             // No const params: Argmax.
@@ -398,6 +379,43 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 size_t decode_consts_budget(const std::vector<Dispatch>& dag) {
     // Worst case 6 const slots/dispatch (sdpa), each ≤ 256-aligned. Be generous.
     return (dag.size() * 6 + 64) * 256;
+}
+
+int bind_mb_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                     const DecodeGeometry& g, int n_tokens,
+                     const SlotHandle& staging, std::vector<SlotHandle>& keep) {
+    keep.clear();
+    if (!staging.valid()) return 0;
+    // The padded row count, not the fire's: the GEMM reads whole row tiles and
+    // the tail of the last one has to hold a defined half of something. It is
+    // the same bound the BF16 GEMM already reads through buffer 3.
+    const int rows = qmm_mb_rows(n_tokens, g.max_tokens, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
+    std::vector<std::pair<std::int32_t, SlotHandle>> counts;
+    int bound = 0;
+    for (const Dispatch& d : dag) {
+        if (d.qmm_bn <= 0) continue;
+        const int K = int(qmv_kn(d.kind, g).K);
+        if (K <= 0) continue;
+        const std::int32_t elems = std::int32_t(rows) * std::int32_t(K);
+        SlotHandle count;
+        for (const auto& entry : counts) {
+            if (entry.first == elems) {
+                count = entry.second;
+                break;
+            }
+        }
+        if (!count.valid()) {
+            count = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            if (!count.valid()) continue;
+            *static_cast<std::int32_t*>(count.contents()) = elems;
+            counts.push_back({elems, count});
+            keep.push_back(count);
+        }
+        ctx.arg_bind_ordinal(d.ordinal, 12, staging);
+        ctx.arg_bind_ordinal(d.ordinal, 13, count);
+        ++bound;
+    }
+    return bound;
 }
 
 }  // namespace pie::metal

@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <type_traits>
 #include "kernels/dequant_fp4.hpp"
 
 #include <cuda_bf16.h>
@@ -122,6 +124,14 @@ __device__ __forceinline__ float mxfp4_block_scale(std::uint8_t b) {
 // gate and up are adjacent rows of the *same* packed tensor (2i and 2i+1),
 // so a slab of kPairs intermediate rows is 2*kPairs contiguous rows and
 // needs no gather.
+// `act_out_fp16`, when non-null, receives the gpt-oss GLU of the two halves --
+// clamp, quickgelu on the gate, `(up + 1) *` -- in fp16, which is what the down
+// projection reads. Both terms are already in registers here, so the activation
+// costs a few instructions on values that would otherwise be written to HBM,
+// read back by a glu kernel, written again, and read a third time by a cast.
+// vLLM does the same thing from the other side: its MoE matmul is
+// `_matmul_ogs_..._swiglu`, one kernel with the activation in the epilogue.
+template <int kPairsT>
 __global__ void mxfp4_moe_gate_up_decode_kernel(
     const __half* __restrict__ act,
     const std::int32_t* __restrict__ topk_idx,
@@ -131,11 +141,18 @@ __global__ void mxfp4_moe_gate_up_decode_kernel(
     const void* const* __restrict__ up_bias_ptrs,
     __nv_bfloat16* __restrict__ gate_out,
     __nv_bfloat16* __restrict__ up_out,
+    __half* __restrict__ act_out_fp16,
+    float glu_limit,
+    float glu_alpha,
     int top_k,
     int hidden,
     int intermediate)
 {
-    constexpr int kPairs = 2;                      // intermediate rows per warp
+    // Intermediate rows per warp. Every extra pair reuses the activation
+    // vector one more time and gives the unpack more independent work to hide
+    // behind, which is what this kernel is short of: at 2 it sustains about
+    // 1.4 TB/s against an HBM roofline near 3.
+    constexpr int kPairs = kPairsT;
     constexpr int kRows = 2 * kPairs;              // packed rows per warp
     const int route = blockIdx.x;
     const int warp_in_block = threadIdx.x >> 5;
@@ -234,12 +251,23 @@ __global__ void mxfp4_moe_gate_up_decode_kernel(
             }
             const long long o =
                 static_cast<long long>(route) * intermediate + row;
-            gate_out[o] = __float2bfloat16(gv);
-            up_out[o] = __float2bfloat16(uv);
+            if (act_out_fp16 != nullptr) {
+                // Same arithmetic and the same order as
+                // `gpt_oss_glu_bf16_kernel`, which read these two back from
+                // HBM to do it.
+                const float g = fminf(gv, glu_limit);
+                const float u = fminf(fmaxf(uv, -glu_limit), glu_limit);
+                const float glu = g / (1.f + __expf(-glu_alpha * g));
+                act_out_fp16[o] = __float2half((u + 1.f) * glu);
+            } else {
+                gate_out[o] = __float2bfloat16(gv);
+                up_out[o] = __float2bfloat16(uv);
+            }
         }
     }
 }
 
+template <int kRowsT>
 __global__ void mxfp4_moe_down_decode_kernel(
     const __half* __restrict__ act,
     const std::int32_t* __restrict__ topk_idx,
@@ -250,7 +278,7 @@ __global__ void mxfp4_moe_down_decode_kernel(
     int hidden,
     int intermediate)
 {
-    constexpr int kRows = 4;
+    constexpr int kRows = kRowsT;
     const int route = blockIdx.x;
     const int warp_in_block = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
@@ -350,8 +378,184 @@ void launch_dequant_mxfp4_to_bf16(
 
 
 namespace {
-constexpr int kMxfp4DecodeBlock = 128;  // four warps, one output row each
+constexpr int kMxfp4DecodeBlock = 128;
+// Intermediate rows each warp of the gate/up decode GEMV owns. Swept with
+// `driver/cuda/bench/moe_bench.cu` at gpt-oss's shape; see the table there.
+constexpr int kMxfp4GateUpPairs = 4;
+// Hidden rows each warp of the down decode GEMV owns, swept the same way.
+constexpr int kMxfp4DownRows = 4;  // four warps, one output row each
 }  // namespace
+
+
+// Expert-grouped variant of `mxfp4_moe_gate_up_decode_kernel`.
+//
+// The per-route kernel above gives one block to each (token, expert) route, so
+// an expert chosen by T tokens has its weight slab streamed T times. Weight
+// traffic therefore grows with the token count while the useful work does not,
+// which is what makes decode throughput flat in batch size: at N=32/top_k=4
+// there are 128 routes over at most 32 experts, so three quarters of the HBM
+// traffic is re-reading slabs already read.
+//
+// Here a block owns (expert, row slab) and walks the expert's own route list,
+// loading each weight group once and applying it to up to `kTok` tokens. The
+// route list comes from `launch_moe_bucket_exact`, which already groups routes
+// by expert; `counts` is its per-expert histogram and the block recovers its
+// slice with an exclusive prefix over it (num_experts is 32-128, so this is
+// cheaper than a second kernel and keeps the whole path device-side).
+template <int kTok>
+__global__ void mxfp4_moe_gate_up_decode_grouped_kernel(
+    const __half* __restrict__ act,
+    const std::int32_t* __restrict__ sorted_route_ids,
+    const std::int32_t* __restrict__ counts,
+    const std::uint8_t* const* __restrict__ packed_ptrs,
+    const std::uint8_t* const* __restrict__ scale_ptrs,
+    const void* const* __restrict__ gate_bias_ptrs,
+    const void* const* __restrict__ up_bias_ptrs,
+    __nv_bfloat16* __restrict__ gate_out,
+    __nv_bfloat16* __restrict__ up_out,
+    int top_k,
+    int hidden,
+    int intermediate,
+    int num_experts)
+{
+    constexpr int kPairs = 2;
+    constexpr int kRows = 2 * kPairs;
+    const int expert = blockIdx.x;
+
+    __shared__ int s_start;
+    __shared__ int s_cnt;
+    if (threadIdx.x == 0) {
+        int st = 0;
+        for (int e = 0; e < expert; ++e) st += counts[e];
+        s_start = st;
+        s_cnt = counts[expert];
+    }
+    __syncthreads();
+    const int cnt = s_cnt;
+    if (cnt == 0) return;
+
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kPairs;
+    if (row0 >= intermediate) return;
+
+    const std::uint8_t* packed = packed_ptrs[expert];
+    const std::uint8_t* scales = scale_ptrs[expert];
+    const int words_per_row = hidden / 8;
+    const int groups_per_row = hidden / 32;
+
+    int row_of[kRows];
+#pragma unroll
+    for (int p = 0; p < kPairs; ++p) {
+        const int r = min(row0 + p, intermediate - 1);
+        row_of[2 * p] = 2 * r;
+        row_of[2 * p + 1] = 2 * r + 1;
+    }
+    const uint4* wq = reinterpret_cast<const uint4*>(
+        reinterpret_cast<const unsigned*>(packed));
+
+    for (int base = 0; base < cnt; base += kTok) {
+        const int nt = min(kTok, cnt - base);
+        int route_of[kTok];
+        const float4* x4[kTok];
+#pragma unroll
+        for (int t = 0; t < kTok; ++t) {
+            const int idx = (t < nt) ? (s_start + base + t) : (s_start + base);
+            route_of[t] = sorted_route_ids[idx];
+            x4[t] = reinterpret_cast<const float4*>(
+                act + static_cast<long long>(route_of[t] / top_k) * hidden);
+        }
+
+        float acc[kRows][kTok];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+#pragma unroll
+            for (int t = 0; t < kTok; ++t) acc[r][t] = 0.f;
+
+        for (int g = lane_id; g < groups_per_row; g += 32) {
+            uint4 ww[kRows];
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+                ww[r] = wq[static_cast<long long>(row_of[r]) *
+                           (words_per_row >> 2) + g];
+            __half2 sum[kRows][kTok];
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+#pragma unroll
+                for (int t = 0; t < kTok; ++t) sum[r][t] = __float2half2_rn(0.f);
+
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                // Unpack the weight quad once and reuse it for every token in
+                // this pass -- the whole point of the grouping.
+                __half2 qd[kRows][4];
+#pragma unroll
+                for (int r = 0; r < kRows; ++r)
+                    mxfp4_unpack8((&ww[r].x)[q], qd[r]);
+#pragma unroll
+                for (int t = 0; t < kTok; ++t) {
+                    if (t >= nt) break;
+                    __half2 xp[4];
+                    const float4 xv = x4[t][g * 4 + q];
+                    const unsigned* xu = reinterpret_cast<const unsigned*>(&xv);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        xp[j] = *reinterpret_cast<const __half2*>(&xu[j]);
+#pragma unroll
+                    for (int r = 0; r < kRows; ++r)
+#pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            sum[r][t] = __hfma2(qd[r][j], xp[j], sum[r][t]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                const float sc = mxfp4_block_scale(scales[
+                    static_cast<long long>(row_of[r]) * groups_per_row + g]);
+#pragma unroll
+                for (int t = 0; t < kTok; ++t) {
+                    if (t >= nt) break;
+                    const float2 f = __half22float2(sum[r][t]);
+                    acc[r][t] = fmaf(f.x + f.y, sc, acc[r][t]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+#pragma unroll
+                for (int t = 0; t < kTok; ++t)
+                    acc[r][t] += __shfl_xor_sync(0xffffffffu, acc[r][t], off);
+        }
+        if (lane_id == 0) {
+            const auto* gb = gate_bias_ptrs != nullptr
+                ? static_cast<const __nv_bfloat16*>(gate_bias_ptrs[expert])
+                : nullptr;
+            const auto* ub = gate_bias_ptrs != nullptr
+                ? static_cast<const __nv_bfloat16*>(up_bias_ptrs[expert])
+                : nullptr;
+            for (int t = 0; t < nt; ++t) {
+#pragma unroll
+                for (int p = 0; p < kPairs; ++p) {
+                    const int row = row0 + p;
+                    if (row >= intermediate) break;
+                    float gv = acc[2 * p][t];
+                    float uv = acc[2 * p + 1][t];
+                    if (gb != nullptr) {
+                        gv += __bfloat162float(gb[row]);
+                        uv += __bfloat162float(ub[row]);
+                    }
+                    const long long o =
+                        static_cast<long long>(route_of[t]) * intermediate + row;
+                    gate_out[o] = __float2bfloat16(gv);
+                    up_out[o] = __float2bfloat16(uv);
+                }
+            }
+        }
+    }
+}
 
 void launch_mxfp4_moe_gate_up_decode_bf16(
     const void* act_fp16,
@@ -363,22 +567,84 @@ void launch_mxfp4_moe_gate_up_decode_bf16(
     void* gate_out_bf16,
     void* up_out_bf16,
     int num_tokens, int top_k, int hidden, int intermediate,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    void* act_out_fp16,
+    float glu_limit,
+    float glu_alpha)
 {
     if (num_tokens <= 0 || top_k <= 0 || hidden <= 0 || intermediate <= 0) {
         return;
     }
     if (hidden % 32 != 0) return;
     const int warps = kMxfp4DecodeBlock / 32;
-    const int pairs_per_block = warps * 2;   // kPairs = 2 rows per warp
+    const int pairs_per_block = warps * kMxfp4GateUpPairs;
     dim3 grid(num_tokens * top_k,
               (intermediate + pairs_per_block - 1) / pairs_per_block);
-    mxfp4_moe_gate_up_decode_kernel<<<grid, kMxfp4DecodeBlock, 0, stream>>>(
+    mxfp4_moe_gate_up_decode_kernel<kMxfp4GateUpPairs>
+        <<<grid, kMxfp4DecodeBlock, 0, stream>>>(
         static_cast<const __half*>(act_fp16), topk_idx,
         gate_up_packed, gate_up_scales, gate_bias, up_bias,
         static_cast<__nv_bfloat16*>(gate_out_bf16),
         static_cast<__nv_bfloat16*>(up_out_bf16),
+        static_cast<__half*>(act_out_fp16), glu_limit, glu_alpha,
         top_k, hidden, intermediate);
+}
+
+void launch_mxfp4_moe_gate_up_decode_grouped_bf16(
+    const void* act_fp16,
+    const std::int32_t* sorted_route_ids,
+    const std::int32_t* counts,
+    const std::uint8_t* const* gate_up_packed,
+    const std::uint8_t* const* gate_up_scales,
+    const void* const* gate_bias,
+    const void* const* up_bias,
+    void* gate_out_bf16,
+    void* up_out_bf16,
+    int num_experts, int top_k, int hidden, int intermediate,
+    cudaStream_t stream)
+{
+    if (num_experts <= 0 || top_k <= 0 || hidden <= 0 || intermediate <= 0) {
+        return;
+    }
+    if (hidden % 32 != 0) return;
+    const int warps = kMxfp4DecodeBlock / 32;
+    const int pairs_per_block = warps * 2;
+    // One block per (expert, row slab). Experts with no routes exit on their
+    // first instruction, which is cheaper than compacting the list on device.
+    dim3 grid(num_experts,
+              (intermediate + pairs_per_block - 1) / pairs_per_block);
+    // Tokens fused per weight pass. The weight bytes are read once per pass
+    // and the FP4 unpack is amortised over the tokens in it, so this is the
+    // knob that decides whether the kernel is unpack-bound or bandwidth-bound.
+    // Swept with `driver/cuda/bench/moe_bench.cu`; PIE_MXFP4_MOE_KTOK overrides.
+    static const int ktok = [] {
+        const char* v = std::getenv("PIE_MXFP4_MOE_KTOK");
+        return v != nullptr ? std::atoi(v) : 4;
+    }();
+    auto launch = [&](auto tag) {
+        constexpr int kT = decltype(tag)::value;
+        mxfp4_moe_gate_up_decode_grouped_kernel<kT>
+            <<<grid, kMxfp4DecodeBlock, 0, stream>>>(
+                static_cast<const __half*>(act_fp16), sorted_route_ids, counts,
+                gate_up_packed, gate_up_scales, gate_bias, up_bias,
+                static_cast<__nv_bfloat16*>(gate_out_bf16),
+                static_cast<__nv_bfloat16*>(up_out_bf16),
+                top_k, hidden, intermediate, num_experts);
+    };
+    switch (ktok) {
+        case 1:  launch(std::integral_constant<int, 1>{});  return;
+        case 2:  launch(std::integral_constant<int, 2>{});  return;
+        case 8:  launch(std::integral_constant<int, 8>{});  return;
+        case 16: launch(std::integral_constant<int, 16>{}); return;
+        default: break;
+    }
+    mxfp4_moe_gate_up_decode_grouped_kernel<4>
+        <<<grid, kMxfp4DecodeBlock, 0, stream>>>(
+            static_cast<const __half*>(act_fp16), sorted_route_ids, counts,
+            gate_up_packed, gate_up_scales, gate_bias, up_bias,
+            static_cast<__nv_bfloat16*>(gate_out_bf16),
+            static_cast<__nv_bfloat16*>(up_out_bf16),
+            top_k, hidden, intermediate, num_experts);
 }
 
 void launch_mxfp4_moe_down_decode_bf16(
@@ -396,11 +662,12 @@ void launch_mxfp4_moe_down_decode_bf16(
     }
     if (intermediate % 32 != 0) return;
     const int warps = kMxfp4DecodeBlock / 32;
-    const int rows_per_warp = 4;
+    const int rows_per_warp = kMxfp4DownRows;
     const int rows_per_block = warps * rows_per_warp;
     dim3 grid(num_tokens * top_k,
               (hidden + rows_per_block - 1) / rows_per_block);
-    mxfp4_moe_down_decode_kernel<<<grid, kMxfp4DecodeBlock, 0, stream>>>(
+    mxfp4_moe_down_decode_kernel<kMxfp4DownRows>
+        <<<grid, kMxfp4DecodeBlock, 0, stream>>>(
         static_cast<const __half*>(act_fp16), topk_idx,
         down_packed, down_scales, down_bias,
         static_cast<__nv_bfloat16*>(out_bf16),

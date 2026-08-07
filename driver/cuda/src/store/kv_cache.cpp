@@ -16,16 +16,6 @@ namespace pie_cuda_driver {
 
 namespace {
 
-bool env_requests_hnd_kv_layout() {
-    const char* value = std::getenv("PIE_CUDA_KV_LAYOUT");
-    if (value == nullptr || value[0] == '\0') {
-        value = std::getenv("PIE_CUDA_KV_CACHE_LAYOUT");
-    }
-    if (value == nullptr) return false;
-    const std::string layout(value);
-    return layout == "HND" || layout == "hnd";
-}
-
 // Quest key envelopes cost `2 * 2 * kv_heads * head_dim` bytes per page per
 // layer — `4 / (page_size * 2)` of the key tier, i.e. 12.5% at
 // `page_size = 16`, or 6.25% of K and V together. They are bf16 because an
@@ -84,7 +74,7 @@ KvCache KvCache::allocate(int num_layers,
     c.num_kv_heads_ = num_kv_heads;
     c.head_dim_ = head_dim;
     c.format_ = std::move(format);
-    c.hnd_layout_ = c.format_.is_native_bf16() && env_requests_hnd_kv_layout();
+    c.hnd_layout_ = false;
 
     c.k_layers_.reserve(num_layers);
     c.v_layers_.reserve(num_layers);
@@ -180,7 +170,7 @@ KvCache KvCache::allocate_per_layer(int num_layers,
     c.num_kv_heads_ = num_kv_heads;
     c.head_dim_ = per_layer_head_dim.empty() ? 0 : per_layer_head_dim[0];
     c.format_ = std::move(format);
-    c.hnd_layout_ = c.format_.is_native_bf16() && env_requests_hnd_kv_layout();
+    c.hnd_layout_ = false;
     c.per_layer_head_dim_ = per_layer_head_dim;
     c.kv_source_layer_ = kv_source_layer;
     c.per_layer_num_kv_heads_ = per_layer_num_kv_heads;
@@ -485,17 +475,29 @@ std::size_t kv_page_bytes_homogeneous(const HfConfig& cfg,
 
 std::size_t kv_page_bytes_per_layer(const HfConfig& cfg,
                                     const std::vector<int>& per_layer_head_dim,
+                                    const std::vector<int>& per_layer_num_kv_heads,
                                     const std::vector<int>& kv_source_layer,
                                     int tp_size,
                                     const KvCacheFormat& format) {
     std::size_t per_token = 0;
-    const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
+    const int tp = std::max(1, tp_size);
+    const int uniform_kv_heads = cfg.num_key_value_heads / tp;
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {
         const bool is_source = kv_source_layer.empty() || kv_source_layer[i] == i;
         if (!is_source) continue;
         const int hd = per_layer_head_dim.empty()
             ? cfg.head_dim_kernel
             : per_layer_head_dim[i];
+        // Gemma-4's `attention_k_eq_v` mode puts the full-attention layers on
+        // `num_global_key_value_heads` instead of `num_key_value_heads`, and
+        // that is what `KvCache::allocate_per_layer` actually reserves. Using
+        // the flat count here charged those layers up to 4x their real width,
+        // which pushed the planner's KV estimate past the point where any
+        // lattice candidate cleared `min_kv_tokens` — the model then failed to
+        // load with "no viable forward/KV layout fits budget".
+        const int kv_heads = per_layer_num_kv_heads.empty()
+            ? uniform_kv_heads
+            : per_layer_num_kv_heads[i] / tp;
         per_token += kv_cache_device_bytes_per_page(format, 1, kv_heads, hd);
     }
     return per_token;

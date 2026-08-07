@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "checkpoint_path.hpp"
 #include "mtl4_context.hpp"
 #include "batch/decode_abi.hpp"
 #include "batch/golden_tap.hpp"
@@ -23,7 +24,7 @@
 #include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
 #include "pie_loader/checkpoint_source.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/gemma4/bind.hpp"
 #include "model/gemma4/decode_consts.hpp"
 #include "model/gemma4/decode_step.hpp"
@@ -246,8 +247,8 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::string ckpt = argc > 1 ? argv[1] : std::string();
     if (ckpt.empty()) {
-        const char* home = std::getenv("HOME");
-        if (home != nullptr) ckpt = std::string(home) + "/.pie-bench/gemma4-e2b-pie";
+        ckpt = pie::metal::test::find_checkpoint("gemma4-e2b-pie",
+                                                 "models--mlx-community--gemma-4-e2b-it-4bit");
     }
     std::string kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
 
@@ -303,8 +304,10 @@ int main(int argc, char** argv) {
     pie_loader::LoadPlan plan;
     try {
         pie::metal::model::ContractFacts facts;
-        facts.first_kv_shared_layer = g.first_kv_shared();
-        plan = compile_load_plan(ckpt, metal_device_target(), "gemma4", facts);
+        facts.num_hidden_layers = g.n_layers;
+        facts.num_kv_shared_layers = g.num_kv_shared_layers;
+        plan = compile_load_plan(ckpt, metal_device_target(),
+                                 descriptor_for_testing("gemma4", facts));
     } catch (const std::exception& e) {
         std::printf("  FAIL  compile_load_plan: %s\n", e.what());
         return 1;
@@ -366,7 +369,7 @@ int main(int argc, char** argv) {
     Gemma4Psos psos;
     DecodeStepPsos base;
     if (!build_gemma4_psos(*ctx, kernels_dir, g, psos, &err) ||
-        !load_decode_psos(*ctx, kernels_dir, base, g.quant, /*with_argmax=*/false, &err)) {
+        !load_decode_psos(*ctx, kernels_dir, base, g.quant, &err)) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }

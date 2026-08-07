@@ -22,6 +22,7 @@
 namespace pie::metal::gemma4 {
 
 using shared_kernels::RowGatherParams;
+using shared_kernels::VNormParams;
 using shared_kernels::elementwise_dispatch;
 
 /// Params structs, replicated EXACTLY from the .metal sources. A mismatch here
@@ -47,11 +48,6 @@ struct PleCombineParams {   // ple_combine.metal:15   (buffer 3)
     float inv_sqrt2;
     std::uint32_t n;
 };
-struct VNormParams {        // vnorm.metal:14         (buffer 2)
-    float eps;
-    std::uint32_t axis_size;
-};
-
 /// The PSOs this family needs beyond the shared set.
 struct Gemma4Psos {
     // Two head widths, because head_dim is per attention type: sliding layers
@@ -106,7 +102,7 @@ struct Gemma4Psos {
     Pso router_topk{};
     Pso qmv_routed{};
     /// The batched form's three column tiles.
-    Pso qmm_routed[3]{};
+    Pso qmm_routed[3][3]{};  // [tile width][bn]
     Pso moe_sort{};
     Pso moe_gather{};
     Pso moe_combine{};
@@ -117,7 +113,12 @@ struct Gemma4Psos {
     bool moe_valid() const {
         return router_topk.valid() && qmv_routed.valid() && moe_sort.valid() &&
                moe_gather.valid() && moe_combine.valid() && residual_add.valid() &&
-               qmm_routed[0].valid() && qmm_routed[1].valid() && qmm_routed[2].valid();
+               [&] {
+                   for (int t = 0; t < 3; ++t)
+                       for (int i = 0; i < 3; ++i)
+                           if (!qmm_routed[t][i].valid()) return false;
+                   return true;
+               }();
     }
 
     bool valid() const {

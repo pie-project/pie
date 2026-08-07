@@ -5,10 +5,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
 use wasmtime::component::{ResourceAny, ResourceTable};
-use wasmtime_wasi::{DirPerms, FilePerms, HostMonotonicClock, WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 use wasmtime_wasi_http::p3::{
@@ -88,20 +89,13 @@ pub struct ProcessCtx {
     execution_permit: Option<OwnedSemaphorePermit>,
     execution_admitted: bool,
     admission_wait_us: u64,
-    ledger_fire_timing_claimed: bool,
-    /// Guest-turnaround probe: `fire_timing_now_us` when the lane's last
-    /// channel read returned a value. 0 = no read pending attribution.
-    pub(crate) last_take_us: u64,
+    /// This process's lock-free planner residency flag, taken once on the
+    /// first residency-gate call. See [`crate::planner::Planner::residency_flag`].
+    residency_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for ProcessCtx {
     fn drop(&mut self) {
-        let timing = crate::scheduler::fire_timing_enabled();
-        let drop_entered_us = if timing {
-            crate::scheduler::fire_timing_now_us()
-        } else {
-            0
-        };
         let execution_permit = self.execution_permit.take();
         let bind_permit = self.bind_permit.take();
         self.execution_admitted = false;
@@ -127,11 +121,6 @@ impl Drop for ProcessCtx {
             fences
         });
         drop(execution_permit);
-        let permit_released_us = if timing {
-            crate::scheduler::fire_timing_now_us()
-        } else {
-            0
-        };
         let resources = std::mem::replace(&mut self.resource_table, ResourceTable::new());
         super::teardown::defer_resource_teardown(
             self.id,
@@ -141,16 +130,6 @@ impl Drop for ProcessCtx {
             bind_permit,
             std::mem::take(&mut self.scratch_dir),
         );
-        if timing {
-            crate::scheduler::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "runtime",
-                "event": "process_drop",
-                "process_id": self.id,
-                "drop_entered_us": drop_entered_us,
-                "permit_released_us": permit_released_us.saturating_sub(drop_entered_us),
-            }));
-        }
     }
 }
 
@@ -209,19 +188,6 @@ impl ProcessCtx {
         py_runtime_dir: Option<&Path>,
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtx::builder();
-        if std::env::var("PIE_LEDGER_TIMING").is_ok_and(|value| !value.is_empty() && value != "0") {
-            struct SharedMonotonicClock;
-            impl HostMonotonicClock for SharedMonotonicClock {
-                fn resolution(&self) -> u64 {
-                    1
-                }
-
-                fn now(&self) -> u64 {
-                    crate::scheduler::ledger_monotonic_ns()
-                }
-            }
-            builder.monotonic_clock(SharedMonotonicClock);
-        }
 
         // Network capability. `inherit_network` exposes the host network;
         // `socket_addr_check` filters per-connect/per-bind. Skipping
@@ -324,13 +290,30 @@ impl ProcessCtx {
             execution_permit: None,
             execution_admitted: false,
             admission_wait_us: 0,
-            ledger_fire_timing_claimed: false,
-            last_take_us: 0,
+            residency_flag: None,
         })
     }
 
     pub fn id(&self) -> ProcessId {
         self.id
+    }
+
+    /// The residency-gate fast path: one relaxed load, no lookup, no lock.
+    ///
+    /// The flag is taken once and cached; until the planner hands one out
+    /// (pre-registration, or no planner at all) the process holds no
+    /// pooled pages and is resident by definition.
+    pub(crate) fn is_resident_fast(&mut self) -> bool {
+        if self.residency_flag.is_none() {
+            let Some(planner) = crate::planner::planner() else {
+                return true;
+            };
+            self.residency_flag = planner.residency_flag(self.id);
+        }
+        match &self.residency_flag {
+            Some(flag) => flag.load(Ordering::Acquire),
+            None => true,
+        }
     }
 
     pub(crate) fn install_prewarm_permit(&mut self, permit: Option<OwnedSemaphorePermit>) {
@@ -372,42 +355,6 @@ impl ProcessCtx {
         self.admission_wait_us
     }
 
-    pub(crate) fn note_take_returned(&mut self, wake_us: u64) {
-        let now = crate::scheduler::fire_timing_now_us();
-        if wake_us > 0 {
-            crate::scheduler::GUEST_PHASES.wake_ns.fetch_add(
-                now.saturating_sub(wake_us) * 1_000,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        self.last_take_us = now;
-    }
-
-    pub(crate) fn note_submit(&mut self) {
-        let last = std::mem::take(&mut self.last_take_us);
-        if last == 0 {
-            return;
-        }
-        let work = crate::scheduler::fire_timing_now_us().saturating_sub(last) * 1_000;
-        let acc = &crate::scheduler::GUEST_PHASES;
-        use std::sync::atomic::Ordering::Relaxed;
-        acc.work_ns.fetch_add(work, Relaxed);
-        acc.work_max_ns.fetch_max(work, Relaxed);
-        acc.n.fetch_add(1, Relaxed);
-    }
-
-    pub(crate) fn fire_timing_requested(&self) -> bool {
-        if crate::scheduler::fire_timing_full() {
-            return true;
-        }
-        crate::scheduler::ledger_timing_enabled() && !self.ledger_fire_timing_claimed
-    }
-
-    pub(crate) fn commit_fire_timing(&mut self, enabled: bool) {
-        if enabled && crate::scheduler::ledger_timing_enabled() {
-            self.ledger_fire_timing_claimed = true;
-        }
-    }
 
     pub fn get_username(&self) -> String {
         self.username.clone()

@@ -26,7 +26,7 @@ impl pie::inferlet::reasoning::Host for ProcessCtx {
 
 impl pie::inferlet::reasoning::HostDecoder for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<Decoder>> {
-        let inner = pie_model::model().instruct().reasoning_decoder();
+        let inner = crate::model::model().instruct().reasoning_decoder();
         let decoder = Decoder { inner };
         Ok(self.ctx().table.push(decoder)?)
     }

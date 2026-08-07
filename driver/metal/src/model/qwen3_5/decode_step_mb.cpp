@@ -9,6 +9,7 @@
 #include "decode_consts.hpp"
 #include "decode_dispatch_mb.hpp"
 #include "heap_bind.hpp"
+#include "batch/scratch.hpp"
 
 namespace pie::metal {
 namespace {
@@ -79,8 +80,28 @@ namespace {
 void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     auto rms = [&](int row, int rows) { rms_mb_dispatch(row, rows, n, d.grid, d.tg); };
     if (const int out = qmv_out_size(d.kind, g); out != 0) {
-        d.qmm_bn = qmm_bn(out, n);
-        d.qmm_bm = qmm_bm(n);
+        // `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only
+        // where split-K supplies the threadgroups the wide tile gives up, and
+        // this family dispatches no split -- see the comment on `qmm_split`
+        // just below, which is the same reason gemma4 and gpt-oss have.
+        // Padded to a whole row tile: `qmm_mb_rows` explains why, and why the
+        // padding is asked for the GEMM's three questions (does a tile exist,
+        // which rung, what grid) and for nothing else in this dispatch.
+        const int qn = qmm_mb_rows(n, g.max_tokens, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
+        d.qmm_bn = qmm_bn_unsplit(out, qn, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
+        d.qmm_bm = qmm_bm(qn);
+        // The second quantized set has a matvec and no GEMM: a checkpoint that
+        // spares its two routing projections at 8 bits gets one extra pipeline
+        // table, not an extra table of every batched shape.
+        //
+        // Measured, because a router runs once per prompt ROW and 40 layers of
+        // them is not obviously free: building the strided GEMM at the second
+        // format too and putting the router back on the batched path moved a
+        // 128-token prefill of Qwen3.6-35B-A3B from 222.4 to 223.7 tok/s, which
+        // is inside the run-to-run spread. The dispatch trace names it 8.5% of
+        // GPU time and that share is a decode's, where the batched path does
+        // not apply. So the second table stays two pipelines.
+        if (qwen35_uses_alt_quant(d.kind, g)) d.qmm_bn = 0;
         // NO split-K, for exactly the reason gemma4's `launch_shape_mb` gives:
         // the split GEMM writes `split_k` partial [M, N] slices into a side
         // buffer and needs a reduce pass to sum them, and NOTHING IN THIS
@@ -90,7 +111,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // whatever the last fire left in it.
         //
         // It survived because the split only engages at `qmm_bn != 0`, which
-        // needs a batch of at least `kQmmMinBatch`, and nothing fired one until
+        // needs a batch of at least `qmm_min_batch()`, and nothing fired one until
         // the throughput harness did. With the harness's fleet check it is a
         // one-line reproduction: sixteen copies of one prompt in one fire
         // answer 74088 and 1125 at step 0 with the split on, and agree with the
@@ -105,9 +126,9 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // built, so it has no way to insert a dispatch after itself.
         d.qmm_split = 1;
         if (d.qmm_split > 1)
-            qmm_t_splitk_dispatch(out, n, d.qmm_bm, d.qmm_split, d.grid, d.tg);
+            qmm_t_splitk_dispatch(out, qn, d.qmm_bm, d.qmm_split, d.grid, d.tg);
         else if (d.qmm_bn > 0)
-            qmm_t_dispatch(out, n, d.qmm_bn, d.qmm_bm, d.grid, d.tg);
+            qmm_t_dispatch(out, qn, d.qmm_bn, d.qmm_bm, d.grid, d.tg);
         else
             qmv_mb_dispatch(out, n, d.grid, d.tg);
         return;
@@ -172,19 +193,20 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // answer for them: they run over the sorted rows, which is neither `n`
         // nor `n * k`, because the sort pads every expert's run to a whole
         // tile. Once the batch fills a tile they become matmuls, and the tile
-        // is `kMoeTileRows` -- the same number the sort padded to, spelled from
-        // the constant rather than restated.
+        // is `moe_tile_rows`'s answer -- the same number the sort padded to,
+        // asked of the same function rather than restated.
         case Kernel::LlExpertGate:
         case Kernel::LlExpertUp:
         case Kernel::LlExpertDown: {
             const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
             const int sorted = moe_sorted_rows(g, n);
-            if (const int bn = qmm_bn(N, sorted);
+            // Routed, so the routed crossover.
+            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
                 bn > 0 && shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
                 d.qmm_bn = bn;
-                d.qmm_bm = shared_kernels::kMoeTileRows;
+                d.qmm_bm = shared_kernels::moe_tile_rows(n * g.experts_per_token, g.n_experts);
                 d.qmm_split = 1;
-                qmm_t_dispatch(N, sorted, bn, shared_kernels::kMoeTileRows, d.grid, d.tg);
+                qmm_t_dispatch(N, sorted, bn, d.qmm_bm, d.grid, d.tg);
             } else {
                 // One sorted row per (token, slot) pair and no expert axis: the
                 // pair's expert is `row_expert[p]`, not `tid.z`.
@@ -202,10 +224,94 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlMoeCombine:
             shared_kernels::expert_combine_dispatch(g.hidden, d.grid, d.tg, n); break;
         case Kernel::LlSharedCombine:
-            elementwise_mb_dispatch(g.hidden, n, d.grid, d.tg); break;
+            // The SAME helper the M=1 DAG emits this with, and not the flat
+            // `elementwise_mb_dispatch` its neighbours take: `shared_expert_combine`
+            // reads its row from `gid.y`, so a flat (width * N, 1, 1) grid puts
+            // every thread on row 0 and leaves rows 1.. holding whatever the
+            // pool did. At N=1 the two shapes are the same grid, which is why
+            // this survived every single-sequence gate and broke a fleet of two
+            // at its first step.
+            shared_kernels::moe_route_rows_dispatch(g.hidden, n, d.grid, d.tg); break;
 
         default:
             throw std::runtime_error("missing multi-batch launch geometry");
+    }
+}
+
+/// The dispatches the mixture's routing owns, in DAG order.
+///
+/// Everything from the top-k down to the combine: what they share is that their
+/// extent is the SORTED stack or the pair list, neither of which is a row count
+/// the per-token walk can supply. The router's own projection is not here -- it
+/// is an ordinary dense matvec and the strided GEMM already batches it -- and
+/// neither is the shared expert's, for the same reason.
+bool is_routed_group(Kernel k) {
+    switch (k) {
+        case Kernel::GoRouterTopK:
+        case Kernel::LlMoeSort:
+        case Kernel::LlMoeGather:
+        case Kernel::LlExpertGate:
+        case Kernel::LlExpertUp:
+        case Kernel::LlExpertDown:
+        case Kernel::LlExpertSiluMul:
+        case Kernel::LlMoeCombine:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// This kind's launch shape and pipeline over `rows` prompt rows at once.
+///
+/// Deliberately the same expressions `mb_geometry` uses at the same row count,
+/// because the batched prefill and the batched decode ARE the same computation
+/// -- what differs is only that the prefill's token-major values are a pitch
+/// apart. Two derivations of one shape is how a sort pads to one tile and a
+/// matmul reads another.
+bool routed_group_shape(const Dispatch& d, const DecodeGeometry& g, int rows,
+                        const MultiBatchPsos& mb, Grid& grid, Threadgroup& tg, Pso& pso) {
+    const int sorted = moe_sorted_rows(g, rows);
+    switch (d.kind) {
+        case Kernel::GoRouterTopK:
+            shared_kernels::router_topk_dispatch(g.n_experts, grid, tg, rows);
+            return true;
+        case Kernel::LlMoeSort:
+            // One threadgroup whatever the batch is; only its params change.
+            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            return true;
+        case Kernel::LlMoeGather:
+            shared_kernels::moe_route_rows_dispatch(g.hidden, sorted, grid, tg);
+            return true;
+        case Kernel::LlExpertSiluMul:
+            elementwise_mb_dispatch(g.moe_intermediate, sorted, grid, tg);
+            return true;
+        case Kernel::LlMoeCombine:
+            shared_kernels::expert_combine_dispatch(g.hidden, grid, tg, rows);
+            return true;
+        case Kernel::LlExpertGate:
+        case Kernel::LlExpertUp:
+        case Kernel::LlExpertDown: {
+            const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
+            const int pairs = rows * g.experts_per_token;
+            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
+                bn > 0 && shared_kernels::moe_should_batch(pairs, g.n_experts)) {
+                const int bm = shared_kernels::moe_tile_rows(pairs, g.n_experts);
+                const Pso& gemm = mb.qmm_routed[shared_kernels::moe_bm_slot(bm)]
+                                              [bn == 64 ? 2 : (bn == 32 ? 1 : 0)];
+                if (gemm.valid()) {
+                    qmm_t_dispatch(N, sorted, bn, bm, grid, tg);
+                    pso = gemm;
+                    return true;
+                }
+            }
+            // One sorted row per pair. Still worth batching: the sort put the
+            // rows that share an expert next to each other, so the slice one
+            // reads is the slice the next three read.
+            shared_kernels::routed_qmv_dispatch(N, 1, grid, tg, sorted);
+            return true;
+        }
+        default:
+            return false;
     }
 }
 
@@ -215,7 +321,8 @@ bool barrier_after_mb(const std::vector<Dispatch>& dag, size_t i,
     return run_ends[i] == int(i);
 }
 
-Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb) {
+Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
+           bool fp16_ok = true) {
     switch (d.kind) {
         case Kernel::EmbedUntied:
         case Kernel::EmbedGather: return mb.embed_mb;
@@ -236,7 +343,8 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::LlExpertDown: {
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
-                if (mb.qmm_routed[slot].valid()) return mb.qmm_routed[slot];
+                const int bm = shared_kernels::moe_bm_slot(d.qmm_bm);
+                if (mb.qmm_routed[bm][slot].valid()) return mb.qmm_routed[bm][slot];
             }
             return base[d.kind];
         }
@@ -247,6 +355,14 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
                 const int wide = wide_;
+                // FP16 first, where the tables exist. Storage and every
+                // neighbouring kernel stay BF16; what changes is that the MMA
+                // is an instruction on this device rather than a sequence the
+                // compiler writes to stand in for one.
+                const Pso& fp16 = d.fuse_residual
+                                      ? mb.qmm_t_residual_fp16_precast[wide][slot]
+                                      : mb.qmm_t_fp16_precast[wide][slot];
+                if (fp16_ok && fp16.valid() && mb.qmm_cast_bf16_f16.valid()) return fp16;
                 const Pso& gemm = d.fuse_residual ? mb.qmm_t_residual[wide][slot]
                                                   : mb.qmm_t[wide][slot];
                 if (gemm.valid()) return gemm;
@@ -254,6 +370,29 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
             return d.fuse_residual ? base.qmv_residual : base[d.kind];
         }
     }
+}
+
+/// The number of elements this dispatch's staging cast has to write, or 0
+/// where it has none.
+///
+/// The one predicate: `mb_pso` is told FP16 is available exactly when this
+/// answers nonzero, so the kernel that reads the staged copy cannot be
+/// selected in a fire that did not write one.
+int mb_fp16_cast_elems(const Dispatch& d, const MultiBatchPsos& mb,
+                       const DecodeGeometry* g, int n_tokens) {
+    if (g == nullptr || d.qmm_bn <= 0 || d.qmm_split > 1) return 0;
+    if (!mb.qmm_cast_bf16_f16.valid()) return 0;
+    if (is_routed_group(d.kind)) return 0;
+    const int wide = qmm_bm_slot(d.qmm_bm);
+    const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
+    const Pso& fp16 = d.fuse_residual ? mb.qmm_t_residual_fp16_precast[wide][slot]
+                                      : mb.qmm_t_fp16_precast[wide][slot];
+    if (!fp16.valid()) return 0;
+    const int K = int(qmv_kn(d.kind, *g).K);
+    if (K <= 0) return 0;
+    // The padded row count, matching what the host bound at buffer 13 and what
+    // the GEMM's row tiles actually read.
+    return qmm_mb_rows(n_tokens, g->max_tokens, qmm_min_batch(g->is_moe(), qwen35_fp16_format(*g))) * K;
 }
 
 inline void bind_slot(RawMetalContext& ctx, int ord, uint8_t idx, const SlotHandle& slot) {
@@ -419,24 +558,26 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
     }
 }
 
-void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
-                                 const std::vector<Dispatch>& dag) {
+/// Point the GDN pair's conv ping-pong at one of its two halves.
+///
+/// `even` selects the half holding the history this fire will READ: true binds
+/// `conv_state` in and `conv_state_out` out, false the reverse.
+///
+/// The two halves may not be the same buffer, which is the whole reason this
+/// exists. `gdn_prep` runs one threadgroup per VALUE head, and `rep = Hv/Hk`
+/// value heads share a key head: that head's conv window is READ by all `rep`
+/// of them and WRITTEN by the first. Alias the output over the input and the
+/// writer shifts the window while its siblings are still reading it -- a race
+/// whose two outcomes are both finite numbers, so it reports as a fleet member
+/// that quietly disagrees with its identical neighbours rather than as a
+/// fault. `rep` is 1 on Qwen3.6-35B-A3B and 3 on Qwen3.6-27B, which is why
+/// only the 27B showed it.
+void bind_gdn_conv_parity(RawMetalContext& ctx, const BoundDecode& b,
+                          const std::vector<Dispatch>& dag, bool even) {
     for (const Dispatch& d : dag) {
         if (d.kind != Kernel::GdnPrepSlotted && d.kind != Kernel::GdnCoreSlotted) continue;
         const auto& s = b.gdn[size_t(d.layer)];
-        if (!s.conv_state.valid()) continue;
-        const uint8_t idx = d.kind == Kernel::GdnPrepSlotted
-                                ? uint8_t(bind::GdnPrep::ConvStateOut)
-                                : uint8_t(bind::GdnCoreRecurrent::ConvStateOut);
-        ctx.arg_bind_ordinal(d.ordinal, idx, s.conv_state);
-    }
-}
-
-void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
-                            const std::vector<Dispatch>& dag, uint32_t slot, bool even) {
-    for (const Dispatch& d : dag) {
-        if (d.kind != Kernel::GdnPrepSlotted && d.kind != Kernel::GdnCoreSlotted) continue;
-        const auto& s = b.gdn[size_t(d.layer)];
+        if (!s.conv_state.valid() || !s.conv_state_out.valid()) continue;
         const SlotHandle& in = even ? s.conv_state : s.conv_state_out;
         const SlotHandle& out = even ? s.conv_state_out : s.conv_state;
         if (d.kind == Kernel::GdnPrepSlotted) {
@@ -447,7 +588,6 @@ void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
             ctx.arg_bind_ordinal(d.ordinal, uint8_t(bind::GdnCoreRecurrent::ConvStateOut), out);
         }
     }
-    (void)slot;  // the slotted shader consumes the per-token SlotOfToken buffer.
 }
 
 namespace {
@@ -526,29 +666,130 @@ void encode_prefill_dags_mb(StepEncoder& se,
     // and are not padded, and it already runs only for sampled rows.
     const int strided_rows =
         geometry != nullptr ? qmm_strided_rows(int(n), max_rows) : 0;
+    // How many prompt rows the mixture runs over at once, or 0 for one at a
+    // time. Bounded by the pool slot, which was sized for a per-token layout:
+    // a batched sort pads every touched expert's run to a whole tile, so its
+    // stack can be several times the rows that are real. A prompt whose stack
+    // would not fit keeps the per-token walk rather than overrunning the
+    // colour into the next value.
+    int routed_group = 0;
+    if (geometry != nullptr && geometry->is_moe() && n > 1 && max_rows > 0) {
+        const std::size_t cap = scratch_slot_elems(*geometry, max_rows);
+        const std::size_t need = std::size_t(moe_sorted_rows(*geometry, int(n))) *
+                                 std::size_t(geometry->hidden);
+        if (need <= cap) routed_group = int(n);
+    }
     for (size_t i = 0; i < length; ++i) {
         const Dispatch& d0 = dags[0][i];
         if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead &&
-            d0.kind != Kernel::LmHeadUntied) {
+            d0.kind != Kernel::LmHeadUntied &&
+            !qwen35_uses_alt_quant(d0.kind, *geometry)) {
             const int out = qmv_out_size(d0.kind, *geometry);
+            // The GEMM below tiles the output 32 columns at a time, so it can
+            // only take a projection whose width is a whole number of tiles.
+            // Everything else needs a batched primitive of its own, and the
+            // wide matvec IS that primitive: it is parametric in N, guards its
+            // last partial row group, and reads each decoded weight chunk once
+            // for four token vectors instead of once per token.
+            //
+            // This used to ask `out == 16`, which is the value Qwen3-Next's
+            // `linear_num_value_heads` has, and every projection of any other
+            // width that the GEMM also declined fell through to ONE MATVEC PER
+            // TOKEN. Qwen3.6-27B has 48 value heads, so its two per-head decay
+            // projections did exactly that: 2 kinds x 48 GDN layers x N tokens,
+            // 3072 dispatches in a 32-token prefill, each moving a 123 KB
+            // weight -- and a 32-token prefill encoded 8435 dispatches where it
+            // now encodes 5459. Prefill tok/s: 67.4 -> 84.2 at 32 tokens, 81.1
+            // -> 90.0 at 64, 94.2 -> 94.0 at 128. It is a per-token cost, so it
+            // is the SHORT prompts it was taxing, and by 128 tokens the GEMMs
+            // have grown past it. The width the GEMM cannot take is the width
+            // that needs this path most, so the question to ask is the GEMM's,
+            // negated.
+            if (out != 0 && out % 32 != 0 && !d0.fuse_residual &&
+                mb_psos.qmv_wide_strided.valid()) {
+                constexpr int vecs = 4;
+                constexpr int lanes = 8;
+                se.set_pso(mb_psos.qmv_wide_strided);
+                se.set_argtable(d0.kind, d0.ordinal);
+                se.dispatch(
+                    Grid{32u * std::uint32_t((int(n) + vecs - 1) / vecs),
+                         2u * std::uint32_t(
+                             (out + (64 / lanes) - 1) / (64 / lanes)), 1},
+                    Threadgroup{32, 2, 1});
+                se.barrier();
+                continue;
+            }
+            // A GDN projection narrow enough to fit one tile stays a matvec
+            // even where the GEMM could take it. A BN16 strided GEMM replaced
+            // 768 dispatches with six and end-to-end prefill fell from 1408 to
+            // 1396 tok/s: at that width a matrix tile's setup costs more than
+            // the four-vector reuse above saves.
             if (out != 0 && out % 32 == 0) {
                 const bool wide = qmm_strided_bm(strided_rows) > kQmmBM &&
                                   mb_psos.qmm_t_strided_wide.valid();
-                const Pso& gemm =
-                    wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
-                                             : mb_psos.qmm_t_strided_wide)
-                         : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
-                                             : mb_psos.qmm_t_strided);
+                const bool fp16 = mb_psos.qmm_t_strided_cast.valid() &&
+                                  mb_psos.qmm_t_strided_fp16_precast.valid();
+                const Pso& gemm = fp16
+                    ? (wide ? (d0.fuse_residual
+                                   ? mb_psos.qmm_t_strided_fp16_precast_wide_residual
+                                   : mb_psos.qmm_t_strided_fp16_precast_wide)
+                            : (d0.fuse_residual
+                                   ? mb_psos.qmm_t_strided_fp16_precast_residual
+                                   : mb_psos.qmm_t_strided_fp16_precast))
+                    : (wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
+                                                : mb_psos.qmm_t_strided_wide)
+                            : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
+                                                : mb_psos.qmm_t_strided));
                 if (gemm.valid()) {
                     Grid grid;
                     Threadgroup tg;
                     qmm_t_strided_dispatch(out, strided_rows, grid, tg);
+                    if (fp16) {
+                        se.set_pso(mb_psos.qmm_t_strided_cast);
+                        se.set_argtable(d0.kind, d0.ordinal);
+                        se.dispatch(
+                            Grid{std::uint32_t(qmv_kn(d0.kind, *geometry).K),
+                                 std::uint32_t(strided_rows), 1},
+                            Threadgroup{256, 1, 1});
+                        se.barrier();
+                    }
                     se.set_pso(gemm);
                     se.set_argtable(d0.kind, d0.ordinal);
                     se.dispatch(grid, tg);
                     se.barrier();
                     continue;
                 }
+            }
+        }
+        // ── the mixture, over the whole prompt at once ──
+        //
+        // The routing group is the one part of a prefill that CANNOT be batched
+        // by taking a kernel's strided variant, because what it batches over is
+        // not rows: the sort groups (row, slot) pairs by EXPERT, and a group of
+        // one row can only ever be one token's eight pairs. Run per token, every
+        // pair read its expert's whole weight slice -- 1.5 MB for a (2048, 512)
+        // triple -- and a 128-token prefill of Qwen3.6-35B-A3B read 1.6 GB a
+        // layer where 256 experts hold 402 MB. `affine_qmv_routed` was 30% of
+        // the fire's GPU time, and it was mostly the same bytes.
+        //
+        // Batched, the group runs on dag[0]'s argument tables: the sorted stack
+        // is packed from the base either way, and the three values that are
+        // TOKEN-major -- the router's logits in, the mixture's output out, and
+        // the hidden rows the gather reads -- carry the prefill's row pitch as a
+        // parameter rather than being assumed packed.
+        if (routed_group > 0 && is_routed_group(d0.kind)) {
+            Grid grid = d0.grid;
+            Threadgroup tg = d0.tg;
+            Pso pso = mb_pso(d0, base_psos, mb_psos);
+            if (!routed_group_shape(d0, *geometry, routed_group, mb_psos, grid, tg, pso)) {
+                // A kind whose batched form this does not know: fall through to
+                // the per-token walk rather than guess a shape for it.
+            } else {
+                se.set_pso(pso);
+                se.set_argtable(d0.kind, d0.ordinal);
+                se.dispatch(grid, tg);
+                se.barrier();
+                continue;
             }
         }
         // Row-independent kernels: the prefill's scratch rows are a uniform pitch
@@ -615,8 +856,18 @@ void encode_prefill_dags_mb(StepEncoder& se,
                     Grid grid = d.grid;
                     // prep is (dk, 1, rows*heads); the recurrent kernel keeps
                     // its (dk, dv, heads) grid and walks the rows internally.
-                    if (d.kind == Kernel::GdnPrepSlotted)
+                    if (d.kind == Kernel::GdnPrepSlotted) {
                         grid.z = d.grid.z * uint32_t(seg.rows);
+                    } else {
+                        // The scan puts 32/`gdn_scan_lanes` dv rows in one
+                        // simdgroup so each token's two reductions run that
+                        // many lanes wide instead of 32. Its x extent therefore
+                        // covers that many rows, not one; a Dv the rows do not
+                        // divide rounds up and the kernel masks the spares.
+                        const uint32_t rows_per_simd =
+                            uint32_t(32 / gdn_scan_lanes());
+                        grid.y = (grid.y + rows_per_simd - 1) / rows_per_simd;
+                    }
                     se.set_argtable(d.kind, d.ordinal);
                     se.dispatch(grid, d.tg);
                     for (int r = 0; r < seg.rows; ++r)
@@ -651,11 +902,28 @@ void encode_prefill_dags_mb(StepEncoder& se,
 
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
-                           bool force_barriers) {
+                           bool force_barriers, const DecodeGeometry* g, int n_tokens) {
     const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
-        se.set_pso(mb_pso(d, base_psos, mb_psos));
+        const int cast_elems = mb_fp16_cast_elems(d, mb_psos, g, n_tokens);
+        // The staging cast, ahead of the GEMM that reads it. It rides the
+        // GEMM's own argument table -- the source is already bound at buffer 3
+        // -- so it needs no DAG entry, and the barrier after it is what makes
+        // the cast visible to the tile loader.
+        //
+        // Per projection rather than grouped: a batched decode produces each
+        // value in the dispatch immediately before its consumer, so there is no
+        // window in which several are simultaneously final and nothing to
+        // group. It touches n*K elements against a GEMM that reads them N/BN
+        // times over.
+        if (cast_elems > 0) {
+            se.set_pso(mb_psos.qmm_cast_bf16_f16);
+            se.set_argtable(d.kind, d.ordinal);
+            se.dispatch(Grid{std::uint32_t(cast_elems), 1, 1}, Threadgroup{256, 1, 1});
+            se.barrier();
+        }
+        se.set_pso(mb_pso(d, base_psos, mb_psos, cast_elems > 0));
         se.set_argtable(d.kind, d.ordinal);
         se.dispatch(d.grid, d.tg);
         // Arm B of the interleaved A/B is a CONTROL by default: identical to

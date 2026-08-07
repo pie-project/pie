@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "batch/forward.hpp"
+#include "checkpoint_path.hpp"
 #include "batch/golden_tap.hpp"
 
 using namespace pie::metal;
@@ -228,8 +229,9 @@ int main() {
 
     // ── gemma4 ──
     if (!go_taps) {
-        const std::string dir = root + "/gemma4-e2b-pie";
-        if (!exists(dir)) {
+        const std::string dir = pie::metal::test::find_checkpoint(
+            "gemma4-e2b-pie", "models--mlx-community--gemma-4-e2b-it-4bit");
+        if (dir.empty() || !exists(dir)) {
             std::printf("  gemma4: SKIP (no checkpoint at %s)\n", dir.c_str());
         } else {
             SetupConfig cfg;
@@ -349,10 +351,10 @@ int main() {
 
             // ── Two sequences, resident at once ──
             //
-            // gpt-oss has no M>1 path -- its MoE picks experts per ROW -- so a
-            // two-member fire is two passes rather than one wider one. Paging
-            // is what makes those passes safe to interleave: before it, the KV
-            // was one ring and the second sequence overwrote the first.
+            // gpt-oss now sorts the two members' routed rows into one wider
+            // expert-major pass. Paging is what makes their KV histories safe:
+            // before it, the cache was one ring and the second sequence
+            // overwrote the first.
             //
             // B's prompt is a PREFIX of A's, so a leak between them would give
             // one answer twice. A must still answer 40510 ("Tokyo") beside a
