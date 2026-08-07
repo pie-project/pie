@@ -97,8 +97,29 @@ impl DecodeEnvelope {
 pub fn classify_decode_envelope(
     container: &TraceContainer,
 ) -> Result<Option<DecodeEnvelope>, String> {
+    classify_decode_envelope_why(container, &mut String::new())
+}
+
+/// `classify_decode_envelope`, plus the RULE that declined.
+///
+/// A shape decline is `Ok(None)` and a caller cannot tell one from another,
+/// so a container that just misses the class looks exactly like one that was
+/// never a candidate — and the fire then dies much later, on the first value
+/// the host cannot derive, naming a port rather than the rule. Every decline
+/// below writes `why`; the production caller logs it.
+pub fn classify_decode_envelope_why(
+    container: &TraceContainer,
+    why: &mut String,
+) -> Result<Option<DecodeEnvelope>, String> {
+    let mut decline = |reason: String| -> Result<Option<DecodeEnvelope>, String> {
+        *why = reason;
+        Ok(None)
+    };
     if !container.externs.is_empty() {
-        return Ok(None);
+        return decline(format!(
+            "the trace has {} extern(s); the class is closed traces only",
+            container.externs.len()
+        ));
     }
     let channel_for = |port| {
         container
@@ -111,10 +132,10 @@ pub fn classify_decode_envelope(
         _ => None,
     };
     let Some(token_channel) = channel_index(Port::EmbedTokens) else {
-        return Ok(None);
+        return decline("EmbedTokens is not bound to a channel".to_string());
     };
     let Some(kv_len_channel) = channel_index(Port::KvLen) else {
-        return Ok(None);
+        return decline("KvLen is not bound to a channel".to_string());
     };
     let puts_channel = |channel: usize| {
         container.stages.iter().any(|stage| {
@@ -134,7 +155,14 @@ pub fn classify_decode_envelope(
         .get(kv_len_channel)
         .ok_or_else(|| "decode envelope KV-length channel is out of range".to_string())?;
     if (!token.seeded && !loop_carried) || !puts_channel(kv_len_channel) {
-        return Ok(None);
+        return decline(format!(
+            "the token channel must be seeded or loop-carried and the KV-length \
+             channel must be put by a stage (token seeded={}, token loop-carried={}, \
+             kv-len put={})",
+            token.seeded,
+            loop_carried,
+            puts_channel(kv_len_channel)
+        ));
     }
     for port in [
         Port::Positions,
@@ -144,7 +172,7 @@ pub fn classify_decode_envelope(
         Port::WOff,
     ] {
         if channel_for(port).is_none() {
-            return Ok(None);
+            return decline(format!("{port:?} has no port binding at all"));
         }
     }
     let token_dims = token.shape.dims();

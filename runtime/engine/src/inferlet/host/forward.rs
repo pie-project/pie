@@ -800,8 +800,10 @@ impl ProcessCtx {
             let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
                 None
             } else {
-                match crate::pipeline::fire::geometry::classify_decode_envelope(
+                let mut why = String::new();
+                match crate::pipeline::fire::geometry::classify_decode_envelope_why(
                     &prog.bound.container,
+                    &mut why,
                 ) {
                     Ok(Some(envelope)) => {
                         let required =
@@ -817,7 +819,18 @@ impl ProcessCtx {
                             None
                         }
                     }
-                    Ok(None) => None,
+                    Ok(None) => {
+                        // The decline that used to be silent. Falling out of
+                        // this class is not itself a fault — most traces are
+                        // not decode envelopes — but when the fire later dies
+                        // on a value the host cannot derive, THIS is the line
+                        // that says which rule sent it down that road.
+                        tracing::info!(
+                            "not a decode envelope: {why}; falling back to \
+                             host-evaluated execution"
+                        );
+                        None
+                    }
                     Err(reason) => {
                         tracing::warn!(
                             "device-dependent geometry is not a decode envelope ({reason}); \
