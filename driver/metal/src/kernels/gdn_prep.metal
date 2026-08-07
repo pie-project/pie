@@ -397,17 +397,19 @@ template <typename T>
     wb(v_off + hv_idx * Dv + dv);
 }
 
-// A sum across the 16 lanes that own one dv row.  The xor tree stays inside the
-// aligned 16-lane half, so the simdgroup's two rows reduce independently.
-METAL_FUNC float gdn_row_sum16(float v) {
+// A sum across the LANES lanes that own one dv row.  The xor tree stays inside
+// the aligned LANES-wide slice, so the simdgroup's rows reduce independently.
+template <int LANES>
+METAL_FUNC float gdn_row_sum(float v) {
   v += simd_shuffle_xor(v, 1u);
-  v += simd_shuffle_xor(v, 2u);
-  v += simd_shuffle_xor(v, 4u);
-  v += simd_shuffle_xor(v, 8u);
+  if (LANES >= 4) v += simd_shuffle_xor(v, 2u);
+  if (LANES >= 8) v += simd_shuffle_xor(v, 4u);
+  if (LANES >= 16) v += simd_shuffle_xor(v, 8u);
+  if (LANES >= 32) v += simd_shuffle_xor(v, 16u);
   return v;
 }
 
-template <typename T>
+template <typename T, int LANES>
 [[kernel]] void gdn_core_recurrent_prefill(
     device float* rstate [[buffer(2)]], device T* core_out [[buffer(3)]],
     const device float* pre_q [[buffer(6)]], const device float* pre_k [[buffer(7)]],
@@ -416,17 +418,19 @@ template <typename T>
     constant int& row_pitch [[buffer(12)]], constant int& n_scan [[buffer(13)]],
     uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
   const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv;
-  // Two dv rows share a simdgroup.  Dropping the two per-token reductions from
-  // 32 lanes to 16 takes them from five shuffle rounds to four, and gives the
-  // simdgroup a second independent chain to interleave against the first --
-  // which is what this loop is short of: with the reductions removed entirely
-  // the kernel measured less than half its time, so it is waiting on them, not
-  // on arithmetic (7% of ALU peak) and not on bandwidth (staging q/k in
-  // threadgroup memory made it slower).  The dispatch halves grid.y to match.
+  // LANES lanes own one dv row, so 32/LANES rows share a simdgroup.  The scan
+  // is latency-bound on its two per-token reductions and on nothing else --
+  // with them removed the kernel measured less than half its time, against 7%
+  // of ALU peak and a bandwidth cost that got WORSE when q/k were staged in
+  // threadgroup memory.  Narrowing a row costs nothing and pays twice: the xor
+  // tree loses a round, and the simdgroup gains another independent chain to
+  // interleave against the first.  The dispatch divides grid.y to match.
+  constexpr int ROWS = 32 / LANES;
+  constexpr int MAX_PER_T = 128 / LANES;
   const int hv_idx = int(tpig.z);
-  const int dv_idx = int(tpig.y) * 2 + (int(tpig.x) >> 4);
-  const int dk_idx = int(tpig.x) & 15;
-  const int slot = int(slot_ids[0]), n_per_t = Dk / 16;
+  const int dv_idx = int(tpig.y) * ROWS + (int(tpig.x) / LANES);
+  const int dk_idx = int(tpig.x) % LANES;
+  const int slot = int(slot_ids[0]), n_per_t = Dk / LANES;
   const size_t pitch_f = size_t(row_pitch) / 2;
   const bool row_lead = dk_idx == 0;
   if (dv_idx >= Dv) return;
@@ -434,7 +438,7 @@ template <typename T>
   // This simdgroup owns the whole (slot, hv, dv) state row, so the scan runs in
   // registers with no ordering beyond the loop itself.
   device float* i_state = rstate + (size_t((slot * Hv + hv_idx) * Dv + dv_idx) * Dk);
-  float st[8];
+  float st[MAX_PER_T];
   for (int i = 0; i < n_per_t; ++i) st[i] = i_state[n_per_t * dk_idx + i];
 
   for (int t = 0; t < n_scan; ++t) {
@@ -446,7 +450,7 @@ template <typename T>
     const device float* iq = pre_q + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
     const device float* ik = pre_k + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
     const device float* g = pre_gate + size_t(t) * pitch_f + 2 * size_t(hv_idx);
-    float q[8], k[8];
+    float q[MAX_PER_T], k[MAX_PER_T];
     for (int i = 0; i < n_per_t; ++i) {
       const int d = n_per_t * dk_idx + i;
       q[i] = iq[d];
@@ -454,11 +458,11 @@ template <typename T>
     }
     float kv_mem = 0.0f;
     for (int i = 0; i < n_per_t; ++i) { st[i] *= g[0]; kv_mem += st[i] * k[i]; }
-    kv_mem = gdn_row_sum16(kv_mem);
+    kv_mem = gdn_row_sum<LANES>(kv_mem);
     const float delta = (vval - kv_mem) * g[1];
     float out = 0.0f;
     for (int i = 0; i < n_per_t; ++i) { st[i] += k[i] * delta; out += st[i] * q[i]; }
-    out = gdn_row_sum16(out);
+    out = gdn_row_sum<LANES>(out);
     if (row_lead)
       core_out[row_t + size_t(hv_idx) * Dv + dv_idx] = static_cast<T>(out);
   }
@@ -472,12 +476,17 @@ template <typename T>
       const device itype*, const device float*, const device itype*,            \
       const device itype*, const device itype*, device float*, device float*,   \
       device float*, device float*, constant GdnCoreParams&, const device uint*,\
-      constant int&, constant int&, uint3, uint);                               \
-  template [[host_name("gdn_core_recurrent_prefill_" #name)]] [[kernel]] void   \
-  gdn_core_recurrent_prefill<itype>(                                            \
+      constant int&, constant int&, uint3, uint);
+
+#define instantiate_gdn_scan(name, itype, lanes)                                \
+  template [[host_name("gdn_core_recurrent_prefill_" #name "_l_" #lanes)]]      \
+  [[kernel]] void gdn_core_recurrent_prefill<itype, lanes>(                     \
       device float*, device itype*, const device float*, const device float*,   \
       const device float*,                                                     \
       constant GdnCoreParams&, const device uint*, constant int&, constant int&,\
       uint3, uint);
 
 instantiate_gdn_prefill(bfloat16, bfloat)
+instantiate_gdn_scan(bfloat16, bfloat, 16)
+instantiate_gdn_scan(bfloat16, bfloat, 8)
+instantiate_gdn_scan(bfloat16, bfloat, 4)

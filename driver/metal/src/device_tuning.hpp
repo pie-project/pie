@@ -262,6 +262,39 @@ struct DeviceTuning {
     /// that it removes reductions.
     int sdpa_tile_min_rows_per_request = 32;
 
+    /// Lanes that share one value row of the gated-delta scan.
+    ///
+    /// The scan is the only strictly sequential kernel in a prefill -- it walks
+    /// the prompt token by token because the state it carries is the answer to
+    /// the token before -- and it is the largest single item in a Qwen prefill:
+    /// 59.4 ms for eighteen layers of a 32-token scan, which is a third of that
+    /// fire and about half of a 128-token one, and it is the reason this family
+    /// is the only one in this driver that loses a prefill to llama.cpp.
+    ///
+    /// The kernel is latency-bound on the two cross-lane reductions each token
+    /// needs, not on arithmetic (7% of ALU peak) and not on bandwidth (staging
+    /// q/k in threadgroup memory made it slower). That reads like an argument
+    /// for narrowing the row: every halving costs one round of the xor tree and
+    /// gives the simdgroup another independent row to interleave. It is wrong,
+    /// and this constant exists to record that it is wrong. M1 Max,
+    /// Qwen3.6-27B (Dk 128, Dv 128, 48 value heads), 128-token prefill tok/s:
+    ///
+    ///   lanes | xor rounds | floats/lane | tok/s
+    ///   ------|------------|-------------|-------
+    ///     16  |     4      |     24      |  92.4
+    ///      8  |     3      |     48      |  85.6
+    ///      4  |     2      |     96      |  92.6
+    ///
+    /// Eight is 7% SLOWER than sixteen and four only gets back to it. Removing
+    /// a reduction round does not help because the latency it removes was
+    /// already being hidden by occupancy, and the registers it costs take that
+    /// occupancy away. The reductions are what the kernel WAITS on; they are
+    /// not what it is short of. What it is short of is a formulation that does
+    /// not walk one token at a time -- the chunked form of the delta rule,
+    /// where a chunk's transitions are a matmul -- and no lane count reaches
+    /// it.
+    int gdn_scan_lanes = 16;
+
     /// Rows an expert's run must hold before the mixture sorts and batches at
     /// all, rather than running the routed projections as matvecs.
     ///
@@ -408,6 +441,7 @@ bool fp16_qmm();
 
 /// The attention's tiled-vs-per-row crossover, in rows per request.
 int sdpa_tile_min_rows_per_request();
+int gdn_scan_lanes();
 
 /// The mixture's batch-vs-matvec crossover, in rows per expert.
 int moe_batch_min_per_expert();
