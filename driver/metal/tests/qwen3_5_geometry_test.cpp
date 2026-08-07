@@ -626,17 +626,27 @@ void check_the_batched_mixture_becomes_a_matmul() {
         expect(d.qmm_bn == 0, "at M=1 the mixture stays matvecs");
         break;
     }
+    // At width the projections WOULD become matmuls, and on this family they
+    // are switched off: see `qwen35_routed_decode_batched`, whose note records
+    // a 32-lane fleet answering `220 0 0 0 0 0`. The geometry has to follow the
+    // switch on both sides -- a batched tile with an unbatched sort behind it
+    // reads rows the sort never wrote -- so this asks the switch rather than
+    // asserting one of the two answers.
+    const bool batched = pie::metal::qwen35_routed_decode_batched();
     for (const auto& d : dag) {
         if (d.kind != Kernel::LlExpertGate) continue;
-        expect(d.qmm_bn > 0, "at width the mixture becomes matmuls");
-        // And the tile must be what the sort padded to. A block spanning two
-        // experts reads one expert's weights for the other's rows.
-        expect(d.qmm_bm == pie::metal::shared_kernels::moe_tile_rows(
-                               wide * moe.experts_per_token, moe.n_experts),
-               "a routed tile is the tile the sort padded every run to");
-        // Split-K would sum partial products across a K the routing already
-        // split by expert, so it must stay off.
-        expect(d.qmm_split == 1, "a routed projection is never split along K");
+        expect((d.qmm_bn > 0) == batched,
+               "the mixture takes matmuls at width exactly when it is allowed to");
+        if (batched) {
+            // The tile must be what the sort padded to. A block spanning two
+            // experts reads one expert's weights for the other's rows.
+            expect(d.qmm_bm == pie::metal::shared_kernels::moe_tile_rows(
+                                   wide * moe.experts_per_token, moe.n_experts),
+                   "a routed tile is the tile the sort padded every run to");
+            // Split-K would sum partial products across a K the routing already
+            // split by expert, so it must stay off.
+            expect(d.qmm_split == 1, "a routed projection is never split along K");
+        }
         break;
     }
 
@@ -644,9 +654,9 @@ void check_the_batched_mixture_becomes_a_matmul() {
     // neither the token count nor `tokens * k`: it pads every touched expert's
     // run to a whole tile. Launched over the tokens instead, the tail of the
     // stack keeps the previous layer's output.
-    const int sorted = pie::metal::moe_sorted_rows(moe, wide);
-    expect(sorted > wide * moe.experts_per_token,
-           "a batched sort pads, where the M=1 sort did not");
+    const int sorted = pie::metal::moe_sorted_rows(moe, wide, batched);
+    expect(sorted > wide * moe.experts_per_token == batched,
+           "the sort pads exactly when the tile that needs the padding runs");
     for (const auto& d : dag) {
         if (d.kind != Kernel::LlMoeGather) continue;
         expect(d.grid.y == static_cast<std::uint32_t>(sorted),

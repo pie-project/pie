@@ -187,7 +187,9 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlExpertSiluMul:
             // The slot axis is gone -- a sorted row IS a slot -- so this is the
             // same elementwise shape over a taller batch.
-            elementwise_mb_dispatch(g.moe_intermediate, moe_sorted_rows(g, n), d.grid, d.tg);
+            elementwise_mb_dispatch(g.moe_intermediate,
+                                    moe_sorted_rows(g, n, qwen35_routed_decode_batched()),
+                                    d.grid, d.tg);
             break;
 
         // ── the mixture ──
@@ -263,8 +265,16 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlMoeSort:
             shared_kernels::moe_route_sort_dispatch(g.n_experts, d.grid, d.tg); break;
         case Kernel::LlMoeGather:
-            shared_kernels::moe_route_rows_dispatch(g.hidden, moe_sorted_rows(g, n),
-                                                    d.grid, d.tg); break;
+            // The stack this fills is the one the sort writes, so it has to
+            // ask the same question the sort did. Launched over the padded
+            // count with an unpadded sort behind it, the gather walks rows the
+            // sort never grouped -- which at 512 tokens is 12800 rows of copy
+            // for 4096 of content, and is exactly the cost
+            // `qwen35_routed_decode_batched` was turned off to stop paying.
+            shared_kernels::moe_route_rows_dispatch(
+                g.hidden, moe_sorted_rows(g, n, qwen35_routed_decode_batched()),
+                d.grid, d.tg);
+            break;
         case Kernel::LlMoeCombine:
             shared_kernels::expert_combine_dispatch(g.hidden, d.grid, d.tg, n); break;
         case Kernel::LlSharedCombine:
