@@ -899,8 +899,12 @@ void mixtral_forward_paged(
         // ── Sparse-MoE block ──
         if (prof.enabled) prof.close(stream);   // o_proj
         if (prof.enabled) prof.open(&prof.router, stream);
-        kernels::launch_rmsnorm_bf16(
+        // The MoE input is wanted in fp16 by the decode GEMV, and this norm is
+        // where it is produced; emitting both here retires the cast kernel
+        // that used to read it straight back.
+        kernels::launch_rmsnorm_bf16_with_fp16(
             ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
+            d_mxfp4_act_fp16.data(),
             N, H, eps, stream);
 
         // 1. Router logits, top-K + softmax + renormalize. We piggy-back
