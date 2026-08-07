@@ -54,6 +54,15 @@ void ForwardFn::attach_model(model::IModel* m) {
             "graph-safe model must gate every KV write on row_valid");
     }
     graph_safe                   = caps.graph_safe;
+    // Diagnostic escape hatch. A capturing stream forbids the event syncs the
+    // in-engine stage profilers need, so the decode path -- the one that
+    // decides throughput -- is the one path that cannot be measured while it
+    // is captured. Dropping capability, rather than replay, keeps the plan
+    // and the executor consistent with each other. Costs throughput; it is
+    // for measurement, not for serving.
+    if (graph_safe && std::getenv("PIE_CUDA_DISABLE_GRAPH_CAPTURE") != nullptr) {
+        graph_safe = false;
+    }
     graph_padding_kv_write_safe  = caps.graph_padding_kv_write_safe;
     supports_compact_logits      = caps.supports_compact_logits;
     supports_small_prefill_graph = caps.supports_small_prefill_graph;
@@ -126,6 +135,22 @@ std::uint32_t ForwardFn::invoke_graph_layout() {
 
 std::uint32_t ForwardFn::invoke_supergraph_graph_layout() {
     return model ? model->supergraph_graph_layout() : 0u;
+}
+
+bool ForwardFn::invoke_prefill_graph_capturable() const {
+    return model != nullptr && model->prefill_graph_capturable();
+}
+
+// `PIE_PREFILL_GRAPH=1` lets a wave carrying a prefill reach the graph cache
+// instead of falling to the eager path along with all of its decode lanes.
+// Default OFF: this changes which fires are captured, and the campaign's own
+// rule is that a single interleaved series is a hypothesis, not a result.
+bool prefill_graph_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_PREFILL_GRAPH");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
 }
 
 namespace {
@@ -799,9 +824,21 @@ bool forward_graph_replay_eligible(
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
          engine.inputs.custom_mask_indptr.data() != nullptr);
+    // A wave is replayable if its geometry is content-independent. Pure decode
+    // always is. A wave carrying a prefill is when the PLANNER says so --
+    // `PrefillPlanCache::graph_capturable`, which is exactly the "FA2 causal
+    // path planned in graph mode" condition and already computed per fire.
+    //
+    // Without the second clause one arriving request costs every decode lane in
+    // the wave its replay: measured 7,290 us of host enqueue on a prefill-
+    // carrying wave against 10 us on a pure-decode wave of the SAME width.
+    const bool geometry_replayable =
+        is_pure_decode ||
+        (prefill_graph_enabled() &&
+         engine.forward_fn.invoke_prefill_graph_capturable());
     return engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
-        is_pure_decode &&
+        geometry_replayable &&
         mask_pointers_stable &&
         !rs_buffer_write &&
         !rs_buffer_fold &&

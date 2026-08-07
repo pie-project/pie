@@ -68,16 +68,45 @@ template <typename T, bool SCALED>
   constexpr float NEG_INF = -3.0e38f;
 
   const uint row = tgid.y;
-  logits += size_t(row) * size_t(n);
+  logits += size_t(row) * size_t(p.logits_pitch != 0u ? p.logits_pitch : n);
   expert_ids += size_t(row) * size_t(k);
   expert_weights += size_t(row) * size_t(k);
 
   float v = lid < n ? float(logits[lid]) : NEG_INF;
 
   threadgroup float part_v[kRouterMaxSimdgroups];
+  threadgroup float part_s[kRouterMaxSimdgroups];
+  threadgroup float all_max;
+  threadgroup float all_sum;
   threadgroup uint part_i[kRouterMaxSimdgroups];
   threadgroup float chosen[kRouterMaxTopK];
   threadgroup uint winner_of_round;
+
+  // `norm_topk_prob: false` wants the softmax taken over EVERY expert and the
+  // top-k read out of it, so the k weights sum to less than one. Take that
+  // denominator here, before the selection loop consumes `v` -- each lane
+  // still holds its own logit and nothing has been knocked out yet.
+  if (p.softmax_over_all != 0u) {
+    const float m0 = simd_max(v);
+    if (simd_lid == 0) part_v[simd_gid] = m0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float best = NEG_INF;
+      for (uint sg = 0; sg < n_simd; ++sg) best = max(best, part_v[sg]);
+      all_max = best;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float e = lid < n ? fast::exp(v - all_max) : 0.0f;
+    const float s0 = simd_sum(e);
+    if (simd_lid == 0) part_s[simd_gid] = s0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float total = 0.0f;
+      for (uint sg = 0; sg < n_simd; ++sg) total += part_s[sg];
+      all_sum = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
 
   for (uint r = 0; r < k; ++r) {
     const float m = simd_max(v);
@@ -108,12 +137,18 @@ template <typename T, bool SCALED>
   }
 
   if (lid == 0) {
-    float mx = NEG_INF;
-    for (uint r = 0; r < k; ++r) mx = max(mx, chosen[r]);
-    float sum = 0.0f;
+    // Either denominator, one shape: exponentiate against a max and divide by
+    // a sum. Which max and which sum is the whole of `norm_topk_prob`.
+    float mx = all_max;
+    float sum = all_sum;
+    if (p.softmax_over_all == 0u) {
+      mx = NEG_INF;
+      for (uint r = 0; r < k; ++r) mx = max(mx, chosen[r]);
+      sum = 0.0f;
+      for (uint r = 0; r < k; ++r) sum += fast::exp(chosen[r] - mx);
+    }
     for (uint r = 0; r < k; ++r) {
       chosen[r] = fast::exp(chosen[r] - mx);
-      sum += chosen[r];
     }
     for (uint r = 0; r < k; ++r) {
       float weight = chosen[r] / sum;
@@ -284,8 +319,9 @@ constant constexpr uint kMaxExperts = 1024;
     if (gid.x >= p.width || gid.y >= p.padded) return;
     const int sel = perm[gid.y];
     const uint k = p.experts_per_token < 1u ? 1u : p.experts_per_token;
+    const uint x_pitch = p.x_pitch != 0u ? p.x_pitch : p.width;
     out[uint(gid.y) * p.width + gid.x] =
-        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * p.width + gid.x];
+        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * x_pitch + gid.x];
 }
 
 /// Sum a token's k expert outputs, weighted by the router's softmax, reading
@@ -317,7 +353,7 @@ constant constexpr uint kMaxExperts = 1024;
     if (at < 0) continue;
     acc += float(expert_weights[row * k + e]) * float(y[uint(at) * p.width + c]);
   }
-  out[row * p.width + c] = static_cast<bfloat>(acc);
+  out[row * (p.out_pitch != 0u ? p.out_pitch : p.width) + c] = static_cast<bfloat>(acc);
 }
 
 // ── The shared expert ────────────────────────────────────────────────────────

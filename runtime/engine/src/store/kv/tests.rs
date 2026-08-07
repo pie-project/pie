@@ -143,10 +143,8 @@ fn single_state_runahead_reuses_the_published_mapping() {
         [PreparedTarget::InPlace { .. }]
     ));
     let (follow_seq, follow_intents) = store.publish_prepared(follower, &[pc(21)]).unwrap();
-    store.settle(first_intents, true);
-    store.retire_through(first_seq);
-    store.settle(follow_intents, true);
-    store.retire_through(follow_seq);
+    store.settle(first_seq, first_intents, true);
+    store.settle(follow_seq, follow_intents, true);
     assert_eq!(store.available_pages(), 1);
 }
 
@@ -441,13 +439,26 @@ fn reclaim_quotes_count_only_the_private_resident_suffix() {
 
     // The 0..5 prefix is shared, so neither sharer can free it alone.
     assert_eq!(
-        t.reclaim_quotes(&[group(a), group(b)]),
+        t.reclaim_quotes(&[group(a), group(b)], u32::MAX),
         vec![ReclaimQuote::Pages(5), ReclaimQuote::Pages(2)]
     );
+    // A budget truncates the ANSWER, never the census: quoting stops as soon
+    // as the pages returned so far cover it, and the caller sees a shorter
+    // vector rather than a different one. Anything the picker would not have
+    // read is work the global KV lock was held for.
+    assert_eq!(
+        t.reclaim_quotes(&[group(a), group(b)], 5),
+        vec![ReclaimQuote::Pages(5)]
+    );
+    assert_eq!(
+        t.reclaim_quotes(&[group(a), group(b)], 6),
+        vec![ReclaimQuote::Pages(5), ReclaimQuote::Pages(2)]
+    );
+    assert!(t.reclaim_quotes(&[group(a), group(b)], 0).is_empty());
     // Sharing WITHIN one group is not sharing outward: quoted together, the
     // prefix belongs to the group and counts once.
     assert_eq!(
-        t.reclaim_quotes(&[HashSet::from([a, b])]),
+        t.reclaim_quotes(&[HashSet::from([a, b])], u32::MAX),
         vec![ReclaimQuote::Pages(12)]
     );
 
@@ -456,21 +467,27 @@ fn reclaim_quotes_count_only_the_private_resident_suffix() {
     let term_a = t.terminal(a).unwrap().unwrap();
     t.pin(term_a);
     assert_eq!(
-        t.reclaim_quotes(&[group(a)]),
+        t.reclaim_quotes(&[group(a)], u32::MAX),
         vec![ReclaimQuote::Nothing(NoReclaim::Pinned)]
     );
     t.unpin(term_a);
-    assert_eq!(t.reclaim_quotes(&[group(a)]), vec![ReclaimQuote::Pages(5)]);
+    assert_eq!(
+        t.reclaim_quotes(&[group(a)], u32::MAX),
+        vec![ReclaimQuote::Pages(5)]
+    );
 
     // Releasing b makes the shared prefix a's alone.
     let freed = t.release_working_set(b);
     assert_eq!(sorted(freed), vec![10, 11]);
-    assert_eq!(t.reclaim_quotes(&[group(a)]), vec![ReclaimQuote::Pages(10)]);
+    assert_eq!(
+        t.reclaim_quotes(&[group(a)], u32::MAX),
+        vec![ReclaimQuote::Pages(10)]
+    );
 
     // The case that livelocked victim selection: a candidate holding nothing
     // reports it, so selection can rule it out instead of re-picking it.
     assert_eq!(
-        t.reclaim_quotes(&[HashSet::new()]),
+        t.reclaim_quotes(&[HashSet::new()], u32::MAX),
         vec![ReclaimQuote::Nothing(NoReclaim::HoldsNothing)]
     );
 }
@@ -491,7 +508,10 @@ fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {
     // suffix it could actually free.
     assert_eq!(t.held_pages(&group(a)).unwrap(), 10);
     assert_eq!(t.held_pages(&group(b)).unwrap(), 7);
-    assert_eq!(t.reclaim_quotes(&[group(a)]), vec![ReclaimQuote::Pages(5)]);
+    assert_eq!(
+        t.reclaim_quotes(&[group(a)], u32::MAX),
+        vec![ReclaimQuote::Pages(5)]
+    );
 
     // THE REGRESSION THIS GUARDS (rainer_v3.md §3.3): a pin collapses the
     // quote to zero, but holdings must not move. `check_hog` read
@@ -502,7 +522,7 @@ fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {
     let term_a = t.terminal(a).unwrap().unwrap();
     t.pin(term_a);
     assert_eq!(
-        t.reclaim_quotes(&[group(a)]),
+        t.reclaim_quotes(&[group(a)], u32::MAX),
         vec![ReclaimQuote::Nothing(NoReclaim::Pinned)]
     );
     assert_eq!(
@@ -739,8 +759,7 @@ fn publish_prepared(
     commits: &[PageCommit],
 ) {
     let (seq, intents) = store.publish_prepared(prepared, commits).unwrap();
-    store.settle(intents, true);
-    store.retire_through(seq);
+    store.settle(seq, intents, true);
 }
 
 /// Prepare+commit `n` fresh pages onto `ws`, returning the committed ids.
@@ -1150,20 +1169,75 @@ fn later_settlement_does_not_retire_older_inflight_pages() {
     store.reserve(second_ws, 1).unwrap();
     let first = store.prepare_write(first_ws, &[0]).unwrap();
     let second = store.prepare_write(second_ws, &[0]).unwrap();
-    let (_first_seq, first_intents) = store.publish_prepared(first, &[pc(1)]).unwrap();
-    let (_second_seq, second_intents) = store.publish_prepared(second, &[pc(2)]).unwrap();
+    let (first_seq, first_intents) = store.publish_prepared(first, &[pc(1)]).unwrap();
+    let (second_seq, second_intents) = store.publish_prepared(second, &[pc(2)]).unwrap();
     store
         .discard(first_ws, &[0..1], store.current_epoch())
         .unwrap();
 
-    store.settle(second_intents, true);
+    // Settled OUT OF ORDER, and with a third fire still outstanding, so the
+    // release cannot come from the `in_flight == 0` whole-set self-heal: only
+    // `settle` removing its own sequence can advance the retirement frontier.
+    let third_ws = store.create_working_set();
+    store.reserve(third_ws, 1).unwrap();
+    let third = store.prepare_write(third_ws, &[0]).unwrap();
+    let (third_seq, third_intents) = store.publish_prepared(third, &[pc(3)]).unwrap();
+
+    store.settle(second_seq, second_intents, true);
+    assert_eq!(
+        store.available_pages(),
+        1,
+        "a later fire cannot retire a page still protected by an older fire"
+    );
+    store.settle(first_seq, first_intents, true);
     assert_eq!(
         store.available_pages(),
         2,
-        "a later fire cannot retire a page still protected by an older fire"
+        "the oldest fire settling releases its epoch even with a newer fire \
+         still in flight — the whole point of tracking the set rather than a \
+         count (analysis.md 10.16-10.17)"
     );
-    store.settle(first_intents, true);
+    store.settle(third_seq, third_intents, true);
+    assert_eq!(store.available_pages(), 2);
+}
+
+/// `settle` carries its own sequence so the retirement frontier cannot be
+/// pinned by a caller who forgot a second call. Nothing may stay outstanding
+/// once every published fire has settled, WITHOUT relying on the quiesced
+/// self-heal — the regression this guards is a silent one (freed pages simply
+/// stop reaching the free list until a moment of global quiescence, which
+/// under load never comes).
+#[test]
+fn settling_every_fire_leaves_no_epoch_outstanding() {
+    let mut store = KvStore::new(6, h(42));
+    let mut live = Vec::new();
+    for _ in 0..3 {
+        let ws = store.create_working_set();
+        store.reserve(ws, 1).unwrap();
+        let prepared = store.prepare_write(ws, &[0]).unwrap();
+        let (seq, intents) = store.publish_prepared(prepared, &[pc(7)]).unwrap();
+        live.push((ws, seq, intents));
+    }
     assert_eq!(store.available_pages(), 3);
+    // Discard every mapping, so all three pages are epoch-tagged and can only
+    // come back through retirement.
+    for (ws, _, _) in &live {
+        store.discard(*ws, &[0..1], store.current_epoch()).unwrap();
+    }
+    assert_eq!(store.available_pages(), 3, "still gated by three live fires");
+
+    // Newest first: each settle may only release what nothing older gates.
+    live.reverse();
+    for (index, (_, seq, intents)) in live.into_iter().enumerate() {
+        store.settle(seq, intents, true);
+        let expected = if index == 2 { 6 } else { 3 };
+        assert_eq!(
+            store.available_pages(),
+            expected,
+            "settle #{index} (newest-first) must release exactly the epochs no \
+             older outstanding fire still gates"
+        );
+    }
 }
 
 #[test]
@@ -1172,10 +1246,11 @@ fn store_publish_mismatch_cancels_prepared_write() {
     let ws = store.create_working_set();
     store.reserve(ws, 2).unwrap();
     let prepared = store.prepare_write(ws, &[0, 1]).unwrap();
-    let seq = prepared.seq();
     let err = store.publish_prepared(prepared, &[pc(0)]).unwrap_err();
     assert_eq!(err, KvStoreError::CommitMismatch);
-    store.retire_through(seq);
+    // The mismatch routes through `cancel_prepared`, which releases the write's
+    // own sequence — no separate retirement call is owed for a write that never
+    // published (this used to be a `retire_through(seq)` that did nothing).
     assert_eq!(store.available_pages(), 4);
     assert_eq!(store.mapped_len(ws).unwrap(), 0);
 }
@@ -1464,4 +1539,56 @@ fn pool_recycles_only_after_epoch_retires() {
     pool.retire_through(5);
     assert_eq!(pool.available(), 4);
     assert!(pool.try_alloc_n(4).is_some());
+}
+
+// ----------------------------------------------------------------------
+// Lock-free page_len mirror
+// ----------------------------------------------------------------------
+
+/// The mirror is what the fire path and the guest's `page-len` host call
+/// read INSTEAD of taking the global KV mutex, so it has to track every
+/// logical extent change: reservation, publication, and truncation. Drift
+/// would hand a fire a stale bound and let a declaration resolve past the
+/// end of the mapping. (`KvPageTable::page_len` debug-asserts the same
+/// invariant on every locked read, which covers the rest of this suite.)
+#[test]
+fn page_len_mirror_tracks_every_extent_change() {
+    use std::sync::atomic::Ordering;
+
+    let mut t = KvPageTable::new();
+    let ws = t.create_working_set();
+    let mirror = t.page_len_mirror(ws).unwrap();
+    assert_eq!(mirror.load(Ordering::Acquire), 0);
+
+    t.reserve(ws, 7).unwrap();
+    assert_eq!(mirror.load(Ordering::Acquire), 7);
+
+    publish(&mut t, ws, 0..5);
+    assert_eq!(mirror.load(Ordering::Acquire), t.page_len(ws).unwrap());
+
+    let published = t.page_len(ws).unwrap();
+    t.discard(ws, &[3..published]).unwrap();
+    assert_eq!(mirror.load(Ordering::Acquire), t.page_len(ws).unwrap());
+    assert_eq!(mirror.load(Ordering::Acquire), 3);
+}
+
+/// A handle can outlive its WorkingSet (release races an in-flight fire).
+/// The mirror must then report the same "unknown working set" the locked
+/// read would have, not the last extent it happened to hold.
+#[test]
+fn page_len_mirror_is_tombstoned_when_the_working_set_goes_away() {
+    use std::sync::atomic::Ordering;
+
+    let mut t = KvPageTable::new();
+    let ws = t.create_working_set();
+    publish(&mut t, ws, 0..3);
+    let mirror = t.page_len_mirror(ws).unwrap();
+    assert_eq!(mirror.load(Ordering::Acquire), 3);
+
+    t.release_working_set(ws);
+    assert!(matches!(
+        t.page_len(ws),
+        Err(KvTableError::UnknownWorkingSet)
+    ));
+    assert_eq!(mirror.load(Ordering::Acquire), u64::MAX);
 }

@@ -219,6 +219,39 @@ pub fn realize_declaration(
     realize_declaration_impl(store, ws, writable, None)
 }
 
+/// KV realize-ahead (`PIE_KV_REALIZE_AHEAD`): extend a fire's writable page
+/// range `ahead` pages past its end, clamped to the working set's logical
+/// reservation (`page_len`) — the capacity the guest itself declared, the
+/// same figure the writable declaration resolved against. The lookahead
+/// pages are ordinary realized pages of the declared range (they free with
+/// the working set); the clamp keeps the extension strictly inside it, so a
+/// fire at the declaration's final page computes zero extra demand instead
+/// of tripping `backing_demand`'s frontier check. `ahead == 0` is the exact
+/// identity (no store read). The demand probe and the grant-consuming
+/// prepare both derive their range through THIS function under one lock
+/// hold — the same one-place discipline as [`declaration_overlap`].
+pub fn realize_ahead_range(
+    store: &KvStore,
+    ws: WorkingSetId,
+    writable: &std::ops::Range<u64>,
+    ahead: u64,
+) -> Result<std::ops::Range<u64>, KvError> {
+    if ahead == 0 {
+        return Ok(writable.clone());
+    }
+    let capacity = store.page_len(ws)?;
+    // `max(writable.end)`: never shrink the base range — if the logical
+    // reservation moved under the resolved declaration, the base fire's
+    // own computation (and its errors) must stay exactly as without the
+    // lookahead.
+    let end = writable
+        .end
+        .saturating_add(ahead)
+        .min(capacity)
+        .max(writable.end);
+    Ok(writable.start..end)
+}
+
 /// Physical-page demand for declaration realization without allocation,
 /// publication, pins, or an open transaction.
 pub fn realize_declaration_demand(
@@ -455,8 +488,7 @@ pub fn prepare(
     let (translation_version, translation) = match build_translation(store, ws) {
         Ok(translation) => translation,
         Err(error) => {
-            store.settle(cas_intents, false);
-            store.retire_through(seq);
+            store.settle(seq, cas_intents, false);
             return Err(error.into());
         }
     };
@@ -512,8 +544,7 @@ pub fn prepare_explicit_reserved(
     let (translation_version, translation) = match build_translation(store, ws) {
         Ok(translation) => translation,
         Err(error) => {
-            store.settle(cas_intents, false);
-            store.retire_through(seq);
+            store.settle(seq, cas_intents, false);
             return Err(error.into());
         }
     };
@@ -535,8 +566,7 @@ pub fn abandon(store: &mut KvStore, txn: KvTxn) {
     let KvTxn {
         seq, cas_intents, ..
     } = txn;
-    store.settle(cas_intents, false);
-    store.retire_through(seq);
+    store.settle(seq, cas_intents, false);
 }
 
 /// Finalize a PTIR fire's KV write after `submit_async` resolves. `success`
@@ -548,8 +578,7 @@ pub fn finalize(store: &mut KvStore, txn: KvTxn, success: bool) -> Result<(), St
     let KvTxn {
         seq, cas_intents, ..
     } = txn;
-    store.settle(cas_intents, success);
-    store.retire_through(seq);
+    store.settle(seq, cas_intents, success);
     Ok(())
 }
 
@@ -1312,6 +1341,38 @@ mod tests {
         assert_eq!(store.lookup(parent, 1).unwrap(), parent_tail);
         assert!(store.page_token_hashes(child, 1).unwrap().is_empty());
         finalize(&mut store, txn.unwrap(), true).unwrap();
+    }
+
+    #[test]
+    fn realize_ahead_adds_one_page_mid_declaration_and_clamps_at_the_end() {
+        let mut store = KvStore::new(16, nonce());
+        let ws = store.create_working_set();
+        // Declared capacity: 4 logical pages, the first 2 already backed.
+        store.reserve(ws, 4).unwrap();
+        store.ensure_backed(ws, 2).unwrap();
+
+        // Mid-declaration: lookahead 1 extends the range by exactly one
+        // page, and the demand grows by exactly that page.
+        let base = 1..2u64;
+        let extended = realize_ahead_range(&store, ws, &base, 1).unwrap();
+        assert_eq!(extended, 1..3);
+        assert_eq!(
+            store.backing_demand(ws, extended.end).unwrap(),
+            store.backing_demand(ws, base.end).unwrap() + 1
+        );
+
+        // At the declaration's final page the clamp holds range and demand
+        // fixed — no demand beyond the declared capacity, no error.
+        let tail = 3..4u64;
+        let clamped = realize_ahead_range(&store, ws, &tail, 1).unwrap();
+        assert_eq!(clamped, tail);
+        assert_eq!(
+            store.backing_demand(ws, clamped.end).unwrap(),
+            store.backing_demand(ws, tail.end).unwrap()
+        );
+
+        // ahead == 0 is the exact identity (the flag-off path).
+        assert_eq!(realize_ahead_range(&store, ws, &base, 0).unwrap(), base);
     }
 
     /// Canonical prefill of `tokens` onto `ws`, chunked as `fires` splits.

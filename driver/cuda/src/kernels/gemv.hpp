@@ -33,6 +33,23 @@ bool launch_gemv_bf16(
     const void* bias,     // bf16 [N] or nullptr
     void*       out,      // bf16 [N]
     int N, int K,
+    cudaStream_t stream,
+    // `out = W @ act + bias + beta * out`. beta = 1 is what a projection
+    // accumulating into a residual asks for, and refusing it used to push
+    // those shapes onto cuBLAS: gpt-oss's o_proj measured 17.3 us there
+    // against 11.2 for the same bytes through this kernel.
+    float beta = 0.f);
+
+// q/k/v in one launch: same activation, same K, three weights and three row
+// counts. Row-per-block with the warps splitting K, so the two small
+// projections inherit the grid of the large one instead of running alone.
+// Returns false and touches nothing if any argument is unsuitable.
+bool launch_gemv3_bf16(
+    const void* w0, const void* w1, const void* w2,
+    const void* b0, const void* b1, const void* b2,  // may be null
+    void* o0, void* o1, void* o2,
+    const void* act,
+    int n0, int n1, int n2, int K,
     cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels

@@ -24,13 +24,17 @@
 
 namespace pie::metal::gemma4 {
 
-int gemma4_qmm_rows(int rows) {
+int gemma4_qmm_rows(const Gemma4Geometry& g, int rows) {
     const int n = rows < 1 ? 1 : rows;
-    // `kQmmMinBatch` is qwen3.5's crossover between the GEMV and the GEMM, and
-    // this family inherits it. MEASURED here rather than assumed: lowering it
-    // to 4, so the GEMM engages at 8 rows instead of 12, costs gemma4 17%
-    // (8 lanes, 128.5 -> 106.5 tok/s). The inherited number holds.
-    if (n < kQmmMinBatch) return n;
+    // The GEMV/GEMM crossover, which `device_tuning.hpp` owns and which this
+    // family inherits rather than measures. What it does NOT inherit is one
+    // number for both shapes of checkpoint: a gemma-4-26B-A4B is a mixture and
+    // an E2B is dense, and on an M2 Max the two want different crossovers --
+    // dense 8, routed 12. Measured here from this family's own side on the M1
+    // Max first, where lowering the single number to 4 (so the GEMM engaged at
+    // 8 rows instead of 12) cost 17% on 8 lanes, 128.5 -> 106.5 tok/s; that
+    // checkpoint was routed, which is the half of the split that kept 12.
+    if (n < qmm_min_batch(g.is_moe())) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -62,7 +66,9 @@ int gemma4_moe_qmm_bn(Kind k, const Gemma4Geometry& g, int rows, int layer) {
     if (!is_routed(k) || gemma4_moe_tile_rows(g, rows) <= 1) return 0;
     const KN kn = qmv_kn(k, g, layer);
     if (kn.N == 0) return 0;
-    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows));
+    // Routed, so the routed crossover; `moe_should_batch` has already admitted
+    // this batch and the sorted count clears either number regardless.
+    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows), qmm_min_batch(true));
 }
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -209,6 +215,17 @@ Kernel pso_kind(Kind k) {
     }
 }
 
+/// Whether this fire's attention runs the tiled pipeline.
+///
+/// One predicate, read by `pso_for_mb` and `launch_shape_mb` both: they must
+/// agree or the grid describes a different kernel than the one that runs, and
+/// that is wrong numbers rather than a crash. `requests == 0` is a caller that
+/// did not say, and an unknown fire does not tile -- the tiled kernel loses
+/// badly on a fleet of decodes, so the safe default is the per-row shape.
+bool sdpa_tile_this_fire(int rows, int requests) {
+    return requests > 0 && sdpa_should_tile(rows, requests);
+}
+
 /// The pipeline a gemma4 dispatch runs on at M>1.
 ///
 /// Distinct from `pso_for` for exactly the kinds whose KERNEL changes with the
@@ -222,7 +239,7 @@ Kernel pso_kind(Kind k) {
 /// is wrong numbers.
 Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
                const DecodeStepPsos& base, const MultiBatchPsos& mb,
-               const Gemma4Psos& g4, int head_rows) {
+               const Gemma4Psos& g4, int head_rows, int requests) {
     const int N = rows < 1 ? 1 : rows;
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
 
@@ -232,20 +249,28 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
     if (is_routed(d.kind)) {
         if (const int bn = gemma4_moe_qmm_bn(d.kind, g, N, d.layer); bn > 0) {
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
-            if (g4.qmm_routed[slot].valid()) return g4.qmm_routed[slot];
+            const int bm = shared_kernels::moe_bm_slot(gemma4_moe_tile_rows(g, N));
+            if (g4.qmm_routed[bm][slot].valid()) return g4.qmm_routed[bm][slot];
         }
         return g4.qmv_routed;
     }
     if (const KN kn = qmv_kn(d.kind, g, d.layer); kn.N != 0) {
-        const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
+        const int M = gemma4_qmm_rows(g, d.kind == Kind::LmHead ? S : N);
         const int bm = qmm_bm(M);
-        const int bn = qmm_bn(kn.N, M);
+        // `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only
+        // where split-K supplies the threadgroups the wide tile gives up, and
+        // this family dispatches no split (see `launch_shape_mb`).
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
         const int wide = qmm_bm_slot(bm);
         // No split-K here either; see `launch_shape_mb`.
         const int split = 0;
         if (split > 1 && mb.qmm_t_splitk[wide].valid()) return mb.qmm_t_splitk[wide];
         if (bn > 0) {
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
+            if (gemma4_fp16_qmm(g, d, d.kind == Kind::LmHead ? S : N) &&
+                mb.qmm_t_fp16_precast[wide][slot].valid()) {
+                return mb.qmm_t_fp16_precast[wide][slot];
+            }
             if (mb.qmm_t[wide][slot].valid()) return mb.qmm_t[wide][slot];
         }
         return pso_for(d, g, base, g4);  // the matvec, when no tiling applies
@@ -267,6 +292,8 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
         // Paged, and windowed by the same slot for both attention types -- the
         // head width is still what picks the instantiation.
         case Kind::Sdpa:
+            if (sdpa_tile_this_fire(N, requests))
+                return d.sliding ? mb.sdpa_paged_tiled : mb.sdpa_paged_tiled_d512;
             return d.sliding ? mb.sdpa_paged : mb.sdpa_paged_d512;
         default:
             return pso_for(d, g, base, g4);
@@ -285,9 +312,11 @@ bool qmv_needs_tail(int K, const AffineFormat& fmt) {
     return K % block != 0;
 }
 
-bool gemma4_uses_alt_quant(Kind k) {
-    return k == Kind::QmvGate || k == Kind::QmvUp || k == Kind::QmvDown ||
-           k == Kind::RouterGemv;
+bool gemma4_uses_alt_quant(Kind k, const Gemma4Geometry& g) {
+    if (k == Kind::QmvGate || k == Kind::QmvUp || k == Kind::QmvDown) {
+        return g.alt_quant_ffn;
+    }
+    return k == Kind::RouterGemv && g.alt_quant_router;
 }
 
 Pso pso_for(const Dispatch& d, const Gemma4Geometry& g, const DecodeStepPsos& base,
@@ -298,7 +327,7 @@ Pso pso_for(const Dispatch& d, const Gemma4Geometry& g, const DecodeStepPsos& ba
     // bounds-checked one.
     if (!is_routed(d.kind)) {
         if (const KN kn = qmv_kn(d.kind, g, d.layer); kn.N != 0) {
-            const bool alt = gemma4_uses_alt_quant(d.kind) && g.has_alt_quant();
+            const bool alt = gemma4_uses_alt_quant(d.kind, g) && g.has_alt_quant();
             const AffineFormat& fmt = alt ? g.ffn_quant : g.quant;
             if (qmv_needs_tail(kn.K, fmt)) return alt ? g4.qmv_tail_alt : g4.qmv_tail;
         }
@@ -354,7 +383,7 @@ Pso pso_for(const Dispatch& d, const Gemma4Geometry& g, const DecodeStepPsos& ba
 /// `rows` is the token count in the batch. At rows==1 each case reduces to
 /// `launch_shape`'s, which the test asserts rather than assuming.
 void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
-                     Threadgroup& tg, int head_rows) {
+                     Threadgroup& tg, int head_rows, int requests) {
     const int L = d.layer;
     const int hd = L >= 0 ? g.head_dim_of(L) : g.head_dim;
     const int N = rows < 1 ? 1 : rows;
@@ -377,7 +406,7 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         const KN kn = qmv_kn(d.kind, g, L);
         const int sorted = gemma4_moe_sorted_rows(g, N);
         if (const int bn = gemma4_moe_qmm_bn(d.kind, g, N, L); bn > 0) {
-            qmm_t_dispatch(kn.N, sorted, bn, shared_kernels::kMoeTileRows, grid, tg);
+            qmm_t_dispatch(kn.N, sorted, bn, gemma4_moe_tile_rows(g, N), grid, tg);
             return;
         }
         // One sorted row per (token, slot) pair, and the expert axis is gone --
@@ -386,9 +415,12 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         return;
     }
     if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
-        const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
+        const int M = gemma4_qmm_rows(g, d.kind == Kind::LmHead ? S : N);
         const int bm = qmm_bm(M);
-        const int bn = qmm_bn(kn.N, M);
+        // Same chooser as `pso_for_mb`, for the same reason -- and it has to be
+        // the same one: the grid and the pipeline disagreeing about BN is a
+        // dispatch that computes the wrong thing rather than one that refuses.
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
         // NO split-K. The split GEMM accumulates partial sums into a split
         // buffer and needs a reduce pass to fold them; qwen3.5 has both, this
         // family has neither -- so a split dispatch here wrote partials nobody
@@ -484,7 +516,11 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
             kv_append_mb_dispatch(hd, g.n_kv_heads_of(L), N, grid, tg);
             return;
         case Kind::Sdpa:
-            sdpa_sliding_dispatch(g.n_q_heads, grid, tg, N);
+            // Same predicate as `pso_for_mb`, for the same reason.
+            if (sdpa_tile_this_fire(N, requests))
+                sdpa_paged_tiled_dispatch(g.n_q_heads, N, grid, tg);
+            else
+                sdpa_sliding_dispatch(g.n_q_heads, grid, tg, N);
             return;
         case Kind::LayerScalar:
             elementwise_mb_dispatch(g.hidden, N, grid, tg);
@@ -661,7 +697,7 @@ void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
         // 4. One pipeline for both would run a 4-bit kernel over 8-bit bytes:
         // it dispatches, it is fast, and every token is wrong.
         const DecodeStepPsos& B =
-            (base_alt != nullptr && gemma4_uses_alt_quant(d.kind)) ? *base_alt : base;
+            (base_alt != nullptr && gemma4_uses_alt_quant(d.kind, g)) ? *base_alt : base;
         se.set_pso(pso_for(d, g, B, g4));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
@@ -676,7 +712,7 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base, const MultiBatchPsos& mb,
                            const Gemma4Psos& g4, int ordinal_base, int head_rows,
                            const DecodeStepPsos* base_alt, const MultiBatchPsos* mb_alt,
-                           std::size_t begin, std::size_t end) {
+                           int requests, std::size_t begin, std::size_t end) {
     // Deliberately the same walk as `encode_gemma4_step`, differing only in
     // which shape and which pipeline each dispatch gets. The DAG, the ordering
     // and the concurrency runs are properties of the MODEL, not of the batch
@@ -686,18 +722,94 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
     // recomputing it per segment would let a boundary invent a barrier.
     const std::vector<int> run_ends = concurrent_run_ends(dag);
     if (end == 0 || end > dag.size()) end = dag.size();
+    const int N0 = rows < 1 ? 1 : rows;
+    const int S0 = head_rows < 1 ? N0 : (head_rows < N0 ? head_rows : N0);
     for (std::size_t i = begin; i < end; ++i) {
         const Dispatch& d = dag[i];
+        // The FP16 staging pass. It rides the projection's own argument table
+        // -- the source is already bound there as the GEMM's input and the
+        // staging buffer beside it -- so it needs no DAG entry, which is what
+        // lets it exist at all: the DAG is built before the row count is known
+        // and nothing here can insert a node into it.
+        const int m = d.kind == Kind::LmHead ? S0 : N0;
+        if (gemma4_fp16_qmm(g, d, m) && gemma4_fp16_cast_before(d.kind) &&
+            mb.qmm_cast_bf16_f16.valid()) {
+            se.set_pso(mb.qmm_cast_bf16_f16);
+            se.set_argtable_ordinal(ordinal_base + d.ordinal);
+            const std::uint32_t count = std::uint32_t(gemma4_qmm_rows(g, m)) *
+                                        std::uint32_t(qmv_kn(d.kind, g, d.layer).K);
+            se.dispatch(Grid{count, 1, 1}, Threadgroup{256, 1, 1});
+            se.barrier();
+        }
         Grid grid;
         Threadgroup tg;
-        launch_shape_mb(d, g, rows, grid, tg, head_rows);
+        launch_shape_mb(d, g, rows, grid, tg, head_rows, requests);
         const bool alt = base_alt != nullptr && mb_alt != nullptr &&
-                         gemma4_uses_alt_quant(d.kind);
+                         gemma4_uses_alt_quant(d.kind, g);
         se.set_pso(pso_for_mb(d, g, rows, alt ? *base_alt : base, alt ? *mb_alt : mb, g4,
-                              head_rows));
+                              head_rows, requests));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
         if (i + 1 >= end || run_ends[i] == static_cast<int>(i)) se.barrier();
+    }
+}
+
+/// Whether this dispatch's GEMM reads an FP16 copy of its input.
+///
+/// M1 runs FP16 simdgroup MMA substantially faster than BF16 -- measured on
+/// this family's own projections with `roofline_probe`, BM=64 BN=32, GFLOP/s:
+///
+///     M     K     N        BF16     FP16
+///     128  1536  2048      3474     5030
+///     128  1536  6144      4376     6074
+///     128  6144  1536      3420     4545
+///     448  1536  2048      4350     6033
+///     448  1536  6144      4574     6384
+///     448  6144  1536      4163     5794
+///
+/// Storage and every surrounding kernel stay BF16; only the GEMM's input is
+/// staged to half, once per input rather than once per output tile. Routed
+/// models are excluded on purpose -- llama measured FP16 flipping expert top-k
+/// -- and so is the second quantized set, where a checkpoint ships one: those
+/// tables are 8-bit and have no FP16 pipeline.
+bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
+    // `is_moe` covers the routed kinds too: the DAG emits them under the same
+    // condition, so a dense checkpoint has none to reach.
+    if (!fp16_qmm()) return false;
+    if (g.is_moe() || g.quant.bits != 4 || g.quant.group != 64) return false;
+    // Only a checkpoint that really ships two formats has an 8-bit set to keep
+    // away from, and only the tensors it actually spared. Reading the kind
+    // alone would have excluded gate, up and down from every checkpoint, which
+    // is three quarters of the arithmetic.
+    if (g.has_alt_quant() && gemma4_uses_alt_quant(d.kind, g)) return false;
+    const KN kn = qmv_kn(d.kind, g, d.layer);
+    if (kn.N == 0) return false;
+    return qmm_bn_unsplit(int(kn.N), gemma4_qmm_rows(g, m),
+                          qmm_min_batch(g.is_moe())) > 0;
+}
+
+/// Which dispatches stage, as opposed to reading what an earlier one staged.
+///
+/// One staging buffer serves the whole step, so a projection casts only when
+/// its input is not already there. The DAG groups projections by input: q/k/v
+/// all read `AttnNorm`'s row, gate/up both read `FfnNorm`'s, and the rest --
+/// o after the attention, down after the GeGLU, and the three PLE heads --
+/// each read something of their own. Casting before the first of each group is
+/// what makes the buffer reusable; casting before every one of them would be
+/// correct too, and would spend a barrier per projection to say the same thing.
+bool gemma4_fp16_cast_before(Kind k) {
+    switch (k) {
+        case Kind::QmvQ:
+        case Kind::QmvO:
+        case Kind::QmvGate:
+        case Kind::QmvDown:
+        case Kind::PleProjGemv:
+        case Kind::PleGateGemv:
+        case Kind::PleProjLayerGemv:
+        case Kind::LmHead:
+            return true;
+        default:
+            return false;
     }
 }
 

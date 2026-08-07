@@ -263,7 +263,7 @@ template <
 // one iteration in the common case, and correct when a tile straddles a
 // request boundary. Simdgroups outside the current run sit out the scoring but
 // still reach every barrier, because the run bounds are threadgroup-uniform.
-template <typename T, int D, int V = D, bool WITH_SINK = false>
+template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LANE = false>
 [[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_tiled(
     const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
     const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
@@ -299,8 +299,43 @@ template <typename T, int D, int V = D, bool WITH_SINK = false>
   constexpr float NEG_INF = -3.0e38f;
   typedef float U;
 
-  threadgroup T ktile[KT * D];
+  // Where a score comes from, and it is the whole difference between the two
+  // shapes this kernel compiles to.
+  //
+  // The original gives a KEY to the simdgroup: thirty-two lanes each multiply
+  // `per_lane = D/32` dimensions and a `simd_sum` folds them into one number.
+  // At llama's d=64 that is TWO fused multiply-adds behind a five-step shuffle
+  // reduction -- the reduction costs more than the arithmetic it reduces.
+  //
+  // `KEY_PER_LANE` gives a key to the LANE instead. Each lane walks the whole
+  // D-long dot product for a key of its own, so thirty-two keys are scored with
+  // no reduction at all, and the softmax then needs one `simd_max` and one
+  // `simd_sum` per THIRTY-TWO keys rather than one of each per key. It costs a
+  // threadgroup copy of q -- the lane no longer owns the slice it needs -- and
+  // a per-pass probability tile to hand the result back to the accumulation,
+  // which still wants the original layout because that one needs no reduction.
+  //
+  // Not free at every width, and the width is what decides it. q and the
+  // probabilities are `QT*D` and `QT*KT` on top of the staged keys and values:
+  // 28 KB at d=64 and d=128, 34 KB at d=256, and at d=512 q alone is the whole
+  // 32 KB. Halving KT does make d=256 fit, at 25 KB, and it was measured: 1304
+  // -> 1196 tok/s on a 448-row gemma-4 prefill, because a pass half as deep is
+  // twice as many staging barriers and at d=256 the reduction this removes is
+  // only 62% of the arithmetic it sits on, against 250% at d=64. So the wide
+  // heads keep the per-row shape, and this is compiled for the two widths where
+  // it both fits and pays.
+  constexpr int kq = KEY_PER_LANE ? QT * D : 1;
+  constexpr int kp_tile = KEY_PER_LANE ? QT * KT : 1;
+  // K's rows are read one per LANE in that shape, so a bare `D` stride puts all
+  // thirty-two lanes in one bank. Two elements of padding walks them across
+  // banks instead.
+  constexpr int kstride = KEY_PER_LANE ? D + 2 : D;
+  constexpr int kcols = KEY_PER_LANE ? (KT + 31) / 32 : 1;
+
+  threadgroup T ktile[KT * kstride];
   threadgroup T vtile[KT * D];
+  threadgroup T qtile[kq];
+  threadgroup U ptile[kp_tile];
 
   const int q_head    = int(tid.x);
   const int n_q_heads = int(tpg.x);
@@ -317,8 +352,20 @@ template <typename T, int D, int V = D, bool WITH_SINK = false>
     const device T* qp =
         queries + (size_t(row) * n_q_heads + q_head) * D + simd_lid * per_lane;
     for (int i = 0; i < per_lane; i++) q[i] = static_cast<U>(scale) * static_cast<U>(qp[i]);
+    // The lane-per-key shape needs the WHOLE row where the lane owns a slice of
+    // it, so the row goes to threadgroup memory once. Unscaled: these are the
+    // checkpoint's own bits, and the scale rides the score instead, which is
+    // one rounding fewer than staging a scaled copy in T.
+    if (KEY_PER_LANE) {
+      for (int i = 0; i < per_lane; i++)
+        qtile[simd_gid * D + simd_lid * per_lane + i] = qp[i];
+    }
   } else {
     for (int i = 0; i < per_lane; i++) q[i] = 0;
+    if (KEY_PER_LANE) {
+      for (int i = 0; i < per_lane; i++)
+        qtile[simd_gid * D + simd_lid * per_lane + i] = T(0);
+    }
   }
 
   const int q_pos     = live ? position_ids[row] : 0;
@@ -361,35 +408,95 @@ template <typename T, int D, int V = D, bool WITH_SINK = false>
         const int page = int(kv_page_indices[page_base + kp / page_size]);
         const size_t slot = size_t(page) * page_size + (kp % page_size);
         const size_t off = (slot * n_kv_heads + kv_head) * D + d;
-        ktile[e] = k_pages[off];
+        ktile[kk * kstride + d] = k_pages[off];
         vtile[e] = v_pages[off];
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (!mine) continue;  // still reaches the next pass's barrier
 
-      const threadgroup T* kbase = ktile + simd_lid * per_lane;
       const threadgroup T* vbase = vtile + simd_lid * per_lane;
-      for (int kk = 0; kk < cnt; kk++) {
-        const int kp = base + kk;
-        // Every condition here is a property of the ROW, and a row is a
-        // simdgroup, so the branch is simd-uniform and `simd_sum` below is
-        // reached by all thirty-two lanes or by none.
-        if (kp > q_pos || kp < my_start) continue;
-        if (masked && (uint(kp) >= attention_mask_stride ||
-                       attention_mask[size_t(row) * attention_mask_stride + uint(kp)] == 0)) {
-          continue;
-        }
-        const threadgroup T* kptr = kbase + kk * D;
-        U score = 0;
-        for (int j = 0; j < per_lane; j++) score += q[j] * static_cast<U>(kptr[j]);
-        score = simd_sum(score);
+      // Whether a key survives this row's causal bound, window and mask. Both
+      // shapes ask it; only where they ask it from differs.
+      const auto keeps = [&](int kp) {
+        if (kp > q_pos || kp < my_start) return false;
+        return !(masked && (uint(kp) >= attention_mask_stride ||
+                            attention_mask[size_t(row) * attention_mask_stride +
+                                           uint(kp)] == 0));
+      };
 
-        U factor, exp_score;
-        sdpa_online_update(
-            score, max_score, sum_exp_score, factor, exp_score);
-        const threadgroup T* vptr = vbase + kk * D;
-        for (int j = 0; j < per_lane; j++)
-          o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[j]);
+      if (KEY_PER_LANE) {
+        // ── the pass's scores, one key per lane, no reduction ──
+        const threadgroup T* qrow = qtile + simd_gid * D;
+        U s[kcols];
+        U block_max = NEG_INF;
+        for (int c = 0; c < kcols; c++) {
+          const int kk = c * 32 + int(simd_lid);
+          U sc = NEG_INF;
+          if (kk < cnt && keeps(base + kk)) {
+            const threadgroup T* kptr = ktile + kk * kstride;
+            U acc = 0;
+            for (int d = 0; d < D; d++)
+              acc += static_cast<U>(qrow[d]) * static_cast<U>(kptr[d]);
+            sc = static_cast<U>(scale) * acc;
+          }
+          s[c] = sc;
+          block_max = sc > block_max ? sc : block_max;
+        }
+        // Two reductions for the whole pass, where the other shape spends two
+        // per key.
+        block_max = simd_max(block_max);
+        const U new_max = block_max > max_score ? block_max : max_score;
+        // A pass whose every key was masked leaves `new_max` at -inf; rescaling
+        // by exp(-inf - -inf) is a NaN, and the pass has nothing to add anyway.
+        if (new_max > NEG_INF) {
+          const U factor = max_score == NEG_INF ? U(0) : fast::exp(max_score - new_max);
+          U block_sum = 0;
+          for (int c = 0; c < kcols; c++) {
+            const int kk = c * 32 + int(simd_lid);
+            const U p = s[c] == NEG_INF ? U(0) : fast::exp(s[c] - new_max);
+            // A pass narrower than the simdgroup leaves lanes with no key of
+            // their own, and their slot is the NEXT row's. `KT >= 32` at every
+            // width compiled here, so this guards a shape rather than a bug --
+            // but it guards it where the shape is decided, not where it is read.
+            if (kk < KT) ptile[simd_gid * KT + kk] = p;
+            block_sum += p;
+          }
+          block_sum = simd_sum(block_sum);
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + block_sum;
+          // ── the pass's values, back in the layout that needs no reduction ──
+          for (int j = 0; j < per_lane; j++) o[j] *= factor;
+          for (int kk = 0; kk < cnt; kk++) {
+            // Uniform across the simdgroup: the row is the simdgroup and the
+            // key is the loop, so this reads one broadcast word.
+            const U p = ptile[simd_gid * KT + kk];
+            if (p == U(0)) continue;
+            const threadgroup T* vptr = vbase + kk * D;
+            for (int j = 0; j < per_lane; j++)
+              o[j] += p * static_cast<U>(vptr[j]);
+          }
+        }
+      } else {
+        const threadgroup T* kbase = ktile + simd_lid * per_lane;
+        for (int kk = 0; kk < cnt; kk++) {
+          const int kp = base + kk;
+          // Every condition here is a property of the ROW, and a row is a
+          // simdgroup, so the branch is simd-uniform and `simd_sum` below is
+          // reached by all thirty-two lanes or by none.
+          if (!keeps(kp)) continue;
+          const threadgroup T* kptr = kbase + kk * kstride;
+          U score = 0;
+          for (int j = 0; j < per_lane; j++) score += q[j] * static_cast<U>(kptr[j]);
+          score = simd_sum(score);
+
+          U factor, exp_score;
+          sdpa_online_update(
+              score, max_score, sum_exp_score, factor, exp_score);
+          const threadgroup T* vptr = vbase + kk * D;
+          for (int j = 0; j < per_lane; j++)
+            o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[j]);
+        }
       }
     }
     sub = sub_hi;
@@ -412,9 +519,9 @@ template <typename T, int D, int V = D, bool WITH_SINK = false>
   }
 }
 
-#define instantiate_sdpa_tiled_impl(fn, name, itype, d, v, sink)           \
+#define instantiate_sdpa_tiled_impl(fn, name, itype, d, v, sink, kpl)      \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
-  [[kernel]] void sdpa_paged_tiled<itype, d, v, sink>(                     \
+  [[kernel]] void sdpa_paged_tiled<itype, d, v, sink, kpl>(                \
       const device itype*, const device itype*, const device itype*,       \
       device itype*, const constant int&, const device int*,               \
       const device int*, const device uint*, const device uint*,           \
@@ -423,8 +530,17 @@ template <typename T, int D, int V = D, bool WITH_SINK = false>
       const constant int&, const device itype*, const constant int&,       \
       uint3, uint3, uint, uint);
 
-instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 128, 128, false)
-instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 64, 64, false)
+instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 128, 128, false, true)
+instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 64, 64, false, true)
+// gemma4's two head widths. `KT = 4096 / D` keeps the staged tile at 16 KB of
+// each of K and V no matter how wide the head is, so these cost the same
+// threadgroup memory as the narrow ones -- only the pass count changes.
+instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 256, 256, false, false)
+instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 512, 512, false, false)
+// gpt-oss's head width, with the learned per-head sink in the denominator. The
+// tiled kernel already merges the sink; it had simply never been asked for with
+// one, because the family that has sinks was not tiling.
+instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", bfloat16, bfloat, 64, 64, true, true)
 
 #define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \

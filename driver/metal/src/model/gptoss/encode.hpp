@@ -56,7 +56,12 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
 void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const GptOssGeometry& g, int rows, const DecodeStepPsos& base,
                            const MultiBatchPsos& mb, const GptOssPsos& go,
-                           int ordinal_base = 0, int head_rows = 0, std::size_t begin = 0,
+                           int ordinal_base = 0, int head_rows = 0,
+                           /// The fire's request count, which with `rows` is
+                           /// what decides the attention's shape. 0 means the
+                           /// caller does not know, and an unknown fire keeps
+                           /// the per-row kernel.
+                           int requests = 0, std::size_t begin = 0,
                            std::size_t end = 0);
 
 /// Encode a single-row step against paged KV. Wider fires use

@@ -804,11 +804,7 @@ int Context::Impl::initialize(
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
     const bool native_mxfp4_moe =
-#ifdef PIE_CUDA_HAS_MARLIN
-        dev_prop.major >= 10;
-#else
-        false;
-#endif
+        native_mxfp4_moe_enabled(dev_prop.major);
     nlohmann::json facts = {
         {"abi_version", PIE_DRIVER_ABI_VERSION},
         {"backend", "cuda"},
@@ -1081,6 +1077,7 @@ int Context::Impl::load_model(
     const CudaMemoryPlan mem_plan = plan_cuda_memory(
         cfg, engine.hf_config(), max_mlp_intermediate, max_Hq, max_Hk,
         family == model::Family::Gemma4, plan_info.per_layer_head_dim,
+        plan_info.per_layer_num_kv_heads,
         plan_info.kv_source_layer, family == model::Family::Qwen3_5,
         family == model::Family::Qwen3_5Moe, qwen3_5_linear_layers,
         family == model::Family::NemotronH, nemotron_h_mamba_layers,

@@ -85,7 +85,8 @@ set(PIE_METAL_EXPLICIT_SOURCES
   src/model_facts.cpp
   src/pipeline/registry.cpp
   src/batch/compose.cpp
-  src/batch/forward.cpp)
+  src/batch/forward.cpp
+  src/device_tuning.cpp)
 if(NOT APPLE)
   list(APPEND PIE_METAL_EXPLICIT_SOURCES src/pipeline/shared_storage.cpp)
 endif()
@@ -97,6 +98,7 @@ set(PIE_METAL_LIVE_SOURCES)
 if(APPLE)
   set(PIE_METAL_LIVE_SOURCES
     src/mtl4_context.mm
+    src/device_tuning_apple.mm
     src/pipeline/shared_storage.mm
     src/pipeline/m1_runtime.cpp
     src/batch/decode_timing.cpp
@@ -213,6 +215,7 @@ if(APPLE)
     "-framework Metal"
     "-framework MetalKit"
     "-framework Foundation"
+    "-framework IOKit"
     "-framework Accelerate")
 endif()
 
@@ -431,7 +434,12 @@ add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/src/batch
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/model/qwen3_5
   ${CMAKE_CURRENT_SOURCE_DIR}/src/loader)
+# The slot size is `scratch_slot_elems`, which asks the device tuning where the
+# mixture's batching threshold is -- so this stopped being a header-only test
+# the day the heap stopped deriving its own answer.
+target_link_libraries(heap_layout_slot_test PRIVATE pie_driver_metal_lib)
 add_test(NAME heap_layout_slot_test COMMAND heap_layout_slot_test)
 
 # The slab is a pointer and a stride, deliberately, so its eviction rule and
@@ -573,4 +581,25 @@ if(APPLE)
     PIE_MSL_RUNTIME_TEMPLATE="${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/runtime/metal/ptir_m1_runtime.metal"
     PIE_MSL_GROUPED_PREAMBLE="${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/runtime/metal/ptir_m1_grouped.metal"
     PIE_MSL_RNG_PREAMBLE="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/ptir_rng.generated.metal")
+  # The tests that load a real checkpoint each take a multi-gigabyte Metal heap
+  # -- `gemma4_forward_test` asks for 6 GiB and `gemma4_prefill_numerics_test`
+  # for 8 -- so two of them scheduled together can exhaust the device where
+  # either alone fits. `ctest -j` had never scheduled two, because until the
+  # checkpoint lookup learned to find the Hugging Face cache they all skipped
+  # in a hundredth of a second. A shared lock keeps the rest of the suite
+  # parallel and these one at a time.
+  set(PIE_METAL_CHECKPOINT_TESTS
+    gemma4_forward_test
+    gemma4_prefill_numerics_test
+    gptoss_forward_test
+    simple_family_executor_test
+    simple_family_executor_streamed_test
+    llama_bench)
+  # `if(TEST)` rather than an unconditional list: several of these are
+  # registered only when the loader is built.
+  foreach(t IN LISTS PIE_METAL_CHECKPOINT_TESTS)
+    if(TEST ${t})
+      set_tests_properties(${t} PROPERTIES RESOURCE_LOCK metal_gpu_heap)
+    endif()
+  endforeach()
 endif()

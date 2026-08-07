@@ -144,8 +144,6 @@ enum class Q35Kernel {
     StepBatchedBf16,
     StepBatchedGqa,
     StepBatchedGqaBf16,
-    PrefillWarpTiled,
-    PrefillWarpTiledBf16,
     PrefillWarpTiledGqa,
     PrefillWarpTiledGqaBf16,
     PrefillCached,
@@ -170,8 +168,6 @@ Q35Kernel resolve_q35_kernel(std::string_view k) {
     if (k == "launch_recurrent_gated_delta_step_batched_state_bf16") return Q35Kernel::StepBatchedBf16;
     if (k == "launch_recurrent_gated_delta_step_batched_gqa") return Q35Kernel::StepBatchedGqa;
     if (k == "launch_recurrent_gated_delta_step_batched_gqa_state_bf16") return Q35Kernel::StepBatchedGqaBf16;
-    if (k == "launch_chunk_gated_delta_prefill_batched_warp_tiled") return Q35Kernel::PrefillWarpTiled;
-    if (k == "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16") return Q35Kernel::PrefillWarpTiledBf16;
     if (k == "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa") return Q35Kernel::PrefillWarpTiledGqa;
     if (k == "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16") return Q35Kernel::PrefillWarpTiledGqaBf16;
     if (k == "launch_chunk_gated_delta_prefill_batched_cached") return Q35Kernel::PrefillCached;
@@ -966,22 +962,6 @@ case PieForwardOpKind::Launch: {
                     la.v_fp32.data(), la.g_log.data(), la.beta.data(),
                     rs_slot0, slot_ids_d, slot_stride,
                     la.core_out.data(), R, K_h, V_h, K_d, V_d, stream);
-                break;
-            case Q35Kernel::PrefillWarpTiled:
-                kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
-                    q_recur_full, k_recur_full,
-                    la.v_fp32.data(), la.g_log.data(), la.beta.data(),
-                    static_cast<float*>(rs_slot0), slot_ids_d, qo_indptr,
-                    slot_stride, la.core_out.data(),
-                    R, V_h, K_d, V_d, stream, write_state);
-                break;
-            case Q35Kernel::PrefillWarpTiledBf16:
-                kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
-                    q_recur_full, k_recur_full,
-                    la.v_fp32.data(), la.g_log.data(), la.beta.data(),
-                    rs_slot0, slot_ids_d, qo_indptr,
-                    slot_stride, la.core_out.data(),
-                    R, V_h, K_d, V_d, stream, write_state);
                 break;
             case Q35Kernel::PrefillWarpTiledGqa:
                 kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(

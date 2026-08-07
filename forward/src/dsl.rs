@@ -2595,7 +2595,7 @@ pub mod cuda {
         }
     }
 
-    /// `kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled[_gqa][_state_bf16]`:
+    /// `kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa[_state_bf16]`:
     /// the warp-tiled small-N prefill recurrence. NOT a value producer:
     /// the three prefill recurrence signatures record launches with NO
     /// outputs, because each runs inside a value-producing guard chain
@@ -2610,14 +2610,18 @@ pub mod cuda {
         g: &Val,
         beta: &Val,
         rs: &Rs,
-        gqa: bool,
         state_bf16: bool,
     ) {
-        let kernel = match (gqa, state_bf16) {
-            (true, true) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
-            (true, false) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa",
-            (false, true) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
-            (false, false) => "launch_chunk_gated_delta_prefill_batched_warp_tiled",
+        // ONE arm per state dtype, and nothing else to choose. The GQA
+        // kernel's `repeat` is 1 when `K_h == V_h`, its `qk_h` is `h`, and
+        // its index reduces to the non-GQA one exactly — so that pair was
+        // a second copy of the same arithmetic and upstream deleted it.
+        // Keeping a statement for a symbol the driver no longer exports
+        // would be a declaration that cannot load.
+        let kernel = if state_bf16 {
+            "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16"
+        } else {
+            "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa"
         };
         gdn_prefill(q, k, v, g, beta, rs, kernel);
     }

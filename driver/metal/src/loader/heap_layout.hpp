@@ -18,6 +18,8 @@
 
 #include <cstddef>
 #include <cstdint>
+
+#include "batch/scratch.hpp"  // scratch_widest_elems
 #include <algorithm>
 #include "decode_abi.hpp"
 
@@ -94,21 +96,24 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
     p.state_bytes = align_region(size_t(n_gdn) * p.state_per_layer);
 
     // ── Scratch (activation ping-pong pool) ──
-    // One slot must hold the largest M=1 activation that ping-pongs through the DAG.
-    // Logits (vocab) live in IO, not scratch; the largest scratch activation is the
-    // widest intermediate projection output.
-    int widest = g.intermediate;                 // MLP gate/up out
-    widest = widest > g.gdn_conv_dim ? widest : g.gdn_conv_dim;   // GDN in-proj out
-    const int gdn_prep_elems =
-        2 * (2 * g.gdn_v_heads + g.gdn_v_heads * g.gdn_v_dim);
-    widest = widest > gdn_prep_elems ? widest : gdn_prep_elems;
-    widest = widest > g.n_q_heads * g.head_dim ? widest : g.n_q_heads * g.head_dim; // q
+    // One slot must hold the largest activation that ping-pongs through the DAG,
+    // and `scratch_slot_elems` is the ONE place that decides how large that is.
+    //
+    // It used to be re-derived here, with a comment on the other copy asking
+    // that the two be kept in sync. They had drifted, in both directions: this
+    // copy never grew the MIXTURE's terms, so on Qwen3.6-35B-A3B it sized the
+    // slot at 8320 elements a row where the binder lays the prefill's rows
+    // 16384 apart -- every row past the halfway point wrote into the next
+    // colour -- and it never knew that a batched sort's padded stack is not
+    // `n` times the M=1 one either. Two derivations of one number is not a
+    // thing to keep in sync; it is a thing to delete.
     // The sealed M=1 allocation stays byte-identical.  Paged fires store
     // token-major [max_tokens,width] activations in the same colored buffers.
     const size_t scratch_rows = g.paged_kv_enabled
                                   ? size_t(g.max_tokens < 1 ? 1 : g.max_tokens)
                                   : 1u;
-    p.scratch_slot_bytes = align_slot(size_t(widest) * scratch_rows * act_dtype_bytes);
+    p.scratch_slot_bytes =
+        align_slot(scratch_slot_elems(g, int(scratch_rows)) * act_dtype_bytes);
     p.scratch_bytes = align_region(size_t(SCRATCH_POOL) * p.scratch_slot_bytes);
 
     // ── IO (per-token scalars + logits; scalars widen to max_tokens at M>1) ──

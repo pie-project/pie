@@ -749,7 +749,8 @@ __global__ void moe_align_decode_kernel(
     int num_routes,
     int num_experts,
     int block_size,
-    int max_blocks)
+    int max_blocks,
+    std::int32_t* __restrict__ num_tokens_past_padded)
 {
     extern __shared__ std::int32_t align_smem[];
     std::int32_t* counts = align_smem;
@@ -855,6 +856,13 @@ __global__ void moe_align_decode_kernel(
                 }
             }
         }
+    }
+    // Marlin/Triton-style grouped GEMMs iterate M-blocks up to this and index
+    // `expert_ids` inside it; the entries past it are the -1 padding above, so
+    // publishing the true total is what keeps them from being read.
+    __syncthreads();
+    if (num_tokens_past_padded != nullptr && threadIdx.x == 0) {
+        *num_tokens_past_padded = *block_base;
     }
 }
 
@@ -1085,6 +1093,7 @@ void launch_moe_align_decode(
     int num_experts,
     int block_size,
     int max_blocks,
+    std::int32_t* num_tokens_past_padded,
     cudaStream_t stream)
 {
     if (num_routes <= 0 || num_experts <= 0 || block_size <= 0 ||
@@ -1098,7 +1107,74 @@ void launch_moe_align_decode(
         static_cast<std::size_t>(3 * num_experts + 1 + 33) * sizeof(std::int32_t);
     moe_align_decode_kernel<<<1, BS, smem, stream>>>(
         topk_idx, sorted_route_ids, expert_ids, route_to_aligned_row,
-        num_routes, num_experts, block_size, max_blocks);
+        num_routes, num_experts, block_size, max_blocks,
+        num_tokens_past_padded);
+}
+
+namespace {
+
+__global__ void add_moe_route_bias_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ bias,
+    const std::int32_t* __restrict__ topk_idx,
+    int num_routes, int cols, int out_stride)
+{
+    const int route = blockIdx.x;
+    if (route >= num_routes) return;
+    const int e = topk_idx[route];
+    if (e < 0) return;
+    const __nv_bfloat16* b = bias + static_cast<long long>(e) * cols;
+    __nv_bfloat16* o = out + static_cast<long long>(route) * out_stride;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        o[i] = __float2bfloat16(__bfloat162float(o[i]) + __bfloat162float(b[i]));
+    }
+}
+
+}  // namespace
+
+void launch_add_moe_route_bias_bf16(
+    void* out, const void* bias, const std::int32_t* topk_idx,
+    int num_routes, int cols, int out_stride, cudaStream_t stream)
+{
+    if (num_routes <= 0 || cols <= 0) return;
+    constexpr int kBlock = 256;
+    add_moe_route_bias_bf16_kernel<<<num_routes, kBlock, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(out),
+        static_cast<const __nv_bfloat16*>(bias),
+        topk_idx, num_routes, cols, out_stride);
+}
+
+namespace {
+
+// [experts, n, k/32] -> [experts, k/32, n], one byte per group scale.
+__global__ void transpose_expert_scales_u8_kernel(
+    const std::uint8_t* __restrict__ src,
+    std::uint8_t* __restrict__ dst,
+    int n, int kg)
+{
+    const int e = blockIdx.z;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;   // k-group
+    const int i = blockIdx.y * blockDim.y + threadIdx.y;   // n
+    if (i >= n || j >= kg) return;
+    const long long base = static_cast<long long>(e) * n * kg;
+    dst[base + static_cast<long long>(j) * n + i] =
+        src[base + static_cast<long long>(i) * kg + j];
+}
+
+}  // namespace
+
+void launch_transpose_expert_scales_u8(
+    const void* src, void* dst, int num_experts, int n, int k_groups,
+    cudaStream_t stream)
+{
+    if (num_experts <= 0 || n <= 0 || k_groups <= 0) return;
+    const dim3 block(32, 8);
+    const dim3 grid((k_groups + block.x - 1) / block.x,
+                    (n + block.y - 1) / block.y,
+                    num_experts);
+    transpose_expert_scales_u8_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const std::uint8_t*>(src),
+        static_cast<std::uint8_t*>(dst), n, k_groups);
 }
 
 void launch_moe_bucket_exact(

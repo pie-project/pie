@@ -14,6 +14,40 @@
 
 namespace pie::metal {
 
+/// `architectures[0]` reduced to the stem the registries key on.
+///
+/// HuggingFace names an architecture `<Stem>For<Task>`, and every registry on
+/// both sides of the ABI -- this driver's family switch and the runtime's
+/// `instruct::create` -- keys on the STEM. So the task suffix comes off.
+///
+/// The list is explicit rather than "cut at the first `for`", and that is the
+/// whole of the care this needs: `ReformerForCausalLM` lowercases to
+/// `reformerforcausallm`, whose FIRST `for` is inside `reformer`. Cutting
+/// there yields `re`, which is not a family and does not announce itself as
+/// one -- it just misses the registry and takes the fallback.
+///
+/// `forconditionalgeneration` is here because leaving it out is what a
+/// multimodal release costs: `Gemma4ForConditionalGeneration` stayed whole,
+/// missed `instruct::create`'s `gemma4` row, and took the ChatML fallback. The
+/// weights still loaded (the load contract keys on `model_type`, not on this)
+/// and the kernels were right, so the model produced fluent text -- of a
+/// conversation that was never had, terminated by `<|im_end|>`, a token that
+/// is not in gemma's vocabulary and was being spelled out a piece at a time.
+/// Both gemma-4 checkpoints ship that architecture name.
+std::string arch_stem(std::string name) {
+    for (auto& c : name) c = static_cast<char>(std::tolower(c));
+    // Longest first, so a suffix that contains another cannot be half-stripped.
+    for (const char* suffix : {"forconditionalgeneration", "forcausallm"}) {
+        const std::string s = suffix;
+        if (name.size() > s.size() &&
+            name.compare(name.size() - s.size(), s.size(), s) == 0) {
+            name.erase(name.size() - s.size());
+            break;
+        }
+    }
+    return name;
+}
+
 ModelFacts read_model_facts(const std::string& hf_path) {
     ModelFacts facts;
     if (hf_path.empty()) return facts;
@@ -90,13 +124,8 @@ ModelFacts read_model_facts(const std::string& hf_path) {
         }
         if (j.contains("architectures") && j["architectures"].is_array() &&
             !j["architectures"].empty()) {
-            std::string a = j["architectures"][0].get<std::string>();
-            for (auto& c : a) c = static_cast<char>(std::tolower(c));
-            const std::string suffix = "forcausallm";
-            if (a.size() > suffix.size() &&
-                a.compare(a.size() - suffix.size(), suffix.size(), suffix) == 0) {
-                a.erase(a.size() - suffix.size());
-            }
+            const std::string a =
+                arch_stem(j["architectures"][0].get<std::string>());
             if (!a.empty()) facts.arch_name = a;
         }
         if (tc.contains("linear_num_value_heads") &&
@@ -565,14 +594,9 @@ std::optional<ModelFacts> read_model_facts_from_descriptor(
 
     // `arch_name` is `architectures[0]` verbatim in the descriptor; this driver
     // keys on the lowercased stem, so apply the same reduction it applies to
-    // `config.json`.
-    std::string arch = j.value("arch_name", std::string{});
-    for (auto& c : arch) c = static_cast<char>(std::tolower(c));
-    const std::string suffix = "forcausallm";
-    if (arch.size() > suffix.size() &&
-        arch.compare(arch.size() - suffix.size(), suffix.size(), suffix) == 0) {
-        arch.erase(arch.size() - suffix.size());
-    }
+    // `config.json` -- the SAME function, because two copies of this is how
+    // one of them came to strip only `forcausallm`.
+    const std::string arch = arch_stem(j.value("arch_name", std::string{}));
     if (!arch.empty()) facts.arch_name = arch;
 
     if (j.value("linear_num_value_heads", 0) > 0) facts.has_linear_attn = true;

@@ -16,6 +16,7 @@ from common import (
     finish,
     hf_chat_prompts_and_counts,
     make_prompts,
+    request_max_tokens,
     summarize,
 )
 
@@ -37,22 +38,43 @@ def health(url: str) -> None:
 
 
 @asynccontextmanager
-async def maybe_server(args: argparse.Namespace):
+async def maybe_server(args: argparse.Namespace, slot_ctx: int | None = None):
     proc: subprocess.Popen[str] | None = None
     url = args.url
     if args.server_bin:
         if not args.gguf_model:
             raise ValueError("--gguf-model is required with --server-bin")
         url = f"http://127.0.0.1:{args.port}"
+        parallel = args.num_requests if args.mode == "tput" else 1
         cmd = [
             args.server_bin,
             "--model", args.gguf_model,
             "--host", "127.0.0.1",
             "--port", str(args.port),
-            "--ctx-size", str(args.max_model_len),
-            "--parallel", str(args.num_requests if args.mode == "tput" else 1),
+            # llama.cpp splits `--ctx-size` ACROSS the parallel slots, so
+            # passing the per-request context here gave each slot
+            # `max_model_len / parallel` tokens -- 128 at the defaults, which
+            # silently truncated every request in a tput run and made the
+            # engine look like it stopped early. Scale by the slot count so a
+            # slot gets the context it needs.
+            #
+            # What it NEEDS, not `max_model_len`. llama.cpp preallocates this
+            # whole budget where pie and mlx-lm page theirs, so asking for
+            # `max_model_len` a slot asks the machine for something the other
+            # two never take: at the 16384 `three_way.py` passes, sixteen slots
+            # is 262144 tokens of KV and the server dies with
+            # `kIOGPUCommandBufferCallbackErrorOutOfMemory` before answering a
+            # request. The workload's own widest prompt plus its output budget
+            # is the honest number, capped by `max_model_len` so the flag still
+            # means what it says.
+            "--ctx-size", str(min(args.max_model_len, slot_ctx or args.max_model_len)
+                              * parallel),
+            "--parallel", str(parallel),
             "--n-gpu-layers", "all",
-            "--flash-attn", "off",
+            # On, because the comparison is against engines running their own
+            # optimized attention; turning llama.cpp's off benchmarks a
+            # handicap rather than the engine.
+            "--flash-attn", "on",
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         deadline = time.time() + 120
@@ -91,13 +113,19 @@ async def run(args: argparse.Namespace):
     # the same question. 0 keeps the old behaviour, which is "no cap".
     gate = asyncio.Semaphore(args.concurrency) if getattr(args, "concurrency", 0) else None
 
-    async with maybe_server(args) as base_url:
+    # Rounded up to a power of two so a prompt a few tokens longer does not
+    # re-tune the server, and floored so a tiny workload still leaves room.
+    needed = max(prompt_counts) + args.max_tokens + 64
+    slot_ctx = 512
+    while slot_ctx < needed:
+        slot_ctx *= 2
+    async with maybe_server(args, slot_ctx) as base_url:
         endpoint = base_url.rstrip("/") + "/v1/completions"
 
-        async def one(prompt: str, prompt_count: int) -> RequestResult:
+        async def one(prompt: str, prompt_count: int, max_tokens: int) -> RequestResult:
             payload = {
                 "prompt": prompt,
-                "max_tokens": args.max_tokens,
+                "max_tokens": max_tokens,
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
@@ -124,17 +152,28 @@ async def run(args: argparse.Namespace):
             except Exception as e:
                 return RequestResult(False, time.perf_counter() - start, 0, error=f"{type(e).__name__}: {e}")
 
+        # Indexed by ABSOLUTE prompt index and sliced with the same
+        # `[warmup:]` slice as `prompts`; see the note in `mlx_bench.py`. A
+        # flat budget here against pie's per-request one compared two
+        # different amounts of work under every unequal-budget shape.
+        budgets = [request_max_tokens(args, i) for i in range(len(prompts))]
+
         for i in range(args.warmup):
-            await one(prompts[i], prompt_counts[i])
+            await one(prompts[i], prompt_counts[i], budgets[i])
 
         run_prompts = prompts[args.warmup:]
         run_counts = prompt_counts[args.warmup:]
+        run_budgets = budgets[args.warmup:]
         start = time.perf_counter()
         if args.mode == "latency":
-            results = [await one(p, c) for p, c in zip(run_prompts, run_counts)]
+            results = [
+                await one(p, c, m)
+                for p, c, m in zip(run_prompts, run_counts, run_budgets)
+            ]
         else:
             results = await asyncio.gather(
-                *(one(p, c) for p, c in zip(run_prompts, run_counts))
+                *(one(p, c, m)
+                  for p, c, m in zip(run_prompts, run_counts, run_budgets))
             )
         wall = time.perf_counter() - start
 
@@ -146,7 +185,7 @@ async def run(args: argparse.Namespace):
         wall_s=wall,
         config={
             "cache_prompt": False,
-            "flash_attn": "off when spawned by benches",
+            "flash_attn": "on when spawned by benches",
             "temperature": args.temperature,
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,

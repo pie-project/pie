@@ -53,6 +53,8 @@ public:
         return declared_ ? &declared_.plan : nullptr;
     }
 
+    bool prefill_graph_capturable() const override;
+
 private:
     Qwen3Weights weights_;
     const HfConfig& hf_config_;

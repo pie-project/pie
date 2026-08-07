@@ -9,6 +9,9 @@
 /// not a compile error: the GPU reads whatever bytes sit at the offset.
 
 #include <cstdint>
+#include <cstdlib>
+
+#include "device_tuning.hpp"
 #include <cstring>
 #include <stdexcept>
 
@@ -26,9 +29,9 @@ struct RowGatherParams {    // row_gather.metal       (buffer 3)
     std::uint32_t count;
 };
 #include "../kernels/moe_params.h"
-static_assert(sizeof(RouterParams) == 8);
-static_assert(sizeof(ExpertCombineParams) == 8);
-static_assert(sizeof(MoeRouteParams) == 24);
+static_assert(sizeof(RouterParams) == 16);
+static_assert(sizeof(ExpertCombineParams) == 12);
+static_assert(sizeof(MoeRouteParams) == 28);
 
 /// Flat elementwise `dispatchThreads` grid: one thread per element, capped at a
 /// 256-wide threadgroup.
@@ -96,17 +99,18 @@ inline void routed_qmv_dispatch(int N, int experts_per_token, Grid& g, Threadgro
                                 int rows = 1) {
     const std::uint32_t r = std::uint32_t(rows > 0 ? rows : 1);
     const std::uint32_t slots = std::uint32_t(experts_per_token > 0 ? experts_per_token : 1);
-    g = Grid{32u * r, std::uint32_t(N > 0 ? N : 1) / 4u, slots};
+    // Rounded UP: the kernel writes four outputs a simdgroup and guards each
+    // against `out_vec_size`, so a width that is not a multiple of four gets
+    // a partial group rather than losing its tail. See `qmv_dispatch`.
+    g = Grid{32u * r, (std::uint32_t(N > 0 ? N : 1) + 3u) / 4u, slots};
     tg = Threadgroup{32, 2, 1};
 }
 
-/// The tile a batched mixture pads each expert's run to.
-///
-/// `kQmmBM`'s narrow tile rather than the wide one, and deliberately: the
-/// padding an expert wastes is up to `tile - 1` rows, paid `n_experts` times,
-/// so the wide tile doubles the waste to buy a shape the routed case rarely
-/// fills anyway.
+/// The narrow tile, and the one the batching threshold is written against.
 constexpr int kMoeTileRows = 16;
+
+/// The three widths a routed GEMM is compiled for, narrow first.
+inline constexpr int kMoeTileWidths[3] = {16, 32, 64};
 
 /// When sorting the rows by expert pays for itself.
 ///
@@ -116,17 +120,74 @@ constexpr int kMoeTileRows = 16;
 /// run half fills a tile, which for `min(n, n_experts)` touched experts is
 /// `n >= n_experts * tile / 2`.
 ///
+/// Written against the NARROW tile, because that is the cheapest way in: a
+/// batch that cannot pay for a 16-row tile cannot pay for a wider one either,
+/// and `moe_tile_rows` widens only after this has said yes.
+///
 /// Below that the matvec wins outright, and it is not close: a decode routes
 /// eight pairs over a hundred and twenty-eight experts, where every tile would
 /// be one live row in sixteen.
 inline bool moe_should_batch(int n_pairs, int n_experts) {
-    return n_experts > 0 && n_pairs >= n_experts * kMoeTileRows / 2;
+    return n_experts > 0 && n_pairs >= n_experts * moe_batch_min_per_expert();
 }
 
 /// Rows each expert's run is padded to, for a batch of `n_pairs`.
+///
+/// A wider tile does the arithmetic faster and rounds each expert's run up
+/// further. What it does NOT cost is the allocation's worst case:
+/// `moe_sorted_rows` is deliberately pessimistic and the tiles past the routing
+/// decline at `tile_expert < 0`, so a wider tile dispatches more threadgroups
+/// that do nothing rather than more arithmetic. An earlier rule here priced
+/// that worst case as work, which is why it refused BM=64 everywhere -- at
+/// gpt-oss's 448 rows all three widths do the same 2048 rows of work.
+///
+/// Priced instead off ROWS PER EXPERT, because that is what decides how much of
+/// a tile a run fills, and measured end to end rather than modelled -- a model
+/// built on the probe's rates picked 64 at 448 rows where the machine prefers
+/// 32. Prefill tok/s, best of each row starred:
+///
+///     per   model            BM=16    BM=32    BM=64
+///      12   26B    192       407.5   *416.5*     --
+///      16   gptoss 128      *409.0*   406.3      --
+///      28   26B    448       454.3   *493.3*   462.7
+///      56   gptoss 448       471.0   *531.1*   509.4
+///      64   26B   1024       443.5   *495.8*   493.7
+///      80   gptoss 640         --     545.3    545.2
+///      96   gptoss 768         --     549.9   *554.1*
+///     128   gptoss 1024        --     548.7   *558.6*
+///
+/// A width past 64 was tried and is not compiled. `roofline_probe` puts the
+/// MXFP4 kernel at 4504 GFLOP/s at BM=64 and 5057 at BM=128, and in a real
+/// mixture BM=128 is SLOWER: 558.5 -> 545.5 tok/s at 1024 rows, where 128 rows
+/// an expert makes it exactly one tile with no padding to blame. That is the
+/// second time the probe has over-promised here -- it also prefers 64 at 448
+/// rows where the machine wants 32 -- and the reason is the same both times.
+/// The probe reads ONE expert with a hot cache; a mixture's threadgroups read
+/// thirty-two and would rather be many and small than few and large. Which is
+/// why what follows is a table of measurements and not a curve.
+///
+/// The other shape of the same idea was tried too and is not here either:
+/// swapping the routed grid's axes so that row tiles run in x, which makes
+/// consecutive threadgroups consecutive tiles of the SAME expert reading the
+/// SAME weight slice where before they were `out_vec/bn` apart and shared
+/// nothing. Correct -- the answers do not move -- and 558.6 -> 557.5 tok/s. So
+/// the reuse is real on paper and the machine does not pay for it either way.
+///
+/// So 32 almost always, 64 once a run fills one, and 16 only where a run is too
+/// short to fill even a 32 -- which `moe_should_batch` already keeps to a sliver,
+/// since it admits nothing below eight rows an expert. The thresholds sit in the
+/// gaps the sweep leaves: 32 wins at twelve, and 64 ties at eighty and wins at
+/// ninety-six.
 inline int moe_tile_rows(int n_pairs, int n_experts) {
-    return moe_should_batch(n_pairs, n_experts) ? kMoeTileRows : 1;
+    if (!moe_should_batch(n_pairs, n_experts)) return 1;
+    const int per = n_pairs / n_experts;
+    if (per >= moe_tile_wide_per()) return 64;
+    return per >= moe_tile_mid_per() ? 32 : 16;
 }
+
+/// Which row of a routed PSO table a tile selects. The tables hold the two
+/// widths `moe_tile_rows` can return, in that order.
+inline int moe_bm_slot(int tile) { return tile >= 64 ? 2 : (tile >= 32 ? 1 : 0); }
 
 /// How many sorted rows a batch of `n_pairs` can produce.
 ///

@@ -12,6 +12,8 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
+#include <cstdlib>
+
 namespace pie_cuda_driver {
 
 /// Whether the attention kernels were instantiated for this head_dim.
@@ -58,6 +60,59 @@ constexpr const char* attn_decode_gqa_list() {
 #define PIE_ATTN_DECODE_GQA(G) " " #G
 #include "kernels.def"
         ;
+}
+
+/// Whether a native MXFP4 expert GEMM is the right way to serve an MXFP4 MoE
+/// on a device of this compute capability.
+///
+/// Not a hardware question. Blackwell has the FP4 unit, but on everything
+/// older the answer is decided by which Marlin the driver was built with:
+///
+///   * the expert-indexed MoE kernel serves a whole layer in one launch, and
+///     is sm80 -- with it the native path wins on Ampere onward;
+///   * the dense, single-problem kernel alone does not qualify. It reaches the
+///     tensor cores once per expert, so a 32-expert layer becomes 32 serial
+///     launches: measured 67 tok/s against 747 for the routed dequant path it
+///     would replace.
+///
+/// Two call sites must agree on this or a model fails to load with a message
+/// about the target's capabilities: `context.cpp` publishes it as the
+/// `native_mxfp4_moe` device fact the loader plans against, and
+/// `loaded_model.cpp` passes the same bit into `DeviceTarget`. They disagreed
+/// once already, and the symptom was a checkpoint that quietly took the slow
+/// path with the fast kernels compiled in and unused.
+// The native MXFP4 lowering is what makes the Marlin MoE reachable, and it is
+// exclusive: the routed-dequant slabs the per-route decode GEMV reads are not
+// published alongside it, so choosing one gives up the other for the life of
+// the model. Which one wins depends on the batch, not on the device --
+// `driver/cuda/bench/moe_bench.cu` at gpt-oss's shape on an H100 measures the
+// routed GEMV 2x AHEAD at one row, level around six, and 2.6x behind by
+// thirty-two. A throughput fleet wants Marlin; a latency-bound single stream
+// wants the GEMV, and on Hopper the difference end to end is 253 tok/s against
+// 197. `PIE_CUDA_NATIVE_MXFP4_MOE=0` is how a deployment says which it is.
+inline bool native_mxfp4_moe_opt_out() {
+    static const bool off = [] {
+        const char* v = std::getenv("PIE_CUDA_NATIVE_MXFP4_MOE");
+        return v != nullptr && v[0] == '0';
+    }();
+    return off;
+}
+
+constexpr bool device_supports_native_mxfp4_moe(int cc_major) {
+#if defined(PIE_CUDA_HAS_MARLIN_MOE)
+    return cc_major >= 8;
+#elif defined(PIE_CUDA_HAS_MARLIN)
+    return cc_major >= 10;
+#else
+    (void)cc_major;
+    return false;
+#endif
+}
+
+// The compile-time gate above, with the deployment's answer applied.
+inline bool native_mxfp4_moe_enabled(int cc_major) {
+    return device_supports_native_mxfp4_moe(cc_major) &&
+           !native_mxfp4_moe_opt_out();
 }
 
 }  // namespace pie_cuda_driver

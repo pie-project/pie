@@ -1195,7 +1195,7 @@ fn gdn_attn_body_cuda(
             let (mut guard, core) = dsl::guarded_value(t, Some(l), out_shape);
             if c.warp_tiled {
                 guard = guard.arm(GuardPred::TokensLE(c.warp_tiled_max), || {
-                    cuda::gdn_prefill_warp_tiled(&q, &k, &v, &g, &beta, &w.rs, gqa, c.state_bf16)
+                    cuda::gdn_prefill_warp_tiled(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16)
                 });
             }
             guard

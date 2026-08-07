@@ -279,10 +279,7 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(gdn_prefill_cached "launch_chunk_gated_delta_prefill_batched_cached"),
     kernel!(gdn_prefill_cached_state_bf16
         "launch_chunk_gated_delta_prefill_batched_cached_state_bf16"),
-    kernel!(gdn_prefill_warp_tiled "launch_chunk_gated_delta_prefill_batched_warp_tiled"),
     kernel!(gdn_prefill_warp_tiled_gqa "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa"),
-    kernel!(gdn_prefill_warp_tiled_state_bf16
-        "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16"),
     kernel!(gdn_prefill_warp_tiled_gqa_state_bf16
         "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16"),
     kernel!(repeat_interleave_heads "launch_repeat_interleave_heads_fp32"),

@@ -29,8 +29,14 @@
 //     So conv_state is READ-ONLY input + a SEPARATE new_conv_state output (ping-pong,
 //     delta swaps the two heap slots per token). ABI co-fix: bind::GdnCore needs a
 //     ConvStateOut slot (was "ConvState in-place").
-//   * GQA: this model (qwen3.5-0.8B) has Hk==Hv (rep=1), q/k index by hv directly.
-//     For rep>1, index hk = hv/(Hv/Hk); see KSTRIDE note below.
+//   * GQA: q and k have Hk heads, v has Hv, and Hv is a whole multiple of Hk.
+//     The reference repeats q/k along the head axis (`mx::repeat(q, rep, 1)`),
+//     which places head hk at v-heads [hk*rep, hk*rep+rep), so a v-head reads
+//     its key head at hv/rep. Every kernel here used to index q/k by hv, which
+//     is only the same expression when rep==1 -- true of qwen3.5-0.8B and of
+//     Qwen3.6-35B-A3B, and false of Qwen3.6-27B (Hk=16, Hv=48). At rep=3 a
+//     v-head past the sixteenth read q from inside the K and V regions of the
+//     same conv output: in bounds, finite, and wrong.
 //   * bfloat native on Metal 4; recurrent state stays fp32 for accuracy.
 
 #include <metal_stdlib>
@@ -70,6 +76,12 @@ METAL_FUNC void gdn_core_body(
   const int n        = int(tpig.z);          // 0 .. N*Hv-1
   const int b_idx    = n / Hv;               // token row (activation index)
   const int hv_idx   = n % Hv;
+  // The key head this value head reads, and whether it is the first of its
+  // group. `rep` is 1 on every checkpoint whose Hk equals Hv, which makes both
+  // of these the identity and keeps that path byte-identical.
+  const int rep      = Hv / p.Hk;
+  const int hk_idx   = hv_idx / rep;
+  const bool hk_first = (hv_idx % rep) == 0;
   const int dk_idx   = int(tpit.x);          // 0..31
   const int dv_idx   = int(tpig.y);          // 0..Vd-1
   const int n_per_t  = Dk / 32;              // 4
@@ -101,8 +113,8 @@ METAL_FUNC void gdn_core_body(
     float qraw[8], kraw[8];                    // n_per_t<=8
     for (int i = 0; i < n_per_t; ++i) {
       int d = n_per_t * dk_idx + i;            // 0..Dk-1
-      qraw[i] = convsilu(q_off + hv_idx * Dk + d);
-      kraw[i] = convsilu(k_off + hv_idx * Dk + d);
+      qraw[i] = convsilu(q_off + hk_idx * Dk + d);
+      kraw[i] = convsilu(k_off + hk_idx * Dk + d);
     }
     float qsq = 0.0f, ksq = 0.0f;
     for (int i = 0; i < n_per_t; ++i) { qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i]; }
@@ -150,20 +162,21 @@ METAL_FUNC void gdn_core_body(
   // --- conv_state writeback (shift + append) to a SEPARATE ping-pong slot. ---
   // Reading conv_state (read-only) and writing new_conv_state avoids the
   // read/write race the redundant v-dim threadgroups would hit if in-place.
-  // q/k channels depend only on (hv,dk) — identical across all Vd threadgroups of
-  // a head — so only dv_idx==0 writes them (was Vd=128-fold redundant write
-  // traffic, ~8MB/token). The v channel is unique per (hv,dv): every dv writes its
-  // own. Full coverage, each channel written exactly once. Output bit-identical.
+  // q/k channels depend only on (hk,dk) — identical across all Vd threadgroups of
+  // a head AND across the `rep` v-heads that share a key head — so only
+  // dv_idx==0 of the group's first v-head writes them (was Vd=128-fold
+  // redundant write traffic, ~8MB/token). The v channel is unique per (hv,dv):
+  // every dv writes its own. Full coverage, each channel written exactly once.
   auto wb = [&](int c) {
     for (int j = 0; j < Kc - 1; ++j)
       new_conv_state[(slot * Kc + j) * CDIM + c] = conv_state[(slot * Kc + (j + 1)) * CDIM + c];
     new_conv_state[(slot * Kc + (Kc - 1)) * CDIM + c] = float(mixed[b_idx * CDIM + c]);
   };
-  if (dv_idx == 0) {
+  if (dv_idx == 0 && hk_first) {
     for (int i = 0; i < n_per_t; ++i) {
       int d = n_per_t * dk_idx + i;
-      wb(q_off + hv_idx * Dk + d);
-      wb(k_off + hv_idx * Dk + d);
+      wb(q_off + hk_idx * Dk + d);
+      wb(k_off + hk_idx * Dk + d);
     }
   }
   wb(v_off + hv_idx * Dv + dv_idx);

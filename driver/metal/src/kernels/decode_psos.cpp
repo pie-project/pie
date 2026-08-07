@@ -72,7 +72,7 @@ bool load_decode_psos(RawMetalContext& ctx,
         // Residual-epilogue GEMV variant for QmvO/QmvOut/QmvDown (adds buffer(7) residual).
         want("quantized_qmv.metal", qmv_residual_fn.c_str(), {});
     }
-    const size_t residual_at =
+    size_t residual_at =
         features.residual_qmv ? requests.size() - 1 : SIZE_MAX;
     if (features.gdn) {
         // Prep-dispatch split (PIE_GDN_PREP): GdnPrep computes the q/k path once/head;
@@ -146,6 +146,13 @@ bool load_decode_psos(RawMetalContext& ctx,
     if (features.argmax) {
         // Device argmax + EOS-compare (I3 sampling substrate). bf16 logits = lm_head out.
         want("argmax.metal", "argmax_logits_bfloat16", {Kernel::Argmax});
+    }
+    if (features.routing_only) {
+        requests.clear();
+        targets.clear();
+        residual_at = SIZE_MAX;
+        want("quantized_qmv.metal", qmv_fast_fn.c_str(),
+             {Kernel::LlRouter, Kernel::LlSharedGateProj});
     }
 
     std::vector<std::string> errors;
@@ -237,16 +244,18 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         want(qmm, "cast_qmm_input_bfloat16_to_float16", &out.qmm_cast_bf16_f16);
     }
     if (features.routed) {
-        // `bm` is spelled from `kMoeTileRows` rather than restated: it is the
+        // `bm` is spelled from the shared widths rather than restated: it is the
         // number the sort padded every expert's run to, and a tile that
         // disagreed with the padding would read one expert's weights for
         // another's rows.
-        for (int i = 0; i < 3; ++i) {
-            want(qmm,
-                 "affine_qmm_t_routed" + q + "_bm_" +
-                     std::to_string(shared_kernels::kMoeTileRows) + "_bn_" +
-                     std::to_string(16 << i),
-                 &out.qmm_routed[i]);
+        for (int t = 0; t < 3; ++t) {
+            for (int i = 0; i < 3; ++i) {
+                want(qmm,
+                     "affine_qmm_t_routed" + q + "_bm_" +
+                         std::to_string(shared_kernels::kMoeTileWidths[t]) + "_bn_" +
+                         std::to_string(16 << i),
+                     &out.qmm_routed[t][i]);
+            }
         }
     }
     if (features.splitk) {
@@ -292,6 +301,12 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     if (features.d512)
         want("sdpa_paged.metal", "sdpa_paged_decode_bfloat16_d_512",
              &out.sdpa_paged_d512);
+    if (features.sdpa_d256)
+        want("sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_256",
+             &out.sdpa_paged_tiled);
+    if (features.d512)
+        want("sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_512",
+             &out.sdpa_paged_tiled_d512);
     if (features.gdn) {
         want("gdn_prep.metal", "gdn_prep_slotted_bfloat16",
              &out.gdn_prep_slotted);

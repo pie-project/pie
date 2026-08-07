@@ -139,6 +139,12 @@ def check(scenario: Scenario, rc: int, wall: float, summary: dict | None,
     if summary is None:
         bad.append(f"no summary written (rc={rc})")
         return bad
+    # A completed bench always exits 0 — across 458 recorded attempts every
+    # nonzero exit was a process that died before it served anything (all
+    # under 3s, none with a planner trace). So a nonzero rc alongside a
+    # summary means the summary is not this attempt's.
+    if rc != 0:
+        bad.append(f"bench exited rc={rc} — summary is not this attempt's")
     if wall > contract.max_wall_s:
         bad.append(f"wall {wall:.1f}s > {contract.max_wall_s:.0f}s")
 
@@ -185,6 +191,33 @@ def check_target(scenario: Scenario, records: list[dict],
     return bad
 
 
+def await_free_gpu(budget_s: float = 180.0, floor_mib: int = 1500) -> None:
+    """Block until the previous scenario's device memory is actually gone.
+
+    Best effort: if `nvidia-smi` is missing or never drains we return anyway
+    and let the scenario report the real failure, rather than turning a
+    diagnostic wait into a second failure mode.
+    """
+    deadline = time.time() + budget_s
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=15)
+        except Exception:
+            return
+        if out.returncode != 0:
+            return
+        try:
+            used = max(int(line) for line in out.stdout.split() if line.strip())
+        except ValueError:
+            return
+        if used < floor_mib:
+            return
+        time.sleep(2.0)
+
+
 def run_once(scenario: Scenario, args: argparse.Namespace,
              attempt: int) -> tuple[bool, dict]:
     out = Path(args.out)
@@ -215,6 +248,18 @@ def run_once(scenario: Scenario, args: argparse.Namespace,
     if "--max-model-len" not in scenario.args:
         cmd += ["--max-model-len", str(args.max_model_len)]
     cmd += scenario.args
+
+    # A crashed attempt writes no `--json-out`, and a leftover file from an
+    # EARLIER run of the same scenario would then be read as this attempt's
+    # summary — a run that died at model load scored `completed=2048` that
+    # way and passed. Unlink first so a crash reads as "no summary written",
+    # which is what it is.
+    jout.unlink(missing_ok=True)
+    # A finished bench can hold tens of GiB for up to a minute; the next
+    # scenario then dies with `pie_cuda_load_model failed with status -5`.
+    # That is an artifact of running scenarios back to back, not a finding
+    # about the engine, so wait the previous one out.
+    await_free_gpu()
 
     started = time.time()
     with log.open("wb") as handle:

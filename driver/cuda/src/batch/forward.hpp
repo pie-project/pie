@@ -358,6 +358,11 @@ struct ForwardFn {
                                 batch::SupergraphBuilder& sg);
     std::uint32_t invoke_graph_layout();
     std::uint32_t invoke_supergraph_graph_layout();
+
+    // Whether the fire just planned carries a prefill whose dispatch has
+    // content-independent launch geometry. Read by
+    // `forward_graph_replay_eligible` only when `PIE_PREFILL_GRAPH` is on.
+    bool invoke_prefill_graph_capturable() const;
 };
 
 struct NativeSystemCommitInputs {

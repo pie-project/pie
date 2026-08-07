@@ -23,7 +23,13 @@ namespace pie::metal {
 // → N/8 threadgroups. Requires N%8==0 (holds for every qwen3.6 projection,
 // incl. lm_head N=vocab=248320). K is a bound constant, not a launch dim.
 inline void qmv_dispatch(int N, Grid& g, Threadgroup& tg) {
-    g  = Grid{32, uint32_t(N) / 4, 1};
+    // Rounded UP. `affine_qmv_fast` produces four outputs per simdgroup, so a
+    // truncating count drops every output past the last whole four -- and at
+    // N < 4 it drops the dispatch entirely. The shared expert's gate is
+    // hidden -> ONE logit a token: its grid was {32, 0, 1}, no threads ran,
+    // its buffer kept the zeros it was allocated with, and every routed token
+    // was combined under `sigmoid(0) = 0.5` instead of its own gate.
+    g  = Grid{32, (uint32_t(N) + 3u) / 4u, 1};
     tg = Threadgroup{32, 2, 1};
 }
 
@@ -37,7 +43,9 @@ inline void rms_dispatch(int row_size, int n_rows, Grid& g, Threadgroup& tg) {
     // Rounded UP: `rms_single_row` guards its own tail, but a truncating
     // thread count silently drops the last partial group of 4 for any row
     // width that is not a multiple of N_READS.
-    const uint32_t t = (uint32_t(row_size) + 3) / 4;  // N_READS = 4
+    // Capped at what Metal allows a threadgroup to be; see `rms_mb_dispatch`,
+    // which this one must agree with exactly at N == 1.
+    const uint32_t t = std::min<uint32_t>((uint32_t(row_size) + 3) / 4, 1024);  // N_READS = 4
     g  = Grid{t * uint32_t(n_rows), 1, 1};
     tg = Threadgroup{t, 1, 1};
 }

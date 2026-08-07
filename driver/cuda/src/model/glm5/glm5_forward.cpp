@@ -648,7 +648,7 @@ void glm5_forward_paged(
                 static_cast<std::int32_t*>(ws.aligned_route_ids.data()),
                 static_cast<std::int32_t*>(ws.aligned_expert_ids.data()),
                 /*route_to_aligned_row=*/nullptr,
-                routes, E, block, max_blocks, stream);
+                routes, E, block, max_blocks, /*num_tokens_past_padded=*/nullptr, stream);
             kernels::launch_gather_moe_aligned_inputs_bf16(
                 ws.norm_y.data(),
                 static_cast<const std::int32_t*>(ws.aligned_route_ids.data()),

@@ -4251,7 +4251,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 0
@@ -4571,7 +4571,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 1
@@ -4891,7 +4891,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 2
@@ -5517,7 +5517,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 4
@@ -5837,7 +5837,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 5
@@ -6157,7 +6157,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 6
@@ -6783,7 +6783,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 8
@@ -7103,7 +7103,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 9
@@ -7423,7 +7423,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 10
@@ -8049,7 +8049,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 12
@@ -8369,7 +8369,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 13
@@ -8689,7 +8689,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 14
@@ -9315,7 +9315,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 16
@@ -9635,7 +9635,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 17
@@ -9955,7 +9955,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 18
@@ -10581,7 +10581,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 20
@@ -10901,7 +10901,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 21
@@ -11221,7 +11221,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 22

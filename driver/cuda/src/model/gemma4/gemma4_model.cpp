@@ -33,17 +33,27 @@ Gemma4Model::Gemma4Model(
         has_audio_ = true;
     }
     caps_.supports_media_encode = has_vision_ || has_audio_;
-    caps_.graph_safe = kv_cache_.format().is_native_bf16();
+    // The MoE branch reads its routing table back to the host and loops the
+    // experts on the CPU for prefill, which cannot run inside a graph capture
+    // (`cudaErrorStreamCaptureUnsupported`). Pure decode -- the only shape the
+    // executor captures -- takes the on-device GEMV dispatch instead, so
+    // capture stays available; `gemma4_moe_block` is handed `is_pure_decode`
+    // and treats it as a hard requirement rather than a hint, which is what
+    // makes that claim true instead of hopeful.
+    const bool kv_capture_ok = kv_cache_.format().is_native_bf16();
+    caps_.graph_safe = kv_capture_ok;
     caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
+    // Small-prefill capture would put the host-dispatched branch inside a
+    // capture, so it stays off for the MoE variants.
     caps_.supports_small_prefill_graph =
-        kv_cache_.format().is_native_bf16() && small_spec_graph_tokens > 0;
+        kv_capture_ok && !hf_config_.gemma4_enable_moe &&
+        small_spec_graph_tokens > 0;
 
-    // Trace and VALIDATE the declaration at load. Nothing executes it
-    // yet — gemma-4's arms are the next rung — but building it here is
-    // what turns a drift between `family::gemma4_cuda` and this driver's
-    // launcher registry into a loud load-time refusal, on a real
-    // checkpoint, before any of it can become a wrong number.
+    // Trace and VALIDATE the declaration at load: a drift against the
+    // launcher registry, or a weight this checkpoint does not bind,
+    // becomes a load-time DECLINE rather than a wrong number. The
+    // drive is default-on now, so the decline has to be graceful.
     if (gemma4_declared_forward_enabled()) {
         declared_ = build_gemma4_declared_plan(hf_config_, weights_,
                                                fwd_cfg_.tp_size);

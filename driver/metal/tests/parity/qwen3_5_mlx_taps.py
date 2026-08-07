@@ -107,14 +107,44 @@ def main():
         dump(f"{il}.attn_resid", h)
         normed = layer.post_attention_layernorm(h)
         dump(f"{il}.ffn_norm", normed)
-        g = layer.mlp.gate_proj(normed)
-        u = layer.mlp.up_proj(normed)
-        dump(f"{il}.gate_proj", g)
-        dump(f"{il}.up_proj", u)
-        act = nn.silu(g) * u
-        dump(f"{il}.swiglu", act)
-        d = layer.mlp.down_proj(act)
-        dump(f"{il}.down_proj", h + d)
+        mlp = layer.mlp
+        if hasattr(mlp, "switch_mlp"):
+            # The routed FFN. Written out rather than called so the taps the
+            # driver publishes have something to be compared against: the
+            # mixture was the one block of this family a parity run could not
+            # see, and it is where Qwen3.6-35B-A3B went wrong.
+            logits_r = mlp.gate(normed)
+            dump(f"{il}.router", logits_r)
+            gates = mx.softmax(logits_r, axis=-1, precise=True)
+            k = mlp.top_k
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            if mlp.norm_topk_prob:
+                scores = scores / scores.sum(axis=-1, keepdims=True)
+            y = mlp.switch_mlp(normed, inds)
+            y = (y * scores[..., None]).sum(axis=-2)
+            dump(f"{il}.moe_out", y)
+            sg = mlp.shared_expert.gate_proj(normed)
+            su = mlp.shared_expert.up_proj(normed)
+            dump(f"{il}.shared_gate", sg)
+            dump(f"{il}.shared_up", su)
+            sact = nn.silu(sg) * su
+            dump(f"{il}.shared_act", sact)
+            sd = mlp.shared_expert.down_proj(sact)
+            dump(f"{il}.shared_down", sd)
+            gate_one = mlp.shared_expert_gate(normed)
+            dump(f"{il}.shared_g", gate_one)
+            d = y + mx.sigmoid(gate_one) * sd
+            dump(f"{il}.ffn_out", d)
+        else:
+            g = mlp.gate_proj(normed)
+            u = mlp.up_proj(normed)
+            dump(f"{il}.gate_proj", g)
+            dump(f"{il}.up_proj", u)
+            act = nn.silu(g) * u
+            dump(f"{il}.swiglu", act)
+            d = mlp.down_proj(act)
+            dump(f"{il}.down_proj", h + d)
         h = h + d
         dump(f"{il}.layer_out", h)
 

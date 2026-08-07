@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "checkpoint_path.hpp"
 #include "mtl4_context.hpp"
 #include "batch/decode_abi.hpp"
 #include "batch/golden_tap.hpp"
@@ -33,6 +34,7 @@
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/encode.hpp"
 #include "model/gemma4/geometry.hpp"
+#include "model_facts.hpp"
 #include "model/gemma4/kernels.hpp"
 #include "model/gemma4/scratch.hpp"
 
@@ -212,8 +214,8 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::string ckpt = argc > 1 ? argv[1] : std::string();
     if (ckpt.empty()) {
-        const char* home = std::getenv("HOME");
-        if (home != nullptr) ckpt = std::string(home) + "/.pie-bench/gemma4-e2b-pie";
+        ckpt = pie::metal::test::find_checkpoint("gemma4-e2b-pie",
+                                                 "models--mlx-community--gemma-4-e2b-it-4bit");
     }
     const std::string kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
     {
@@ -245,9 +247,43 @@ int main(int argc, char** argv) {
     }
     const int N = int(ids.size());
 
+    // Read the CHECKPOINT, not a copy of gemma-4-E2B's shape. The hardcoded
+    // `Facts{}` below is E2B's, so this harness answered about E2B whatever
+    // path it was given -- and asked for E2B's `embed_tokens_per_layer` on
+    // models that ship none, which is how it became unreachable on the two
+    // checkpoints whose numbers are wrong.
+    Facts facts{};
+    {
+        const pie::metal::ModelFacts mf = pie::metal::read_model_facts(ckpt);
+        if (mf.g4_num_hidden_layers > 0) {
+            facts.n_layers = mf.g4_num_hidden_layers;
+            facts.hidden = mf.g4_hidden_size;
+            facts.intermediate = mf.g4_intermediate_size;
+            facts.n_q_heads = mf.g4_num_attention_heads;
+            facts.n_kv_heads = mf.g4_num_key_value_heads;
+            facts.head_dim = mf.g4_head_dim;
+            facts.global_head_dim = mf.g4_global_head_dim;
+            facts.sliding_window = mf.g4_sliding_window;
+            facts.num_kv_shared_layers = mf.g4_num_kv_shared_layers;
+            facts.per_layer_emb_dim = mf.g4_per_layer_emb_dim;
+            facts.full_attn_interval = mf.g4_full_attn_interval;
+            facts.double_wide_mlp = mf.g4_double_wide_mlp;
+            facts.final_softcap = mf.g4_final_softcap;
+            facts.rope_theta_full = mf.g4_rope_theta_full;
+            facts.rope_theta_sliding = mf.g4_rope_theta_sliding;
+            facts.full_partial_rotary = mf.g4_full_partial_rotary;
+            facts.enable_moe = mf.g4_enable_moe;
+            facts.n_experts = mf.g4_num_experts;
+            facts.experts_per_token = mf.g4_experts_per_token;
+            facts.moe_intermediate = mf.g4_moe_intermediate;
+            facts.attention_k_eq_v = mf.g4_attention_k_eq_v;
+            facts.n_global_kv_heads = mf.g4_num_global_kv_heads;
+        }
+    }
+
     Gemma4Geometry g;
     std::string err;
-    if (!geometry_from_facts(Facts{}, g, &err)) {
+    if (!geometry_from_facts(facts, g, &err)) {
         std::printf("  FAIL  geometry: %s\n", err.c_str());
         return 1;
     }
@@ -263,7 +299,15 @@ int main(int argc, char** argv) {
     // the pool is the budget rather than the weights.
     // Under a tap dump every activation VALUE gets its own slot, so the pool
     // scales with the row count. 8 rows fit in 14 GB; 16 do not.
-    auto ctx = RawMetalContext::create(std::size_t(golden_taps_enabled() ? 12 : 8) << 30);
+    // 8 GiB fits every gemma-4 this test was written against and none of the
+    // 26B/31B builds, which is how a numerics harness stops being reachable
+    // exactly where the numbers are wrong. Overridable, so the next one is.
+    std::size_t heap_gib = golden_taps_enabled() ? 12 : 8;
+    if (const char* env = std::getenv("PIE_G4_HEAP_GIB"); env != nullptr && *env != '\0') {
+        const long v = std::atol(env);
+        if (v > 0) heap_gib = std::size_t(v);
+    }
+    auto ctx = RawMetalContext::create(heap_gib << 30);
     if (!ctx) {
         std::printf("  FAIL  RawMetalContext::create\n");
         return 1;
@@ -601,6 +645,22 @@ int main(int argc, char** argv) {
     //
     // 16 rows does not catch it (BM=16 there) and 12 does not either, so the
     // wide block needs a case of its own.
+    //
+    // It is earning its keep again. gemma-4-26b-a4b-it-4bit reports
+    // `argmax -1` here, which is not "a wrong token" -- the search starts at
+    // -1e30 and only NaN leaves it at -1, so every logit in the row is NaN.
+    // gemma-4-31b-it-4bit, same head widths (256 sliding, 512 full) and the
+    // same 4-bit affine group of 64, reports 818 and matches. So it is the
+    // MIXTURE at BM=32, not the width and not the quantisation. Ruled out
+    // already: the pipeline exists (`instantiate_qmm_t(64, 32, 32, 16, 4)` and
+    // its five siblings are all there), K is a whole number of BK=32 (2816 and
+    // 2112 are 88 and 66), and it happens with tiled attention forced off.
+    //
+    // Separately and not the same thing: this checkpoint's tiled attention is
+    // wrong too. `PIE_METAL_SDPA_TILE_MIN_ROWS=4096` -- which turns tiling off
+    // -- takes its 53-token answer from "deike-no'=emptyia deK=A" to
+    // "The capital of France es[|im_und|>", so most of the damage at a real
+    // prompt length is there, and what is left over is this.
     if (default_prompt) {
         std::vector<std::uint32_t> ids32;
         for (int rep = 0; rep < 4; ++rep) ids32.insert(ids32.end(), ids.begin(), ids.end());
@@ -624,6 +684,96 @@ int main(int argc, char** argv) {
         }
         std::printf("    (32 rows, the wide row block: argmax %d)\n", bi);
         expect(bi == 818, "the wide-BM GEMM agrees with mlx-lm");
+        std::vector<float> per_row(std::size_t(g.vocab));
+        for (int i = 0; i < g.vocab; ++i) per_row[std::size_t(i)] = from_bf16(r[i]);
+
+        // The SAME rows through the tiled attention. Thirty-two rows of one
+        // request is the smallest fire that earns it, and the answer must not
+        // depend on which of the two attention pipelines computed it: the
+        // tiled kernel gives a row a simdgroup where the per-row kernel gives
+        // it a threadgroup, which changes the summation order and nothing
+        // else. Told `requests` -- without it the fire cannot be told from a
+        // fleet of decodes and keeps the per-row shape, so this case would
+        // silently be a second run of the check above.
+        for (int L = 0; L < g.n_layers; ++L) {
+            if (g.is_kv_shared(L)) continue;
+            std::memset(kpages[std::size_t(L)].contents(), 0, kpages[std::size_t(L)].size);
+            std::memset(vpages[std::size_t(L)].contents(), 0, vpages[std::size_t(L)].size);
+        }
+        fill_io(ids32, {0u}, g.total_pages);
+        ctx->run_step([&](StepEncoder& se) {
+            encode_gemma4_step_mb(se, dag, g, rows32, base, mb, psos, /*ordinal_base=*/0,
+                                  /*head_rows=*/0, /*base_alt=*/nullptr, /*mb_alt=*/nullptr,
+                                  /*requests=*/1);
+        });
+        int ti = -1;
+        float tv = -1e30f;
+        for (int i = 0; i < g.vocab; ++i) {
+            const float v = from_bf16(r[i]);
+            if (v > tv) { tv = v; ti = i; }
+        }
+        std::printf("    (32 rows, tiled attention: argmax %d)\n", ti);
+        expect(ti == 818, "the tiled attention agrees with mlx-lm too");
+        // Layer 0's attention output ALONE, both pipelines, by cutting the fire
+        // just past it -- the pool is colour-reused, so a whole fire leaves
+        // nothing of layer 0 to read.
+        std::size_t di_sdpa = dag.size();
+        for (std::size_t di = 0; di < dag.size(); ++di) {
+            if (dag[di].kind == Kind::Sdpa && dag[di].layer == 0) { di_sdpa = di; break; }
+        }
+        if (di_sdpa < dag.size()) {
+            int col = -1;
+            for (const auto& sb : coloring.per_dispatch[di_sdpa]) {
+                if (sb.bind_index == 3) col = int(sb.color);
+            }
+            const int w = g.n_q_heads * g.head_dim_of(0);
+            if (col >= 0 && col < int(b.pool.size()) && b.pool[std::size_t(col)].valid()) {
+                const std::size_t n = std::size_t(rows32) * std::size_t(w);
+                std::vector<float> a(n);
+                for (int pass = 0; pass < 2; ++pass) {
+                    fill_io(ids32, {0u}, g.total_pages);
+                    ctx->run_step([&](StepEncoder& se) {
+                        encode_gemma4_step_mb(se, dag, g, rows32, base, mb, psos, 0, 0, nullptr,
+                                              nullptr, pass == 0 ? 0 : 1, 0, di_sdpa + 1);
+                    });
+                    const auto* q =
+                        static_cast<const std::uint16_t*>(b.pool[std::size_t(col)].contents());
+                    if (pass == 0) {
+                        for (std::size_t i = 0; i < n; ++i) a[i] = from_bf16(q[i]);
+                    } else {
+                        float ad = 0, ax = 0;
+                        for (std::size_t i = 0; i < n; ++i) {
+                            ad = std::max(ad, std::fabs(a[i] - from_bf16(q[i])));
+                            ax = std::max(ax, std::fabs(a[i]));
+                        }
+                        std::printf("    (layer 0 attention, tiled vs per-row: "
+                                    "max|d|=%.4g over max|x|=%.4g)\n", ad, ax);
+                        // Sub-ulp. bf16 carries eight mantissa bits, so one ulp
+                        // at this tensor's largest value is ax/256; the two
+                        // pipelines land inside a thousandth of it. The bound
+                        // is loose on purpose -- it is not pinning the rounding,
+                        // it is catching a tiled kernel that reads the wrong
+                        // keys, drops a run or writes the wrong rows, all of
+                        // which move this by whole values rather than ulps.
+                        expect(ad < 1e-3f * ax,
+                               "the tiled attention agrees with the per-row one to below a ulp");
+                    }
+                }
+            }
+        }
+
+        float dmax = 0, amax = 0;
+        for (int i = 0; i < g.vocab; ++i) {
+            const float a = per_row[std::size_t(i)], b2 = from_bf16(r[i]);
+            dmax = std::max(dmax, std::fabs(a - b2));
+            amax = std::max(amax, std::fabs(a));
+        }
+        // Printed rather than bounded: after thirty-five layers this is no
+        // longer a rounding difference but an amplified one, and what it is
+        // allowed to be is a question about the model, not about the kernel.
+        // The number is here because it is the one that explains why
+        // `llama_bench`'s Gemma-4-26B row moves when this path turns on.
+        std::printf("    (tiled vs per-row logits: max|d|=%.4g over max|x|=%.4g)\n", dmax, amax);
     }
 
     // ── Two requests in one fire ──

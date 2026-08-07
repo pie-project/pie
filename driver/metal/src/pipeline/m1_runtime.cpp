@@ -533,6 +533,14 @@ struct M3GroupCommand {
     int readiness_ordinal = -1;
     int commit_ordinal = -1;
     M3GroupStats stats{};
+    // Set by `encode_m3_pre`/`encode_m3_post`. A group is prepared BEFORE the
+    // forward it rides is encoded, and the forward can still refuse the batch
+    // -- in which case nothing ever dispatched, the status buffer keeps its
+    // zero fill, and `finish_m3_group` used to read that back as every lane
+    // faulting. The lie is expensive: it reports a GPU fault for a host-side
+    // refusal and hides the executor's own message, which is the only account
+    // of why the batch was rejected.
+    bool encoded = false;
     void* timestamp_heap = nullptr;
     std::chrono::steady_clock::time_point post_begin{};
 };
@@ -3088,6 +3096,7 @@ void M1Runtime::encode_m3_pre(
     const std::shared_ptr<M3GroupCommand>& command,
     StepEncoder& encoder) {
     if (!command) return;
+    command->encoded = true;
     bind_m3_effect(*command, command->readiness_ordinal);
     encoder.set_pso(command->readiness);
     encoder.set_argtable_ordinal(command->readiness_ordinal);
@@ -3119,6 +3128,7 @@ void M1Runtime::encode_m3_post(
     const std::shared_ptr<M3GroupCommand>& command,
     StepEncoder& encoder) {
     if (!command) return;
+    command->encoded = true;
     command->post_begin = std::chrono::steady_clock::now();
     encoder.mark_timestamp(command->timestamp_heap, 0);
     for (const auto& stage : command->stages) {
@@ -3165,7 +3175,23 @@ std::vector<M1ExecuteOutcome> M1Runtime::finish_m3_group(
     // and the (lane_count, channel_count) it saw. Dropping it left the driver
     // printing "launch failed:" with nothing after the colon.
     std::string faults;
-    for (std::size_t lane = 0; lane < command->candidates.size(); ++lane) {
+    // A group that was never encoded never dispatched, so every lane's status
+    // still holds the buffer's zero fill. Reading that back lane by lane
+    // produces `state=0 op_tag=0x0 guard=unknown` for all of them -- a GPU
+    // fault report for something the GPU was never asked to do, and one that
+    // replaces the executor's own account of why the forward was refused.
+    if (!command->encoded) {
+        outcomes.assign(
+            command->candidates.size(), M1ExecuteOutcome::Failed);
+        if (error.empty()) {
+            error =
+                "Metal M3 group was prepared but never encoded: the forward "
+                "it rides was not run, so no lane dispatched";
+        }
+    }
+    for (std::size_t lane = 0;
+         command->encoded && lane < command->candidates.size();
+         ++lane) {
         if (statuses[lane].state == 4) {
             outcomes.push_back(M1ExecuteOutcome::Committed);
             continue;

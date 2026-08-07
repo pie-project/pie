@@ -40,6 +40,7 @@
 #include "batch/forward.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"
 #include "batch/simple_family.hpp"
+#include "batch/wire_mask.hpp"
 #include "batch/scratch.hpp"
 #include "batch/worker.hpp"
 #include "decode_abi.hpp"
@@ -110,6 +111,23 @@ struct BatchingConfig {
     std::uint32_t max_forward_requests = 512;
     std::uint32_t cpu_pages = 0;
     std::string kv_cache_dtype = "auto";
+    /// Tokens the KV ring must hold across the WHOLE resident fleet. Zero --
+    /// the default -- means `kMetalMaxCtxTokens`, which is what this driver
+    /// has always used and what a `pie serve` fleet wants.
+    ///
+    /// `SetupConfig::max_ctx_tokens` has carried a comment since it was added
+    /// saying "a caller that knows it drives ONE sequence should not pay for
+    /// sixty-four" -- and nothing ever set it, so every caller paid for
+    /// sixty-four. The ring does not scale with the model, so it is the same
+    /// number of tokens beside a 405 MB checkpoint and a 14 GiB one: on
+    /// Qwen3.6-27B that is 26.50 GiB of KV against 14.09 GiB of weights, and
+    /// no knob moved it. `total_pages` looks like the one to reach for and is
+    /// not -- `setup_simple` derives the pool from this context instead, so
+    /// setting it changed nothing and said nothing.
+    ///
+    /// Zero-means-default on purpose: an operator who sets nothing gets the
+    /// behaviour they had, byte for byte.
+    std::uint32_t max_model_len = 0;
 };
 
 struct Config {
@@ -144,6 +162,7 @@ Config load_config(const std::filesystem::path& path) {
             "max_forward_requests",
             "cpu_pages",
             "kv_cache_dtype",
+            "max_model_len",
         };
         for (const auto& [key, _] : *batching) {
             const auto name = key.str();
@@ -172,6 +191,9 @@ Config load_config(const std::filesystem::path& path) {
                 config.batching.cpu_pages);
         config.batching.kv_cache_dtype =
             (*batching)["kv_cache_dtype"].value_or(config.batching.kv_cache_dtype);
+        config.batching.max_model_len =
+            (*batching)["max_model_len"].value_or<std::int64_t>(
+                config.batching.max_model_len);
     }
     if (auto runtime = tbl["runtime"].as_table()) {
         config.runtime.verbose =
@@ -206,13 +228,31 @@ void publish_terminal(PieTerminalCell* cell, std::uint32_t outcome) {
 // page-range check (what we ENFORCE) so both always agree.
 constexpr std::uint32_t kMetalPhase1aMaxCtxTokens = executor::kMetalMaxCtxTokens;
 
+/// Tokens the ring is built for, in ONE place.
+///
+/// The operator's `[batching].max_model_len` only ever lowers it, and zero
+/// leaves it at the constant this driver has always used. Every consumer --
+/// what setup ALLOCATES, what caps ADVERTISES, and the page count the
+/// descriptor resolver ENFORCES -- reads this, because a ring sized from one
+/// number and advertised from another is how a runtime comes to address pages
+/// that were never allocated.
+std::uint32_t effective_max_ctx_tokens(const Config& cfg) {
+    const std::uint32_t asked = cfg.batching.max_model_len;
+    return asked == 0 ? kMetalPhase1aMaxCtxTokens
+                      : std::min(asked, kMetalPhase1aMaxCtxTokens);
+}
+
 std::uint32_t effective_total_pages(const Config& cfg, bool rs_cache_required) {
     const std::uint32_t kv_page_size = std::max<std::uint32_t>(1u, cfg.batching.kv_page_size);
-    // Ceil-divide: the ring must hold kMetalPhase1aMaxCtxTokens tokens even
+    // Ceil-divide: the ring must hold `effective_max_ctx_tokens` tokens even
     // when kv_page_size does not divide it evenly (a floor division would
     // under-report by up to one page).
-    return rs_cache_required ? (kMetalPhase1aMaxCtxTokens + kv_page_size - 1) / kv_page_size
-                             : cfg.batching.total_pages;
+    const std::uint32_t ctx_pages =
+        (effective_max_ctx_tokens(cfg) + kv_page_size - 1) / kv_page_size;
+    // A paged family's pool is the operator's to size, but it can no longer
+    // exceed the context the ring was built for -- the two used to be able to
+    // disagree, and the pool is what the runtime's physical page ids index.
+    return rs_cache_required ? ctx_pages : std::min(cfg.batching.total_pages, ctx_pages);
 }
 
 
@@ -385,7 +425,7 @@ std::string build_caps_json(const Config& cfg,
         rs_cache_slot_bytes =
             static_cast<std::uint32_t>(executor::rs_slot_bytes_for(g));
         rs_cache_slots = executor::rs_slots_for_budget(
-            g, executor::kRsSlotBudgetBytes,
+            g, executor::rs_slot_budget_bytes(),
             std::min(cfg.batching.max_forward_requests,
                      kMetalPagedMaxForwardRequests));
     }
@@ -403,9 +443,12 @@ std::string build_caps_json(const Config& cfg,
         rs_cache_required
             ? std::min(cfg.batching.max_forward_tokens, kMetalPagedMaxForwardTokens)
             : simple_family_max_forward_tokens(cfg, facts);
-    const std::uint32_t max_model_len =
-        rs_cache_required ? std::min(facts.max_model_len, kMetalPhase1aMaxCtxTokens)
-                          : facts.max_model_len;
+    // Bounded by the ring in BOTH cases now. The non-rs branch advertised the
+    // checkpoint's own `max_position_embeddings` unbounded, which was true
+    // only because the ring happened to be the largest number in the system;
+    // once an operator can lower the ring it stops being true.
+    const std::uint32_t ctx_tokens = effective_max_ctx_tokens(cfg);
+    const std::uint32_t max_model_len = std::min(facts.max_model_len, ctx_tokens);
     const std::uint32_t total_pages = effective_total_pages(cfg, rs_cache_required);
     nlohmann::json caps = {
         {"abi_version", PIE_DRIVER_ABI_VERSION},
@@ -898,12 +941,51 @@ class Context::Impl {
                 return PIE_STATUS_UNSUPPORTED;
             }
         }
+        std::vector<std::uint32_t> causal_kv_lengths;
         if (launch.has_user_mask != 0) {
-            std::cerr
-                << "[pie-driver-metal] launch: user-provided wire masks "
-                   "require BRLE decoding, which Metal does not support; "
-                   "refusing to run unmasked\n";
-            return PIE_STATUS_UNSUPPORTED;
+            // A prefill's mask is the causal pattern, which is the bound
+            // `sdpa_paged` applies from `qo_indptr` and the page CSR anyway --
+            // EXCEPT that the CSR it would apply it against counts pages
+            // reserved for the decode still to come. So take the length the
+            // mask states, trim the CSR to it below, and the kernel's own
+            // predicate becomes the mask's predicate exactly.
+            //
+            // Anything with a shape of its own -- a window, a sink, a hole in
+            // the middle -- has nowhere to go: the dense buffers the kernels
+            // read are filled from a descriptor channel (`read_mask_cell`) and
+            // this launch resolves no descriptors.
+            const bool causal = wire_mask::causal_prefix_lengths(
+                launch.masks, launch.qo_indptr, causal_kv_lengths);
+            if (std::getenv("PIE_METAL_MASK_TRACE") != nullptr) {
+                std::cerr << "[pie-metal] mask trace: words=" << launch.masks.words.len
+                          << " rows=" << launch.masks.word_indptr.len
+                          << " requests=" << (launch.qo_indptr.len - 1)
+                          << " causal=" << (causal ? 1 : 0) << " lengths=";
+                for (std::uint32_t len : causal_kv_lengths) std::cerr << len << " ";
+                std::cerr << " | tokens=" << launch.token_ids.len << " readout=";
+                for (std::size_t i = 0; i < launch.sampling_indices.len; ++i) {
+                    std::cerr << launch.sampling_indices.ptr[i] << " ";
+                }
+                std::cerr << "csr=";
+                for (std::size_t r = 0; r + 1 < launch.qo_indptr.len; ++r) {
+                    const std::uint32_t pages =
+                        launch.kv_page_indptr.ptr[r + 1] - launch.kv_page_indptr.ptr[r];
+                    const std::uint32_t kv = pages == 0
+                        ? 0u
+                        : (pages - 1) * cfg_.batching.kv_page_size +
+                              launch.kv_last_page_lens.ptr[r];
+                    std::cerr << pages << "p/" << kv << "k ";
+                }
+                std::cerr << "\n";
+            }
+            if (!causal) {
+                std::cerr
+                    << "[pie-driver-metal] launch: this wire attention mask is "
+                       "not a causal prefix, and Metal has no path from the "
+                       "wire form to the dense mask its kernels read; refusing "
+                       "rather than attending to keys the mask excluded\n";
+                return PIE_STATUS_UNSUPPORTED;
+            }
         }
         // Phase 2 (C3): at most one device-geometry program per launch batch
         // — the same structural constraint the runtime's scheduler already
@@ -946,6 +1028,31 @@ class Context::Impl {
         auto job = std::make_shared<LaunchJobData>();
         job->completion = completion;
         job->launch = executor::OwnedLaunchView::capture(launch);
+        if (!causal_kv_lengths.empty()) {
+            // The mask and the page CSR state the same number, and if they
+            // disagree the driver cannot tell which one the KV write used. Say
+            // which two differ and stop, rather than attend to whichever the
+            // geometry happens to reach.
+            std::uint32_t claimed = 0;
+            const int bad = wire_mask::first_kv_len_disagreement(
+                causal_kv_lengths, launch.kv_page_indptr, launch.kv_last_page_lens,
+                cfg_.batching.kv_page_size, claimed);
+            if (bad >= 0) {
+                std::cerr << "[pie-driver-metal] launch: request " << bad
+                          << "'s causal mask covers " << causal_kv_lengths[bad]
+                          << " keys but its page CSR claims " << claimed
+                          << " at kv_page_size=" << cfg_.batching.kv_page_size
+                          << "; the two must agree (an inferlet paging at a "
+                             "different size than the driver is the usual cause)\n";
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            // Agreed: the mask restates the bound `sdpa_paged` already applies,
+            // so it has nothing left to say.
+            job->launch.has_user_mask = false;
+            job->launch.mask_request_indptr.clear();
+            job->launch.mask_word_indptr.clear();
+            job->launch.mask_words.clear();
+        }
         job->members.resize(members.size());
         for (std::size_t m = 0; m < members.size(); ++m) {
             LaunchMember& lm = job->members[m];
@@ -2170,6 +2277,11 @@ class Context::Impl {
         // these families allocate their pool for this many rows.
         setup_cfg.max_forward_tokens = simple_family_max_forward_tokens(cfg_, facts_);
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
+        // The one knob that moves the KV ring, and it only moves it DOWN:
+        // `setup` clamps to `kMetalMaxCtxTokens`, so an operator cannot ask
+        // for a ring the driver does not advertise. Zero leaves it exactly
+        // where it was.
+        setup_cfg.max_ctx_tokens = effective_max_ctx_tokens(cfg_);
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
         setup_cfg.descriptor_json = descriptor_json_;
         setup_cfg.stream_routed_experts = cfg_.model.stream_routed_experts;

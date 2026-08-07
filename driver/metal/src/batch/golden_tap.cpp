@@ -56,9 +56,30 @@ bool tap_for(const Dispatch& d, const DecodeGeometry& g, Tap& out) {
 
         case Kernel::QmvGate:       out = {"gate_proj",  4, g.intermediate}; return true;
         case Kernel::QmvUp:         out = {"up_proj",    4, g.intermediate}; return true;
-        case Kernel::SiluMul:       out = {"swiglu",     2, g.intermediate}; return true;
+        // Routed, the dense SwiGLU that remains is the SHARED expert's, at its
+        // own width. Named `swiglu` at `g.intermediate` for both, this tap was
+        // zero elements wide on every routed checkpoint -- present, empty, and
+        // silently skipped by anything comparing it.
+        case Kernel::SiluMul:
+            out = g.is_moe() ? Tap{"shared_act", 2, g.shared_intermediate}
+                             : Tap{"swiglu", 2, g.intermediate};
+            return true;
         case Kernel::QmvDown:       out = {"down_proj",  4, g.hidden};       return true;
         case Kernel::LayerOut:      out = {"layer_out",  2, g.hidden};       return true;
+
+        // ── the mixture, in TOKEN order ──
+        // The sorted tensors are deliberately untapped: their row order is the
+        // driver's own, so a dump of them would diff against nothing. What is
+        // here is every value a reference can also produce, which until now was
+        // nothing at all -- the routed FFN was the one block of this family no
+        // parity run could see, and it is where Qwen3.6-35B-A3B went wrong.
+        case Kernel::LlRouter:      out = {"router",     4, g.n_experts}; return true;
+        case Kernel::LlMoeCombine:  out = {"moe_out",    2, g.hidden};   return true;
+        case Kernel::LlSharedGate:  out = {"shared_gate", 4, g.shared_intermediate}; return true;
+        case Kernel::LlSharedUp:    out = {"shared_up",  4, g.shared_intermediate};  return true;
+        case Kernel::LlSharedDown:  out = {"shared_down", 4, g.hidden};   return true;
+        case Kernel::LlSharedGateProj: out = {"shared_g", 4, 1};          return true;
+        case Kernel::LlSharedCombine:  out = {"ffn_out",  3, g.hidden};   return true;
         default: return false;
     }
 }
@@ -99,6 +120,11 @@ const std::string& golden_tap_dir() {
         return std::string(e == nullptr ? "" : e);
     }();
     return dir;
+}
+
+bool golden_taps_recycle() {
+    static const bool on = std::getenv("PIE_METAL_TAPS_RECYCLE") != nullptr;
+    return on;
 }
 
 void dump_golden_taps(const std::vector<Dispatch>& dag,

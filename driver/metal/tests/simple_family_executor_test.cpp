@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "batch/forward.hpp"
+#include "checkpoint_path.hpp"
 #include "batch/golden_tap.hpp"
 
 using namespace pie::metal;
@@ -228,8 +229,9 @@ int main() {
 
     // ── gemma4 ──
     if (!go_taps) {
-        const std::string dir = root + "/gemma4-e2b-pie";
-        if (!exists(dir)) {
+        const std::string dir = pie::metal::test::find_checkpoint(
+            "gemma4-e2b-pie", "models--mlx-community--gemma-4-e2b-it-4bit");
+        if (dir.empty() || !exists(dir)) {
             std::printf("  gemma4: SKIP (no checkpoint at %s)\n", dir.c_str());
         } else {
             SetupConfig cfg;

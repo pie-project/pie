@@ -369,14 +369,26 @@ macro_rules! define_run_one {
             //
             // `run_ahead_frames` overrides the depth for sweeps only; it is stated
             // in frames, and the ring grows with it.
+            //
+            // The ring is sized a full frame of margin ABOVE the advertised
+            // capacity (`7 * live_slots` covers every frame size this bench
+            // runs). `channel-capacity()` bakes in a staging margin, but the
+            // engine's ticket check is more conservative still, and a
+            // continuation that lands inside that margin is silently skipped at
+            // the reader-cell validation rather than refused. Sized at exactly
+            // `cap`, the measured continuation engaged on 12% of frames — the
+            // run-ahead the whole pipeline depends on, lost with no error
+            // anywhere. Chaining collapses and every frame's guest turnaround
+            // lands on the critical path: c256 23,478 -> 19,321 tok/s, S 30,277
+            // -> 21,506, X 5,429 -> 4,039 (analysis.md 10.30).
             let (window_fires, out_capacity) = match input.run_ahead_frames {
                 Some(r) => {
                     let w = r.max(1) * live_slots;
-                    (w, w + 1)
+                    (w, w + 1 + 7 * live_slots)
                 }
                 None => {
                     let cap = channel_capacity();
-                    (cap - 1, cap)
+                    (cap - 1, cap + 7 * live_slots)
                 }
             };
             let out = Channel::new([1], dtype::i32)

@@ -36,10 +36,18 @@
 #include "kernels/swiglu.hpp"
 #include "kernels/topk_softmax.hpp"
 #include "ops/attention_naive_paged.hpp"
+#include "ops/flashinfer_moe.hpp"
 
 namespace pie_cuda_driver::model {
 
 namespace {
+
+// Rows the fused CUTLASS MoE workspace is sized for. Gemma-4 routes 8 experts
+// per token against 128 experts, so the runner's permuted-activation buffer is
+// `rows * 8 * hidden` -- a prefill-wide budget would be hundreds of MiB for a
+// path that only pays off at decode-sized batches. Decode batches are bounded
+// by the scheduler's concurrency, which is what this tracks.
+constexpr int kGemma4FusedMoeMaxRows = 512;
 
 
 struct Gemma4ForwardProfile {
@@ -62,6 +70,7 @@ struct Gemma4ForwardProfile {
     float attention_ms = 0.f;
     float attn_out_ms = 0.f;
     float mlp_ms = 0.f;
+    float mlp_moe_ms = 0.f;
     float ple_residual_ms = 0.f;
     float final_norm_ms = 0.f;
     float lm_head_ms = 0.f;
@@ -95,7 +104,29 @@ struct Gemma4ForwardProfile {
         return idx;
     }
 
-    void begin(cudaStream_t) {}
+    void begin(cudaStream_t stream) {
+        // Off unless asked for: the stage events are cheap to record but the
+        // read-back in `end()` synchronizes, which is exactly what the decode
+        // path exists to avoid.
+        static const bool want =
+            std::getenv("PIE_GEMMA4_FORWARD_PROFILE") != nullptr;
+        if (!want) return;
+        // An event recorded on a capturing stream cannot be synchronized on,
+        // so a captured fire is not measurable this way at all -- and trying
+        // is a hard error (907), not a silent miss. Eager fires still carry
+        // the same kernels, which is what the stage split is read for.
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &status) != cudaSuccess ||
+            status != cudaStreamCaptureStatusNone) {
+            return;
+        }
+        enabled = true;
+        static std::atomic<std::uint64_t> counter{0};
+        seq = counter.fetch_add(1);
+        CUDA_CHECK(cudaEventCreate(&total_start));
+        CUDA_CHECK(cudaEventCreate(&total_stop));
+        CUDA_CHECK(cudaEventRecord(total_start, stream));
+    }
 
     void end(cudaStream_t stream) {
         if (!enabled || ended) return;
@@ -167,6 +198,7 @@ void maybe_print_gemma4_forward_profile(
         << " attention_ms=" << p.attention_ms
         << " attn_out_ms=" << p.attn_out_ms
         << " mlp_ms=" << p.mlp_ms
+        << " mlp_moe_ms=" << p.mlp_moe_ms
         << " ple_residual_ms=" << p.ple_residual_ms
         << " final_norm_ms=" << p.final_norm_ms
         << " lm_head_ms=" << p.lm_head_ms
@@ -211,14 +243,34 @@ constexpr const char* kPrefix = "model.language_model.";
 constexpr int kGemma4RowDecodeQmax = 4;
 constexpr std::size_t kGemma4RowDecodeMaxPageRefs = std::size_t{1} << 20;
 
+// Widths at which the routed experts stay on the one-warp-per-row GEMV rather
+// than the host-dispatched per-expert loop. Same value the other sparse-MoE
+// families use: at M=1 there is no weight reuse to amortise a tiled GEMM over,
+// and past that the loop's batching wins back what its sync costs.
+constexpr int kGemma4MoeGemvMaxTokens = 1;
+
+// KV splits for the sliding layers' decode. Eight is the knee measured by
+// `tests/bench_decode_attention.cu` at this model's shape -- 8 splits x 8 KV
+// heads = 64 CTAs, which is where the flat CTA sweep ended. Four leaves the
+// device short (20.7 us against 17.4), sixteen starts paying for the merge
+// (20.4) and twenty-four more so (26.0).
+constexpr int kGemma4HopperSplits = 8;
+
+// The full-attention layers run two KV heads, so an unsplit fire is two CTAs.
+// They have no window, so the chunking is a plain division of the pages.
+constexpr int kGemma4FullSplits = 16;
+
 bool gemma4_dense_gate_up_fused_enabled(const HfConfig& cfg) {
-    return !cfg.gemma4_enable_moe &&
-           cfg.hidden_size == 2560 &&
-           cfg.intermediate_size == 10240 &&
-           cfg.num_hidden_layers == 42 &&
-           cfg.num_attention_heads == 8 &&
-           cfg.num_key_value_heads == 2 &&
-           cfg.head_dim == 256;
+    // Presence of the bank decides, not the shape. `dense_fused_projection_joins`
+    // publishes `mlp.gate_up_proj.fused.weight` for every Gemma-4 that fits its
+    // byte budget, and the consumer is shape-agnostic -- one GEMM plus the same
+    // chunked GeGLU the split path runs. The allowlist this replaces named the
+    // one checkpoint the fused path had been tried on, which left 26B-A4B
+    // issuing two M=1 GEMVs per layer where one would do; `optional_tensor`
+    // already yields null when the join did not run, so an absent bank falls
+    // back on its own.
+    (void)cfg;
+    return true;
 }
 
 bool gemma4_dense_gate_up_fused_for_row_decode(const HfConfig& cfg) {
@@ -415,6 +467,192 @@ void prepare_gemma4_plan_for_layer(
         hnd_layout);
 }
 
+// FA3 decode plan for the sliding layers. One token per request, so
+// `qo_indptr` is the identity; everything else the SM90 planner needs is the
+// same page table the decode plans were built from.
+void prepare_gemma4_hopper_decode_plan(
+    Gemma4MoeMlpWorkspace& moe_ws,
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    AttentionWorkspace& attn_ws,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int num_requests,
+    int page_size)
+{
+    moe_ws.hopper_decode_plan_sliding.valid = false;
+    moe_ws.hopper_splits = 0;
+    moe_ws.hopper_plan_layer_window = -2;
+    moe_ws.full_splits = 0;
+    if (num_requests <= 0) return;
+    int sliding_idx = -1;
+    for (std::size_t i = 0; i < w.layers.size(); ++i) {
+        if (!w.layers[i].is_full) { sliding_idx = static_cast<int>(i); break; }
+    }
+    if (sliding_idx < 0) return;
+    const auto* sliding = &w.layers[sliding_idx];
+    const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+    const int q_heads = cfg.num_attention_heads / T;
+    const int kv_heads = sliding->num_kv_heads / T;
+    const int window_left = w.per_layer_window_left[sliding_idx];
+    if (!ops::hopper_prefill_supported(
+            sliding->head_dim, window_left, num_requests, num_requests)) {
+        return;
+    }
+    // One request only: the split turns R rows into R*S pseudo-requests, and
+    // interleaving those across requests is bookkeeping this does not need
+    // while decode concurrency is where it is.
+    const int splits = (num_requests == 1) ? kGemma4HopperSplits : 1;
+    const int pages = static_cast<int>(kv_page_indptr_h[1] - kv_page_indptr_h[0]);
+    const int last_len = static_cast<int>(kv_last_page_lens_h[0]);
+    const int kv_len = (pages - 1) * page_size + last_len;
+    if (pages < splits) return;
+
+    // Only the in-window tail is worth splitting. The oldest chunk takes one
+    // extra page and carries the window: with qo_len = 1 the kernel's first
+    // visible index is `kv_len - 1 - window_left`, so `window_left =
+    // len_0 - 1 - skip` starts it exactly at the window boundary, and the
+    // extra page is what keeps that same scalar from masking anything in the
+    // later, shorter chunks.
+    const int win_start =
+        (window_left >= 0) ? std::max(0, kv_len - window_left) : 0;
+    const int first_page = win_start / page_size;
+    const int skip = win_start - first_page * page_size;
+    const int live = pages - first_page;
+    const int chunk = std::max(1, (live + splits - 1) / splits);
+
+    moe_ws.hopper_split_qo_h.resize(splits + 1);
+    moe_ws.hopper_split_kv_indptr_h.resize(splits + 1);
+    moe_ws.hopper_split_last_h.resize(splits);
+    for (int i = 0; i <= splits; ++i) {
+        moe_ws.hopper_split_qo_h[i] = static_cast<std::uint32_t>(i);
+    }
+    moe_ws.hopper_split_kv_indptr_h[0] =
+        static_cast<std::uint32_t>(first_page);
+    int cursor = first_page;
+    int split_window = -1;
+    for (int i = 0; i < splits; ++i) {
+        const int extra = (i == 0 && skip > 0) ? 1 : 0;
+        const int lo = cursor;
+        const int hi = std::min(lo + chunk + extra, pages);
+        cursor = hi;
+        moe_ws.hopper_split_kv_indptr_h[i + 1] =
+            static_cast<std::uint32_t>(hi);
+        const bool last = (hi == pages);
+        const int len = (hi > lo)
+            ? ((hi - lo - 1) * page_size + (last ? last_len : page_size))
+            : 0;
+        moe_ws.hopper_split_last_h[i] = static_cast<std::uint32_t>(
+            (hi > lo) ? (last ? last_len : page_size) : 1);
+        if (i == 0) split_window = len - 1 - skip;
+    }
+    if (cursor != pages) return;  // chunking did not cover the range
+
+    ops::plan_attention_flashinfer_prefill_sm90_bf16(
+        moe_ws.hopper_decode_plan_sliding,
+        moe_ws.hopper_split_qo_h.data(),
+        moe_ws.hopper_split_kv_indptr_h.data(),
+        moe_ws.hopper_split_last_h.data(),
+        /*total_tokens=*/splits, splits,
+        q_heads, kv_heads, sliding->head_dim, page_size,
+        attn_ws, /*stream=*/nullptr,
+        /*enable_cuda_graph=*/true, /*causal=*/true,
+        (skip > 0 && window_left >= 0) ? split_window : -1,
+        // Clear of the decode plans, which start at offset 0.
+        /*int_base_bytes=*/attn_ws.int_bytes() / 2);
+    if (!moe_ws.hopper_decode_plan_sliding.valid) return;
+    moe_ws.hopper_splits = splits;
+    moe_ws.hopper_plan_layer_window = window_left;
+    const std::size_t rows = static_cast<std::size_t>(splits) * q_heads;
+    if (moe_ws.hopper_split_partial.size() <
+        rows * static_cast<std::size_t>(sliding->head_dim)) {
+        moe_ws.hopper_split_partial = DeviceBuffer<std::uint16_t>::alloc(
+            rows * static_cast<std::size_t>(sliding->head_dim));
+        moe_ws.hopper_split_lse = DeviceBuffer<float>::alloc(rows);
+        moe_ws.hopper_split_lse_merged =
+            DeviceBuffer<float>::alloc(static_cast<std::size_t>(q_heads));
+    }
+}
+
+// The same batch-split for the full-attention layers, on FlashInfer's decode
+// plan rather than FA3's -- head_dim 512 has no Hopper instantiation, but the
+// underfill is the same problem and the same construction fixes it. No window
+// here, so the chunks are a plain division.
+void prepare_gemma4_full_split_plan(
+    Gemma4MoeMlpWorkspace& moe_ws,
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    AttentionWorkspace& attn_ws,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int num_requests,
+    int page_size,
+    bool hnd_layout)
+{
+    if (num_requests != 1) return;
+    const auto* full = first_layer_for_plan(w, /*full=*/true);
+    if (full == nullptr) return;
+    const int pages =
+        static_cast<int>(kv_page_indptr_h[1] - kv_page_indptr_h[0]);
+    const int splits = kGemma4FullSplits;
+    if (pages < splits) return;
+    const int last_len = static_cast<int>(kv_last_page_lens_h[0]);
+    const int chunk = (pages + splits - 1) / splits;
+
+    moe_ws.full_split_kv_indptr_h.resize(splits + 1);
+    moe_ws.full_split_last_h.resize(splits);
+    moe_ws.full_split_kv_indptr_h[0] = 0;
+    for (int i = 0; i < splits; ++i) {
+        const int lo = std::min(i * chunk, pages);
+        const int hi = std::min(lo + chunk, pages);
+        moe_ws.full_split_kv_indptr_h[i + 1] = static_cast<std::uint32_t>(hi);
+        const bool last = (hi == pages);
+        moe_ws.full_split_last_h[i] = static_cast<std::uint32_t>(
+            (hi > lo) ? (last ? last_len : page_size) : 1);
+    }
+    if (moe_ws.full_split_kv_indptr_h[splits] !=
+        static_cast<std::uint32_t>(pages)) {
+        return;
+    }
+
+    const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+    const int q_heads = cfg.num_attention_heads / T;
+    const int kv_heads = full->num_kv_heads / T;
+    if (!moe_ws.full_split_plan) moe_ws.full_split_plan = ops::make_decode_plan();
+    ops::plan_attention_flashinfer_decode(
+        *moe_ws.full_split_plan, moe_ws.full_split_kv_indptr_h.data(), splits,
+        q_heads, kv_heads, full->head_dim, page_size, attn_ws,
+        /*stream=*/nullptr, /*enable_cuda_graph=*/true,
+        /*full_attention_variant=*/true, hnd_layout);
+
+    const std::size_t n = static_cast<std::size_t>(splits);
+    if (moe_ws.full_split_kv_indptr_d.size() < n + 1) {
+        moe_ws.full_split_kv_indptr_d =
+            DeviceBuffer<std::uint32_t>::alloc(n + 1);
+        moe_ws.full_split_last_d = DeviceBuffer<std::uint32_t>::alloc(n);
+    }
+    CUDA_CHECK(cudaMemcpy(moe_ws.full_split_kv_indptr_d.data(),
+                          moe_ws.full_split_kv_indptr_h.data(),
+                          (n + 1) * sizeof(std::uint32_t),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(moe_ws.full_split_last_d.data(),
+                          moe_ws.full_split_last_h.data(),
+                          n * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+
+    const std::size_t rows = n * static_cast<std::size_t>(q_heads);
+    if (moe_ws.hopper_split_partial.size() <
+        rows * static_cast<std::size_t>(full->head_dim)) {
+        moe_ws.hopper_split_partial = DeviceBuffer<std::uint16_t>::alloc(
+            rows * static_cast<std::size_t>(full->head_dim));
+        moe_ws.hopper_split_lse = DeviceBuffer<float>::alloc(rows);
+        moe_ws.hopper_split_lse_merged =
+            DeviceBuffer<float>::alloc(static_cast<std::size_t>(q_heads));
+    }
+    moe_ws.full_splits = splits;
+}
+
 ops::DecodePlanCachePtr& select_prepared_plan(
     Gemma4MoeMlpWorkspace& moe_ws,
     bool row_decode,
@@ -498,6 +736,12 @@ void prepare_gemma4_decode_plans(
     if (is_pure_decode) {
         prepare_pair(kv_page_indptr_h, R, /*row_decode=*/false);
         moe_ws.decode_plans_prepared = true;
+        prepare_gemma4_hopper_decode_plan(
+            moe_ws, w, cfg, fwd_cfg, attn_ws, kv_page_indptr_h,
+            kv_last_page_lens_h, R, cache.page_size());
+        prepare_gemma4_full_split_plan(
+            moe_ws, w, cfg, fwd_cfg, attn_ws, kv_page_indptr_h,
+            kv_last_page_lens_h, R, cache.page_size(), cache.hnd_layout());
         if (log_debug) {
             std::cerr << "[pie-driver-cuda] gemma4 plan prepare"
                       << " N=" << N
@@ -579,6 +823,27 @@ Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
     ws.b_dn_ptrs    = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
     ws.c_dn_ptrs    = DeviceBuffer<std::uint16_t*>::alloc(top_k);
     ws.batch_weights = DeviceBuffer<float>::alloc(top_k);
+
+    if (ops::flashinfer_cutlass_moe_enabled()) {
+        // Sized for decode rather than for the prefill high-water mark: the
+        // runner's workspace holds the permuted activations, so it scales
+        // with rows * top_k * hidden, and Gemma-4's top_k is 8. A prefill-wide
+        // budget would be hundreds of MiB of arena for a path that only pays
+        // off at decode-sized batches; anything larger falls back to the
+        // host-routed walk.
+        ws.cutlass_max_rows = std::min(max_tokens, kGemma4FusedMoeMaxRows);
+        const std::size_t bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
+            ops::MoeActivation::Geglu, ws.cutlass_max_rows, hidden,
+            moe_intermediate, num_experts, top_k,
+            /*tp_size=*/1, /*tp_rank=*/0);
+        if (bytes > 0) {
+            ws.cutlass_ws = DeviceBuffer<std::uint8_t>::alloc(bytes);
+            ws.cutlass_row_map = DeviceBuffer<std::int32_t>::alloc(
+                static_cast<std::size_t>(ws.cutlass_max_rows) * top_k);
+        } else {
+            ws.cutlass_max_rows = 0;
+        }
+    }
     return ws;
 }
 
@@ -627,6 +892,21 @@ void Gemma4MoeMlpWorkspace::allocate_ple(int max_tokens, int per_layer_total)
     ple_proj  = DeviceBuffer<std::uint16_t>::alloc(elems);
 }
 
+bool gemma4_moe_gate_up_swapped() { return true; }
+
+// Force the host-routed per-expert walk even when the fused CUTLASS path is
+// available. The two paths must agree token-for-token on the same weights, and
+// without a switch there is no way to run the comparison: the fused path is
+// selected by batch size, so "same prompt, other kernel" is otherwise
+// unreachable. Mirrors `PIE_QWEN35_MOE_FORCE_GENERAL`.
+bool gemma4_moe_force_general_path() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_GEMMA4_MOE_FORCE_GENERAL");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
 Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     if (cfg.layer_types.empty()) {
@@ -642,7 +922,13 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     Gemma4Weights w;
     const bool fuse_dense_gate_up = gemma4_dense_gate_up_fused_enabled(cfg);
     const bool fuse_dense_qkv =
-        !cfg.gemma4_enable_moe;
+        // Same rule as the gate/up bank: ask for it, and let the per-layer
+        // guards below plus `optional_tensor` decide. A layer that reads its
+        // K/V from elsewhere (`is_shared`) or derives V from K
+        // (`use_k_as_v`, Gemma-4's k_eq_v full-attention layers) still
+        // declines, so 26B-A4B fuses its 25 sliding layers and leaves the
+        // 5 full ones split.
+        true;
     const std::string p = kPrefix;
     w.embed           = &must(engine, p + "embed_tokens.weight");
     // PLE (Per-Layer Embeddings) machinery is optional — Gemma-4 E2B /
@@ -1142,6 +1428,7 @@ void gemma4_moe_block(
     Workspace& ws,
     Gemma4MoeMlpWorkspace& moe_ws,
     int N,
+    bool device_dispatch_required,
     ops::CublasHandle& cublas, cudaStream_t stream)
 {
     const int H  = cfg.hidden_size;
@@ -1180,10 +1467,99 @@ void gemma4_moe_block(
         ws.y.data(), Lw.moe_norm_pre->data(), moe_ws.moe_input.data(),
         N, H, eps, stream);
 
+    // ── Expert dispatch ──────────────────────────────────────────
+    // Two device-side dispatchers, and the batch width picks between them.
+    // Neither leaves the GPU, which is what keeps this layer capturable; the
+    // host-routed walk below is only for shapes neither covers.
+    const int routes = N * K;
+    const bool gemv_ok =
+        Lw.moe_gate_up_proj != nullptr && Lw.moe_down_proj != nullptr &&
+        (H % 8) == 0 && (Im % 8) == 0;
+    // At M=1 the routed GEMMs are streaming reads with no weight reuse, so one
+    // warp per output row beats any batched GEMM -- there is nothing for a
+    // grouped GEMM's tiling to amortise. `kGemma4MoeGemvMaxTokens` is where
+    // that stops being true.
+    const bool gemv_preferred =
+        gemv_ok && N <= ops::moe_gemv_max_tokens(kGemma4MoeGemvMaxTokens);
+    const auto dispatch_gemv = [&]() {
+        kernels::launch_moe_gate_up_decode_gemv_bf16(
+            moe_ws.topk_idx.data(),
+            moe_ws.moe_input.data(),
+            Lw.moe_gate_up_proj->data(),
+            moe_ws.expert_gate_up.data(),
+            N, K, H, Im, stream);
+        kernels::launch_chunked_geglu_tanh_bf16(
+            moe_ws.expert_gate_up.data(),
+            moe_ws.expert_act.data(),
+            routes, Im, stream);
+        kernels::launch_moe_down_decode_gemv_bf16(
+            moe_ws.topk_idx.data(),
+            moe_ws.expert_act.data(),
+            Lw.moe_down_proj->data(),
+            moe_ws.expert_out.data(),
+            N, K, H, Im, stream);
+        // Writes (does not accumulate) the top-k weighted sum, so `moe_out`
+        // needs no zeroing on this path.
+        kernels::launch_token_batched_weighted_sum_bf16(
+            moe_ws.moe_out.data(),
+            moe_ws.expert_out.data(),
+            moe_ws.topk_weights.data(),
+            N, K, H, stream);
+    };
+    if (gemv_preferred) {
+        dispatch_gemv();
+        return;
+    }
+
+    // Past that width the weights are read once and used many times, so one
+    // CUTLASS grouped GEMM over every (token, expert) route wins -- still
+    // driven entirely from device memory, so still capturable. The runner
+    // declines only on a null pointer or a workspace too small for `num_rows`,
+    // both decided here, so a decline lands on the GEMV below rather than on
+    // the host walk -- which is what keeps a captured fire legal.
+    if (!moe_ws.cutlass_ws.empty() && !gemma4_moe_force_general_path() &&
+        N > 0 && N <= moe_ws.cutlass_max_rows &&
+        ops::flashinfer_cutlass_moe_bf16(
+            ops::MoeActivation::Geglu,
+            static_cast<const std::uint16_t*>(moe_ws.moe_input.data()),
+            moe_ws.topk_idx.data(),
+            moe_ws.topk_weights.data(),
+            static_cast<const std::uint16_t*>(Lw.moe_gate_up_proj->data()),
+            static_cast<const std::uint16_t*>(Lw.moe_down_proj->data()),
+            static_cast<std::uint16_t*>(moe_ws.moe_out.data()),
+            moe_ws.cutlass_ws.data(),
+            moe_ws.cutlass_ws.size(),
+            moe_ws.cutlass_row_map.data(),
+            N, H, Im, E, K,
+            /*tp_size=*/1, /*tp_rank=*/0, stream)) {
+        return;
+    }
+
+    // `device_dispatch_required` is the caller saying this fire is a pure
+    // decode, the only shape the executor captures. The host loop below
+    // synchronizes and so cannot run inside a capture; on those fires the GEMV
+    // is not an optimisation but the only legal choice, whatever the width.
+    if (device_dispatch_required) {
+        if (gemv_ok) {
+            dispatch_gemv();
+            return;
+        }
+        // Falling through would put a `cudaStreamSynchronize` inside a stream
+        // capture, which CUDA rejects with "operation not permitted when
+        // stream is capturing" (900) -- an error naming the sync, not the
+        // shape that made it unavoidable. Say which requirement failed.
+        throw std::runtime_error(
+            "gemma4: MoE decode needs a device-side dispatcher inside a graph "
+            "capture, but neither is available (fused grouped GEMM declined "
+            "and the decode GEMV requires fused gate/up + down weights with "
+            "hidden_size and intermediate_size both divisible by 8)");
+    }
+
     // D2H sync the routing decisions for the prefill / multi-token
-    // dispatch loop. The dense Gemma-4 forward is non-graph-capturable
-    // (per-layer head_dim, attention_factor lookups all run host code),
-    // so an extra sync here is in the noise.
+    // dispatch loop. Prefill is not captured and already pays a host
+    // round-trip for its plan, so the extra sync here is in the noise --
+    // but it is why `Gemma4Model` refuses graph capture whenever this
+    // block can be reached.
     std::vector<std::int32_t> topk_idx_h((std::size_t)N * K);
     std::vector<float>        topk_w_h((std::size_t)N * K);
     CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), moe_ws.topk_idx.data(),
@@ -1233,7 +1609,7 @@ void gemma4_moe_block(
         kernels::launch_chunked_geglu_tanh_bf16(
             moe_ws.expert_gate_up.data(),
             moe_ws.expert_act.data(),
-            Ne, Im, stream);
+            Ne, Im, stream, /*gate_second=*/gemma4_moe_gate_up_swapped());
 
         const auto* down_w = static_cast<const std::uint16_t*>(
                                  Lw.moe_down_proj->data())
@@ -1272,9 +1648,18 @@ std::uint32_t gemma4_decode_graph_layout(
         : pack(moe_ws.decode_plan_full);
     if (sliding == 0u && full == 0u) return 0u;
 
+    // The FA3 sliding-layer plan is part of the launch geometry too: unlike
+    // the decode plans its schedule is derived from the KV lengths it was
+    // built with, so a captured graph replayed against a differently-shaped
+    // plan reads the wrong work assignment and silently produces garbage.
+    // Fold its layout in so a change forces a recapture rather than a wrong
+    // answer.
+    const std::uint32_t hopper =
+        ops::hopper_prefill_graph_layout(moe_ws.hopper_decode_plan_sliding);
     return (row_decode ? 0x10000u : 0x20000u) |
            (sliding & 0xffu) |
-           ((full & 0xffu) << 8);
+           ((full & 0xffu) << 8) |
+           ((hopper & 0xffu) << 20);
 }
 
 void gemma4_forward_paged(
@@ -1731,7 +2116,53 @@ void gemma4_forward_paged(
         profile_gemma4_cuda_stage(
             profile, profile.attention_ms, stream, [&] {
                 ops::DecodePlanCachePtr decode_plan;
-                if (use_decode_path) {
+                const auto& hplan = moe_ws.hopper_decode_plan_sliding;
+                const bool use_hopper_decode =
+                    use_decode_path && hplan.valid && !layer.is_full &&
+                    hplan.head_dim == d &&
+                    hplan.num_kv_heads == num_kv_heads_local &&
+                    moe_ws.hopper_plan_layer_window ==
+                        w.per_layer_window_left[l];
+                if (use_hopper_decode && moe_ws.hopper_splits > 1) {
+                    ops::dispatch_attention_flashinfer_prefill_sm90_bf16(
+                        hplan, ws.q.data(), kv_view.k_pages, kv_view.v_pages,
+                        moe_ws.hopper_split_partial.data(), kv_page_indices,
+                        attn_ws, stream, /*logits_soft_cap=*/0.f,
+                        /*sm_scale=*/1.0f, moe_ws.hopper_split_lse.data(),
+                        /*broadcast_q=*/true);
+                    ops::merge_attention_states_bf16(
+                        moe_ws.hopper_split_partial.data(),
+                        moe_ws.hopper_split_lse.data(),
+                        ws.attn_out.data(),
+                        moe_ws.hopper_split_lse_merged.data(),
+                        moe_ws.hopper_splits, 1, num_q_heads_local, d, stream);
+                } else if (use_hopper_decode) {
+                    ops::dispatch_attention_flashinfer_prefill_sm90_bf16(
+                        hplan, ws.q.data(), kv_view.k_pages, kv_view.v_pages,
+                        ws.attn_out.data(), kv_page_indices, attn_ws, stream,
+                        // Gemma-4 folds `query_pre_attn_scalar` into Q before
+                        // attention, so the kernel must not apply the usual
+                        // 1/sqrt(head_dim) again -- the decode path beside
+                        // this one passes the same 1.0.
+                        /*logits_soft_cap=*/0.f, /*sm_scale=*/1.0f);
+                } else if (use_decode_path && layer.is_full &&
+                           moe_ws.full_splits > 1 && moe_ws.full_split_plan) {
+                    ops::dispatch_attention_flashinfer_decode_bf16(
+                        *moe_ws.full_split_plan, ws.q.data(),
+                        kv_view.k_pages, kv_view.v_pages,
+                        moe_ws.hopper_split_partial.data(), kv_page_indices,
+                        moe_ws.full_split_kv_indptr_d.data(),
+                        moe_ws.full_split_last_d.data(),
+                        attn_ws, stream, /*window_left=*/-1,
+                        /*logits_soft_cap=*/0.f, /*sm_scale=*/1.0f,
+                        moe_ws.hopper_split_lse.data(), /*broadcast_q=*/true);
+                    ops::merge_attention_states_bf16(
+                        moe_ws.hopper_split_partial.data(),
+                        moe_ws.hopper_split_lse.data(),
+                        ws.attn_out.data(),
+                        moe_ws.hopper_split_lse_merged.data(),
+                        moe_ws.full_splits, 1, num_q_heads_local, d, stream);
+                } else if (use_decode_path) {
                     ops::DecodePlanCache* plan =
                         select_prepared_plan(
                             moe_ws, /*row_decode=*/false, layer.is_full).get();
@@ -1914,7 +2345,10 @@ void gemma4_forward_paged(
                 ws.norm_x.data(), layer.mlp_norm_post_dense->data(),
                 ws.norm_y.data(), N, H, eps, stream);
             // experts → moe_ws.moe_out (raw, no post-norm).
-            gemma4_moe_block(layer, cfg, ws, moe_ws, N, cublas, stream);
+            profile_gemma4_cuda_stage(profile, profile.mlp_moe_ms, stream, [&] {
+                gemma4_moe_block(layer, cfg, ws, moe_ws, N, is_pure_decode,
+                                 cublas, stream);
+            });
             // branch_2 = post_feedforward_layernorm_2(moe_out) → norm_x
             // (norm_x's prior contents — dense_out — are no longer
             // needed).

@@ -161,7 +161,7 @@ int main() {
         bind_scratch(*ctx, prefill[t], prefill_sched, scratch.data(), int(scratch.size()),
                      t * scratch_row);
         bind_decode_consts(*ctx, prefill[t], g, 4096, true);
-        bind_prefill_gdn_state(*ctx, b, prefill[t], uint32_t(t & 1), (t & 1) == 0);
+        bind_gdn_conv_parity(*ctx, b, prefill[t], (t & 1) == 0);
     }
 
     bool all_bound = true;
@@ -263,10 +263,33 @@ int main() {
         };
 
         const auto at_wide = route_params(moe_dag);
-        expect(at_wide.n == uint32_t(wide * moe.experts_per_token) &&
+        const int wide_pairs = wide * moe.experts_per_token;
+        const uint32_t wide_tile = uint32_t(
+            shared_kernels::moe_tile_rows(wide_pairs, moe.n_experts));
+        expect(at_wide.n == uint32_t(wide_pairs) &&
                    at_wide.padded == uint32_t(moe_sorted_rows(moe, wide)) &&
-                   at_wide.tile_rows == uint32_t(shared_kernels::kMoeTileRows),
+                   at_wide.tile_rows == wide_tile,
                "the sort is told the pair count and padded rows of the width it was bound at");
+        // The number itself is not the point; the AGREEMENT is. The sort pads
+        // each expert's run to `tile_rows` and the routed GEMM's grid divides
+        // the sorted rows by its BM, so a pipeline compiled for one against a
+        // grid built for the other reads another expert's rows -- wrong
+        // numbers, not a crash. That is a bug this driver has shipped: gpt-oss
+        // spelled its routed BM as a literal 16 while everything around it
+        // spelled it from the constant, and nothing noticed until the constant
+        // moved.
+        bool gemm_bm_matches_sort = false;
+        for (const Dispatch& d : moe_dag) {
+            if (d.kind != Kernel::LlExpertGate && d.kind != Kernel::LlExpertUp &&
+                d.kind != Kernel::LlExpertDown) {
+                continue;
+            }
+            if (d.qmm_bn <= 0) continue;   // matvec: no tile to agree about
+            gemm_bm_matches_sort = uint32_t(d.qmm_bm) == at_wide.tile_rows;
+            if (!gemm_bm_matches_sort) break;
+        }
+        expect(gemm_bm_matches_sort,
+               "and the routed GEMM's row block is the tile the sort padded to");
         expect(at_wide.padded > uint32_t(wide * moe.experts_per_token),
                "and the padded count is the sort's, not the linear one");
 

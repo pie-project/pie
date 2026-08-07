@@ -41,6 +41,13 @@ int router_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& 
     return router_bits_from_extents(w->second.size, s->second.size);
 }
 
+int proj_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights) {
+    const auto w = weights.find("layers.0.self_attn.q_proj.weight");
+    const auto s = weights.find("layers.0.self_attn.q_proj.scales");
+    if (w == weights.end() || s == weights.end()) return 0;
+    return router_bits_from_extents(w->second.size, s->second.size);
+}
+
 ScratchColoring color_gptoss_scratch(const std::vector<Dispatch>& dag,
                                     const ScratchPlan& plan, bool no_recycle) {
     return model::color_family_scratch(dag.size(), plan.uses, gptoss_run_ends(dag),

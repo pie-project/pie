@@ -1125,6 +1125,15 @@ pub struct MetalDriverOptions {
     pub max_forward_requests: u32,
     /// Host-memory KV pages to swap into. `0` disables swapping.
     pub cpu_pages: u32,
+    /// Tokens the KV ring holds across the whole resident fleet. Absent -- the
+    /// default -- keeps the driver's own constant, which is what a `pie serve`
+    /// fleet wants and what every run got before this existed.
+    ///
+    /// The one knob that shrinks the KV, and it only shrinks: the driver
+    /// clamps to its own ceiling, so this cannot ask for a ring it will not
+    /// build. `total_pages` is NOT that knob and never was -- the simple
+    /// families derive their pool from this context and discard it.
+    pub max_model_len: Option<u32>,
     /// Dtype KV pages are stored in. `"auto"` follows the activation dtype;
     /// a narrower one buys pages at some accuracy.
     pub kv_cache_dtype: String,
@@ -1140,6 +1149,27 @@ pub struct MetalDriverOptions {
     /// Off by default: it trades resident memory for page faults, which only
     /// pays when the weights do not comfortably fit.
     pub stream_routed_experts: bool,
+    /// How many bytes the routed experts may occupy on the device, or `None`
+    /// to keep the whole bank resident.
+    ///
+    /// A stronger statement than `stream_routed_experts` and a different
+    /// mechanism, not a dial on the same one. Streaming binds the bank over a
+    /// mapping, and on Apple Silicon every mapped page is WIRED -- so it moves
+    /// bytes out of the heap but bounds nothing. A budget turns the mapping
+    /// off and pages experts through a slab of exactly this size, which is the
+    /// only setting under which a checkpoint larger than the machine can be
+    /// admitted at all. It costs a submit-and-wait per mixture layer, so it is
+    /// for when the alternative is not running.
+    ///
+    /// `None` and not 0 for "unset", the way the CUDA driver spells
+    /// `expert_cache`: the C++ side already reads an absent key as "keep the
+    /// bank resident", so a sentinel would be a second spelling of one thing.
+    ///
+    /// The C++ has read `[model].expert_slab_bytes` since the slab landed;
+    /// what was missing was any way for an operator to say it, which made the
+    /// one feature that admits an oversized model reachable only from a test
+    /// binary's environment variable.
+    pub expert_slab_bytes: Option<u64>,
     /// Metal device string, e.g. `"metal:0"`. Populated from
     /// `model.driver.device` rather than written here.
     #[serde(skip)]
@@ -1163,8 +1193,10 @@ impl Default for MetalDriverOptions {
             max_forward_tokens: 10240,
             max_forward_requests: 512,
             cpu_pages: 0,
+            max_model_len: None,
             kv_cache_dtype: "auto".to_string(),
             stream_routed_experts: false,
+            expert_slab_bytes: None,
             device: "metal:0".to_string(),
             verbose: false,
             ready_timeout: Duration::from_secs(120),

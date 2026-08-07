@@ -10,6 +10,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -41,6 +42,12 @@
 
 namespace pie_cuda_driver {
 namespace {
+
+// Every candidate layout must hold at least this much KV, independent of the
+// request cap: below it a boot would admit so few sequences that admission and
+// eviction cannot recover. Named because the "no viable layout" diagnostic
+// reports it back to the operator.
+constexpr std::size_t kMinKvTokensFloor = 32768;
 
 std::size_t align_up(std::size_t n, std::size_t a) {
     return (n + a - 1) / a * a;
@@ -283,6 +290,7 @@ CudaMemoryPlan plan_cuda_memory(
     int max_Hk,
     bool gemma4_selected,
     const std::vector<int>& gemma4_per_layer_head_dim,
+    const std::vector<int>& gemma4_per_layer_num_kv_heads,
     const std::vector<int>& gemma4_kv_source_layer,
     bool qwen3_5_selected,
     bool qwen3_5_moe_selected,
@@ -358,6 +366,7 @@ CudaMemoryPlan plan_cuda_memory(
                           kv_format, 1, 1, 1)
             : gemma4_selected
             ? pie_cuda_driver::kv_page_bytes_per_layer(hf, gemma4_per_layer_head_dim,
+                                      gemma4_per_layer_num_kv_heads,
                                       gemma4_kv_source_layer, tp_size,
                                       kv_format)
             : nemotron_h_selected
@@ -617,7 +626,7 @@ CudaMemoryPlan plan_cuda_memory(
             }
             const std::size_t attn_float_bytes =
                 pie_cuda_driver::attention_float_workspace_bytes(
-                    hf, cfg, prop);
+                    hf, cfg, prop, N, R0);
             arena += attn_float_bytes;     // AttentionWorkspace float section
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
             const std::size_t persistent_bytes =
@@ -671,8 +680,25 @@ CudaMemoryPlan plan_cuda_memory(
                               : 608.0;
             const double score_kv_horizon =
                 score_as_auto ? (low_horizon_kv_heavy ? 384.0 : 544.0) : 608.0;
+            // `kMinKvTokensFloor` is the absolute half of the viability
+            // floor, in context tokens. `kv_tokens` is a function of the budget and the page size only —
+            // no term of the (N, R) shape enters it — so this absolute floor
+            // cannot choose between candidates. It either admits every shape
+            // or refuses the model outright, and refusing is what it does to
+            // a KV-heavy architecture: gemma-4-31B spends 1120 KiB per context
+            // token across its 60 layers, so 32768 tokens is 35 GiB of KV,
+            // which no budget on an 80 GiB card can reach once the model's
+            // 58 GiB of weights are resident. The driver then declines a model
+            // it can otherwise serve, with an error naming a budget the
+            // operator cannot raise far enough to matter.
+            //
+            // Clamp it to what the budget can actually supply. Nothing changes
+            // for a model that can reach 32768 tokens; one that cannot now
+            // plans instead of failing, and the `R * min_kv_horizon` term
+            // below — the shape-aware half of this floor — still rejects a
+            // decode width that this KV pool would starve.
             const std::size_t min_kv_tokens = std::max<std::size_t>(
-                32768,
+                std::min<std::size_t>(kMinKvTokensFloor, kv_tokens),
                 static_cast<std::size_t>(
                     std::ceil(static_cast<double>(R) * min_kv_horizon)));
             if (kv_tokens < min_kv_tokens) continue;
@@ -868,6 +894,17 @@ CudaMemoryPlan plan_cuda_memory(
         std::string why =
             "cuda memory planner: no viable forward/KV layout fits budget " +
             std::to_string(budget / (1024 * 1024)) + " MiB";
+        // Which of the lattice's filters emptied it is not recoverable from
+        // the message otherwise, and the KV side is the one an operator can
+        // act on: the surviving floor is `decode width x horizon`, so a
+        // KV-heavy checkpoint fails here when even the narrowest decode shape
+        // the ladder offers cannot be kept resident.
+        const std::size_t kv_tokens_at_budget =
+            per_kv_token_bytes > 0 ? budget / per_kv_token_bytes : 0;
+        why += " (per-token KV " +
+               std::to_string(per_kv_token_bytes / 1024) + " KiB — at most " +
+               std::to_string(kv_tokens_at_budget) +
+               " KV tokens in this budget)";
         // A pin is the likeliest reason a lattice that normally has hundreds of
         // candidates has none -- and the operator can act on that, where they
         // cannot act on "no layout fits".
@@ -877,6 +914,35 @@ CudaMemoryPlan plan_cuda_memory(
                 ". [driver] max_forward_tokens/max_forward_requests pin the "
                 "shape to a single candidate; unset them to let the planner "
                 "choose, or re-run `pie config tune` on this machine";
+        } else if (per_kv_token_bytes > 0) {
+            // Unpinned, the usual reason is simply that the weights left too
+            // little behind to clear the KV floor every candidate must meet.
+            // "No layout fits" is not something an operator can act on; the
+            // shortfall and the utilization that would cover it are.
+            const std::size_t have_tokens = budget / per_kv_token_bytes;
+            const std::size_t need_bytes =
+                kMinKvTokensFloor * per_kv_token_bytes;
+            // Round the advice UP to the next hundredth: truncating it hands
+            // back a utilization that still lands under the floor, which is
+            // worse than no advice at all.
+            const double need_util =
+                total_bytes > 0
+                    ? std::ceil(
+                          static_cast<double>(
+                              need_bytes + current_used + safety) /
+                          static_cast<double>(total_bytes) * 100.0) / 100.0
+                    : 0.0;
+            char util_text[8] = {};
+            std::snprintf(util_text, sizeof(util_text), "%.2f", need_util);
+            why += ". KV needs " +
+                   std::to_string(per_kv_token_bytes / 1024) +
+                   " KiB/token, so this budget holds ~" +
+                   std::to_string(have_tokens) + " tokens, short of the "
+                   + std::to_string(kMinKvTokensFloor) + " a layout wants "
+                   "before its decode width is the binding term. Raise [driver] gpu_mem_utilization (>= " +
+                   std::string(util_text) +
+                   " here), shrink the weights (`kv_cache_dtype`/quantization), "
+                   "or add a GPU";
         }
         throw std::runtime_error(why);
     }

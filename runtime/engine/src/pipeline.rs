@@ -62,6 +62,22 @@ pub struct Pipeline {
     /// Per-lane frame sequence for Vesuvius frame submission (k > 1): each
     /// `forward.submit` frame on this pipeline takes the next number.
     pub(crate) frame_seq: std::sync::atomic::AtomicU64,
+    // UPSTREAM'S `PIE_DEFER_ALLOC` HANDLE IS NOT CARRIED BY THIS MERGE.
+    //
+    // Upstream parks a frame's grant on an engine completion task
+    // (`fire::DeferredSubmission`) and takes it on the next frame in.
+    // That is the same concern this branch's kv-contention rewrite owns —
+    // one queue, one grant, a fire lease as the suspend seal — and the two
+    // designs meet inside `prepare_submission`, which the rewrite replaced
+    // wholesale. Merging them is a design question, not a conflict
+    // resolution, and this branch's rule is that runtime scheduling does
+    // not change under it.
+    //
+    // Dropping it changes NO default behaviour: upstream's path is gated
+    // behind `PIE_DEFER_ALLOC` and is off unless asked for. It is recorded
+    // here rather than deleted quietly so that reconciling the two designs
+    // stays a visible, named piece of work.
+
 }
 
 impl Pipeline {
