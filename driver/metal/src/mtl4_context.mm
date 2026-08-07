@@ -1149,6 +1149,10 @@ size_t RawMetalContext::elastic_budget_pages() const {
         impl_->effective_elastic_budget_bytes());
 }
 
+std::uint32_t RawMetalContext::memory_pressure_level() const {
+    return impl_->memory_pressure_level->load(std::memory_order_acquire);
+}
+
 size_t RawMetalContext::elastic_committed_pages() const {
     return pie::elastic::pages_for_bytes(impl_->elastic_committed_bytes);
 }

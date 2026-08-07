@@ -1637,7 +1637,14 @@ bool MetalExecutor::Impl::ensure_elastic_storage(
     }
     if (ctx_->ensure_elastic_buffers_atomically(targets)) return true;
     if (err != nullptr) {
-        *err = "Metal elastic physical budget exhausted";
+        // Which of the two it is decides what an operator does about it. A full
+        // pool is a sizing problem; a clamped one is the OS having said the
+        // machine is tight, which passes on its own.
+        *err = "Metal elastic physical budget exhausted (" +
+               std::to_string(ctx_->elastic_committed_pages()) + " of " +
+               std::to_string(ctx_->elastic_budget_pages()) +
+               " pages committed, memory pressure level " +
+               std::to_string(ctx_->memory_pressure_level()) + ")";
     }
     return false;
 }
