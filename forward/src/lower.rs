@@ -1294,7 +1294,16 @@ mod tests {
     /// earn its own row the way 27B earned qwen3_5's.
     #[test]
     fn the_gemma4_flat_list_covers_every_statement() {
-        let facts = crate::facts::Gemma4Facts::gemma_4_e4b();
+        // BOTH geometries. E2B is not a formality: 35 layers, MQA, 20/35
+        // KV-shared and a DOUBLE-WIDE MLP, so it exercises
+        // `intermediate_of`, the odd-layer interval and the unfused MLP
+        // arm — three things E4B cannot say anything about. It found
+        // three real gaps the day it was first booted.
+        for (name, facts) in [
+            ("e4b", crate::facts::Gemma4Facts::gemma_4_e4b()),
+            ("e2b", crate::facts::Gemma4Facts::gemma_4_e2b()),
+        ] {
+        let _ = name;
         let cuda = crate::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic();
         for class in [FireClass::Decode, FireClass::Prefill] {
             let plan = family::gemma4_cuda(&facts, &cuda, class);
@@ -1313,6 +1322,7 @@ mod tests {
                     "{class:?}/{shape}: a fire that executes nothing is not a fire"
                 );
             }
+        }
         }
     }
 

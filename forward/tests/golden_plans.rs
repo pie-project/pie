@@ -651,3 +651,53 @@ fn gpt_oss_20b_cuda_prefill() {
         ),
     );
 }
+
+/// gemma-4-E2B's decode reading — the family's SECOND geometry, pinned so
+/// a change to it is caught without a GPU.
+///
+/// Worth reading against the E4B goldens for three shapes E4B cannot
+/// show: an odd layer count the interval does not divide, MQA
+/// (`kv_heads = 1`), and the DOUBLE-WIDE MLP — the trailing 20 KV-shared
+/// layers carry `2 * intermediate`, so `gate_proj`/`up_proj` change width
+/// partway down the stack. It is also the geometry whose binding is
+/// UNFUSED, so the MLP is two matmuls and the pair activation rather than
+/// one packed bank.
+#[test]
+fn gemma_4_e2b_cuda_decode() {
+    check_plan(
+        "gemma_4_e2b_cuda_decode",
+        &gemma4_cuda(
+            &Gemma4Facts::gemma_4_e2b(),
+            &Gemma4CudaFacts {
+                // LIVE-anchored, and the anchoring is the point: this pair
+                // was GUESSED wrong twice (once from the E4B-shaped
+                // `gemma4_dense_gate_up_fused_enabled` predicate, once from
+                // the op-count delta) before being read off the driver.
+                // Enumerating all four combinations gives 574/574,
+                // 539/539, 523/559 and 488/524; only the last matches what
+                // the driver prints on this checkpoint, so this is the
+                // deployment's actual binding and not a plausible one.
+                fused_qkv: true,
+                gate_up_fused: true,
+                kv_native_bf16: true,
+            },
+            FireClass::Decode,
+        ),
+    );
+}
+
+#[test]
+fn gemma_4_e2b_cuda_prefill() {
+    check_plan(
+        "gemma_4_e2b_cuda_prefill",
+        &gemma4_cuda(
+            &Gemma4Facts::gemma_4_e2b(),
+            &Gemma4CudaFacts {
+                fused_qkv: true,
+                gate_up_fused: true,
+                kv_native_bf16: true,
+            },
+            FireClass::Prefill,
+        ),
+    );
+}

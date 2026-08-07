@@ -1104,6 +1104,38 @@ impl Gemma4Facts {
             logit_softcap: 30.0,
         }
     }
+
+    /// gemma-4-E2B-it, read from the checkpoint's `config.json`
+    /// (2026-08-07). The SECOND geometry, and it disagrees with E4B on
+    /// nearly every axis that matters: 35 layers (odd, so the interval
+    /// does not divide it), `kv_heads = 1` (MQA where E4B is GQA-4), 20
+    /// of 35 KV-shared, tied embeddings, and `use_double_wide_mlp` — the
+    /// only gemma-4 fixture where `intermediate_of` is not constant.
+    ///
+    /// Live-anchored: the driver's derivation on this checkpoint prints
+    /// `layers=35 interval=5 shared=20 d=256/512`, and traces 488 decode
+    /// / 524 prefill ops. Both classes are byte-identical to the
+    /// hand-written pass on the parity gate.
+    pub fn gemma_4_e2b() -> Self {
+        Self {
+            hidden: 1536,
+            layers: 35,
+            full_attn_interval: 5,
+            q_heads: 8,
+            kv_heads: 1,
+            head_dim: 256,
+            global_head_dim: 512,
+            // 0.25 * 512 through `max(2, 2 * int(0.5 * f * d))`.
+            global_rotary_dim: 128,
+            intermediate: 6144,
+            vocab: 262144,
+            tied_embeddings: true,
+            kv_shared_layers: 20,
+            ple_dim: 256,
+            double_wide_shared: true,
+            logit_softcap: 30.0,
+        }
+    }
 }
 
 #[cfg(test)]
