@@ -41,6 +41,25 @@ bool decide(bool gate_up, bool down, bool found, std::uint32_t arity,
                                         num_experts, /*layer=*/7, kGroup);
 }
 
+/// Run `decide` expecting it to accept, and report the answer it gave.
+/// A throw here is a failure, not a crash: a refusal that swallowed a form it
+/// should bind is exactly the regression the positive cases exist to catch,
+/// and it has to read as one line rather than as an aborted process.
+void check_accepts(bool gate_up, bool down, bool found, std::uint32_t arity,
+                   int num_experts, bool want_streamed,
+                   const std::string& what) {
+    try {
+        const bool got = decide(gate_up, down, found, arity, num_experts);
+        check(got == want_streamed,
+              what + ": bound the " + (got ? "streamed" : "stacked") +
+                  " form, expected the " +
+                  (want_streamed ? "streamed" : "stacked") + " one");
+    } catch (const std::runtime_error& e) {
+        check(false, what + ": refused with \"" + e.what() +
+                         "\", but it must bind");
+    }
+}
+
 /// Run `decide` expecting a throw, and check the message names the reason.
 void check_refuses(bool gate_up, bool down, bool found, std::uint32_t arity,
                    int num_experts, const std::string& needle,
@@ -62,16 +81,17 @@ int main() {
     // ── Both forms are optional, and each is accepted alone ────────────
     //
     // This pair is the whole change: before it, the right-hand case threw.
-    check(!decide(/*gate_up=*/true, /*down=*/true, /*found=*/false, 0, 896),
-          "stacked experts bind to the stacked path");
-    check(decide(/*gate_up=*/false, /*down=*/false, /*found=*/true, 896, 896),
-          "a group of the right arity binds to the streamed path");
+    check_accepts(/*gate_up=*/true, /*down=*/true, /*found=*/false, 0, 896,
+                  /*want_streamed=*/false, "stacked experts");
+    check_accepts(/*gate_up=*/false, /*down=*/false, /*found=*/true, 896, 896,
+                  /*want_streamed=*/true, "a group of the right arity");
 
     // The stacks win when both forms somehow arrived. A contract publishes one
     // or the other, so this cannot happen from `author_kimi_k3` -- but if it
     // ever did, the stacked path is the one that needs no page-in.
-    check(!decide(true, true, /*found=*/true, 896, 896),
-          "stacks take precedence over a group that is also present");
+    check_accepts(true, true, /*found=*/true, 896, 896,
+                  /*want_streamed=*/false,
+                  "stacks alongside a group that is also present");
 
     // ── Never neither ──────────────────────────────────────────────────
     //
