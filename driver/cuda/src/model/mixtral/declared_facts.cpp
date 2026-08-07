@@ -145,6 +145,9 @@ GptOssDeclaredPlan build_gpt_oss_declared_plan(
         out.decode = ForwardPlan::trace_gpt_oss_cuda(
             facts, cuda, pie_forward::PieForwardFireClass::Decode);
         gpt_oss_validate_stated_kernels(out.decode);
+        const std::string verdict =
+            gpt_oss_validate_stated_weights(out.decode, w);
+        if (!verdict.empty()) GO_REFUSE(verdict);
     } catch (const std::exception& e) {
         GO_REFUSE(std::string("trace failed: ") + e.what());
     }

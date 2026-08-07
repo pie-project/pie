@@ -142,6 +142,54 @@ const DeviceTensor& require(const MixtralWeights& w, std::string_view name) {
 
 }  // namespace
 
+std::string gpt_oss_validate_stated_weights(
+    const pie_forward::ForwardPlan& plan, const MixtralWeights& w) {
+    // qwen3_5's name-resolution dry walk. An unbound weight found at the
+    // first fire takes the model load down; found here, the plan declines
+    // and the hand-written pass runs.
+    const auto resolves = [&](std::string_view name) {
+        if (name.empty()) return true;
+        // The two expert BANKS are not tensors — they name the layer's
+        // per-expert pointer arrays, which the arms reach through
+        // `w.layers` directly.
+        if (name.find("expert_gate_up_bank") != std::string_view::npos ||
+            name.find("expert_down_bank") != std::string_view::npos) {
+            return true;
+        }
+        try {
+            return bind(w, name) != nullptr;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+    for (std::size_t i = 0; i < plan.op_count(); ++i) {
+        const auto& op = plan.op(i);
+        // On a LAUNCH op the weight slot holds the KERNEL SYMBOL, not a
+        // weight — the arms read `aux_names` for the weights. Checking
+        // the symbol here declined every deployment for a bogus reason,
+        // which a fault-injection run caught: the drive was silently off
+        // and the parity gate still said PASS, because both sides were
+        // then the hand-written pass.
+        const std::string_view name =
+            op.kind == pie_forward::PieForwardOpKind::Launch
+                ? std::string_view{}
+                : plan.weight_name(op);
+        if (!resolves(name)) {
+            return "weight '" + std::string(name) + "' unresolvable";
+        }
+        if (op.kind == pie_forward::PieForwardOpKind::Launch) {
+            const auto aux = plan.aux_names(op);
+            for (std::size_t j = 0; j < aux.size; ++j) {
+                const std::string_view a = plan.name(aux[j]);
+                if (!resolves(a)) {
+                    return "weight '" + std::string(a) + "' unresolvable";
+                }
+            }
+        }
+    }
+    return {};
+}
+
 void gpt_oss_validate_stated_kernels(const pie_forward::ForwardPlan& plan) {
     const std::size_t n = plan.op_count();
     for (std::size_t i = 0; i < n; ++i) {

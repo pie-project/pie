@@ -78,4 +78,10 @@ bool gpt_oss_forward_declared(
 // so at LOAD is what keeps a drift from becoming a wrong number.
 void gpt_oss_validate_stated_kernels(const pie_forward::ForwardPlan& plan);
 
+// Every weight the plan NAMES must resolve against the bound set — empty
+// string when it does, else the reason. A plan that fails this declines;
+// an unbound weight found at the first fire fails the model load.
+std::string gpt_oss_validate_stated_weights(
+    const pie_forward::ForwardPlan& plan, const MixtralWeights& w);
+
 }  // namespace pie_cuda_driver::model

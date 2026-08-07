@@ -227,6 +227,10 @@ Gemma4DeclaredPlan build_gemma4_declared_plan(
         out.prefill = ForwardPlan::trace_gemma4_cuda(
             facts, cuda, pie_forward::PieForwardFireClass::Prefill);
         gemma4_validate_stated_kernels(out.prefill);
+        for (const ForwardPlan* pl : {&out.decode, &out.prefill}) {
+            const std::string verdict = gemma4_validate_stated_weights(*pl, w);
+            if (!verdict.empty()) G4_REFUSE(verdict);
+        }
     } catch (const std::exception& e) {
         G4_REFUSE(std::string("trace failed: ") + e.what());
     }

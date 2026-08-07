@@ -185,6 +185,54 @@ const DeviceTensor& require(const Gemma4Weights& w, std::string_view name) {
 
 }  // namespace
 
+std::string gemma4_validate_stated_weights(
+    const pie_forward::ForwardPlan& plan, const Gemma4Weights& w) {
+    // The name-resolution DRY WALK, qwen3_5's precedent. Without it an
+    // unbound weight is discovered by the first fire and takes the whole
+    // MODEL LOAD down; with it the plan simply declines and the
+    // hand-written pass runs. That difference is what makes arming this
+    // drive by default safe on a geometry nobody has booted yet — E2B
+    // needed exactly this treatment three times.
+    const auto resolves = [&](std::string_view name) {
+        if (name.empty()) return true;
+        // Names the executor does NOT resolve to a tensor: `scale.*` is a
+        // CONSTANT riding in the weight slot so the arm can tell four
+        // identical launches apart.
+        if (name.rfind("scale.", 0) == 0) return true;
+        try {
+            return bind(w, name) != nullptr;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+    for (std::size_t i = 0; i < plan.op_count(); ++i) {
+        const auto& op = plan.op(i);
+        // On a LAUNCH op the weight slot holds the KERNEL SYMBOL, not a
+        // weight — the arms read `aux_names` for the weights. Checking
+        // the symbol here declined every deployment for a bogus reason,
+        // which a fault-injection run caught: the drive was silently off
+        // and the parity gate still said PASS, because both sides were
+        // then the hand-written pass.
+        const std::string_view name =
+            op.kind == pie_forward::PieForwardOpKind::Launch
+                ? std::string_view{}
+                : plan.weight_name(op);
+        if (!resolves(name)) {
+            return "weight '" + std::string(name) + "' unresolvable";
+        }
+        if (op.kind == pie_forward::PieForwardOpKind::Launch) {
+            const auto aux = plan.aux_names(op);
+            for (std::size_t j = 0; j < aux.size; ++j) {
+                const std::string_view a = plan.name(aux[j]);
+                if (!resolves(a)) {
+                    return "weight '" + std::string(a) + "' unresolvable";
+                }
+            }
+        }
+    }
+    return {};
+}
+
 bool gemma4_forward_declared(
     const Gemma4DeclaredPlan& declared,
     const Gemma4Weights& w,

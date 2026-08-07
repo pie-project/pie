@@ -73,4 +73,11 @@ bool gemma4_forward_declared(
 // so at LOAD is what keeps a drift from becoming a wrong number.
 void gemma4_validate_stated_kernels(const pie_forward::ForwardPlan& plan);
 
+// Every weight the plan NAMES must resolve against the bound set. Returns
+// an empty string when it does, else the reason — a plan that fails this
+// declines, where an unbound weight found at the first fire would fail
+// the model load instead.
+std::string gemma4_validate_stated_weights(
+    const pie_forward::ForwardPlan& plan, const Gemma4Weights& w);
+
 }  // namespace pie_cuda_driver::model
