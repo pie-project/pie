@@ -17,8 +17,6 @@
 
 #![cfg(feature = "contract")]
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
@@ -71,33 +69,10 @@ impl Checkpoint {
         self
     }
 
-    /// Two fixtures that describe different tensors get different files.
-    ///
-    /// A family may have more than one — K3 has a narrow one and a wide one,
-    /// because a tp>1 slice of the narrow one has a zero-width axis — and
-    /// keying the path on the family alone made those two share it. The tests
-    /// run in one process, so they took turns rewriting it and whichever
-    /// compiled second was verified against the other's bytes.
-    ///
-    /// The key is what the fixture *says*, not how long it is: two layouts can
-    /// serialize to the same length and still describe different tensors, so a
-    /// length key would only have made that collision rarer. Distinct
-    /// descriptors therefore give distinct paths; identical descriptors are the
-    /// same fixture and are meant to share.
     fn finish(self, name: &str) -> CheckpointMetadata {
-        let mut hasher = DefaultHasher::new();
-        for tensor in &self.tensors {
-            tensor.name.hash(&mut hasher);
-            tensor.shape.hash(&mut hasher);
-            tensor.span_bytes.hash(&mut hasher);
-            // `Encoding` carries no `Hash`, and its `Debug` is what the rest of
-            // this harness already compares layouts by.
-            format!("{:?}", tensor.encoding).hash(&mut hasher);
-        }
         let path = std::env::temp_dir().join(format!(
-            "pie_model_family_{}_{:016x}_{}.safetensors",
+            "pie_model_family_{}_{}.safetensors",
             name,
-            hasher.finish(),
             std::process::id()
         ));
         if std::fs::metadata(&path).map(|meta| meta.len()).ok() != Some(self.offset) {
@@ -714,45 +689,6 @@ fn kimi_k2_cuda() {
     );
 }
 
-/// Two fixtures that describe different tensors never share a file, even when
-/// they serialize to the same number of bytes.
-///
-/// The harness is shared by every family here, and a collision in it does not
-/// announce itself as a harness bug: the loser is verified against the
-/// winner's file and reports a plan/checkpoint size mismatch in whichever
-/// family lost the race. This is the assertion that keeps the doc comment on
-/// `finish` true.
-#[test]
-fn two_fixtures_of_one_family_share_a_file_only_when_they_are_the_same() {
-    let square = {
-        let mut ck = Checkpoint::new();
-        ck.push("w", &[4, 4], bf16());
-        ck.finish("collision_probe")
-    };
-    let flat = {
-        let mut ck = Checkpoint::new();
-        ck.push("w", &[16], bf16());
-        ck.finish("collision_probe")
-    };
-    let flat_again = {
-        let mut ck = Checkpoint::new();
-        ck.push("w", &[16], bf16());
-        ck.finish("collision_probe")
-    };
-    assert_eq!(
-        square.files[0].size_bytes, flat.files[0].size_bytes,
-        "the probe only means something if both are the same length"
-    );
-    assert_ne!(
-        square.files[0].path, flat.files[0].path,
-        "different tensors, same length: these must not share a file"
-    );
-    assert_eq!(
-        flat.files[0].path, flat_again.files[0].path,
-        "the same fixture twice is one file, not two"
-    );
-}
-
 // ── kimi_k3: A_log bands + MXFP4 stacks with GEMV republish ─────────
 
 /// `experts` of `None` is a dense-only K3, with no `block_sparse_moe` names at
@@ -760,12 +696,22 @@ fn two_fixtures_of_one_family_share_a_file_only_when_they_are_the_same() {
 /// `enc` — `u8enc()` for the MXFP4 layout the family really ships, anything
 /// else for a checkpoint that spells the names and means something different.
 ///
+/// `tag` names the fixture and is required, not derived: K3 has several, they
+/// must not share a temp file, and a new one that inherited another's path
+/// would be verified against the wrong bytes and report the mismatch as a
+/// defect in whichever case lost the race. A required argument cannot be
+/// forgotten.
+///
 /// `intermediate` is a parameter because the streamed group shards *inside*
 /// the expert: at 32 the tp=2 slice is 16, and `down.weight_scale`'s
 /// `[latent, local_inter / 32]` collapses to a zero-width axis. Any tp>1 case
 /// needs at least 64.
-fn kimi_k3_checkpoint_at(intermediate: i64, experts: Option<Encoding>) -> CheckpointMetadata {
-    kimi_k3_checkpoint_sized(64, 64, intermediate, experts)
+fn kimi_k3_checkpoint_at(
+    intermediate: i64,
+    experts: Option<Encoding>,
+    tag: &str,
+) -> CheckpointMetadata {
+    kimi_k3_checkpoint_sized(64, 64, intermediate, experts, tag)
 }
 
 /// [`kimi_k3_checkpoint_at`] with the two widths the expert shapes are built
@@ -775,6 +721,7 @@ fn kimi_k3_checkpoint_sized(
     latent: i64,
     intermediate: i64,
     experts: Option<Encoding>,
+    tag: &str,
 ) -> CheckpointMetadata {
     let mut ck = Checkpoint::new();
     ck.push(
@@ -815,11 +762,11 @@ fn kimi_k3_checkpoint_sized(
         }
     }
     ck.push("language_model.model.norm.weight", &[hidden], bf16());
-    ck.finish("kimi_k3")
+    ck.finish(&format!("kimi_k3_{tag}"))
 }
 
 fn kimi_k3_checkpoint() -> CheckpointMetadata {
-    kimi_k3_checkpoint_at(32, Some(u8enc()))
+    kimi_k3_checkpoint_at(32, Some(u8enc()), "narrow")
 }
 
 fn kimi_k3_facts() -> ModelFacts {
@@ -857,7 +804,7 @@ fn kimi_k3_cuda() {
 fn kimi_k3_streamed_cuda_tp1_of_2() {
     check(
         "kimi_k3_streamed_cuda_tp1_of_2",
-        &kimi_k3_checkpoint_at(64, Some(u8enc())),
+        &kimi_k3_checkpoint_at(64, Some(u8enc()), "wide"),
         &kimi_k3_facts(),
         &target(1, 2),
         &streamed(),
@@ -890,19 +837,19 @@ fn kimi_k3_refuses_a_streaming_request_it_cannot_serve() {
         (
             "no routed experts",
             kimi_k3_facts(),
-            kimi_k3_checkpoint_at(64, None),
+            kimi_k3_checkpoint_at(64, None, "dense"),
             "no routed experts to stream",
         ),
         (
             "a config that declares zero experts",
             no_experts,
-            kimi_k3_checkpoint_at(64, Some(u8enc())),
+            kimi_k3_checkpoint_at(64, Some(u8enc()), "wide"),
             "no routed experts to stream",
         ),
         (
             "experts that are not MXFP4",
             kimi_k3_facts(),
-            kimi_k3_checkpoint_at(64, Some(bf16())),
+            kimi_k3_checkpoint_at(64, Some(bf16()), "bf16experts"),
             "not MXFP4",
         ),
     ] {
@@ -931,7 +878,7 @@ fn kimi_k3_refuses_a_streaming_request_it_cannot_serve() {
 /// point of a group. Everything that describes the *quantization* must match.
 #[test]
 fn the_streamed_group_and_the_resident_experts_scale_alike() {
-    let checkpoint = kimi_k3_checkpoint_at(64, Some(u8enc()));
+    let checkpoint = kimi_k3_checkpoint_at(64, Some(u8enc()), "wide");
     let resident = author(
         &kimi_k3_facts(),
         &checkpoint,
@@ -1093,7 +1040,8 @@ fn kimi_k3_streams_real_width_slots() {
         (16, 1_096_704),
     ];
 
-    let checkpoint = kimi_k3_checkpoint_sized(HIDDEN, LATENT, INTERMEDIATE, Some(u8enc()));
+    let checkpoint =
+        kimi_k3_checkpoint_sized(HIDDEN, LATENT, INTERMEDIATE, Some(u8enc()), "realwidth");
     for (tp, expected_bytes) in SLOT_BYTES {
         let streamed_contract = author(
             &kimi_k3_facts(),

@@ -198,28 +198,18 @@ fn mxfp4_block_scales(weight: impl Into<String>, channel_axis: u32) -> Scales {
     }
 }
 
-/// The six MXFP4 sources one routed expert ships, in the order every pass
-/// here reads them.
-const EXPERT_SOURCES: [&str; 6] = [
-    "w1.weight_packed",
-    "w1.weight_scale",
-    "w3.weight_packed",
-    "w3.weight_scale",
-    "w2.weight_packed",
-    "w2.weight_scale",
-];
-
 /// One expert's `(intermediate, latent)` widths, read off its six sources.
 ///
 /// `Ok(None)` is "this checkpoint packs its experts some other way" — not a
-/// contradiction, just not the layout these passes rewrite. `Err` is a
+/// contradiction, just not the layout this pass rewrites. `Err` is a
 /// contradiction: the six tensors disagree about the same expert.
 ///
-/// Shared rather than restated, because the resident stack and the streamed
-/// group publish the *same* bytes under two residencies. A shape rule that
-/// lived in each of them separately is a rule that can come to mean two
-/// different things.
-fn expert_dims(parts: &[&RawTensor], what: &str) -> Result<Option<(i64, i64)>, Error> {
+/// [`streamed_expert_groups`] is the only caller. [`bf16_expert_stacks`] states
+/// the same rule inline and keeps it: that pass predates streaming and this
+/// ticket does not own it, and the divergence the duplication risks is caught
+/// by a test — `the_streamed_group_and_the_resident_experts_scale_alike` — not
+/// by a shared definition.
+fn streamed_expert_dims(parts: &[&RawTensor], what: &str) -> Result<Option<(i64, i64)>, Error> {
     if parts
         .iter()
         .any(|part| !is_raw(&part.encoding, DType::U8) || part.shape.len() != 2)
@@ -256,6 +246,7 @@ fn expert_dims(parts: &[&RawTensor], what: &str) -> Result<Option<(i64, i64)>, E
 /// worth four times its weight there. Both stay resident and the forward
 /// picks per step, the way Kimi-K2 does.
 fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Error> {
+    const GROUP: i64 = 32;
     let experts = i64::from(b.facts().num_experts);
     if experts <= 0 {
         return Ok(());
@@ -309,9 +300,17 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
 
         for e in 0..experts {
             let ep = format!("{prefix}experts.{e}.");
+            let names = [
+                format!("{ep}w1.weight_packed"),
+                format!("{ep}w1.weight_scale"),
+                format!("{ep}w3.weight_packed"),
+                format!("{ep}w3.weight_scale"),
+                format!("{ep}w2.weight_packed"),
+                format!("{ep}w2.weight_scale"),
+            ];
             let mut parts = Vec::with_capacity(6);
-            for suffix in EXPERT_SOURCES {
-                let Some(part) = b.find(&format!("{ep}{suffix}")) else {
+            for name in &names {
+                let Some(part) = b.find(name) else {
                     return fail(format!(
                         "kimi_k3 expert stack: layer {layer} expert {e} is missing a \
                          weight or scale"
@@ -322,13 +321,28 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
             // A checkpoint that packs its experts some other way is not this
             // pass's to rewrite — leave the whole model alone rather than
             // half of it.
-            let Some((inter, latent_here)) = expert_dims(
-                &parts,
-                &format!("kimi_k3 expert stack: layer {layer} expert {e}"),
-            )?
-            else {
+            if parts
+                .iter()
+                .any(|part| !is_raw(&part.encoding, DType::U8) || part.shape.len() != 2)
+            {
                 return Ok(());
-            };
+            }
+
+            // w1/w3 are [I, L/2] packed with [I, L/32] scales; w2 is
+            // [L, I/2] with [L, I/32]. The declared shapes below are in
+            // *elements*, not bytes.
+            let inter = parts[0].shape[0];
+            let latent_here = parts[0].shape[1] * 2;
+            if parts[4].shape[0] != latent_here
+                || parts[4].shape[1] * 2 != inter
+                || parts[1].shape[1] != latent_here / GROUP
+                || parts[5].shape[1] != inter / GROUP
+            {
+                return fail(format!(
+                    "kimi_k3 expert stack: layer {layer} expert {e} has inconsistent \
+                     MXFP4 shapes"
+                ));
+            }
             if e == 0 {
                 latent = latent_here;
                 local_inter = b.local_extent(inter);
@@ -341,8 +355,8 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
             // `[up | gate]` is what flashinfer's grouped GEMM reads fc1 as.
             let w1 = packed(b, parts[0], vec![1, inter, latent], 1);
             let w3 = packed(b, parts[2], vec![1, inter, latent], 1);
-            let w1s = factors(b, parts[1], vec![1, inter, latent / MXFP4_BLOCK], 1);
-            let w3s = factors(b, parts[3], vec![1, inter, latent / MXFP4_BLOCK], 1);
+            let w1s = factors(b, parts[1], vec![1, inter, latent / GROUP], 1);
+            let w3s = factors(b, parts[3], vec![1, inter, latent / GROUP], 1);
             // The decode GEMV reads gate and up as *adjacent* rows — row 2i
             // is gate row i, row 2i+1 is up row i — because that is how
             // gpt-oss ships them, and it is what lets one warp pull a slab
@@ -377,19 +391,14 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
                 },
             ));
             down.push(packed(b, parts[4], vec![1, latent, inter], 2));
-            down_scales.push(factors(
-                b,
-                parts[5],
-                vec![1, latent, inter / MXFP4_BLOCK],
-                2,
-            ));
+            down_scales.push(factors(b, parts[5], vec![1, latent, inter / GROUP], 2));
 
             // Gate over up, always — `gate_second` reorders the *bf16* stack
             // for flashinfer's fc1, and this path reads its two halves by
             // name into separate outputs.
             let ep_out = format!("{moe}experts.{e}.");
             let gu_packed = pair(b, parts[0], parts[2], latent / 2);
-            let gu_scale = pair(b, parts[1], parts[3], latent / MXFP4_BLOCK);
+            let gu_scale = pair(b, parts[1], parts[3], latent / GROUP);
             let dn_packed = b.split(Expr::src(&parts[4].name), 1);
             let dn_scale = b.split(Expr::src(&parts[5].name), 1);
             let u8enc = Encoding::Raw(DType::U8);
@@ -408,7 +417,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
                 format!("{ep_out}gate_up.weight_scale"),
                 gu_scale,
                 u8enc.clone(),
-                Some(vec![local_inter, 2, latent / MXFP4_BLOCK]),
+                Some(vec![local_inter, 2, latent / GROUP]),
             ) {
                 b.set_scales(
                     id,
@@ -425,7 +434,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
                 format!("{ep_out}down.weight_scale"),
                 dn_scale,
                 u8enc,
-                Some(vec![latent, local_inter / MXFP4_BLOCK]),
+                Some(vec![latent, local_inter / GROUP]),
             ) {
                 b.set_scales(
                     id,
@@ -448,7 +457,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
             gu_scale.clone(),
             Expr::concat(0, gate_up_scales),
             e8m0.clone(),
-            Some(vec![experts, 2 * local_inter, latent / MXFP4_BLOCK]),
+            Some(vec![experts, 2 * local_inter, latent / GROUP]),
         ) {
             b.mark_internal(gu);
         }
@@ -456,7 +465,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
             dn_scale.clone(),
             Expr::concat(0, down_scales),
             e8m0,
-            Some(vec![experts, latent, local_inter / MXFP4_BLOCK]),
+            Some(vec![experts, latent, local_inter / GROUP]),
         ) {
             b.mark_internal(dn);
         }
@@ -541,9 +550,17 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
         let mut dims = None;
         for e in 0..experts {
             let ep = format!("{prefix}experts.{e}.");
+            let names = [
+                format!("{ep}w1.weight_packed"),
+                format!("{ep}w1.weight_scale"),
+                format!("{ep}w3.weight_packed"),
+                format!("{ep}w3.weight_scale"),
+                format!("{ep}w2.weight_packed"),
+                format!("{ep}w2.weight_scale"),
+            ];
             let mut parts = Vec::with_capacity(6);
-            for suffix in EXPERT_SOURCES {
-                let Some(part) = b.find(&format!("{ep}{suffix}")) else {
+            for name in &names {
+                let Some(part) = b.find(name) else {
                     return fail(format!(
                         "kimi_k3 expert group: layer {layer} expert {e} is missing a \
                          weight or scale"
@@ -552,7 +569,7 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
                 parts.push(part);
             }
             if e == 0 {
-                let Some(read) = expert_dims(
+                let Some(read) = streamed_expert_dims(
                     &parts,
                     &format!("kimi_k3 expert group: layer {layer} expert 0"),
                 )?
