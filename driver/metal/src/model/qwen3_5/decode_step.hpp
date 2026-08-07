@@ -20,6 +20,7 @@
 // byte-identical every token (I1). delta binds arg tables by the SAME ordinal.
 // The Kernel `kind` + `layer` are retained only for charlie's <layer>.<tag>.npy dumps.
 
+#include <cstdlib>
 #include <functional>
 #include <vector>
 #include "decode_abi.hpp"
@@ -129,7 +130,17 @@ inline int moe_tile_rows_for(const DecodeGeometry& g, int n_tokens, bool batched
 /// because three places have to agree on the sorted count -- the dispatch
 /// shape, `MoeRouteParams` and the pool sizing -- and a disagreement between
 /// them is a read off the end of the routing.
-inline constexpr bool qwen35_routed_decode_batched() { return false; }
+inline bool qwen35_routed_decode_batched() {
+    // Overridable, like every other tuned constant in this driver and for the
+    // same reason: whoever fixes the GEMM has to run the same binary with the
+    // arm on and off, and a rebuild between arms is a different binary. It is
+    // also the one-line reproduction of the bug.
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_METAL_QWEN_ROUTED_DECODE_GEMM");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
 
 // Build the ordered per-token DAG (~393 raw dispatches; 363 are golden-tapped) from
 // the geometry, with grid/tg filled per dispatch via delta's decode_dispatch.hpp
