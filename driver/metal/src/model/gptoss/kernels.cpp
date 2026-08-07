@@ -4,6 +4,7 @@
 #include <string>
 
 #include "model/shared_kernels.hpp"
+#include "model/qwen3_5/decode_dispatch_mb.hpp"
 
 namespace pie::metal::gptoss {
 
@@ -33,6 +34,7 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     const std::string sink_name = "sdpa_vector_decode_sink_bfloat16" + d;
     const std::string sink_paged_name = "sdpa_paged_decode_sink_bfloat16" + d;
     const std::string sink_tiled_name = "sdpa_paged_tiled_sink_bfloat16" + d;
+    const std::string sink_mma_name = "sdpa_paged_mma_sink_bfloat16" + d;
     const std::string dir =
         kernels_dir.empty() || kernels_dir.back() == '/' ? kernels_dir : kernels_dir + "/";
     struct Spec {
@@ -65,6 +67,24 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
             if (err != nullptr) {
                 *err = std::string("gpt-oss PSO '") + spec.fn + "' (" + spec.file +
                        "): " + compile_error;
+            }
+            return false;
+        }
+    }
+    // Not in the list above because it is conditional, and it is conditional on
+    // exactly what `sdpa_mma_this_fire` asks: the matrix-unit attention is
+    // instantiated per head width, and a checkpoint of some other width keeps
+    // the scalar tiled kernel. Where it IS asked for, a failure is fatal --
+    // the grid for the matrix shape is 128 threads and the scalar one's is
+    // 1024, so falling back silently would launch the wrong geometry.
+    if (g.head_dim == kSdpaMmaHeadDim) {
+        std::string compile_error;
+        out.sdpa_sink_paged_mma = ctx.compile_pso_from_file(
+            dir + "sdpa_paged_mma.metal", sink_mma_name, &compile_error);
+        if (!out.sdpa_sink_paged_mma.valid()) {
+            if (err != nullptr) {
+                *err = "gpt-oss PSO '" + sink_mma_name + "' (sdpa_paged_mma.metal): " +
+                       compile_error;
             }
             return false;
         }

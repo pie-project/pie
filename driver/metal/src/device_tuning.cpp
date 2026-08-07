@@ -100,6 +100,7 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
     t.fp16_qmm = env_bool("PIE_METAL_FP16_QMM", t.fp16_qmm);
     t.sdpa_tile_min_rows_per_request =
         env_int("PIE_METAL_SDPA_TILE_MIN_ROWS", t.sdpa_tile_min_rows_per_request);
+    t.sdpa_mma = env_bool("PIE_METAL_SDPA_MMA", t.sdpa_mma);
     t.moe_batch_min_per_expert =
         env_int("PIE_METAL_MOE_BATCH_MIN_PER_EXPERT", t.moe_batch_min_per_expert);
     t.gdn_scan_lanes = env_int("PIE_METAL_GDN_SCAN_LANES", t.gdn_scan_lanes);
@@ -143,6 +144,7 @@ bool fp16_qmm() { return device_tuning().fp16_qmm; }
 int sdpa_tile_min_rows_per_request() {
     return device_tuning().sdpa_tile_min_rows_per_request;
 }
+bool sdpa_mma() { return device_tuning().sdpa_mma; }
 int moe_batch_min_per_expert() { return device_tuning().moe_batch_min_per_expert; }
 
 }  // namespace pie::metal

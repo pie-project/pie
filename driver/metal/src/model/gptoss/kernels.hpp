@@ -69,6 +69,12 @@ struct GptOssPsos {
     /// threadgroup, with the keys staged once per thirty-two rows. Earned by
     /// row count and request count together -- see `sdpa_should_tile`.
     Pso sdpa_sink_paged_tiled{};
+    /// The tiled attention again, on the simdgroup MATRIX unit: a simdgroup owns
+    /// eight rows and issues Q Kᵀ and P V as 8x8 matrix multiplies rather than
+    /// walking dot products. Selected over `sdpa_sink_paged_tiled` whenever it
+    /// compiled and `sdpa_mma()` is on. Only head_dim 64 and 128 are
+    /// instantiated, so an unusual width leaves this invalid and falls back.
+    Pso sdpa_sink_paged_mma{};
     /// YaRN, as a frequency table the host computed once.
     Pso rope_freqs{};
     /// The M>1 counterparts: the two kernels whose ROW indexing differs, rather

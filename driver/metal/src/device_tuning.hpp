@@ -262,6 +262,26 @@ struct DeviceTuning {
     /// that it removes reductions.
     int sdpa_tile_min_rows_per_request = 32;
 
+    /// Whether a tiled prefill attention runs on the simdgroup MATRIX unit
+    /// rather than the scalar path.
+    ///
+    /// M1 Max: on. `sdpa_paged_tiled` computes Q Kᵀ and P V as hand-walked dot
+    /// products -- it was measured at 35.8% of a 2048-token gpt-oss prefill,
+    /// running near 0.5 TFLOP/s while the quantized GEMM one dispatch away
+    /// reaches ~5.6 on the same silicon. The arithmetic is a matmul; issuing it
+    /// as one is what `sdpa_paged_mma.metal` is.
+    ///
+    /// This is a PREFILL switch. The predicate that earns the tiled shape at
+    /// all (`sdpa_should_tile`) is unchanged and still keeps a fleet of decodes
+    /// on the per-row kernel, where staging a tile per request would lose.
+    ///
+    /// It exists as a switch rather than a replacement because the matrix path
+    /// depends on the register layout of `simdgroup_matrix<T,8,8>` -- see the
+    /// header of that file -- and a machine whose layout differs would produce
+    /// wrong numbers rather than slow ones. `PIE_METAL_SDPA_MMA=0` is the way
+    /// back, and the greedy gate in `llama_bench` is what would catch it.
+    bool sdpa_mma = true;
+
     /// Lanes that share one value row of the gated-delta scan.
     ///
     /// The scan is the only strictly sequential kernel in a prefill -- it walks
@@ -511,6 +531,9 @@ bool fp16_qmm();
 
 /// The attention's tiled-vs-per-row crossover, in rows per request.
 int sdpa_tile_min_rows_per_request();
+
+/// Whether a tiled prefill attention runs on the simdgroup matrix unit.
+bool sdpa_mma();
 int gdn_scan_lanes();
 int gdn_scan_rows();
 
