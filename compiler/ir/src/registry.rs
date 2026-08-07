@@ -160,11 +160,25 @@ impl Port {
     /// pass; false = peeked (read). The token-indexed family (embed,
     /// positions, `w_slot`/`w_off`) consumes — a token is spent by the pass
     /// that embeds it; geometry and masks are state, peeked.
+    ///
+    /// `RsFoldLen` joined the consuming side (2026-08-07). It reads like
+    /// geometry, but a fold length is not state a later fire re-reads: it
+    /// is a COUNT spent by the one fire that folds on it. Peeking it had a
+    /// consequence beyond bookkeeping — a peek records `desc_reads` on the
+    /// channel, that state PERSISTS ACROSS PASSES, and
+    /// `dsl::context::record_channel_put` then drains a peeked port before
+    /// a put. So a device handoff (fire A computes the count, fire B folds
+    /// on it) made fire A emit an implicit take of the channel it was
+    /// about to produce, and the driver refused the launch forever:
+    /// `req cons pub 0/0`, a fire waiting on its own output.
+    /// `cuda_gdn_foldcommit::the_fold_length_can_live_on_device` and
+    /// `cuda_mtp_native_verify::a_device_resident_fold_length_decodes_identically`
+    /// are the tests that were red for it.
     pub fn consumes(self) -> bool {
         matches!(
             self,
             Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff | Port::RsWSlot
-                | Port::RsWOff
+                | Port::RsWOff | Port::RsFoldLen
         )
     }
 }
