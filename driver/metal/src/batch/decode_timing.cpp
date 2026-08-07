@@ -38,6 +38,40 @@ bool kernel_ablated(Kernel k) {
                      "[ablate] PIE_METAL_ABLATE=%s -- these kinds are NOT "
                      "DISPATCHED. The tokens are wrong on purpose; only the "
                      "wall clock means anything.\n", e);
+        // A token that matched nothing skips nothing, and the run then
+        // reports the baseline while looking armed -- the banner above still
+        // prints. That has cost a whole session's worth of "trace said 46%,
+        // ablation says 0%" readings, all of them no-ops, because this takes
+        // a kernel KIND and the dispatch trace prints a pipeline HOST NAME:
+        // paste `affine_qmv_routed_bfloat16_gs_64_b_4` in here and it matches
+        // no kind at all. Say so, loudly, and list what it does take.
+        for (std::size_t at = 0; at <= spec.size();) {
+            const std::size_t end = std::min(spec.find(',', at), spec.size());
+            const std::string token = spec.substr(at, end - at);
+            at = end + 1;
+            if (token.empty()) continue;
+            bool matched = false;
+            for (int i = 0; i < kKernelKindCount && !matched; ++i) {
+                const char* n = kernel_name(static_cast<Kernel>(i));
+                matched = n != nullptr && token == n;
+            }
+            if (matched) continue;
+            std::fprintf(stderr,
+                         "[ablate] '%s' IS NOT A KERNEL KIND -- it ablates "
+                         "NOTHING and this run will report the baseline. This "
+                         "takes kind names, not the pipeline host names the "
+                         "dispatch trace prints. Known kinds:\n[ablate]  ",
+                         token.c_str());
+            for (int i = 0; i < kKernelKindCount; ++i) {
+                const char* n = kernel_name(static_cast<Kernel>(i));
+                // The enum is sparse -- unassigned ordinals all answer
+                // "unknown" -- and printing that seventy times buries the list.
+                if (n != nullptr && std::strcmp(n, "unknown") != 0) {
+                    std::fprintf(stderr, "%s ", n);
+                }
+            }
+            std::fprintf(stderr, "\n");
+        }
         return t;
     }();
     const int i = static_cast<int>(k);
