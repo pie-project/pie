@@ -522,6 +522,11 @@ struct MetalExecutor::Impl {
     std::vector<SlotHandle> pool_{};
     DecodeStepPsos psos_{};
     MultiBatchPsos mb_psos_{};
+    // The same table in the checkpoint's ALTERNATE affine format, built only
+    // when one exists. Only the strided entries are wanted from it: the two
+    // kinds an alt format covers here -- the router and the shared expert's
+    // gate -- need a batched shape for a prefill, and had none.
+    MultiBatchPsos mb_alt_psos_{};
     KvPagePool kv_pool_{};
     std::vector<Dispatch> mb_dag_{};
     ScratchSchedule mb_sched_{};
@@ -1325,6 +1330,19 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                 .fp16_precast = g_.quant.bits == 4 && g_.quant.group == 64,
                 .fp16_strided = g_.quant.bits == 4 && g_.quant.group == 64})) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
+        ctx_.reset();
+        return false;
+    }
+    // The alternate format's batched matvec. Without it a prefill ran the
+    // router and the shared gate as ONE MATVEC PER TOKEN -- the largest single
+    // line in a Qwen3.6-35B-A3B prefill profile -- because the strided arm has
+    // to decline a kind whose bytes its pipelines cannot read. Strided only:
+    // nothing else in this table is ever asked of the alt format, and building
+    // the rest would be compiling pipelines with no caller.
+    if (g_.paged_kv_enabled && g_.has_alt_quant() &&
+        !load_multibatch_psos(*ctx_, kernels_dir, mb_alt_psos_, g_.alt_quant, &load_err,
+                              MultiBatchPsoFeatures{.strided = true})) {
+        if (err) *err = "multi-batch PSO load failed (alt format): " + load_err;
         ctx_.reset();
         return false;
     }
@@ -2586,7 +2604,8 @@ bool MetalExecutor::Impl::run_prefill_step(
         }
         encode_prefill_dags_mb(se, prefill_dags_, schedule.N, psos_, mb_psos_,
                                force_barriers_, in.row_needs_logits, &g_,
-                               int(prefill_dags_.size()), gdn_scans);
+                               int(prefill_dags_.size()), gdn_scans,
+                               g_.has_alt_quant() ? &mb_alt_psos_ : nullptr);
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);

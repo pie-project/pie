@@ -639,7 +639,8 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::uint8_t>& row_needs_logits,
                             const DecodeGeometry* geometry,
                             int max_rows,
-                            const std::vector<GdnScanSegment>& gdn_scans) {
+                            const std::vector<GdnScanSegment>& gdn_scans,
+                            const MultiBatchPsos* mb_alt_psos) {
     const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
     if (n == 0 || dags.size() < n) return;
     const size_t length = dags[0].size();
@@ -681,6 +682,44 @@ void encode_prefill_dags_mb(StepEncoder& se,
     }
     for (size_t i = 0; i < length; ++i) {
         const Dispatch& d0 = dags[0][i];
+        // ── the alternate affine format ──
+        //
+        // A checkpoint may spare individual tensors from the model-wide format
+        // -- mlx-lm's predicate names them -- and Qwen3.6-35B-A3B leaves the MoE
+        // router and the shared expert's gate at 8 bits inside a 4-bit build.
+        // The strided arm below has to decline those two, because its pipelines
+        // read 4-bit bytes and running them over 8-bit ones is not a crash, it
+        // is a wrong answer: gemma4's router did exactly that once and produced
+        // logits at cosine 0.10 to mlx-lm's with every tensor feeding them at
+        // 0.9999.
+        //
+        // Declining is not the same as having nothing to run, though, and until
+        // now it was: both kinds fell all the way through to the per-token walk,
+        // so a prefill dispatched them once per row -- forty layers times two
+        // kinds times every token. In a 1024-row fire that was the largest line
+        // in the profile at 30-37% of GPU time, against 1.75% for the real
+        // GEMMs. The wide matvec is the batched shape they were missing: it is
+        // parametric in the row count, guards its last partial group, and reads
+        // each decoded weight chunk once for four token vectors. Asked of the
+        // ALT table, so the bytes and the pipeline agree.
+        if (strided_rows > 0 && geometry != nullptr && mb_alt_psos != nullptr &&
+            qwen35_uses_alt_quant(d0.kind, *geometry) && !d0.fuse_residual &&
+            mb_alt_psos->qmv_wide_strided.valid()) {
+            const int out = qmv_out_size(d0.kind, *geometry);
+            if (out != 0) {
+                constexpr int vecs = 4;
+                constexpr int lanes = 8;
+                se.set_pso(mb_alt_psos->qmv_wide_strided);
+                se.set_argtable(d0.kind, d0.ordinal);
+                se.dispatch(
+                    Grid{32u * std::uint32_t((int(n) + vecs - 1) / vecs),
+                         2u * std::uint32_t(
+                             (out + (64 / lanes) - 1) / (64 / lanes)), 1},
+                    Threadgroup{32, 2, 1});
+                se.barrier();
+                continue;
+            }
+        }
         if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead &&
             d0.kind != Kernel::LmHeadUntied &&
             !qwen35_uses_alt_quant(d0.kind, *geometry)) {

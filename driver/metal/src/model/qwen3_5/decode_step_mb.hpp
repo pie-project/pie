@@ -120,7 +120,11 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::uint8_t>& row_needs_logits = {},
                             const DecodeGeometry* geometry = nullptr,
                             int max_rows = 0,
-                            const std::vector<GdnScanSegment>& gdn_scans = {});
+                            const std::vector<GdnScanSegment>& gdn_scans = {},
+                            /// The same table in the checkpoint's alternate
+                            /// affine format, or null when it has none. Only
+                            /// `qmv_wide_strided` is read from it.
+                            const MultiBatchPsos* mb_alt_psos = nullptr);
 
 // Point the GDN pair's conv ping-pong at one of its two halves: `even` binds
 // `conv_state` in and `conv_state_out` out, false the reverse. The halves may

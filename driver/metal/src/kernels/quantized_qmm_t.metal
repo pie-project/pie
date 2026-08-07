@@ -2619,16 +2619,25 @@ template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
   }
 }
 
-#define instantiate_qmv_wide_strided(v, kl)                                  \
-  template [[host_name("affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_" #v   \
+#define instantiate_qmv_wide_strided(b, v, kl)                               \
+  template [[host_name("affine_qmv_wide_strided_bfloat16_gs_64_b_" #b "_v_" #v \
                        "_kl_" #kl)]]                                         \
-  [[kernel]] void affine_qmv_wide_strided<bfloat, 64, 4, v, kl>(            \
+  [[kernel]] void affine_qmv_wide_strided<bfloat, 64, b, v, kl>(            \
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
       const device bfloat*, device bfloat*, const constant int&,             \
       const constant int&, const constant int&, const constant int&,         \
       uint3, uint, uint);
 
-instantiate_qmv_wide_strided(4, 8)
+instantiate_qmv_wide_strided(4, 4, 8)
+// The 8-bit twin, for a checkpoint that spares individual tensors from the
+// model-wide format. mlx-lm's quantization predicate can single out a tensor by
+// NAME, and Qwen3.6-35B-A3B's build leaves the MoE router and the shared
+// expert's gate at 8 bits while everything else is 4. Those two kinds had no
+// batched shape to run in, so a prefill fell back to ONE MATVEC PER TOKEN for
+// them -- 40 layers times two kinds times every row -- and that was the single
+// largest line in the profile. The kernel body is parametric in `bits`; only
+// the instantiation was missing.
+instantiate_qmv_wide_strided(8, 4, 8)
 
 
 // Split-K's affine-loader adapter. The common loop runs `k_len` columns from
