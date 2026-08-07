@@ -1190,6 +1190,13 @@ void mixtral_forward_paged(
             kernels::launch_bf16_to_fp16(
                 ws.norm_y.data(), d_mxfp4_act_fp16.data(),
                 static_cast<std::size_t>(N) * H, stream);
+            // The activation rides the gate/up epilogue when this model uses
+            // the gpt-oss GLU and the routes are not bucketed by expert (the
+            // grouped kernel has its own epilogue). Then the glu kernel and
+            // the cast after it have nothing left to do.
+            const bool fuse_glu =
+                cfg.swiglu_limit > 0.f &&
+                !mxfp4_moe_grouped_choice(routes, num_experts);
             if (prof.enabled) prof.close(stream);   // moe_align (act cast)
             mx_stage(prof, &prof.moe_gate_up, stream, [&]{
             // Group the routes by expert first: without it every route
@@ -1217,10 +1224,14 @@ void mixtral_forward_paged(
                     layer.expert_gate_bias_ptrs.data(),
                     layer.expert_up_bias_ptrs.data(),
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
-                    N, top_k, H, I, stream);
+                    N, top_k, H, I, stream,
+                    /*act_out_fp16=*/fuse_glu
+                        ? d_mxfp4_route_act_fp16.data() : nullptr,
+                    /*glu_limit=*/cfg.swiglu_limit);
             }
             });
             if (prof.enabled) prof.open(&prof.moe_act, stream);
+            if (!fuse_glu) {
             // The gpt-oss activation emits the fp16 copy the down GEMV wants
             // as a second store, so the cast below is only needed on the plain
             // swiglu branch, which no model with this activation takes.
@@ -1243,6 +1254,7 @@ void mixtral_forward_paged(
                 kernels::launch_bf16_to_fp16(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_act_fp16.data(),
                     static_cast<std::size_t>(routes) * I, stream);
+            }
             }
             // b_down is replicated across ranks, so only the leader adds it;
             // the all-reduce below would otherwise sum it T times.

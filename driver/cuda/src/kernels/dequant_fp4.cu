@@ -124,6 +124,13 @@ __device__ __forceinline__ float mxfp4_block_scale(std::uint8_t b) {
 // gate and up are adjacent rows of the *same* packed tensor (2i and 2i+1),
 // so a slab of kPairs intermediate rows is 2*kPairs contiguous rows and
 // needs no gather.
+// `act_out_fp16`, when non-null, receives the gpt-oss GLU of the two halves --
+// clamp, quickgelu on the gate, `(up + 1) *` -- in fp16, which is what the down
+// projection reads. Both terms are already in registers here, so the activation
+// costs a few instructions on values that would otherwise be written to HBM,
+// read back by a glu kernel, written again, and read a third time by a cast.
+// vLLM does the same thing from the other side: its MoE matmul is
+// `_matmul_ogs_..._swiglu`, one kernel with the activation in the epilogue.
 __global__ void mxfp4_moe_gate_up_decode_kernel(
     const __half* __restrict__ act,
     const std::int32_t* __restrict__ topk_idx,
@@ -133,6 +140,9 @@ __global__ void mxfp4_moe_gate_up_decode_kernel(
     const void* const* __restrict__ up_bias_ptrs,
     __nv_bfloat16* __restrict__ gate_out,
     __nv_bfloat16* __restrict__ up_out,
+    __half* __restrict__ act_out_fp16,
+    float glu_limit,
+    float glu_alpha,
     int top_k,
     int hidden,
     int intermediate)
@@ -236,8 +246,18 @@ __global__ void mxfp4_moe_gate_up_decode_kernel(
             }
             const long long o =
                 static_cast<long long>(route) * intermediate + row;
-            gate_out[o] = __float2bfloat16(gv);
-            up_out[o] = __float2bfloat16(uv);
+            if (act_out_fp16 != nullptr) {
+                // Same arithmetic and the same order as
+                // `gpt_oss_glu_bf16_kernel`, which read these two back from
+                // HBM to do it.
+                const float g = fminf(gv, glu_limit);
+                const float u = fminf(fmaxf(uv, -glu_limit), glu_limit);
+                const float glu = g / (1.f + __expf(-glu_alpha * g));
+                act_out_fp16[o] = __float2half((u + 1.f) * glu);
+            } else {
+                gate_out[o] = __float2bfloat16(gv);
+                up_out[o] = __float2bfloat16(uv);
+            }
         }
     }
 }
@@ -536,7 +556,10 @@ void launch_mxfp4_moe_gate_up_decode_bf16(
     void* gate_out_bf16,
     void* up_out_bf16,
     int num_tokens, int top_k, int hidden, int intermediate,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    void* act_out_fp16,
+    float glu_limit,
+    float glu_alpha)
 {
     if (num_tokens <= 0 || top_k <= 0 || hidden <= 0 || intermediate <= 0) {
         return;
@@ -551,6 +574,7 @@ void launch_mxfp4_moe_gate_up_decode_bf16(
         gate_up_packed, gate_up_scales, gate_bias, up_bias,
         static_cast<__nv_bfloat16*>(gate_out_bf16),
         static_cast<__nv_bfloat16*>(up_out_bf16),
+        static_cast<__half*>(act_out_fp16), glu_limit, glu_alpha,
         top_k, hidden, intermediate);
 }
 
