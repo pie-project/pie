@@ -5774,6 +5774,11 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
             }
         }
     }
+    // Defined below (`describe_uncommitted_lane`); declared here because the
+    // settle needs it 2,600 lines earlier than its definition.
+    extern std::string describe_uncommitted_lane(
+        std::uint64_t instance_id, const BoundInstance& bound,
+        const StagedLane& lane);
     const bool stateful_rs = rs_launch_requires_readiness_settlement(
         view.rs_slot_ids.size(),
         view.rs_fold_lens.size(),
@@ -5789,12 +5794,26 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
                 stream));
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (const auto& lane : state.lanes) {
-            if (*lane->snapshot->host == 0) {
-                throw RetryableLaunchError(
-                    std::string("ptir ") + phase +
-                    " readiness did not commit");
+        for (std::size_t i = 0; i < state.lanes.size(); ++i) {
+            const auto& lane = state.lanes[i];
+            if (*lane->snapshot->host != 0) continue;
+            // NAME THE LANE. This used to throw a wave-wide string, and a
+            // wave is many fires: the message then pointed at whichever
+            // submit happened to be running rather than at the lane whose
+            // ticket refused, so a channel-ticket failure read as a bug in
+            // an unrelated fire. `describe_uncommitted_lane` already says
+            // which channel refused and with what head/tail — the sibling
+            // check at the prologue gate has used it all along.
+            std::string detail;
+            if (lane->bound != nullptr) {
+                detail = describe_uncommitted_lane(
+                    lane->bound->program_hash, *lane->bound, *lane);
             }
+            throw RetryableLaunchError(
+                std::string("ptir ") + phase + " readiness did not commit" +
+                " [lane " + std::to_string(i) + " of " +
+                std::to_string(state.lanes.size()) + "]" +
+                (detail.empty() ? std::string() : " " + detail));
         }
     };
     try {
