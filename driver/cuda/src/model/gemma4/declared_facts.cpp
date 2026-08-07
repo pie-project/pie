@@ -70,15 +70,30 @@ bool gemma4_declared_forward_enabled() {
 }
 
 bool gemma4_declared_drive_enabled() {
-    // EXECUTING it is opt-in, and stays opt-in until the arms are right.
-    // They are written and they build; on a live E4B decode they fault
-    // (an illegal access that surfaces at the next device copy), so the
-    // buffer threading in at least one arm is wrong. Default-on would
-    // make that everyone's problem for the sake of a rung that is not
-    // finished.
+    // DEFAULT ON, llama_like and qwen3_5's polarity: `=0` disarms onto the
+    // hand-written pass. The comment this replaces said "opt-in until the
+    // arms are right", and named the fault that made it so — an illegal
+    // access on a live E4B decode. What changed since:
+    //
+    //  * both CLASSES run (decode and prefill), byte-identical to the
+    //    hand-written pass on a seeded battery;
+    //  * TWO geometries, and the second was not a formality — E2B is 35
+    //    layers, MQA, 20/35 KV-shared, and DOUBLE-WIDE MLP, and it found
+    //    three real gaps, every one of them a load-time refusal naming
+    //    the weight it wanted;
+    //  * an unseen geometry now DECLINES instead of failing the model
+    //    load (the weight dry walk at plan build), which is what makes
+    //    default-on safe for a checkpoint nobody has booted;
+    //  * the parity gate can no longer pass by accident: it asserts the
+    //    drive logged a first fire, so a silent decline is a red test.
+    //
+    // Everything outside what the declaration states still answers false
+    // at eligibility — hooks, masks, multimodal, tp>1, the row-decode
+    // shape — and the MoE-on-top variant refuses at load by reading its
+    // bound router. One env var reverts this.
     static const bool on = [] {
         const char* v = std::getenv("PIE_DECLARED_FORWARD_GEMMA4");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return on;
 }

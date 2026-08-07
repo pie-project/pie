@@ -35,8 +35,8 @@
 //!   cargo test -p pie-gpu-tests --release --no-default-features \
 //!     --features driver-cuda --test cuda_declared_family_parity \
 //!     -- --ignored --nocapture
-//!   PIE_DECLARED_FORWARD_GEMMA4=1 PIE_DECLARED_FORWARD_GPT_OSS=1 \
-//!     cargo test ... --test cuda_declared_family_parity -- --ignored --nocapture
+//!   PIE_DECLARED_FORWARD_GEMMA4=0 cargo test ... gemma4 ...   (gemma-4 defaults ON)
+//!   PIE_DECLARED_FORWARD_GPT_OSS=1 cargo test ... gpt_oss ...   (gpt-oss is opt-in)
 //! ```
 
 mod common;
@@ -61,12 +61,18 @@ struct Family {
     name: &'static str,
     hub_dir: &'static str,
     gate: &'static str,
+    /// Whether the driver ARMS this family's drive when the env is unset.
+    /// MUST mirror `*_declared_drive_enabled()`: reading it the wrong way
+    /// files both invocations under one slot and compares a run against
+    /// itself — the failure this harness exists to make impossible.
+    default_on: bool,
 }
 
 const GEMMA4: Family = Family {
     name: "gemma4",
     hub_dir: "models--google--gemma-4-E4B-it",
     gate: "PIE_DECLARED_FORWARD_GEMMA4",
+    default_on: true,
 };
 
 /// gemma-4's SECOND geometry, and the reason it earns a row: 35 layers
@@ -78,12 +84,14 @@ const GEMMA4_E2B: Family = Family {
     name: "gemma4_e2b",
     hub_dir: "models--google--gemma-4-E2B-it",
     gate: "PIE_DECLARED_FORWARD_GEMMA4",
+    default_on: true,
 };
 
 const GPT_OSS: Family = Family {
     name: "gpt_oss",
     hub_dir: "models--openai--gpt-oss-20b",
     gate: "PIE_DECLARED_FORWARD_GPT_OSS",
+    default_on: false,
 };
 
 /// A checkpoint snapshot in the HF cache. Unlike the qwen resolver this
@@ -164,13 +172,14 @@ fn restore_stderr(saved: i32) {
 
 async fn run_family(family: &Family) -> Result<()> {
     common::init_trace();
-    // MIRROR the driver's own polarity: these two gates are opt-in, so
-    // an UNSET env means the hand-written pass. Reading it the other way
-    // would file both invocations under one slot and compare a run
-    // against itself — a gate that passes because it stopped asking.
+    // MIRROR the driver's own polarity, which now DIFFERS per family:
+    // gemma-4 defaults ON (`=0` disarms), gpt-oss is still opt-in.
+    // Reading it the wrong way files both invocations under one slot and
+    // compares a run against itself — a gate that passes because it
+    // stopped asking.
     let declared = std::env::var(family.gate)
         .map(|v| !v.is_empty() && !v.starts_with('0'))
-        .unwrap_or(false);
+        .unwrap_or(family.default_on);
 
     let snapshot = resolve_snapshot(family.hub_dir)?;
     let toml = common::cuda_standalone_toml(&snapshot);
