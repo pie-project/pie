@@ -1665,7 +1665,10 @@ bool MetalExecutor::Impl::ensure_elastic_storage(
             capacity;
         add_target(slot, bytes);
     }
-    if (ctx_->ensure_elastic_buffers_atomically(targets)) return true;
+    if (ctx_->ensure_elastic_buffers_atomically(
+            targets, /*step_requirement=*/true)) {
+        return true;
+    }
     if (err != nullptr) {
         // Which of the two it is decides what an operator does about it. A full
         // pool is a sizing problem; a clamped one is the OS having said the

@@ -235,6 +235,9 @@ struct RawMetalContext::Impl {
     size_t elastic_mandatory_bytes = 0;
     size_t elastic_reserved_bytes = 0;
     size_t elastic_committed_bytes = 0;
+    // Set only for the span of `ensure_elastic_buffers_atomically`, whose
+    // targets are a step's requirement rather than speculative growth.
+    bool serving_step_requirement = false;
     std::shared_ptr<std::atomic<std::uint32_t>> memory_pressure_level =
         std::make_shared<std::atomic<std::uint32_t>>(0);
     dispatch_source_t memory_pressure_source = nullptr;
@@ -293,7 +296,21 @@ struct RawMetalContext::Impl {
 // it only turns an admitted model into an unusable one. What pressure should
 // throttle is GROWTH past that point -- KV pages for sequences that have not
 // arrived yet -- and that is still clamped.
+//
+// The same argument reaches one step further than it first did, and Qwen3.6-
+// 35B-A3B found that gap by running rather than by loading. A pool's
+// `initial_commit_bytes` is what makes the buffer exist, not what makes the
+// first forward pass legal: the step also needs its scratch and its KV rows
+// sized to the tokens actually in hand. Those are not growth either -- they
+// are the same admitted requirement arriving a moment later -- but only the
+// initial commit was ever recorded in `elastic_mandatory_bytes`, so the
+// clamp declined the remainder and the model that had just loaded could not
+// take a step. `serving_step_requirement` marks the window where the ask is
+// a requirement rather than growth -- the caller says which it is -- and
+// inside it the budget is the whole budget `fits_on_this_gpu` already checked
+// the machine against.
 size_t RawMetalContext::Impl::effective_elastic_budget_bytes() const {
+    if (serving_step_requirement) return elastic_budget_bytes;
     const std::uint32_t level =
         memory_pressure_level->load(std::memory_order_acquire);
     if (level == 0) return elastic_budget_bytes;
@@ -967,8 +984,17 @@ bool RawMetalContext::ensure_elastic_buffer(
 }
 
 bool RawMetalContext::ensure_elastic_buffers_atomically(
-    const std::vector<std::pair<SlotHandle, size_t>>& targets) {
+    const std::vector<std::pair<SlotHandle, size_t>>& targets,
+    bool step_requirement) {
     auto& I = *impl_;
+    // The targets describe what this step needs, so the pressure clamp does
+    // not apply for their duration; restored on every exit, including the
+    // rollback below.
+    I.serving_step_requirement = step_requirement;
+    struct Restore {
+        Impl& i;
+        ~Restore() { i.serving_step_requirement = false; }
+    } restore{I};
     std::vector<std::pair<SlotHandle, size_t>> normalized;
     std::unordered_map<void*, std::size_t> by_buffer;
     for (const auto& [slot, bytes] : targets) {
