@@ -295,6 +295,37 @@ struct DeviceTuning {
     /// it.
     int gdn_scan_lanes = 16;
 
+    /// Value rows one lane group of that scan walks, sharing the q and k it
+    /// read for all of them.
+    ///
+    /// The table above says the reductions are not what the scan is short of.
+    /// The arithmetic says what is: with LANES=16 a simdgroup covers two of Dv's
+    /// 128 rows, so 64 of them per head each pull the head's whole q and k row
+    /// every token, and one layer of a 128-token scan reads 402 MB of tensors
+    /// that hold 6 MB. Narrowing LANES amortizes that and is the experiment
+    /// above, which fails because `n_per_t` is Dk/LANES: halving the lanes
+    /// doubles every register the scan carries. Walking more VALUE rows per
+    /// lane group amortizes the same reads while q[] and k[] stay put.
+    ///
+    /// Same model and prompt, sweeping both axes:
+    ///
+    ///   lanes | rows | tok/s
+    ///   ------|------|-------
+    ///     16  |   1  |  99.4
+    ///     16  |   2  | 100.9
+    ///     16  |   4  |  97.0
+    ///      8  |   1  |  89.3
+    ///      8  |   2  |  94.6
+    ///
+    /// Two rows halves the q/k traffic for one more accumulator per lane and
+    /// wins 1.5%. Four does not: the scan's state is `rows * Dk/LANES` floats
+    /// per lane, so the third doubling spends the occupancy that was hiding
+    /// the reduction latency the table above measured. The win is small next
+    /// to the traffic it removes because the scan is not purely bandwidth
+    /// bound -- it is serialized on the token loop, and only the chunked form
+    /// changes that.
+    int gdn_scan_rows = 2;
+
     /// Rows an expert's run must hold before the mixture sorts and batches at
     /// all, rather than running the routed projections as matvecs.
     ///
@@ -442,6 +473,7 @@ bool fp16_qmm();
 /// The attention's tiled-vs-per-row crossover, in rows per request.
 int sdpa_tile_min_rows_per_request();
 int gdn_scan_lanes();
+int gdn_scan_rows();
 
 /// The mixture's batch-vs-matvec crossover, in rows per expert.
 int moe_batch_min_per_expert();

@@ -335,7 +335,8 @@ bool load_multibatch_psos(RawMetalContext& ctx,
              &out.gdn_prep_prefill);
         want("gdn_prep.metal",
              "gdn_core_recurrent_prefill_bfloat16_l_" +
-                 std::to_string(gdn_scan_lanes()),
+                 std::to_string(gdn_scan_lanes()) + "_v_" +
+                 std::to_string(gdn_scan_rows()),
              &out.gdn_core_prefill);
         want("gated_rms.metal", "gated_rms_strided_bfloat16",
              &out.gated_rms_strided);

@@ -894,7 +894,7 @@ void encode_prefill_dags_mb(StepEncoder& se,
                         // covers that many rows, not one; a Dv the rows do not
                         // divide rounds up and the kernel masks the spares.
                         const uint32_t rows_per_simd =
-                            uint32_t(32 / gdn_scan_lanes());
+                            uint32_t(32 / gdn_scan_lanes()) * uint32_t(gdn_scan_rows());
                         grid.y = (grid.y + rows_per_simd - 1) / rows_per_simd;
                     }
                     se.set_argtable(d.kind, d.ordinal);
