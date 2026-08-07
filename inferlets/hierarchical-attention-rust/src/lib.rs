@@ -12,12 +12,12 @@
 //!         recent generated text    (a sliding local window at the end)
 //! ```
 //!
-//! A long prompt is split into word chunks. Each chunk contributes a short
-//! header (its "summary") and a full body. We record the token ranges of every
-//! header and body, pick the chunk(s) most relevant to the task by lexical
-//! overlap, then run a **manual decode loop**. At each step we build a BRLE
-//! attention mask whose *true* runs are exactly: the sink, every chunk header,
-//! the selected chunk body, and the recent window. Everything else is masked.
+//! A long user turn is split into word chunks. We map those chunks onto the
+//! tokenized turn, treat the first few tokens of each chunk as its summary,
+//! select the chunk(s) most relevant to the task by lexical overlap, then run a
+//! **manual decode loop**. At each step we build a BRLE attention mask whose
+//! *true* runs are exactly: the sink, every chunk summary, the selected chunk
+//! detail, and the recent window. Everything else is masked.
 //!
 //! How this differs from the existing examples:
 //!
@@ -27,10 +27,10 @@
 //!   hierarchical-attention = sink + ALL chunk summaries + selected full chunk + recent window
 //! ```
 //!
-//! MVP scope: "summaries" are the first N tokens of each chunk header, and
-//! relevance is lexical overlap. One shared mask is applied to every query
-//! token in a pass (the pseudocode's documented simplification). The point is
-//! to demonstrate Pie's programmable attention-mask interface
+//! MVP scope: "summaries" are the first N tokens of each chunk, and relevance
+//! is lexical overlap. The runtime clips each query's hierarchy mask to its
+//! causal bound. The point is to demonstrate Pie's programmable attention-mask
+//! interface
 //! (`ctx.forward()` + `pass.attention_mask(...)`), not to ship a tuned policy.
 //! No speedup is claimed — masked KV pages still occupy memory; the mask only
 //! controls what the model *attends to*.
@@ -38,6 +38,9 @@
 use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
 use serde::Deserialize;
 use std::collections::HashSet;
+
+// Large per-query custom-mask prefills can fail as an empty driver future.
+const PREFILL_CHUNK_TOKENS: usize = 256;
 
 #[derive(Debug, Clone, Deserialize)]
 struct Input {
@@ -64,13 +67,27 @@ fn default_prompt() -> String {
      attention masks. Include one practical example."
         .into()
 }
-fn default_max_tokens() -> usize { 128 }
-fn default_chunk_words() -> usize { 80 }
-fn default_sink() -> u32 { 64 }
-fn default_summary() -> u32 { 24 }
-fn default_window() -> u32 { 128 }
-fn default_selected_chunks() -> usize { 1 }
-fn default_selection_mode() -> String { "lexical".into() }
+fn default_max_tokens() -> usize {
+    128
+}
+fn default_chunk_words() -> usize {
+    80
+}
+fn default_sink() -> u32 {
+    64
+}
+fn default_summary() -> u32 {
+    24
+}
+fn default_window() -> u32 {
+    128
+}
+fn default_selected_chunks() -> usize {
+    1
+}
+fn default_selection_mode() -> String {
+    "lexical".into()
+}
 
 /// A half-open `[start, end)` token range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,62 +106,93 @@ impl Range {
 async fn main(input: Input) -> Result<String> {
     let model = Model::load(runtime::models().first().ok_or("No models available")?)?;
     let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let (system_text, user_text) = split_chat_prompt(&input.prompt);
 
     // Minimum chunk size guards against degenerate 1-word chunks blowing up the
-    // header/body bookkeeping.
+    // range bookkeeping.
     let chunk_words = input.chunk_size_words.max(8);
-    let chunks = split_words(&input.prompt, chunk_words);
+    let chunks = split_words(user_text, chunk_words);
 
-    let selected = select_relevant_chunks(&chunks, &input.prompt, input.selected_chunks.max(1));
+    let selected = select_chunks(
+        &chunks,
+        user_text,
+        input.selected_chunks.max(1),
+        &input.selection_mode,
+    )?;
 
-    // Build one prompt token stream, recording the header (summary) and body
-    // (full) token ranges for each chunk as we go.
+    // Keep the model-facing prompt as one valid chat turn. The prior
+    // implementation emitted adjacent user turns for every header and body,
+    // which caused chat models to immediately emit a stop token.
     let mut prompt_tokens: Vec<u32> = Vec::new();
-    let mut summary_ranges: Vec<Range> = Vec::new();
-    let mut full_ranges: Vec<Range> = Vec::new();
+    prompt_tokens.extend(inferlet::chat::system(&model, system_text));
 
-    prompt_tokens.extend(inferlet::chat::system(
-        &model,
-        "You are a concise assistant. Use the visible hierarchy: global \
-         instructions, the chunk summaries, and the selected local chunk.",
-    ));
+    let user_start = prompt_tokens.len() as u32;
+    let user_tokens = inferlet::chat::user(&model, user_text);
+    let user_len = user_tokens.len() as u32;
+    prompt_tokens.extend(user_tokens);
 
-    for (i, chunk) in chunks.iter().enumerate() {
-        let header = format!("Chunk {} summary: {}\n", i, summarize_words(chunk, 20));
-        let body = format!("Chunk {} full text:\n{}\n", i, chunk);
+    // Map the lexical word chunks onto contiguous ranges of the single
+    // tokenized user turn. Boundaries are proportional because tokenizer
+    // pieces do not correspond one-to-one with whitespace-separated words.
+    let full_ranges = partition_range(user_start, user_len, chunks.len());
+    let summary_ranges: Vec<Range> = full_ranges
+        .iter()
+        .map(|range| {
+            Range::new(
+                range.start,
+                range.start + input.summary_tokens_per_chunk.min(range.end - range.start),
+            )
+        })
+        .collect();
 
-        // Header → keep only its first `summary_tokens_per_chunk` tokens as a
-        // global summary range.
-        let header_start = prompt_tokens.len() as u32;
-        prompt_tokens.extend(inferlet::chat::user(&model, &header));
-        let header_end = prompt_tokens.len() as u32;
-        let summary_end = header_start + input.summary_tokens_per_chunk.min(header_end - header_start);
-        summary_ranges.push(Range::new(header_start, summary_end));
-
-        // Body → record the full range so a selected chunk can be kept whole.
-        let body_start = prompt_tokens.len() as u32;
-        prompt_tokens.extend(inferlet::chat::user(&model, &body));
-        let body_end = prompt_tokens.len() as u32;
-        full_ranges.push(Range::new(body_start, body_end));
-    }
-
-    prompt_tokens.extend(inferlet::chat::user(
-        &model,
-        "Answer the original request using the selected local chunk(s) and the \
-         global chunk summaries.",
-    ));
     prompt_tokens.extend(inferlet::chat::cue(&model));
 
     println!("--- hierarchical-attention-rust ---");
     println!("chunks={}", chunks.len());
-    println!("selected_chunk={:?} (mode={})", selected, input.selection_mode);
+    println!(
+        "selected_chunk={:?} (mode={})",
+        selected, input.selection_mode
+    );
     println!("summary_ranges={}", fmt_ranges(&summary_ranges));
     println!("full_ranges={}", fmt_ranges(&full_ranges));
 
     let mut ctx = Context::new(&model)?;
-    let mut pending = prompt_tokens;
-    let mut generated: Vec<u32> = Vec::new();
     let mut logged_mask = false;
+
+    // Keep custom-mask prefills bounded. This also gives the host a chance to
+    // validate and commit KV lineage before processing the rest of a long
+    // multi-step agent transcript.
+    let mut prompt_offset = 0;
+    while prompt_tokens.len() - prompt_offset > PREFILL_CHUNK_TOKENS {
+        let end = prompt_offset + PREFILL_CHUNK_TOKENS;
+        let chunk = &prompt_tokens[prompt_offset..end];
+        let mut fwd = ctx.forward();
+        let start_position = fwd.start_position();
+        let masks = build_hierarchical_masks(
+            start_position,
+            chunk.len(),
+            input.sink_tokens,
+            &summary_ranges,
+            &full_ranges,
+            &selected,
+            input.local_window_tokens,
+        );
+        if !logged_mask {
+            println!(
+                "mask_true_tokens={} / total={}",
+                mask_true_count(masks.last().expect("chunk is non-empty")),
+                start_position + chunk.len() as u32
+            );
+            logged_mask = true;
+        }
+        fwd.input(chunk);
+        fwd.attention_mask(&masks);
+        fwd.execute().await?;
+        prompt_offset = end;
+    }
+
+    let mut pending = prompt_tokens[prompt_offset..].to_vec();
+    let mut generated: Vec<u32> = Vec::new();
 
     for _ in 0..input.max_tokens {
         if pending.is_empty() {
@@ -152,47 +200,37 @@ async fn main(input: Input) -> Result<String> {
         }
 
         let mut fwd = ctx.forward();
-        let total_seq_after = fwd.start_position() + pending.len() as u32;
-
-        // Assemble the keep-set for this step.
-        let mut keep: Vec<Range> = Vec::new();
-        // 1. Sink: the very beginning stays globally visible.
-        keep.push(Range::new(0, input.sink_tokens.min(total_seq_after)));
-        // 2. Summary/header tokens from every chunk.
-        keep.extend(summary_ranges.iter().copied());
-        // 3. The full body of each selected chunk.
-        for &idx in &selected {
-            if let Some(r) = full_ranges.get(idx) {
-                keep.push(*r);
-            }
-        }
-        // 4. Recent window over the committed + pending sequence.
-        let win_start = total_seq_after.saturating_sub(input.local_window_tokens);
-        keep.push(Range::new(win_start, total_seq_after));
-
-        let mask = build_brle_mask(total_seq_after, &keep);
+        let start_position = fwd.start_position();
+        let total_seq_after = start_position + pending.len() as u32;
+        let masks = build_hierarchical_masks(
+            start_position,
+            pending.len(),
+            input.sink_tokens,
+            &summary_ranges,
+            &full_ranges,
+            &selected,
+            input.local_window_tokens,
+        );
 
         // Log the first step's mask occupancy so the effect is visible without
         // spamming one line per generated token.
         if !logged_mask {
             println!(
                 "mask_true_tokens={} / total={}",
-                mask_true_count(&mask),
+                mask_true_count(masks.last().expect("pending is non-empty")),
                 total_seq_after
             );
             logged_mask = true;
         }
 
         fwd.input(&pending);
-        // One shared mask per query token in this pass (MVP simplification).
-        let masks: Vec<Vec<u32>> = (0..pending.len()).map(|_| mask.clone()).collect();
         fwd.attention_mask(&masks);
 
         let h = fwd.sample(&[(pending.len() - 1) as u32], Sampler::Argmax);
         let out = fwd.execute().await?;
         let token = match out.token(h) {
             Some(t) => t,
-            None => break,
+            None => return Err("hierarchical-attention: sampler returned no token".into()),
         };
         if stop_tokens.contains(&token) {
             break;
@@ -202,7 +240,7 @@ async fn main(input: Input) -> Result<String> {
         pending = vec![token];
     }
 
-    println!("generated_tokens={}", generated.len());
+    println!("generated_tokens_total={}", generated.len());
     Ok(model.tokenizer().decode(&generated)?)
 }
 
@@ -213,6 +251,23 @@ async fn main(input: Input) -> Result<String> {
 /// Split text into chunks of at most `chunk_words` whitespace-separated words.
 /// An empty prompt yields a single empty chunk so downstream range bookkeeping
 /// always has something to point at.
+fn split_chat_prompt(prompt: &str) -> (&str, &str) {
+    prompt
+        .split_once("\n\n")
+        .unwrap_or(("You are a concise assistant.", prompt))
+}
+
+fn partition_range(start: u32, len: u32, parts: usize) -> Vec<Range> {
+    let parts = parts.max(1);
+    (0..parts)
+        .filter_map(|index| {
+            let range_start = start + len * index as u32 / parts as u32;
+            let range_end = start + len * (index + 1) as u32 / parts as u32;
+            (range_start < range_end).then(|| Range::new(range_start, range_end))
+        })
+        .collect()
+}
+
 fn split_words(text: &str, chunk_words: usize) -> Vec<String> {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
@@ -222,9 +277,14 @@ fn split_words(text: &str, chunk_words: usize) -> Vec<String> {
     words.chunks(n).map(|w| w.join(" ")).collect()
 }
 
-/// First `n` words of `text` — the stand-in "summary" for a chunk.
-fn summarize_words(text: &str, n: usize) -> String {
-    text.split_whitespace().take(n).collect::<Vec<_>>().join(" ")
+fn select_chunks(chunks: &[String], query: &str, k: usize, mode: &str) -> Result<Vec<usize>> {
+    match mode {
+        "lexical" => Ok(select_relevant_chunks(chunks, query, k)),
+        "all-visible" | "all-visible-baseline" => Ok((0..chunks.len()).collect()),
+        other => Err(format!(
+            "unsupported selection_mode {other:?}; expected lexical or all-visible-baseline"
+        )),
+    }
 }
 
 /// Pick the `k` chunks with the highest lexical overlap with `query`.
@@ -317,6 +377,31 @@ fn build_brle_mask(total: u32, ranges: &[Range]) -> Vec<u32> {
     out
 }
 
+fn build_hierarchical_masks(
+    start_position: u32,
+    pending_len: usize,
+    sink_tokens: u32,
+    summary_ranges: &[Range],
+    full_ranges: &[Range],
+    selected: &[usize],
+    local_window_tokens: u32,
+) -> Vec<Vec<u32>> {
+    let total = start_position + pending_len as u32;
+    let mut keep = vec![Range::new(0, sink_tokens.min(total))];
+    keep.extend(summary_ranges.iter().copied());
+    for &index in selected {
+        if let Some(range) = full_ranges.get(index) {
+            keep.push(*range);
+        }
+    }
+    keep.push(Range::new(total.saturating_sub(local_window_tokens), total));
+
+    // The runtime expects one full-request mask per query token. It applies
+    // each query position's causal bound after decoding the BRLE mask.
+    let mask = build_brle_mask(total, &keep);
+    vec![mask; pending_len]
+}
+
 /// Number of *attended* positions in a BRLE mask = sum of the true runs (the
 /// odd-indexed entries).
 fn mask_true_count(mask: &[u32]) -> u32 {
@@ -324,6 +409,72 @@ fn mask_true_count(mask: &[u32]) -> u32 {
 }
 
 fn fmt_ranges(ranges: &[Range]) -> String {
-    let parts: Vec<String> = ranges.iter().map(|r| format!("[{},{})", r.start, r.end)).collect();
+    let parts: Vec<String> = ranges
+        .iter()
+        .map(|r| format!("[{},{})", r.start, r.end))
+        .collect();
     format!("[{}]", parts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_chat_prompt_preserves_roles() {
+        assert_eq!(
+            split_chat_prompt("system rules\n\nuser task"),
+            ("system rules", "user task")
+        );
+        assert_eq!(
+            split_chat_prompt("user-only task"),
+            ("You are a concise assistant.", "user-only task")
+        );
+    }
+
+    #[test]
+    fn partition_range_is_contiguous_and_complete() {
+        assert_eq!(
+            partition_range(10, 10, 3),
+            vec![Range::new(10, 13), Range::new(13, 16), Range::new(16, 20)]
+        );
+    }
+
+    #[test]
+    fn partition_range_drops_empty_partitions() {
+        assert_eq!(
+            partition_range(5, 2, 4),
+            vec![Range::new(5, 6), Range::new(6, 7)]
+        );
+    }
+
+    #[test]
+    fn selection_mode_controls_visible_chunks() {
+        let chunks = vec!["alpha beta".into(), "gamma delta".into()];
+        assert_eq!(
+            select_chunks(&chunks, "gamma", 1, "lexical").unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            select_chunks(&chunks, "gamma", 1, "all-visible-baseline").unwrap(),
+            vec![0, 1]
+        );
+        assert!(select_chunks(&chunks, "gamma", 1, "unknown").is_err());
+    }
+
+    #[test]
+    fn hierarchical_prefill_masks_cover_the_full_request() {
+        let summaries = vec![Range::new(2, 4), Range::new(8, 10)];
+        let full = vec![Range::new(2, 8), Range::new(8, 14)];
+        let masks = build_hierarchical_masks(10, 3, 2, &summaries, &full, &[1], 4);
+
+        assert_eq!(masks.len(), 3);
+        assert_eq!(
+            masks
+                .iter()
+                .map(|mask| mask.iter().sum::<u32>())
+                .collect::<Vec<_>>(),
+            vec![13, 13, 13]
+        );
+    }
 }
