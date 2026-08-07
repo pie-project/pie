@@ -907,6 +907,27 @@ void kimi_k3_forward_paged(
                 // The whole layer's routing is known before any of it runs and
                 // experts page in one at a time, so say which ones are wanted
                 // now: the read for the next overlaps the GEMMs for this one.
+                //
+                // This survives the `end_batch` each iteration makes, which is
+                // the only reason a prefetch this far ahead is worth issuing.
+                // The two touch disjoint state and neither can undo the other:
+                // `prefetch` is host-only and reaches the OS page cache --
+                // `advise_will_need` on the mapped checkpoint, plus a stats
+                // counter, no slot and no pin (group_stream_cache.hpp:320-338)
+                // -- while `end_batch` is `index_.unpin_all()`, which is
+                // `for (auto& s : slots_) s.pinned = false;` and touches
+                // nothing else (group_stream_cache.hpp:342,
+                // pie_loader/group_slot_index.hpp:134-136). So the pages a
+                // prefetch pulled in stay pulled in, and the `ensure_resident`
+                // that wants them later faults against pages already there,
+                // which is what the header says the split is for.
+                //
+                // What it does not buy is unbounded depth: advising the whole
+                // routed set at once hands the kernel a queue it services at
+                // its own rate, so the experts that actually overlap are the
+                // ones near the front. That is a bound on the win, not on the
+                // correctness, and it is the same shape mixtral and qwen3_5
+                // issue their prefetch in.
                 for (int e = 0; e < E; ++e) {
                     if (routing.token_idx[static_cast<std::size_t>(e)].empty()) {
                         continue;
