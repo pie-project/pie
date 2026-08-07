@@ -489,7 +489,12 @@ class PtirInstance {
                            " chan#" + std::to_string(dense) +
                            " (global " + std::to_string(view_.global_id(dense)) +
                            "): got " + std::to_string(value.bytes.size()) +
-                           " bytes, expected " + std::to_string(expected);
+                           " bytes, expected " + std::to_string(expected) +
+                           " (declared numel=" +
+                           std::to_string(channel.type.shape.numel()) +
+                           " dtype_size=" +
+                           std::to_string(dtype_size(channel.type.dtype)) +
+                           ")";
                 }
                 return false;
             }
