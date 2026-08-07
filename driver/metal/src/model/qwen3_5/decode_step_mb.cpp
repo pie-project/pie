@@ -84,8 +84,12 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // where split-K supplies the threadgroups the wide tile gives up, and
         // this family dispatches no split -- see the comment on `qmm_split`
         // just below, which is the same reason gemma4 and gpt-oss have.
-        d.qmm_bn = qmm_bn_unsplit(out, n, qmm_min_batch(g.is_moe()));
-        d.qmm_bm = qmm_bm(n);
+        // Padded to a whole row tile: `qmm_mb_rows` explains why, and why the
+        // padding is asked for the GEMM's three questions (does a tile exist,
+        // which rung, what grid) and for nothing else in this dispatch.
+        const int qn = qmm_mb_rows(n, g.max_tokens, qmm_min_batch(g.is_moe()));
+        d.qmm_bn = qmm_bn_unsplit(out, qn, qmm_min_batch(g.is_moe()));
+        d.qmm_bm = qmm_bm(qn);
         // The second quantized set has a matvec and no GEMM: a checkpoint that
         // spares its two routing projections at 8 bits gets one extra pipeline
         // table, not an extra table of every batched shape.
@@ -122,9 +126,9 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // built, so it has no way to insert a dispatch after itself.
         d.qmm_split = 1;
         if (d.qmm_split > 1)
-            qmm_t_splitk_dispatch(out, n, d.qmm_bm, d.qmm_split, d.grid, d.tg);
+            qmm_t_splitk_dispatch(out, qn, d.qmm_bm, d.qmm_split, d.grid, d.tg);
         else if (d.qmm_bn > 0)
-            qmm_t_dispatch(out, n, d.qmm_bn, d.qmm_bm, d.grid, d.tg);
+            qmm_t_dispatch(out, qn, d.qmm_bn, d.qmm_bm, d.grid, d.tg);
         else
             qmv_mb_dispatch(out, n, d.grid, d.tg);
         return;
