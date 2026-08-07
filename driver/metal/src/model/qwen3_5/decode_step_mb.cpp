@@ -1030,6 +1030,8 @@ void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
     const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
+        // Priced by ablation, same as the prefill walk; see `kernel_ablated`.
+        if (kernel_ablated(d.kind)) continue;
         const int cast_elems = mb_fp16_cast_elems(d, mb_psos, g, n_tokens);
         // The staging cast, ahead of the GEMM that reads it. It rides the
         // GEMM's own argument table -- the source is already bound at buffer 3
