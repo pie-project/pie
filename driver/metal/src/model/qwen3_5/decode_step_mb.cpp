@@ -816,6 +816,29 @@ void encode_prefill_dags_mb(StepEncoder& se,
                         grid.x = d0.grid.x * uint32_t(n);
                     }
                     break;
+                case Kernel::QNorm:
+                case Kernel::KNorm:
+                    // `rms_mb_dispatch` lays the heads along x as
+                    // (axis_threads * n_rows); the strided form wants them as
+                    // their own dimension so the threadgroup's position carries
+                    // the (head, token) pair. tg.x IS the axis thread count, so
+                    // the head count divides out.
+                    if (d0.grid.y == 1 && d0.grid.z == 1 && d0.tg.x > 0 &&
+                        d0.grid.x % d0.tg.x == 0) {
+                        strided = mb_psos.rms_strided_head;
+                        grid = Grid{d0.tg.x, d0.grid.x / d0.tg.x, uint32_t(n)};
+                    }
+                    break;
+                case Kernel::Rope:
+                case Kernel::RopeK:
+                    // Already (half, n_heads, 1) per token, and the kernel reads
+                    // `position[m]` from the same array dag[0] points at, so the
+                    // token row is the only thing the launch has to add.
+                    if (d0.grid.z == 1) {
+                        strided = mb_psos.rope_strided;
+                        grid.z = uint32_t(n);
+                    }
+                    break;
                 case Kernel::SiluMul:
                     if (d0.grid.y == 1 && d0.grid.z == 1) {
                         strided = mb_psos.silu_mul_strided;

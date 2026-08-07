@@ -343,6 +343,9 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     if (features.strided) {
         want("rms_norm.metal", "rms_strided_row_bfloat16",
              &out.rms_strided);
+        want("rms_norm.metal", "rms_strided_head_row_bfloat16",
+             &out.rms_strided_head);
+        want("rope.metal", "rope_neox_strided_bfloat16", &out.rope_strided);
         want("silu_mul.metal", "silu_mul_strided_bfloat16",
              &out.silu_mul_strided);
     }

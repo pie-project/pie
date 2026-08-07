@@ -111,6 +111,37 @@ template <typename T>
 
 instantiate_rope_neox_mb(bfloat16, bfloat)
 
+// The prefill's variant.  `rope_neox_mb` derives its per-token stride from the
+// launch -- `n_head * head_dim`, which is the PACKED layout the batched decode
+// writes.  A prefill's scratch rows are a uniform `row_pitch` apart (the widest
+// tensor in the layout) and that is wider, so the packed stride walks into the
+// middle of the next row.  Only the row base differs; the rotation is the same
+// arithmetic, which is why both call the one body.
+template <typename T>
+[[kernel]] void rope_neox_strided(
+    device T* x                       [[buffer(0)]],
+    const device int* position        [[buffer(1)]],  // [N] per-token positions
+    const constant float& scale       [[buffer(2)]],
+    const constant float& base        [[buffer(3)]],
+    const constant int& head_dim      [[buffer(4)]],
+    const constant int& row_pitch     [[buffer(5)]],
+    uint3 pos  [[thread_position_in_grid]],
+    uint3 grid [[threads_per_grid]]) {
+  const int m = int(pos.z);
+  rope_neox_geometric_body<T>(
+      x, position[m], scale, base, head_dim, int(grid.x), int(pos.x), int(pos.y),
+      size_t(m) * size_t(row_pitch));
+}
+
+#define instantiate_rope_neox_strided(name, itype)               \
+  template [[host_name("rope_neox_strided_" #name)]]             \
+  [[kernel]] void rope_neox_strided<itype>(                      \
+      device itype*, const device int*, const constant float&,   \
+      const constant float&, const constant int&,                \
+      const constant int&, uint3, uint3);
+
+instantiate_rope_neox_strided(bfloat16, bfloat)
+
 // ── Proportional (gemma4) partial NEOX RoPE ──────────────────────────────────
 // `rope_neox_decode` infers two things from the launch: the pair offset and the
 // frequency divisor are both `grid.x` = rotary_dims/2. That is MLX's

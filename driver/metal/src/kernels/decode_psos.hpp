@@ -141,6 +141,11 @@ struct MultiBatchPsos {
     // the M=1 kernels beside them -- only the row's base address is computed
     // from the prefill layout's uniform pitch.
     Pso rms_strided{};
+    /// The per-head q/k norms, which `rms_strided` cannot take: they are
+    /// `n_heads` rows packed inside one token's row and the launch carries the
+    /// pair. See `rms_strided_head_row`.
+    Pso rms_strided_head{};
+    Pso rope_strided{};
     Pso silu_mul_strided{};
     Pso gated_rms_strided{};
     // GDN over a whole prompt in one dispatch (prep is token-parallel, the
