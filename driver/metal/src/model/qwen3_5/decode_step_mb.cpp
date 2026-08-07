@@ -236,6 +236,24 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             //     passing ones lack is REQUESTS: a fleet is 32 of them where a
             //     prefill is one.
             //
+            // A later attempt to re-open this could not get back to the bug on
+            // the reference M1 Max, and the reason is worth knowing before
+            // trying again: BATCHING TRIPLES THE SCRATCH. The sort pads every
+            // touched expert's run to a tile, so 32 lanes on this mixture is
+            // 4096 sorted rows carrying 256 real ones, and the fit term goes
+            // from 0.511 GiB of KV/state/scratch to 1.584. With 18.16 GiB of
+            // weights on a 32 GiB machine that does not admit at all -- the
+            // run dies in `fits_on_this_gpu`, not in the GEMM. Reproducing the
+            // wrong answer needs a bigger machine, and so does benefiting from
+            // the fix. `MIN_PER=0` at 16 lanes does admit and did pass its
+            // gates once, which is one observation and not a bisection.
+            //
+            // Not a reason to raise `moe_batch_min_per_expert` past 1, which
+            // is the shape of fix that suggests itself: that constant carries
+            // a measured table in `device_tuning.hpp` where 1 beats 4 by up to
+            // 132% on the families whose arm IS on. This is a qwen3.5 bug, and
+            // the crossover is not the thing that is wrong.
+            //
             // Shutting it costs a mixture's fleet decode the batched form above
             // 32 lanes and costs nothing below, because below is where the
             // matvec already ran. That is a throughput loss on one family and
