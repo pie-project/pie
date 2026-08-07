@@ -540,6 +540,11 @@ struct MetalExecutor::Impl {
     SlotHandle prefill_row_stride_{};
     SlotHandle prefill_rows_{};
     SlotHandle prefill_fp16_input_{};
+    // The batched decode stages into the same buffer the prefill does -- the
+    // two never encode in one fire and the prefill's size bounds both -- but
+    // its element counts are the fire's, so they are their own slots.
+    std::vector<SlotHandle> mb_fp16_keep_{};
+    int mb_fp16_tokens_ = 0;
     // One scan-length buffer per prompt row.  A grouped prefill carries several
     // requests, each with its own scan length, and the row's argument table is
     // what selects the segment -- so the length has to be per row too.
@@ -1310,8 +1315,15 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                 .residual = fuse_residual_,
                 .routed = g_.is_moe(),
                 .strided = true,
-                .fp16_strided = !g_.is_moe() &&
-                    g_.quant.bits == 4 && g_.quant.group == 64})) {
+                // Neither of these excludes a mixture. They both used to, on
+                // the reading that a routed checkpoint has nothing dense worth
+                // staging -- but q, k, v, o and the shared expert are ordinary
+                // dense projections whatever the FFN is, and on a device with
+                // no bfloat matrix unit they were the last GEMMs in this
+                // family still emulating one. The ROUTED projections are kept
+                // off by the tables they select, not by these flags.
+                .fp16_precast = g_.quant.bits == 4 && g_.quant.group == 64,
+                .fp16_strided = g_.quant.bits == 4 && g_.quant.group == 64})) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -1329,7 +1341,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         *static_cast<std::int32_t*>(prefill_row_stride_.contents()) =
             static_cast<std::int32_t>(scratch_widest_elems(g_));
     }
-    if (!g_.is_moe() && g_.quant.bits == 4 && g_.quant.group == 64) {
+    if (g_.quant.bits == 4 && g_.quant.group == 64) {
         prefill_fp16_input_ = ctx_->heap_alloc(
             std::size_t(std::max(1, g_.max_tokens)) *
             std::size_t(scratch_widest_elems(g_)) * sizeof(std::uint16_t));
@@ -2382,12 +2394,21 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         bind_token_consts(*ctx_, fire_dag, g_, schedule.N);
         mb_bound_tokens_ = schedule.N;
     }
+    // The FP16 staging buffer and, next to it, the element count the cast
+    // kernel walks. The count is the only thing here that depends on the
+    // fire's width, so it is rebound when the width moves and left alone when
+    // a serving loop settles.
+    if (prefill_fp16_input_.valid() && mb_fp16_tokens_ != schedule.N) {
+        bind_mb_fp16_qmm(*ctx_, fire_dag, g_, schedule.N, prefill_fp16_input_,
+                         mb_fp16_keep_);
+        mb_fp16_tokens_ = schedule.N;
+    }
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.pre_forward) callbacks.pre_forward(se);
         }
-        encode_decode_step_mb(se, fire_dag, psos_, mb_psos_, force_barriers_);
+        encode_decode_step_mb(se, fire_dag, psos_, mb_psos_, force_barriers_, &g_, schedule.N);
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);

@@ -1771,7 +1771,7 @@ METAL_FUNC void qmm_t_aligned_impl(
 }
 
 template <typename P, int group_size, int bits, int BM, int BK, int BN,
-          bool WITH_BIAS = false>
+          bool WITH_BIAS = false, bool WITH_RESIDUAL = false>
 METAL_FUNC void qmm_t_fp16_precast_impl(
     const device uint32_t* w,
     const device bfloat* scales,
@@ -1803,7 +1803,7 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   scales += y_col * K_g;
   biases += y_col * K_g;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, false, WITH_BIAS>(
+  qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS>(
       x, y, bias, Xs, Ws, K, N, k_len,
       tid, simd_gid, simd_lid, loader_w);
 }
@@ -1863,6 +1863,38 @@ template <int group_size, int bits, int BM, int BK, int BN>
   threadgroup half Ws[BN * BK_padded];
   qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN, true>(
       w, scales, biases, x, y, bias, Xs, Ws, K, K, N, tid, simd_gid, simd_lid);
+}
+
+/// The same GEMM adding the layer's residual row to its output.
+///
+/// Buffer 7 again, which the BF16 `affine_qmm_t_aligned_residual` already uses
+/// for the same pointer -- so a family that had one has the other for free.
+/// The epilogue is not the bias's: a residual is per-ROW and the accumulator
+/// is not, so `qmm_t_loaded_impl` stores, fences and reads back, where the
+/// bias folds into the store. Both are its code and neither is repeated here.
+///
+/// qwen3.5's fused-residual projections are 28% of its batched decode, and
+/// without this they were the half of that path still on the emulated BF16
+/// matrix unit while the other half had moved.
+template <int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_residual_fp16_precast(
+    const device uint32_t* w [[buffer(0)]],
+    const device bfloat* scales [[buffer(1)]],
+    const device bfloat* biases [[buffer(2)]],
+    device bfloat* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const device bfloat* residual [[buffer(7)]],
+    const device half* x [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN, false, true>(
+      w, scales, biases, x, y, residual, Xs, Ws, K, K, N, tid, simd_gid,
+      simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
@@ -2277,6 +2309,24 @@ instantiate_qmm_t_fp16_precast(64, 64)
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
       device bfloat*, const constant int&, const constant int&,              \
       const device bfloat*, const device half*, uint3, uint, uint);
+
+#define instantiate_qmm_t_residual_fp16_precast(bm, bn)                      \
+  template [[host_name("affine_qmm_t_residual_fp16_precast_bfloat16"         \
+                       "_gs_64_b_4_bm_" #bm "_bn_" #bn)]]                    \
+  [[kernel]] void affine_qmm_t_residual_fp16_precast<64, 4, bm, 32, bn>(     \
+      const device uint32_t*, const device bfloat*, const device bfloat*,    \
+      device bfloat*, const constant int&, const constant int&,              \
+      const device bfloat*, const device half*, uint3, uint, uint);
+
+instantiate_qmm_t_residual_fp16_precast(16, 16)
+instantiate_qmm_t_residual_fp16_precast(16, 32)
+instantiate_qmm_t_residual_fp16_precast(16, 64)
+instantiate_qmm_t_residual_fp16_precast(32, 16)
+instantiate_qmm_t_residual_fp16_precast(32, 32)
+instantiate_qmm_t_residual_fp16_precast(32, 64)
+instantiate_qmm_t_residual_fp16_precast(64, 16)
+instantiate_qmm_t_residual_fp16_precast(64, 32)
+instantiate_qmm_t_residual_fp16_precast(64, 64)
 
 instantiate_qmm_t_bias_fp16_precast(16, 16)
 instantiate_qmm_t_bias_fp16_precast(16, 32)

@@ -88,6 +88,10 @@ struct MultiBatchPsos {
     // native and BF16 MMA is markedly slower.
     Pso qmm_t_fp16_precast[3][3]{};
     Pso qmm_t_residual[3][3]{};
+    /// The residual counterpart of `qmm_t_fp16_precast`. A family whose
+    /// projections fuse the residual add had half its batched GEMM on the
+    /// emulated matrix path until this existed.
+    Pso qmm_t_residual_fp16_precast[3][3]{};
     /// The same GEMM with a Linear's additive bias broadcast down the tile.
     /// gpt-oss biases every projection, so without it the batched path is a
     /// GEMM plus a dispatch that rewrites the whole output to add one vector.

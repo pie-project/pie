@@ -321,7 +321,8 @@ bool barrier_after_mb(const std::vector<Dispatch>& dag, size_t i,
     return run_ends[i] == int(i);
 }
 
-Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb) {
+Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
+           bool fp16_ok = true) {
     switch (d.kind) {
         case Kernel::EmbedUntied:
         case Kernel::EmbedGather: return mb.embed_mb;
@@ -354,6 +355,14 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
                 const int wide = wide_;
+                // FP16 first, where the tables exist. Storage and every
+                // neighbouring kernel stay BF16; what changes is that the MMA
+                // is an instruction on this device rather than a sequence the
+                // compiler writes to stand in for one.
+                const Pso& fp16 = d.fuse_residual
+                                      ? mb.qmm_t_residual_fp16_precast[wide][slot]
+                                      : mb.qmm_t_fp16_precast[wide][slot];
+                if (fp16_ok && fp16.valid() && mb.qmm_cast_bf16_f16.valid()) return fp16;
                 const Pso& gemm = d.fuse_residual ? mb.qmm_t_residual[wide][slot]
                                                   : mb.qmm_t[wide][slot];
                 if (gemm.valid()) return gemm;
@@ -361,6 +370,29 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
             return d.fuse_residual ? base.qmv_residual : base[d.kind];
         }
     }
+}
+
+/// The number of elements this dispatch's staging cast has to write, or 0
+/// where it has none.
+///
+/// The one predicate: `mb_pso` is told FP16 is available exactly when this
+/// answers nonzero, so the kernel that reads the staged copy cannot be
+/// selected in a fire that did not write one.
+int mb_fp16_cast_elems(const Dispatch& d, const MultiBatchPsos& mb,
+                       const DecodeGeometry* g, int n_tokens) {
+    if (g == nullptr || d.qmm_bn <= 0 || d.qmm_split > 1) return 0;
+    if (!mb.qmm_cast_bf16_f16.valid()) return 0;
+    if (is_routed_group(d.kind)) return 0;
+    const int wide = qmm_bm_slot(d.qmm_bm);
+    const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
+    const Pso& fp16 = d.fuse_residual ? mb.qmm_t_residual_fp16_precast[wide][slot]
+                                      : mb.qmm_t_fp16_precast[wide][slot];
+    if (!fp16.valid()) return 0;
+    const int K = int(qmv_kn(d.kind, *g).K);
+    if (K <= 0) return 0;
+    // The padded row count, matching what the host bound at buffer 13 and what
+    // the GEMM's row tiles actually read.
+    return qmm_mb_rows(n_tokens, g->max_tokens, qmm_min_batch(g->is_moe())) * K;
 }
 
 inline void bind_slot(RawMetalContext& ctx, int ord, uint8_t idx, const SlotHandle& slot) {
@@ -846,11 +878,28 @@ void encode_prefill_dags_mb(StepEncoder& se,
 
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
-                           bool force_barriers) {
+                           bool force_barriers, const DecodeGeometry* g, int n_tokens) {
     const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
-        se.set_pso(mb_pso(d, base_psos, mb_psos));
+        const int cast_elems = mb_fp16_cast_elems(d, mb_psos, g, n_tokens);
+        // The staging cast, ahead of the GEMM that reads it. It rides the
+        // GEMM's own argument table -- the source is already bound at buffer 3
+        // -- so it needs no DAG entry, and the barrier after it is what makes
+        // the cast visible to the tile loader.
+        //
+        // Per projection rather than grouped: a batched decode produces each
+        // value in the dispatch immediately before its consumer, so there is no
+        // window in which several are simultaneously final and nothing to
+        // group. It touches n*K elements against a GEMM that reads them N/BN
+        // times over.
+        if (cast_elems > 0) {
+            se.set_pso(mb_psos.qmm_cast_bf16_f16);
+            se.set_argtable(d.kind, d.ordinal);
+            se.dispatch(Grid{std::uint32_t(cast_elems), 1, 1}, Threadgroup{256, 1, 1});
+            se.barrier();
+        }
+        se.set_pso(mb_pso(d, base_psos, mb_psos, cast_elems > 0));
         se.set_argtable(d.kind, d.ordinal);
         se.dispatch(d.grid, d.tg);
         // Arm B of the interleaved A/B is a CONTROL by default: identical to
