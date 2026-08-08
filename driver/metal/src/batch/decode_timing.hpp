@@ -35,6 +35,23 @@ namespace pie::metal {
 // Human-readable kernel name (for the attribution report / charlie's dump tags).
 const char* kernel_name(Kernel k);
 
+/// Whether `PIE_METAL_ABLATE` names this kind, so the encoder should SKIP it.
+///
+/// A measurement tool, and the only one that prices a kernel correctly. The
+/// dispatch trace cannot: it charges every dispatch its whole wall interval,
+/// so kernels that overlap are each billed for the same time and their shares
+/// sum to far more than the fire costs. Only a kind a barrier isolates has a
+/// share that is also a serial cost. Ablation sidesteps all of that -- drop the
+/// dispatch, keep the wall clock, and the difference is what the kind cost --
+/// at the price of a wrong answer, which is why this is a benchmarking knob and
+/// says so loudly when it is on.
+///
+/// Comma-separated `kernel_name` values, e.g. `PIE_METAL_ABLATE=sdpa_paged`.
+/// Read once. Two separate investigations have now had to hand-roll this by
+/// editing the encoder, which is a patch that cannot be reviewed and does not
+/// survive the session that made it.
+bool kernel_ablated(Kernel k);
+
 // One dispatch's attributed GPU time.
 struct DispatchAttribution {
     int    ordinal = 0;

@@ -397,17 +397,33 @@ template <typename T>
     wb(v_off + hv_idx * Dv + dv);
 }
 
-// A sum across the 16 lanes that own one dv row.  The xor tree stays inside the
-// aligned 16-lane half, so the simdgroup's two rows reduce independently.
-METAL_FUNC float gdn_row_sum16(float v) {
+// A sum across the LANES lanes that own one dv row.  The xor tree stays inside
+// the aligned LANES-wide slice, so the simdgroup's rows reduce independently.
+template <int LANES>
+METAL_FUNC float gdn_row_sum(float v) {
   v += simd_shuffle_xor(v, 1u);
-  v += simd_shuffle_xor(v, 2u);
-  v += simd_shuffle_xor(v, 4u);
-  v += simd_shuffle_xor(v, 8u);
+  if (LANES >= 4) v += simd_shuffle_xor(v, 2u);
+  if (LANES >= 8) v += simd_shuffle_xor(v, 4u);
+  if (LANES >= 16) v += simd_shuffle_xor(v, 8u);
+  if (LANES >= 32) v += simd_shuffle_xor(v, 16u);
   return v;
 }
 
-template <typename T>
+// VROWS is how many dv rows one lane group walks, and it exists because of what
+// the LANES sweep found and did not explain. Every simdgroup re-reads the WHOLE
+// q and k row for its head, once a token, and there are Dv/(32/LANES) of them
+// per head -- 64 on Qwen3.6-27B, so a layer's scan pulls 402 MB of q/k where
+// the tensors are 6 MB. Narrowing LANES amortizes that, but it pays for it
+// twice over: `n_per_t` is Dk/LANES, so halving the lanes DOUBLES st[], q[] and
+// k[] together, and the occupancy that was hiding the load latency goes before
+// the amortization arrives. That is why 8 lanes measured 7% slower than 16.
+//
+// VROWS buys the same amortization without the same bill: q and k stay
+// `Dk/LANES` long whatever it is, and only st[] grows. At LANES=16 the register
+// cost of VROWS=4 equals that of LANES=4 while reading a quarter as much
+// instead of half. The V reductions are independent, so they also give the
+// simdgroup something to interleave.
+template <typename T, int LANES, int VROWS = 1>
 [[kernel]] void gdn_core_recurrent_prefill(
     device float* rstate [[buffer(2)]], device T* core_out [[buffer(3)]],
     const device float* pre_q [[buffer(6)]], const device float* pre_k [[buffer(7)]],
@@ -416,53 +432,68 @@ template <typename T>
     constant int& row_pitch [[buffer(12)]], constant int& n_scan [[buffer(13)]],
     uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
   const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv;
-  // Two dv rows share a simdgroup.  Dropping the two per-token reductions from
-  // 32 lanes to 16 takes them from five shuffle rounds to four, and gives the
-  // simdgroup a second independent chain to interleave against the first --
-  // which is what this loop is short of: with the reductions removed entirely
-  // the kernel measured less than half its time, so it is waiting on them, not
-  // on arithmetic (7% of ALU peak) and not on bandwidth (staging q/k in
-  // threadgroup memory made it slower).  The dispatch halves grid.y to match.
+  // LANES lanes own one dv row, so 32/LANES rows share a simdgroup.  The scan
+  // is latency-bound on its two per-token reductions and on nothing else --
+  // with them removed the kernel measured less than half its time, against 7%
+  // of ALU peak and a bandwidth cost that got WORSE when q/k were staged in
+  // threadgroup memory.  Narrowing a row costs nothing and pays twice: the xor
+  // tree loses a round, and the simdgroup gains another independent chain to
+  // interleave against the first.  The dispatch divides grid.y to match.
+  constexpr int ROWS = 32 / LANES;
+  constexpr int MAX_PER_T = 128 / LANES;
   const int hv_idx = int(tpig.z);
-  const int dv_idx = int(tpig.y) * 2 + (int(tpig.x) >> 4);
-  const int dk_idx = int(tpig.x) & 15;
-  const int slot = int(slot_ids[0]), n_per_t = Dk / 16;
+  const int dv_base = (int(tpig.y) * ROWS + (int(tpig.x) / LANES)) * VROWS;
+  const int dk_idx = int(tpig.x) % LANES;
+  const int slot = int(slot_ids[0]), n_per_t = Dk / LANES;
   const size_t pitch_f = size_t(row_pitch) / 2;
   const bool row_lead = dk_idx == 0;
-  if (dv_idx >= Dv) return;
+  if (dv_base >= Dv) return;
+  // A Dv the rows do not divide leaves the last group short; the spare rows are
+  // masked rather than clamped, because clamping would make two lane groups own
+  // the same state row and the scan is a read-modify-write.
+  const int vn = min(VROWS, Dv - dv_base);
 
   // This simdgroup owns the whole (slot, hv, dv) state row, so the scan runs in
   // registers with no ordering beyond the loop itself.
-  device float* i_state = rstate + (size_t((slot * Hv + hv_idx) * Dv + dv_idx) * Dk);
-  float st[8];
-  for (int i = 0; i < n_per_t; ++i) st[i] = i_state[n_per_t * dk_idx + i];
+  device float* i_state = rstate + (size_t((slot * Hv + hv_idx) * Dv + dv_base) * Dk);
+  float st[VROWS][MAX_PER_T];
+  for (int v = 0; v < vn; ++v)
+    for (int i = 0; i < n_per_t; ++i)
+      st[v][i] = i_state[size_t(v) * Dk + n_per_t * dk_idx + i];
 
   for (int t = 0; t < n_scan; ++t) {
     const size_t row_t = size_t(t) * size_t(row_pitch);
-    const float vval =
-        pre_gate[size_t(t) * pitch_f + 2 * size_t(Hv) +
-                 size_t(hv_idx) * Dv + dv_idx];
-
+    const device float* iv = pre_gate + size_t(t) * pitch_f + 2 * size_t(Hv) +
+                             size_t(hv_idx) * Dv + dv_base;
+    // Read once for all VROWS rows: this is the whole point of the parameter.
     const device float* iq = pre_q + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
     const device float* ik = pre_k + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
     const device float* g = pre_gate + size_t(t) * pitch_f + 2 * size_t(hv_idx);
-    float q[8], k[8];
+    float q[MAX_PER_T], k[MAX_PER_T];
     for (int i = 0; i < n_per_t; ++i) {
       const int d = n_per_t * dk_idx + i;
       q[i] = iq[d];
       k[i] = ik[d];
     }
-    float kv_mem = 0.0f;
-    for (int i = 0; i < n_per_t; ++i) { st[i] *= g[0]; kv_mem += st[i] * k[i]; }
-    kv_mem = gdn_row_sum16(kv_mem);
-    const float delta = (vval - kv_mem) * g[1];
-    float out = 0.0f;
-    for (int i = 0; i < n_per_t; ++i) { st[i] += k[i] * delta; out += st[i] * q[i]; }
-    out = gdn_row_sum16(out);
-    if (row_lead)
-      core_out[row_t + size_t(hv_idx) * Dv + dv_idx] = static_cast<T>(out);
+    const float ga = g[0], gb = g[1];
+    float kv_mem[VROWS];
+    for (int v = 0; v < vn; ++v) {
+      float acc = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) { st[v][i] *= ga; acc += st[v][i] * k[i]; }
+      kv_mem[v] = gdn_row_sum<LANES>(acc);
+    }
+    for (int v = 0; v < vn; ++v) {
+      const float delta = (iv[v] - kv_mem[v]) * gb;
+      float out = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) { st[v][i] += k[i] * delta; out += st[v][i] * q[i]; }
+      out = gdn_row_sum<LANES>(out);
+      if (row_lead)
+        core_out[row_t + size_t(hv_idx) * Dv + dv_base + v] = static_cast<T>(out);
+    }
   }
-  for (int i = 0; i < n_per_t; ++i) i_state[n_per_t * dk_idx + i] = st[i];
+  for (int v = 0; v < vn; ++v)
+    for (int i = 0; i < n_per_t; ++i)
+      i_state[size_t(v) * Dk + n_per_t * dk_idx + i] = st[v][i];
 }
 
 #define instantiate_gdn_prefill(name, itype)                                    \
@@ -472,12 +503,24 @@ template <typename T>
       const device itype*, const device float*, const device itype*,            \
       const device itype*, const device itype*, device float*, device float*,   \
       device float*, device float*, constant GdnCoreParams&, const device uint*,\
-      constant int&, constant int&, uint3, uint);                               \
-  template [[host_name("gdn_core_recurrent_prefill_" #name)]] [[kernel]] void   \
-  gdn_core_recurrent_prefill<itype>(                                            \
+      constant int&, constant int&, uint3, uint);
+
+#define instantiate_gdn_scan(name, itype, lanes, vrows)                         \
+  template [[host_name("gdn_core_recurrent_prefill_" #name "_l_" #lanes         \
+                       "_v_" #vrows)]]                                          \
+  [[kernel]] void gdn_core_recurrent_prefill<itype, lanes, vrows>(              \
       device float*, device itype*, const device float*, const device float*,   \
       const device float*,                                                     \
       constant GdnCoreParams&, const device uint*, constant int&, constant int&,\
       uint3, uint);
 
 instantiate_gdn_prefill(bfloat16, bfloat)
+instantiate_gdn_scan(bfloat16, bfloat, 16, 1)
+instantiate_gdn_scan(bfloat16, bfloat, 16, 2)
+instantiate_gdn_scan(bfloat16, bfloat, 16, 4)
+instantiate_gdn_scan(bfloat16, bfloat, 8, 1)
+instantiate_gdn_scan(bfloat16, bfloat, 8, 2)
+instantiate_gdn_scan(bfloat16, bfloat, 4, 1)
+instantiate_gdn_scan(bfloat16, bfloat, 32, 2)
+instantiate_gdn_scan(bfloat16, bfloat, 32, 4)
+instantiate_gdn_scan(bfloat16, bfloat, 32, 8)

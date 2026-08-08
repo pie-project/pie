@@ -81,6 +81,11 @@ int main(int argc, char** argv) {
     const int SPLIT = argc > 4 ? atoi(argv[4]) : 1;
     const bool COLD = getenv("PROBE_COLD") != nullptr;
     const int BM = getenv("PROBE_BM") ? atoi(getenv("PROBE_BM")) : 16;
+    // Warp shape. The default 2x2 is 128 threads; a suffixed variant spreads
+    // the same tile over eight simdgroups, which is the occupancy question.
+    const char* WSUF = getenv("PROBE_WSUF") ? getenv("PROBE_WSUF") : "";
+    const int WM = getenv("PROBE_WM") ? atoi(getenv("PROBE_WM")) : 2;
+    const int WN = getenv("PROBE_WN") ? atoi(getenv("PROBE_WN")) : 2;
 
     auto ctx = RawMetalContext::create(/*heap_bytes=*/3072ull << 20);
     if (!ctx) { printf("FAIL: no context\n"); return 1; }
@@ -94,7 +99,7 @@ int main(int argc, char** argv) {
     Pso qmm = ctx->compile_pso_from_file(
         dir + "/quantized_qmm_t.metal",
         "affine_qmm_t_bfloat16_gs_64_b_4_bm_" + std::to_string(BM) + "_bn_" +
-            std::to_string(BN), &err);
+            std::to_string(BN) + WSUF, &err);
     if (!qmm.valid()) { printf("FAIL qmm compile: %s\n", err.c_str()); return 1; }
     Pso qmv = ctx->compile_pso_from_file(dir + "/quantized_qmv.metal",
                                          "affine_qmv_fast_bfloat16_gs_64_b_4", &err);
@@ -219,8 +224,9 @@ int main(int argc, char** argv) {
             pso = qmm;
             const uint32_t rows = uint32_t((M + BM - 1) / BM * BM);
             if (N % uint32_t(BN) != 0) { printf("  %s: N %% BN != 0\n", s.label); continue; }
-            g = Grid{32u * (N / uint32_t(BN)), 2u * (rows / uint32_t(BM)), 2};
-            tg = Threadgroup{32, 2, 2};
+            g = Grid{32u * (N / uint32_t(BN)), uint32_t(WM) * (rows / uint32_t(BM)),
+                     uint32_t(WN)};
+            tg = Threadgroup{32, uint32_t(WM), uint32_t(WN)};
         }
         double ms;
         if (SPLIT > 1) {

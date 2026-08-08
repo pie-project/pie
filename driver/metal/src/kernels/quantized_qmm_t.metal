@@ -1380,6 +1380,18 @@ inline constexpr short get_bytes_per_pack() {
 
 
 // ── quantized.h dequantize ──
+//
+// Priced before optimising it, because a 4-bit GEMM that looked like 53% of
+// this GPU's peak invited the theory that unpacking was eating the other half.
+// It is not, and the 53% was also the wrong fraction -- a pure fp16 GEMM with
+// no quantization measures 6.32 TFLOP/s at this model's shape (M=128, K=N=5120)
+// and 7.27 at its best, so 5.6 is 89% of what the hardware gives anyone, not
+// 53% of an fp32 ALU peak no GEMM reaches. See finding 15 in the bench wiki.
+//
+// Unpacking itself: one Ws tile is BN*BK elements at three ops each -- an AND,
+// a multiply and an add, with the nibble shift folded into `scale / 16` rather
+// than issued -- against BM*BN*BK*2 flops of MMA over the same tile. That is
+// 3 / (2 * BM), or 2.3% at BM = 64. Deleting dequantization outright buys 2.3%.
 template <typename U, int N, int bits, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
@@ -1595,7 +1607,7 @@ struct QuantizedBlockLoader {
 // row pitches, K span, and epilogue; every exported variant keeps the same
 // unsafe full-tile contract and therefore the same hot loop.
 template <typename T, typename P, typename LoaderW, int BM, int BK, int BN,
-          bool WITH_RESIDUAL, bool WITH_BIAS>
+          bool WITH_RESIDUAL, bool WITH_BIAS, int WM = 2, int WN = 2>
 METAL_FUNC void qmm_t_loaded_impl(
     const device T* x,
     device P* y,
@@ -1609,8 +1621,6 @@ METAL_FUNC void qmm_t_loaded_impl(
     uint simd_gid,
     uint simd_lid,
     thread LoaderW& loader_w) {
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   constexpr int BK_padded = BK + 16 / sizeof(T);
   using mma_t = mlx::steel::
       BlockMMA<T, P, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
@@ -1638,6 +1648,14 @@ METAL_FUNC void qmm_t_loaded_impl(
   // hand-pipelining one threadgroup does not pay for the two it evicted. The
   // loss shrinks with row count (-7.5%, -7.2%, -1.4%) exactly as that story
   // predicts. Not a tuning knob: there is no shape here where it wins.
+  //
+  // This also settles THE TWO FENCES below, which read like separate targets
+  // and are not. The first guards WAR (last iteration's `mma` still reading
+  // Xs/Ws) and the second RAW (this iteration's loads not landed yet), and
+  // the only way to drop the first is to give the next tile its own buffer --
+  // which is the double buffering the table above already priced and lost. A
+  // fence here is not a latency to remove; it is what lets three threadgroups
+  // share a core, and that sharing is worth more than the stall it costs.
   for (int k = 0; k < k_len; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     loader_x.load_unsafe();
@@ -1672,8 +1690,71 @@ METAL_FUNC void qmm_t_loaded_impl(
   }
 }
 
+/// The same loop, staged to HALF when the device has no bfloat matrix unit.
+///
+/// A separate implementation and not a flag on the one above, because the two
+/// differ in the x loader and the comment on `BlockLoaderCast` explains why
+/// that is not a degenerate case of `BlockLoader`: the same-type path copies
+/// whole `ReadVector`s and would lose that copy if it had to convert. What is
+/// shared is everything that could drift -- the tile shape, the double-fence
+/// K loop, the epilogue -- which is the same argument `affine_qmm_t_routed`
+/// makes for being an entry point rather than an implementation.
+///
+/// Both callers are ROUTED. Nothing here is routing-aware: the expert is
+/// already folded into the weight pointers the caller constructs, and `x` and
+/// `y` are contiguous in the sorted order `moe_route_sort` produced. The dense
+/// projections take a different road to the same instruction -- see
+/// `qmm_t_fp16_precast_impl`, which stages the activations once in a separate
+/// dispatch instead of converting each x tile N/BN times. That road is not
+/// open here: the sorted buffer is written by a kernel whose row count only
+/// the GPU knows, and paying the conversion per tile is what MXFP4 measured
+/// as worth it anyway.
+template <typename T, typename LoaderW, int BM, int BK, int BN, bool WITH_BIAS>
+METAL_FUNC void qmm_t_cast_loaded_impl(
+    const device T* x,
+    device T* y,
+    const device T* bias,
+    threadgroup half* Xs,
+    threadgroup half* Ws,
+    const int K,
+    const int N,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid,
+    thread LoaderW& loader_w) {
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  using loader_x_t = mlx::steel::
+      BlockLoaderCast<T, half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using mma_t = mlx::steel::
+      BlockMMA<half, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+
+  const int y_row = int(tid.y) * BM;
+  const int y_col = int(tid.x) * BN;
+
+  loader_x_t loader_x(x + size_t(y_row) * size_t(K), K, Xs, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  device T* yp = y + size_t(y_row) * size_t(N) + y_col;
+  if (WITH_BIAS) {
+    mma_op.store_result_bias(yp, N, bias);
+  } else {
+    mma_op.store_result(yp, N);
+  }
+}
+
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
-          bool WITH_RESIDUAL, bool WITH_BIAS = false>
+          bool WITH_RESIDUAL, bool WITH_BIAS = false, int WM = 2, int WN = 2>
 METAL_FUNC void qmm_t_aligned_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1692,7 +1773,7 @@ METAL_FUNC void qmm_t_aligned_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -1703,17 +1784,20 @@ METAL_FUNC void qmm_t_aligned_impl(
   scales += y_col * K_g;
   biases += y_col * K_g;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS>(
+  qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS,
+                    WM, WN>(
       x, y, residual, Xs, Ws, K, N, K, tid, simd_gid, simd_lid, loader_w);
 }
 
-template <typename P, int group_size, int bits, int BM, int BK, int BN>
+template <typename P, int group_size, int bits, int BM, int BK, int BN,
+          bool WITH_BIAS = false, bool WITH_RESIDUAL = false>
 METAL_FUNC void qmm_t_fp16_precast_impl(
     const device uint32_t* w,
     const device bfloat* scales,
     const device bfloat* biases,
     const device half* x,
     device P* y,
+    const device P* bias,
     threadgroup half* Xs,
     threadgroup half* Ws,
     const constant int& K,
@@ -1738,8 +1822,8 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   scales += y_col * K_g;
   biases += y_col * K_g;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, false, false>(
-      x, y, nullptr, Xs, Ws, K, N, k_len,
+  qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS>(
+      x, y, bias, Xs, Ws, K, N, k_len,
       tid, simd_gid, simd_lid, loader_w);
 }
 
@@ -1770,7 +1854,66 @@ template <int group_size, int bits, int BM, int BK, int BN>
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN>(
-      w, scales, biases, x, y, Xs, Ws, K, K, N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, (const device bfloat*)nullptr, Xs, Ws, K, K, N,
+      tid, simd_gid, simd_lid);
+}
+
+/// The same GEMM with the projection's additive bias folded into the store.
+///
+/// gpt-oss biases every dense projection, so the plain precast kernel could
+/// not serve it: the bias would have needed a second pass over the output
+/// tile, which is exactly the trip `store_result_bias` exists to avoid. Buffer
+/// 7 is `bind::GoQmv::Bias`, already bound there by the matvec this replaces.
+template <int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_bias_fp16_precast(
+    const device uint32_t* w [[buffer(0)]],
+    const device bfloat* scales [[buffer(1)]],
+    const device bfloat* biases [[buffer(2)]],
+    device bfloat* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const device bfloat* bias [[buffer(7)]],
+    const device half* x [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN, true>(
+      w, scales, biases, x, y, bias, Xs, Ws, K, K, N, tid, simd_gid, simd_lid);
+}
+
+/// The same GEMM adding the layer's residual row to its output.
+///
+/// Buffer 7 again, which the BF16 `affine_qmm_t_aligned_residual` already uses
+/// for the same pointer -- so a family that had one has the other for free.
+/// The epilogue is not the bias's: a residual is per-ROW and the accumulator
+/// is not, so `qmm_t_loaded_impl` stores, fences and reads back, where the
+/// bias folds into the store. Both are its code and neither is repeated here.
+///
+/// qwen3.5's fused-residual projections are 28% of its batched decode, and
+/// without this they were the half of that path still on the emulated BF16
+/// matrix unit while the other half had moved.
+template <int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_residual_fp16_precast(
+    const device uint32_t* w [[buffer(0)]],
+    const device bfloat* scales [[buffer(1)]],
+    const device bfloat* biases [[buffer(2)]],
+    device bfloat* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const device bfloat* residual [[buffer(7)]],
+    const device half* x [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN, false, true>(
+      w, scales, biases, x, y, residual, Xs, Ws, K, K, N, tid, simd_gid,
+      simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
@@ -1795,7 +1938,8 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       w, scales, biases, x, y, bias, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, int BM, int BK, int BN>
+template <typename T, int group_size, int bits, int BM, int BK, int BN,
+          int WM = 2, int WN = 2>
 [[kernel]] void affine_qmm_t_aligned(
     const device uint32_t* w   [[buffer(0)]],
     const device T* scales     [[buffer(1)]],
@@ -1810,7 +1954,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
-  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false>(
+  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false, false, WM, WN>(
       w, scales, biases, x, y, nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
@@ -1882,11 +2026,12 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 /// its own expert and no further, which at two tiles an expert is a reuse of
 /// two.
 ///
-/// So the remaining gap to a dense prefill is that reuse and one other thing:
-/// the input cannot be staged to FP16. Not for the reason first written here --
-/// see `llama_bench`'s gpt-oss row, whose answers turn out not to be mlx-lm's
-/// either -- but because under FP16 this checkpoint tracks mlx-lm for two
-/// tokens where BF16 tracks it for four.
+/// So the remaining gap to a dense prefill is that reuse. The other thing it
+/// used to be -- that the input could not be staged to FP16 -- is no longer
+/// true of the kernel below it: `mxfp4_qmm_t_routed_bias` stages both tiles to
+/// half, and `affine_qmm_t_routed_fp16` does the same for this format. What
+/// keeps a model on THIS kernel is `fp16_qmm` saying no, which llama's routed
+/// projections do because their next-layer top-k moved under FP16.
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
 [[kernel]] void affine_qmm_t_routed(
     const device uint32_t* w   [[buffer(0)]],
@@ -1924,6 +2069,69 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       simd_gid, simd_lid);
 }
 
+/// The routed affine matmul with the tiles and the MMA in HALF.
+///
+/// Same buffers, same grid, same `tile_expert` contract as the kernel above --
+/// the host picks between them by NAME and changes nothing else. That is the
+/// point: a routed GEMM's argument table is shared with the routed matvec, so
+/// a variant that needed a different binding would have to be threaded through
+/// the decode path as well for no reason.
+///
+/// The checkpoint and the output stay bfloat. Only the two threadgroup tiles
+/// and the matrix instruction are half, which on a device without a native
+/// bfloat matrix unit is the difference between an emulated sequence and one
+/// instruction -- about 40% on the GEMM, measured on the dense projections
+/// (see `gemma4_fp16_qmm`). The weight loader converts for free: it has to
+/// dequantize into threadgroup memory anyway, so asking it for `half` costs
+/// nothing over asking it for `bfloat`.
+///
+/// gemma-4-26b-a4b spends 47.9% of a 512-row prefill in the BF16 form of this
+/// kernel, which is the largest single term in that model's prefill and the
+/// reason this exists.
+///
+/// Correctness is the host's call and not the kernel's: `fp16_qmm` gates it,
+/// and llama keeps its routed projections on the BF16 kernel because a routed
+/// model's next-layer top-k moved under FP16 in `llama_numerics_test`.
+template <typename T, int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_routed_fp16(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& K      [[buffer(5)]],
+    const constant int& N      [[buffer(6)]],
+    const device int* tile_expert [[buffer(12)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  const int e = tile_expert[tid.y];
+  if (e < 0) return;
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits, half>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_col = int(tid.x) * BN;
+  const size_t w_bytes = size_t(e) * size_t(N) * size_t(K) *
+                         size_t(bytes_per_pack) / size_t(pack_factor);
+  const size_t g_off = size_t(e) * size_t(N) * size_t(K_g);
+
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  loader_w_t loader_w(
+      (const device uint8_t*)w + w_bytes + size_t(y_col) * size_t(K_w),
+      scales + g_off + size_t(y_col) * size_t(K_g),
+      biases + g_off + size_t(y_col) * size_t(K_g), K, Ws, simd_gid, simd_lid);
+  qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, false>(
+      x, y, (const device T*)nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid,
+      loader_w);
+}
+
 template <typename T, int BM, int BK, int BN>
 [[kernel]] void mxfp4_qmm_t_routed_bias(
     const device uint32_t* w [[buffer(0)]],
@@ -1950,44 +2158,20 @@ template <typename T, int BM, int BK, int BN>
 
   // The tiles and the MMA are HALF while the checkpoint and the output stay
   // bfloat, which is the same trick `fp16_qmm` plays on the DENSE projections
-  // and the largest single win in this driver -- about 40% on the GEMM. It was
-  // never extended to the routed mixture, and gpt-oss is the only model here
-  // whose prefill is mostly routed MXFP4, which is exactly where llama.cpp was
-  // ahead.
+  // and the largest single win in this driver -- about 40% on the GEMM. The
+  // MXFP4 loader gets it cheapest of all: it has to decode into threadgroup
+  // memory anyway, so asking it for `half` instead of `bfloat` is free.
   //
-  // Nothing is precast. The dense path stages a half copy of the activations
-  // in a separate dispatch because its input is a plain activation row; here
-  // the weight loader already materialises every value (MXFP4 has to be
-  // decoded anyway, so asking it for `half` instead of `bfloat` is free), and
-  // the x tile is converted once on the way into threadgroup memory rather
-  // than on every MMA read of it.
+  // The loop and the epilogue are shared with `affine_qmm_t_routed_fp16`; only
+  // the weight loader differs.
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   using loader_w_t =
       mlx::steel::Mxfp4BlockLoader<T, BN, BK, BK_padded, 1, tgp_size, half>;
-  using loader_x_t = mlx::steel::
-      BlockLoaderCast<T, half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  using mma_t = mlx::steel::
-      BlockMMA<half, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
-
-  const int y_row = int(tid.y) * BM;
   loader_w_t loader_w(wb, sb, K, Ws, simd_gid, simd_lid);
-  loader_x_t loader_x(x + size_t(y_row) * size_t(K), K, Xs, simd_gid, simd_lid);
-  mma_t mma_op(simd_gid, simd_lid);
-  for (int k = 0; k < K; k += BK) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    loader_x.load_unsafe();
-    loader_w.load_unsafe();
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mma_op.mma(Xs, Ws);
-    loader_x.next();
-    loader_w.next();
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  mma_op.store_result_bias(y + size_t(y_row) * size_t(N) + y_col, N,
-                           bias + size_t(e) * N + y_col);
+  qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, true>(
+      x, y, bias + size_t(e) * size_t(N) + y_col, Xs, Ws, K, N, tid, simd_gid,
+      simd_lid, loader_w);
 }
 
 #define instantiate_qmm_t(gs, bm, bk, bn, b)                                          \
@@ -2099,6 +2283,27 @@ instantiate_mxfp4_qmm_t_routed(64, 16)
 instantiate_mxfp4_qmm_t_routed(64, 32)
 instantiate_mxfp4_qmm_t_routed(64, 64)
 
+// Only g64/b4, which is what `fp16_qmm` gates on: an 8-bit routed bank has no
+// FP16 pipeline anywhere in this driver, and instantiating one here would cost
+// every load the compile without a caller.
+#define instantiate_qmm_t_routed_fp16(bm, bn)                                 \
+  template [[host_name("affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_"      \
+                       #bm "_bn_" #bn)]]                                      \
+  [[kernel]] void affine_qmm_t_routed_fp16<bfloat, 64, 4, bm, 32, bn>(        \
+      const device uint32_t*, const device bfloat*, const device bfloat*,     \
+      const device bfloat*, device bfloat*, const constant int&,              \
+      const constant int&, const device int*, uint3, uint, uint);
+
+instantiate_qmm_t_routed_fp16(16, 16)
+instantiate_qmm_t_routed_fp16(16, 32)
+instantiate_qmm_t_routed_fp16(16, 64)
+instantiate_qmm_t_routed_fp16(32, 16)
+instantiate_qmm_t_routed_fp16(32, 32)
+instantiate_qmm_t_routed_fp16(32, 64)
+instantiate_qmm_t_routed_fp16(64, 16)
+instantiate_qmm_t_routed_fp16(64, 32)
+instantiate_qmm_t_routed_fp16(64, 64)
+
 #define instantiate_qmm_t_fp16_precast(bm, bn)                              \
   template [[host_name("affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_"   \
                        #bm "_bn_" #bn)]]                                     \
@@ -2116,6 +2321,42 @@ instantiate_qmm_t_fp16_precast(32, 64)
 instantiate_qmm_t_fp16_precast(64, 16)
 instantiate_qmm_t_fp16_precast(64, 32)
 instantiate_qmm_t_fp16_precast(64, 64)
+
+#define instantiate_qmm_t_bias_fp16_precast(bm, bn)                          \
+  template [[host_name("affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4"   \
+                       "_bm_" #bm "_bn_" #bn)]]                              \
+  [[kernel]] void affine_qmm_t_bias_fp16_precast<64, 4, bm, 32, bn>(         \
+      const device uint32_t*, const device bfloat*, const device bfloat*,    \
+      device bfloat*, const constant int&, const constant int&,              \
+      const device bfloat*, const device half*, uint3, uint, uint);
+
+#define instantiate_qmm_t_residual_fp16_precast(bm, bn)                      \
+  template [[host_name("affine_qmm_t_residual_fp16_precast_bfloat16"         \
+                       "_gs_64_b_4_bm_" #bm "_bn_" #bn)]]                    \
+  [[kernel]] void affine_qmm_t_residual_fp16_precast<64, 4, bm, 32, bn>(     \
+      const device uint32_t*, const device bfloat*, const device bfloat*,    \
+      device bfloat*, const constant int&, const constant int&,              \
+      const device bfloat*, const device half*, uint3, uint, uint);
+
+instantiate_qmm_t_residual_fp16_precast(16, 16)
+instantiate_qmm_t_residual_fp16_precast(16, 32)
+instantiate_qmm_t_residual_fp16_precast(16, 64)
+instantiate_qmm_t_residual_fp16_precast(32, 16)
+instantiate_qmm_t_residual_fp16_precast(32, 32)
+instantiate_qmm_t_residual_fp16_precast(32, 64)
+instantiate_qmm_t_residual_fp16_precast(64, 16)
+instantiate_qmm_t_residual_fp16_precast(64, 32)
+instantiate_qmm_t_residual_fp16_precast(64, 64)
+
+instantiate_qmm_t_bias_fp16_precast(16, 16)
+instantiate_qmm_t_bias_fp16_precast(16, 32)
+instantiate_qmm_t_bias_fp16_precast(16, 64)
+instantiate_qmm_t_bias_fp16_precast(32, 16)
+instantiate_qmm_t_bias_fp16_precast(32, 32)
+instantiate_qmm_t_bias_fp16_precast(32, 64)
+instantiate_qmm_t_bias_fp16_precast(64, 16)
+instantiate_qmm_t_bias_fp16_precast(64, 32)
+instantiate_qmm_t_bias_fp16_precast(64, 64)
 
 // ── Strided form, for the prefill ────────────────────────────────────────────
 // Identical to the aligned kernel above except that the row pitch of `x`, `y`
@@ -2310,6 +2551,12 @@ instantiate_qmm_t_strided(128, 32, 32, 32, 4)
 instantiate_qmm_t_strided(64, 32, 32, 32, 8)
 instantiate_qmm_t_strided(32, 32, 32, 32, 8)
 instantiate_qmm_t_strided(128, 32, 32, 32, 8)
+instantiate_qmm_t_strided(64, 64, 32, 32, 4)
+instantiate_qmm_t_strided(32, 64, 32, 32, 4)
+instantiate_qmm_t_strided(128, 64, 32, 32, 4)
+instantiate_qmm_t_strided(64, 64, 32, 32, 8)
+instantiate_qmm_t_strided(32, 64, 32, 32, 8)
+instantiate_qmm_t_strided(128, 64, 32, 32, 8)
 
 #define instantiate_qmm_t_strided_fp16_precast(bm, residual, name)           \
   template [[host_name("affine_qmm_t_strided_fp16_precast" name              \
@@ -2324,6 +2571,8 @@ instantiate_qmm_t_strided_fp16_precast(16, false, "")
 instantiate_qmm_t_strided_fp16_precast(32, false, "")
 instantiate_qmm_t_strided_fp16_precast(16, true, "_residual")
 instantiate_qmm_t_strided_fp16_precast(32, true, "_residual")
+instantiate_qmm_t_strided_fp16_precast(64, false, "")
+instantiate_qmm_t_strided_fp16_precast(64, true, "_residual")
 
 template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
 [[kernel]] void affine_qmv_wide_strided(
@@ -2390,16 +2639,25 @@ template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
   }
 }
 
-#define instantiate_qmv_wide_strided(v, kl)                                  \
-  template [[host_name("affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_" #v   \
+#define instantiate_qmv_wide_strided(b, v, kl)                               \
+  template [[host_name("affine_qmv_wide_strided_bfloat16_gs_64_b_" #b "_v_" #v \
                        "_kl_" #kl)]]                                         \
-  [[kernel]] void affine_qmv_wide_strided<bfloat, 64, 4, v, kl>(            \
+  [[kernel]] void affine_qmv_wide_strided<bfloat, 64, b, v, kl>(            \
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
       const device bfloat*, device bfloat*, const constant int&,             \
       const constant int&, const constant int&, const constant int&,         \
       uint3, uint, uint);
 
-instantiate_qmv_wide_strided(4, 8)
+instantiate_qmv_wide_strided(4, 4, 8)
+// The 8-bit twin, for a checkpoint that spares individual tensors from the
+// model-wide format. mlx-lm's quantization predicate can single out a tensor by
+// NAME, and Qwen3.6-35B-A3B's build leaves the MoE router and the shared
+// expert's gate at 8 bits while everything else is 4. Those two kinds had no
+// batched shape to run in, so a prefill fell back to ONE MATVEC PER TOKEN for
+// them -- 40 layers times two kinds times every row -- and that was the single
+// largest line in the profile. The kernel body is parametric in `bits`; only
+// the instantiation was missing.
+instantiate_qmv_wide_strided(8, 4, 8)
 
 
 // Split-K's affine-loader adapter. The common loop runs `k_len` columns from
@@ -2460,10 +2718,33 @@ METAL_FUNC void qmm_t_splitk_impl(
 // quarter of the parallelism they had room for.
 //
 // Each threadgroup takes one K partition and writes its own [M, N] slice; the
-// reduce below sums the slices. Most projections use bf16 partials because the
-// side-buffer traffic is otherwise a visible second pass over the output. The
-// V projection uses the float instantiation: rounding each partition there
-// moved a routed model's next-layer top-k choice in llama_numerics_test.
+// reduce below sums the slices, in float, whatever the partials are stored as.
+//
+// The partials are FLOAT for every projection, and that is a correctness
+// requirement rather than a preference. A bfloat partial carries seven mantissa
+// bits, so each partition's accumulated dot product is rounded to about 0.4%
+// before anything sums it, and the error on the total is that times
+// `sum|p_i| / |sum p_i|` -- the cancellation factor. For a projection whose
+// partitions largely cancel, which is the ordinary case for an attention
+// output, that factor is one to two orders of magnitude and the split GEMM
+// simply returns a different answer from the unsplit one.
+//
+// It shipped with bf16 partials for every kind but V, on the reading that the
+// side-buffer traffic is otherwise a visible second pass over the output and
+// that V was special because rounding it "moved a routed model's next-layer
+// top-k choice in llama_numerics_test". V was not special. It was the first
+// place the effect was large enough to cross a gate. The others cross it too:
+// `llama_numerics_test`'s eight-row mixture diverges at layer 1's O projection
+// at 0.0999 rel_l2 against a 0.06 tolerance, and a sixteen-wide llama-1b fleet
+// generates visibly wrong text -- both only once the batch is wide enough to
+// take this kernel at all, which is why lowering the GEMM crossover is what
+// exposed it rather than what caused it.
+//
+// The traffic the bf16 partials were saving is real and is now paid in full.
+// It is `split_k * M * N` extra bytes written and read once each, against a
+// GEMM that reads `M * K * N / BN`; measured end to end it is inside the
+// run-to-run spread on every checkpoint here.
+//
 // The K sum is reassociated into `split_k` contiguous blocks -- pairwise rather
 // than strictly sequential, which is the better-conditioned order, but it does
 // mean this is not bit-identical to the unsplit kernel.
@@ -2532,8 +2813,8 @@ template <typename P, int group_size, int bits, int BM, int BK, int BN>
   y += int64_t(tid.z) * split_k_partition_stride;
 
   qmm_t_fp16_precast_impl<P, group_size, bits, BM, BK, BN>(
-      (const device uint32_t*)wl, scales, biases, x, y, Xs, Ws, K,
-      k_partition_size, N, tid, simd_gid, simd_lid);
+      (const device uint32_t*)wl, scales, biases, x, y, (const device P*)nullptr,
+      Xs, Ws, K, k_partition_size, N, tid, simd_gid, simd_lid);
 }
 
 // Sum the split_k slices and write the activation type, folding in the block
@@ -2615,3 +2896,75 @@ template [[host_name("qmm_splitk_reduce_f32_bfloat16")]] [[kernel]] void
 qmm_splitk_reduce<bfloat, float>(
     device bfloat*, const constant int&, const device float*,
     const constant int&, const constant int&, uint2);
+
+// Warp-shape variants, kept for `roofline_probe`'s PROBE_WM/PROBE_WN.
+//
+// The K loop's note says occupancy is how this GPU hides the kernel's latency,
+// and at 128 threads a threadgroup only three fit on a core. A 256-thread
+// threadgroup puts twice the threads there for the same threadgroup memory and
+// the same sixteen accumulators a lane already holds, so it is the one shape
+// argument the tile sweep never tested. It loses. M=1024, M1 Max, GFLOP/s over
+// the checkpoint's projections:
+//
+//     BM=64  BN=32  2x2  (128 thr)   4530   the shipping shape
+//     BM=64  BN=64  2x4  (256 thr)   4090   -9.7%
+//     BM=128 BN=32  4x2  (256 thr)   4470   -1.3%
+//
+// Fewer, fatter threadgroups is what it minds, which is the same thing BN=64
+// says in the model (104.6 vs 107.2 tok/s) from the other direction. These two
+// are instantiated and not dispatched ON PURPOSE: the sweep that closes an
+// axis is worth as much as the one that opens it, and the next person to
+// suspect occupancy should be able to re-run it rather than re-derive it.
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 64, 2, 4>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 128, 32, 32, 4, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+// The other direction, which the note above argues for and never tested. If
+// "fewer, fatter threadgroups is what it minds" then 128 threads is not the
+// floor of that argument -- 64 is. A 2x1 or 1x2 warp shape halves the
+// threadgroup at the same tile, so six fit on a core where three do, and a
+// standalone `matmul2d` sweep at this checkpoint's prefill shape (M=128,
+// K=N=5120) does put its best arm at two simdgroups: 6.33 TFLOP/s against
+// 6.29 at four and 3.23 at eight.
+//
+// IT LOSES, and it loses to the cost the argument predicted. A lane holds
+// TM*TN*2 accumulator fragments and halving the simdgroups doubles one of TM
+// or TN, so 16 becomes 32 and the registers give back what the threadgroup
+// count won. `roofline_probe <kernels> 128 32`, M1 Max, whole-step TFLOP/s:
+//
+//     BM=64  2x2  (128 thr)   3.88   the shipping shape
+//     BM=64  2x1  ( 64 thr)   3.61   -7.0%
+//     BM=64  1x2  ( 64 thr)   3.58   -7.7%
+//     BM=32  1x2  ( 64 thr)   3.34   -13.9%
+//
+// So the occupancy axis is now closed in BOTH directions around 2x2 -- eight
+// simdgroups is -9.7% by the table above, two is -7.0% by this one. That is
+// worth more than either arm winning would have been: it means the shipping
+// warp shape is a peak and not a default nobody questioned. Kept instantiated
+// and undispatched, like the 256-thread pair, so the next person to have this
+// idea can re-run it in a minute instead of re-deriving it.
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 32, 2, 1>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 32, 1, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 32, 32, 32, 1, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);

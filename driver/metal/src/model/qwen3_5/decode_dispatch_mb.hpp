@@ -31,6 +31,8 @@ namespace pie::metal {
 // exactly qmv_dispatch (the sealed M=1 fast path). out%8==0 holds for every qwen3.6 projection.
 inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
     // Rounded UP, for the reason `qmv_dispatch` gives.
+    // The 4 is `results_per_simdgroup` in `quantized_qmv.metal`, which was swept
+    // and is at a peak in both directions -- see the table there before moving it.
     g  = Grid{32u * uint32_t(N), (uint32_t(out_vec) + 3u) / 4u, 1};
     tg = Threadgroup{32, 2, 1};
 }
@@ -205,6 +207,14 @@ inline int qmm_bn_unsplit(int out_vec, int N, int min_batch) {
     const int bm = qmm_bm(N);
     if (N < min_batch || N % bm != 0 || out_vec % 16 != 0) return 0;
     const int row_tiles = N / bm;
+    // BN=64 was tried here and does not pay on the batched DECODE, which is
+    // the only shape this function serves: Qwen3.6-27B on an M4 Pro measured
+    // 42.3 / 72.4 tok/s at 8 and 16 lanes against 43.0 / 73.4 at BN=32, and
+    // BN=16 -- which doubles the threadgroup count -- is 20% WORSE (33.6 /
+    // 63.3). More threadgroups losing that badly is the finding: a decode fire
+    // is one row tile, so BN does not change how many times a weight is
+    // dequantized, and what it does change is how much of `x` each threadgroup
+    // re-reads. 32 is the middle this shape wants.
     if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= qmm_bn_crossover_tg_value())
         return 32;
     return 16;
@@ -285,9 +295,15 @@ inline void qmm_splitk_reduce_dispatch(int out_vec, int N, Grid& g, Threadgroup&
 // weight thirty-two times.
 inline int qmm_strided_bm(int padded_rows) {
     static const bool off = std::getenv("PIE_METAL_NO_PREFILL_BM32") != nullptr;
-    // The strided form is instantiated as a narrow/wide PAIR, not over
-    // `kQmmBMs`, so it stops at 32 whatever the aligned table grew to.
-    return (!off && padded_rows >= 32) ? 32 : kQmmBM;
+    // 128 was instantiated and measured and is not here: Qwen3.6-27B prefill
+    // gives 103.0 tok/s at 128 rows against 64's 104.5, and 106.5 against 106.7
+    // at 512. A 128-row block is 12.8 KiB of threadgroup memory against 64's
+    // 7.7, which takes a core from four resident threadgroups to two -- and
+    // overlapping one threadgroup's weight read with another's MMA is the only
+    // thing hiding either, per the note in `qmm_t_loaded_impl`. Halving the
+    // dequantizations does not pay for it. The rung stops here.
+    if (off) return kQmmBM;
+    return padded_rows >= 64 ? 64 : (padded_rows >= 32 ? 32 : kQmmBM);
 }
 
 inline int qmm_strided_rows(int N, int max_rows) {
@@ -296,11 +312,50 @@ inline int qmm_strided_rows(int N, int max_rows) {
     return padded <= max_rows ? padded : 0;
 }
 
-inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, Grid& g,
+/// `bm` is passed rather than recomputed: the encoder may have had to narrow it
+/// to a rung whose pipeline exists, and the grid is the ONLY thing that tells
+/// this kernel how many rows it has.
+inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, int bm, Grid& g,
                                    Threadgroup& tg) {
     g  = Grid{32u * (uint32_t(out_vec) / 32u),
-              2u * (uint32_t(padded_rows) / uint32_t(qmm_strided_bm(padded_rows))), 2};
+              2u * (uint32_t(padded_rows) / uint32_t(bm > 0 ? bm : kQmmBM)), 2};
     tg = Threadgroup{32, 2, 2};
+}
+
+/// Rows the BATCHED DECODE launches its dense GEMM over, for a fire of `n`.
+///
+/// The kernel takes no `M`. It is written for full tiles only -- see the header
+/// of `quantized_qmm_t.metal` -- so the driver may select it only when
+/// `M % BM == 0`, and the row count reaches it through the grid. Handing it the
+/// raw fire width therefore made the GEMM reachable at EXACT MULTIPLES OF A
+/// RUNG AND NOWHERE ELSE, which for a decode is almost never: measured on
+/// Qwen3.6-27B, a device that affords 24 recurrent slots ran 75.6 tok/s at 16
+/// lanes and 30-32 at 2, 4, 6, 8, 12, 20 and 24 -- a flat curve with one spike,
+/// because 16 was the only width that divided a rung. Six times the lanes
+/// bought nothing.
+///
+/// So pad the fire up to its rung, which is what every other caller of this
+/// GEMM already does -- the prefill in `qmm_strided_rows` just above, and
+/// llama's `llama_qmm_rows`. The padding is free of consequence for the same
+/// reason theirs is: the scratch pool holds `max_tokens` rows token-major, so
+/// rows `n .. padded-1` land in slots the fire does not read and compute
+/// discardable values, rather than the kernel needing a bounds-checked inner
+/// loop. A GEMM row's output depends only on its own input row, so garbage in
+/// the tail cannot reach a real one.
+///
+/// Two guards, both of which fall back to the unpadded width (and so to the
+/// matvec, since it will not divide a rung):
+///   * `n < min_batch` -- padding must not be able to talk the dispatch past
+///     the measured crossover. A 2-row fire padded to 16 would launch eight
+///     times the arithmetic it needs.
+///   * `padded > max_tokens` -- the pool is only that deep, and a wider write
+///     would run into the next activation's slot.
+inline int qmm_mb_rows(int n, int max_tokens, int min_batch) {
+    const int rows = n < 1 ? 1 : n;
+    if (rows < min_batch) return rows;
+    const int bm = qmm_bm(rows);
+    const int padded = ((rows + bm - 1) / bm) * bm;
+    return padded <= (max_tokens < 1 ? 1 : max_tokens) ? padded : rows;
 }
 
 inline void qmm_t_dispatch(int out_vec, int N, int bn, int bm, Grid& g, Threadgroup& tg) {
@@ -395,6 +450,21 @@ inline void sdpa_paged_tiled_dispatch(int n_q_heads, int N, Grid& g, Threadgroup
     const uint32_t tiles = uint32_t((N + kSdpaQueryTile - 1) / kSdpaQueryTile);
     g  = Grid{uint32_t(n_q_heads) * 1024u, tiles < 1u ? 1u : tiles, 1};
     tg = Threadgroup{1024, 1, 1};
+}
+
+// The head widths `sdpa_paged_mma.metal` is instantiated for. The matrix path
+// stages three tiles of KT*D halves in 32 KB of threadgroup memory, which is
+// what bounds the list: adding a width means choosing its KT there first.
+inline constexpr int kSdpaMmaHeadDim = 64;
+
+// sdpa_paged_mma: the same tile of `kSdpaQueryTile` rows, but a simdgroup owns
+// EIGHT of them and multiplies 8x8 fragments, so the threadgroup is 128 threads
+// rather than 1024. Same grid otherwise -- the tile height is what the grid
+// describes, and that has not moved.
+inline void sdpa_paged_mma_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) {
+    const uint32_t tiles = uint32_t((N + kSdpaQueryTile - 1) / kSdpaQueryTile);
+    g  = Grid{uint32_t(n_q_heads) * 128u, tiles < 1u ? 1u : tiles, 1};
+    tg = Threadgroup{128, 1, 1};
 }
 
 // kv_append (paged, delta's kernel): one thread per (channel, kv_head, token). grid=

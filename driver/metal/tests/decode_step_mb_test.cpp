@@ -161,7 +161,7 @@ int main() {
         bind_scratch(*ctx, prefill[t], prefill_sched, scratch.data(), int(scratch.size()),
                      t * scratch_row);
         bind_decode_consts(*ctx, prefill[t], g, 4096, true);
-        bind_prefill_gdn_state(*ctx, b, prefill[t], uint32_t(t & 1), (t & 1) == 0);
+        bind_gdn_conv_parity(*ctx, b, prefill[t], (t & 1) == 0);
     }
 
     bool all_bound = true;
@@ -278,7 +278,13 @@ int main() {
         // spelled its routed BM as a literal 16 while everything around it
         // spelled it from the constant, and nothing noticed until the constant
         // moved.
-        bool gemm_bm_matches_sort = false;
+        //
+        // A family may run the whole mixture as matvecs -- qwen3.5's decode
+        // does, see `qwen35_routed_decode_batched` -- and then there is no tile
+        // to agree about and nothing here to check. Start true and let a
+        // disagreeing tile falsify it, rather than requiring a tile to exist:
+        // the padding is only wrong when something reads it.
+        bool gemm_bm_matches_sort = true;
         for (const Dispatch& d : moe_dag) {
             if (d.kind != Kernel::LlExpertGate && d.kind != Kernel::LlExpertUp &&
                 d.kind != Kernel::LlExpertDown) {

@@ -120,12 +120,17 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::uint8_t>& row_needs_logits = {},
                             const DecodeGeometry* geometry = nullptr,
                             int max_rows = 0,
-                            const std::vector<GdnScanSegment>& gdn_scans = {});
+                            const std::vector<GdnScanSegment>& gdn_scans = {},
+                            /// The same table in the checkpoint's alternate
+                            /// affine format, or null when it has none. Only
+                            /// `qmv_wide_strided` is read from it.
+                            const MultiBatchPsos* mb_alt_psos = nullptr);
 
-// Point ConvStateOut at ConvState so a paged decode shifts the conv history in
-// place; the prefill re-binds its own ordinals per fire and is unaffected.
-void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
-                                 const std::vector<Dispatch>& dag);
+// Point the GDN pair's conv ping-pong at one of its two halves: `even` binds
+// `conv_state` in and `conv_state_out` out, false the reverse. The halves may
+// not be aliased -- see the definition.
+void bind_gdn_conv_parity(RawMetalContext& ctx, const BoundDecode& b,
+                          const std::vector<Dispatch>& dag, bool even);
 
 // Interleaved A/B.  This machine is permanently contended -- the agent process
 // alone runs at ~250% CPU and macOS daemons spike on top of it -- so the same
@@ -140,12 +145,13 @@ bool ab_all_barriers();
 bool ab_arm();
 void ab_set_arm(bool b);
 
+// `g` and `n_tokens` are what the FP16 staging cast needs to size itself, and
+// passing them is what enables it: a caller that leaves them out gets the BF16
+// GEMM, which is correct at any width and merely slower where a matrix unit
+// would have applied.
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
-                           bool force_barriers = false);
-
-void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
-                            const std::vector<Dispatch>& dag, uint32_t slot,
-                            bool even);
+                           bool force_barriers = false,
+                           const DecodeGeometry* g = nullptr, int n_tokens = 0);
 
 }  // namespace pie::metal

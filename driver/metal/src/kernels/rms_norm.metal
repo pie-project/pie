@@ -114,6 +114,45 @@ template <typename T, int N_READS>
 
 instantiate_rms_strided_row(bfloat16, bfloat, 4)
 
+// The per-HEAD norms (q/k) over a whole prompt.  `rms_strided_row` cannot take
+// these: a token holds `n_rows` of them packed `axis_size` apart, and the next
+// token is a uniform `row_pitch` away, so the row base is two-level and the
+// single grid dimension it walks cannot carry both terms.
+//
+// Rather than pass `n_rows`, the launch carries it: grid is (axis_threads,
+// n_rows, N) so the threadgroup's own position IS the (head, token) pair. That
+// keeps the argument table identical to `rms_strided_row`'s -- same buffer 4,
+// same pitch value the other prefill kernels already bind.
+template <typename T, int N_READS>
+[[kernel]] void rms_strided_head_row(
+    const device T* x          [[buffer(0)]],
+    const device T* w          [[buffer(1)]],
+    device T* out              [[buffer(2)]],
+    constant RmsParams& p      [[buffer(3)]],
+    constant int& row_pitch    [[buffer(4)]],
+    // All three position attributes are uint3: Metal rejects a signature that
+    // mixes scalar and vector ones, and this kernel needs the threadgroup's
+    // full 3-D position to carry the (head, token) pair.
+    uint3 gid                  [[threadgroup_position_in_grid]],
+    uint3 lid                  [[thread_position_in_threadgroup]],
+    uint simd_lane             [[thread_index_in_simdgroup]],
+    uint simd_group            [[simdgroup_index_in_threadgroup]],
+    uint3 tg_size              [[threads_per_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  rms_row_body<T, N_READS>(
+      x, w, out, p,
+      size_t(gid.z) * size_t(row_pitch) + size_t(gid.y) * p.axis_size,
+      inv_rms, partials, lid.x, simd_lane, simd_group, tg_size.x);
+}
+
+#define instantiate_rms_strided_head_row(name, itype, n_reads)         \
+  template [[host_name("rms_strided_head_row_" #name)]] [[kernel]] void \
+  rms_strided_head_row<itype, n_reads>(                                 \
+      const device itype*, const device itype*, device itype*,          \
+      constant RmsParams&, constant int&, uint3, uint3, uint, uint, uint3);
+
+instantiate_rms_strided_head_row(bfloat16, bfloat, 4)
+
 #define instantiate_rms_single_row(name, itype, n_reads)               \
   template [[host_name("rms_single_row_" #name)]] [[kernel]] void       \
   rms_single_row<itype, n_reads>(                                       \

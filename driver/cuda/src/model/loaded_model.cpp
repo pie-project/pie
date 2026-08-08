@@ -204,7 +204,7 @@ LoadedModel LoadedModel::load(
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
     const bool mxfp4_native_gemm =
-        device_supports_native_mxfp4_moe(dev_prop.major);
+        native_mxfp4_moe_enabled(dev_prop.major);
 
     // Compile the plan for *this* device. The driver states what the device can
     // do and the loader answers with a plan that stays inside it, so there is

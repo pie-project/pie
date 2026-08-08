@@ -21,6 +21,7 @@
 #include "kernels/deinterleave.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
+#include "kernels/gemv.hpp"
 #include "kernels/residual_add.hpp"
 #include "kernels/kv_paged.hpp"
 #include "kernels/moe_dispatch.hpp"
@@ -55,6 +56,12 @@ struct MixtralPhaseProfile {
     cudaEvent_t a{}, b{};
     double attn = 0, router = 0, moe_gate_up = 0, moe_down = 0;
     double o_proj = 0, epilogue = 0;
+    double moe_align = 0, moe_act = 0, moe_reduce = 0, moe_prep = 0;
+    // The whole fire, so `sum` is always readable against what it explains.
+    // Without it a stage that is not instrumented is invisible rather than
+    // merely unattributed, and `sum` reads like a step time -- which is how
+    // the uninstrumented Marlin MoE was once mistaken for a host-side stall.
+    double fire = 0;
     int last_N = 0;
 
     // Intervals may nest, so opens are held on a stack and each close pairs
@@ -82,6 +89,7 @@ struct MixtralPhaseProfile {
         }
         const std::size_t i = used++;
         last_stream = stream;
+        have_stream = true;
         CUDA_CHECK(cudaEventRecord(pool[i], stream));
         return i;
     }
@@ -97,10 +105,24 @@ struct MixtralPhaseProfile {
         span_dst.push_back(o.dst);
     }
     cudaStream_t last_stream{};
+    // Whether `last_stream` has been set. Not `last_stream != nullptr`: the
+    // null stream is a real stream and is the one this forward runs on, so
+    // testing the handle made the teardown sweep below a no-op here -- any
+    // span left open simply never resolved, and its counter printed 0.000
+    // rather than reporting that it was never closed.
+    bool have_stream = false;
+    // Spans the teardown sweep had to close. A stage closed by the sweep did
+    // not measure itself -- it measured from its open to the end of the fire,
+    // which is wall clock, not the stage -- so its number is reported as
+    // unclosed rather than passed off as a duration.
+    std::size_t swept = 0;
     void resolve() {
         // A fire has several exits, so anything still open at teardown is
         // closed here rather than at each of them.
-        while (!stack.empty() && last_stream) close(last_stream);
+        while (!stack.empty() && have_stream) {
+            ++swept;
+            close(last_stream);
+        }
         if (used == 0) return;
         CUDA_CHECK(cudaEventSynchronize(pool[used - 1]));
         for (std::size_t i = 0; i < spans.size(); ++i) {
@@ -128,9 +150,26 @@ struct MixtralPhaseProfile {
             // gpt-oss's decode shape that remainder is the largest single
             // item left.
             "[MX-PROF] N=%d attn=%.3f o_proj=%.3f router=%.3f "
-            "moe_gate_up=%.3f moe_down=%.3f | sum=%.3f ms\n",
+            "moe_gate_up=%.3f moe_down=%.3f align=%.3f act=%.3f "
+            "reduce=%.3f prep=%.3f epi=%.3f | sum=%.3f fire=%.3f "
+            "unattributed=%.3f ms\n",
             last_N, attn, o_proj, router, moe_gate_up, moe_down,
-            attn + o_proj + router + moe_gate_up + moe_down + epilogue);
+            moe_align, moe_act, moe_reduce, moe_prep, epilogue,
+            attn + o_proj + router + moe_gate_up + moe_down + moe_align +
+            moe_act + moe_reduce + moe_prep + epilogue,
+            fire,
+            fire - (attn + o_proj + router + moe_gate_up + moe_down +
+                    moe_align + moe_act + moe_reduce + moe_prep + epilogue));
+        if (swept > 1) {
+            // One is `fire` itself, which is opened to be swept. More than
+            // that means a stage boundary opened without closing its
+            // predecessor, so the totals above double-count and `sum` will
+            // exceed `fire`.
+            std::fprintf(stderr,
+                "[MX-PROF] %zu stage span(s) were left open and closed at "
+                "teardown; their totals measure to the end of the fire, not "
+                "the stage\n", swept - 1);
+        }
         cudaEventDestroy(a);
         cudaEventDestroy(b);
         for (cudaEvent_t e : pool) cudaEventDestroy(e);
@@ -164,6 +203,16 @@ bool mxfp4_moe_grouped_choice(int routes, int num_experts) {
 //   N=128 per-route 2.745  grouped 1.735  marlin 0.146
 // At N=32 that is 1274 GB/s of weight traffic, i.e. the kernel is finally
 // bandwidth-bound instead of unpack-bound.
+// Rows below which the routed GEMV beats Marlin; see the table at the use.
+int mxfp4_marlin_moe_min_tokens() {
+    static const int n = [] {
+        const char* v = std::getenv("PIE_MXFP4_MARLIN_MOE_MIN_TOKENS");
+        const int parsed = (v != nullptr) ? std::atoi(v) : 8;
+        return parsed > 0 ? parsed : 8;
+    }();
+    return n;
+}
+
 bool mxfp4_marlin_moe_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_MXFP4_MARLIN_MOE");
@@ -348,6 +397,9 @@ void mixtral_forward_paged(
     if (prof.enabled) {
         CUDA_CHECK(cudaEventCreate(&prof.a));
         CUDA_CHECK(cudaEventCreate(&prof.b));
+        // Outermost span: `resolve()` closes whatever is still open at
+        // teardown, so this pairs with every exit the fire has.
+        prof.open(&prof.fire, stream);
     }
     const bool any_sinks = [&]{
         for (const auto& L : w.layers) {
@@ -576,9 +628,28 @@ void mixtral_forward_paged(
         w.layers[0].experts[0].format ==
             MixtralExpertWeightFormat::Mxfp4NativeGemm &&
         w.layers[0].experts[0].w_gate_mxfp4 != nullptr;
+    // Marlin wins by tiling weights across many rows of A, so it needs rows.
+    // At one token there are none to amortise over and its own microbench
+    // (`driver/cuda/bench/moe_bench.cu`, gpt-oss shape, H100) says so plainly:
+    //
+    //   N       1       8      32
+    //   route   0.0223  0.1231  0.4612   ms
+    //   marlin  0.0442  0.1044  0.1764
+    //
+    // -- it loses by 2x at N=1, crosses over around 6, and is 2.6x ahead by 32.
+    // In the model the same shape holds: single-stream decode measured MoE at
+    // 2.52 ms through Marlin against 1.30 through the routed GEMV, and 197 vs
+    // 253 tok/s end to end. Both paths read the same native slabs, so this is
+    // a per-fire choice, and `N` is part of the batch shape a captured graph is
+    // keyed on, so it is safe to make one.
     const bool use_marlin_moe =
         marlin_native_slabs && mxfp4_marlin_moe_enabled() &&
-        w.mxfp4_intermediate_padded > 0;
+        w.mxfp4_intermediate_padded > 0 &&
+        // ...but only stand aside for the routed GEMV when there IS one. When
+        // the weights arrive Marlin-only the alternative is not the GEMV, it is
+        // the materializing path, which is an order of magnitude worse than
+        // either (25 tok/s against 197).
+        (N >= mxfp4_marlin_moe_min_tokens() || !mxfp4_decode_gemv_available);
 #else
     constexpr bool use_marlin_moe = false;
 #endif
@@ -669,6 +740,23 @@ void mixtral_forward_paged(
         // Bias folded into the projection: at decode these route to the
         // warp-per-row GEMV, whose epilogue absorbs it for free. gpt-oss
         // biases all three, so this is 3 launches per layer removed.
+        // At one token the three projections share an activation and differ
+        // only in row count, and issuing them separately leaves k and v -- 512
+        // rows against q's 4096 -- alone on a device they cannot fill. One
+        // launch over the concatenated grid moves the same bytes and lets them
+        // ride q's occupancy. Only at N=1: above that the GEMM has rows of its
+        // own to work with and cuBLAS is the better answer.
+        const bool fused_qkv_gemv =
+            N == 1 &&
+            kernels::launch_gemv3_bf16(
+                layer.q_proj->data(), layer.k_proj->data(),
+                layer.v_proj->data(),
+                layer.q_bias ? layer.q_bias->data() : nullptr,
+                layer.k_bias ? layer.k_bias->data() : nullptr,
+                layer.v_bias ? layer.v_bias->data() : nullptr,
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                ws.norm_x.data(), Hq, Hk, Hk, H, stream);
+        if (!fused_qkv_gemv) {
         ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
             ws.norm_x.data(), layer.q_proj->data(),
             layer.q_bias ? layer.q_bias->data() : nullptr,
@@ -681,6 +769,7 @@ void mixtral_forward_paged(
             ws.norm_x.data(), layer.v_proj->data(),
             layer.v_bias ? layer.v_bias->data() : nullptr,
             ws.v.data(), N, Hk, H, stream);
+        }
 
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
@@ -789,11 +878,13 @@ void mixtral_forward_paged(
         // residual-add into y. o_bias (replicated; e.g. GPT-OSS) only goes
         // in once on the leader so the all-reduce sums it exactly once.
         if (T == 1) {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
-                N, H, Hq, /*beta=*/1.f);
-            if (layer.o_bias) kernels::launch_add_bias_bf16(
-                ws.y.data(), layer.o_bias->data(), N, H, stream);
+            // beta = 1 accumulates into the residual and the bias rides the
+            // same epilogue, so what used to be a GEMM plus an `add_bias` plus
+            // a `residual_add` is one kernel.
+            ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+                ws.attn_out.data(), layer.o_proj->data(),
+                layer.o_bias ? layer.o_bias->data() : nullptr,
+                ws.y.data(), N, H, Hq, stream, /*beta=*/1.f);
         } else {
             ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
                 ws.attn_out.data(), layer.o_proj->data(),
@@ -808,8 +899,12 @@ void mixtral_forward_paged(
         // ── Sparse-MoE block ──
         if (prof.enabled) prof.close(stream);   // o_proj
         if (prof.enabled) prof.open(&prof.router, stream);
-        kernels::launch_rmsnorm_bf16(
+        // The MoE input is wanted in fp16 by the decode GEMV, and this norm is
+        // where it is produced; emitting both here retires the cast kernel
+        // that used to read it straight back.
+        kernels::launch_rmsnorm_bf16_with_fp16(
             ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
+            d_mxfp4_act_fp16.data(),
             N, H, eps, stream);
 
         // 1. Router logits, top-K + softmax + renormalize. We piggy-back
@@ -857,6 +952,7 @@ void mixtral_forward_paged(
         // routed set falls back to the per-expert loop rather than deadlock
         // against its own pins.
         if (prof.enabled) prof.close(stream);
+        if (prof.enabled) prof.open(&prof.moe_prep, stream);
         bool streamed_fused = false;
         // The routing table is read back at most once per layer. The fused
         // paged path below needs it to decide what to page in, and the generic
@@ -1007,6 +1103,11 @@ void mixtral_forward_paged(
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 layer.marlin_scales_ready = true;
             }
+            // `close` first: `moe_prep` is open on entry to this branch, and
+            // opening on top of it would leave one span per layer on the stack
+            // for `resolve()` to close at teardown. Every other stage boundary
+            // in this branch pairs the two for the same reason.
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_align, stream); }
             kernels::launch_moe_align_decode(
                 d_topk_idx.data(), d_marlin_sorted.data(),
                 d_marlin_expert_ids.data(), /*route_to_aligned_row=*/nullptr,
@@ -1032,12 +1133,14 @@ void mixtral_forward_paged(
                     marlin_block, num_experts, top_k_arg, mul_w,
                     prob_m_arg, prob_n, prob_k, stream);
             };
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_gate_up, stream); }
             moe_gemm(ws.norm_y.data(), e0.w_gate_mxfp4->data(),
                      layer.marlin_gate_scales.data(), d_marlin_gate.data(),
                      N, top_k, Ip_marlin, H, false);
             moe_gemm(ws.norm_y.data(), e0.w_up_mxfp4->data(),
                      layer.marlin_up_scales.data(), d_marlin_up.data(),
                      N, top_k, Ip_marlin, H, false);
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_act, stream); }
             // GPT-OSS publishes its expert biases at the UNPADDED width, which
             // is not the stride Marlin's own bias epilogue assumes.
             if (e0.b_gate != nullptr) {
@@ -1059,9 +1162,11 @@ void mixtral_forward_paged(
                     d_marlin_act.data(), routes, I, Ip_marlin, Ip_marlin,
                     stream, /*limit=*/0.f);
             }
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_down, stream); }
             moe_gemm(d_marlin_act.data(), e0.w_down_mxfp4->data(),
                      layer.marlin_down_scales.data(), d_mxfp4_route_out.data(),
                      routes, /*top_k=*/1, H, Ip_marlin, false);
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_reduce, stream); }
             if (e0.b_down != nullptr && tp_is_leader) {
                 kernels::launch_add_moe_route_bias_bf16(
                     d_mxfp4_route_out.data(), e0.b_down->data(),
@@ -1071,6 +1176,7 @@ void mixtral_forward_paged(
                 d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
                 static_cast<const float*>(d_topk_w.data()), N, top_k, H,
                 stream);
+            if (prof.enabled) prof.close(stream);   // moe_reduce
             if (T > 1) {
                 tp->all_reduce_bf16(d_mxfp4_moe_out.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -1084,9 +1190,18 @@ void mixtral_forward_paged(
             use_mxfp4_decode_gemv &&
             !layer.expert_gate_up_packed_ptrs.empty()) {
             const int routes = N * top_k;
+            if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_align, stream); }
             kernels::launch_bf16_to_fp16(
                 ws.norm_y.data(), d_mxfp4_act_fp16.data(),
                 static_cast<std::size_t>(N) * H, stream);
+            // The activation rides the gate/up epilogue when this model uses
+            // the gpt-oss GLU and the routes are not bucketed by expert (the
+            // grouped kernel has its own epilogue). Then the glu kernel and
+            // the cast after it have nothing left to do.
+            const bool fuse_glu =
+                cfg.swiglu_limit > 0.f &&
+                !mxfp4_moe_grouped_choice(routes, num_experts);
+            if (prof.enabled) prof.close(stream);   // moe_align (act cast)
             mx_stage(prof, &prof.moe_gate_up, stream, [&]{
             // Group the routes by expert first: without it every route
             // re-streams its expert's slab, so weight traffic scales with
@@ -1113,26 +1228,41 @@ void mixtral_forward_paged(
                     layer.expert_gate_bias_ptrs.data(),
                     layer.expert_up_bias_ptrs.data(),
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
-                    N, top_k, H, I, stream);
+                    N, top_k, H, I, stream,
+                    /*act_out_fp16=*/fuse_glu
+                        ? d_mxfp4_route_act_fp16.data() : nullptr,
+                    /*glu_limit=*/cfg.swiglu_limit);
             }
             });
+            if (prof.enabled) prof.open(&prof.moe_act, stream);
+            if (!fuse_glu) {
+            // The gpt-oss activation emits the fp16 copy the down GEMV wants
+            // as a second store, so the cast below is only needed on the plain
+            // swiglu branch, which no model with this activation takes.
+            bool act_fp16_ready = false;
             if (cfg.swiglu_limit > 0.f) {
                 kernels::launch_gpt_oss_glu_bf16(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
                     d_mxfp4_route_gate.data(),
                     static_cast<int>(static_cast<std::size_t>(routes) * I),
-                    stream, /*limit=*/cfg.swiglu_limit);
+                    stream, /*limit=*/cfg.swiglu_limit, /*alpha=*/1.702f,
+                    d_mxfp4_route_act_fp16.data());
+                act_fp16_ready = true;
             } else {
                 kernels::launch_swiglu_bf16(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
                     d_mxfp4_route_gate.data(),
                     static_cast<std::size_t>(routes) * I, stream);
             }
-            kernels::launch_bf16_to_fp16(
-                d_mxfp4_route_gate.data(), d_mxfp4_route_act_fp16.data(),
-                static_cast<std::size_t>(routes) * I, stream);
+            if (!act_fp16_ready) {
+                kernels::launch_bf16_to_fp16(
+                    d_mxfp4_route_gate.data(), d_mxfp4_route_act_fp16.data(),
+                    static_cast<std::size_t>(routes) * I, stream);
+            }
+            }
             // b_down is replicated across ranks, so only the leader adds it;
             // the all-reduce below would otherwise sum it T times.
+            if (prof.enabled) prof.close(stream);   // moe_act (glu + cast)
             mx_stage(prof, &prof.moe_down, stream, [&]{
             kernels::launch_mxfp4_moe_down_decode_bf16(
                 d_mxfp4_route_act_fp16.data(), d_topk_idx.data(),
@@ -1141,16 +1271,29 @@ void mixtral_forward_paged(
                 tp_is_leader ? layer.expert_down_bias_ptrs.data() : nullptr,
                 d_mxfp4_route_out.data(), N, top_k, H, I, stream);
             });
-            kernels::launch_token_batched_weighted_sum_bf16(
-                d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
-                static_cast<const float*>(d_topk_w.data()),
-                N, top_k, H, stream);
-            if (T > 1) {
+            if (prof.enabled) prof.open(&prof.moe_reduce, stream);
+            if (T == 1) {
+                // The combine already walks every element of the result; the
+                // residual is one more add on a value it is holding, so the
+                // separate `residual_add` was a full read and write of the
+                // hidden state to do what an epilogue could. Under TP the
+                // all-reduce has to see the combine's output alone, so that
+                // path keeps the two apart.
+                kernels::launch_token_batched_weighted_sum_add_bf16(
+                    ws.y.data(), d_mxfp4_route_out.data(),
+                    static_cast<const float*>(d_topk_w.data()),
+                    N, top_k, H, stream);
+            } else {
+                kernels::launch_token_batched_weighted_sum_bf16(
+                    d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
+                    static_cast<const float*>(d_topk_w.data()),
+                    N, top_k, H, stream);
                 tp->all_reduce_bf16(d_mxfp4_moe_out.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
+                kernels::launch_residual_add_bf16(
+                    ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
             }
-            kernels::launch_residual_add_bf16(
-                ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
+            if (prof.enabled) prof.close(stream);   // moe_reduce
             if (streamed_fused) {
                 // Safe with the kernels above still queued: a page-in that
                 // wants one of these slots synchronizes `stream` before it

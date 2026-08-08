@@ -143,6 +143,14 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                     bind_const<std::int32_t>(ctx, ord,
                                              (std::uint8_t)bind::KvAppendPaged::NKvHeads,
                                              g.n_kv_heads, &count);
+                    // Packed rows: this family's batched step lays k_new and
+                    // v_new out as [N, n_kv_heads, head_dim]. Bound explicitly
+                    // because an ordinal the kernel DOES declare and nobody
+                    // wrote is a source pitch read out of whatever the table
+                    // held -- the wrong rows appended, not a crash.
+                    bind_const<std::int32_t>(ctx, ord,
+                                             (std::uint8_t)bind::KvAppendPaged::SrcRowStride,
+                                             0, &count);
                 }
                 break;
 
@@ -262,6 +270,41 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         }
     }
     return count;
+}
+
+int bind_gptoss_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                         const GptOssGeometry& g, int rows, int head_rows,
+                         const SlotHandle& staging, std::vector<SlotHandle>& keep) {
+    keep.clear();
+    if (!staging.valid()) return 0;
+    const int R = rows < 1 ? 1 : rows;
+    const int S = head_rows < 1 ? R : std::min(head_rows, R);
+    std::vector<std::pair<std::int32_t, SlotHandle>> counts;
+    int bound = 0;
+    for (const Dispatch& d : dag) {
+        const int m = d.kind == Kind::LmHead ? S : R;
+        if (!gptoss_fp16_qmm(g, d.kind, m)) continue;
+        const std::int32_t elems =
+            std::int32_t(gptoss_qmm_rows(m)) * std::int32_t(qmv_kn(d.kind, g).K);
+        SlotHandle count;
+        for (const auto& entry : counts) {
+            if (entry.first == elems) {
+                count = entry.second;
+                break;
+            }
+        }
+        if (!count.valid()) {
+            count = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            if (!count.valid()) continue;
+            *static_cast<std::int32_t*>(count.contents()) = elems;
+            counts.push_back({elems, count});
+            keep.push_back(count);
+        }
+        ctx.arg_bind_ordinal(d.ordinal, 12, staging);
+        ctx.arg_bind_ordinal(d.ordinal, 13, count);
+        ++bound;
+    }
+    return bound;
 }
 
 }  // namespace pie::metal::gptoss

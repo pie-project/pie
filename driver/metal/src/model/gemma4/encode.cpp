@@ -15,6 +15,9 @@
 // having.
 
 #include "encode.hpp"
+#include <string>
+#include <cstring>
+#include <cstdlib>
 
 #include "../qwen3_5/decode_dispatch_mb.hpp"
 
@@ -23,6 +26,12 @@
 #include "scratch.hpp"
 
 namespace pie::metal::gemma4 {
+
+/// Whether this checkpoint's GEMM reaches the FP16 matrix path. The GEMM
+/// crossover moves with it -- see `qmm_min_batch`.
+inline bool gemma4_fp16_format(const Gemma4Geometry& g) {
+    return fp16_gemm_format(g.quant.bits, g.quant.group);
+}
 
 int gemma4_qmm_rows(const Gemma4Geometry& g, int rows) {
     const int n = rows < 1 ? 1 : rows;
@@ -34,7 +43,7 @@ int gemma4_qmm_rows(const Gemma4Geometry& g, int rows) {
     // Max first, where lowering the single number to 4 (so the GEMM engaged at
     // 8 rows instead of 12) cost 17% on 8 lanes, 128.5 -> 106.5 tok/s; that
     // checkpoint was routed, which is the half of the split that kept 12.
-    if (n < qmm_min_batch(g.is_moe())) return n;
+    if (n < qmm_min_batch(g.is_moe(), gemma4_fp16_format(g))) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -62,13 +71,51 @@ bool is_routed(Kind k) {
 }
 
 /// The routed matmul's column tile, or 0 when the batch stays a matvec.
+///
+/// CLOSED BUG, recorded because the diagnosis that stood here for three
+/// sessions was wrong in a way worth not repeating. This GEMM was believed to
+/// answer wrongly on a decode fleet -- `PIE_BENCH_TPUT=64`, or 16 lanes with
+/// the crossover forced to 1, both "FAILED" -- and that belief is what kept
+/// `moe_batch_min_per_expert` pinned at 4 and cost up to 114% of gpt-oss's
+/// fleet throughput.
+///
+/// There was no defect. The evidence was an artefact of the harness, twice
+/// over:
+///
+///   * `llama_bench`'s fleet gate compared the fleet to THIS DRIVER'S OWN
+///     one-row decode. A one-row decode and an n-row decode take different
+///     kernels the whole way down -- `qmv` against `qmv_mb` or a GEMM, `rms`
+///     against `rms_mb`, sliding attention against tiled -- so they are not the
+///     same arithmetic and were never going to be bit-identical. Which step
+///     their greedy argmaxes first differ on is a fact about how sharp the
+///     logits are there, and the bench's own prompt is `kGatePrompt` repeated
+///     and then TRUNCATED, so at the default 128 it ends mid-sentence and the
+///     next token is close to a coin flip. The file already warned about
+///     exactly this trap one screen above the prompt it builds.
+///   * The reference token buffer was one element short, so at `n_decode == 1`
+///     the comparison never ran and the gate printed PASS having checked
+///     nothing. That produced a four-cell table in which 1-step runs "passed"
+///     and 64-step runs "failed", from which this comment concluded that the
+///     variable was the decode length of the run before -- a dirty scratch
+///     pool. Both halves of that table were measurement error.
+///
+/// What settles it, and what the gate now asks: force this GEMM onto EVERY
+/// fire with `PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=0` -- so even a one-row decode
+/// takes the batched path -- and gemma-4-26b-a4b still reproduces mlx-lm's
+/// recorded continuation token for token. An n-wide fleet reproduces it too, at
+/// 4, 8, 16 and 32 lanes, with and without the routed GEMM engaged. The kernel
+/// is correct; it was the ruler that was bent.
+///
+/// The general lesson, which is why this is here and not in a commit message:
+/// a correctness gate must compare against something OUTSIDE the driver. Two
+/// of our own kernels disagreeing is the expected state of the world.
 int gemma4_moe_qmm_bn(Kind k, const Gemma4Geometry& g, int rows, int layer) {
     if (!is_routed(k) || gemma4_moe_tile_rows(g, rows) <= 1) return 0;
     const KN kn = qmv_kn(k, g, layer);
     if (kn.N == 0) return 0;
     // Routed, so the routed crossover; `moe_should_batch` has already admitted
     // this batch and the sorted count clears either number regardless.
-    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows), qmm_min_batch(true));
+    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows), qmm_min_batch(true, gemma4_fp16_format(g)));
 }
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -260,7 +307,7 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
         // `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only
         // where split-K supplies the threadgroups the wide tile gives up, and
         // this family dispatches no split (see `launch_shape_mb`).
-        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe(), gemma4_fp16_format(g)));
         const int wide = qmm_bm_slot(bm);
         // No split-K here either; see `launch_shape_mb`.
         const int split = 0;
@@ -420,7 +467,7 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         // Same chooser as `pso_for_mb`, for the same reason -- and it has to be
         // the same one: the grid and the pipeline disagreeing about BN is a
         // dispatch that computes the wrong thing rather than one that refuses.
-        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe(), gemma4_fp16_format(g)));
         // NO split-K. The split GEMM accumulates partial sums into a split
         // buffer and needs a reduce pass to fold them; qwen3.5 has both, this
         // family has neither -- so a split dispatch here wrote partials nobody
@@ -683,6 +730,101 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
     }
 }
 
+/// This family's kinds, for `PIE_METAL_ABLATE`.
+///
+/// gemma4 carries its own `Kind` enum rather than the shared `Kernel`, so the
+/// shared `kernel_name` cannot answer for it and the ablation knob could not
+/// name a single gemma4 dispatch. Prefixed `g4_` for the same reason the shared
+/// table prefixes its gemma4 entries: `attn_norm` means something in three
+/// families and they are different dispatches.
+///
+/// First result off this table, and it retires an unmeasured claim. The note
+/// closing the gemma-4-31b decode question said ablation found "nothing else
+/// in the fire" and named `affine_qmv_tail` -- a PSO host name, which this
+/// knob does not match, so that run reported the baseline and skipped nothing.
+/// Priced for real: 16.5 tok/s no-readback, `g4_qmv_up` ablated 20.6, **24.8%**
+/// in one kernel. (`g4_qmv_down`, `g4_qmv_gate`, `g4_qmv_o` and `g4_lm_head`
+/// still abort -- an ablated fire samples a token outside the page table.)
+///
+/// 24.8% is not waste, it is the read. This checkpoint keeps 67% of its 16.08
+/// GiB in FFN and the up projection alone is 3.58 GiB, so it owns 22% of the
+/// bytes a token moves and a memory-bound decode charges it 25% of the time.
+/// The old conclusion was right; it just had no measurement under it.
+const char* gemma4_kind_name(Kind k) {
+    switch (k) {
+        case Kind::EmbedGather:          return "g4_embed_gather";
+        case Kind::PleTokenGather:       return "g4_ple_token_gather";
+        case Kind::PleProjGemv:          return "g4_ple_proj_gemv";
+        case Kind::PleProjNorm:          return "g4_ple_proj_norm";
+        case Kind::PleCombine:           return "g4_ple_combine";
+        case Kind::AttnNorm:             return "g4_attn_norm";
+        case Kind::QmvQ:                 return "g4_qmv_q";
+        case Kind::QmvK:                 return "g4_qmv_k";
+        case Kind::QmvV:                 return "g4_qmv_v";
+        case Kind::QNorm:                return "g4_q_norm";
+        case Kind::KNorm:                return "g4_k_norm";
+        case Kind::VNorm:                return "g4_v_norm";
+        case Kind::VNormFromK:           return "g4_v_norm_from_k";
+        case Kind::RopeQ:                return "g4_rope_q";
+        case Kind::RopeK:                return "g4_rope_k";
+        case Kind::KvAppend:             return "g4_kv_append";
+        case Kind::Sdpa:                 return "g4_sdpa";
+        case Kind::QmvO:                 return "g4_qmv_o";
+        case Kind::PostAttnResidual:     return "g4_post_attn_residual";
+        case Kind::FfnNorm:              return "g4_ffn_norm";
+        case Kind::QmvGate:              return "g4_qmv_gate";
+        case Kind::QmvUp:                return "g4_qmv_up";
+        case Kind::GegluTanh:            return "g4_geglu_tanh";
+        case Kind::QmvDown:              return "g4_qmv_down";
+        case Kind::DenseBranchNorm:      return "g4_dense_branch_norm";
+        case Kind::RouterNorm:           return "g4_router_norm";
+        case Kind::RouterGemv:           return "g4_router_gemv";
+        case Kind::RouterTopK:           return "g4_router_top_k";
+        case Kind::MoeNorm:              return "g4_moe_norm";
+        case Kind::ExpertSort:           return "g4_expert_sort";
+        case Kind::ExpertGather:         return "g4_expert_gather";
+        case Kind::ExpertGate:           return "g4_expert_gate";
+        case Kind::ExpertUp:             return "g4_expert_up";
+        case Kind::ExpertGeglu:          return "g4_expert_geglu";
+        case Kind::ExpertDown:           return "g4_expert_down";
+        case Kind::ExpertCombine:        return "g4_expert_combine";
+        case Kind::MoeBranchNorm:        return "g4_moe_branch_norm";
+        case Kind::BranchAdd:            return "g4_branch_add";
+        case Kind::PostFfnResidual:      return "g4_post_ffn_residual";
+        case Kind::PleGateGemv:          return "g4_ple_gate_gemv";
+        case Kind::PleGeglu:             return "g4_ple_geglu";
+        case Kind::PleProjLayerGemv:     return "g4_ple_proj_layer_gemv";
+        case Kind::PleResidualScaled:    return "g4_ple_residual_scaled";
+        case Kind::LayerScalar:          return "g4_layer_scalar";
+        case Kind::RowGather:            return "g4_row_gather";
+        case Kind::FinalRms:             return "g4_final_rms";
+        case Kind::LmHead:               return "g4_lm_head";
+        case Kind::FinalSoftcap:         return "g4_final_softcap";
+        case Kind::Argmax:               return "g4_argmax";
+    }
+    return "g4_unknown";
+}
+
+/// Whether `PIE_METAL_ABLATE` names this kind. See `kernel_ablated`; this is
+/// the same knob, reading this family's own names.
+bool gemma4_ablated(Kind k) {
+    static const std::string spec = [] {
+        const char* e = std::getenv("PIE_METAL_ABLATE");
+        return std::string(e == nullptr ? "" : e);
+    }();
+    if (spec.empty()) return false;
+    const char* n = gemma4_kind_name(k);
+    std::size_t at = 0;
+    while ((at = spec.find(n, at)) != std::string::npos) {
+        const bool lok = at == 0 || spec[at - 1] == ',';
+        const std::size_t end = at + std::strlen(n);
+        const bool rok = end == spec.size() || spec[end] == ',';
+        if (lok && rok) return true;
+        at = end;
+    }
+    return false;
+}
+
 void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                         const Gemma4Geometry& g, const DecodeStepPsos& base,
                         const Gemma4Psos& g4, int ordinal_base,
@@ -690,6 +832,7 @@ void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
     const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (std::size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
+        if (gemma4_ablated(d.kind)) continue;
         Grid grid;
         Threadgroup tg;
         launch_shape(d, g, grid, tg);
@@ -726,6 +869,7 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
     const int S0 = head_rows < 1 ? N0 : (head_rows < N0 ? head_rows : N0);
     for (std::size_t i = begin; i < end; ++i) {
         const Dispatch& d = dag[i];
+        if (gemma4_ablated(d.kind)) continue;
         // The FP16 staging pass. It rides the projection's own argument table
         // -- the source is already bound there as the GEMM's input and the
         // staging buffer beside it -- so it needs no DAG entry, which is what
@@ -768,15 +912,25 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
 ///     448  6144  1536      4163     5794
 ///
 /// Storage and every surrounding kernel stay BF16; only the GEMM's input is
-/// staged to half, once per input rather than once per output tile. Routed
-/// models are excluded on purpose -- llama measured FP16 flipping expert top-k
-/// -- and so is the second quantized set, where a checkpoint ships one: those
-/// tables are 8-bit and have no FP16 pipeline.
+/// staged to half, once per input rather than once per output tile. The ROUTED
+/// projections are excluded -- their weight stack is indexed on the GPU and
+/// the precast kernel has no routed form -- and so is the second quantized
+/// set, where a checkpoint ships one: those tables are 8-bit and have no FP16
+/// pipeline. A mixture's DENSE projections are not excluded; they were, once,
+/// and that cost gemma-4-26b-a4b 37% of its prefill.
 bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
-    // `is_moe` covers the routed kinds too: the DAG emits them under the same
-    // condition, so a dense checkpoint has none to reach.
+    // `is_routed`, not `is_moe`. This used to refuse the whole checkpoint on
+    // the strength of a comment that read "`is_moe` covers the routed kinds
+    // too" -- true, and far too much: a mixture's q/k/v/o are ordinary dense
+    // projections and were being sent down the emulated BF16 MMA with them.
+    // On gemma-4-26b-a4b those are 37% of a 512-row prefill.
+    //
+    // What the routed kinds are actually kept away from is not rounding but
+    // the tile: their weight stack is indexed on the GPU and the precast
+    // kernel has no routed form to select. The router's own GEMV is 8-bit and
+    // excluded by the width test below, so no top-k decision changes here.
     if (!fp16_qmm()) return false;
-    if (g.is_moe() || g.quant.bits != 4 || g.quant.group != 64) return false;
+    if (is_routed(d.kind) || g.quant.bits != 4 || g.quant.group != 64) return false;
     // Only a checkpoint that really ships two formats has an 8-bit set to keep
     // away from, and only the tensors it actually spared. Reading the kind
     // alone would have excluded gate, up and down from every checkpoint, which
@@ -785,7 +939,7 @@ bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
     const KN kn = qmv_kn(d.kind, g, d.layer);
     if (kn.N == 0) return false;
     return qmm_bn_unsplit(int(kn.N), gemma4_qmm_rows(g, m),
-                          qmm_min_batch(g.is_moe())) > 0;
+                          qmm_min_batch(g.is_moe(), gemma4_fp16_format(g))) > 0;
 }
 
 /// Which dispatches stage, as opposed to reading what an earlier one staged.

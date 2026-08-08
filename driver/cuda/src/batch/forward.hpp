@@ -563,6 +563,11 @@ struct ForwardDispatchInputs {
     int forward_R = 0;
     int forward_N = 0;
     int num_sampling = 0;
+    // Rows the forward gathers and emits logits for. Separate from
+    // `num_sampling` (which settlement uses) because a graph-padded wave pads
+    // this up to `forward_R` so the count the captured body bakes is a value
+    // `ForwardGraphKey` already carries. 0 = full-N emit.
+    int num_logit_rows = 0;
     bool is_pure_decode = false;
     bool have_custom_mask = false;
     // Direct non-graph prefill/mixed launches may gather the requested hidden
@@ -647,7 +652,8 @@ bool forward_graph_replay_eligible(
     int forward_R,
     int num_images,
     int num_clips,
-    bool has_stage_hooks);
+    bool has_stage_hooks,
+    int num_logit_rows);
 
 // Run the per-fire forward body directly against `forward_fn.body`. See
 // `ForwardDispatchInputs` for why this is not a graph-replay dispatcher.

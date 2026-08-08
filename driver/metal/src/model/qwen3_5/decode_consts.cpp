@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg}
+#include "decode_dispatch_mb.hpp"
 #include "mtl4_context.hpp"
 #include "../../kernels/gdn_params.h"
 #include "../shared_kernels.hpp"
@@ -132,11 +133,14 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
 // the mixture's share of it. `const_slot` caches by (ordinal, index), so this
 // overwrites the same slots in place and allocates nothing after the first.
 int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                      const DecodeGeometry& g, int n_tokens, int row_pitch) {
+                      const DecodeGeometry& g, int n_tokens, int row_pitch,
+                      bool routed_batched) {
     int count = 0;
     const int rows = n_tokens > 0 ? n_tokens : 1;
     const int pairs = rows * g.experts_per_token;
-    const int sorted = moe_sorted_rows(g, rows);
+    // The sort's own contract, and it has to match the dispatch that reads it.
+    const int sorted = moe_sorted_rows(g, rows, routed_batched);
+    const int tile = moe_tile_rows_for(g, rows, routed_batched);
 
     for (const auto& d : dag) {
         const int ord = d.ordinal;
@@ -153,7 +157,7 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 const MoeRouteParams p{(uint32_t)pairs,
                                        (uint32_t)g.n_experts,
                                        (uint32_t)g.experts_per_token,
-                                       (uint32_t)shared_kernels::moe_tile_rows(pairs, g.n_experts),
+                                       (uint32_t)tile,
                                        (uint32_t)sorted,
                                        (uint32_t)g.hidden,
                                        (uint32_t)row_pitch};
@@ -274,6 +278,10 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 
             case Kernel::QSplit:
                 bind_const<int>(ctx, ord, (uint8_t)bind::QSplit::HeadDim, g.head_dim, &count);
+                // Packed by default; the prefill rebinds both to the arena's
+                // pitch on row zero's table when it runs the prompt at once.
+                bind_const<int>(ctx, ord, (uint8_t)bind::QSplit::QgRowStride, 0, &count);
+                bind_const<int>(ctx, ord, (uint8_t)bind::QSplit::OutRowStride, 0, &count);
                 break;
 
             case Kernel::Rope:
@@ -302,6 +310,9 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                 g.kv_page_size, &count);
                 bind_const<int>(ctx, ord, (uint8_t)bind::KvAppendPaged::NKvHeads,
                                 g.n_kv_heads, &count);
+                // Packed by default; the prefill rebinds this to the arena's
+                // pitch on row zero's table when it appends the whole prompt.
+                bind_const<int>(ctx, ord, (uint8_t)bind::KvAppendPaged::SrcRowStride, 0, &count);
                 break;
 
             case Kernel::Sdpa:
@@ -327,7 +338,11 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
 
             case Kernel::SiluMul:
+                break;
             case Kernel::AttnGate:
+                // Packed by default; the prefill rebinds this to the arena's
+                // pitch on row zero's table when it runs the prompt at once.
+                bind_const<int>(ctx, ord, (uint8_t)bind::AttnGate::RowStride, 0, &count);
                 break;
             case Kernel::LlExpertSiluMul:
             case Kernel::LlMoeSort:
@@ -378,6 +393,43 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 size_t decode_consts_budget(const std::vector<Dispatch>& dag) {
     // Worst case 6 const slots/dispatch (sdpa), each ≤ 256-aligned. Be generous.
     return (dag.size() * 6 + 64) * 256;
+}
+
+int bind_mb_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                     const DecodeGeometry& g, int n_tokens,
+                     const SlotHandle& staging, std::vector<SlotHandle>& keep) {
+    keep.clear();
+    if (!staging.valid()) return 0;
+    // The padded row count, not the fire's: the GEMM reads whole row tiles and
+    // the tail of the last one has to hold a defined half of something. It is
+    // the same bound the BF16 GEMM already reads through buffer 3.
+    const int rows = qmm_mb_rows(n_tokens, g.max_tokens, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
+    std::vector<std::pair<std::int32_t, SlotHandle>> counts;
+    int bound = 0;
+    for (const Dispatch& d : dag) {
+        if (d.qmm_bn <= 0) continue;
+        const int K = int(qmv_kn(d.kind, g).K);
+        if (K <= 0) continue;
+        const std::int32_t elems = std::int32_t(rows) * std::int32_t(K);
+        SlotHandle count;
+        for (const auto& entry : counts) {
+            if (entry.first == elems) {
+                count = entry.second;
+                break;
+            }
+        }
+        if (!count.valid()) {
+            count = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            if (!count.valid()) continue;
+            *static_cast<std::int32_t*>(count.contents()) = elems;
+            counts.push_back({elems, count});
+            keep.push_back(count);
+        }
+        ctx.arg_bind_ordinal(d.ordinal, 12, staging);
+        ctx.arg_bind_ordinal(d.ordinal, 13, count);
+        ++bound;
+    }
+    return bound;
 }
 
 }  // namespace pie::metal

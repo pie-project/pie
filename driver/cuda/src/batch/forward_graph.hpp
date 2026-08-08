@@ -122,50 +122,41 @@ constexpr int forward_graph_request_bucket(int requests,
 // default for want of a better one rather than for the reason above.
 constexpr int kForwardGraphTokenGrain = 128;
 
-constexpr int forward_graph_token_bucket_at(
-    int tokens, int max_tokens, int grain) noexcept {
-    if (tokens <= 0 || max_tokens <= 0 || tokens > max_tokens || grain <= 0) {
-        return 0;
-    }
-    const int bucket = ((tokens + grain - 1) / grain) * grain;
-    return bucket <= max_tokens ? bucket : max_tokens;
-}
-
-constexpr int forward_graph_token_bucket(int tokens, int max_tokens) noexcept {
-    return forward_graph_token_bucket_at(
-        tokens, max_tokens, kForwardGraphTokenGrain);
-}
-
-// `PIE_GRAPH_TOKEN_GRAIN` overrides the grain. A CALIBRATION knob, and the
-// reason it exists is that the comment above rejects G=64 for a reason that no
-// longer binds: "G=64 would need 132 entries and evict its own working set".
-// `PIE_GRAPH_CACHE_ENTRIES` lifts that ceiling, so the trade the grain
-// actually makes — 3.1% padding waste at 81 keys against 6.9% at 67 — can be
-// measured instead of assumed. Padding waste is device work on exactly the
-// waves the fleet is waiting on, and it is one of the two terms §34 found the
-// prefill graph path losing to. Unset keeps 128 exactly.
+// `PIE_TOKEN_GRAIN` overrides the grain so the padding-vs-reuse trade can be
+// swept rather than argued: a coarser grain means fewer distinct keys (more
+// replay, fewer one-off captures) but more padded rows to compute. The value
+// above was measured on one cell, which §6's "no magic constants" rule makes
+// suspect; this is how it gets re-derived.
 inline int forward_graph_token_grain() {
     static const int value = [] {
-        const char* const env = std::getenv("PIE_GRAPH_TOKEN_GRAIN");
+        const char* const env = std::getenv("PIE_TOKEN_GRAIN");
         if (env == nullptr || *env == '\0') return kForwardGraphTokenGrain;
-        const long long parsed = std::atoll(env);
-        return parsed > 0 ? static_cast<int>(parsed)
-                          : kForwardGraphTokenGrain;
+        const int parsed = std::atoi(env);
+        return parsed > 0 ? parsed : kForwardGraphTokenGrain;
     }();
     return value;
 }
 
-inline int forward_graph_token_bucket_runtime(int tokens, int max_tokens) {
+// Pure form, so the rounding rule stays compile-time checkable below.
+constexpr int forward_graph_token_bucket_at(
+    int tokens, int max_tokens, int grain) noexcept {
+    if (tokens <= 0 || max_tokens <= 0 || tokens > max_tokens) return 0;
+    if (grain <= 0) return 0;
+    const int bucket = ((tokens + grain - 1) / grain) * grain;
+    return bucket <= max_tokens ? bucket : max_tokens;
+}
+
+inline int forward_graph_token_bucket(int tokens, int max_tokens) noexcept {
     return forward_graph_token_bucket_at(
         tokens, max_tokens, forward_graph_token_grain());
 }
 
-static_assert(forward_graph_token_bucket(1, 8192) == 128);
-static_assert(forward_graph_token_bucket(128, 8192) == 128);
-static_assert(forward_graph_token_bucket(129, 8192) == 256);
-static_assert(forward_graph_token_bucket(6003, 8192) == 6016);
-static_assert(forward_graph_token_bucket(8100, 8192) == 8192);
-static_assert(forward_graph_token_bucket(9000, 8192) == 0);
+static_assert(forward_graph_token_bucket_at(1, 8192, 128) == 128);
+static_assert(forward_graph_token_bucket_at(128, 8192, 128) == 128);
+static_assert(forward_graph_token_bucket_at(129, 8192, 128) == 256);
+static_assert(forward_graph_token_bucket_at(6003, 8192, 128) == 6016);
+static_assert(forward_graph_token_bucket_at(8100, 8192, 128) == 8192);
+static_assert(forward_graph_token_bucket_at(9000, 8192, 128) == 0);
 
 static_assert(forward_graph_request_bucket(1, 512) == 1);
 static_assert(forward_graph_request_bucket(3, 512) == 4);

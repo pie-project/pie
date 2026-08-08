@@ -110,19 +110,24 @@ static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// dense gathering while an epoch executes (`executing` still parks).
 ///
 /// **Default ON**; `PIE_SEAL_MODE=strict` restores holding for every awaited
-/// lane. Measured on the current stack, three interleaved pairs per cell:
-/// S (4096x64 @c256) **+1.91%, 3 of 3 same sign**, c32 +1.35% (3 of 3),
-/// D +1.62%, c256 +0.23%, c64 −0.25% — no regression at any concurrency.
+/// lane. Two independent measurements, one per tree, agreeing:
 ///
-/// The check that matters is width, not throughput: fragmenting the wave is
-/// what killed the no-quiescence variant and the `=1` contributed-gate variant
-/// before it, and an earlier ready-mode attempt was rejected at −1.0% having
-/// cut decode batch 171 → 99. This one does not: `avg_active_pipelines_at_fire`
-/// 242.5 → 243.7 and `wave_fires` 1096 → 1098 on S, i.e. the same waves, the
-/// same width, opened earlier.
+///   * upstream, against strict on 4096x64 @c256 — the inter-fire device gap
+///     falls 0.696 -> 0.517 s (-26%) and occupancy 91.8 -> 93.8%, because 87%
+///     of all device idle sits in front of a wave carrying an arrival: a lane
+///     is `awaited` from creation but needs ~200 us of its own work before it
+///     can submit, and strict spends that as GPU idle. Throughput +1.22% at
+///     c256 (7 of 8 ABBA rounds), +1.27% at c32, +1.26% at c64, +0.19% at c8.
+///   * here, three interleaved pairs per cell on top of the channel-init
+///     scatter fix — S +1.91% (3 of 3), c32 +1.35% (3 of 3), D +1.62%,
+///     c256 +0.23%, c64 -0.25%. The two levers compose rather than overlap.
 ///
-/// Independent of the channel-init scatter fix — this was measured on top of
-/// it, so the two compose rather than overlapping.
+/// The check that matters is WIDTH, not throughput: fragmenting the wave is
+/// what killed the no-quiescence variant below and the `=1` contributed-gate
+/// variant before it, and an earlier ready-mode attempt was rejected at -1.0%
+/// having cut decode batch 171 -> 99. This one does not — 238.5 -> 240.8 and
+/// `avg_active_pipelines_at_fire` 242.5 -> 243.7 / `wave_fires` 1096 -> 1098:
+/// the same waves, the same width, opened earlier.
 /// Threshold for the `[idle-gap]` dump, in microseconds. `u64::MAX` (never)
 /// unless `PIE_IDLE_DUMP_US` names one. Read once.
 /// Seat floor for the `[device-idle]` dump. `0` (report every gap) unless
@@ -154,14 +159,14 @@ fn seal_mode_ready() -> bool {
         Ok(value) => match value.trim() {
             "strict" => false,
             "ready" => true,
-            // Anything else is a config error, not a vote. Treating every
-            // unrecognised value as "ready" (upstream's form of this) makes
-            // `PIE_SEAL_MODE=0` silently select the mode the operator was
-            // trying to turn off, with no diagnostic.
+            // Anything else is a config error, not a vote. Reading every
+            // unrecognised value as "ready" makes `PIE_SEAL_MODE=0` silently
+            // select the mode the operator was trying to turn off.
             other => {
                 tracing::warn!(
                     value = other,
-                    "PIE_SEAL_MODE must be \"ready\" or \"strict\";                      ignoring and keeping the default (ready)"
+                    "PIE_SEAL_MODE must be \"ready\" or \"strict\"; \
+                     ignoring and keeping the default (ready)"
                 );
                 true
             }

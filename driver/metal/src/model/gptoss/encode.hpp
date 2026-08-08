@@ -43,6 +43,13 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
 /// How many rows the activation pool must hold for `max_rows` to be paddable to
 /// a whole GEMM tile.
 int gptoss_qmm_pool_rows(int max_rows);
+/// Whether a dense projection takes an FP16 tile, and which dispatches stage
+/// the cast the rest of their group then reads. `simple_family` sizes the
+/// staging buffer from the first and `encode_gptoss_step_mb` walks the second.
+bool gptoss_fp16_qmm(const GptOssGeometry& g, Kind k, int m);
+bool gptoss_fp16_cast_before(Kind k);
+int gptoss_qmm_bn(Kind k, const GptOssGeometry& g, int rows);
+int gptoss_qmm_rows(int rows);
 int gptoss_moe_pairs(const GptOssGeometry& g, int rows);
 int gptoss_moe_tile_rows(const GptOssGeometry& g, int rows);
 int gptoss_moe_sorted_rows(const GptOssGeometry& g, int rows);

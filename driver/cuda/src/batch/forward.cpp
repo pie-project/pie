@@ -133,14 +133,38 @@ bool ForwardFn::invoke_prefill_graph_capturable() const {
     return model != nullptr && model->prefill_graph_capturable();
 }
 
-// `PIE_PREFILL_GRAPH=1` lets a wave carrying a prefill reach the graph cache
-// instead of falling to the eager path along with all of its decode lanes.
-// Default OFF: this changes which fires are captured, and the campaign's own
-// rule is that a single interleaved series is a hypothesis, not a result.
+// Lets a wave carrying a prefill reach the graph cache instead of falling to
+// the eager path along with all of its decode lanes. Without it one arriving
+// request costs every decode lane in its wave the replay: 7,290 us of host
+// enqueue against 10 us at the same width.
+//
+// **Default ON**; `PIE_PREFILL_GRAPH=0` restores the decode-only gate.
+// Measured on 4096x64 @c256: +10.6% (3 of 3 rounds), and mixed-sign neutral on
+// 768x512, 256x256 and the shared-prefix shape — it pays where request
+// turnover is high and costs nothing where it is not.
+//
+// The price is memory, not speed: sizing the float workspace for graph-mode
+// planning takes it 80 -> 672 MiB, i.e. 592 MiB out of the KV pool (338 pages
+// of 22,039, ~1.5%). A deployment tighter on KV than on throughput should turn
+// this off.
+//
+// It does NOT cost the decode path, despite an earlier reading to that effect:
+// normalised per LANE across runs of matched width the decode host cost rises
+// 6.1%, uniformly across phases that share no machinery, which tracks the 6.9%
+// shorter wall rather than any decode-side regression. Net on the cell is
+// -880 ms of prefill enqueue against +85 ms of decode.
+bool graph_key_check_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_GRAPH_KEY_CHECK");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
+}
+
 bool prefill_graph_enabled() {
     static const bool value = [] {
         const char* const env = std::getenv("PIE_PREFILL_GRAPH");
-        return env != nullptr && *env != '\0' && env[0] != '0';
+        return env == nullptr || *env == '\0' || env[0] != '0';
     }();
     return value;
 }
@@ -562,8 +586,8 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             make_graph_variant(/*small_spec=*/false, /*rs_verify=*/false,
                                /*custom_mask=*/false,
                                /*fused_argmax=*/lattice_chunk > 0,
-                               /*compact_logits=*/false,
-                               graph_layout);
+                               graph_layout,
+                               /*compact_logits=*/false);
         const ForwardGraphKey key{R, N, graph_variant};
         if (engine.graph_cache->get(key) != nullptr) continue;
 
@@ -845,9 +869,10 @@ std::size_t capture_prefill_graph_lattice(BatchEngine& engine) {
             const std::uint32_t graph_variant = make_graph_variant(
                 /*small_spec=*/false, /*rs_verify=*/false,
                 /*custom_mask=*/false, /*fused_argmax=*/lattice_chunk > 0,
-                // This pass always records the compact R-row gather below.
-                /*compact_logits=*/true,
-                engine.forward_fn.invoke_graph_layout());
+                engine.forward_fn.invoke_graph_layout(),
+                // This pass always records the compact R-row gather below,
+                // padded to `R` so the baked count is derivable from the key.
+                /*compact_logits=*/true);
             const ForwardGraphKey key{R, N, graph_variant};
             if (engine.graph_cache->get(key) != nullptr) continue;
 
@@ -919,7 +944,8 @@ bool forward_graph_replay_eligible(
     int forward_R,
     int num_images,
     int num_clips,
-    bool has_stage_hooks) {
+    bool has_stage_hooks,
+    int num_logit_rows) {
     const bool mask_pointers_stable =
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
@@ -932,9 +958,25 @@ bool forward_graph_replay_eligible(
     // Without the second clause one arriving request costs every decode lane in
     // the wave its replay: measured 7,290 us of host enqueue on a prefill-
     // carrying wave against 10 us on a pure-decode wave of the SAME width.
+    // `num_logit_rows` is BAKED INTO the captured body -- it sizes the logits
+    // gather and the lm_head rows -- but `ForwardGraphKey` carries only the
+    // (R, N) buckets. Replay is therefore safe only when the baked count is
+    // itself derivable from the key: either 0 (full-N emit, which is what
+    // every pure-decode capture gets, since `compact_logits` requires
+    // `!is_pure_decode`) or exactly `forward_R`, which `frame.cpp` arranges by
+    // padding the compact row list up to the request bucket.
+    //
+    // This is the invariant rather than a proxy for it on purpose: a wave whose
+    // row list could not be padded -- device-composed, over capacity, unpadded
+    // -- fails this test and runs eager, instead of replaying a body that
+    // gathers the wrong number of rows and leaves the surplus requests sampling
+    // the previous fire's residue.
+    const bool logit_rows_keyed =
+        num_logit_rows == 0 || num_logit_rows == forward_R;
     const bool geometry_replayable =
         is_pure_decode ||
         (prefill_graph_enabled() &&
+         logit_rows_keyed &&
          engine.forward_fn.invoke_prefill_graph_capturable());
     return engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
@@ -976,7 +1018,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.forward_R,
         in.num_images,
         in.num_clips,
-        in.stage_hooks != nullptr);
+        in.stage_hooks != nullptr,
+        in.num_logit_rows);
     if (graph_eligible) {
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
@@ -986,13 +1029,33 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 /*rs_verify=*/false,
                 in.have_custom_mask,
                 /*fused_argmax=*/in.logits_argmax_chunk_tokens > 0,
-                in.compact_logits,
-                graph_layout);
+                graph_layout,
+                /*compact_logits=*/in.num_logit_rows > 0);
         const ForwardGraphKey key{
             in.forward_R,
             in.forward_N,
             graph_variant,
         };
+        // `PIE_GRAPH_KEY_CHECK=1`: the invariant this whole path rests on is
+        // that a key determines the baked `num_logit_rows`. Assert it directly
+        // rather than inferring it from output agreement -- a mismatch here
+        // produces occasional wrong tokens, which is indistinguishable from
+        // this engine's own run-to-run nondeterminism and is exactly how the
+        // first version of this shipped.
+        if (graph_key_check_enabled()) {
+            static std::mutex mu;
+            static std::unordered_map<ForwardGraphKey, int,
+                                      ForwardGraphKeyHash> seen;
+            std::lock_guard<std::mutex> lock(mu);
+            auto [it, fresh] = seen.emplace(key, in.num_logit_rows);
+            if (!fresh && it->second != in.num_logit_rows) {
+                std::fprintf(stderr,
+                             "[graph-key-check] VIOLATION R=%d N=%d var=%u "
+                             "baked=%d now=%d\n",
+                             key.num_requests, key.num_tokens, key.variant,
+                             it->second, in.num_logit_rows);
+            }
+        }
         cudaGraphExec_t exec = engine.graph_cache->get(key);
         if (exec == nullptr) {
             if (step_profile_enabled()) {
@@ -1019,7 +1082,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 // capture records the compact row list instead — its count
                 // is pinned to R by the eligibility gate above.
                 in.compact_logits ? pi.sample_idx.data() : nullptr,
-                in.compact_logits ? in.num_sampling : 0,
+                in.num_logit_rows,
                 pi.w_page.data(),
                 pi.w_off.data(),
                 in.has_write_desc,
@@ -1072,7 +1135,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.logit_row_indices_d =
         in.compact_logits ? pi.sample_idx.data() : nullptr;
     fwd_in.num_logit_rows =
-        in.compact_logits ? in.num_sampling : 0;
+        in.num_logit_rows;
     fwd_in.emit_logits         = in.num_sampling > 0;
     fwd_in.logits_argmax_chunk_tokens = in.logits_argmax_chunk_tokens;
     // Multimodal: image data for the encode+scatter (no-op if none).

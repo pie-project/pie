@@ -724,7 +724,7 @@ int Context::Impl::initialize(
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
     const bool native_mxfp4_moe =
-        device_supports_native_mxfp4_moe(dev_prop.major);
+        native_mxfp4_moe_enabled(dev_prop.major);
     nlohmann::json facts = {
         {"abi_version", PIE_DRIVER_ABI_VERSION},
         {"backend", "cuda"},
@@ -1004,6 +1004,11 @@ int Context::Impl::load_model(
         family == model::Family::Kimi,
         family == model::Family::Glm5,
         family == model::Family::KimiK3,
+        // Only LlamaLike overrides `IModel::prefill_graph_capturable`, so it is
+        // the only family that can replay a prefill-carrying wave -- and the
+        // only one that should be charged the enlarged graph-mode attention
+        // workspace.
+        family == model::Family::LlamaLike,
         kv_format, runtime_quant_scratch_base, verbose);
     std::size_t free_device_bytes = 0;
     std::size_t total_device_bytes = 0;

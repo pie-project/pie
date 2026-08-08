@@ -191,10 +191,16 @@ enum class SiluMul : uint8_t { Gate = 0, Up = 1, Out = 2 };
 
 // q_gate_split: deinterleave 2x-wide q_proj output (qwen3.5 gated attn).
 // qg[n_q,2,head_dim] -> Q[n_q,head_dim] + gate[n_q,head_dim]. Internal (no golden tag).
-enum class QSplit : uint8_t { Qg = 0, QOut = 1, GateOut = 2, HeadDim = 3 };
+// The two pitches are elements between one token row and the next, 0 meaning
+// packed. They differ because the source is the 2x-wide projection and the
+// destinations are not -- except in a prefill, where both sit in the scratch
+// arena at its one common width.
+enum class QSplit : uint8_t {
+    Qg = 0, QOut = 1, GateOut = 2, HeadDim = 3, QgRowStride = 4, OutRowStride = 5
+};
 
 // attn_gate: attn *= sigmoid(gate) before o_proj (golden tag `attn_gated`). In-place.
-enum class AttnGate : uint8_t { Attn = 0, Gate = 1 };
+enum class AttnGate : uint8_t { Attn = 0, Gate = 1, RowStride = 2 };
 
 // single-token rope (NeoX, partial). In-place on buffer 0; matches rope.metal exactly:
 //   0=x (activation, in/out), 1=position (IO::Position, I1), 2=scale, 3=base=log2(theta),
@@ -237,6 +243,10 @@ enum class KvAppendPaged : uint8_t {
     KHeadStride = 6, KSeqStride = 7,
     KvPageIndices = 8, KvPageIndptr = 9, PageSize = 10, ReqOfToken = 11,
     NKvHeads = 12, WPage = 13, WOff = 14,
+    // Elements between one token's k_new/v_new row and the next; 0 is packed.
+    // Only the source needs one -- the destination is the page pool, whose rows
+    // are always exactly n_kv_heads * head_dim.
+    SrcRowStride = 15,
 };
 
 // GDN fused core (1 dispatch — beta): folds conv1d+silu + l2norm*2 + q-scale + gating +
