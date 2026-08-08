@@ -443,6 +443,14 @@ def build_config(args: argparse.Namespace):
             # to be wrong.
             **({"wasm_warm_slots": args.wasm_warm_slots}
                if getattr(args, "wasm_warm_slots", None) else {}),
+            # Bytes of a guest's linear memory that survive its exit instead of
+            # being decommitted. The engine's default is 0, so every arriving
+            # guest re-faults its whole heap -- and the madvise that frees it
+            # is an address-space operation, i.e. it interrupts every other
+            # thread in this process, scheduler threads included. Exposed to
+            # measure that cost under turnover.
+            **({"wasm_warm_memory_mb": args.wasm_warm_memory_mb}
+               if getattr(args, "wasm_warm_memory_mb", None) is not None else {}),
             **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
         model=ModelConfig(
@@ -1210,6 +1218,47 @@ async def run(args: argparse.Namespace):
                         "wave avg missing pipelines",
                     ),
                     ("default.fire.quorum.wave_fires", "wave fires"),
+                    # Chain engagement: what fraction of boundaries were
+                    # assembled while the device was still working. Present in
+                    # every build, not just profile-fire.
+                    ("default.fire.quorum.seal_events", "seal events"),
+                    ("default.fire.quorum.seal_while_executing",
+                     "seals while executing"),
+                    ("default.fire.quorum.dispatch_blocked_holds",
+                     "sealed-queue blocked holds"),
+                    # Device starvation: idle summed at frame post, when the
+                    # post found nothing executing.
+                    ("default.fire.quorum.device_idle_us", "device idle us"),
+                    ("default.fire.quorum.device_idle_gaps", "device idle gaps"),
+                    ("default.fire.quorum.idle_break_control",
+                     "idle breaks (control holds launches)"),
+                    ("default.fire.quorum.idle_break_depth",
+                     "idle breaks (depth cap)"),
+                    ("default.fire.quorum.idle_park_control_us",
+                     "idle park us (control holds launches)"),
+                    ("default.fire.quorum.idle_park_other_us",
+                     "idle park us (other)"),
+                    ("default.fire.quorum.accept_us", "accept us total"),
+                    ("default.fire.quorum.turnaround_sum_us", "turnaround sum us"),
+                    ("default.fire.quorum.turnaround_max_us", "turnaround max us"),
+                    ("default.fire.quorum.turnaround_n", "turnaround n"),
+                    ("default.fire.quorum.lane_launch_us", "lane launch us"),
+                    ("default.fire.quorum.lane_launch_n", "lane launch n"),
+                    ("default.fire.quorum.lane_prefill_us", "lane prefill us"),
+                    ("default.fire.quorum.lane_prefill_n", "lane prefill n"),
+                    ("default.fire.quorum.lane_control_us", "lane control us"),
+                    ("default.fire.quorum.lane_control_n", "lane control n"),
+                    ("default.fire.quorum.lane_control_max_us", "lane control max us"),
+                    ("default.fire.quorum.accept_calls", "accept calls"),
+                    # Guest bring-up: what a fresh lane costs before it can
+                    # submit anything.
+                    ("default.process.completed", "processes completed"),
+                    ("default.process.avg_admission_wait_us",
+                     "process avg admission wait us"),
+                    ("default.process.avg_instantiate_us",
+                     "process avg instantiate us"),
+                    ("default.process.avg_wasm_run_us",
+                     "process avg wasm run us"),
                     ("default.cumulative_batch_latency_us", "cumulative_batch_latency_us"),
                     ("default.fire.post_dispatch.context_tick_us", "fire.post_dispatch.context_tick_us"),
                     ("default.fire.post_dispatch.stats_update_us", "fire.post_dispatch.stats_update_us"),
@@ -1403,6 +1452,9 @@ def build_parser() -> argparse.ArgumentParser:
             ("--wasm-warm-slots", "wasm_warm_slots",
              "Prepared-but-idle guest slots kept for fast respawn. "
              "Default: the engine's (100)."),
+            ("--wasm-warm-memory-mb", "wasm_warm_memory_mb",
+             "MiB of a guest's linear memory kept resident across its exit "
+             "instead of decommitted. Default: the engine's (0)."),
             ("--frame-size", "frame_size",
              "Waves per frame (k). Default: the engine's."),
             ("--frame-submit-depth", "frame_submit_depth",

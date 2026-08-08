@@ -478,6 +478,14 @@ struct StepTiming {
     fire_timing::Clock::time_point wire_parse_end{};
     fire_timing::Clock::time_point prepare_end{};
     fire_timing::Clock::time_point enqueue_start{};
+    // `h2d_prepare_us` is a misnomer inherited from when the span WAS the
+    // uploads: it runs from `enqueue_start` to the end of the attention plan
+    // and holds five unrelated things. §29 makes it the second-largest block
+    // on the lane, so it gets split at its own seams rather than guessed at.
+    fire_timing::Clock::time_point enq_begin_end{};
+    fire_timing::Clock::time_point enq_geometry_end{};
+    fire_timing::Clock::time_point enq_uploads_end{};
+    fire_timing::Clock::time_point enq_compose_end{};
     fire_timing::Clock::time_point h2d_end{};
     fire_timing::Clock::time_point forward_enqueue_end{};
     fire_timing::Clock::time_point settlement_enqueue_end{};
@@ -533,7 +541,45 @@ struct StepTiming {
                        << R"(,"begin_pass_c_us":)"
                        << begin_breakdown.pass_c_us
                        << R"(,"begin_pull_validate_us":)"
-                       << begin_breakdown.pull_validate_us;
+                       << begin_breakdown.pull_validate_us
+                       << R"(,"begin_pull_seq_us":)"
+                       << begin_breakdown.pull_seq_us
+                       << R"(,"begin_pull_alloc_us":)"
+                       << begin_breakdown.pull_alloc_us
+                       << R"(,"begin_pull_alloc_order_us":)"
+                       << begin_breakdown.pull_alloc_order_us
+                       << R"(,"begin_init_flush_us":)"
+                       << begin_breakdown.init_flush_us
+                       << R"(,"begin_init_wait_us":)"
+                       << begin_breakdown.init_wait_us
+                       << R"(,"begin_init_flush_slots":)"
+                       << begin_breakdown.init_flush_slots
+                       << R"(,"begin_init_flush_calls":)"
+                       << begin_breakdown.init_flush_calls
+                       << R"(,"begin_pull_alloc_malloc_us":)"
+                       << begin_breakdown.pull_alloc_malloc_us
+                       << R"(,"begin_pull_alloc_events_us":)"
+                       << begin_breakdown.pull_alloc_events_us
+                       << R"(,"begin_pull_alloc_claim_us":)"
+                       << begin_breakdown.pull_alloc_claim_us
+                       << R"(,"begin_pull_stage_us":)"
+                       << begin_breakdown.pull_stage_us
+                       << R"(,"begin_pull_flush_us":)"
+                       << begin_breakdown.pull_flush_us
+                       << R"(,"begin_pull_staged":)"
+                       << begin_breakdown.pull_staged
+                       << R"(,"begin_pull_lanes":)"
+                       << begin_breakdown.pull_lanes
+                       << R"(,"begin_pull_tickets":)"
+                       << begin_breakdown.pull_tickets
+                       << R"(,"begin_pull_descriptors":)"
+                       << begin_breakdown.pull_descriptors
+                       << R"(,"begin_pool_growth_bytes":)"
+                       << begin_breakdown.pool_growth_bytes
+                       << R"(,"begin_membership_carried":)"
+                       << begin_breakdown.membership_carried
+                       << R"(,"begin_membership_identical":)"
+                       << begin_breakdown.membership_identical;
             }
             if (begin_end != fire_timing::Clock::time_point{} &&
                 resolve_end != fire_timing::Clock::time_point{}) {
@@ -563,6 +609,25 @@ struct StepTiming {
                 h2d_end != fire_timing::Clock::time_point{}) {
                 output << R"(,"h2d_prepare_us":)"
                        << fire_timing::duration_us(enqueue_start, h2d_end);
+                // Sub-spans of the same window, in order. Each is emitted only
+                // when its own mark was reached, so a step that skipped a
+                // phase (fold, plan-once-per-frame, empty) reports nothing for
+                // it rather than a zero that would read as "free".
+                auto span = [&](const char* name,
+                                fire_timing::Clock::time_point from,
+                                fire_timing::Clock::time_point to) {
+                    if (from == fire_timing::Clock::time_point{} ||
+                        to == fire_timing::Clock::time_point{}) {
+                        return;
+                    }
+                    output << ",\"" << name << "\":"
+                           << fire_timing::duration_us(from, to);
+                };
+                span("enq_begin_us", enqueue_start, enq_begin_end);
+                span("enq_geometry_us", enq_begin_end, enq_geometry_end);
+                span("enq_uploads_us", enq_geometry_end, enq_uploads_end);
+                span("enq_compose_us", enq_uploads_end, enq_compose_end);
+                span("enq_attn_plan_us", enq_compose_end, h2d_end);
             }
             if (h2d_end != fire_timing::Clock::time_point{} &&
                 forward_enqueue_end !=
@@ -604,7 +669,21 @@ struct StepTiming {
                        << R"(,"finish_exec_upload_us":)"
                        << finish_breakdown.epilogue_exec_upload_us
                        << R"(,"finish_exec_launch_us":)"
-                       << finish_breakdown.epilogue_exec_launch_us;
+                       << finish_breakdown.epilogue_exec_launch_us
+                       << R"(,"finish_exec_around_us":)"
+                       << finish_breakdown.epilogue_exec_around_us
+                       << R"(,"finish_exec_effects_us":)"
+                       << finish_breakdown.epilogue_exec_effects_us
+                       << R"(,"finish_try_ok":)"
+                       << finish_breakdown.group_try_add_ok
+                       << R"(,"finish_try_fail":)"
+                       << finish_breakdown.group_try_add_fail
+                       << R"(,"finish_try_ok_us":)"
+                       << finish_breakdown.group_try_ok_us
+                       << R"(,"finish_try_fail_us":)"
+                       << finish_breakdown.group_try_fail_us
+                       << R"(,"finish_census_us":)"
+                       << finish_breakdown.group_census_us;
             }
             if (finish_groups >= 0) {
                 output << R"(,"finish_groups":)" << finish_groups
@@ -620,8 +699,24 @@ struct StepTiming {
                 host_total += fire_timing::duration_us(t0, prepare_end);
             }
             if (enqueue_start != fire_timing::Clock::time_point{}) {
+                // The enqueue half ends at SETTLE, not at `now`. This record
+                // is emitted when the `PreparedStep` dies, and every step of a
+                // frame dies together in `Context::Impl::launch`'s `prepared`
+                // vector -- so `now` for step 0 of a k=2 frame is after step 1
+                // has prepared, enqueued and settled, and `host_total` for the
+                // FIRST step of every frame silently carried the second one's
+                // whole span. Measured: residual-over-phases 782 us on
+                // even-index records against 209 on odd, and step-0
+                // `host_total` 2,235 us against step-1's 1,368 for the same
+                // 256-token wave. `now` remains the fallback for the abort and
+                // error paths, which never reach settle and whose host time is
+                // still real.
+                const auto enqueue_end =
+                    settlement_enqueue_end != fire_timing::Clock::time_point{}
+                        ? settlement_enqueue_end
+                        : now;
                 host_total +=
-                    fire_timing::duration_us(enqueue_start, now);
+                    fire_timing::duration_us(enqueue_start, enqueue_end);
             }
             output << R"(,"host_total_us":)" << host_total << '}';
             fire_timing::write(output.str());
@@ -1619,7 +1714,7 @@ void prepare_step(
             // not carry a prefill through here.
             const int page = kv_cache.page_size();
             if (!is_pure_decode && !s.have_custom_mask && page > 0) {
-                int n_bucket = forward_graph_token_bucket(
+                int n_bucket = forward_graph_token_bucket_runtime(
                     s.fN_real, engine.max_workspace_tokens);
                 bool solved = false;
                 for (int iter = 0; iter < 8 && n_bucket > 0; ++iter) {
@@ -1638,7 +1733,7 @@ void prepare_step(
                         break;
                     }
                     if (lanes > want) {
-                        n_bucket = forward_graph_token_bucket(
+                        n_bucket = forward_graph_token_bucket_runtime(
                             s.fN_real + lanes, engine.max_workspace_tokens);
                         continue;
                     }
@@ -2182,8 +2277,42 @@ class EnqTimer {
 
 }  // namespace
 
+// `PIE_STEP_BALLAST_DECODE_US` / `PIE_STEP_BALLAST_PREFILL_US`: the §29 ballast
+// again, but SPLIT by what the step carries. §30's flush cut returned 2.3x the
+// uniform exchange rate, on the theory that a cut landing at the prefill /
+// turnover boundary — where the device is measured draining — is worth more per
+// microsecond than the same cut spread over every launch. That is a claim about
+// POSITION, and it is testable by adding host time at one position only.
+// Calibration probes; zero/unset costs one predicted branch each.
+namespace {
+std::uint64_t step_ballast_us(const char* name) {
+    const char* const env = std::getenv(name);
+    if (env == nullptr || *env == '\0') return 0;
+    const long long parsed = std::atoll(env);
+    return parsed > 0 ? static_cast<std::uint64_t>(parsed) : 0;
+}
+std::uint64_t decode_ballast_us() {
+    static const std::uint64_t value =
+        step_ballast_us("PIE_STEP_BALLAST_DECODE_US");
+    return value;
+}
+std::uint64_t prefill_ballast_us() {
+    static const std::uint64_t value =
+        step_ballast_us("PIE_STEP_BALLAST_PREFILL_US");
+    return value;
+}
+void spin_us(std::uint64_t microseconds) {
+    if (microseconds == 0) return;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::microseconds(microseconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+    }
+}
+}  // namespace
+
 void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     PreparedStep::Impl& s = *step.impl();
+    spin_us(s.is_pure_decode ? decode_ballast_us() : prefill_ballast_us());
     const bool dbg_fire = s.timing.enabled;
     if (dbg_fire) s.timing.enqueue_start = fire_timing::Clock::now();
 
@@ -2194,6 +2323,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         EnqTimer begin_timer(EnqProfile::kBeginEnq);
         engine.dispatch->begin_enqueue(*s.staged);
     }
+    if (dbg_fire) s.timing.enq_begin_end = fire_timing::Clock::now();
     // Original wave order: the Prologue (begin_enqueue) runs against the
     // pre-resolution state; the resolved geometry lands on the wave only
     // now, before every later phase (attention hooks, Epilogue, settle).
@@ -2202,6 +2332,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         engine.dispatch->update_launch_geometry(
             *s.staged, s.dispatch_view, s.program_token_starts);
     }
+    if (dbg_fire) s.timing.enq_geometry_end = fire_timing::Clock::now();
 
     // Wake the follower FIRST, before this rank's uploads, compose and payload
     // broadcast, so it gets that window as a head start. Rank 0 pre-enqueues
@@ -2321,6 +2452,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             cublas.stream()));
     }
     uploads_timer.stop();
+    if (dbg_fire) s.timing.enq_uploads_end = fire_timing::Clock::now();
     std::optional<EnqTimer> forward_timer;
     EnqTimer compose_timer(EnqProfile::kCompose);
     if (s.has_decode_envelopes) {
@@ -2422,6 +2554,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     // Plan-once-per-frame: a step whose every plan input is content-
     // identical to the frame's previous step skips the hook — the
     // workspace already holds the identical plan.
+    if (dbg_fire) s.timing.enq_compose_end = fire_timing::Clock::now();
     if (!s.rs_is_fold && !s.skip_plan) {
         compose_timer.stop();
         EnqTimer plan_timer(EnqProfile::kAttnPlan);

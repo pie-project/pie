@@ -17,9 +17,20 @@ namespace pie_cuda_driver::fire_timing {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr bool full() { return false; }
+// `PIE_FIRE_TIMING=1` (any non-empty, non-"0" value) turns the per-fire phase
+// record back on. It was frozen to `constexpr false`, which compiled the whole
+// breakdown out -- and that breakdown is the only thing that says whether a
+// launch's host time is wave PREPARATION or the graph replay it precedes.
+// Read once; off by default, so the hot path pays one predicted branch.
+inline bool full() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_FIRE_TIMING");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
+}
 
-constexpr bool enabled() { return false; }
+inline bool enabled() { return full(); }
 
 inline std::uint64_t duration_us(
     Clock::time_point start,
