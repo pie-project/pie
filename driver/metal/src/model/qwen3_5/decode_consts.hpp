@@ -54,7 +54,17 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                        /// a prefill lays every value's rows a uniform
                        /// `scratch_widest_elems` apart, and the routing group
                        /// is the one thing that runs over all of them at once.
-                       int row_pitch = 0);
+                       int row_pitch = 0,
+                       /// Forwarded to `bind_token_consts`. A DAG whose routed
+                       /// projections do NOT batch must say so HERE and not
+                       /// only on the fire path: setup seeds the fire path's
+                       /// "already bound at this width" memo with the width it
+                       /// bound at, so a first fire that happens to arrive at
+                       /// exactly that width skips the rebind and keeps this
+                       /// call's answer. Defaulted `true` because the prefill
+                       /// DAGs and the tests always batch; the decode's mb DAG
+                       /// is the one caller that has to pass its arm.
+                       bool routed_batched = true);
 
 // Rebind ONLY the constants the batch width can change -- the mixture's routing.
 // `bind_decode_consts` calls this, so a freshly bound DAG is complete; the fire path

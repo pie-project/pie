@@ -141,6 +141,19 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
     // The sort's own contract, and it has to match the dispatch that reads it.
     const int sorted = moe_sorted_rows(g, rows, routed_batched);
     const int tile = moe_tile_rows_for(g, rows, routed_batched);
+    // What the sort was ACTUALLY told, against what the projections were
+    // actually dispatched at. Kept rather than deleted for the same reason
+    // `PIE_METAL_PAGING_TRACE` is: the one open wrong-answer bug on this family
+    // is a disagreement between these two numbers, the failure mode is a
+    // fluent wrong answer rather than a fault, and every attempt to find it by
+    // reading has been wrong. See `moe_trace` in decode_step_mb.cpp.
+    if (moe_trace_enabled()) {
+        std::fprintf(stderr,
+                     "[moe] bind  n=%d pairs=%d E=%d k=%d batched=%d tile=%d sorted=%d"
+                     " row_pitch=%d\n",
+                     rows, pairs, g.n_experts, g.experts_per_token, int(routed_batched), tile,
+                     sorted, row_pitch);
+    }
 
     for (const auto& d : dag) {
         const int ord = d.ordinal;
@@ -178,11 +191,11 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 
 int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                        const DecodeGeometry& g, int max_ctx, bool gdn_prep, int n_tokens,
-                       int row_pitch) {
+                       int row_pitch, bool routed_batched) {
     // The width-dependent ones first, so a DAG is never left half-bound: this
     // function is the complete binding, and the fire path's rebind is a subset
     // of it rather than a second, separate contract.
-    int count = bind_token_consts(ctx, dag, g, n_tokens, row_pitch);
+    int count = bind_token_consts(ctx, dag, g, n_tokens, row_pitch, routed_batched);
 
     // rope: x[h*head_dim + i], rotary half from grid.x. scale=1.0 (qwen3.6 default mrope),
     // base = log2(theta).

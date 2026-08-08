@@ -124,6 +124,20 @@ inline int moe_tile_rows_for(const DecodeGeometry& g, int n_tokens, bool batched
 
 /// Whether a DECODE fire's routed projections run batched.
 ///
+/// Gate for the routing traces on both sides of the contract: what the sort was
+/// told (`bind_token_consts`) and what the projections were dispatched at
+/// (`mb_geometry`). Off unless asked for, and printed to stderr so it cannot
+/// land in a measured number.
+inline bool moe_trace_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_METAL_MOE_TRACE");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
+
+/// Whether a DECODE fire's routed projections run batched.
+///
 /// False, and not as a tuning choice: qwen3.5's routed batched GEMM answers
 /// wrongly on a decode fleet. See the routed arm of `mb_geometry` for the
 /// bisection. Named rather than written as a literal `false` at each site

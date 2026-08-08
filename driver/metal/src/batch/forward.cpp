@@ -1914,7 +1914,14 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
         if (!mb_bound_) {
             bind_scratch(*ctx_, mb_dag_, mb_sched_, pool_.data(), int(pool_.size()));
             bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_,
-                               std::max(1, g_.max_tokens));
+                               std::max(1, g_.max_tokens), /*row_pitch=*/0,
+                               // The arm, not the default. `mb_bound_tokens_`
+                               // is seeded on the next line with the width
+                               // bound here, so a first fire that arrives at
+                               // exactly `max_tokens` takes the memo below and
+                               // never rebinds -- and would then run the sort
+                               // padded while the projections dispatch unpadded.
+                               qwen35_routed_decode_batched());
             mb_bound_tokens_ = std::max(1, g_.max_tokens);
             prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {

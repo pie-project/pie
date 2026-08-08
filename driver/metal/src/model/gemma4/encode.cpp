@@ -106,6 +106,14 @@ bool is_routed(Kind k) {
 /// 4, 8, 16 and 32 lanes, with and without the routed GEMM engaged. The kernel
 /// is correct; it was the ruler that was bent.
 ///
+/// That last paragraph was itself written on an unrun experiment, and stands
+/// only because it has since been re-run: `env_int` rejected 0, so every
+/// `MIN_PER=0` invocation quietly fell back to the default 1 and this family
+/// never took the forced path at all. With `env_int_allow_zero` honouring it,
+/// the one-row run PASSES for real (and so does gpt-oss). Kept as a standing
+/// warning: a knob that reports a fallback is worse than a knob that does
+/// nothing, because the experiment still prints PASS.
+///
 /// The general lesson, which is why this is here and not in a commit message:
 /// a correctness gate must compare against something OUTSIDE the driver. Two
 /// of our own kernels disagreeing is the expected state of the world.
