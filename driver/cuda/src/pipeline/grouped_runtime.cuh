@@ -146,8 +146,8 @@ struct GroupedLaneBinding {
     // Launch-scoped staged execution overlays. A stage reads a channel written
     // by an earlier stage from its pending cell, and readiness treats prior
     // takes/puts as logical-fire-local rather than externally committed.
-    const std::unordered_set<std::uint32_t>* prior_put_slots = nullptr;
-    const std::unordered_set<std::uint32_t>* prior_take_slots = nullptr;
+    const SlotSet* prior_put_slots = nullptr;
+    const SlotSet* prior_take_slots = nullptr;
     std::uint32_t* commit_slot = nullptr;
     std::uint32_t logits_row_offset = 0;
     std::uint32_t logits_row_count = 0;
@@ -1467,13 +1467,25 @@ class GroupedStageAccumulator {
         const GroupedStageStaticPlan& static_plan)
         : static_plan_(&static_plan) {}
 
+    // `shared_conflict`, when given, reports whether the rejection was the
+    // ordered-execution one the caller counts — so the candidate loop can pass
+    // `reason = nullptr` and skip building a `std::string` (and then searching
+    // it for "shared") once per REJECTED candidate per group. A wave that
+    // splits into two groups rejects ~126 candidates in the first pass, and
+    // every message here is past the small-string limit, so that was ~126
+    // allocations and ~126 substring scans a wave to recover one bit.
     bool try_add(
         const GroupedLaneBinding& lane,
-        std::string* reason = nullptr) {
+        std::string* reason = nullptr,
+        bool* shared_conflict = nullptr) {
+        if (shared_conflict != nullptr) *shared_conflict = false;
         auto fail = [&](const char* message) {
             if (reason != nullptr) *reason = message;
             return false;
         };
+        // `prepare_candidate_slots` is the only rejection that is a shared-slot
+        // conflict — both of its failure paths carry that one message — so it
+        // sets the flag itself and nothing else here has to.
         bool provisional_plan = false;
         if (static_plan_ == nullptr) {
             if (lane.plan == nullptr) {
@@ -1493,7 +1505,7 @@ class GroupedStageAccumulator {
             if (provisional_plan) reset_owned_plan();
             return false;
         }
-        if (!prepare_candidate_slots(lane, reason)) {
+        if (!prepare_candidate_slots(lane, reason, shared_conflict)) {
             if (provisional_plan) reset_owned_plan();
             return false;
         }
@@ -1599,8 +1611,10 @@ class GroupedStageAccumulator {
 
     bool prepare_candidate_slots(
         const GroupedLaneBinding& lane,
-        std::string* reason) {
+        std::string* reason,
+        bool* shared_conflict) {
         auto fail = [&](const char* message) {
+            if (shared_conflict != nullptr) *shared_conflict = true;
             if (reason != nullptr) *reason = message;
             return false;
         };

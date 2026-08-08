@@ -249,6 +249,38 @@ pub struct QuorumStats {
     pub wave_missing_sum: u64,
     /// Count of WaitAll wave fires (denominator for the two averages above).
     pub wave_fires: u64,
+    /// Sealed partitions, and the subset sealed while a frame was executing.
+    /// `seal_while_executing / seal_events` is chain engagement — see
+    /// [`crate::scheduler::probe::QuorumProbes`].
+    pub seal_events: u64,
+    pub seal_while_executing: u64,
+    /// Whole-sealed-queue holds caused by a blocked front frame.
+    pub dispatch_blocked_holds: u64,
+    /// Device idle measured at frame post: total microseconds and the number
+    /// of gaps. See [`crate::scheduler::probe::QuorumProbes`].
+    pub device_idle_us: u64,
+    pub device_idle_gaps: u64,
+    /// Dispatch passes that skipped the frame policy with the device idle.
+    pub idle_break_control: u64,
+    pub idle_break_depth: u64,
+    /// Device-idle park time, split by whether a control op held launches.
+    pub idle_park_control_us: u64,
+    pub idle_park_other_us: u64,
+    /// Scheduler-thread serial cost of ingesting arrivals, and the count.
+    pub accept_us: u64,
+    pub accept_calls: u64,
+    /// Guest turnaround across every sealed lane: sum, max, count.
+    pub turnaround_sum_us: u64,
+    pub turnaround_max_us: u64,
+    pub turnaround_n: u64,
+    /// Driver-lane busy time split by op kind.
+    pub lane_launch_us: u64,
+    pub lane_launch_n: u64,
+    pub lane_prefill_us: u64,
+    pub lane_prefill_n: u64,
+    pub lane_control_us: u64,
+    pub lane_control_n: u64,
+    pub lane_control_max_us: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -317,6 +349,27 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     let mut q_wave_active_sum = 0u64;
     let mut q_wave_missing_sum = 0u64;
     let mut q_wave_fires = 0u64;
+    let mut q_seal_events = 0u64;
+    let mut q_seal_while_executing = 0u64;
+    let mut q_dispatch_blocked_holds = 0u64;
+    let mut q_device_idle_us = 0u64;
+    let mut q_device_idle_gaps = 0u64;
+    let mut q_idle_break_control = 0u64;
+    let mut q_idle_break_depth = 0u64;
+    let mut q_idle_park_control_us = 0u64;
+    let mut q_idle_park_other_us = 0u64;
+    let mut q_accept_us = 0u64;
+    let mut q_accept_calls = 0u64;
+    let mut q_turn_sum = 0u64;
+    let mut q_turn_max = 0u64;
+    let mut q_turn_n = 0u64;
+    let mut q_lane_launch = 0u64;
+    let mut q_lane_launch_n = 0u64;
+    let mut q_lane_prefill = 0u64;
+    let mut q_lane_prefill_n = 0u64;
+    let mut q_lane_control = 0u64;
+    let mut q_lane_control_n = 0u64;
+    let mut q_lane_control_max = 0u64;
     for s in scheduler_stats {
         total_batches += s.total_batches.load(Relaxed);
         total_tokens += s.total_tokens_processed.load(Relaxed);
@@ -349,6 +402,27 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         q_wave_active_sum += f.quorum.wave_active_sum.load(Relaxed);
         q_wave_missing_sum += f.quorum.wave_missing_sum.load(Relaxed);
         q_wave_fires += f.quorum.wave_fires.load(Relaxed);
+        q_seal_events += f.quorum.seal_events.load(Relaxed);
+        q_seal_while_executing += f.quorum.seal_while_executing.load(Relaxed);
+        q_dispatch_blocked_holds += f.quorum.dispatch_blocked_holds.load(Relaxed);
+        q_device_idle_us += f.quorum.device_idle_us.load(Relaxed);
+        q_device_idle_gaps += f.quorum.device_idle_gaps.load(Relaxed);
+        q_idle_break_control += f.quorum.idle_break_control.load(Relaxed);
+        q_idle_break_depth += f.quorum.idle_break_depth.load(Relaxed);
+        q_idle_park_control_us += f.quorum.idle_park_control_us.load(Relaxed);
+        q_idle_park_other_us += f.quorum.idle_park_other_us.load(Relaxed);
+        q_accept_us += f.quorum.accept_us.load(Relaxed);
+        q_accept_calls += f.quorum.accept_calls.load(Relaxed);
+        q_turn_sum += f.quorum.turnaround_sum_us.load(Relaxed);
+        q_turn_max = q_turn_max.max(f.quorum.turnaround_max_us.load(Relaxed));
+        q_turn_n += f.quorum.turnaround_n.load(Relaxed);
+        q_lane_launch += f.quorum.lane_launch_us.load(Relaxed);
+        q_lane_launch_n += f.quorum.lane_launch_n.load(Relaxed);
+        q_lane_prefill += f.quorum.lane_prefill_us.load(Relaxed);
+        q_lane_prefill_n += f.quorum.lane_prefill_n.load(Relaxed);
+        q_lane_control += f.quorum.lane_control_us.load(Relaxed);
+        q_lane_control_n += f.quorum.lane_control_n.load(Relaxed);
+        q_lane_control_max = q_lane_control_max.max(f.quorum.lane_control_max_us.load(Relaxed));
         for (dst, src) in bubble_hist.iter_mut().zip(s.bubble_us_hist.iter()) {
             *dst += src.load(Relaxed);
         }
@@ -432,6 +506,27 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
                 wave_active_sum: q_wave_active_sum,
                 wave_missing_sum: q_wave_missing_sum,
                 wave_fires: q_wave_fires,
+                seal_events: q_seal_events,
+                seal_while_executing: q_seal_while_executing,
+                dispatch_blocked_holds: q_dispatch_blocked_holds,
+                device_idle_us: q_device_idle_us,
+                device_idle_gaps: q_device_idle_gaps,
+                idle_break_control: q_idle_break_control,
+                idle_break_depth: q_idle_break_depth,
+                idle_park_control_us: q_idle_park_control_us,
+                idle_park_other_us: q_idle_park_other_us,
+                accept_us: q_accept_us,
+                accept_calls: q_accept_calls,
+                turnaround_sum_us: q_turn_sum,
+                turnaround_max_us: q_turn_max,
+                turnaround_n: q_turn_n,
+                lane_launch_us: q_lane_launch,
+                lane_launch_n: q_lane_launch_n,
+                lane_prefill_us: q_lane_prefill,
+                lane_prefill_n: q_lane_prefill_n,
+                lane_control_us: q_lane_control,
+                lane_control_n: q_lane_control_n,
+                lane_control_max_us: q_lane_control_max,
             },
         },
         bubble_us_hist: bubble_hist,

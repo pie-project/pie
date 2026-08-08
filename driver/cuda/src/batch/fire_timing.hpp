@@ -17,43 +17,20 @@ namespace pie_cuda_driver::fire_timing {
 
 using Clock = std::chrono::steady_clock;
 
-// `PIE_FIRE_TIMING` -- the variable four comments across this driver already
-// name as the way to get these records (`dispatch.cu`, `channel_registry.hpp`,
-// `frame.cpp`). Both of these were `constexpr false`, so the only way to read a
-// per-fire breakdown was to edit this header and rebuild, and the rebuilt
-// binary was then not the one whose numbers were being explained.
-//
-//   unset / 0        both off
-//   1 (or anything)  `enabled` -- the per-wave driver records
-//   waves | full     also `full` -- the per-fire host-stage breakdown
-//
-// Every call site hoists these once per fire (six in total, none per-token or
-// per-lane), so the runtime read costs a cached load on a path that already
-// does device work in the microseconds.
-namespace detail {
-inline const char* fire_timing_env() {
-    static const char* const value = std::getenv("PIE_FIRE_TIMING");
-    return value;
-}
-inline bool fire_timing_set() {
+// `PIE_FIRE_TIMING=1` (any non-empty, non-"0" value) turns the per-fire phase
+// record back on. It was frozen to `constexpr false`, which compiled the whole
+// breakdown out -- and that breakdown is the only thing that says whether a
+// launch's host time is wave PREPARATION or the graph replay it precedes.
+// Read once; off by default, so the hot path pays one predicted branch.
+inline bool full() {
     static const bool value = [] {
-        const char* const env = fire_timing_env();
+        const char* const env = std::getenv("PIE_FIRE_TIMING");
         return env != nullptr && *env != '\0' && env[0] != '0';
     }();
     return value;
 }
-}  // namespace detail
 
-inline bool enabled() { return detail::fire_timing_set(); }
-
-inline bool full() {
-    static const bool value = [] {
-        if (!detail::fire_timing_set()) return false;
-        const std::string mode = detail::fire_timing_env();
-        return mode == "waves" || mode == "full";
-    }();
-    return value;
-}
+inline bool enabled() { return full(); }
 
 inline std::uint64_t duration_us(
     Clock::time_point start,

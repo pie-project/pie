@@ -56,7 +56,68 @@ class StagedLaunch {
         std::int64_t pass_a_us = -1;
         std::int64_t tickets_us = -1;
         std::int64_t pass_c_us = -1;
+        /// NOT part of `prologue_us`/`pass_*` above, and not part of the
+        /// caller's `begin_us`: this span is measured in `begin_enqueue`,
+        /// which the frame driver calls from `enqueue_step` -- so it is nested
+        /// INSIDE `h2d_prepare_us`, specifically inside `enq_begin_us`.
+        /// §28 read the two as separate costs stepping at the same boundary
+        /// and double-counted one span (over the cliff: `enq_begin` 647 us
+        /// against `pull_validate` 635 us -- the same code).
         std::int64_t pull_validate_us = -1;
+        /// `pull_validate_us` split at its four internal seams: the in-lane-
+        /// order registry sequence applies, the stream-ordered allocation and
+        /// the initialization/publication ordering waits, the arena staging
+        /// copies, and the flush + pull-validate kernel launch. Every one of
+        /// the last three makes CUDA API calls, which is what has to be ruled
+        /// in or out before any of this counts as host work worth cutting.
+        std::int64_t pull_seq_us = -1;
+        std::int64_t pull_alloc_us = -1;
+        /// `pull_alloc_us` again, at its own seams. It reads 9 us on a decode
+        /// wave and 466 us median / 6,622 us p90 on a wave carrying prefill,
+        /// for the same lane and ticket counts -- a p90 in milliseconds on a
+        /// host call is a WAIT, and these four say which one: the
+        /// initialization-stream ordering, the 4-byte stream-ordered alloc,
+        /// the publication/publish-done event waits, or the parameter arena's
+        /// slot claim (which recycles on stream completion and so blocks on
+        /// the device when the ring is shallower than the pipeline is deep).
+        std::int64_t pull_alloc_order_us = -1;
+        /// Split of `pull_alloc_order_us`: the pending-initialization flush
+        /// (bind-time enqueue work, still on the lane thread despite the
+        /// comment's claim that binds no longer block it) against the
+        /// `cudaStreamWaitEvent` edge the function is named for, plus the
+        /// slots and contiguous runs the flush covered.
+        std::int64_t init_flush_us = -1;
+        std::int64_t init_wait_us = -1;
+        std::int64_t init_flush_slots = -1;
+        std::int64_t init_flush_calls = -1;
+        std::int64_t pull_alloc_malloc_us = -1;
+        std::int64_t pull_alloc_events_us = -1;
+        std::int64_t pull_alloc_claim_us = -1;
+        std::int64_t pull_stage_us = -1;
+        std::int64_t pull_flush_us = -1;
+        /// Did the pull-validate staging fit the parameter arena? A wave that
+        /// does not falls to the legacy per-launch upload path, which is the
+        /// first thing to check when `pull_validate_us` is large.
+        std::int64_t pull_staged = -1;
+        std::int64_t pull_lanes = -1;
+        /// Staged ticket and lane-descriptor counts: pull-validate's real
+        /// work unit, and what separates a prefill wave from a decode one.
+        std::int64_t pull_tickets = -1;
+        std::int64_t pull_descriptors = -1;
+        /// Bytes the stream-ordered allocator's pool GREW across this wave's
+        /// begin phase. Non-zero means `cudaMallocAsync` had no free block of
+        /// the requested size and took the slow synchronizing path — the
+        /// mechanism `context.cpp` blames for the `pull_validate` /
+        /// `h2d_prepare` stalls.
+        std::int64_t pool_growth_bytes = -1;
+        /// Lane-set invariance against the PREVIOUS wave (fire-timing only).
+        /// `carried` counts lanes whose (instance, program) pair sat at the
+        /// same lane index last wave; `identical` is 1 when the whole ordered
+        /// list matches, which is the condition under which every table this
+        /// begin phase builds could in principle be a delta rather than a
+        /// rebuild.
+        std::int64_t membership_carried = -1;
+        std::int64_t membership_identical = -1;
     };
     const BeginBreakdown& begin_breakdown() const { return begin_breakdown_; }
 
@@ -254,6 +315,35 @@ class Dispatch {
         std::int64_t epilogue_exec_workspace_us = -1;
         std::int64_t epilogue_exec_upload_us = -1;
         std::int64_t epilogue_exec_launch_us = -1;
+        // What `execute_group` does AROUND `run_generated_stage`, which the
+        // four sections above do not see: the `generated_stage_supported`
+        // re-check, the ticket `cudaFreeAsync`, the `direct_bf16` scan, the
+        // stats mutex, and `record_stage_channel_effects` per member. Measured
+        // at 124 us a decode wave — half again the table build it wraps.
+        std::int64_t epilogue_exec_around_us = -1;
+        /// The PER-LANE half of `epilogue_exec_around_us`: the `direct_bf16`
+        /// scan over every binding and `record_stage_channel_effects` for
+        /// every member. The rest is per-GROUP (support re-check, ticket free,
+        /// stats mutex) and a decode wave has exactly one group, so this split
+        /// says whether 122 us of wrapper is 255 small things or one big one.
+        std::int64_t epilogue_exec_effects_us = -1;
+        /// `epilogue_group_us` is 74 us on a one-group decode wave and 390 on
+        /// a two-group prefill-carrying one -- 5.3x for what the loop's shape
+        /// says should be ~1.5x more `try_add` calls. These count the calls
+        /// and split their time by outcome, because two rounds of reading the
+        /// loop did not explain the gap and §35 is the standing warning
+        /// against fixing what merely looks wasteful.
+        std::int64_t group_try_add_ok = -1;
+        std::int64_t group_try_add_fail = -1;
+        std::int64_t group_try_ok_us = -1;
+        std::int64_t group_try_fail_us = -1;
+        /// The cross-group slot-independence census, which runs ONLY when a
+        /// wave splits into more than one group — the same boundary at which
+        /// `epilogue_group_us` jumps 90 -> 408 us. Timed separately because
+        /// the `try_add` counters above exonerate the loop: a two-group wave
+        /// makes 251 successful and ONE failed call, i.e. no more work than a
+        /// one-group wave's 254.
+        std::int64_t group_census_us = -1;
     };
 
     bool finish(

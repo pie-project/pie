@@ -10,6 +10,7 @@
 
 #include "batch/forward_graph.hpp"
 #include "kernels/custom_all_reduce.hpp"
+#include "batch/forward_graph.hpp"  // prefill_graph_enabled()
 #include "cuda_check.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/argmax.hpp"
@@ -199,25 +200,43 @@ void prepare_llama_like_decode_plan(
                 cache.page_size(),
                 attn_ws,
                 /*stream=*/nullptr,
-                // Graph-mode planning for the REAL prefill/mixed batch. This
-                // was a hardcoded `false` while every other plan site here
-                // passed `decode_plan_cuda_graph`, and it is what
-                // `PrefillPlanCache::graph_capturable` is computed from --
-                // so `prefill_graph_capturable()` returned false for every
-                // wave, and the whole `PIE_PREFILL_GRAPH` path above it
-                // (eligibility, the (R,N) lattice, the padded logit rows, the
-                // compact-emit variant bit, the enlarged float workspace) was
-                // unreachable. Measured on the S cell before this line
-                // changed: `prefill: hits=0 misses=0`, 176 of 176
-                // prefill-carrying waves `refused by planner_refused`.
+                // `graph_mode_plan` marks the plan CUDA-graph capturable
+                // (`PrefillPlanCache::graph_capturable`), which is what
+                // `forward_graph_replay_eligible` consults for a wave carrying
+                // a prefill -- so with `false` here, no value of
+                // `PIE_PREFILL_GRAPH` could make such a wave replay on this
+                // family. agent-charlie reached this independently (§53) and
+                // left the literal `false`; the objection recorded there was
+                // to arming it on `PIE_PREFILL_GRAPH`, which defaults ON and
+                // would have turned graph-mode planning on for every prefill
+                // wave. That objection stands and is not reopened here.
                 //
-                // Safe to arm rather than assume: graph-mode planning always
-                // splits KV and carves float partials sized by the PADDED
-                // work-item count, and `plan_attention_flashinfer_prefill`
-                // already demotes itself back to a content-shaped plan when
-                // that carve would exceed the workspace grant. The grant is
-                // sized for exactly this in `batch/workspace.cu`, under the
-                // same flag.
+                // `PIE_PREFILL_GRAPH_PLAN` defaults OFF, so the compiled
+                // behaviour is `false` exactly as before -- it only makes the
+                // path reachable to measure instead of requiring a rebuild.
+                // Armed once, it does work (`PIE_GRAPH_STATS`: prefill hits
+                // 115 / misses 62 against hits 0 / misses 0, 4096/4096, zero
+                // key-check violations) and it LOSES, which is why it stays
+                // off: holding workspace and padding fixed, S cell, 4 rounds
+                // ABBA, 31282 against 32431 -- -3.54%, 4/4 same sign. Capture
+                // buys back a ~1.3 ms eager enqueue but graph-mode planning
+                // always splits KV and carves float partials sized by the
+                // padded work-item count.
+                //
+                // One correction to §53's second gate. It reads the invariant
+                // failure as "the wave is never graph-PADDED, so
+                // `graph_pad_requests` is 0". Measured here it is not zero --
+                // waves reach the dispatch at R=272, a padded bucket. The
+                // invariant failed because `frame.cpp` padded `sample_rows` to
+                // `s.forward_R` while that field still held its PRE-pad value
+                // (it is not assigned `fR_real + graph_pad_requests` until
+                // ~330 lines later), so `num_logit_rows` came out equal to
+                // `fR_real` exactly, every time, short by that wave's own pad
+                // width: (234,240) (248,256) (256,272). Fixing the ordering
+                // took `refused by logit_rows` 176 -> 0 and left this gate as
+                // the only one standing. Both readings agree the flag is
+                // inert; they disagree on which line makes it so, and the
+                // ordering fix is in `frame.cpp` on this branch.
                 prefill_graph_plan_enabled() && fwd_cfg.decode_plan_cuda_graph,
                 fwd_cfg.sliding_window,
                 /*full_attention_variant=*/false,

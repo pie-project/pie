@@ -2187,7 +2187,33 @@ class StepPhaseTimer {
 
 }  // namespace
 
+// `PIE_LANE_BALLAST_US`: spin this many microseconds of pure host time at the
+// top of every launch. A CALIBRATION probe, never a behaviour: the driver lane
+// is one thread and every launch's host work is serial on it, so before
+// spending effort shaving that work we need its marginal price in tok/s. Adding
+// a known amount and reading the slope answers that in one sweep; the answer
+// divides through to say what a microsecond saved is worth. Zero/unset = off,
+// one predicted branch.
+namespace {
+std::uint64_t lane_ballast_us() {
+    static const std::uint64_t value = [] {
+        const char* const env = std::getenv("PIE_LANE_BALLAST_US");
+        if (env == nullptr || *env == '\0') return std::uint64_t{0};
+        const long long parsed = std::atoll(env);
+        return parsed > 0 ? static_cast<std::uint64_t>(parsed)
+                          : std::uint64_t{0};
+    }();
+    return value;
+}
+}  // namespace
+
 int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
+    if (const std::uint64_t ballast = lane_ballast_us(); ballast != 0) {
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::microseconds(ballast);
+        while (std::chrono::steady_clock::now() < deadline) {
+        }
+    }
     pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
         runtime_quant_context_);
     const PieStepDesc* steps = frame.steps.ptr;

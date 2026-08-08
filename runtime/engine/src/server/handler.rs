@@ -236,6 +236,92 @@ impl Session {
                         format!("{}.fire.quorum.wave_fires", model_name),
                         serde_json::Value::from(inf.fire.quorum.wave_fires),
                     );
+                    // Chain engagement and the sealed-queue head-of-line hold.
+                    // Populated in every build (they ride the seal path, which
+                    // already touches these atomics), so a plain release
+                    // binary can answer "is the fleet pipelined?".
+                    stats.insert(
+                        format!("{}.fire.quorum.seal_events", model_name),
+                        serde_json::Value::from(inf.fire.quorum.seal_events),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.seal_while_executing", model_name),
+                        serde_json::Value::from(inf.fire.quorum.seal_while_executing),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.dispatch_blocked_holds", model_name),
+                        serde_json::Value::from(inf.fire.quorum.dispatch_blocked_holds),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.device_idle_us", model_name),
+                        serde_json::Value::from(inf.fire.quorum.device_idle_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.device_idle_gaps", model_name),
+                        serde_json::Value::from(inf.fire.quorum.device_idle_gaps),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.idle_break_control", model_name),
+                        serde_json::Value::from(inf.fire.quorum.idle_break_control),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.idle_break_depth", model_name),
+                        serde_json::Value::from(inf.fire.quorum.idle_break_depth),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.idle_park_control_us", model_name),
+                        serde_json::Value::from(inf.fire.quorum.idle_park_control_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.idle_park_other_us", model_name),
+                        serde_json::Value::from(inf.fire.quorum.idle_park_other_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.accept_us", model_name),
+                        serde_json::Value::from(inf.fire.quorum.accept_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.accept_calls", model_name),
+                        serde_json::Value::from(inf.fire.quorum.accept_calls),
+                    );
+                    for (key, value) in [
+                        ("fire.quorum.turnaround_sum_us", inf.fire.quorum.turnaround_sum_us),
+                        ("fire.quorum.turnaround_max_us", inf.fire.quorum.turnaround_max_us),
+                        ("fire.quorum.turnaround_n", inf.fire.quorum.turnaround_n),
+                        ("fire.quorum.lane_launch_us", inf.fire.quorum.lane_launch_us),
+                        ("fire.quorum.lane_launch_n", inf.fire.quorum.lane_launch_n),
+                        ("fire.quorum.lane_prefill_us", inf.fire.quorum.lane_prefill_us),
+                        ("fire.quorum.lane_prefill_n", inf.fire.quorum.lane_prefill_n),
+                        ("fire.quorum.lane_control_us", inf.fire.quorum.lane_control_us),
+                        ("fire.quorum.lane_control_n", inf.fire.quorum.lane_control_n),
+                        ("fire.quorum.lane_control_max_us", inf.fire.quorum.lane_control_max_us),
+                    ] {
+                        stats.insert(
+                            format!("{model_name}.{key}"),
+                            serde_json::Value::from(value),
+                        );
+                    }
+                    // Guest-side bring-up cost. `process::get_runtime_stats`
+                    // has recorded these since the admission rework and had
+                    // no reader at all, which is why a campaign chasing the
+                    // wait-all boundary's TAIL had to reach for config knobs
+                    // to ask what a fresh lane costs.
+                    let proc = process::get_runtime_stats();
+                    for (key, value) in [
+                        ("process.completed", proc.completed),
+                        ("process.avg_admission_wait_us", proc.avg_admission_wait_us),
+                        ("process.last_admission_wait_us", proc.last_admission_wait_us),
+                        ("process.avg_instantiate_us", proc.avg_instantiate_us),
+                        ("process.last_instantiate_us", proc.last_instantiate_us),
+                        ("process.avg_wasm_run_us", proc.avg_wasm_run_us),
+                        ("process.cumulative_instantiate_us", proc.cumulative_instantiate_us),
+                        ("process.cumulative_admission_wait_us", proc.cumulative_admission_wait_us),
+                    ] {
+                        stats.insert(
+                            format!("{model_name}.{key}"),
+                            serde_json::Value::from(value),
+                        );
+                    }
                 }
 
                 self.send_response(corr_id, true, serde_json::Value::Object(stats).to_string())
