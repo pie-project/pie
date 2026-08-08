@@ -447,6 +447,28 @@ impl CheckpointWriter {
         write_meta_object(self.writer(), &name, bytes)
     }
 
+    /// The 1-based index of the shard currently receiving tensors.
+    ///
+    /// `None` for a single-file writer. A caller that needs to retire source
+    /// files incrementally can remember which output shard received each
+    /// tensor, then wait for that shard to appear in [`published_shards`](Self::published_shards)
+    /// before deleting anything.
+    pub fn current_shard_index(&self) -> Option<u32> {
+        self.sharding.as_ref().map(|sharding| sharding.index)
+    }
+
+    /// Shards that have been finished, fsynced and atomically published.
+    ///
+    /// The current shard is deliberately absent: until it is finished it has
+    /// no manifest or footer and therefore cannot be opened to verify the
+    /// tensor digests it will carry. Paths stay in publication order and
+    /// remain available until [`finish`](Self::finish) consumes the writer.
+    pub fn published_shards(&self) -> impl Iterator<Item = &Path> {
+        self.sharding
+            .iter()
+            .flat_map(|sharding| sharding.done.iter().map(|(_, path)| path.as_path()))
+    }
+
     /// Closes the open shard and opens the next, when the one open is full.
     ///
     /// Called before a tensor is declared, so the decision is "does this

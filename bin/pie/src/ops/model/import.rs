@@ -316,7 +316,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     }
     .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
     let mut decoded = decoded;
-    let written_bytes = write_artifact(
+    let (written_bytes, deletion) = write_artifact(
         &mut writer,
         decoded.as_mut(),
         &passthrough,
@@ -324,6 +324,9 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         &mut bar,
         decode_read_bytes,
         copy_bytes,
+        &source.name,
+        &metadata,
+        args.delete_source,
     )?;
     // Closing belongs to whoever opened it: `finish` consumes the writer.
     writer
@@ -343,8 +346,8 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         crate::ui::duration(started.elapsed()),
         crate::ui::short_path(&out_file)
     );
-    if args.delete_source {
-        delete_source(&source.name, &metadata, &out_file)?;
+    if let Some(deletion) = deletion {
+        deletion.finish(&out_file)?;
     }
     Ok(crate::ui::Answer::did(did))
 }
@@ -356,6 +359,182 @@ fn report_would_delete(metadata: &CheckpointMetadata) {
         metadata.files.len(),
         bytes / (1 << 20)
     );
+}
+
+struct SourceFileProgress {
+    path: PathBuf,
+    size_bytes: u64,
+    remaining_tensors: usize,
+    last_shard: Option<u32>,
+    removed: bool,
+}
+
+/// Destructive import state, advanced only by published, reread output shards.
+///
+/// A tensor reaching `CheckpointWriter::end_tensor` is not enough: its digest
+/// still lives only in the open writer's manifest. A source file becomes
+/// reclaimable after all its tensors were written *and* the last output shard
+/// carrying one of them has been finished, fsynced, published and verified.
+struct IncrementalDeletion {
+    repo_id: String,
+    files: BTreeMap<u32, SourceFileProgress>,
+    verified_shards: usize,
+    removed_files: usize,
+    freed_bytes: u64,
+}
+
+impl IncrementalDeletion {
+    fn new(
+        repo_id: &str,
+        metadata: &CheckpointMetadata,
+        remaining: &std::collections::HashMap<u32, usize>,
+    ) -> Self {
+        let files = metadata
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.id.0,
+                    SourceFileProgress {
+                        path: PathBuf::from(&file.path),
+                        size_bytes: file.size_bytes,
+                        remaining_tensors: remaining.get(&file.id.0).copied().unwrap_or(0),
+                        last_shard: None,
+                        removed: false,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            repo_id: repo_id.to_string(),
+            files,
+            verified_shards: 0,
+            removed_files: 0,
+            freed_bytes: 0,
+        }
+    }
+
+    fn tensor_written(&mut self, raw: &RawTensor, shard: Option<u32>) -> Result<()> {
+        let file = self.files.get_mut(&raw.file_id.0).ok_or_else(|| {
+            anyhow!(
+                "cannot track source file {} for tensor '{}'",
+                raw.file_id.0,
+                raw.name
+            )
+        })?;
+        file.remaining_tensors = file.remaining_tensors.checked_sub(1).ok_or_else(|| {
+            anyhow!(
+                "source tensor count underflow for '{}' in {}",
+                raw.name,
+                file.path.display()
+            )
+        })?;
+        if let Some(shard) = shard {
+            file.last_shard = Some(file.last_shard.map_or(shard, |last| last.max(shard)));
+        }
+        Ok(())
+    }
+
+    fn verify_published(
+        &mut self,
+        writer: &CheckpointWriter,
+        sources: &mut std::collections::HashMap<u32, std::fs::File>,
+    ) -> Result<()> {
+        let published: Vec<PathBuf> = writer
+            .published_shards()
+            .skip(self.verified_shards)
+            .map(Path::to_path_buf)
+            .collect();
+        for path in published {
+            let verified = pie_loader::checkpoint::zt::verify_checkpoint(&path).map_err(|err| {
+                anyhow!(
+                    "refusing to delete a source: published shard {} does not verify: {err}",
+                    path.display()
+                )
+            })?;
+            self.verified_shards += 1;
+            println!(
+                "import: verified output shard {} ({} tensors)",
+                path.display(),
+                verified
+            );
+        }
+
+        let eligible: Vec<u32> = self
+            .files
+            .iter()
+            .filter(|(_, file)| {
+                !file.removed
+                    && file.remaining_tensors == 0
+                    && file
+                        .last_shard
+                        .is_some_and(|shard| shard as usize <= self.verified_shards)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in eligible {
+            // Do not leave an open handle behind after the directory entry is
+            // removed. Unix permits it; other supported hosts need not.
+            sources.remove(&id);
+            self.remove_file(id)?;
+        }
+        Ok(())
+    }
+
+    fn remove_file(&mut self, id: u32) -> Result<()> {
+        let file = self
+            .files
+            .get_mut(&id)
+            .expect("eligible source file came from this map");
+        remove_cache_file(&file.path)?;
+        file.removed = true;
+        self.removed_files += 1;
+        self.freed_bytes += file.size_bytes;
+        println!(
+            "{}: deleted verified source shard {}, freed {}",
+            self.repo_id,
+            file.path.display(),
+            crate::ui::bytes(file.size_bytes)
+        );
+        Ok(())
+    }
+
+    fn finish(mut self, artifact: &Path) -> Result<()> {
+        let verified = pie_loader::checkpoint::zt::verify_checkpoint(artifact).map_err(|err| {
+            anyhow!(
+                "refusing to delete the remaining source: {} does not verify: {err}",
+                artifact.display()
+            )
+        })?;
+        let pending: Vec<u32> = self
+            .files
+            .iter()
+            .filter(|(_, file)| !file.removed)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in pending {
+            self.remove_file(id)?;
+        }
+        if let Some(dir) = self
+            .files
+            .values()
+            .next()
+            .and_then(|file| file.path.parent())
+        {
+            let index = dir.join("model.safetensors.index.json");
+            if index.exists() {
+                remove_cache_file(&index)?;
+            }
+        }
+        println!(
+            "{}: artifact verified ({} tensors), deleted {} source file(s), freed {}",
+            self.repo_id,
+            verified,
+            self.removed_files,
+            crate::ui::bytes(self.freed_bytes)
+        );
+        Ok(())
+    }
 }
 
 /// Deletes the source weight files, after proving the artifact whole.
@@ -905,9 +1084,12 @@ fn write_artifact(
     progress: &mut ProgressLine,
     decode_read_bytes: u64,
     copy_bytes: u64,
-) -> Result<u64> {
+    repo_id: &str,
+    metadata: &CheckpointMetadata,
+    delete_source: bool,
+) -> Result<(u64, Option<IncrementalDeletion>)> {
     enum From<'a> {
-        Decoded(&'a TensorDecl),
+        Decoded(&'a TensorDecl, &'a RawTensor),
         /// The tensor and the file its bytes are in.
         Copy(&'a RawTensor, &'a str),
         Meta(&'a [u8]),
@@ -920,7 +1102,13 @@ fn write_artifact(
     let mut spool = spool;
     if let Some(plan) = decoded_plan {
         for decl in &plan.tensors {
-            entries.push((&decl.name, From::Decoded(decl)));
+            let raw = metadata.tensor_by_name(&decl.name).ok_or_else(|| {
+                anyhow!(
+                    "decoded tensor '{}' is not present in the source checkpoint",
+                    decl.name
+                )
+            })?;
+            entries.push((&decl.name, From::Decoded(decl, raw)));
         }
     }
     for (raw, path) in passthrough {
@@ -931,6 +1119,19 @@ fn write_artifact(
     }
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
+    let mut remaining = std::collections::HashMap::<u32, usize>::new();
+    for (_, entry) in &entries {
+        let raw = match entry {
+            From::Decoded(_, raw) | From::Copy(raw, _) => Some(*raw),
+            From::Meta(_) => None,
+        };
+        if let Some(raw) = raw {
+            *remaining.entry(raw.file_id.0).or_default() += 1;
+        }
+    }
+    let mut deletion =
+        delete_source.then(|| IncrementalDeletion::new(repo_id, metadata, &remaining));
+
     let mut sources: std::collections::HashMap<u32, std::fs::File> =
         std::collections::HashMap::new();
     let mut buffer = vec![0u8; 16 << 20];
@@ -938,12 +1139,23 @@ fn write_artifact(
     let mut written_bytes = 0u64;
     for (name, entry) in &entries {
         match entry {
-            From::Decoded(decl) => {
+            From::Decoded(decl, raw) => {
                 let spool = spool.as_mut().expect("decoded entries imply a spool");
                 let bytes = spool.read(name)?;
                 writer
-                    .add_tensor(decl, &bytes)
+                    .begin_tensor(decl, bytes.len() as u64)
                     .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
+                let shard = writer.current_shard_index();
+                if let Some(deletion) = &mut deletion {
+                    deletion.verify_published(writer, &mut sources)?;
+                }
+                writer
+                    .write(&bytes)
+                    .and_then(|_| writer.end_tensor())
+                    .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
+                if let Some(deletion) = &mut deletion {
+                    deletion.tensor_written(raw, shard)?;
+                }
                 written_bytes += bytes.len() as u64;
             }
             From::Meta(bytes) => {
@@ -956,12 +1168,6 @@ fn write_artifact(
                 written_bytes += bytes.len() as u64;
             }
             From::Copy(raw, path) => {
-                let handle = match sources.entry(raw.file_id.0) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                        std::fs::File::open(path).with_context(|| format!("cannot open {path}"))?,
-                    ),
-                };
                 let decl = TensorDecl {
                     id: raw.id,
                     name: raw.name.clone(),
@@ -973,6 +1179,16 @@ fn write_artifact(
                 writer
                     .begin_tensor(&decl, raw.span_bytes)
                     .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
+                let shard = writer.current_shard_index();
+                if let Some(deletion) = &mut deletion {
+                    deletion.verify_published(writer, &mut sources)?;
+                }
+                let handle = match sources.entry(raw.file_id.0) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                        std::fs::File::open(path).with_context(|| format!("cannot open {path}"))?,
+                    ),
+                };
                 handle
                     .seek(SeekFrom::Start(raw.file_offset))
                     .with_context(|| format!("cannot seek in {path}"))?;
@@ -996,10 +1212,13 @@ fn write_artifact(
                 writer
                     .end_tensor()
                     .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
+                if let Some(deletion) = &mut deletion {
+                    deletion.tensor_written(raw, shard)?;
+                }
                 written_bytes += raw.span_bytes;
             }
         }
     }
     progress.finish();
-    Ok(written_bytes)
+    Ok((written_bytes, deletion))
 }

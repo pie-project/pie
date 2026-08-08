@@ -17,6 +17,50 @@ use std::path::Path;
 use pie_loader::checkpoint::zt::{parse_checkpoint, verify_checkpoint};
 use pie_loader::types::{DType, Encoding};
 
+fn write_u8_safetensors(path: &Path, tensors: &[(&str, &[u8])]) {
+    let mut header = String::from("{");
+    let mut offset = 0usize;
+    for (index, (name, bytes)) in tensors.iter().enumerate() {
+        if index > 0 {
+            header.push(',');
+        }
+        header.push_str(&format!(
+            "\"{name}\":{{\"dtype\":\"U8\",\"shape\":[{}],\"data_offsets\":[{offset},{}]}}",
+            bytes.len(),
+            offset + bytes.len()
+        ));
+        offset += bytes.len();
+    }
+    header.push('}');
+    let mut file = Vec::with_capacity(8 + header.len() + offset);
+    file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    file.extend_from_slice(header.as_bytes());
+    for (_, bytes) in tensors {
+        file.extend_from_slice(bytes);
+    }
+    std::fs::write(path, file).expect("write safetensors shard");
+}
+
+/// Two interleaved source shards: global artifact order is a, b, c, d, so a
+/// source can be reclaimed only from remaining-tensor counts, not by noticing
+/// that the input file changed.
+fn write_interleaved_snapshot(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("create snapshot dir");
+    write_u8_safetensors(
+        &dir.join("model-00001-of-00002.safetensors"),
+        &[("a", &[1; 16]), ("c", &[3; 16])],
+    );
+    write_u8_safetensors(
+        &dir.join("model-00002-of-00002.safetensors"),
+        &[("b", &[2; 16]), ("d", &[4; 16])],
+    );
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        r#"{"metadata":{"total_size":64},"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors","c":"model-00001-of-00002.safetensors","d":"model-00002-of-00002.safetensors"}}"#,
+    )
+    .expect("write shard index");
+}
+
 /// A dense llama-shaped snapshot: `config.json` plus one real safetensors
 /// file of zeroed `dtype` weights.
 fn write_snapshot(dir: &Path, dtype: &str) {
@@ -184,4 +228,55 @@ fn import_streams_a_fully_decoded_model_through_the_spool() {
     );
     let verified = verify_checkpoint(&artifact).expect("digests verify");
     assert_eq!(verified as usize, parsed.tensors.len());
+}
+
+#[test]
+fn delete_source_preserves_sharded_artifact_bytes() {
+    let root = tempfile::tempdir().expect("root");
+    let staging = root.path().join("snapshot");
+    let normal = root.path().join("normal/model.zt");
+    let incremental = root.path().join("incremental/model.zt");
+
+    write_interleaved_snapshot(&staging);
+    pie_bin::ops::model::import::run(pie_bin::ops::model::import::ImportArgs {
+        source: staging.to_string_lossy().into_owned(),
+        out: Some(normal.clone()),
+        dry_run: false,
+        force: false,
+        // One tensor per output shard. This forces three roll/verify cycles
+        // before finish and exercises interleaved source ownership.
+        max_shard_size: Some(16),
+        delete_source: false,
+    })
+    .expect("normal import failed");
+
+    write_interleaved_snapshot(&staging);
+    pie_bin::ops::model::import::run(pie_bin::ops::model::import::ImportArgs {
+        source: staging.to_string_lossy().into_owned(),
+        out: Some(incremental.clone()),
+        dry_run: false,
+        force: false,
+        max_shard_size: Some(16),
+        delete_source: true,
+    })
+    .expect("incremental import failed");
+
+    assert!(!staging.join("model-00001-of-00002.safetensors").exists());
+    assert!(!staging.join("model-00002-of-00002.safetensors").exists());
+    assert!(!staging.join("model.safetensors.index.json").exists());
+    assert_eq!(verify_checkpoint(&incremental).unwrap(), 4);
+
+    assert_eq!(
+        std::fs::read(&normal).unwrap(),
+        std::fs::read(&incremental).unwrap()
+    );
+    for shard in 1..=4 {
+        let normal_shard = normal.with_file_name(format!("model-{shard:05}.zt"));
+        let incremental_shard = incremental.with_file_name(format!("model-{shard:05}.zt"));
+        assert_eq!(
+            std::fs::read(normal_shard).unwrap(),
+            std::fs::read(incremental_shard).unwrap(),
+            "output shard {shard} differs"
+        );
+    }
 }
