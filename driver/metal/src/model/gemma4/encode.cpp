@@ -15,6 +15,9 @@
 // having.
 
 #include "encode.hpp"
+#include <string>
+#include <cstring>
+#include <cstdlib>
 
 #include "../qwen3_5/decode_dispatch_mb.hpp"
 
@@ -727,6 +730,88 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
     }
 }
 
+/// This family's kinds, for `PIE_METAL_ABLATE`.
+///
+/// gemma4 carries its own `Kind` enum rather than the shared `Kernel`, so the
+/// shared `kernel_name` cannot answer for it and the ablation knob could not
+/// name a single gemma4 dispatch. Prefixed `g4_` for the same reason the shared
+/// table prefixes its gemma4 entries: `attn_norm` means something in three
+/// families and they are different dispatches.
+const char* gemma4_kind_name(Kind k) {
+    switch (k) {
+        case Kind::EmbedGather:          return "g4_embed_gather";
+        case Kind::PleTokenGather:       return "g4_ple_token_gather";
+        case Kind::PleProjGemv:          return "g4_ple_proj_gemv";
+        case Kind::PleProjNorm:          return "g4_ple_proj_norm";
+        case Kind::PleCombine:           return "g4_ple_combine";
+        case Kind::AttnNorm:             return "g4_attn_norm";
+        case Kind::QmvQ:                 return "g4_qmv_q";
+        case Kind::QmvK:                 return "g4_qmv_k";
+        case Kind::QmvV:                 return "g4_qmv_v";
+        case Kind::QNorm:                return "g4_q_norm";
+        case Kind::KNorm:                return "g4_k_norm";
+        case Kind::VNorm:                return "g4_v_norm";
+        case Kind::VNormFromK:           return "g4_v_norm_from_k";
+        case Kind::RopeQ:                return "g4_rope_q";
+        case Kind::RopeK:                return "g4_rope_k";
+        case Kind::KvAppend:             return "g4_kv_append";
+        case Kind::Sdpa:                 return "g4_sdpa";
+        case Kind::QmvO:                 return "g4_qmv_o";
+        case Kind::PostAttnResidual:     return "g4_post_attn_residual";
+        case Kind::FfnNorm:              return "g4_ffn_norm";
+        case Kind::QmvGate:              return "g4_qmv_gate";
+        case Kind::QmvUp:                return "g4_qmv_up";
+        case Kind::GegluTanh:            return "g4_geglu_tanh";
+        case Kind::QmvDown:              return "g4_qmv_down";
+        case Kind::DenseBranchNorm:      return "g4_dense_branch_norm";
+        case Kind::RouterNorm:           return "g4_router_norm";
+        case Kind::RouterGemv:           return "g4_router_gemv";
+        case Kind::RouterTopK:           return "g4_router_top_k";
+        case Kind::MoeNorm:              return "g4_moe_norm";
+        case Kind::ExpertSort:           return "g4_expert_sort";
+        case Kind::ExpertGather:         return "g4_expert_gather";
+        case Kind::ExpertGate:           return "g4_expert_gate";
+        case Kind::ExpertUp:             return "g4_expert_up";
+        case Kind::ExpertGeglu:          return "g4_expert_geglu";
+        case Kind::ExpertDown:           return "g4_expert_down";
+        case Kind::ExpertCombine:        return "g4_expert_combine";
+        case Kind::MoeBranchNorm:        return "g4_moe_branch_norm";
+        case Kind::BranchAdd:            return "g4_branch_add";
+        case Kind::PostFfnResidual:      return "g4_post_ffn_residual";
+        case Kind::PleGateGemv:          return "g4_ple_gate_gemv";
+        case Kind::PleGeglu:             return "g4_ple_geglu";
+        case Kind::PleProjLayerGemv:     return "g4_ple_proj_layer_gemv";
+        case Kind::PleResidualScaled:    return "g4_ple_residual_scaled";
+        case Kind::LayerScalar:          return "g4_layer_scalar";
+        case Kind::RowGather:            return "g4_row_gather";
+        case Kind::FinalRms:             return "g4_final_rms";
+        case Kind::LmHead:               return "g4_lm_head";
+        case Kind::FinalSoftcap:         return "g4_final_softcap";
+        case Kind::Argmax:               return "g4_argmax";
+    }
+    return "g4_unknown";
+}
+
+/// Whether `PIE_METAL_ABLATE` names this kind. See `kernel_ablated`; this is
+/// the same knob, reading this family's own names.
+bool gemma4_ablated(Kind k) {
+    static const std::string spec = [] {
+        const char* e = std::getenv("PIE_METAL_ABLATE");
+        return std::string(e == nullptr ? "" : e);
+    }();
+    if (spec.empty()) return false;
+    const char* n = gemma4_kind_name(k);
+    std::size_t at = 0;
+    while ((at = spec.find(n, at)) != std::string::npos) {
+        const bool lok = at == 0 || spec[at - 1] == ',';
+        const std::size_t end = at + std::strlen(n);
+        const bool rok = end == spec.size() || spec[end] == ',';
+        if (lok && rok) return true;
+        at = end;
+    }
+    return false;
+}
+
 void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                         const Gemma4Geometry& g, const DecodeStepPsos& base,
                         const Gemma4Psos& g4, int ordinal_base,
@@ -734,6 +819,7 @@ void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
     const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (std::size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
+        if (gemma4_ablated(d.kind)) continue;
         Grid grid;
         Threadgroup tg;
         launch_shape(d, g, grid, tg);
@@ -770,6 +856,7 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
     const int S0 = head_rows < 1 ? N0 : (head_rows < N0 ? head_rows : N0);
     for (std::size_t i = begin; i < end; ++i) {
         const Dispatch& d = dag[i];
+        if (gemma4_ablated(d.kind)) continue;
         // The FP16 staging pass. It rides the projection's own argument table
         // -- the source is already bound there as the GEMM's input and the
         // staging buffer beside it -- so it needs no DAG entry, which is what
