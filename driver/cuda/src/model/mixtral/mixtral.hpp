@@ -121,12 +121,10 @@ struct MixtralLayerWeights {
     /// reading back the routed set to rebuild them. Mutable because it is a
     /// memo of the cache's state, not part of the weights.
     mutable bool expert_ptrs_static = false;
-    // Marlin-order (`[k/32, n]`) copies of the native MXFP4 group scales,
-    // built once on first use. The checkpoint publishes the transpose.
-    mutable DeviceBuffer<std::uint8_t> marlin_gate_scales;
-    mutable DeviceBuffer<std::uint8_t> marlin_up_scales;
-    mutable DeviceBuffer<std::uint8_t> marlin_down_scales;
-    mutable bool marlin_scales_ready = false;
+    // No Marlin-order scale copies here any more: the loader's
+    // `RepackLayout::MarlinMxfp4Scale` already publishes the native MXFP4
+    // group scales in exactly the order Marlin walks them. These used to hold
+    // a re-transposed copy, which was the gpt-oss native-MXFP4 corruption.
 };
 
 struct MixtralWeights {
