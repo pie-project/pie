@@ -654,6 +654,10 @@ struct PreparedStep::Impl {
     int R = 0;
     int N = 0;
     int num_sampling = 0;
+    // Rows the FORWARD gathers/emits: `num_sampling` padded up to the request
+    // bucket when the wave is graph-padded, so the baked count is keyed. See
+    // the comment where it is set. Settlement still uses `num_sampling`.
+    int num_logit_rows = 0;
     bool is_pure_decode = false;
     bool empty_step = false;
     bool settle_plain = false;   // empty or fold settle: finish(nullptr, 0)
@@ -1580,17 +1584,8 @@ void prepare_step(
         // of extra rows, exactly as it would have unpadded. Under-padding is
         // what costs -- it is what leaves the shape off-lattice and forces the
         // one-off capture.
-        // A compact-logit wave can never replay (see the `compact_logits`
-        // clause in `forward_graph_replay_eligible`), so padding one buys
-        // nothing and costs its pad rows real compute on the eager path.
-        // `s.compact_logits` is not decided until later, but its shape term
-        // is known here; `mtp_plan` is not, so this is the conservative half
-        // -- it declines to pad whenever the wave MIGHT come out compact.
-        const bool maybe_compact_logits =
-            num_sampling > 0 && num_sampling < s.fN_real;
         const bool prefill_pad_ok =
-            prefill_graph_enabled() && !s.have_custom_mask &&
-            !maybe_compact_logits;
+            prefill_graph_enabled() && !s.have_custom_mask;
         const bool eligible = forward_graph_replay_eligible(
             engine,
             is_pure_decode || prefill_pad_ok,
@@ -1605,7 +1600,10 @@ void prepare_step(
             s.img_num_images,
             s.aud_num_clips,
             s.has_attention_stages,
-            maybe_compact_logits);
+            // Nothing is baked yet at this point -- this call only decides
+            // whether to PAD. The dispatch-side call is the authority on
+            // replay and re-checks the real row count.
+            /*num_logit_rows=*/0);
         if (eligible && engine.graph_pad_page >= 0) {
             const int max_requests = std::min(
                 engine.max_forward_requests, engine.max_workspace_tokens);
@@ -1776,10 +1774,7 @@ void prepare_step(
     if (!s.rs_is_fold && N > tensor_rows(ws.logits)) {
         throw std::runtime_error("forward batch exceeds logits workspace");
     }
-    if (!s.sample_rows.empty() && !s.rpg.device_composed) {
-        s.up_sample_idx = pi.sample_idx.stage_from_host(
-            std::span<const std::int32_t>(s.sample_rows));
-    }
+    // MTP plans against the REAL rows, before any padding below.
     s.mtp_plan = preflight_mtp_draft_logits(
         engine, s.composed, s.sample_rows, s.mtp_draft_counts);
     s.compact_logits =
@@ -1787,6 +1782,37 @@ void prepare_step(
         s.mtp_plan.work.empty() &&
         num_sampling > 0 &&
         num_sampling < s.fN_real;
+    // `num_logit_rows` is baked into a captured body (it sizes the gather and
+    // the lm_head rows) but `ForwardGraphKey` carries only the (R, N) buckets,
+    // so a compact row count that varies per fire cannot be replayed safely --
+    // two waves in the same bucket pair would gather different row counts and
+    // the surplus requests would sample the previous fire's residue.
+    //
+    // Padding the row list up to `s.forward_R` makes the baked count equal to
+    // a value the key already carries. The extra entries name row 0, which is
+    // always in range; their logits land in slots [num_sampling, forward_R)
+    // of `ws.logits`, and settlement reads only [0, num_sampling), so they are
+    // computed and never read. `s.num_sampling` stays the REAL count for
+    // exactly that reason.
+    //
+    // Only worth doing when the wave was padded at all; an unpadded wave has
+    // nothing to gain and the dispatch gate will refuse it either way.
+    s.num_logit_rows = num_sampling;
+    if (s.compact_logits && s.graph_pad_requests > 0 &&
+        !s.rpg.device_composed &&
+        static_cast<int>(s.sample_rows.size()) < s.forward_R &&
+        s.forward_R < s.fN_real + s.graph_pad_tokens) {
+        s.sample_rows.resize(static_cast<std::size_t>(s.forward_R), 0);
+        s.num_logit_rows = s.forward_R;
+    }
+    if (s.sample_rows.size() > pi.sample_idx.size()) {
+        throw std::runtime_error(
+            "padded sampling rows exceed persistent input capacity");
+    }
+    if (!s.sample_rows.empty() && !s.rpg.device_composed) {
+        s.up_sample_idx = pi.sample_idx.stage_from_host(
+            std::span<const std::int32_t>(s.sample_rows));
+    }
     // Fold the greedy argmax into the LM head GEMM when every epilogue in the
     // launch is a bare argmax over `logits`, so the vocabulary is reduced as
     // it is produced instead of making a round trip through HBM (§20.37).
@@ -2392,7 +2418,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             s.rs_is_fold ? 0 : s.mask_indptr_count,
             /*has_slot_ids=*/s.use_slots,
             !s.rs_is_fold && s.has_write_desc,
-            s.compact_logits ? s.num_sampling : 0,
+            s.compact_logits ? s.num_logit_rows : 0,
             s.structured_window_left,
             s.rs_plan.mode,
             static_cast<int>(s.rs_fold_len_view.size()),
@@ -2539,7 +2565,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             s.rs_is_fold ? 0 : s.mask_indptr_count,
                             /*has_slot_ids=*/s.use_slots,
                             !s.rs_is_fold && s.has_write_desc,
-                            s.compact_logits ? s.num_sampling : 0,
+                            s.compact_logits ? s.num_logit_rows : 0,
                             s.structured_window_left,
                             s.rs_plan.mode,
                             static_cast<int>(s.rs_fold_len_view.size()),
@@ -2680,6 +2706,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .forward_R = s.forward_R,
             .forward_N = s.forward_N,
             .num_sampling = s.num_sampling,
+            .num_logit_rows = s.compact_logits ? s.num_logit_rows : 0,
             .is_pure_decode = s.is_pure_decode,
             .have_custom_mask = s.have_custom_mask,
             .compact_logits = s.compact_logits,

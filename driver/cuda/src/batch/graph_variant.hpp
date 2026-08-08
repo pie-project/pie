@@ -27,10 +27,20 @@ inline constexpr std::uint32_t kGvCustomMask  = 1u << 2;
 // token ids as it produces them (§20.37). Those are different kernel sequences,
 // so they are different captures and must not share a key.
 inline constexpr std::uint32_t kGvFusedArgmax = 1u << 3;
-inline constexpr int           kGvLayoutShift = 4;
+// A compact emit gathers `num_logit_rows` rows and runs the LM head over them;
+// a full emit runs it over all N. Different kernel sequences, and the row count
+// is BAKED into the capture while `ForwardGraphKey` carries only the (R, N)
+// buckets -- so without this bit a compact wave and a full-emit wave in the
+// same bucket pair would share a graph and one of them would gather the wrong
+// number of rows. The dispatch gate additionally pins the compact count to
+// `forward_R`, which the key does carry; this bit is what keeps "compact at
+// forward_R" and "full emit" apart.
+inline constexpr std::uint32_t kGvCompactLogits = 1u << 4;
+inline constexpr int           kGvLayoutShift = 5;
 
 inline constexpr std::uint32_t kGvFlagMask =
-    kGvSmallSpec | kGvRsVerify | kGvCustomMask | kGvFusedArgmax;
+    kGvSmallSpec | kGvRsVerify | kGvCustomMask | kGvFusedArgmax |
+    kGvCompactLogits;
 
 // By construction: every flag is below the layout field, so no `graph_layout`
 // value can ever alias a flag bit.
@@ -41,11 +51,13 @@ constexpr std::uint32_t make_graph_variant(bool small_spec,
                                            bool rs_verify,
                                            bool custom_mask,
                                            bool fused_argmax,
-                                           std::uint32_t graph_layout) {
-    return (small_spec   ? kGvSmallSpec   : 0u) |
-           (rs_verify    ? kGvRsVerify    : 0u) |
-           (custom_mask  ? kGvCustomMask  : 0u) |
-           (fused_argmax ? kGvFusedArgmax : 0u) |
+                                           std::uint32_t graph_layout,
+                                           bool compact_logits = false) {
+    return (small_spec     ? kGvSmallSpec     : 0u) |
+           (rs_verify      ? kGvRsVerify      : 0u) |
+           (custom_mask    ? kGvCustomMask    : 0u) |
+           (fused_argmax   ? kGvFusedArgmax   : 0u) |
+           (compact_logits ? kGvCompactLogits : 0u) |
            (graph_layout << kGvLayoutShift);
 }
 
@@ -84,5 +96,11 @@ static_assert(make_graph_variant(false, false, false, false, 64u) !=
 static_assert(make_graph_variant(false, false, false, false, 1u) !=
                   make_graph_variant(false, false, false, true, 0u),
               "graph_layout=1 must hash distinctly from fused_argmax");
+static_assert(make_graph_variant(false, false, false, false, 1u) !=
+                  make_graph_variant(false, false, false, false, 0u, true),
+              "graph_layout=1 must hash distinctly from compact_logits");
+static_assert(make_graph_variant(false, false, false, false, 0u, true) !=
+                  make_graph_variant(false, false, false, false, 0u, false),
+              "a compact emit must not share a key with a full emit");
 
 }  // namespace pie_cuda_driver
