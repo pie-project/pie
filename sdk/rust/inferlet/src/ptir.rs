@@ -1562,34 +1562,44 @@ pub async fn run_ahead<W: PassWit>(
         submit_one_frame(&mut submitted)?;
     }
 
-    // Submission is over the moment the window can no longer be topped up.
-    // Saying so HERE rather than after the drain is the whole point: an
-    // awaited lane with nothing queued holds the frame seal for every other
-    // lane in the fleet, and the engine cannot tell a finished guest from one
-    // that is merely between decode steps -- both have an empty queue and no
-    // outstanding debt. Measured on the equivalent hand-rolled loop: the
-    // departing lane held the seal a median 4-8 ms, once per request, worth
-    // +16.8% at 512-way concurrency.
+    // END OF STREAM. The instant this lane will not submit again, every other
+    // lane in the fleet is holding its frame seal for a guest with nothing left
+    // to contribute -- and the engine cannot work that out for itself, because a
+    // finished guest and one merely between decode steps look identical to it
+    // (empty queue, no outstanding debt). Only the loop that owns `budget`
+    // knows, so it has to say so. This is `Pipeline`'s own documented rule:
+    // "call close right after the last submit".
     //
-    // Safe to call with fires still in flight: close never waits for an
-    // unsettled fire, already-submitted fires settle in FIFO order and stay
-    // take-able, and the close latches, so a caller's own trailing `close()`
-    // is a no-op rather than an error.
+    // Measured on the equivalent hand-rolled loop: a departing lane held the
+    // seal a median 4-8 ms, once per request; saying so on time is worth
+    // +9.5% to +18.7% depending on shape, and the wave does not narrow where
+    // request turnover refills the slot.
+    //
+    // Safe with fires still in flight -- close never waits for an unsettled
+    // fire, and already-submitted fires settle in FIFO order and stay
+    // take-able. `ended` is not redundant with the engine's own `first_close`
+    // latch: that latch only suppresses the wait-set notify, while every
+    // `close()` still crosses into the host and drains settled entries
+    // (measured 3 us p50 at conc 512). So a caller's trailing `close()` stays
+    // CORRECT, but it is not free, and neither would be closing on every
+    // iteration here.
     let mut ended = false;
-    let end_stream = |on: &Pipeline, ended: &mut bool| {
-        if !*ended {
-            on.close();
-            *ended = true;
-        }
-    };
-    if submitted >= budget {
-        end_stream(on, &mut ended);
+
+    // Three sites, one condition, none of them redundant:
+    //   (a) the priming loop above already spent the budget, so say it before
+    //       the first take rather than after it;
+    if submitted >= budget && !ended {
+        on.close();
+        ended = true;
     }
     while consumed < submitted {
         if on_token().await? == ControlFlow::Break(()) {
-            // An early stop ends the stream too -- the remaining window is
-            // never taken and close reclaims it.
-            end_stream(on, &mut ended);
+            //   (b) an early stop also ends the stream -- the rest of the
+            //       window is never taken, and close reclaims it. No need to
+            //       latch `ended`: this arm returns.
+            if !ended {
+                on.close();
+            }
             return Ok(consumed + 1);
         }
         consumed += 1;
@@ -1598,11 +1608,17 @@ pub async fn run_ahead<W: PassWit>(
         if submitted < budget && submitted - consumed <= (window_frames - 1) * r {
             submit_one_frame(&mut submitted)?;
         }
-        if submitted >= budget {
-            end_stream(on, &mut ended);
+        if submitted >= budget && !ended {
+            on.close();
+            ended = true;
         }
     }
-    end_stream(on, &mut ended);
+    //   (c) and a lane whose live width is zero never submits at all, so the
+    //       loop can fall out with `submitted < budget` and neither (a) nor
+    //       the in-loop check will have fired.
+    if !ended {
+        on.close();
+    }
     Ok(consumed)
 }
 
