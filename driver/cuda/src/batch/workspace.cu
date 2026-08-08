@@ -127,7 +127,16 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
     // actually replay one, so the OFF arm of any A/B -- and every model family
     // that does not override `IModel::prefill_graph_capturable` -- allocates
     // exactly what it allocated before.
-    if (prefill_graph_enabled() && prefill_graph_capable &&
+    // Gated on the PLAN half, not the whole lever. This reservation exists
+    // solely to stop graph-mode prefill planning from demoting itself on the
+    // carve check; with the plan mode off, nothing consults it. Measured on
+    // the S cell, 4 rounds ABBA each: the flag's gain is entirely its padding
+    // half (+6.77%, 4/4), and padding-off WITH this reservation (30409) lands
+    // on flag-off without it (30305) -- so the 592 MiB it takes buys nothing
+    // unless `PIE_PREFILL_GRAPH_PLAN=1`. The term is linear in `max_tokens`,
+    // so on a pinned-page bench it is invisible and in auto mode it is KV
+    // capacity spent for nothing.
+    if (prefill_graph_plan_enabled() && prefill_graph_capable &&
         max_tokens > 0 && max_requests > 0) {
         const std::size_t gqa = std::max<std::size_t>(1, qo_heads / kv_heads);
         const std::size_t max_r = static_cast<std::size_t>(max_requests);

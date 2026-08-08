@@ -1585,7 +1585,7 @@ void prepare_step(
         // what costs -- it is what leaves the shape off-lattice and forces the
         // one-off capture.
         const bool prefill_pad_ok =
-            prefill_graph_enabled() && !s.have_custom_mask;
+            prefill_graph_pad_enabled() && !s.have_custom_mask;
         const bool eligible = forward_graph_replay_eligible(
             engine,
             is_pure_decode || prefill_pad_ok,

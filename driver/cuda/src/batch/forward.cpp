@@ -193,6 +193,20 @@ bool prefill_graph_plan_enabled() {
     return value;
 }
 
+// `PIE_PREFILL_GRAPH_PAD` -- the request/token padding half of the lever, so
+// it can be priced against the workspace half. `PIE_PREFILL_GRAPH` moves both
+// plus the plan mode; `PIE_PREFILL_GRAPH_PLAN` already split the plan off, and
+// this splits the remaining two. Follows `prefill_graph_enabled()` unless
+// overridden, so default behaviour is unchanged.
+bool prefill_graph_pad_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_PREFILL_GRAPH_PAD");
+        if (env == nullptr || *env == '\0') return prefill_graph_enabled();
+        return env[0] != '0';
+    }();
+    return value;
+}
+
 bool graph_stats_enabled() {
     static const bool value = [] {
         const char* const env = std::getenv("PIE_GRAPH_STATS");

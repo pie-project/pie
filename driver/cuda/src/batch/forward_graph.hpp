@@ -11,6 +11,8 @@ bool prefill_graph_enabled();
 // Graph-mode PLANNING half of the same lever; see `PIE_PREFILL_GRAPH_PLAN` in
 // `batch/forward.cpp`. Follows `prefill_graph_enabled()` unless overridden.
 bool prefill_graph_plan_enabled();
+// Request/token padding half; see `PIE_PREFILL_GRAPH_PAD` in `forward.cpp`.
+bool prefill_graph_pad_enabled();
 }  // namespace pie_cuda_driver
 
 // CUDA-graph cache for the decode forward body.
