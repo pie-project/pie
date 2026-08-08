@@ -9,11 +9,13 @@ from common import (
     ArrivalPacer,
     RequestResult,
     add_mode_subcommands,
+    add_output_dump_args,
     arrival_schedule,
     finish,
     hf_chat_prompts_and_counts,
     make_prompts,
     maybe_set_cpu_affinity,
+    print_first_output,
     request_max_tokens,
     request_max_tokens_varies,
     summarize,
@@ -134,6 +136,14 @@ def run(args: argparse.Namespace):
 
     engine = build_engine(args, max_running_requests)
     want_timing = getattr(args, "report_timing", False)
+    # The correctness gate counts DISTINCT WORDS in the generated text, and
+    # `ignore_eos` makes token count useless for that -- it always yields
+    # exactly max_tokens, degenerate or not. So the text has to come back.
+    # SGLang hands the cumulative string back on every streamed chunk, so
+    # keeping it is a matter of not discarding the last one.
+    want_text = getattr(args, "dump_all_texts", False) or getattr(
+        args, "dump_first_text", False
+    )
 
     async def stream_one(
         prompt,
@@ -165,6 +175,7 @@ def run(args: argparse.Namespace):
                     int(meta.get("completion_tokens", 0)),
                     prompt_count,
                     client_send_s=client_send_s,
+                    output_text=out.get("text") if want_text else None,
                 )
             except Exception as e:  # noqa: BLE001
                 return RequestResult(
@@ -180,6 +191,7 @@ def run(args: argparse.Namespace):
         token_arrival_s: list[float] = []
         token_arrival_monotonic_ns: list[int] = []
         n_tokens = 0
+        text: str | None = None
         try:
             generator = await engine.async_generate(
                 prompt=prompt, sampling_params=params, stream=True
@@ -187,6 +199,8 @@ def run(args: argparse.Namespace):
             async for out in generator:
                 now = time.perf_counter()
                 now_monotonic_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+                if want_text:
+                    text = out.get("text")
                 meta = out.get("meta_info") or {}
                 new_total = int(meta.get("completion_tokens", n_tokens))
                 if new_total > n_tokens:
@@ -226,6 +240,7 @@ def run(args: argparse.Namespace):
                     if measured_epoch_monotonic_ns is not None
                     else None
                 ),
+                output_text=text,
             )
         except Exception as e:  # noqa: BLE001
             return RequestResult(
@@ -329,6 +344,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SGLang canonical latency/throughput benchmark")
     add_mode_subcommands(parser)
     for sp in parser._subparsers._group_actions[0].choices.values():
+        add_output_dump_args(sp)
         sp.add_argument(
             "--report-timing",
             action="store_true",
@@ -339,6 +355,8 @@ def main() -> None:
         )
     args = parser.parse_args()
     summary, results = run(args)
+    first = next((r.output_text for r in results if r.ok and r.output_text), None)
+    print_first_output(args, first)
     finish(summary, results, args.json_out)
 
 

@@ -146,13 +146,22 @@ def embedded_engine_identity() -> dict[str, str]:
 
     engine_path = Path(_engine.__file__).resolve()
     source_suffixes = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".rs"}
-    source_roots = (
+    source_roots = [
         ROOT / "driver",
         ROOT / "interface",
         ROOT / "runtime",
         ROOT / "worker",
         ROOT / "sdk" / "python-server" / "src",
-    )
+    ]
+    # `driver-metal` is only in the dependency list on Apple-Silicon builds
+    # (sdk/python-server/Cargo.toml), so on Linux its sources cannot have gone
+    # into this .so. Counting them makes an origin/dev pull that touched only
+    # the Metal driver look like a stale CUDA engine.
+    skip_roots = () if sys.platform == "darwin" else (ROOT / "driver" / "metal",)
+    # `driver/*/bench` holds standalone microbenchmarks built directly with
+    # nvcc; the engine's CMakeLists builds `tests/`, never `bench/`. Editing
+    # one cannot change the .so, so counting them here only blocks the bench
+    # from running until an unrelated 12-minute rebuild is done.
     newest_source = max(
         (
             path
@@ -165,6 +174,8 @@ def embedded_engine_identity() -> dict[str, str]:
             # `cargo test`). They are outputs, not inputs: including them makes
             # the guard fire on a tree that is not stale.
             and "target" not in path.parts
+            and "bench" not in path.relative_to(root).parts
+            and not any(path.is_relative_to(s) for s in skip_roots)
         ),
         key=lambda path: path.stat().st_mtime_ns,
     )

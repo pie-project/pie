@@ -1,4 +1,6 @@
 #include "kernels/rmsnorm.hpp"
+
+#include <type_traits>
 #include "kernels/dequant_wna16.hpp"
 
 #include <cuda_bf16.h>
@@ -339,6 +341,96 @@ __global__ void rmsnorm_residual_add_bf16_kernel(
     }
 }
 
+// Vectorized twin of the kernel below: float4 loads (8 bf16) instead of
+// scalars. The scalar form walks the row THREE times, once per pass, so at
+// hidden 2816 with BLOCK=512 each thread does ~6 dependent loads per pass;
+// vectorized it is under one. The plain norm's own note records ~7x from
+// exactly this change, and this kernel measured 10.79 us/call in
+// gemma-4-26B's decode -- 8% of the step -- against 2.51 for the vectorized
+// plain norm.
+//
+// Per-element arithmetic and the bf16 rounding points are identical to the
+// scalar form; only the ORDER of the two sum reductions differs (8 values
+// accumulate per thread before the block reduce), which is the same trade
+// rmsnorm_bf16_vec8_kernel already makes. Requires hidden % 8 == 0 and
+// 16-byte-aligned rows -- the launcher checks with rmsnorm_vec8_ok.
+template <int BLOCK>
+__global__ void rmsnorm_rasr_vec8_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ hidden,
+    float scale,
+    const __nv_bfloat16* __restrict__ next_weight,
+    __nv_bfloat16* __restrict__ norm_out,
+    int hidden_size,
+    float eps)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int vecs = hidden_size / 8;
+    const float4* xr = reinterpret_cast<const float4*>(x + (long long)row * hidden_size);
+    const float4* wv = reinterpret_cast<const float4*>(weight);
+    const float4* nwv = reinterpret_cast<const float4*>(next_weight);
+    float4* hr = reinterpret_cast<float4*>(hidden + (long long)row * hidden_size);
+    float4* nr = reinterpret_cast<float4*>(norm_out + (long long)row * hidden_size);
+
+    float local = 0.f;
+    for (int i = tid; i < vecs; i += BLOCK) {
+        const float4 v = xr[i];
+        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float f = __bfloat162float(b[j]);
+            local += f * f;
+        }
+    }
+    __shared__ float buf[BLOCK];
+    const float s0 = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(s0 / static_cast<float>(hidden_size) + eps);
+    const float scale_rounded = __bfloat162float(__float2bfloat16(scale));
+
+    float local_next = 0.f;
+    for (int i = tid; i < vecs; i += BLOCK) {
+        const float4 xv4 = xr[i];
+        const float4 wv4 = wv[i];
+        float4 hv4 = hr[i];
+        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv4);
+        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv4);
+        __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hv4);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const __nv_bfloat16 norm = __float2bfloat16(
+                __bfloat162float(xb[j]) * inv_rms * __bfloat162float(wb[j]));
+            const float sum = __bfloat162float(hb[j]) + __bfloat162float(norm);
+            const __nv_bfloat16 rounded = __float2bfloat16(sum);
+            const __nv_bfloat16 scaled = __float2bfloat16(
+                __bfloat162float(rounded) * scale_rounded);
+            hb[j] = scaled;
+            const float f = __bfloat162float(scaled);
+            local_next += f * f;
+        }
+        hr[i] = hv4;
+    }
+    __shared__ float buf2[BLOCK];
+    const float s1 = block_reduce_sum_exact<BLOCK>(local_next, buf2);
+    const float inv_next = rsqrtf(s1 / static_cast<float>(hidden_size) + eps);
+
+    for (int i = tid; i < vecs; i += BLOCK) {
+        const float4 hv4 = hr[i];
+        const float4 nw4 = nwv[i];
+        const __nv_bfloat16* hb = reinterpret_cast<const __nv_bfloat16*>(&hv4);
+        const __nv_bfloat16* nb = reinterpret_cast<const __nv_bfloat16*>(&nw4);
+        float4 out4;
+        __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&out4);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            ob[j] = __float2bfloat16(
+                __bfloat162float(hb[j]) * inv_next * __bfloat162float(nb[j]));
+        }
+        nr[i] = out4;
+    }
+}
+
 template <int BLOCK>
 __global__ void rmsnorm_residual_add_scale_rmsnorm_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -559,8 +651,55 @@ void launch_rmsnorm_residual_add_scale_rmsnorm_bf16(
     float eps,
     cudaStream_t stream)
 {
-    constexpr int BLOCK = 256;
+    // Vectorized when the rows allow it (float4 = 8 bf16), scalar otherwise.
+    //
+    // The scalar form walks the row three times, once per pass, and measured
+    // 10.79 us/call in gemma-4-26B's decode -- 8% of the step -- against 2.51
+    // for the vectorized plain norm. Swept under graph replay at the shapes
+    // these models use, us:
+    //
+    //   hidden   scalar256  scalar512   vec256  vec512  vec1024
+    //     2048        4.38       3.68     2.72    2.93     3.31
+    //     2816        6.17       4.83     3.46    3.12     3.51
+    //     5376        8.48       6.55     4.44    4.07     4.02
+    //
+    // Against the shipping scalar/256 that is -38%, -49% and -53%. The
+    // vectorized twin is BIT-IDENTICAL to the scalar form at all three sizes
+    // (0 of 2048/2816/5376 bf16 values differ) -- only the two sum reductions
+    // reassociate, and at these lengths that rounds to the same bf16.
+    //
+    // vec512 is chosen above hidden 2560 and vec256 below: it is best at 2816,
+    // within 1.5% of best at 5376, and the 2048 case prefers the narrower
+    // block. Scalar keeps hidden < 2560's old width only when the rows are
+    // unaligned.
     dim3 grid(num_rows);
+    const bool vec_ok = (hidden_size % 8) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(x) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(hidden) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(norm_out) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(weight) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(next_weight) % 16) == 0;
+    if (vec_ok) {
+        if (hidden_size >= 2560) {
+            constexpr int kB = 512;
+            rmsnorm_rasr_vec8_kernel<kB><<<grid, kB, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x),
+                static_cast<const __nv_bfloat16*>(weight),
+                static_cast<__nv_bfloat16*>(hidden), scale,
+                static_cast<const __nv_bfloat16*>(next_weight),
+                static_cast<__nv_bfloat16*>(norm_out), hidden_size, eps);
+            return;
+        }
+        constexpr int kB = 256;
+        rmsnorm_rasr_vec8_kernel<kB><<<grid, kB, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x),
+            static_cast<const __nv_bfloat16*>(weight),
+            static_cast<__nv_bfloat16*>(hidden), scale,
+            static_cast<const __nv_bfloat16*>(next_weight),
+            static_cast<__nv_bfloat16*>(norm_out), hidden_size, eps);
+        return;
+    }
+    constexpr int BLOCK = 512;
     dim3 block(BLOCK);
     rmsnorm_residual_add_scale_rmsnorm_bf16_kernel<BLOCK>
         <<<grid, block, 0, stream>>>(
@@ -758,6 +897,88 @@ void launch_rmsnorm_gated_bf16(
         static_cast<const float*>(weight),
         static_cast<__nv_bfloat16*>(y),
         hidden, eps);
+}
+
+// Sweep entry point: VBLOCK is fixed at 512, chosen on an H100. At decode
+// there is ONE row, so the whole kernel is a single block and VBLOCK decides
+// both how many threads sit idle (hidden 2816 is 352 vec8 vectors, so 160 of
+// 512 threads do nothing) and how deep the block reduction is (9 rounds at
+// 512 vs 7 at 128). Shapes for the sweep come from the models' configs.
+bool launch_rmsnorm_bf16_tuned(
+    const void* x, const void* weight, void* y, int num_rows, int hidden,
+    float eps, int vblock, cudaStream_t stream)
+{
+    if (num_rows <= 0 || hidden <= 0 || (hidden % 8) != 0) return false;
+    const dim3 grid(static_cast<unsigned>(num_rows));
+    auto go = [&](auto V) {
+        constexpr int VB = decltype(V)::value;
+        rmsnorm_bf16_vec8_kernel<VB, /*WEIGHT_PLUS_ONE=*/false>
+            <<<grid, VB, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x),
+                static_cast<const __nv_bfloat16*>(weight),
+                static_cast<__nv_bfloat16*>(y), nullptr,
+                hidden, /*x_row_stride=*/hidden, /*y_row_stride=*/hidden, eps);
+    };
+#define PIE_RMS_CASE(V) \
+    if (vblock == (V)) { go(std::integral_constant<int, V>{}); return true; }
+    PIE_RMS_CASE(64) PIE_RMS_CASE(128) PIE_RMS_CASE(256)
+    PIE_RMS_CASE(512) PIE_RMS_CASE(1024)
+#undef PIE_RMS_CASE
+    return false;
+}
+
+// Sweep entry point for the fused residual-add + norm + scale + norm.
+// BLOCK is fixed at 256 and this kernel is the SCALAR form, so at hidden 2816
+// each thread walks 11 loads -- twice, once per norm. The file's own note on
+// the plain kernel records that vectorizing the same walk cut it ~7x. It
+// measures 10.79 us/call in-engine against 2.51 for the vectorized plain
+// norm, and is 8% of gemma-4-26B's decode step.
+bool launch_rmsnorm_rasr_tuned(
+    const void* x, const void* weight, void* hidden, float scale,
+    const void* next_weight, void* norm_out, int num_rows, int hidden_size,
+    float eps, int block, cudaStream_t stream)
+{
+    if (num_rows <= 0 || hidden_size <= 0) return false;
+    dim3 grid(static_cast<unsigned>(num_rows));
+    const bool vec_ok = (hidden_size % 8) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(x) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(hidden) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(norm_out) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(weight) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(next_weight) % 16) == 0;
+    if (block < 0) {   // negative block = "use the vectorized twin"
+        const int b = -block;
+        auto gov = [&](auto B) {
+            constexpr int kB = decltype(B)::value;
+            rmsnorm_rasr_vec8_kernel<kB><<<grid, kB, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x),
+                static_cast<const __nv_bfloat16*>(weight),
+                static_cast<__nv_bfloat16*>(hidden), scale,
+                static_cast<const __nv_bfloat16*>(next_weight),
+                static_cast<__nv_bfloat16*>(norm_out), hidden_size, eps);
+        };
+        if (!vec_ok) return false;
+        if (b == 128) { gov(std::integral_constant<int,128>{}); return true; }
+        if (b == 256) { gov(std::integral_constant<int,256>{}); return true; }
+        if (b == 512) { gov(std::integral_constant<int,512>{}); return true; }
+        if (b == 1024){ gov(std::integral_constant<int,1024>{}); return true; }
+        return false;
+    }
+    auto go = [&](auto B) {
+        constexpr int kB = decltype(B)::value;
+        rmsnorm_residual_add_scale_rmsnorm_bf16_kernel<kB>
+            <<<grid, kB, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x),
+                static_cast<const __nv_bfloat16*>(weight),
+                static_cast<__nv_bfloat16*>(hidden), scale,
+                static_cast<const __nv_bfloat16*>(next_weight),
+                static_cast<__nv_bfloat16*>(norm_out), hidden_size, eps);
+    };
+#define PIE_RASR_CASE(B) \
+    if (block == (B)) { go(std::integral_constant<int, B>{}); return true; }
+    PIE_RASR_CASE(128) PIE_RASR_CASE(256) PIE_RASR_CASE(512) PIE_RASR_CASE(1024)
+#undef PIE_RASR_CASE
+    return false;
 }
 
 }  // namespace pie_cuda_driver::kernels

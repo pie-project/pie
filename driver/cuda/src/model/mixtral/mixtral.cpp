@@ -771,10 +771,48 @@ void mixtral_forward_paged(
             ws.v.data(), N, Hk, H, stream);
         }
 
+        // RoPE and the KV append are one kernel when the cache is plain bf16
+        // and no Quest envelopes need refreshing. write_kv runs one block per
+        // current-step token, so at decode it is a single block on 148 SMs
+        // moving 2 KB, while RoPE has already fanned the heads across
+        // blockIdx.y and holds the rotated K in registers exactly where
+        // write_kv would re-read it. Measured 4.38 -> 2.76 us in graph replay,
+        // bit-identical in q, k and both page arrays across NHD/HND, multiple
+        // requests and head_dim 128 (driver/cuda/bench/smallop_bench.cu).
+        //
+        // Quantised schemes and the envelope refresh stay on the two-kernel
+        // path: both do work after the raw store that this kernel does not.
+        auto kv_view = cache.layer_view(L);
+        // N == 1 only, conservatively.
+        //
+        // gpt-oss is CORRUPT at concurrency ("Whitening? Algar Whitening Adem
+        // Adem Adem..."), and this fusion was the obvious suspect: gpt-oss is
+        // the only model carrying it, and gemma-4, which does not, stays
+        // clean. It is NOT the cause -- gating it to N == 1 leaves the
+        // corruption exactly as it was (distinct=2, STUCK, at c=8). Whatever
+        // breaks batched decode here is something else, and is not yet found.
+        //
+        // The gate stays anyway: the fusion was validated bit-exactly at one
+        // token per request, and the N>1 path has never been checked against
+        // the two-kernel path with `row_valid` padding present, which is what
+        // graph capture introduces at concurrency. It costs nothing today,
+        // since concurrency is broken for an unrelated reason.
+        const bool fused_rope_kv =
+            N == 1 && kv_view.is_native_bf16() && !kv_view.has_envelopes();
+        if (fused_rope_kv) {
+            kernels::launch_rope_write_kv_bf16(
+                ws.q.data(), ws.k.data(), ws.v.data(), positions,
+                kv_view.k_pages, kv_view.v_pages,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                row_valid_d, N, R, kv_view.page_size,
+                num_q_heads_local, num_kv_heads_local, d,
+                cfg.rope_theta, kv_view.hnd_layout, stream);
+        } else {
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
             N, num_q_heads_local, num_kv_heads_local, d,
             cfg.rope_theta, stream);
+        }
         // Fires POST-rope (and post q/k-norm): the query a PTIR program
         // observes here is the one that actually enters attention, so an
         // observer scoring it against the cached keys -- which are stored
@@ -786,11 +824,12 @@ void mixtral_forward_paged(
             static_cast<std::uint32_t>(Hq),
             static_cast<std::uint32_t>(L), stream);
 
-        auto kv_view = cache.layer_view(L);
-        kernels::launch_write_kv_to_pages(
-            kv_view, ws.k.data(), ws.v.data(),
-            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, stream, row_valid_d);
+        if (!fused_rope_kv) {
+            kernels::launch_write_kv_to_pages(
+                kv_view, ws.k.data(), ws.v.data(),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                N, R, stream, row_valid_d);
+        }
 
         // Only ask flashinfer for lse on layers that actually use sinks.
         // Saves a per-layer kernel write on plain Mixtral, and on
@@ -1191,9 +1230,14 @@ void mixtral_forward_paged(
             !layer.expert_gate_up_packed_ptrs.empty()) {
             const int routes = N * top_k;
             if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_align, stream); }
-            kernels::launch_bf16_to_fp16(
-                ws.norm_y.data(), d_mxfp4_act_fp16.data(),
-                static_cast<std::size_t>(N) * H, stream);
+            // No cast here: the mlp_norm above already emitted this exact
+            // buffer. `launch_rmsnorm_bf16_with_fp16` writes ws.norm_y and its
+            // fp16 image in one pass, `d_mxfp4_act_fp16` is only allocated
+            // when use_mxfp4_decode_gemv (the condition guarding this branch),
+            // and nothing between the two writes ws.norm_y. Re-casting it cost
+            // a launch per layer -- 1.75 us x 24 layers = 42 us per decode
+            // step on B200, 1.8% of the step, for a buffer that already held
+            // the answer.
             // The activation rides the gate/up epilogue when this model uses
             // the gpt-oss GLU and the routes are not bucketed by expert (the
             // grouped kernel has its own epilogue). Then the glu kernel and

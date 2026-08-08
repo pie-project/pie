@@ -363,22 +363,7 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
 
 }  // namespace pie_cuda_driver::ops
 
-namespace pie_cuda_driver::ops {
-
-void merge_attention_states_bf16(
-    const void* v, const float* s,
-    void* v_merged, float* s_merged,
-    int num_index_sets, int seq_len, int num_heads, int head_dim,
-    cudaStream_t stream) {
-    if (num_index_sets <= 1 || seq_len <= 0 || num_heads <= 0) return;
-    CUDA_CHECK((::flashinfer::MergeStates<__nv_bfloat16, __nv_bfloat16>(
-        const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(v)),
-        const_cast<float*>(s),
-        static_cast<__nv_bfloat16*>(v_merged), s_merged,
-        static_cast<std::uint32_t>(num_index_sets),
-        static_cast<std::uint32_t>(seq_len),
-        static_cast<std::uint32_t>(num_heads),
-        static_cast<std::uint32_t>(head_dim), stream)));
-}
-
-}  // namespace pie_cuda_driver::ops
+// `merge_attention_states_bf16` used to live here. It moved to
+// `attention_merge_states.cu` because its callers are not sm90-only: the
+// decode KV-split path reaches it on every architecture, so stubbing it out
+// with the rest of this unit broke Blackwell. See that file for the details.

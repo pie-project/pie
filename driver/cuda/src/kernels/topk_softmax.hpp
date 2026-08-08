@@ -26,6 +26,23 @@ void launch_topk_softmax_bf16(
     int K,
     cudaStream_t stream);
 
+// As above, but selects the implementation explicitly instead of from the
+// environment. Exists for the microbenchmark: the production entry point
+// caches its env read in a function-local static, so a harness that flips
+// PIE_TOPK_WARP between calls silently gets the SAME form twice and its
+// comparison passes without having compared anything. `use_warp` is honoured
+// only where the warp form applies (K <= 8 and num_experts <= 128); outside
+// that range both values give the block form.
+void launch_topk_softmax_bf16_form(
+    const void* logits,
+    std::int32_t* topk_idx,
+    float* topk_w,
+    int N,
+    int num_experts,
+    int K,
+    bool use_warp,
+    cudaStream_t stream);
+
 // MEASURED DEAD END, kept because the reasoning is not obvious and someone
 // will try it again: fusing the router projection into the top-K that consumes
 // it costs 2x. The top-K has to see every expert to pick from them, so it is

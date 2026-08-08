@@ -609,6 +609,10 @@ add_library(pie_driver_cuda_lib STATIC
   src/ops/attention_flashinfer.cu
   ${PIE_ATTENTION_HEAD_DIM_SOURCES}
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
+  # Unconditional, and not part of PIE_CUDA_FLASHINFER_HOPPER_SOURCE above:
+  # the decode KV-split path reaches the state merge on every architecture,
+  # so it cannot ride the sm90 prefill's stub/real switch.
+  src/ops/attention_merge_states.cu
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
   src/ops/attention_workspace.cpp

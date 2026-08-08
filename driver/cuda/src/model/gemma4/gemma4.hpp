@@ -205,6 +205,41 @@ struct Gemma4MoeMlpWorkspace {
     std::vector<std::uint32_t> full_split_last_h;
     DeviceBuffer<std::uint32_t> full_split_kv_indptr_d;
     DeviceBuffer<std::uint32_t> full_split_last_d;
+    // Sliding layers run their DECODE through the FA2 prefill path (a decode
+    // is a prefill with qo_len = 1). That splitter bounds work by the window
+    // and the kernel masks the window itself, which is what the decode
+    // splitter cannot do -- see gemma4.cpp. Measured 72.1 -> 14.4 us at ctx
+    // 1024 and 283 -> 14.4 at ctx 4096, flat because the window bounds it.
+    ops::PrefillPlanCachePtr sliding_prefill_plan;
+    // The FULL layers need it just as badly: gemma-4 runs TWO kv heads on
+    // those, so an unsplit fire is two CTAs on 148 SMs (their own comment
+    // says so). Separate plan because their kv-head count differs from the
+    // sliding layers'.
+    ops::PrefillPlanCachePtr full_prefill_plan;
+    bool full_prefill_ready = false;
+    std::vector<std::uint32_t> sliding_qo_indptr_h;
+    DeviceBuffer<std::uint32_t> sliding_qo_indptr_d;
+    bool sliding_prefill_ready = false;
+
+    // The same precomputed split for the SLIDING layers, on FlashInfer's
+    // decode plan. FA3 is what carried these on Hopper and has no sm_100
+    // build, so without this they fire unsplit: 8 KV heads is 8 CTAs on 148
+    // SMs, measured 135.9 us/call and 53% of a whole gemma-4-26B decode step.
+    //
+    // Unlike the full layers these carry a window, so the page range is
+    // truncated to it and the OLDEST chunk takes one extra page; that lets a
+    // single `window_left` start chunk 0 exactly at the window while being too
+    // large to mask anything in the later, shorter chunks.
+    ops::DecodePlanCachePtr sliding_split_plan;
+    int sliding_splits = 0;
+    int sliding_split_window = -1;
+    std::vector<std::uint32_t> sliding_split_kv_indptr_h;
+    std::vector<std::uint32_t> sliding_split_last_h;
+    DeviceBuffer<std::uint32_t> sliding_split_kv_indptr_d;
+    DeviceBuffer<std::uint32_t> sliding_split_last_d;
+    DeviceBuffer<std::uint16_t> sliding_split_partial;
+    DeviceBuffer<float> sliding_split_lse;
+    DeviceBuffer<float> sliding_split_lse_merged;
     std::vector<std::uint32_t> hopper_split_qo_h;
     std::vector<std::uint32_t> hopper_split_kv_indptr_h;
     std::vector<std::uint32_t> hopper_split_last_h;

@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cfloat>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace pie_cuda_driver::kernels {
@@ -196,6 +197,110 @@ __global__ void topk_softmax_bf16_kernel(
     }
 }
 
+// Single-warp top-K softmax: no shared memory, no __syncthreads.
+//
+// The block form above pays three block-wide reduction trees (max, sum, and
+// K argmaxes) through shared memory. At BLOCK=64 each tree is 6 rounds and
+// every round carries a __syncthreads, so routing one decode token through
+// 32 experts runs ~36 barriers to do 32 exponentials. Measured on B200 with
+// graph replay: 4.39 us/call against a 0.54 us empty-kernel floor, and it is
+// called once per layer per token -- 105 us of a ~2.4 ms decode step.
+//
+// When the experts fit in a warp's registers (PER_LANE values per lane) the
+// same reductions are __shfl_xor, which need no barrier and no shared
+// traffic. Ties still resolve to the LOWEST index, so routing decisions stay
+// identical to the block form -- that is a correctness requirement, not a
+// nicety: a different expert choice is a different model.
+//
+// This is not a Blackwell path; warp shuffles are universal and this helps
+// every architecture equally, so it is not gated on compute capability.
+template <int PER_LANE>
+__global__ void topk_softmax_warp_bf16_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    std::int32_t* __restrict__ topk_idx,
+    float* __restrict__ topk_w,
+    int num_experts, int K)
+{
+    const int n = blockIdx.x;
+    const int lane = static_cast<int>(threadIdx.x);
+    const __nv_bfloat16* row =
+        logits + static_cast<long long>(n) * num_experts;
+
+    // The full softmax is never needed. The block form computes probs over
+    // all experts, takes the top K, then renormalises them by their own sum --
+    // so the partition function divides out exactly:
+    //
+    //   w_k = (e^{v_k - m} / Z) / sum_j (e^{v_j - m} / Z)
+    //       =  e^{v_k - m}      / sum_j e^{v_j - m}      over the K winners
+    //
+    // and exp is monotonic, so the K winners are the same whether it is
+    // applied or not. Selecting on the RAW logits therefore gives identical
+    // routing while costing K exponentials instead of num_experts, and drops
+    // a whole warp-sum reduction. At E=32 that is 32 expf calls saved.
+    int idx[PER_LANE];
+    float val[PER_LANE];
+#pragma unroll
+    for (int i = 0; i < PER_LANE; ++i) {
+        idx[i] = lane + i * 32;
+        val[i] = idx[i] < num_experts ? __bfloat162float(row[idx[i]])
+                                      : -FLT_MAX;
+    }
+
+    // K rounds of warp argmax with exclusion. Every lane ends each round
+    // holding the winner, so the running sum needs no broadcast.
+    std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
+    float* out_w = topk_w + static_cast<long long>(n) * K;
+    float best_w[8];
+    int best_e[8];
+    for (int k = 0; k < K; ++k) {
+        // Seeded below every representable logit, matching block_argmax's
+        // "strictly above the floor" rule now that the scores are raw logits
+        // rather than non-negative probabilities.
+        float bv = -FLT_MAX;
+        int bi = -1;
+#pragma unroll
+        for (int i = 0; i < PER_LANE; ++i) {
+            if (val[i] > bv || (val[i] == bv && idx[i] < bi)) {
+                bv = val[i];
+                bi = idx[i];
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < PER_LANE; ++i) {
+            if (idx[i] == bi) val[i] = -FLT_MAX;  // exclude on the next round
+        }
+        best_w[k] = bv;
+        best_e[k] = bi;
+    }
+    if (lane == 0) {
+        // best_w[0] is the row max by construction, so it is the shift that
+        // keeps the exponentials in range -- the same one the block form
+        // subtracts. Copy it out first: writing best_w[0] on the k=0
+        // iteration would leave every later term shifted by exp(0)=1 instead
+        // of by the max.
+        const float row_max = best_w[0];
+        float w_sum = 0.f;
+        for (int k = 0; k < K; ++k) {
+            best_w[k] = expf(best_w[k] - row_max);
+            w_sum += best_w[k];
+        }
+        const float inv_w = 1.f / w_sum;
+        for (int k = 0; k < K; ++k) {
+            out_idx[k] = best_e[k];
+            out_w[k] = best_w[k] * inv_w;
+        }
+    }
+}
+
 }  // namespace
 
 void launch_topk_softmax_bf16(
@@ -207,6 +312,52 @@ void launch_topk_softmax_bf16(
     if (N <= 0 || num_experts <= 0 || K <= 0) return;
     if (num_experts > MAX_EXPERTS) {
         throw std::runtime_error("topk_softmax_bf16: num_experts exceeds MAX_EXPERTS");
+    }
+    // PIE_TOPK_WARP=0 forces the block form, for A/B measurement.
+    static const bool warp_ok = [] {
+        const char* v = std::getenv("PIE_TOPK_WARP");
+        return v == nullptr || v[0] != '0';
+    }();
+    launch_topk_softmax_bf16_form(logits, topk_idx, topk_w, N, num_experts, K,
+                                  warp_ok, stream);
+}
+
+void launch_topk_softmax_bf16_form(
+    const void* logits,
+    std::int32_t* topk_idx, float* topk_w,
+    int N, int num_experts, int K,
+    bool use_warp,
+    cudaStream_t stream)
+{
+    if (N <= 0 || num_experts <= 0 || K <= 0) return;
+    if (num_experts > MAX_EXPERTS) {
+        throw std::runtime_error("topk_softmax_bf16: num_experts exceeds MAX_EXPERTS");
+    }
+    // The warp form keeps the experts in registers, so it applies while they
+    // fit (<= 512, which is MAX_EXPERTS) and while the K winners fit the small
+    // result array (<= 8). Qwen3.6-35B-A3B routes through more than 128 and
+    // was falling back to the block form at 7.56 us/call, 4.9% of its step.
+    if (use_warp && K <= 8 && num_experts <= 512) {
+        const auto* in = static_cast<const __nv_bfloat16*>(logits);
+        if (num_experts <= 32) {
+            topk_softmax_warp_bf16_kernel<1><<<N, 32, 0, stream>>>(
+                in, topk_idx, topk_w, num_experts, K);
+        } else if (num_experts <= 64) {
+            topk_softmax_warp_bf16_kernel<2><<<N, 32, 0, stream>>>(
+                in, topk_idx, topk_w, num_experts, K);
+        } else if (num_experts <= 128) {
+            topk_softmax_warp_bf16_kernel<4><<<N, 32, 0, stream>>>(
+                in, topk_idx, topk_w, num_experts, K);
+        } else if (num_experts <= 256) {
+            topk_softmax_warp_bf16_kernel<8><<<N, 32, 0, stream>>>(
+                in, topk_idx, topk_w, num_experts, K);
+        } else {
+            // 512 experts is MAX_EXPERTS; 16 values per lane is 32 registers
+            // of scores plus indices, which still leaves the warp room.
+            topk_softmax_warp_bf16_kernel<16><<<N, 32, 0, stream>>>(
+                in, topk_idx, topk_w, num_experts, K);
+        }
+        return;
     }
     topk_softmax_bf16_kernel</*FUSED_GEMV=*/false><<<N, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits),

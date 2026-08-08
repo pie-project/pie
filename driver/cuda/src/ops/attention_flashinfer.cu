@@ -168,6 +168,7 @@ void plan_static_nonsplit_decode(
             cache.int_base_bytes,
         cursor, cudaMemcpyHostToDevice, stream));
 
+    decode_window_hint() = -1;
     cache.num_requests = num_requests;
     cache.num_q_heads  = num_q_heads;
     cache.num_kv_heads = num_kv_heads;
@@ -195,7 +196,8 @@ void plan_attention_flashinfer_decode_bf16(
     cudaStream_t stream,
     bool enable_cuda_graph,
     bool full_attention_variant,
-    bool hnd_layout)
+    bool hnd_layout,
+    int window_left)
 {
     const int gqa_group_size = num_q_heads / num_kv_heads;
     // Checked up front, not just in the switch below: the static non-split
@@ -206,7 +208,13 @@ void plan_attention_flashinfer_decode_bf16(
         throw_unsupported_head_dim("flashinfer decode", head_dim);
     }
 
-    if (can_use_static_nonsplit_decode_plan(
+    // A windowed layer wants the real planner: the static plan is unsplit by
+    // construction, which is what leaves a sliding layer at batch*kv_heads
+    // CTAs (8 on 148 SMs for gemma-4) and ~50x off its bandwidth roofline.
+    const bool windowed_split =
+        window_split_kv_enabled() && window_left >= 0;
+    decode_window_hint() = windowed_split ? window_left : -1;
+    if (!windowed_split && can_use_static_nonsplit_decode_plan(
             static_cast<uint32_t>(num_requests))) {
         plan_static_nonsplit_decode(
             cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,

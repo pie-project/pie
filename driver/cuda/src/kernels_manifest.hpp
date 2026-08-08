@@ -98,6 +98,18 @@ inline bool native_mxfp4_moe_opt_out() {
     return off;
 }
 
+// `PIE_CUDA_NATIVE_MXFP4_MOE=1` forces the lowering back ON where the default
+// declines it. Separate from "not opted out" on purpose: the Blackwell gate
+// below is a correctness quarantine, and the only way to test a fix for it is
+// to be able to ask for the quarantined path explicitly.
+inline bool native_mxfp4_moe_opt_in() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_CUDA_NATIVE_MXFP4_MOE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
 constexpr bool device_supports_native_mxfp4_moe(int cc_major) {
 #if defined(PIE_CUDA_HAS_MARLIN_MOE)
     return cc_major >= 8;
@@ -109,10 +121,37 @@ constexpr bool device_supports_native_mxfp4_moe(int cc_major) {
 #endif
 }
 
+// The Marlin MXFP4 MoE kernels produce WRONG VALUES on sm_100.
+//
+// Measured on a B200 with gpt-oss-20b: under this lowering decode emits
+// uniform garbage ("nasquorashBR @@ Put ShortfacesInte Imper fmt Ind tass"),
+// a 0% function-word rate against 39% for the same prompt on vLLM and
+// SGLang. Under the routed-dequant GEMV the same build answers correctly at
+// 314 tok/s. Bisected against CUDA graph capture: corrupt both captured and
+// eager, correct both ways with the GEMV, so the lowering is the only
+// variable. The generated kernel set is sm80-shaped
+// (`sm80_kernel_bfloat16_fe2m1f_bfloat16.cu`) and was never exercised above
+// sm_90.
+//
+// This is quarantined rather than left to the deployment to discover because
+// the gate above answers TRUE on Blackwell whether or not Marlin was built --
+// so without this, every sm_100 deployment serves gpt-oss as garbage BY
+// DEFAULT, and the failure is silent: the tokens arrive, at a plausible rate,
+// and only reading them reveals it.
+//
+// Drop this once the kernel is fixed, and verify with
+// `PIE_CUDA_NATIVE_MXFP4_MOE=1` before doing so.
+constexpr bool native_mxfp4_moe_known_broken(int cc_major) {
+    return cc_major >= 10;
+}
+
 // The compile-time gate above, with the deployment's answer applied.
 inline bool native_mxfp4_moe_enabled(int cc_major) {
-    return device_supports_native_mxfp4_moe(cc_major) &&
-           !native_mxfp4_moe_opt_out();
+    if (!device_supports_native_mxfp4_moe(cc_major)) return false;
+    if (native_mxfp4_moe_opt_out()) return false;
+    if (native_mxfp4_moe_known_broken(cc_major))
+        return native_mxfp4_moe_opt_in();
+    return true;
 }
 
 }  // namespace pie_cuda_driver
