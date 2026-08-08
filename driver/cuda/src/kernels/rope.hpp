@@ -42,6 +42,37 @@ void launch_rope_bf16(
     cudaStream_t stream,
     bool interleaved = false);
 
+// RoPE that also lands K and V in the paged KV cache, replacing a following
+// `launch_write_kv_to_pages` on the same tensors. Only for a bf16 (native)
+// cache -- quantised schemes have their own store path.
+//
+// Worth it because write_kv runs one block per current-step token, so at
+// decode it is a single block on 148 SMs moving 2 KB (3.69 us measured),
+// while RoPE has already fanned the heads across blockIdx.y and is holding
+// the rotated K in registers exactly where write_kv would re-read it.
+//
+// K is still written to `k` as well, so anything downstream reading the
+// contiguous copy is unaffected.
+void launch_rope_write_kv_bf16(
+    void* q, void* k, const void* v,
+    const std::int32_t* positions,
+    void* k_pages, void* v_pages,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint8_t* row_valid,          // may be null
+    int num_tokens,
+    int num_requests,
+    int page_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    bool hnd_layout,
+    cudaStream_t stream,
+    bool interleaved = false);
+
 // Fused per-head Q/K RMSNorm + standard RoPE. This matches models such as
 // Qwen3 where q_norm/k_norm have shape [head_dim] and RoPE is the standard
 // first-half/second-half pairing.

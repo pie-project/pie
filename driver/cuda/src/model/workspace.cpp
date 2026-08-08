@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "model/workspace.hpp"
 
 #include "kernels/argmax.hpp"
@@ -40,19 +42,45 @@ Workspace Workspace::allocate_full(
     ws.norm_y        = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.gate          = DeviceTensor::allocate(DType::BF16, {N, I});
     ws.up            = DeviceTensor::allocate(DType::BF16, {N, I});
-    ws.logits        = DeviceTensor::allocate(
-        DType::BF16, {workspace_logits_rows(N, D), V});
+    // NOTE (measured, do not "optimise" this without reading it):
+    // this slab is sized by TOKENS, not by the sampled-row bound `O`, and that
+    // is load-bearing. On Qwen3.6-27B it is N=8192 D=192 V=248320 -> 3970.9 MiB,
+    // against `probs` at [O=64, V] fp32 = 60.6 MiB for the same sampling step,
+    // and the workspace arena is charged IN FULL at every frame commit
+    // (context.cpp passes {used=1, capacity=1}), so it costs ~3.85 GiB of lane
+    // budget on every fire. Sizing it [O + D, V] was TRIED and REVERTED: output
+    // stayed byte-identical at C=1 with a short prompt, but a 1024-token prompt
+    // failed EVERY request in 0.2 s, at C=8 and C=64 alike -- prefill needs the
+    // per-token rows. Recovering that memory needs the prefill path to honour
+    // the compact row list, not a smaller allocation.
+    const int logits_rows = workspace_logits_rows(N, D);
+    ws.logits        = DeviceTensor::allocate(DType::BF16, {logits_rows, V});
     ws.mtp_draft_row_base = workspace_mtp_draft_row_base(N);
     ws.mtp_draft_row_capacity = D;
     ws.probs         = DeviceTensor::allocate(DType::FP32, {O, V});
+    {
+        static const bool dbg = [] {
+            const char* v = std::getenv("PIE_WS_DEBUG");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (dbg) {
+            const double mb = 1048576.0;
+            std::fprintf(stderr,
+                "[ws] N=%lld O=%lld D=%d V=%lld logits_rows=%d "
+                "logits=%.1fMiB probs=%.1fMiB\n",
+                (long long)N, (long long)O, D, (long long)V, logits_rows,
+                logits_rows * (double)V * 2 / mb,
+                (double)O * V * 4 / mb);
+        }
+    }
     ws.sampled_tokens = DeviceTensor::allocate(
-        DType::INT32, {workspace_logits_rows(N, D), 1});
+        DType::INT32, {logits_rows, 1});
     ws.argmax_acc_val = DeviceTensor::allocate(
         DType::FP32,
-        {workspace_logits_rows(N, D), kernels::kArgmaxAccumSlots});
+        {logits_rows, kernels::kArgmaxAccumSlots});
     ws.argmax_acc_idx = DeviceTensor::allocate(
         DType::INT32,
-        {workspace_logits_rows(N, D), kernels::kArgmaxAccumSlots});
+        {logits_rows, kernels::kArgmaxAccumSlots});
     // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
     // (currently only Phi-3 at 96 → 128). Empty allocations otherwise
     // — the forward path detects the empty-state and aliases the

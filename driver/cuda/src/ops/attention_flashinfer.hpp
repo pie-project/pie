@@ -80,7 +80,11 @@ void plan_attention_flashinfer_decode_bf16(
     cudaStream_t stream,
     bool enable_cuda_graph = true,
     bool full_attention_variant = false,
-    bool hnd_layout = false);
+    bool hnd_layout = false,
+    // A sliding layer's KV is bounded by its window, so its split is bounded
+    // and can be planned per step cheaply. Pass the layer's window to let the
+    // planner split; -1 keeps the unsplit static plan.
+    int window_left = -1);
 
 inline void plan_attention_flashinfer_decode(
     DecodePlanCache& cache,
@@ -94,11 +98,12 @@ inline void plan_attention_flashinfer_decode(
     cudaStream_t stream,
     bool enable_cuda_graph = true,
     bool full_attention_variant = false,
-    bool hnd_layout = false) {
+    bool hnd_layout = false,
+    int window_left = -1) {
     plan_attention_flashinfer_decode_bf16(
         cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,
         head_dim, page_size, workspace, stream, enable_cuda_graph,
-        full_attention_variant, hnd_layout);
+        full_attention_variant, hnd_layout, window_left);
 }
 
 void plan_attention_flashinfer_prefill_bf16(

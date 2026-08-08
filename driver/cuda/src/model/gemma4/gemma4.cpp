@@ -452,7 +452,8 @@ void prepare_gemma4_plan_for_layer(
     int num_requests,
     int page_size,
     bool hnd_layout,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int window_left)
 {
     if (!plan) plan = ops::make_decode_plan();
     const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
@@ -464,7 +465,13 @@ void prepare_gemma4_plan_for_layer(
         page_size, attn_ws, stream,
         /*enable_cuda_graph=*/true,
         /*full_attention_variant=*/layer.is_full,
-        hnd_layout);
+        hnd_layout,
+        // Telling the planner the window is what lets it split a sliding
+        // layer: its KV is bounded by the window however long the request
+        // runs, so the split is bounded too. Without it these layers fire
+        // batch*kv_heads CTAs -- 8 on 148 SMs -- and measure ~50x off their
+        // KV-bandwidth roofline.
+        window_left);
 }
 
 // FA3 decode plan for the sliding layers. One token per request, so
@@ -573,6 +580,365 @@ void prepare_gemma4_hopper_decode_plan(
         moe_ws.hopper_split_lse_merged =
             DeviceBuffer<float>::alloc(static_cast<std::size_t>(q_heads));
     }
+}
+
+// The same batch-split for the SLIDING layers, on FlashInfer's decode plan.
+//
+// FA3 carried these on Hopper; `hopper_prefill_supported` is the stub on
+// sm_100 and returns false, so on B200 they fired unsplit -- 8 KV heads is 8
+// CTAs on 148 SMs, and this one kernel measured 135.9 us/call, 53% of the
+// model's whole decode step, against SGLang's 10.5. Re-enabling FlashInfer's
+// own per-batch planner is not the answer: attention_flashinfer_common.cuh
+// records that it took a 256-token generation from 22 s to over 2400 s of
+// host time, and forcing it on here still times out a 128-token run.
+//
+// Two differences from the full-layer split, both because of the window:
+//   * the page range is truncated to the window, so cost stops growing with
+//     context (measured flat at 14.5 us from ctx 1024 to 4096, against 72 and
+//     283 unsplit);
+//   * the OLDEST chunk takes one extra page and carries `window_left`. With
+//     qo_len = 1 the kernel's first visible index is `kv_len - 1 -
+//     window_left`, so `window_left = len_0 - 1 - skip` starts chunk 0 exactly
+//     at the window, and that same value is too large to mask anything in the
+//     later, shorter chunks -- one dispatch stays correct for every split.
+//
+// Validated in tests/bench_decode_attention.cu against the unsplit answer:
+// max|diff| 0.0039, half a bf16 ULP, i.e. summation order. Standalone the
+// split is 72.1 -> 14.5 us at ctx 1024 and 283.1 -> 14.5 at ctx 4096 (flat,
+// because the window now bounds the read).
+//
+// NOT YET EFFECTIVE, and the reason is worth writing down. Which dispatch
+// branch runs is decided when the CUDA graph is CAPTURED, not per step, and
+// at capture time this plan is always refused: the capture sweep calls the
+// forward with num_requests = 2, 4, 8, 16, 24 (never 1 except once), and that
+// single R=1 capture carries a synthetic one-page context, so `pages < splits`.
+// `sliding_splits` is therefore 0 whenever the graph is recorded, the unsplit
+// dispatch is what gets baked in, and rebuilding the plan on later steps
+// cannot change the recorded graph. `prepare_gemma4_full_split_plan` has the
+// same guard against the same one-page capture, so the full layers almost
+// certainly never split here either.
+//
+// To make this live the split has to be capture-compatible: a fixed split
+// FACTOR chosen at capture (schedule static across replays) with only the
+// indptr/last DEVICE buffers refreshed per step -- which is what
+// attention_flashinfer_common.cuh means by "a precomputed split factor folded
+// into the cached plan". The window truncation must then be expressed through
+// those device buffers rather than by refusing to build the plan.
+// Sliding-layer decode through the FA2 PREFILL path.
+//
+// The decode splitter cannot help these layers: its work estimator has no
+// window parameter, so it cannot know that a sliding layer reads at most
+// `window` tokens however long the request has run, and pie disables split-kv
+// outright because an unbounded split is ruinous to plan per step. The result
+// is batch*kv_heads CTAs -- 8 on 148 SMs -- and ~50x off the KV roofline.
+//
+// The prefill splitter has exactly what is missing. PrefillSplitQOKVIndptr
+// computes
+//     effective_kv_len = min(ceil_div(window_left + cta_tile_q, page), kv_len)
+// so the work, the chunk count and the planning cost are all bounded by the
+// window rather than by the context; and the kernel applies the window mask
+// itself, so there is no page-range truncation and no sub-page window start
+// to get wrong. Two earlier hand-rolled splits foundered on exactly that.
+//
+// Measured (tests/bench_decode_attention.cu, gemma-4's sliding shape, one Q
+// token): ctx 1024 72.1 -> 14.4 us, ctx 2048 142.2 -> 14.4, ctx 4096 283.0 ->
+// 14.4 -- flat, because the window bounds it. Against a CPU reference it
+// matches the path it replaces everywhere, including reproducing its wrong
+// answers at the (ctx, window) shapes where FlashInfer's masking is broken:
+// strictly faster, no new wrongness.
+//
+// ON by default. The per-step planning cost was the open question -- the
+// decode-split attempt timed out at 900 s for exactly that -- and it is a
+// non-issue here because PrefillPlan's work items are bounded by the window
+// rather than the context: gemma-4-26B measured 132.1 -> 200.5 tok/s and
+// gemma-4-31B 47.9 -> 63.3, both gate=PASS. PIE_GEMMA4_PREFILL_DECODE=0
+// reverts to the unsplit decode path.
+bool gemma4_prefill_decode_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_GEMMA4_PREFILL_DECODE");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+void prepare_gemma4_sliding_prefill_plan(
+    Gemma4MoeMlpWorkspace& moe_ws,
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    AttentionWorkspace& attn_ws,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int num_requests,
+    int page_size,
+    bool hnd_layout)
+{
+    moe_ws.sliding_prefill_ready = false;
+    // BOTH flags must be cleared HERE, before any early return. Clearing
+    // `full_prefill_ready` further down meant that at concurrency this
+    // function bailed at `num_requests != 1` while the flag kept the `true`
+    // a previous single-request call left behind -- so the full-layer branch
+    // fired with a plan built for R = 1 and gemma-4-26B went gate=FAIL at
+    // c=8 and c=32 after passing at 467 tok/s.
+    moe_ws.full_prefill_ready = false;
+    // SINGLE REQUEST ONLY. At concurrency the batch is padded for graph
+    // capture and the dead rows are masked by `row_valid` -- which the
+    // decode dispatch takes and the PREFILL dispatch has no parameter for.
+    // Measured: with this path on at c=8, gemma-4-26B goes gate=FAIL
+    // (CORRUPT, stopwords 2%), and gemma-4 is the ONLY model that passes at
+    // concurrency today, so that is not a trade worth making for throughput
+    // that is already ungated elsewhere. Single-stream keeps the whole win:
+    // 132.1 -> 200.5 tok/s on 26B and 47.9 -> 63.3 on 31B, both gate=PASS.
+    if (num_requests != 1) return;
+    if (!gemma4_prefill_decode_enabled() || num_requests <= 0) return;
+    int sliding_idx = -1;
+    for (std::size_t i = 0; i < w.layers.size(); ++i) {
+        if (!w.layers[i].is_full) { sliding_idx = static_cast<int>(i); break; }
+    }
+    if (sliding_idx < 0) return;
+    const auto* sliding = &w.layers[sliding_idx];
+    const int window_left = w.per_layer_window_left[sliding_idx];
+    if (window_left < 0) return;
+
+    // One token per request: qo_indptr is the identity.
+    moe_ws.sliding_qo_indptr_h.resize(num_requests + 1);
+    for (int r = 0; r <= num_requests; ++r) {
+        moe_ws.sliding_qo_indptr_h[r] = static_cast<std::uint32_t>(r);
+    }
+    const std::size_t n = static_cast<std::size_t>(num_requests) + 1;
+    if (moe_ws.sliding_qo_indptr_d.size() < n) {
+        moe_ws.sliding_qo_indptr_d = DeviceBuffer<std::uint32_t>::alloc(n);
+    }
+    CUDA_CHECK(cudaMemcpy(moe_ws.sliding_qo_indptr_d.data(),
+                          moe_ws.sliding_qo_indptr_h.data(),
+                          n * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+
+    const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+    const int q_heads = cfg.num_attention_heads / T;
+    const int kv_heads = sliding->num_kv_heads / T;
+    if (!moe_ws.sliding_prefill_plan) {
+        moe_ws.sliding_prefill_plan = ops::make_prefill_plan();
+    }
+    ops::plan_attention_flashinfer_prefill_bf16(
+        *moe_ws.sliding_prefill_plan, moe_ws.sliding_qo_indptr_h.data(),
+        kv_page_indptr_h, kv_last_page_lens_h,
+        /*total_tokens=*/num_requests, num_requests, q_heads, kv_heads,
+        sliding->head_dim, page_size, attn_ws, /*stream=*/nullptr,
+        /*enable_cuda_graph=*/true, window_left,
+        /*full_attention_variant=*/false, hnd_layout, /*causal_mask=*/true);
+    moe_ws.sliding_prefill_ready = true;
+
+    // Same treatment for the FULL layers. They carry no window, so nothing
+    // bounds their KV -- but the reason the decode kernel underfills has
+    // nothing to do with windows: gemma-4's full layers run TWO kv heads, so
+    // the grid is two CTAs. Measured at that shape (2 kv heads, gqa 8,
+    // head_dim 256): ctx 1024 101.0 -> 14.1 us, ctx 4096 397.9 -> 15.2.
+    const auto* full = first_layer_for_plan(w, /*full=*/true);
+    if (full != nullptr) {
+        if (!moe_ws.full_prefill_plan) {
+            moe_ws.full_prefill_plan = ops::make_prefill_plan();
+        }
+        ops::plan_attention_flashinfer_prefill_bf16(
+            *moe_ws.full_prefill_plan, moe_ws.sliding_qo_indptr_h.data(),
+            kv_page_indptr_h, kv_last_page_lens_h,
+            /*total_tokens=*/num_requests, num_requests, q_heads,
+            full->num_kv_heads / T, full->head_dim, page_size, attn_ws,
+            /*stream=*/nullptr, /*enable_cuda_graph=*/true,
+            /*window_left=*/-1, /*full_attention_variant=*/true, hnd_layout,
+            /*causal_mask=*/true);
+        // DISABLED. Routing the FULL layers through the prefill plan measured
+        // 251.9 tok/s once (from 200.4) but is not stable: with the flag
+        // lifetime corrected, single-stream came back 89.2 median with a
+        // 61.0-252.8 spread -- some requests faster than before, others
+        // slower than the original baseline. The sliding-only configuration
+        // is steady (200.4 latency, c=8 gate=PASS at 467 tok/s), so that is
+        // what ships.
+        //
+        // The likely cause is plan lifetime rather than the kernel: this
+        // prepare only runs when `is_pure_decode`, so across a prefill the
+        // full-layer plan persists into a request whose KV geometry has
+        // changed, and full layers have no window to bound that drift the way
+        // the sliding ones do. Worth revisiting with the plan keyed to the
+        // shape it was built for.
+        moe_ws.full_prefill_ready = false;
+    }
+}
+
+void prepare_gemma4_sliding_split_plan(
+    Gemma4MoeMlpWorkspace& moe_ws,
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    AttentionWorkspace& attn_ws,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int num_requests,
+    int page_size,
+    bool hnd_layout)
+{
+    moe_ws.sliding_splits = 0;
+    // OFF BY DEFAULT: this path is ~50% faster and currently WRONG.
+    //
+    // When the window start is not page-aligned (skip != 0) chunk 0 ends
+    // mid-page, the next chunk resumes at the following page boundary, and
+    // the tokens between are dropped -- 12 of them every step at ctx 1332,
+    // window 1024, page_size 16. gemma-4-26B degenerates (gate: distinct=2,
+    // STUCK) and gemma-4-31B silently loses quality (distinct 37 -> 24) while
+    // still passing.
+    //
+    // It cannot be fixed by choosing a better constant: the kernel's mask
+    // boundary is `kv_len - 1 - window_left`, so masking a sub-page prefix AND
+    // ending on a page boundary over-constrains a single baked scalar. An
+    // exact fix needs the window start to reach the kernel through DEVICE
+    // memory, which is the "graph-safe attention dispatch refactor" ForwardFn
+    // already anticipates.
+    //
+    // Kept behind the flag because everything else about it is validated:
+    // 72.1 -> 14.5 us at ctx 1024 standalone, and it is MORE correct than the
+    // unsplit path it replaces, which disagrees with a CPU reference by up to
+    // 196% at some (ctx, window) pairs. See tests/bench_decode_attention.cu
+    // with CPU_REF=1.
+    static const bool split_opt_in =
+        std::getenv("PIE_GEMMA4_SLIDING_SPLIT") != nullptr;
+    if (!split_opt_in) return;
+    static const bool dbg = std::getenv("PIE_GEMMA4_SPLIT_DEBUG") != nullptr;
+    static int said = 0;
+    auto refuse = [&](const char* why, long a, long b) {
+        if (dbg && said < 6) {
+            ++said;
+            std::cerr << "[pie-driver-cuda] gemma4 sliding split refused: "
+                      << why << " (" << a << " vs " << b << ")\n";
+        }
+    };
+    if (num_requests != 1) { refuse("num_requests != 1", num_requests, 1); return; }
+    int sliding_idx = -1;
+    for (std::size_t i = 0; i < w.layers.size(); ++i) {
+        if (!w.layers[i].is_full) { sliding_idx = static_cast<int>(i); break; }
+    }
+    if (sliding_idx < 0) { refuse("no sliding layer", sliding_idx, 0); return; }
+    const auto* sliding = &w.layers[sliding_idx];
+    const int window_left = w.per_layer_window_left[sliding_idx];
+    if (window_left < 0) { refuse("window_left < 0", window_left, 0); return; }
+
+    const int splits = kGemma4HopperSplits;
+    const int pages =
+        static_cast<int>(kv_page_indptr_h[1] - kv_page_indptr_h[0]);
+    const int last_len = static_cast<int>(kv_last_page_lens_h[0]);
+    const int ctx = (pages - 1) * page_size + last_len;
+
+    // NOTHING below may refuse on a runtime quantity. Which dispatch branch
+    // runs is fixed when the CUDA graph is CAPTURED, and the R=1 capture
+    // carries a synthetic ONE-page context; refusing there bakes in the
+    // unsplit path and no amount of correct re-planning afterwards can
+    // change the recorded graph. So the plan is always built, and short
+    // contexts simply leave the trailing chunks empty (validated: the kernel
+    // and MergeStates handle a zero-length chunk).
+    //
+    // `pages_per_chunk` and the window passed to the dispatch derive ONLY
+    // from the model's window, the split count and the page size -- all fixed
+    // at load -- so the baked scalar is the same at capture and at replay.
+    const int pages_per_chunk = std::max(
+        1, (window_left + splits * page_size - 1) / (splits * page_size));
+    const int fixed_window = pages_per_chunk * page_size - 1;
+
+    // `window_left` is a host scalar and is baked into the graph, but the
+    // kernel derives its mask boundary as `kv_len - 1 - window_left` and
+    // kv_len comes from the page table, which is device state refreshed every
+    // step. So carry the moving part there: give the OLDEST chunk one extra
+    // page and a kv_last_page_len of `skip`, and the boundary lands exactly on
+    // the window start.
+    //
+    //   kv_len_0 = pages_per_chunk*page + skip
+    //   boundary = kv_len_0 - 1 - fixed_window = skip      <- the slop, masked
+    //
+    // Every later chunk is at most pages_per_chunk pages, so kv_len <=
+    // fixed_window + 1 and nothing in them is masked. Validated against a CPU
+    // reference in tests/bench_decode_attention.cu (CPU_REF=1) across four
+    // windows and two head shapes; it also found that the UNSPLIT path this
+    // replaces is itself wrong at some (ctx, window) pairs -- up to 196%
+    // relative error -- while this one matches everywhere.
+    const int win_start = std::max(0, ctx - window_left);
+    const int first_page = win_start / page_size;
+    const int skip = win_start - first_page * page_size;
+
+    moe_ws.sliding_split_kv_indptr_h.resize(splits + 1);
+    moe_ws.sliding_split_last_h.resize(splits);
+    moe_ws.sliding_split_kv_indptr_h[0] =
+        static_cast<std::uint32_t>(first_page);
+    int cursor = first_page;
+    for (int i = 0; i < splits; ++i) {
+        const int want = (i == 0 && skip > 0) ? (pages_per_chunk + 1)
+                                              : pages_per_chunk;
+        const int lo = cursor;
+        const int hi = std::min(lo + want, pages);
+        cursor = hi;
+        moe_ws.sliding_split_kv_indptr_h[i + 1] =
+            static_cast<std::uint32_t>(hi);
+        if (hi <= lo) {
+            moe_ws.sliding_split_last_h[i] = 1u;       // empty chunk
+        } else if (i == 0 && skip > 0 && hi == lo + want) {
+            moe_ws.sliding_split_last_h[i] =
+                static_cast<std::uint32_t>(skip);      // steers the boundary
+        } else if (hi == pages) {
+            moe_ws.sliding_split_last_h[i] =
+                static_cast<std::uint32_t>(last_len);
+        } else {
+            moe_ws.sliding_split_last_h[i] =
+                static_cast<std::uint32_t>(page_size);
+        }
+    }
+    // The chunks must reach the end of the request, or the newest keys are
+    // dropped. Capacity is splits*pages_per_chunk (+1 when skip > 0) and the
+    // live range is at most ceil(window/page)+1 pages, so this holds by
+    // construction; refuse rather than answer wrongly if it ever does not.
+    if (cursor < pages) { refuse("split did not reach the tail", cursor, pages); return; }
+
+    const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+    const int q_heads = cfg.num_attention_heads / T;
+    const int kv_heads = sliding->num_kv_heads / T;
+    if (!moe_ws.sliding_split_plan) {
+        moe_ws.sliding_split_plan = ops::make_decode_plan();
+    }
+    ops::plan_attention_flashinfer_decode(
+        *moe_ws.sliding_split_plan, moe_ws.sliding_split_kv_indptr_h.data(),
+        splits, q_heads, kv_heads, sliding->head_dim, page_size, attn_ws,
+        /*stream=*/nullptr, /*enable_cuda_graph=*/true,
+        /*full_attention_variant=*/false, hnd_layout);
+
+    const std::size_t n = static_cast<std::size_t>(splits);
+    if (moe_ws.sliding_split_kv_indptr_d.size() < n + 1) {
+        moe_ws.sliding_split_kv_indptr_d =
+            DeviceBuffer<std::uint32_t>::alloc(n + 1);
+        moe_ws.sliding_split_last_d = DeviceBuffer<std::uint32_t>::alloc(n);
+    }
+    CUDA_CHECK(cudaMemcpy(moe_ws.sliding_split_kv_indptr_d.data(),
+                          moe_ws.sliding_split_kv_indptr_h.data(),
+                          (n + 1) * sizeof(std::uint32_t),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(moe_ws.sliding_split_last_d.data(),
+                          moe_ws.sliding_split_last_h.data(),
+                          n * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+
+    const std::size_t rows = n * static_cast<std::size_t>(q_heads);
+    if (moe_ws.sliding_split_partial.size() <
+        rows * static_cast<std::size_t>(sliding->head_dim)) {
+        moe_ws.sliding_split_partial = DeviceBuffer<std::uint16_t>::alloc(
+            rows * static_cast<std::size_t>(sliding->head_dim));
+        moe_ws.sliding_split_lse = DeviceBuffer<float>::alloc(rows);
+        moe_ws.sliding_split_lse_merged =
+            DeviceBuffer<float>::alloc(static_cast<std::size_t>(q_heads));
+    }
+    static int said_ok = 0;
+    if (dbg && said_ok < 3) {
+        ++said_ok;
+        std::cerr << "[pie-driver-cuda] gemma4 sliding split OK: pages=" << pages
+                  << " ctx=" << ctx << " window=" << window_left
+                  << " chunk_pages=" << pages_per_chunk
+                  << " fixed_window=" << fixed_window
+                  << " skip=" << skip << "\n";
+    }
+    moe_ws.sliding_split_window = fixed_window;
+    moe_ws.sliding_splits = splits;
 }
 
 // The same batch-split for the full-attention layers, on FlashInfer's decode
@@ -723,13 +1089,16 @@ void prepare_gemma4_decode_plans(
             prepare_gemma4_plan_for_layer(
                 select_prepared_plan(moe_ws, row_decode, /*full=*/false),
                 *sliding, cfg, fwd_cfg, attn_ws, indptr, requests,
-                cache.page_size(), cache.hnd_layout(), /*stream=*/nullptr);
+                cache.page_size(), cache.hnd_layout(), /*stream=*/nullptr,
+                w.per_layer_window_left[
+                    static_cast<std::size_t>(sliding - w.layers.data())]);
         }
         if (const auto* full = first_layer_for_plan(w, /*full=*/true)) {
             prepare_gemma4_plan_for_layer(
                 select_prepared_plan(moe_ws, row_decode, /*full=*/true),
                 *full, cfg, fwd_cfg, attn_ws, indptr, requests,
-                cache.page_size(), cache.hnd_layout(), /*stream=*/nullptr);
+                cache.page_size(), cache.hnd_layout(), /*stream=*/nullptr,
+                /*window_left=*/-1);
         }
     };
 
@@ -740,6 +1109,12 @@ void prepare_gemma4_decode_plans(
             moe_ws, w, cfg, fwd_cfg, attn_ws, kv_page_indptr_h,
             kv_last_page_lens_h, R, cache.page_size());
         prepare_gemma4_full_split_plan(
+            moe_ws, w, cfg, fwd_cfg, attn_ws, kv_page_indptr_h,
+            kv_last_page_lens_h, R, cache.page_size(), cache.hnd_layout());
+        prepare_gemma4_sliding_split_plan(
+            moe_ws, w, cfg, fwd_cfg, attn_ws, kv_page_indptr_h,
+            kv_last_page_lens_h, R, cache.page_size(), cache.hnd_layout());
+        prepare_gemma4_sliding_prefill_plan(
             moe_ws, w, cfg, fwd_cfg, attn_ws, kv_page_indptr_h,
             kv_last_page_lens_h, R, cache.page_size(), cache.hnd_layout());
         if (log_debug) {
@@ -1488,10 +1863,18 @@ void gemma4_moe_block(
             Lw.moe_gate_up_proj->data(),
             moe_ws.expert_gate_up.data(),
             N, K, H, Im, stream);
+        // The GEMV writes its rows in the fused bank's own order, so the
+        // split has to read that order too -- `moe_gate_up_proj` is built in
+        // flashinfer's [linear|gate] layout, not HuggingFace's [gate|up],
+        // which is what `gemma4_moe_gate_up_swapped()` reports and what the
+        // host-routed path below already passes. Omitting it here took the
+        // `gate_second = false` default and computed `gelu_tanh(up) * gate`:
+        // wrong, but smoothly wrong, so 26B-A4B stayed fluent and looped
+        // instead of failing.
         kernels::launch_chunked_geglu_tanh_bf16(
             moe_ws.expert_gate_up.data(),
             moe_ws.expert_act.data(),
-            routes, Im, stream);
+            routes, Im, stream, /*gate_second=*/gemma4_moe_gate_up_swapped());
         kernels::launch_moe_down_decode_gemv_bf16(
             moe_ws.topk_idx.data(),
             moe_ws.expert_act.data(),
@@ -2141,6 +2524,67 @@ void gemma4_forward_paged(
                         // 1/sqrt(head_dim) again -- the decode path beside
                         // this one passes the same 1.0.
                         /*logits_soft_cap=*/0.f, /*sm_scale=*/1.0f);
+                } else if (use_decode_path && layer.is_full &&
+                           moe_ws.full_prefill_ready &&
+                           moe_ws.full_prefill_plan) {
+                    // Full layers, same reasoning as the sliding ones: two kv
+                    // heads is two CTAs, and the prefill splitter fills the
+                    // device.
+                    ops::dispatch_attention_flashinfer_prefill_bf16(
+                        *moe_ws.full_prefill_plan, ws.q.data(),
+                        kv_view.k_pages, kv_view.v_pages, ws.attn_out.data(),
+                        moe_ws.sliding_qo_indptr_d.data(), kv_page_indices,
+                        kv_page_indptr, kv_last_page_lens,
+                        attn_ws, stream, /*logits_soft_cap=*/0.f,
+                        /*sm_scale=*/1.0f, /*lse_out=*/nullptr);
+                } else if (use_decode_path && !layer.is_full &&
+                           moe_ws.sliding_prefill_ready &&
+                           moe_ws.sliding_prefill_plan) {
+                    // Sliding layers through the FA2 prefill kernel: one Q
+                    // token per request, the window bounding the KV, and the
+                    // kernel doing its own masking. sm_scale stays 1.0 -- q is
+                    // pre-scaled here, same as every other branch.
+                    ops::dispatch_attention_flashinfer_prefill_bf16(
+                        *moe_ws.sliding_prefill_plan, ws.q.data(),
+                        kv_view.k_pages, kv_view.v_pages, ws.attn_out.data(),
+                        moe_ws.sliding_qo_indptr_d.data(), kv_page_indices,
+                        kv_page_indptr, kv_last_page_lens,
+                        attn_ws, stream, /*logits_soft_cap=*/0.f,
+                        /*sm_scale=*/1.0f, /*lse_out=*/nullptr);
+                } else if (use_decode_path && !layer.is_full &&
+                           moe_ws.sliding_splits > 1 &&
+                           moe_ws.sliding_split_plan) {
+                    {
+                        static const bool dbg2 =
+                            std::getenv("PIE_GEMMA4_SPLIT_DEBUG") != nullptr;
+                        static int hits = 0;
+                        if (dbg2 && hits < 3) {
+                            ++hits;
+                            std::cerr << "[pie-driver-cuda] gemma4 sliding "
+                                         "split DISPATCHED\n";
+                        }
+                    }
+                    // Sliding layers, split over the in-window pages. Without
+                    // this they run unsplit at 8 CTAs -- 135.9 us/call and 53%
+                    // of the decode step. The plan already folded the window
+                    // into `sliding_split_window`, so the dispatch passes that
+                    // rather than the layer's own `window_left`.
+                    ops::dispatch_attention_flashinfer_decode_bf16(
+                        *moe_ws.sliding_split_plan, ws.q.data(),
+                        kv_view.k_pages, kv_view.v_pages,
+                        moe_ws.sliding_split_partial.data(), kv_page_indices,
+                        moe_ws.sliding_split_kv_indptr_d.data(),
+                        moe_ws.sliding_split_last_d.data(),
+                        attn_ws, stream,
+                        /*window_left=*/moe_ws.sliding_split_window,
+                        /*logits_soft_cap=*/0.f, /*sm_scale=*/1.0f,
+                        moe_ws.sliding_split_lse.data(), /*broadcast_q=*/true);
+                    ops::merge_attention_states_bf16(
+                        moe_ws.sliding_split_partial.data(),
+                        moe_ws.sliding_split_lse.data(),
+                        ws.attn_out.data(),
+                        moe_ws.sliding_split_lse_merged.data(),
+                        moe_ws.sliding_splits, 1, num_q_heads_local, d, stream);
                 } else if (use_decode_path && layer.is_full &&
                            moe_ws.full_splits > 1 && moe_ws.full_split_plan) {
                     ops::dispatch_attention_flashinfer_decode_bf16(

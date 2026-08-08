@@ -164,6 +164,15 @@ void launch_build_moe_ptrs_decode_batched_bf16(
 // routed GEMMs have no weight reuse, so they are pure streaming reads;
 // one warp per output row beats both the tensor-core kernels below and
 // `cublasGemmBatchedEx`, whose tiling assumes an M worth filling.
+// Sweep entry point for the microbenchmark: warps per block and unroll depth
+// chosen explicitly. Shapes for the sweep must come from a decode trace of the
+// model -- a hand-picked set already produced a confident number for a shape
+// that never runs, and cost two models a regression.
+bool launch_moe_decode_gemv_tuned(
+    const std::int32_t* topk_idx, const void* act, const void* weight_base,
+    void* out, int routes, int top_k, int K, int N, long long expert_stride,
+    int warps, int unroll, cudaStream_t stream);
+
 void launch_moe_gate_up_decode_gemv_bf16(
     const std::int32_t* topk_idx,
     const void* norm_x,

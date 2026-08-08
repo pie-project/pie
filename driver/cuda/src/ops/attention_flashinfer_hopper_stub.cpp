@@ -50,19 +50,20 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
     throw std::runtime_error("flashinfer sm90 prefill is not built for this CUDA architecture");
 }
 
-// Not Hopper-only in principle -- it wraps a cascade kernel that would build
-// anywhere -- but it lives in the Hopper translation unit because the KV split
-// that produces its inputs is the sm90 prefill's. Stubbed with the rest of
-// that unit; nothing on this arch can reach a call to it, because the only
-// caller runs after a dispatch that already threw.
-void merge_attention_states_bf16(
-    const void* /*v*/, const float* /*s*/,
-    void* /*v_merged*/, float* /*s_merged*/,
-    int /*num_index_sets*/, int /*seq_len*/, int /*num_heads*/,
-    int /*head_dim*/, cudaStream_t /*stream*/) {
-    throw std::runtime_error(
-        "flashinfer attention-state merge is not built for this CUDA architecture");
-}
+// `merge_attention_states_bf16` is deliberately NOT stubbed here.
+//
+// It used to be, on the reasoning that the KV split producing its inputs was
+// the sm90 prefill's, so the only caller ran after a dispatch that had
+// already thrown. That was wrong: the DECODE KV-split path calls
+// `dispatch_attention_flashinfer_decode_bf16`, which is built on every
+// architecture, and then merges. On sm_100 the dispatch succeeded and this
+// stub threw on the first fire, poisoning the driver and taking gpt-oss and
+// gemma-4 down with it.
+//
+// The real implementation now lives in `attention_merge_states.cu`, which is
+// compiled unconditionally. Re-adding a stub here would be an ODR conflict,
+// which is the desired outcome: it makes the mistake a link error rather
+// than a runtime one.
 
 }  // namespace pie_cuda_driver::ops
 

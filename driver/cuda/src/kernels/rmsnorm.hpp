@@ -25,6 +25,11 @@ void launch_rmsnorm_bf16(
 // rather than compacted first.
 // As above, plus an fp16 copy of the result for a consumer that wants fp16.
 // `y_fp16` may be null, in which case this is exactly `launch_rmsnorm_bf16`.
+// Sweep entry point for the microbenchmark: block width chosen explicitly.
+bool launch_rmsnorm_bf16_tuned(
+    const void* x, const void* weight, void* y, int num_rows, int hidden,
+    float eps, int vblock, cudaStream_t stream);
+
 void launch_rmsnorm_bf16_with_fp16(
     const void* x, const void* weight, void* y, void* y_fp16,
     int num_rows, int hidden, float eps, cudaStream_t stream);
@@ -106,6 +111,12 @@ void launch_rmsnorm_residual_add_scale_rmsnorm_bf16(
 // HF stores Gemma's RMSNorm gamma centered at zero; this lets the loaded
 // tensor be inspected/initialized like a residual gate, but downstream
 // math expects the +1 shift.
+// Sweep entry point for the microbenchmark: block width chosen explicitly.
+bool launch_rmsnorm_rasr_tuned(
+    const void* x, const void* weight, void* hidden, float scale,
+    const void* next_weight, void* norm_out, int num_rows, int hidden_size,
+    float eps, int block, cudaStream_t stream);
+
 void launch_rmsnorm_gemma_bf16(
     const void* x,
     const void* weight,

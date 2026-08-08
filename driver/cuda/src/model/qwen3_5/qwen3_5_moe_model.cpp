@@ -1,5 +1,6 @@
 #include "model/qwen3_5/qwen3_5_moe_model.hpp"
 
+#include <cstdlib>
 #include <utility>
 
 namespace pie_cuda_driver::model {
@@ -52,7 +53,13 @@ Qwen35MoeModel::Qwen35MoeModel(
             break;
         }
     }
-    if (host_work_in_forward) {
+    // A profiled forward times stages with CUDA events, which is illegal on a
+    // capturing stream — so profiling and graph capture are mutually
+    // exclusive. Drop capture rather than silently producing no timings.
+    const char* moe_profile = std::getenv("PIE_QWEN35_MOE_PROFILE");
+    const bool moe_profile_on =
+        moe_profile != nullptr && moe_profile[0] != '\0' && moe_profile[0] != '0';
+    if (host_work_in_forward || moe_profile_on) {
         // Only the capture caps. `graph_padding_kv_write_safe` states that this
         // family's KV writes are gated on `row_valid`, which is a property of
         // its kernels and stays true either way -- startup validates it against

@@ -1,5 +1,9 @@
 #include "kernels/rope.hpp"
 
+#include <type_traits>
+
+#include "kernels/kv_paged_addr.cuh"
+
 #include <cuda_bf16.h>
 
 #include "kernels/rope_device.cuh"
@@ -35,6 +39,21 @@ __global__ void rope_standard_table_kernel(
     }
 }
 
+// `kWriteKv` lands the rotated K straight in the paged cache, and copies V
+// alongside it, instead of leaving both to a following write_kv launch.
+//
+// The pair is worth fusing because write_kv is one block per current-step
+// token: at decode that is a SINGLE block on 148 SMs writing 2 KB, which
+// measured 3.69 us -- nearly all of it launch plus one dependent round trip.
+// RoPE has already split the heads across blockIdx.y for exactly that reason,
+// and its kv-head blocks hold the rotated K in registers at the moment
+// write_kv would re-read it from memory. Folding the store in costs those
+// blocks a page-index lookup and gives back a launch, a store and a load of K.
+//
+// V is not rotated; the same threads copy it because they are already
+// resolved to the right (page, offset) and each covers dim_pair and its
+// partner, which together span head_dim.
+template <bool kWriteKv, bool kHnd>
 __global__ void rope_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k,
@@ -45,13 +64,35 @@ __global__ void rope_bf16_kernel(
     float theta,
     bool interleaved,
     int cache_pairs,
-    int heads_per_block)
+    int heads_per_block,
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ k_pages,
+    __nv_bfloat16* __restrict__ v_pages,
+    const std::uint32_t* __restrict__ qo_indptr,
+    const std::uint32_t* __restrict__ kv_page_indices,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    const std::uint32_t* __restrict__ kv_last_page_lens,
+    const std::uint8_t* __restrict__ row_valid,
+    int R,
+    int page_size)
 {
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
 
     const int half = head_dim / 2;
     const int pos = positions[n];
+
+    // Every thread in this block shares token n, so the destination row is
+    // resolved once here rather than per element.
+    KvSlot slot{};
+    bool write_this_row = false;
+    if constexpr (kWriteKv) {
+        write_this_row = (row_valid == nullptr) || (row_valid[n] != 0);
+        if (write_this_row) {
+            slot = kv_slot_for_token(qo_indptr, kv_page_indices, kv_page_indptr,
+                                     kv_last_page_lens, n, R, page_size);
+        }
+    }
 
     // The rotation angle depends only on (pos, dim_pair): every head of this
     // token shares it. Computing it inside the element loop ran a full-precision
@@ -104,6 +145,27 @@ __global__ void rope_bf16_kernel(
                                      kv_h) * head_dim;
             if (interleaved) rotate_pair_interleaved(kp, dim_pair, cos_v, sin_v);
             else rotate_pair(kp, half, dim_pair, cos_v, sin_v);
+            if constexpr (kWriteKv) {
+                if (write_this_row) {
+                    // K is still written to `k` as well: code past this point
+                    // may read the contiguous copy, and at decode it is 1 KB.
+                    const int j0 = interleaved ? dim_pair * 2 : dim_pair;
+                    const int j1 = interleaved ? dim_pair * 2 + 1
+                                               : dim_pair + half;
+                    const __nv_bfloat16* vp =
+                        v + (static_cast<long long>(n) * num_kv_heads + kv_h) *
+                                head_dim;
+                    const int base = kv_h * head_dim;
+                    const long long d0 = kv_dst_index<kHnd>(
+                        slot, base + j0, page_size, num_kv_heads, head_dim);
+                    const long long d1 = kv_dst_index<kHnd>(
+                        slot, base + j1, page_size, num_kv_heads, head_dim);
+                    k_pages[d0] = kp[j0];
+                    k_pages[d1] = kp[j1];
+                    v_pages[d0] = vp[j0];
+                    v_pages[d1] = vp[j1];
+                }
+            }
         }
     }
 }
@@ -367,12 +429,57 @@ void launch_rope_bf16(
     const int heads_per_block = half >= BLOCK ? 1 : (BLOCK / half);
     dim3 grid(num_tokens, (total_heads + heads_per_block - 1) / heads_per_block);
     dim3 block(BLOCK);
-    rope_bf16_kernel<<<grid, block, smem, stream>>>(
+    rope_bf16_kernel<false, false><<<grid, block, smem, stream>>>(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
         num_q_heads, num_kv_heads, head_dim, theta, interleaved, cache_pairs,
-        heads_per_block);
+        heads_per_block,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        0, 0);
+}
+
+void launch_rope_write_kv_bf16(
+    void* q, void* k, const void* v,
+    const std::int32_t* positions,
+    void* k_pages, void* v_pages,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint8_t* row_valid,
+    int num_tokens, int num_requests, int page_size,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float theta, bool hnd_layout,
+    cudaStream_t stream, bool interleaved)
+{
+    constexpr int BLOCK = 256;
+    constexpr int kMaxCachedPairs = 4096;
+    const int half = head_dim / 2;
+    if (half <= 0 || num_tokens <= 0) return;
+    const int cache_pairs = half <= kMaxCachedPairs ? half : 0;
+    const std::size_t smem =
+        static_cast<std::size_t>(cache_pairs) * 2 * sizeof(float);
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int heads_per_block = half >= BLOCK ? 1 : (BLOCK / half);
+    dim3 grid(num_tokens, (total_heads + heads_per_block - 1) / heads_per_block);
+    dim3 block(BLOCK);
+    auto launch = [&](auto hnd) {
+        rope_bf16_kernel<true, decltype(hnd)::value>
+            <<<grid, block, smem, stream>>>(
+                static_cast<__nv_bfloat16*>(q),
+                static_cast<__nv_bfloat16*>(k),
+                positions,
+                num_q_heads, num_kv_heads, head_dim, theta, interleaved,
+                cache_pairs, heads_per_block,
+                static_cast<const __nv_bfloat16*>(v),
+                static_cast<__nv_bfloat16*>(k_pages),
+                static_cast<__nv_bfloat16*>(v_pages),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                row_valid, num_requests, page_size);
+    };
+    if (hnd_layout) launch(std::true_type{});
+    else launch(std::false_type{});
 }
 
 void launch_qk_rmsnorm_rope_bf16(

@@ -1499,6 +1499,44 @@ void prepare_qwen3_5_decode_plan(
         }
         return;
     }
+    // Decode through the FA2 PREFILL plan when there is a single request.
+    //
+    // Qwen3.6-MoE runs 2 KV heads, so the decode kernel's grid is
+    // batch * num_kv_heads = TWO CTAs on 148 SMs, and it measured 135 us per
+    // call -- 22% of this model's whole decode step. A decode is a prefill
+    // with qo_len = 1, and the prefill splitter chops the KV across enough
+    // CTAs to fill the device. Measured at this model's attention shape
+    // (2 kv heads, gqa 8, head_dim 256), one Q token:
+    //
+    //   ctx 1024  101.0 -> 14.1 us     ctx 2048  200.1 -> 14.6
+    //   ctx 4096  397.9 -> 15.2 us
+    //
+    // R == 1 only. At concurrency the batch is padded for graph capture and
+    // the dead rows are masked through `row_valid`, which the decode dispatch
+    // takes and the prefill dispatch has no parameter for -- enabling it at
+    // c=8 corrupted gemma-4-26B, the one model that passes there.
+    // PIE_QWEN35_PREFILL_DECODE=0 reverts.
+    static const bool prefill_decode_on = [] {
+        const char* v = std::getenv("PIE_QWEN35_PREFILL_DECODE");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (prefill_decode_on && num_requests == 1 &&
+        cache.format().is_native_bf16() && !cache.hnd_layout() &&
+        qo_indptr_h != nullptr) {
+        if (!state.prefill_plan) state.prefill_plan = ops::make_prefill_plan();
+        const int Tp = std::max(1, fwd_cfg.tp_size);
+        ops::plan_attention_flashinfer_prefill_bf16(
+            *state.prefill_plan, qo_indptr_h, kv_page_indptr_h,
+            kv_last_page_lens_h, total_tokens, num_requests,
+            cfg.num_attention_heads / Tp, cfg.num_key_value_heads / Tp,
+            cfg.head_dim, cache.page_size(), attn_ws, stream,
+            /*enable_cuda_graph=*/true, /*window_left=*/-1,
+            /*full_attention_variant=*/false, cache.hnd_layout(),
+            /*causal_mask=*/true);
+        state.use_prefill_plan = true;
+        state.decode_plan.reset();
+        return;
+    }
     if (!state.decode_plan) {
         state.decode_plan = ops::make_decode_plan();
     }

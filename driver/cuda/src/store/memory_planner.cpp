@@ -648,7 +648,18 @@ CudaMemoryPlan plan_cuda_memory(
             if (arena + persistent_bytes >= budget) continue;
 
             int R = R0;
-            const int state_slots = state_slot_bytes > 0 ? R : 0;
+            // PIE_RS_SLOT_MULT: the RS pool is sized to R, but admission needs
+            // `dispatch_depth` slots PER LANE (bootstrap.rs:328 --
+            // rs_seat_cap = rs_cache_slots / seat_cost), so a pool of R seats
+            // only R/depth lanes. Sizing it R*depth instead lets R lanes seat
+            // at the configured depth and keeps frame pipelining, rather than
+            // buying lanes by dropping to depth 1.
+            const int slot_mult = [] {
+                const char* v = std::getenv("PIE_RS_SLOT_MULT");
+                const int n = (v != nullptr) ? std::atoi(v) : 1;
+                return (n >= 1 && n <= 8) ? n : 1;
+            }();
+            const int state_slots = state_slot_bytes > 0 ? R * slot_mult : 0;
             const std::size_t state_bytes =
                 static_cast<std::size_t>(state_slots) * state_slot_bytes;
             const std::size_t minimum_wave_kv_bytes =

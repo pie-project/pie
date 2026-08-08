@@ -6781,6 +6781,13 @@ bool Dispatch::stage_fixed_decode(
     return true;
 }
 
+// Defined below; used by the fixed-decode fail-stop report to name the channel
+// and predicate behind a zero pass-commit instead of only its class.
+std::string describe_uncommitted_lane(
+    std::uint64_t instance_id,
+    const BoundInstance& bound,
+    const StagedLane& lane);
+
 bool Dispatch::enqueue_fixed_decode(
     const FixedDecodeDeviceBuffers& buffers,
     std::string* err,
@@ -6896,6 +6903,27 @@ bool Dispatch::enqueue_fixed_decode(
         std::cerr << "[pie-driver-cuda] fixed-decode compose FAIL-STOPPED "
                   << fresh << " lane(s): " << reasons
                   << "; the affected chains are killed (successors dummy-run)\n";
+        // The device kill names only the class of cause ("pass_commit
+        // missing/zero"), but a zero pass-commit means exactly one of the
+        // gates in `k_pull_validate_host_channels_batch` refused the lane.
+        // `describe_uncommitted_lane` replays those gates on the host — the
+        // ticket words are mapped pinned memory — and names the channel and
+        // the predicate. It was only wired to the host retry path, so a lane
+        // that dies on the device compose never produced it, which is what
+        // left this failure attributable only to "the whole class of causes".
+        for (std::size_t li = 0; li < programs; ++li) {
+            const StagedLane* lane =
+                staged.lanes[scope.program_begin + li].get();
+            if (lane == nullptr || lane->bound == nullptr) continue;
+            std::cerr << "[pie-driver-cuda]   lane " << li << " (program "
+                      << lane->program << ", snapshot_seeded="
+                      << ((lane->snapshot != nullptr &&
+                           lane->snapshot->ever_validated)
+                              ? "yes" : "no")
+                      << ", tickets=" << lane->tickets.size() << "): "
+                      << describe_uncommitted_lane(0, *lane->bound, *lane)
+                      << "\n";
+        }
     }
 
     const FixedDecodeLane* device_lanes =

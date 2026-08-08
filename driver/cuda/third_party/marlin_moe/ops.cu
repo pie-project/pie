@@ -532,8 +532,20 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         ", thread_k_blocks = ", thread_k_blocks, ", num_bits = ", num_bits);
   }
 
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       max_shared_mem);
+  // Both of these were unchecked upstream, and the pair is a silent-wrong-
+  // answer machine: the opt-in is what raises the dynamic smem ceiling above
+  // the 48 KB default, and the launch below asks for `max_shared_mem` of it.
+  // If the opt-in is refused the launch fails with cudaErrorInvalidValue, the
+  // kernel never runs, and `C_ptr` keeps whatever it already held -- which the
+  // caller then reads as the GEMM result. That is not hypothetical on this
+  // driver: `cudaDevAttrMaxSharedMemoryPerBlockOptin` is 232448 on Hopper but
+  // 163840 on A100, so a config that is legal where this was developed can be
+  // over the ceiling here, and the only symptom is wrong tokens.
+  const cudaError_t optin = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
+  TORCH_CHECK(optin == cudaSuccess,
+              "marlin_moe: could not opt in to ", max_shared_mem,
+              " bytes of dynamic shared memory: ", cudaGetErrorString(optin));
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
@@ -542,6 +554,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
   // clang-format on
+  const cudaError_t launched = cudaGetLastError();
+  TORCH_CHECK(launched == cudaSuccess,
+              "marlin_moe: kernel launch failed (blocks=", blocks,
+              " threads=", num_threads, " smem=", max_shared_mem,
+              " MNK=[", prob_m, ",", prob_n, ",", prob_k, "]): ",
+              cudaGetErrorString(launched));
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME
