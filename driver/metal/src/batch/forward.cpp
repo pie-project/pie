@@ -2908,13 +2908,32 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         // one refusal, before any number is computed, so the message is the
         // reason.
         //
+        // What is missing is wiring and not a property of the family, which is
+        // worth stating precisely because the refusal reads like a limit. This
+        // family's routed FFN is built from the SAME shared kernels the llama
+        // family pages today (`LlRouter`, `LlMoeSort`, `LlExpertGate/Up/Down`),
+        // and the renumbering works on them unchanged: a routed matvec does
+        // `base += expert_ids[sel] * stride`, and a slot number in a shorter
+        // stack is the same instruction against different bytes.
+        // `stream_predicate` takes no family argument at all -- it matches
+        // `experts.`, which this family's tensors carry. Three things are
+        // absent, all mechanical: `stage_decode_storage` passes no
+        // `ExpertSlabRequest`; `encode_decode_step` has no `[begin, end)`, and
+        // `ExpertPaging` needs one to end a command buffer at each mixture
+        // layer's router; and the scratch plan publishes no
+        // `expert_ids_by_layer`, so there is no per-layer buffer to hand a
+        // `Cut`. Two encode entry points need the first of those, since the
+        // multi-batch path is its own.
+        //
         // Mapped streaming is a different field and stays supported here; it is
         // passed to `impl->setup` below.
         if (cfg.expert_slab_bytes > 0) {
             if (err != nullptr) {
-                *err = "qwen3.5: expert_slab_bytes is not supported by this family -- its "
-                       "routed FFN is built by a separate engine that keeps the whole bank "
-                       "resident. Use stream_routed_experts to map the bank instead.";
+                *err = "qwen3.5: expert_slab_bytes is not wired for this family yet -- its "
+                       "routed FFN is built by a separate engine that has no sub-range "
+                       "encode to cut a command buffer at each mixture layer, so the bank "
+                       "stays resident. Nothing about the family prevents it. Use "
+                       "stream_routed_experts to map the bank instead.";
             }
             return false;
         }
