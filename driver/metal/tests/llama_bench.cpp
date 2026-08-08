@@ -479,8 +479,19 @@ int main(int argc, char** argv) {
     // So the host term is halved and the expectation flipped, which asks the
     // stronger question -- not whether paging survives a full machine, but
     // whether it still loads one that has room for only half the weights.
+    //
+    // Plus the flat reserve the admission keeps for the load itself, and that
+    // term is not slack: without it this gate is decided by the slab budget the
+    // operator happened to pass. gpt-oss at 1024 MB of slots asks for 3.260 GiB
+    // against 5.205 GiB of half-weights and is refused, because 3.260 + 2 GiB
+    // is 55 MiB over -- while the same model at 512 MB passes. A gate that
+    // flips on a knob unrelated to what it asserts reports the knob. The
+    // reserve is about the machine and not the checkpoint, so squeezing it is
+    // not the question here; the weights are.
     {
-        const std::size_t left = std::size_t(paging ? weight_bytes / 2 : weight_bytes);
+        constexpr std::size_t kAdmissionReserve = 2ull << 30;  // forward.cpp kHostMargin
+        const std::size_t left =
+            std::size_t(paging ? weight_bytes / 2 + kAdmissionReserve : weight_bytes);
         RawMetalContext::set_host_reclaimable_bytes_for_test(left);
         MetalExecutor probe;
         std::string why;
