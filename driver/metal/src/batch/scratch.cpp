@@ -363,8 +363,34 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
     for (const Use& u : uses) {
         shared_uses.push_back({u.ordinal, u.bind_index, u.value, u.write});
     }
-    const auto coloring = pie::metal::scratch::color_live_ranges(shared_uses, run_ends,
-                                                                next_value, no_recycle);
+    // `PIE_METAL_TAPS_LAYER=<n>`: keep every value DEFINED in layer n out of the
+    // recycling, and let the rest colour normally. `no_recycle` is the honest
+    // instrument and this is the one that fits: a 40-layer mixture under
+    // no_recycle asks for ~18 GiB of scratch and the GPU refuses the command
+    // buffer before anything is dumped, so the values a wrong answer is
+    // actually made of have never been readable on the checkpoint that has the
+    // wrong answer. One layer is a few dozen slots.
+    std::vector<bool> pinned;
+    if (const char* e = std::getenv("PIE_METAL_TAPS_LAYER"); e != nullptr && !no_recycle) {
+        const int want = std::atoi(e);
+        // A value's layer is its DEFINING dispatch's: the first use that writes
+        // it. Reads from the next layer do not move it.
+        std::vector<int> def_at(std::size_t(next_value), -1);
+        for (const Use& u : uses) {
+            if (!u.write) continue;
+            int& d = def_at[std::size_t(u.value)];
+            if (d < 0 || u.ordinal < d) d = u.ordinal;
+        }
+        pinned.assign(std::size_t(next_value), false);
+        for (int v = 0; v < next_value; ++v) {
+            const int o = def_at[std::size_t(v)];
+            if (o >= 0 && o < int(dag.size()) && dag[std::size_t(o)].layer == want) {
+                pinned[std::size_t(v)] = true;
+            }
+        }
+    }
+    const auto coloring = pie::metal::scratch::color_live_ranges(
+        shared_uses, run_ends, next_value, no_recycle, pinned.empty() ? nullptr : &pinned);
     const std::vector<int>& color = coloring.color;
 
     ScratchSchedule sched;

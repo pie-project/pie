@@ -206,100 +206,38 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             // Asked with the SAME answer `bind_token_consts` gives the sort, so
             // the stack the dispatch walks is the stack the sort built.
             const int sorted = moe_sorted_rows(g, n, qwen35_routed_decode_batched());
-            // WRONG ANSWERS, so this arm is currently shut. NOT a fleet bug and
-            // NOT a width bug, whatever the note that used to stand here said.
+            // The batched arm. It answered WRONGLY for as long as it existed,
+            // and the cause was not in this file: `bind_mb_fp16_qmm` bound the
+            // FP16 staging buffer to argument-table ordinal 12 on every
+            // dispatch with a `qmm_bn`, and on a ROUTED dispatch ordinal 12 is
+            // `GoQmv::TileExpert`. The GEMM read half-precision activations as
+            // expert indices -- a different expert per tile, and no write at
+            // all on a tile whose reinterpreted int came out negative. The fix
+            // is the `is_routed` skip in `bind_mb_fp16_qmm`; the comment there
+            // is the long version.
             //
-            // A ONE-ROW GREEDY DECODE REPRODUCES IT:
+            // Two things about the hunt are worth keeping, because both are
+            // traps this file can fall into again:
             //
-            //   PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=0 \
-            //   PIE_METAL_QWEN_ROUTED_DECODE_GEMM=1 \
-            //   PIE_METAL_EXPERT_SLAB_MB=1024 ./bin/llama_bench <q35> 32 32
+            //   * The bisection this comment used to carry -- "30 and 31 lanes
+            //     PASS, 32 FAILS", "MIN_PER=2 makes 32 pass", "forced on at 8
+            //     lanes it reproduces mlx-lm" -- was ENTIRELY FALSE. `env_int`
+            //     rejected 0, so every `MIN_PER=0` run silently used the
+            //     default and never left the matvec: nothing was ever forced.
+            //     See `env_int_allow_zero` in device_tuning.cpp. A knob that
+            //     reports the default is worse than no knob, because the
+            //     experiment still prints PASS.
+            //   * 32 was never a threshold. Two independent filters gate this
+            //     branch and 32 is where they coincide on THIS mixture:
+            //     `moe_should_batch` first admits at 256 pairs = 32 lanes at
+            //     top-8, and `qmm_bn` returns 0 -- silently demoting to the
+            //     matvec below -- whenever `sorted` is not BN-aligned. 32 lanes
+            //     sort to 4096 rows (aligned, GEMM); 33 to 4112 = 16*257 (not
+            //     aligned, matvec). `PIE_METAL_MOE_TRACE=1` prints the `bn`.
             //
-            // answers `220 96834 45163 149960 149960 97282` where mlx-lm says
-            // `220 24 11 220 16 15`. Either env alone PASSES; only the pair
-            // fails, which is the definition of this branch and nothing else.
-            //
-            // The bisection this comment used to carry -- "30 and 31 lanes
-            // PASS, 32 FAILS", "MIN_PER=2 makes 32 pass", "forced on at 8 lanes
-            // it reproduces mlx-lm", "reproducing the wrong answer needs a
-            // bigger machine" -- was ENTIRELY FALSE, and both halves of why are
-            // worth carrying:
-            //
-            //   * `env_int` rejected 0, so every `MIN_PER=0` run silently used
-            //     the default 1 and never left the matvec. That is why "forced
-            //     on at 8 lanes" passed: nothing was forced. See
-            //     `env_int_allow_zero` in device_tuning.cpp.
-            //   * The widths that "passed" never reached this branch either.
-            //     Two independent filters gate it, and 32 is where they happen
-            //     to coincide on THIS mixture: `moe_should_batch` first admits
-            //     at 256 pairs = 32 lanes at top-8, and `qmm_bn` returns 0 --
-            //     silently demoting to the matvec below -- whenever `sorted` is
-            //     not BN-aligned. 32 lanes sort to 4096 rows (aligned, GEMM);
-            //     33 sort to 4112 = 16*257 (not aligned, matvec). Traced with
-            //     `PIE_METAL_MOE_TRACE=1`: 33 lanes report `bn=0`.
-            //
-            // So the honest statement is that the qwen3.5 routed decode GEMM
-            // has NEVER produced a right answer at any width tested. 32 was an
-            // artefact of the two gates, not a threshold.
-            //
-            // What has been ruled out since, all measured:
-            //   * NOT expert paging: fails with and without the slab.
-            //   * NOT the tile width: at one row `moe_tile_rows` pins BM=16,
-            //     and `PIE_METAL_MOE_TILE_MID_PER=1` moves the PREFILL to
-            //     BM=32 while the decode stays at 16 and stays wrong.
-            //   * NOT a silent PSO fallback to the matvec: the trace reports
-            //     `routed=1`, so `mb.qmm_routed[0][2]` is valid and selected.
-            //   * NOT the kernel. The PREFILL fires the SAME PSO over
-            //     `sorted=5376` and reproduces mlx-lm. Same scratch schedule,
-            //     same weights, same `tile_expert` contract.
-            //   * NOT the shared kernels: gpt-oss (32 experts, top-4) and
-            //     gemma-4-26b-a4b both PASS at one row with `MIN_PER=0` now
-            //     that the knob is honoured.
-            //   * NOT the recurrent state, and NOT the dense GEMM
-            //     (`PIE_METAL_QMM_MIN_BATCH=64` does not help).
-            //   * NOT a missing bind. `PIE_METAL_MOE_TRACE=1` now prints what
-            //     `bind_scratch` actually put in the argument table, and the mb
-            //     decode's layer-0 sort (ordinal 12301) writes `tile_expert` to
-            //     colour 6 while its expert projections (12303) read bind 12
-            //     from colour 6, with `row_expert` on 5 and `sorted_x` on 3 --
-            //     the schedule's contract, honoured, with no `SKIPPED` line on
-            //     any DAG. The prefill's rows bind the same colours at their
-            //     own offsets.
-            //
-            // That leaves what the two paths PUT in those colours, which no
-            // instrument in the tree can currently read on this checkpoint.
-            // Golden taps turn pool recycling off, which takes scratch from
-            // 0.184 to 2.616 GiB and puts an 18.16 GiB checkpoint over the
-            // GPU's limit (`kIOGPUCommandBufferCallbackErrorOutOfMemory`).
-            // `PIE_METAL_TAPS_RECYCLE=1` dumps, but only the LAST layer's
-            // values survive the recycling and by then both arms have diverged.
-            // Truncating the checkpoint to one layer via `num_hidden_layers`
-            // does not help either: the heap is reserved from the checkpoint's
-            // tensors, not from the geometry, so a 1-layer DAG still asks for
-            // 18.26 GiB and the paging staging refuses `1 routed layers in the
-            // DAG against 40 staged`. Reading the sorted stack needs a tap that
-            // can name ONE dispatch, which is the next thing to build.
-            //
-            // One lead was checked here and is NOT it, recorded so the next
-            // reader does not spend the afternoon on it: the schedule colours
-            // the sort's `perm` and the gate's output `gp` the SAME slot (both
-            // colour 1 above), which would be a WAR hazard if the gather were
-            // still reading `perm` when the gate wrote `gp`. It is not --
-            // `concurrency_group` returns 0 for every mixture kind, so
-            // `concurrent_run_ends` leaves each of them alone in its run and
-            // `barrier_after_mb` emits a barrier after all of them.
-            //
-            // Not a reason to raise `moe_batch_min_per_expert` past 1, which
-            // is the shape of fix that suggests itself: that constant carries
-            // a measured table in `device_tuning.hpp` where 1 beats 4 by up to
-            // 132% on the families whose arm IS on. This is a qwen3.5 bug, and
-            // the crossover is not the thing that is wrong.
-            //
-            // Shutting it costs a mixture's decode the batched form wherever
-            // both gates would have admitted it, which on this mixture is 32
-            // lanes and up. That is a throughput loss on one family and it is
-            // the correct trade against a wrong answer.
-            //
+            // With the bind fixed the arm is worth 161.3 -> 214.5 tok/s on a
+            // 32-lane Qwen3.6-35B-A3B fleet, +33%, and is on by default.
+
             // The prefill is deliberately unaffected: its routed batching is
             // `routed_group_shape`, a different call site, and these DAGs are
             // built at `n_tokens == 1` where the predicate is false anyway.
@@ -333,8 +271,8 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             // ask the same question the sort did. Launched over the padded
             // count with an unpadded sort behind it, the gather walks rows the
             // sort never grouped -- which at 512 tokens is 12800 rows of copy
-            // for 4096 of content, and is exactly the cost
-            // `qwen35_routed_decode_batched` was turned off to stop paying.
+            // count for 4096 of content, and is what the padded arm pays for
+            // its aligned tiles.
             shared_kernels::moe_route_rows_dispatch(
                 g.hidden, moe_sorted_rows(g, n, qwen35_routed_decode_batched()),
                 d.grid, d.tg);

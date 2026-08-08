@@ -122,8 +122,14 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
                 env_int("PIE_METAL_QMM_MIN_BATCH", t.qmm_min_batch_emulated));
     t.qmm_bn_crossover_tg =
         env_int("PIE_METAL_QMM_BN_CROSSOVER_TG", t.qmm_bn_crossover_tg);
-    t.moe_tile_mid_per = env_int("PIE_METAL_MOE_TILE_MID_PER", t.moe_tile_mid_per);
-    t.moe_tile_wide_per = env_int("PIE_METAL_MOE_TILE_WIDE_PER", t.moe_tile_wide_per);
+    // Zero is a MEANING here and not a typo: it is "widen unconditionally",
+    // which is the only way to reach the 32- and 64-row routed tiles on a
+    // decode, where `per` is `experts_per_token * n / n_experts` and rounds to
+    // nothing. `env_int` would have taken it for a parse failure and reported
+    // the default, which is how this pair spent so long looking like a knob
+    // that did nothing to a routed answer.
+    t.moe_tile_mid_per = env_int_allow_zero("PIE_METAL_MOE_TILE_MID_PER", t.moe_tile_mid_per);
+    t.moe_tile_wide_per = env_int_allow_zero("PIE_METAL_MOE_TILE_WIDE_PER", t.moe_tile_wide_per);
     t.fp16_qmm = env_bool("PIE_METAL_FP16_QMM", t.fp16_qmm);
     t.sdpa_tile_min_rows_per_request =
         env_int("PIE_METAL_SDPA_TILE_MIN_ROWS", t.sdpa_tile_min_rows_per_request);

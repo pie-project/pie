@@ -2685,6 +2685,27 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         }
     }
 
+    // The mixture's wrong-answer bug lives in the DECODE, and until now only
+    // the prefill dumped. Dumping the FIRST decode fire is what makes an A/B
+    // possible at all: the prefill is identical whatever the routed decode arm
+    // is, so at step 0 both arms enter with the same KV, the same recurrent
+    // state and the same token, and any difference in a layer's values is the
+    // arm. By the last step they have diverged for pages and a diff says only
+    // that they diverged. Pair it with `PIE_METAL_TAPS_LAYER` -- this
+    // checkpoint's no-recycle pool does not fit, and without pinning a layer
+    // the recycling leaves only the final one readable.
+    static bool mb_taps_dumped = false;
+    if (golden_taps_enabled() && !mb_taps_dumped) {
+        mb_taps_dumped = true;
+        dump_golden_taps(fire_dag, mb_sched_, pool_.data(), int(pool_.size()), g_, schedule.N,
+                         /*row_stride_bytes=*/0, "dec.",
+                         moe_sorted_rows(g_, schedule.N,
+                                         qwen35_routed_decode_batched()),
+                         moe_sorted_rows(g_, schedule.N, qwen35_routed_decode_batched()) /
+                             std::max(1, moe_tile_rows_for(g_, schedule.N,
+                                                           qwen35_routed_decode_batched())));
+    }
+
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
     // The fire wrote every active slot's shifted history into the other half.
     for (uint32_t slot : active_slots) conv_in_out_[slot] = std::uint8_t(parity ^ 1u);

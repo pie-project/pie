@@ -138,20 +138,25 @@ inline bool moe_trace_enabled() {
 
 /// Whether a DECODE fire's routed projections run batched.
 ///
-/// False, and not as a tuning choice: qwen3.5's routed batched GEMM answers
-/// wrongly on a decode fleet. See the routed arm of `mb_geometry` for the
-/// bisection. Named rather than written as a literal `false` at each site
-/// because three places have to agree on the sorted count -- the dispatch
-/// shape, `MoeRouteParams` and the pool sizing -- and a disagreement between
-/// them is a read off the end of the routing.
+/// True. It was false for as long as the routed GEMM answered wrongly on a
+/// decode fleet, which it did because `bind_mb_fp16_qmm` bound the FP16
+/// staging buffer over `GoQmv::TileExpert` -- see the skip in
+/// `bind_mb_fp16_qmm`, which is the whole fix. With that gone the arm is worth
+/// 161.3 -> 214.5 tok/s on a 32-lane Qwen3.6-35B-A3B fleet, +33%, at an
+/// unchanged M=1 decode (the mixture does not batch eight pairs over 256
+/// experts) and an unchanged greedy continuation.
+///
+/// Named rather than written as a literal at each site because three places
+/// have to agree on the sorted count -- the dispatch shape, `MoeRouteParams`
+/// and the pool sizing -- and a disagreement between them is a read off the
+/// end of the routing.
 inline bool qwen35_routed_decode_batched() {
-    // Overridable, like every other tuned constant in this driver and for the
-    // same reason: whoever fixes the GEMM has to run the same binary with the
-    // arm on and off, and a rebuild between arms is a different binary. It is
-    // also the one-line reproduction of the bug.
+    // Overridable, like every other tuned constant in this driver: the arm
+    // changes the shape of every routed dispatch in a decode, so anything that
+    // regresses here has to be bisectable against the matvec without a rebuild.
     static const bool on = [] {
         const char* e = std::getenv("PIE_METAL_QWEN_ROUTED_DECODE_GEMM");
-        return e != nullptr && *e != '\0' && *e != '0';
+        return e == nullptr || (*e != '\0' && *e != '0');
     }();
     return on;
 }
