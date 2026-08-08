@@ -1,10 +1,9 @@
-//! The Rust normalizer against the C++ one it replaces, field for field.
+//! The Rust normalizer against the recorded output of the C++ one it replaced.
 //!
 //! `pie.model/1` only works if this crate answers "what is this model made of"
-//! the same way `driver/cuda/src/model/config.cpp` does. Not approximately —
-//! a single defaulting rule that differs breaks a model, and it breaks it
-//! *later*, once the C++ side is deleted and there is nothing left to disagree
-//! with.
+//! deliberately. A single accidental defaulting change can publish a wrong
+//! descriptor, so the deleted parser's harvested outputs remain a field-for-
+//! field drift detector, not a second implementation or a normative oracle.
 //!
 //! So the check is a comparison against recorded output of the real thing.
 //! `driver/cuda/tests/hf_config_dump/` builds `parse_hf_config` behind a JSON
@@ -13,11 +12,9 @@
 //! and checks in the results. This test re-normalizes the same inputs here and
 //! compares.
 //!
-//! The goldens record what `config.cpp` *does*, including where that is wrong:
-//! `attention_has_sinks` is set for `deepseek_v4` and then unconditionally
-//! overwritten, so DeepSeek-V4 has no sinks. This test asserts the port
-//! reproduces that. Fixing it means editing the C++, regenerating the goldens
-//! and updating both sides together — never one side quietly diverging.
+//! A deliberate correction updates the normalizer, the affected recording,
+//! and its focused assertion together. That keeps the broad differential
+//! useful without preserving a deleted implementation's known bugs.
 
 use std::path::{Path, PathBuf};
 
@@ -240,32 +237,26 @@ fn the_corpus_exercises_the_branches_it_claims_to() {
     assert!(load("Qwen--Qwen3-VL-2B-Instruct")["qwen3_vl_vision"].is_object());
 }
 
-/// The `deepseek_v4` sinks bug is reproduced, deliberately.
-///
-/// `config.cpp:306` sets it; `config.cpp:331` overwrites it. If someone fixes
-/// the C++ without regenerating the goldens, or "fixes" the port on its own,
-/// this is what says so.
+/// DeepSeek-V4's published descriptor says the architecture has sink tensors.
 #[test]
-fn the_dead_deepseek_v4_sinks_assignment_is_reproduced() {
+fn deepseek_v4_descriptor_records_attention_sinks() {
     let golden: Value = serde_json::from_str(
         &std::fs::read_to_string(oracle_dir().join("golden/synthetic--deepseek-v4.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(
-        golden["attention_has_sinks"], false,
-        "the golden no longer records the overwrite — if config.cpp was fixed, \
-         update this test with it"
+        golden["attention_has_sinks"], true,
+        "the recorded descriptor must state DeepSeek-V4's sink metadata"
     );
 
     let raw =
         std::fs::read_to_string(oracle_dir().join("corpus/synthetic--deepseek-v4.json")).unwrap();
     let cfg = pie_model_config::normalize(&serde_json::from_str(&raw).unwrap(), "dsv4").unwrap();
     assert!(
-        !cfg.attention_has_sinks,
-        "the port diverged from the C++ side by fixing the bug on its own"
+        cfg.attention_has_sinks,
+        "DeepSeek-V4 sink metadata was dropped"
     );
-    // The rest of the DSV4 block did land, so this is the overwrite and not a
-    // block that failed to run.
+    // The rest of the DSV4 block still lands with the sink fact.
     assert_eq!(cfg.dsv4_o_lora_rank, 32);
 }
 

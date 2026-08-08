@@ -25,6 +25,7 @@ use pie_loader::plan::{
 };
 use pie_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, ScaleForm, TensorId,
+    Visibility,
 };
 use pie_loader::verify::ContractView;
 
@@ -1126,6 +1127,7 @@ fn deepseek_v4_checkpoint() -> CheckpointMetadata {
         Encoding::Raw(DType::F8E4M3),
     );
     ck.push(&format!("{p}attn.wq.scale"), &[2, 2], u8enc());
+    ck.push(&format!("{p}attn.attn_sink"), &[4], f32enc());
     for expert in 0..2 {
         let e = format!("{p}ffn.experts.{expert}.");
         for half in ["w1", "w3"] {
@@ -1388,6 +1390,30 @@ fn assert_imported_block_scale_decodes(contract: &pie_loader::contract::ModelCon
             .unwrap_or_else(|| panic!("routed scale '{name}' is published"));
         assert_eq!(scale.encoding, Encoding::Raw(DType::E8M0), "{name}");
         assert!(scale.scales.is_none(), "{name}");
+    }
+}
+
+#[test]
+fn deepseek_v4_attention_sink_survives_contract_authoring() {
+    let metadata = deepseek_v4_checkpoint();
+    for policy in [
+        Policy::default(),
+        Policy {
+            stream_routed_experts: true,
+            ..Policy::default()
+        },
+    ] {
+        let contract = author(&facts("deepseek_v4", 1), &metadata, &target(0, 1), &policy)
+            .expect("DeepSeek-V4 contract authoring succeeds")
+            .expect("DeepSeek-V4 has a contract author");
+        let sink = contract
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "layers.0.attn.attn_sink")
+            .expect("DeepSeek-V4 attention sink survives contract authoring");
+        assert_eq!(sink.shape, Some(vec![4]));
+        assert_eq!(sink.encoding, f32enc());
+        assert_eq!(sink.visibility, Visibility::Public);
     }
 }
 

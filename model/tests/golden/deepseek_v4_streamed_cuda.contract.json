@@ -53,6 +53,20 @@
       "visibility": "Public"
     },
     {
+      "name": "layers.0.attn.attn_sink",
+      "expr": {
+        "Src": "layers.0.attn.attn_sink"
+      },
+      "shape": [
+        4
+      ],
+      "encoding": {
+        "Raw": "F32"
+      },
+      "scales": null,
+      "visibility": "Public"
+    },
+    {
       "name": "norm.weight",
       "expr": {
         "Src": "norm.weight"

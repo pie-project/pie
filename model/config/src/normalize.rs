@@ -1,24 +1,16 @@
 //! HuggingFace `config.json` → the normalized shape, once, at import.
 //!
-//! A transliteration of `parse_hf_config`
-//! (`driver/cuda/src/model/config.cpp`), in the same order, with the same
-//! rules. Not a reimplementation: the order matters, because several fields
-//! are written more than once and the last write wins, and the defaults matter
-//! because most of them are "what HF omits when it means the common case".
+//! This began as a transliteration of the CUDA driver's `parse_hf_config`,
+//! whose recorded outputs still seed the differential goldens. That parser was
+//! deleted once this became the sole normalizer, so those recordings catch
+//! accidental drift without making former bugs normative.
 //!
-//! Two consequences of being a transliteration rather than a rewrite:
-//!
-//! - **Bugs are reproduced, not fixed.** `attention_has_sinks` is set to `true`
-//!   inside the `deepseek_v4` block and then overwritten unconditionally a few
-//!   lines later, so DeepSeek-V4 loses its sinks. That is what this does too.
-//!   Fixing it is a deliberate change to both sides at once, with the goldens
-//!   regenerated — not something the port decides on its own.
-//! - **Field order in the source is load-bearing.** `norm_topk_prob` has an
-//!   in-class default of `true` and is then read with a default of `false`,
-//!   so the effective default is `false` -- for the families that inherit
-//!   that config class. The qwen3.5/3.6/next line has its own class that
-//!   defaults to `true`, so the default here is keyed on the model type.
-//!   Reordering to group the MoE fields would quietly change both.
+//! Field order remains load-bearing. `norm_topk_prob` has an in-class default
+//! of `true` and is then read with a default of `false`, so the effective
+//! default is `false` for the families that inherit that config class. The
+//! qwen3.5/3.6/next line has its own class that defaults to `true`, so the
+//! default here is keyed on the model type. Reordering to group the MoE fields
+//! would quietly change both.
 //!
 //! `head_dim_kernel` is the one field here that is not a fact about the
 //! checkpoint: it rounds `head_dim` up to a head dim the *driver build*
@@ -363,8 +355,6 @@ pub fn normalize(root: &Value, path: &str) -> Result<HfConfig> {
         cfg.dsv4_compress_rope_theta = opt_f32(j, "compress_rope_theta", 0.0, path)?;
         cfg.dsv4_scoring_func = opt_string(j, "scoring_func", "", path)?;
         cfg.dsv4_expert_dtype = opt_string(j, "expert_dtype", "", path)?;
-        // Dead: overwritten unconditionally below. Kept because the port
-        // reproduces behavior, and behavior today is that it is dead.
         cfg.attention_has_sinks = true;
         if let Some(ratios) = opt_i32_array(j, "compress_ratios", path)? {
             cfg.dsv4_compress_ratios = ratios;
@@ -388,8 +378,9 @@ pub fn normalize(root: &Value, path: &str) -> Result<HfConfig> {
     cfg.swiglu_limit = opt_f32(j, "swiglu_limit", 0.0, path)?;
     cfg.mlp_has_bias = cfg.model_type == "gpt_oss";
     cfg.router_has_bias = cfg.model_type == "gpt_oss";
-    // This is the assignment that kills the `deepseek_v4` one above.
-    cfg.attention_has_sinks = cfg.model_type == "gpt_oss";
+    if cfg.model_type == "gpt_oss" {
+        cfg.attention_has_sinks = true;
+    }
 
     cfg.gemma_query_pre_attn_scalar =
         opt_f32(j, "query_pre_attn_scalar", cfg.head_dim as f32, path)?;
