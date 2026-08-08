@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include "kernels/custom_all_reduce.hpp"
+#include "batch/forward_graph.hpp"  // prefill_graph_enabled()
 #include "cuda_check.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/argmax.hpp"
@@ -198,7 +199,39 @@ void prepare_llama_like_decode_plan(
                 cache.page_size(),
                 attn_ws,
                 /*stream=*/nullptr,
-                /*graph_mode_plan=*/false,
+                // `graph_mode_plan` marks the plan CUDA-graph capturable
+                // (`PrefillPlanCache::graph_capturable`), which is what
+                // `forward_graph_replay_eligible` consults for a wave carrying
+                // a prefill — so with `false` here, no value of
+                // `PIE_PREFILL_GRAPH` could make such a wave replay on this
+                // family.
+                //
+                // ARMED under the flag, so `PIE_PREFILL_GRAPH=1` means what
+                // its name says; inert at the default 0, so the default path
+                // is bit-for-bit unchanged.
+                //
+                // Arming it costs ~4-6% on 4096x64 @c256, and profiling
+                // (rather than subtracting) says what that is: **the graph
+                // CAPTURES**, at ~10-14.5 ms each. With the flag on, 79 waves
+                // spend more than 2 ms in `forward_enqueue` and together they
+                // are 0.798 s of an 8.8 s run, against a replay saving of
+                // ~0.199 s. `plan_us` barely moves (93 -> 103 us), so it is
+                // NOT the planning — an earlier reading here said it was, from
+                // a grain sweep whose two terms (padding waste and capture
+                // count) cancel, and from a second-touch experiment that was
+                // confounded because declining to capture means paying the
+                // eager path instead.
+                //
+                // The mechanism itself works completely: over-cliff
+                // `forward_enqueue` drops 1,136 -> 18 us and the emitted
+                // tokens are bit-identical to the eager path on the
+                // deterministic c1 cell. What it needs is the captures taken
+                // OUT OF BAND — `capture_prefill_graph_lattice` in
+                // `batch/forward.cpp` does that behind
+                // `PIE_PREFILL_GRAPH_LATTICE`, and with it the same cell reads
+                // +0.2% at 4,096 requests and +0.95% at 16,384.
+                /*graph_mode_plan=*/
+                prefill_graph_enabled() && score_window == 0,
                 fwd_cfg.sliding_window,
                 /*full_attention_variant=*/false,
                 cache.hnd_layout(),

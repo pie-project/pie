@@ -41,6 +41,7 @@ bool prefill_graph_enabled();
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
@@ -109,18 +110,54 @@ constexpr int forward_graph_request_bucket(int requests,
 //     G=128 -> 67 keys, 63.2% reuse, 6.9% padding waste
 //     G=256 -> 56 keys, 69.2% reuse, 13.6% padding waste
 //
-// 128 is the finest grain whose key set still fits `kMaxEntries` beside the
-// 51 upfront decode graphs (67 + 51 = 118). G=64 would need 132 entries and
-// evict its own working set, spending the padding and losing the reuse that
-// paid for it.
+// 128 was chosen because it is the finest grain whose key set still fits
+// `kMaxEntries` beside the 51 upfront decode graphs (67 + 51 = 118) — G=64
+// would have needed 132 entries and evicted its own working set.
+//
+// That reason no longer binds (`PIE_GRAPH_CACHE_ENTRIES` lifts the ceiling),
+// and the grain was swept with it lifted: G = 64/128/256 gives 81/67/47
+// captures and 3.1%/6.9%/13.6% padding waste, and throughput does not move at
+// all. **The two terms cancel** — a finer grain pays less padding and captures
+// more shapes, a coarser one the reverse — so no grain wins and 128 stays the
+// default for want of a better one rather than for the reason above.
 constexpr int kForwardGraphTokenGrain = 128;
 
-constexpr int forward_graph_token_bucket(int tokens, int max_tokens) noexcept {
-    if (tokens <= 0 || max_tokens <= 0 || tokens > max_tokens) return 0;
-    const int bucket =
-        ((tokens + kForwardGraphTokenGrain - 1) / kForwardGraphTokenGrain) *
-        kForwardGraphTokenGrain;
+constexpr int forward_graph_token_bucket_at(
+    int tokens, int max_tokens, int grain) noexcept {
+    if (tokens <= 0 || max_tokens <= 0 || tokens > max_tokens || grain <= 0) {
+        return 0;
+    }
+    const int bucket = ((tokens + grain - 1) / grain) * grain;
     return bucket <= max_tokens ? bucket : max_tokens;
+}
+
+constexpr int forward_graph_token_bucket(int tokens, int max_tokens) noexcept {
+    return forward_graph_token_bucket_at(
+        tokens, max_tokens, kForwardGraphTokenGrain);
+}
+
+// `PIE_GRAPH_TOKEN_GRAIN` overrides the grain. A CALIBRATION knob, and the
+// reason it exists is that the comment above rejects G=64 for a reason that no
+// longer binds: "G=64 would need 132 entries and evict its own working set".
+// `PIE_GRAPH_CACHE_ENTRIES` lifts that ceiling, so the trade the grain
+// actually makes — 3.1% padding waste at 81 keys against 6.9% at 67 — can be
+// measured instead of assumed. Padding waste is device work on exactly the
+// waves the fleet is waiting on, and it is one of the two terms §34 found the
+// prefill graph path losing to. Unset keeps 128 exactly.
+inline int forward_graph_token_grain() {
+    static const int value = [] {
+        const char* const env = std::getenv("PIE_GRAPH_TOKEN_GRAIN");
+        if (env == nullptr || *env == '\0') return kForwardGraphTokenGrain;
+        const long long parsed = std::atoll(env);
+        return parsed > 0 ? static_cast<int>(parsed)
+                          : kForwardGraphTokenGrain;
+    }();
+    return value;
+}
+
+inline int forward_graph_token_bucket_runtime(int tokens, int max_tokens) {
+    return forward_graph_token_bucket_at(
+        tokens, max_tokens, forward_graph_token_grain());
 }
 
 static_assert(forward_graph_token_bucket(1, 8192) == 128);
@@ -186,7 +223,7 @@ public:
             return;
         }
 
-        if (execs_.size() >= kMaxEntries && !execs_.empty()) {
+        if (execs_.size() >= max_entries() && !execs_.empty()) {
             auto victim = execs_.begin();
             cudaGraphExecDestroy(victim->second);
             execs_.erase(victim);
@@ -197,10 +234,30 @@ public:
     }
 
     std::size_t size() const noexcept { return execs_.size(); }
+    /// The ceiling `put` evicts against. Public so a pre-capture pass can
+    /// refuse to store more graphs than the cache can hold: eviction picks an
+    /// arbitrary bucket, so overrunning it discards entries captured earlier
+    /// in the SAME pass -- including the decode lattice.
+    std::size_t capacity() const noexcept { return max_entries(); }
     Metrics metrics() const noexcept { return metrics_; }
 
 private:
     static constexpr std::size_t kMaxEntries = 128;
+    // `PIE_GRAPH_CACHE_ENTRIES` overrides the ceiling. A CALIBRATION knob, not
+    // a tuning one: 128 was sized against ONE cell's key set (the comment on
+    // `kForwardGraphTokenGrain` says so — "67 + 51 = 118"), and at 4x the
+    // request count the prefill key set overflows it and the cache thrashes
+    // (§33: 74 captures at 4,096 requests, 169-196 at 16,384, for a key set
+    // that should saturate). Unset keeps 128 exactly.
+    static std::size_t max_entries() {
+        static const std::size_t value = [] {
+            const char* const env = std::getenv("PIE_GRAPH_CACHE_ENTRIES");
+            if (env == nullptr || *env == '\0') return kMaxEntries;
+            const long long parsed = std::atoll(env);
+            return parsed > 0 ? static_cast<std::size_t>(parsed) : kMaxEntries;
+        }();
+        return value;
+    }
     std::unordered_map<ForwardGraphKey, cudaGraphExec_t,
                        ForwardGraphKeyHash> execs_;
     mutable Metrics metrics_;
