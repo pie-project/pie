@@ -326,6 +326,13 @@ struct BoundInstance {
     std::vector<std::vector<std::uint32_t>> stage_topologies;
     std::array<std::vector<const plan::StagePlan*>, 4> phase_plans;
     cudaEvent_t publish_done = nullptr;
+    /// Wave generation that last collected this instance's callback fence at
+    /// settlement. Deduplicating the wave's instances on the instance itself
+    /// is what lets the settle path walk `state.lanes` — which already hold
+    /// `bound` — instead of sorting a parallel id list and looking every id
+    /// back up in `impl_->instances`. Lane-thread only, like every other
+    /// mutation here.
+    std::uint64_t settle_generation = 0;
     std::deque<CommitSnapshot> commit_snapshots;
 };
 
@@ -1434,6 +1441,15 @@ struct Dispatch::Impl {
     // different stream), consumed at the instance's first completed wave.
     cudaEvent_t publications_done = nullptr;
     bool publications_recorded = false;
+    // Fire-timing only: the previous wave's (instance id, program hash) list,
+    // in lane order. §35 asks whether a steady decode wave re-describes the
+    // SAME lanes every wave -- 1,081 us of host bookkeeping to make a 6 us
+    // launch -- and that is answerable only by comparing consecutive waves.
+    // Written and read on the driver lane, like every other Impl member.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> previous_membership;
+    /// Monotone wave stamp for `BoundInstance::settle_generation`. Never
+    /// cleared, so nothing is walked to reset it.
+    std::uint64_t settle_generation = 0;
     // Settlement notification runs on its OWN stream. `cudaLaunchHostFunc`
     // blocks the stream it is enqueued on until the driver's callback thread
     // wakes and returns, so hosting it on the compute stream stalled the GPU
@@ -1545,8 +1561,8 @@ struct StagedLane {
     DeviceHostChannelTicket* device_tickets = nullptr;
     std::uint32_t device_ticket_offset = 0;
     std::uint32_t device_ticket_count = 0;
-    std::unordered_set<std::uint32_t> prior_put_slots;
-    std::unordered_set<std::uint32_t> prior_take_slots;
+    SlotSet prior_put_slots;
+    SlotSet prior_take_slots;
     // The Prologue's statically-known put effects, computed at begin_host
     // for FramePrepare-time consumers (descriptor resolution, the stage_*
     // composition tables): they historically ran post-begin — after the
@@ -1554,7 +1570,7 @@ struct StagedLane {
     // the frame split they run before the Prologue is enqueued. The live
     // sets above still fill at execution time only (the Prologue's own
     // stage-metadata build must NOT see its own effects).
-    std::unordered_set<std::uint32_t> prologue_put_slots;
+    SlotSet prologue_put_slots;
     std::uint32_t row_offset = 0;
     std::uint32_t sampled_rows = 0;
     std::uint32_t token_start = 0;
@@ -1570,6 +1586,7 @@ struct StagedLane {
     std::vector<std::uint64_t> presampled_token_rows;
     const std::uint8_t* row_valid = nullptr;
     std::uint32_t row_valid_offset = 0;
+
 };
 
 struct StagedLaunch::State {
@@ -1577,7 +1594,7 @@ struct StagedLaunch::State {
     pie::driver::fire::LaunchView view{};
     cudaStream_t stream = nullptr;
     std::vector<std::unique_ptr<StagedLane>> lanes;
-    std::vector<std::uint64_t> touched_instances;
+
     std::vector<DeviceHostChannelTicket> ticket_staging;
     std::vector<PullValidateHostChannelLane> pull_staging;
     // Host-writer ring pulls staged for this launch (bool cells unpack on
@@ -2503,36 +2520,12 @@ std::uint32_t stage_logits_vocab(
     return logical_vocab;
 }
 
-// Does this stage name a second-party kernel? Used to decide whether the fire's
-// KV geometry has to be resolved for the lane at all: resolving it is cheap but
-// it THROWS when unavailable, so it must only run for stages that need it.
-bool stage_calls_kernel(
-    const plan::StagePlan& stage,
-    std::string_view name) {
-    for (const auto& normalized : stage.ops) {
-        const auto& op = normalized.op;
-        if (op.tag != PTIR_OP_KERNEL_CALL) continue;
-        if (op.name_idx < stage.names.size() &&
-            stage.names[op.name_idx] == name) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool stage_calls_sink(
-    const plan::StagePlan& stage,
-    std::string_view name) {
-    for (const auto& normalized : stage.ops) {
-        const auto& op = normalized.op;
-        if (op.tag != PTIR_OP_SINK_CALL) continue;
-        if (op.name_idx < stage.names.size() &&
-            stage.names[op.name_idx] == name) {
-            return true;
-        }
-    }
-    return false;
-}
+// `stage_calls_kernel("envelope_dot")` and `stage_calls_sink("attn_page_mask")`
+// used to live here. Both answered "does this stage name X?" -- deciding
+// whether the fire's KV geometry has to be resolved for the lane at all, since
+// resolving it is cheap but THROWS when unavailable -- by walking every op and
+// comparing names as strings, once per lane per wave. `build_stage_lane_digest`
+// answers both in the single per-stage walk it already makes.
 
 bool stage_uses_intrinsic(
     const plan::StagePlan& stage,
@@ -2566,21 +2559,98 @@ std::vector<std::uint32_t> channel_alias_topology(
     return topology;
 }
 
-void record_stage_channel_effects(
-    StagedLane& lane,
-    const plan::StagePlan& stage) {
+// Everything `execute_declared_phase`'s per-lane loop used to re-derive from
+// the stage plan, derived ONCE. All five questions below are pure functions of
+// `stage` -- "does it read Query", "does it call envelope_dot", "does it write
+// the attn_page_mask sink", "which value ids are Query/AttnScore intrinsics",
+// "which ops move a channel" -- and a homogeneous decode wave asked all five of
+// them once per lane to get one answer 255 times over. That was five separate
+// walks of `stage.ops` per lane per wave (two of them comparing op names as
+// strings); this is one walk per distinct stage per phase call. Only the
+// numbers the answers are then used to look up are per-lane, and those stay in
+// the loop.
+struct StageLaneDigest {
+    struct IntrinsicValue {
+        std::uint32_t value = 0;
+        // Query and AttnScore are checked differently and report different
+        // errors, so the kind is carried rather than re-tested.
+        bool attn_score = false;
+    };
+    struct ChanEffect {
+        std::uint32_t local = 0;
+        bool take = false;
+    };
+    bool uses_query = false;
+    bool calls_envelope_dot = false;
+    bool writes_page_mask = false;
+    std::vector<IntrinsicValue> intrinsic_values;
+    std::vector<ChanEffect> chan_effects;
+};
+
+StageLaneDigest build_stage_lane_digest(const plan::StagePlan& stage) {
+    StageLaneDigest digest;
+    std::uint32_t value_base = 0;
     for (const auto& normalized : stage.ops) {
         const auto& op = normalized.op;
-        if (op.chan < 0 ||
-            (op.tag != PTIR_OP_CHAN_TAKE &&
-             op.tag != PTIR_OP_CHAN_PUT)) {
-            continue;
+        switch (op.tag) {
+            case PTIR_OP_INTRINSIC_VAL:
+                if (op.intr == PTIR_INTR_QUERY) {
+                    digest.uses_query = true;
+                    digest.intrinsic_values.push_back(
+                        StageLaneDigest::IntrinsicValue{
+                            .value = value_base,
+                            .attn_score = false,
+                        });
+                } else if (op.intr == PTIR_INTR_ATTN_SCORE) {
+                    digest.intrinsic_values.push_back(
+                        StageLaneDigest::IntrinsicValue{
+                            .value = value_base,
+                            .attn_score = true,
+                        });
+                }
+                break;
+            case PTIR_OP_KERNEL_CALL:
+                if (op.name_idx < stage.names.size() &&
+                    stage.names[op.name_idx] == "envelope_dot") {
+                    digest.calls_envelope_dot = true;
+                }
+                break;
+            case PTIR_OP_SINK_CALL:
+                if (op.name_idx < stage.names.size() &&
+                    stage.names[op.name_idx] == "attn_page_mask") {
+                    digest.writes_page_mask = true;
+                }
+                break;
+            case PTIR_OP_CHAN_TAKE:
+            case PTIR_OP_CHAN_PUT:
+                if (op.chan >= 0) {
+                    const std::uint32_t local =
+                        static_cast<std::uint32_t>(op.chan);
+                    if (local < stage.channel_bindings.size()) {
+                        digest.chan_effects.push_back(
+                            StageLaneDigest::ChanEffect{
+                                .local = local,
+                                .take = op.tag == PTIR_OP_CHAN_TAKE,
+                            });
+                    }
+                }
+                break;
+            default:
+                break;
         }
-        const std::uint32_t local = static_cast<std::uint32_t>(op.chan);
-        if (local >= stage.channel_bindings.size()) continue;
+        value_base += op.results;
+    }
+    return digest;
+}
+
+void record_stage_channel_effects(
+    StagedLane& lane,
+    const plan::StagePlan& stage,
+    const StageLaneDigest& digest) {
+    for (const auto& effect : digest.chan_effects) {
         const std::uint32_t slot = lane.bound->instance->view().slot(
-            stage.channel_bindings[local]);
-        if (op.tag == PTIR_OP_CHAN_TAKE) {
+            stage.channel_bindings[effect.local]);
+        if (effect.take) {
             lane.prior_take_slots.insert(slot);
         } else {
             lane.prior_put_slots.insert(slot);
@@ -4308,6 +4378,25 @@ void execute_declared_phase(
             }
         }
     } phase_temporaries{{}, stream};
+    // Memoised per-stage derivations, keyed on the plan's ADDRESS: a hit is
+    // the same object, not a same-looking one, so this reuses an answer rather
+    // than inferring one. Scoped to the call, so nothing here outlives the
+    // launch it describes and no lifetime or cross-thread question arises.
+    // `unique_ptr` because a `Task` holds the reference across the vector's
+    // growth. A homogeneous wave builds exactly one.
+    std::vector<std::pair<const plan::StagePlan*,
+                          std::unique_ptr<StageLaneDigest>>> digests;
+    auto digest_for =
+        [&digests](const plan::StagePlan& stage) -> const StageLaneDigest& {
+        for (const auto& entry : digests) {
+            if (entry.first == &stage) return *entry.second;
+        }
+        digests.emplace_back(
+            &stage,
+            std::make_unique<StageLaneDigest>(
+                build_stage_lane_digest(stage)));
+        return *digests.back().second;
+    };
     for (std::size_t occurrence = 0;
          occurrence < max_occurrences;
          ++occurrence) {
@@ -4319,6 +4408,7 @@ void execute_declared_phase(
             const plan::StagePlan* plan = nullptr;
             const generated::FusedStageExecutable* executable = nullptr;
             const GroupedStageStaticPlan* group_plan = nullptr;
+            const StageLaneDigest* digest = nullptr;
             GroupedLaneBinding binding;
             const std::vector<std::uint32_t>* topology = nullptr;
             bool complete = false;
@@ -4339,7 +4429,8 @@ void execute_declared_phase(
                 throw std::runtime_error(
                     "PTIR staged launch has no compiled fused stage");
             }
-            if (stage_uses_intrinsic(stage, PTIR_INTR_QUERY)) {
+            const StageLaneDigest& digest = digest_for(stage);
+            if (digest.uses_query) {
                 if (query_base == nullptr || query_columns == 0 ||
                     lane.token_count == kUnavailableGroupedExtent ||
                     lane.token_start > query_rows ||
@@ -4351,47 +4442,42 @@ void execute_declared_phase(
             GroupedLaneBinding binding = make_staged_binding(
                 lane, stage, logits_base, logits_stride,
                 query_base, query_columns, launch.device_layer);
-            if (stage_calls_kernel(stage, "envelope_dot")) {
+            if (digest.calls_envelope_dot) {
                 binding.envelope = resolve_lane_envelope(
                     lane, query_base, query_columns, layer);
             }
-            if (stage_calls_sink(stage, "attn_page_mask")) {
+            if (digest.writes_page_mask) {
                 binding.page_mask = resolve_lane_page_mask(lane, layer);
             }
             std::uint64_t attn_score_kv_max = 0;
-            std::uint32_t value_base = 0;
-            for (const auto& normalized : stage.ops) {
-                if (normalized.op.tag == PTIR_OP_INTRINSIC_VAL &&
-                    normalized.op.intr == PTIR_INTR_QUERY) {
-                    if (value_base >= stage.value_types.size() ||
+            for (const auto& intrinsic : digest.intrinsic_values) {
+                if (!intrinsic.attn_score) {
+                    if (intrinsic.value >= stage.value_types.size() ||
                         grouped_numel(
-                            stage.value_types[value_base], binding) >
+                            stage.value_types[intrinsic.value], binding) >
                             static_cast<std::uint64_t>(lane.token_count) *
                                 query_columns) {
                         throw std::runtime_error(
                             "Query intrinsic shape exceeds the current "
                             "program query tensor");
                     }
+                    continue;
                 }
-                if (normalized.op.tag == PTIR_OP_INTRINSIC_VAL &&
-                    normalized.op.intr == PTIR_INTR_ATTN_SCORE) {
-                    if (value_base >= stage.value_types.size()) {
-                        throw std::runtime_error(
-                            "AttnScore intrinsic has no declared value type");
-                    }
-                    const std::uint64_t declared = grouped_numel(
-                        stage.value_types[value_base], binding);
-                    // One occurrence per stage may declare several reads; they
-                    // must agree, since one buffer backs them all.
-                    if (attn_score_kv_max != 0 &&
-                        attn_score_kv_max != declared) {
-                        throw std::runtime_error(
-                            "AttnScore is read at two different widths in one "
-                            "stage");
-                    }
-                    attn_score_kv_max = declared;
+                if (intrinsic.value >= stage.value_types.size()) {
+                    throw std::runtime_error(
+                        "AttnScore intrinsic has no declared value type");
                 }
-                value_base += normalized.op.results;
+                const std::uint64_t declared = grouped_numel(
+                    stage.value_types[intrinsic.value], binding);
+                // One occurrence per stage may declare several reads; they
+                // must agree, since one buffer backs them all.
+                if (attn_score_kv_max != 0 &&
+                    attn_score_kv_max != declared) {
+                    throw std::runtime_error(
+                        "AttnScore is read at two different widths in one "
+                        "stage");
+                }
+                attn_score_kv_max = declared;
             }
             if (attn_score_kv_max != 0) {
                 binding.attn_score_base = resolve_lane_attn_score(
@@ -4406,6 +4492,7 @@ void execute_declared_phase(
                 .group_plan = launch.owner->grouped_plans.at(
                     lane.generated_program->stages[stage_index]->runtime_id)
                     .get(),
+                .digest = &digest,
                 .binding = binding,
                 .topology =
                     &lane.bound->stage_topologies.at(stage_index),
@@ -4454,9 +4541,25 @@ void execute_declared_phase(
                     *next.topology != *first.topology) {
                     continue;
                 }
-                reason.clear();
-                if (!accumulator.try_add(next.binding, &reason)) {
-                    if (reason.find("shared") != std::string::npos) {
+                bool shared_conflict = false;
+                const auto t_try = probing
+                    ? fire_timing::Clock::now()
+                    : fire_timing::Clock::time_point{};
+                const bool added = accumulator.try_add(
+                    next.binding, /*reason=*/nullptr, &shared_conflict);
+                if (probing) {
+                    const std::int64_t us = fire_timing::duration_us(
+                        t_try, fire_timing::Clock::now());
+                    auto bump = [](std::int64_t& t, std::int64_t v) {
+                        t = (t < 0 ? 0 : t) + v;
+                    };
+                    bump(added ? breakdown->group_try_add_ok
+                               : breakdown->group_try_add_fail, 1);
+                    bump(added ? breakdown->group_try_ok_us
+                               : breakdown->group_try_fail_us, us);
+                }
+                if (!added) {
+                    if (shared_conflict) {
                         std::lock_guard<std::mutex> lock(
                             launch.owner->stats_mutex);
                         ++launch.owner->stats.shared_slot_exclusions;
@@ -4483,6 +4586,10 @@ void execute_declared_phase(
         };
         auto execute_group = [&](ExecutionGroup& group,
                                  cudaStream_t target_stream) {
+            const auto t_around_begin = probing
+                ? fire_timing::Clock::now()
+                : fire_timing::Clock::time_point{};
+            std::int64_t inside_us = 0;
             Task& first = *group.first;
             std::string generated_reason;
             if (first.executable == nullptr ||
@@ -4512,11 +4619,16 @@ void execute_declared_phase(
                      result.t_upload_us);
                 bump(breakdown->epilogue_exec_launch_us,
                      result.t_launch_us);
+                inside_us = result.t_build_us + result.t_workspace_us +
+                    result.t_upload_us + result.t_launch_us;
             }
             if (result.device_tickets != nullptr) {
                 CUDA_CHECK(cudaFreeAsync(
                     result.device_tickets, target_stream));
             }
+            const auto t_effects_begin = probing
+                ? fire_timing::Clock::now()
+                : fire_timing::Clock::time_point{};
             const bool direct_bf16 = std::any_of(
                 group.bindings.begin(), group.bindings.end(),
                 [](const GroupedLaneBinding& binding) {
@@ -4548,7 +4660,18 @@ void execute_declared_phase(
             }
             for (Task* member : group.members) {
                 record_stage_channel_effects(
-                    *member->lane, *member->plan);
+                    *member->lane, *member->plan, *member->digest);
+            }
+            if (probing) {
+                const auto now = fire_timing::Clock::now();
+                const std::int64_t around =
+                    fire_timing::duration_us(t_around_begin, now) - inside_us;
+                std::int64_t& total = breakdown->epilogue_exec_around_us;
+                total = (total < 0 ? 0 : total) + std::max<std::int64_t>(
+                    around, 0);
+                std::int64_t& effects = breakdown->epilogue_exec_effects_us;
+                effects = (effects < 0 ? 0 : effects) +
+                    fire_timing::duration_us(t_effects_begin, now);
             }
         };
 
@@ -4560,23 +4683,60 @@ void execute_declared_phase(
         // Measured on a 512-way decode wave, the census walked ~300 lanes'
         // slot sets through two `unordered_set`s to re-derive a constant.
         bool independent = groups.size() > 1;
+        const auto t_census_begin = probing
+            ? fire_timing::Clock::now()
+            : fire_timing::Clock::time_point{};
         if (independent) {
-            std::unordered_set<std::uint32_t> prior_group_slots;
-            for (const auto& group : groups) {
-                std::unordered_set<std::uint32_t> group_slots;
-                for (const auto& binding : group.bindings) {
-                    group_slots.insert(
-                        binding.instance->view().slots().begin(),
-                        binding.instance->view().slots().end());
-                }
-                for (const std::uint32_t slot : group_slots) {
-                    if (prior_group_slots.contains(slot)) {
-                        independent = false;
+            // Slot-indexed ownership stamp instead of two `unordered_set`s per
+            // group. Same question — does any slot appear in two different
+            // groups — and the same answer, but each slot is one array write
+            // rather than a hash insert into a per-group set and a lookup in
+            // the accumulated one. Measured at 299 us of a two-group wave's
+            // 409 us `epilogue_group`, and 0 us at one group, since the census
+            // does not run there at all.
+            //
+            // The stamp is a monotone generation, so nothing is cleared
+            // between censuses; the buffers are `thread_local` because this
+            // runs on the driver lane and must not allocate per wave. And it
+            // stops at the first shared slot: the old loop kept walking every
+            // remaining group after the verdict was already decided.
+            struct SlotOwnership {
+                std::vector<std::uint64_t> stamp;
+                std::vector<std::size_t> owner;
+                std::uint64_t generation = 0;
+            };
+            thread_local SlotOwnership ownership;
+            ++ownership.generation;
+            for (std::size_t index = 0;
+                 index < groups.size() && independent;
+                 ++index) {
+                for (const auto& binding : groups[index].bindings) {
+                    const auto slots = binding.instance->view().slots();
+                    for (const std::uint32_t slot : slots) {
+                        if (slot >= ownership.stamp.size()) {
+                            ownership.stamp.resize(
+                                static_cast<std::size_t>(slot) + 1, 0);
+                            ownership.owner.resize(
+                                static_cast<std::size_t>(slot) + 1, 0);
+                        }
+                        if (ownership.stamp[slot] == ownership.generation) {
+                            if (ownership.owner[slot] != index) {
+                                independent = false;
+                                break;
+                            }
+                            continue;
+                        }
+                        ownership.stamp[slot] = ownership.generation;
+                        ownership.owner[slot] = index;
                     }
+                    if (!independent) break;
                 }
-                prior_group_slots.insert(
-                    group_slots.begin(), group_slots.end());
             }
+        }
+        if (probing) {
+            auto& total = breakdown->group_census_us;
+            total = (total < 0 ? 0 : total) + fire_timing::duration_us(
+                t_census_begin, fire_timing::Clock::now());
         }
         const auto t_execute_begin = probing
             ? fire_timing::Clock::now()
@@ -4708,6 +4868,14 @@ std::unique_ptr<StagedLaunch> Dispatch::begin_host(
     }
     std::vector<std::unique_ptr<StagedLane>> pending_lanes(count);
     std::vector<std::uint32_t> pending_initial_commit(count, 0);
+    // Which channel LOCALS the Prologue puts is a property of the program, not
+    // of the lane -- but the loop below used to re-walk every Prologue stage's
+    // ops for each of the wave's 256 lanes to rediscover the same handful.
+    // Same shape as §29's epilogue digest, same fix: derive once per program
+    // hash, memoised alongside the three cache lookups already memoised here.
+    // Only the slot lookup is genuinely per-lane (lanes hold distinct
+    // instances), so that is all that stays inside.
+    std::vector<std::uint32_t> memo_prologue_put_locals;
     // A wave overwhelmingly repeats one program (the bench: 256 lanes,
     // one hash) — memoize the three per-hash cache lookups instead of
     // paying 3·C hash-map probes (W6 pass-A hoist).
@@ -4742,6 +4910,19 @@ std::unique_ptr<StagedLaunch> Dispatch::begin_host(
             memo_identities = impl_->cache.graph_stage_identities(memo_hash);
             memo_generated = impl_->fused_modules.program(memo_hash);
             memo_valid = true;
+            memo_prologue_put_locals.clear();
+            for (const plan::StagePlan* stage :
+                 bound.phase_plans[PTIR_STAGE_PROLOGUE]) {
+                for (const auto& normalized : stage->ops) {
+                    const auto& op = normalized.op;
+                    if (op.chan < 0 || op.tag != PTIR_OP_CHAN_PUT) continue;
+                    const std::uint32_t local =
+                        static_cast<std::uint32_t>(op.chan);
+                    if (local >= stage->channel_bindings.size()) continue;
+                    memo_prologue_put_locals.push_back(
+                        stage->channel_bindings[local]);
+                }
+            }
         }
         lane->plans = memo_plans;
         lane->plan_identities = memo_identities;
@@ -4756,19 +4937,11 @@ std::unique_ptr<StagedLaunch> Dispatch::begin_host(
         lane->phase_plans = &bound.phase_plans;
         // Prologue put effects for FramePrepare-time consumers (see the
         // field's comment) — the LIVE effect sets stay empty until the
-        // phases execute.
-        for (const plan::StagePlan* stage :
-             (*lane->phase_plans)[PTIR_STAGE_PROLOGUE]) {
-            for (const auto& normalized : stage->ops) {
-                const auto& op = normalized.op;
-                if (op.chan < 0 || op.tag != PTIR_OP_CHAN_PUT) continue;
-                const std::uint32_t local =
-                    static_cast<std::uint32_t>(op.chan);
-                if (local >= stage->channel_bindings.size()) continue;
-                lane->prologue_put_slots.insert(
-                    bound.instance->view().slot(
-                        stage->channel_bindings[local]));
-            }
+        // phases execute. The dense-channel list is the memo above; only the
+        // instance's slot for each is per-lane.
+        for (const std::uint32_t dense : memo_prologue_put_locals) {
+            lane->prologue_put_slots.insert(
+                bound.instance->view().slot(dense));
         }
         pending_initial_commit[program] =
             instance_occurrence == 0 ? 1u : 0u;
@@ -4779,6 +4952,30 @@ std::unique_ptr<StagedLaunch> Dispatch::begin_host(
         launch->begin_breakdown_.pass_a_us =
             fire_timing::duration_us(begin_mark, now);
         begin_mark = now;
+        std::int64_t carried = 0;
+        auto& previous = impl_->previous_membership;
+        for (std::size_t program = 0; program < count; ++program) {
+            const std::uint64_t instance_id =
+                view.ptir_program_instances.data()[program];
+            const std::uint64_t program_hash =
+                view.ptir_program_hashes.data()[program];
+            if (program < previous.size() &&
+                previous[program].first == instance_id &&
+                previous[program].second == program_hash) {
+                ++carried;
+            }
+        }
+        launch->begin_breakdown_.membership_carried = carried;
+        launch->begin_breakdown_.membership_identical =
+            (previous.size() == count &&
+             carried == static_cast<std::int64_t>(count)) ? 1 : 0;
+        previous.resize(count);
+        for (std::size_t program = 0; program < count; ++program) {
+            previous[program] = {
+                view.ptir_program_instances.data()[program],
+                view.ptir_program_hashes.data()[program],
+            };
+        }
     }
     // Pass B (parallel, W6): the per-lane ticket builds are pure functions
     // of the view and bind-time-immutable registry arrays — the single
@@ -4853,8 +5050,6 @@ std::unique_ptr<StagedLaunch> Dispatch::begin_host(
             .initial_commit = initial_commit,
             .diagnose = kDiagnosePullValidate,
         });
-        state.touched_instances.push_back(
-            view.ptir_program_instances.data()[program]);
         state.lanes.push_back(std::move(lane));
     }
     if (begin_timing) {
@@ -4886,15 +5081,35 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
         apply_lane_sequence_tickets(
             view, lane->program, *lane->bound, impl_->channels);
     }
+    auto seam = [&](std::int64_t& field) {
+        if (!begin_timing) return;
+        const auto now = fire_timing::Clock::now();
+        field = fire_timing::duration_us(begin_mark, now);
+        begin_mark = now;
+    };
+    seam(launch.begin_breakdown_.pull_seq_us);
     // Order this wave after any pending bind-time initialization work (ring
     // metadata, seed uploads, baked-list uploads) still riding the registry's
     // initialization stream — binds no longer host-sync it (RV-28: fires must
     // never observe a slot whose ring metadata or seeds are still in flight).
-    impl_->channels.order_after_initialization(stream);
+    impl_->channels.publish_initialization();
+    seam(launch.begin_breakdown_.init_flush_us);
+    CUDA_CHECK(cudaStreamWaitEvent(
+        stream, impl_->channels.initialization_done(), 0));
+    seam(launch.begin_breakdown_.init_wait_us);
+    launch.begin_breakdown_.pull_alloc_order_us =
+        launch.begin_breakdown_.init_flush_us +
+        launch.begin_breakdown_.init_wait_us;
+    if (begin_timing) {
+        const auto probe = impl_->channels.take_init_flush_probe();
+        launch.begin_breakdown_.init_flush_slots = probe.slots;
+        launch.begin_breakdown_.init_flush_calls = probe.flushes;
+    }
     CUDA_CHECK(cudaMallocAsync(
         reinterpret_cast<void**>(&state.device_layer),
         sizeof(std::uint32_t),
         stream));
+    seam(launch.begin_breakdown_.pull_alloc_malloc_us);
     // ONE publication-ordering wait for the whole wave (see
     // `Impl::publications_done`): the previous wave's publications all rode
     // the callback stream, so this single wait replaces the per-instance
@@ -4913,7 +5128,27 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
                 stream, lane->bound->publish_done, 0));
         }
     }
+    seam(launch.begin_breakdown_.pull_alloc_events_us);
     state.param_slot = impl_->pipeline_params.claim();
+    seam(launch.begin_breakdown_.pull_alloc_claim_us);
+    launch.begin_breakdown_.pull_alloc_us =
+        launch.begin_breakdown_.pull_alloc_order_us +
+        launch.begin_breakdown_.pull_alloc_malloc_us +
+        launch.begin_breakdown_.pull_alloc_events_us +
+        launch.begin_breakdown_.pull_alloc_claim_us;
+    // Diagnostic only: did the pull-validate staging fit the arena, or did
+    // this wave fall to the legacy per-launch upload path?
+    bool staged_probe = true;
+    std::uint64_t pool_reserved_before = 0;
+    if (begin_timing) {
+        cudaMemPool_t pool = nullptr;
+        int device = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
+            cudaMemPoolGetAttribute(
+                pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved_before);
+        }
+    }
     {
         auto& arena = impl_->pipeline_params;
         DeviceHostChannelTicket* device_tickets = nullptr;
@@ -4937,6 +5172,8 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
             staged = device_lanes != nullptr &&
                 (state.ticket_staging.empty() || device_tickets != nullptr);
         }
+        staged_probe = staged;
+        seam(launch.begin_breakdown_.pull_stage_us);
         if (staged) {
             arena.flush(state.param_slot, stream);
             if (!state.pull_staging.empty()) {
@@ -4955,14 +5192,37 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
                 state.pull_staging,
                 stream);
             state.tickets_in_arena = false;
+            staged_probe = false;
         }
     }
     for (const auto& lane : state.lanes) {
         if (lane->snapshot != nullptr) lane->snapshot->ever_validated = true;
     }
     if (begin_timing) {
-        launch.begin_breakdown_.pull_validate_us = fire_timing::duration_us(
-            begin_mark, fire_timing::Clock::now());
+        seam(launch.begin_breakdown_.pull_flush_us);
+        launch.begin_breakdown_.pull_validate_us =
+            launch.begin_breakdown_.pull_seq_us +
+            launch.begin_breakdown_.pull_alloc_us +
+            launch.begin_breakdown_.pull_stage_us +
+            launch.begin_breakdown_.pull_flush_us;
+        launch.begin_breakdown_.pull_staged = staged_probe ? 1 : 0;
+        launch.begin_breakdown_.pull_lanes =
+            static_cast<std::int64_t>(state.lanes.size());
+        launch.begin_breakdown_.pull_tickets =
+            static_cast<std::int64_t>(state.ticket_staging.size());
+        launch.begin_breakdown_.pull_descriptors =
+            static_cast<std::int64_t>(state.pull_staging.size());
+        std::uint64_t pool_reserved_after = pool_reserved_before;
+        cudaMemPool_t pool = nullptr;
+        int device = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
+            cudaMemPoolGetAttribute(
+                pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved_after);
+        }
+        launch.begin_breakdown_.pool_growth_bytes =
+            static_cast<std::int64_t>(pool_reserved_after) -
+            static_cast<std::int64_t>(pool_reserved_before);
     }
     if (state.device_tickets != nullptr) {
         for (auto& lane : state.lanes) {
@@ -5532,42 +5792,43 @@ bool Dispatch::finish(
             notify->copy_done,
             0));
     }
-    std::sort(
-        state.touched_instances.begin(),
-        state.touched_instances.end());
-    state.touched_instances.erase(
-        std::unique(
-            state.touched_instances.begin(),
-            state.touched_instances.end()),
-        state.touched_instances.end());
     if (state.device_layer != nullptr) {
         CUDA_CHECK(cudaFreeAsync(state.device_layer, stream));
         state.device_layer = nullptr;
     }
-    notify->callback_fences.reserve(
-        state.touched_instances.size());
-    for (std::uint64_t instance_id : state.touched_instances) {
-        auto found = impl_->instances.find(instance_id);
-        if (found != impl_->instances.end()) {
-            // The instance's bind-time seed event is consumed: from here
-            // its publication ordering rides the shared per-wave event
-            // below. (Retire to the pool; close handles a null event.)
-            if (found->second.publish_done != nullptr) {
-                if (impl_->available_publish_events.size() <
-                    Impl::kMaxRetainedInstanceResources) {
-                    impl_->available_publish_events.push_back(
-                        found->second.publish_done);
-                } else {
-                    CUDA_CHECK(cudaEventDestroy(
-                        found->second.publish_done));
-                }
-                found->second.publish_done = nullptr;
-            }
-            notify->callback_fences.push_back(
-                found->second.callback_fence);
-            found->second.callback_fence->pending.fetch_add(
-                1, std::memory_order_acq_rel);
+    // The wave's distinct instances, taken from the lanes that already point
+    // at them. This used to sort a parallel `touched_instances` id vector,
+    // `unique` it, and look every surviving id back up in
+    // `impl_->instances` — a hash probe per lane, 256 of them a wave, to
+    // recover the `BoundInstance` the lane is holding a pointer to.
+    // `state.lanes` and `touched_instances` are filled in lockstep by the
+    // same loop in `begin_host`, so they describe the same set; the
+    // generation stamp does the deduplication in one pass instead of a sort.
+    ++impl_->settle_generation;
+    notify->callback_fences.reserve(state.lanes.size());
+    for (const auto& lane : state.lanes) {
+        BoundInstance* bound = lane->bound;
+        if (bound == nullptr ||
+            bound->settle_generation == impl_->settle_generation) {
+            continue;
         }
+        bound->settle_generation = impl_->settle_generation;
+        // The instance's bind-time seed event is consumed: from here
+        // its publication ordering rides the shared per-wave event
+        // below. (Retire to the pool; close handles a null event.)
+        if (bound->publish_done != nullptr) {
+            if (impl_->available_publish_events.size() <
+                Impl::kMaxRetainedInstanceResources) {
+                impl_->available_publish_events.push_back(
+                    bound->publish_done);
+            } else {
+                CUDA_CHECK(cudaEventDestroy(bound->publish_done));
+            }
+            bound->publish_done = nullptr;
+        }
+        notify->callback_fences.push_back(bound->callback_fence);
+        bound->callback_fence->pending.fetch_add(
+            1, std::memory_order_acq_rel);
     }
     // ONE publication-ordering record for the whole wave (replaces the
     // per-instance records): callback_stream has already been joined with
@@ -7054,7 +7315,7 @@ bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
         if (host_class && !mask_only && !fold_len_only) {
             continue;
         }
-        const std::unordered_set<std::uint32_t>* pending_slots =
+        const SlotSet* pending_slots =
             staged == nullptr
                 ? nullptr
                 : &staged->lanes[p]->prologue_put_slots;
@@ -7226,7 +7487,7 @@ bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
             continue;
         }
 
-        const std::unordered_set<std::uint32_t>* pending_slots = nullptr;
+        const SlotSet* pending_slots = nullptr;
         if (staged != nullptr) {
             const StagedLane& lane = *staged->lanes[p];
             if (lane.snapshot->ever_validated && ready[p] == 0) {

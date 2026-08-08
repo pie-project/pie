@@ -56,7 +56,7 @@ using PortCellCache =
 // the cell is not full — nothing will fill it on a solo device-geometry fire.
 inline bool read_port_cell(ChannelView& view, ChannelId dense,
                            std::vector<std::uint8_t>& out, std::string* err,
-                           const std::unordered_set<std::uint32_t>*
+                           const SlotSet*
                                pending_slots = nullptr,
                            const PortCellCache* cached_cells = nullptr) {
     const std::uint32_t slot = view.slot(dense);
@@ -108,7 +108,7 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                                   std::uint32_t page_size, FireGeometry& out,
                                   std::string* err,
                                   bool allow_structured_masks = false,
-                                  const std::unordered_set<std::uint32_t>*
+                                  const SlotSet*
                                       pending_slots = nullptr,
                                   const detail::PortCellCache*
                                       cached_cells = nullptr) {
@@ -427,7 +427,7 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
 inline bool resolve_rs_fold_len(
     const Trace& trace, ChannelView& view, FireGeometry& out,
     std::string* err,
-    const std::unordered_set<std::uint32_t>* pending_slots = nullptr,
+    const SlotSet* pending_slots = nullptr,
     const detail::PortCellCache* cached_cells = nullptr) {
     for (const PortBinding& candidate : trace.ports) {
         if (candidate.port != kPortRsFoldLen) continue;
@@ -452,7 +452,7 @@ inline bool resolve_rs_fold_len(
 inline bool resolve_attention_mask(
     const Trace& trace, ChannelView& view, FireGeometry& out,
     std::string* err, bool allow_structured_masks,
-    const std::unordered_set<std::uint32_t>* pending_slots = nullptr,
+    const SlotSet* pending_slots = nullptr,
     const detail::PortCellCache* cached_cells = nullptr) {
     const PortBinding* binding = nullptr;
     for (const PortBinding& candidate : trace.ports) {
