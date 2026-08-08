@@ -467,24 +467,47 @@ int main(int argc, char** argv) {
     // peak footprint, with zero swaps, because `copy_storage_bytes` hands each
     // tile back to the kernel before it takes the next. Gating the discredited
     // number here is how it survived being wrong.
+    //
+    // With a slab budget this probe inverts for the same reason the device one
+    // does, and leaving it uninverted is how the paged path went unmeasured.
+    // A budget means the routed bank is never wired -- 10.17 GB of gpt-oss
+    // reaches the GPU through 0.42 GB of slots -- so a host holding the whole
+    // checkpoint is not the squeeze this asserts, and the refusal it demanded
+    // could not come. The bench exited here, BEFORE the continuation gates,
+    // which is why "the model can exceed the machine" was a claim about
+    // admission alone: nothing downstream of setup had ever run under a budget.
+    // So the host term is halved and the expectation flipped, which asks the
+    // stronger question -- not whether paging survives a full machine, but
+    // whether it still loads one that has room for only half the weights.
     {
-        const std::size_t left = std::size_t(weight_bytes);
+        const std::size_t left = std::size_t(paging ? weight_bytes / 2 : weight_bytes);
         RawMetalContext::set_host_reclaimable_bytes_for_test(left);
         MetalExecutor probe;
         std::string why;
         const bool set_up = probe.setup(cfg, &why);
         RawMetalContext::set_host_reclaimable_bytes_for_test(0);
-        if (set_up) {
-            std::printf("  FAIL  setup succeeded on a machine with only %.2f GiB left, "
-                        "against %.2f GiB of weights it has to wire\n",
+        if (paging) {
+            if (!set_up) {
+                std::printf("  FAIL  paging refused a host that should hold it: %s\n",
+                            why.c_str());
+                return 1;
+            }
+            std::printf("  PASS  paged the experts onto a machine with %.2f GiB left,"
+                        " against %.2f GiB of weights\n",
                         double(left) / (1 << 30), double(weight_bytes) / (1 << 30));
-            return 1;
+        } else {
+            if (set_up) {
+                std::printf("  FAIL  setup succeeded on a machine with only %.2f GiB left, "
+                            "against %.2f GiB of weights it has to wire\n",
+                            double(left) / (1 << 30), double(weight_bytes) / (1 << 30));
+                return 1;
+            }
+            if (why.find("does not fit the memory this machine has left") == std::string::npos) {
+                std::printf("  FAIL  refused, but not for the host: %s\n", why.c_str());
+                return 1;
+            }
+            std::printf("  PASS  refused a model the machine could not hold: %s\n", why.c_str());
         }
-        if (why.find("does not fit the memory this machine has left") == std::string::npos) {
-            std::printf("  FAIL  refused, but not for the host: %s\n", why.c_str());
-            return 1;
-        }
-        std::printf("  PASS  refused a model the machine could not hold: %s\n", why.c_str());
     }
 
     MetalExecutor exec;

@@ -2897,6 +2897,27 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // shape" before it ever reached `setup_simple`, which builds its own
     // geometry from its own facts.
     if (family == model::ModelFamily::Qwen35) {
+        // The slab refusal `setup_simple` makes has to be repeated here,
+        // because this family does not go through it. `expert_slab_bytes` is
+        // read where the simple engine is built, and this path builds its own
+        // engine from its own facts -- so a budget set on a Qwen3.5 mixture was
+        // not rejected, it was UNREAD. The ask stayed the whole 18.16 GiB bank
+        // and the fit check refused with "this model does not fit this GPU",
+        // which is true and tells the operator nothing: the budget they set to
+        // make it fit had never been looked at. Same rule as the other site --
+        // one refusal, before any number is computed, so the message is the
+        // reason.
+        //
+        // Mapped streaming is a different field and stays supported here; it is
+        // passed to `impl->setup` below.
+        if (cfg.expert_slab_bytes > 0) {
+            if (err != nullptr) {
+                *err = "qwen3.5: expert_slab_bytes is not supported by this family -- its "
+                       "routed FFN is built by a separate engine that keeps the whole bank "
+                       "resident. Use stream_routed_experts to map the bank instead.";
+            }
+            return false;
+        }
         std::string gerr;
         if (cfg.quant_bits != 0) geom.quant.bits = cfg.quant_bits;
         if (cfg.quant_group_size != 0) geom.quant.group = cfg.quant_group_size;
