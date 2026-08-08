@@ -1541,6 +1541,12 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                                /*rs_verify=*/false,
                                have_custom_mask,
                                /*fused_argmax=*/false,
+                               // The follower records the compact R-row
+                               // gather exactly when the leader's broadcast
+                               // carries one (`fwd_in.logit_row_indices_d` is
+                               // set from the same `logit_rows` below), so the
+                               // key has to say which capture this is.
+                               /*compact_logits=*/logit_rows > 0,
                                graph_layout);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
