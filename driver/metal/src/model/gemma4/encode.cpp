@@ -737,6 +737,19 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
 /// name a single gemma4 dispatch. Prefixed `g4_` for the same reason the shared
 /// table prefixes its gemma4 entries: `attn_norm` means something in three
 /// families and they are different dispatches.
+///
+/// First result off this table, and it retires an unmeasured claim. The note
+/// closing the gemma-4-31b decode question said ablation found "nothing else
+/// in the fire" and named `affine_qmv_tail` -- a PSO host name, which this
+/// knob does not match, so that run reported the baseline and skipped nothing.
+/// Priced for real: 16.5 tok/s no-readback, `g4_qmv_up` ablated 20.6, **24.8%**
+/// in one kernel. (`g4_qmv_down`, `g4_qmv_gate`, `g4_qmv_o` and `g4_lm_head`
+/// still abort -- an ablated fire samples a token outside the page table.)
+///
+/// 24.8% is not waste, it is the read. This checkpoint keeps 67% of its 16.08
+/// GiB in FFN and the up projection alone is 3.58 GiB, so it owns 22% of the
+/// bytes a token moves and a memory-bound decode charges it 25% of the time.
+/// The old conclusion was right; it just had no measurement under it.
 const char* gemma4_kind_name(Kind k) {
     switch (k) {
         case Kind::EmbedGather:          return "g4_embed_gather";
