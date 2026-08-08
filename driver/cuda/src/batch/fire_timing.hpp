@@ -17,9 +17,43 @@ namespace pie_cuda_driver::fire_timing {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr bool full() { return false; }
+// `PIE_FIRE_TIMING` -- the variable four comments across this driver already
+// name as the way to get these records (`dispatch.cu`, `channel_registry.hpp`,
+// `frame.cpp`). Both of these were `constexpr false`, so the only way to read a
+// per-fire breakdown was to edit this header and rebuild, and the rebuilt
+// binary was then not the one whose numbers were being explained.
+//
+//   unset / 0        both off
+//   1 (or anything)  `enabled` -- the per-wave driver records
+//   waves | full     also `full` -- the per-fire host-stage breakdown
+//
+// Every call site hoists these once per fire (six in total, none per-token or
+// per-lane), so the runtime read costs a cached load on a path that already
+// does device work in the microseconds.
+namespace detail {
+inline const char* fire_timing_env() {
+    static const char* const value = std::getenv("PIE_FIRE_TIMING");
+    return value;
+}
+inline bool fire_timing_set() {
+    static const bool value = [] {
+        const char* const env = fire_timing_env();
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
+}
+}  // namespace detail
 
-constexpr bool enabled() { return false; }
+inline bool enabled() { return detail::fire_timing_set(); }
+
+inline bool full() {
+    static const bool value = [] {
+        if (!detail::fire_timing_set()) return false;
+        const std::string mode = detail::fire_timing_env();
+        return mode == "waves" || mode == "full";
+    }();
+    return value;
+}
 
 inline std::uint64_t duration_us(
     Clock::time_point start,

@@ -161,6 +161,46 @@ bool graph_key_check_enabled() {
     return value;
 }
 
+// `PIE_PREFILL_GRAPH_PLAN` -- graph-mode planning for the real prefill/mixed
+// batch, which is what makes a prefill-carrying wave capturable at all.
+//
+// **Default OFF, and the default is the measurement.** `PIE_PREFILL_GRAPH`
+// gates three separate things: this plan mode, the request/token padding in
+// `frame.cpp`, and the enlarged float workspace in `batch/workspace.cu`. Until
+// this knob existed they could only be moved together, which is how
+// `8775dda9` came to be credited with "prefill graph replay" -- a mechanism
+// that, measured by `PIE_GRAPH_STATS`, had never run: `prefill: hits=0
+// misses=0 ineligible=175`.
+//
+// Armed, the mechanism works (`prefill: hits=115 misses=62`, 4096/4096, zero
+// key-check violations) and it LOSES. Holding the workspace and the padding
+// fixed and toggling only this, on the S cell, 4 rounds ABBA:
+//
+//     plan on   31317  30720  31396  31695   mean 31282
+//     plan off  32140  32585  32246  32753   mean 32431   -3.54%, 4/4
+//
+// Prefill capture buys a ~1.3 ms eager enqueue back on a wave that replays,
+// but graph-mode planning always splits KV and carves float partials sized by
+// the PADDED work-item count, and on this cell that costs more than the
+// enqueue it saves. Off by default until a cell is found where it wins;
+// everything downstream of it stays built, tested and reachable behind
+// `PIE_PREFILL_GRAPH_PLAN=1`.
+bool prefill_graph_plan_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_PREFILL_GRAPH_PLAN");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
+}
+
+bool graph_stats_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_GRAPH_STATS");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
+}
+
 bool prefill_graph_enabled() {
     static const bool value = [] {
         const char* const env = std::getenv("PIE_PREFILL_GRAPH");
@@ -676,28 +716,67 @@ bool forward_graph_replay_eligible(
     // the previous fire's residue.
     const bool logit_rows_keyed =
         num_logit_rows == 0 || num_logit_rows == forward_R;
+    const bool planner_capturable =
+        engine.forward_fn.invoke_prefill_graph_capturable();
     const bool geometry_replayable =
         is_pure_decode ||
         (prefill_graph_enabled() &&
          logit_rows_keyed &&
-         engine.forward_fn.invoke_prefill_graph_capturable());
-    return engine.graph_cache != nullptr &&
-        engine.forward_fn.graph_safe &&
-        geometry_replayable &&
-        mask_pointers_stable &&
-        !rs_buffer_write &&
-        !rs_buffer_fold &&
-        structured_window_left == -2 &&
+         planner_capturable);
+
+    // Named terms, then a first-failure scan, so `PIE_GRAPH_STATS` can say
+    // WHICH clause refused a wave. A bare bool told us only that 175 of 175
+    // prefill-carrying waves were ineligible on the S cell, which is the same
+    // report whether the planner refused, the row list could not be padded, or
+    // the flag was simply off -- three findings with nothing in common.
+    // Order is the reporting order; a wave is attributed to its first
+    // failing clause.
+    const struct { const char* name; bool ok; } clauses[] = {
+        {"cache_absent",      engine.graph_cache != nullptr},
+        {"forward_not_safe",  engine.forward_fn.graph_safe},
+        {"flag_off",          is_pure_decode || prefill_graph_enabled()},
+        {"logit_rows",        is_pure_decode || logit_rows_keyed},
+        {"planner_refused",   is_pure_decode || planner_capturable},
+        {"mask_pointers",     mask_pointers_stable},
+        {"rs_buffer_write",   !rs_buffer_write},
+        {"rs_buffer_fold",    !rs_buffer_fold},
+        {"structured_window", structured_window_left == -2},
         // Pure-decode captures record the explicit w_page/w_off KV-write
         // path, so a decode fire without write descriptors must stay eager.
-        has_write_desc &&
-        graph_replay_has_no_host_resets(
-            use_slots,
-            is_fresh_h_data,
-            static_cast<std::size_t>(std::max(forward_R, 0))) &&
-        num_images == 0 &&
-        num_clips == 0 &&
-        !has_stage_hooks;
+        {"no_write_desc",     has_write_desc},
+        {"host_resets",       graph_replay_has_no_host_resets(
+                                  use_slots, is_fresh_h_data,
+                                  static_cast<std::size_t>(
+                                      std::max(forward_R, 0)))},
+        {"images",            num_images == 0},
+        {"clips",             num_clips == 0},
+        {"stage_hooks",       !has_stage_hooks},
+    };
+    for (const auto& clause : clauses) {
+        if (!clause.ok) {
+            if (engine.graph_cache != nullptr) {
+                engine.graph_cache->note_refusal(is_pure_decode, clause.name);
+            }
+            // The `logit_rows` clause is the one `frame.cpp` is supposed to
+            // satisfy by padding, so a refusal here means the padding did not
+            // fire. Print the pair it disagreed on, bounded, rather than
+            // leaving the count to be explained by reading the padding
+            // conditions and guessing which one was false.
+            if (!is_pure_decode && clause.name[0] == 'l' &&
+                graph_stats_enabled()) {
+                static std::atomic<int> shown{0};
+                if (shown.fetch_add(1) < 10) {
+                    std::fprintf(stderr,
+                                 "[graph-stats]   logit_rows refusal: "
+                                 "num_logit_rows=%d forward_R=%d\n",
+                                 num_logit_rows, forward_R);
+                }
+            }
+            return false;
+        }
+    }
+    static_cast<void>(geometry_replayable);
+    return true;
 }
 
 void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) {
@@ -759,7 +838,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                              it->second, in.num_logit_rows);
             }
         }
-        cudaGraphExec_t exec = engine.graph_cache->get(key);
+        cudaGraphExec_t exec =
+            engine.graph_cache->get(key, in.is_pure_decode);
         if (exec == nullptr) {
             if (step_profile_enabled()) {
                 std::fprintf(stderr,

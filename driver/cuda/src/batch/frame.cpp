@@ -1797,13 +1797,26 @@ void prepare_step(
     //
     // Only worth doing when the wave was padded at all; an unpadded wave has
     // nothing to gain and the dispatch gate will refuse it either way.
+    //
+    // Pad to the POST-pad request count, computed here from its two parts.
+    // `s.forward_R` is documented "final (post-pad)" but does not receive that
+    // value until the pad-lane block far below; at this point it still holds
+    // the pre-pad `s.fR_real` it was seeded with. Padding to it left
+    // `num_logit_rows == fR_real` while the dispatch gate compares against
+    // `fR_real + graph_pad_requests`, so the invariant failed by exactly the
+    // pad width and EVERY prefill-carrying wave was refused the graph --
+    // measured on the S cell as `refused by logit_rows 176`, prefill hits 0,
+    // with the printed pairs (234,240) (248,256) (256,272) each differing by
+    // their own `graph_pad_requests`.
+    const int padded_R = s.fR_real + s.graph_pad_requests;
+    const int padded_N = s.fN_real + s.graph_pad_tokens;
     s.num_logit_rows = num_sampling;
     if (s.compact_logits && s.graph_pad_requests > 0 &&
         !s.rpg.device_composed &&
-        static_cast<int>(s.sample_rows.size()) < s.forward_R &&
-        s.forward_R < s.fN_real + s.graph_pad_tokens) {
-        s.sample_rows.resize(static_cast<std::size_t>(s.forward_R), 0);
-        s.num_logit_rows = s.forward_R;
+        static_cast<int>(s.sample_rows.size()) < padded_R &&
+        padded_R < padded_N) {
+        s.sample_rows.resize(static_cast<std::size_t>(padded_R), 0);
+        s.num_logit_rows = padded_R;
     }
     if (s.sample_rows.size() > pi.sample_idx.size()) {
         throw std::runtime_error(
@@ -2173,7 +2186,18 @@ struct EnqProfile {
     // read as a 2.5ms steady cost when its steady value is ~2us.
     std::uint64_t steps = 0;
     static constexpr std::uint64_t warmup() { return 32ull; }
-    static constexpr bool enabled() { return false; }
+    // Read at runtime, matching the `PIE_STEP_PROFILE=1` the comment above
+    // has always advertised: this was `constexpr false`, so the only way to
+    // get the breakdown was to edit and rebuild, and the enclosing
+    // `h2d_prepare_us` span is the largest host phase left on the S cell.
+    // Same cached-static form as `DeviceIntervalProbe::enabled()` below.
+    static bool enabled() {
+        static const bool value = [] {
+            const char* const env = std::getenv("PIE_STEP_PROFILE");
+            return env != nullptr && *env != '\0' && env[0] != '0';
+        }();
+        return value;
+    }
     static EnqProfile& instance() { static EnqProfile p; return p; }
     ~EnqProfile() {
         if (!enabled()) return;
@@ -2634,8 +2658,15 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             });
         engine.attn_ws.end_plan_update(cublas.stream());
         plan_timer.stop();
-        forward_timer.emplace(EnqProfile::kForward);
     }
+    // Outside the plan branch, so the two phases stay exclusive on EVERY step.
+    // Started inside it, a step that took the `skip_plan` fast path (a third of
+    // S's steps -- exactly the graph-replay ones this is meant to price) left
+    // `compose_timer` running across its forward enqueue and never opened
+    // `kForward`: the cheap steps were charged to compose and the mean over
+    // `kForward` described only the expensive ones.
+    compose_timer.stop();
+    forward_timer.emplace(EnqProfile::kForward);
     if (dbg_fire) s.timing.h2d_end = fire_timing::Clock::now();
 
     // ── Forward pass ────────────────────────────────────────────────

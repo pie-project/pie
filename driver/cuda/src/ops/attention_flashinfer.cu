@@ -8,6 +8,10 @@
 //===----------------------------------------------------------------------===//
 #include "ops/attention_flashinfer_common.cuh"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 namespace pie_cuda_driver::ops {
 
 void DecodePlanCacheDeleter::operator()(DecodePlanCache* p) const noexcept {
@@ -383,6 +387,28 @@ void plan_attention_flashinfer_prefill_bf16(
             2 * 16;  // two 16-byte-aligned allocations
         if (carve_bytes > workspace.float_bytes()) {
             enable_cuda_graph = false;
+            // `PIE_GRAPH_STATS=1`: this demotion is invisible from above --
+            // the wave simply reports itself uncapturable and the refusal is
+            // attributed to the planner. Print the two numbers that decided
+            // it, bounded, so the workspace grant can be compared against the
+            // carve it is supposed to cover instead of re-derived by hand.
+            if (const char* const env = std::getenv("PIE_GRAPH_STATS");
+                env != nullptr && *env != '\0' && env[0] != '0') {
+                static std::atomic<int> shown{0};
+                if (shown.fetch_add(1) < 8) {
+                    std::fprintf(
+                        stderr,
+                        "[graph-stats]   plan demoted: carve=%.1f MiB > "
+                        "float_ws=%.1f MiB (N=%d R=%d tile_q=%llu "
+                        "padded_batch=%llu)\n",
+                        static_cast<double>(carve_bytes) / (1024.0 * 1024.0),
+                        static_cast<double>(workspace.float_bytes()) /
+                            (1024.0 * 1024.0),
+                        total_tokens, num_requests,
+                        static_cast<unsigned long long>(cta_tile_q),
+                        static_cast<unsigned long long>(padded_batch));
+                }
+            }
         }
     } else {
         enable_cuda_graph = enable_cuda_graph && !disable_split_kv;

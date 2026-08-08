@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include "batch/forward_graph.hpp"
 #include "kernels/custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "kernels/add_bias.hpp"
@@ -198,7 +199,26 @@ void prepare_llama_like_decode_plan(
                 cache.page_size(),
                 attn_ws,
                 /*stream=*/nullptr,
-                /*graph_mode_plan=*/false,
+                // Graph-mode planning for the REAL prefill/mixed batch. This
+                // was a hardcoded `false` while every other plan site here
+                // passed `decode_plan_cuda_graph`, and it is what
+                // `PrefillPlanCache::graph_capturable` is computed from --
+                // so `prefill_graph_capturable()` returned false for every
+                // wave, and the whole `PIE_PREFILL_GRAPH` path above it
+                // (eligibility, the (R,N) lattice, the padded logit rows, the
+                // compact-emit variant bit, the enlarged float workspace) was
+                // unreachable. Measured on the S cell before this line
+                // changed: `prefill: hits=0 misses=0`, 176 of 176
+                // prefill-carrying waves `refused by planner_refused`.
+                //
+                // Safe to arm rather than assume: graph-mode planning always
+                // splits KV and carves float partials sized by the PADDED
+                // work-item count, and `plan_attention_flashinfer_prefill`
+                // already demotes itself back to a content-shaped plan when
+                // that carve would exceed the workspace grant. The grant is
+                // sized for exactly this in `batch/workspace.cu`, under the
+                // same flag.
+                prefill_graph_plan_enabled() && fwd_cfg.decode_plan_cuda_graph,
                 fwd_cfg.sliding_window,
                 /*full_attention_variant=*/false,
                 cache.hnd_layout(),

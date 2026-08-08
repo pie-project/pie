@@ -8,6 +8,9 @@
 // Defined in `batch/forward.cpp`.
 namespace pie_cuda_driver {
 bool prefill_graph_enabled();
+// Graph-mode PLANNING half of the same lever; see `PIE_PREFILL_GRAPH_PLAN` in
+// `batch/forward.cpp`. Follows `prefill_graph_enabled()` unless overridden.
+bool prefill_graph_plan_enabled();
 }  // namespace pie_cuda_driver
 
 // CUDA-graph cache for the decode forward body.
@@ -41,8 +44,10 @@ bool prefill_graph_enabled();
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -180,22 +185,80 @@ public:
         std::uint64_t misses = 0;
         std::uint64_t captures = 0;
         std::uint64_t evictions = 0;
+        // Split by path. An aggregate hit rate is dominated by pure decode
+        // (4/5 of steps here) and stays ~95% whether or not a single
+        // prefill-carrying wave ever reaches the cache -- which is the
+        // question `PIE_PREFILL_GRAPH` exists to answer. `ineligible` counts
+        // waves that never looked up, so eligibility and cache behaviour are
+        // not read off one number.
+        std::uint64_t prefill_hits = 0;
+        std::uint64_t prefill_misses = 0;
+        std::uint64_t prefill_ineligible = 0;
+        std::uint64_t decode_ineligible = 0;
     };
+
+    // Counts a wave that never reached `get` because the gate refused it,
+    // against the clause that refused. `reason` must be a string literal --
+    // the tally keys on the pointer, not the contents.
+    void note_refusal(bool is_pure_decode, const char* reason) const noexcept {
+        if (is_pure_decode) ++metrics_.decode_ineligible;
+        else ++metrics_.prefill_ineligible;
+        for (auto& [name, count] : refusals_) {
+            if (name == reason) { ++count; return; }
+        }
+        if (refusals_.size() < kMaxRefusalReasons) {
+            refusals_.emplace_back(reason, 1);
+        }
+    }
     ForwardGraphCache() = default;
     ~ForwardGraphCache() noexcept {
+        // `PIE_GRAPH_STATS=1`. These counters existed but had no reader
+        // outside a unit test, so "is the prefill path actually replaying"
+        // was not answerable from a run -- the question the whole lattice
+        // above exists to serve. Reported at teardown, off the hot path.
+        if (const char* const env = std::getenv("PIE_GRAPH_STATS");
+            env != nullptr && *env != '\0' && env[0] != '0') {
+            const std::uint64_t lookups = metrics_.hits + metrics_.misses;
+            std::fprintf(
+                stderr,
+                "[graph-stats] lookups=%llu hits=%llu (%.1f%%) misses=%llu "
+                "captures=%llu evictions=%llu resident=%zu/%zu | "
+                "prefill: hits=%llu misses=%llu ineligible=%llu | "
+                "decode: ineligible=%llu\n",
+                static_cast<unsigned long long>(lookups),
+                static_cast<unsigned long long>(metrics_.hits),
+                lookups == 0 ? 0.0
+                             : 100.0 * static_cast<double>(metrics_.hits) /
+                                   static_cast<double>(lookups),
+                static_cast<unsigned long long>(metrics_.misses),
+                static_cast<unsigned long long>(metrics_.captures),
+                static_cast<unsigned long long>(metrics_.evictions),
+                execs_.size(), kMaxEntries,
+                static_cast<unsigned long long>(metrics_.prefill_hits),
+                static_cast<unsigned long long>(metrics_.prefill_misses),
+                static_cast<unsigned long long>(metrics_.prefill_ineligible),
+                static_cast<unsigned long long>(metrics_.decode_ineligible));
+            for (const auto& [name, count] : refusals_) {
+                std::fprintf(stderr, "[graph-stats]   refused by %-18s %llu\n",
+                             name, static_cast<unsigned long long>(count));
+            }
+        }
         for (auto& [_, exec] : execs_) cudaGraphExecDestroy(exec);
     }
     ForwardGraphCache(const ForwardGraphCache&) = delete;
     ForwardGraphCache& operator=(const ForwardGraphCache&) = delete;
 
     // Returns a captured graph for `key`, or nullptr if none cached.
-    cudaGraphExec_t get(const ForwardGraphKey& key) const noexcept {
+    cudaGraphExec_t get(const ForwardGraphKey& key,
+                        bool is_pure_decode = true) const noexcept {
         auto it = execs_.find(key);
         if (it == execs_.end()) {
             ++metrics_.misses;
+            if (!is_pure_decode) ++metrics_.prefill_misses;
             return nullptr;
         }
         ++metrics_.hits;
+        if (!is_pure_decode) ++metrics_.prefill_hits;
         return it->second;
     }
 
@@ -223,9 +286,11 @@ public:
 
 private:
     static constexpr std::size_t kMaxEntries = 128;
+    static constexpr std::size_t kMaxRefusalReasons = 24;
     std::unordered_map<ForwardGraphKey, cudaGraphExec_t,
                        ForwardGraphKeyHash> execs_;
     mutable Metrics metrics_;
+    mutable std::vector<std::pair<const char*, std::uint64_t>> refusals_;
 };
 
 }  // namespace pie_cuda_driver
