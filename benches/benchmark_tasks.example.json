@@ -1,0 +1,24 @@
+[
+  {
+    "id": "json-write-settings",
+    "category": "file_workflow",
+    "tools": ["filesystem"],
+    "goal": "Create settings.json as a JSON object with mode=\"fast\" and retries=2. Use write_file, then FINAL done.",
+    "oracle": [
+      {"action": "write_file", "args": {"path": "settings.json", "content": "{\"mode\": \"fast\", \"retries\": 2}"}},
+      {"final": "done"}
+    ],
+    "grader": {"type": "file_json_equals", "path": "settings.json", "required": {"mode": "fast", "retries": 2}}
+  },
+  {
+    "id": "json-web-fact",
+    "category": "web_research",
+    "tools": ["web_search"],
+    "goal": "Use web_search to find what the Bradley-Terry model estimates from pairwise outcomes, then FINAL that single word (lowercase).",
+    "oracle": [
+      {"action": "web_search", "args": {"query": "bradley terry model pairwise"}},
+      {"final": "strength"}
+    ],
+    "grader": {"type": "answer_equals", "expected": "strength", "normalize": "lower_alpha"}
+  }
+]
