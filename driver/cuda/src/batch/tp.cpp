@@ -1533,7 +1533,13 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             R,
             /*num_images=*/0,
             /*num_clips=*/0,
-            /*has_stage_hooks=*/false);
+            /*has_stage_hooks=*/false,
+            // Rank 0 sends `logit_rows = compact_logits ? num_sampling : 0`
+            // (frame.cpp), so this is exactly its `compact_logits` and the two
+            // ranks refuse replay on the same fires. They must agree: a rank
+            // that replays while its peer captures deadlocks the NCCL ops
+            // inside the body, which is the whole reason this mirror exists.
+            /*compact_logits=*/logit_rows > 0);
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =

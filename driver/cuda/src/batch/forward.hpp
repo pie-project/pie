@@ -647,7 +647,8 @@ bool forward_graph_replay_eligible(
     int forward_R,
     int num_images,
     int num_clips,
-    bool has_stage_hooks);
+    bool has_stage_hooks,
+    bool compact_logits);
 
 // Run the per-fire forward body directly against `forward_fn.body`. See
 // `ForwardDispatchInputs` for why this is not a graph-replay dispatcher.

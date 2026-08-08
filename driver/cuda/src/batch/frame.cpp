@@ -1580,8 +1580,17 @@ void prepare_step(
         // of extra rows, exactly as it would have unpadded. Under-padding is
         // what costs -- it is what leaves the shape off-lattice and forces the
         // one-off capture.
+        // A compact-logit wave can never replay (see the `compact_logits`
+        // clause in `forward_graph_replay_eligible`), so padding one buys
+        // nothing and costs its pad rows real compute on the eager path.
+        // `s.compact_logits` is not decided until later, but its shape term
+        // is known here; `mtp_plan` is not, so this is the conservative half
+        // -- it declines to pad whenever the wave MIGHT come out compact.
+        const bool maybe_compact_logits =
+            num_sampling > 0 && num_sampling < s.fN_real;
         const bool prefill_pad_ok =
-            prefill_graph_enabled() && !s.have_custom_mask;
+            prefill_graph_enabled() && !s.have_custom_mask &&
+            !maybe_compact_logits;
         const bool eligible = forward_graph_replay_eligible(
             engine,
             is_pure_decode || prefill_pad_ok,
@@ -1595,7 +1604,8 @@ void prepare_step(
             s.fR_real,
             s.img_num_images,
             s.aud_num_clips,
-            s.has_attention_stages);
+            s.has_attention_stages,
+            maybe_compact_logits);
         if (eligible && engine.graph_pad_page >= 0) {
             const int max_requests = std::min(
                 engine.max_forward_requests, engine.max_workspace_tokens);

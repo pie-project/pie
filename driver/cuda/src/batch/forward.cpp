@@ -639,7 +639,8 @@ bool forward_graph_replay_eligible(
     int forward_R,
     int num_images,
     int num_clips,
-    bool has_stage_hooks) {
+    bool has_stage_hooks,
+    bool compact_logits) {
     const bool mask_pointers_stable =
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
@@ -652,9 +653,22 @@ bool forward_graph_replay_eligible(
     // Without the second clause one arriving request costs every decode lane in
     // the wave its replay: measured 7,290 us of host enqueue on a prefill-
     // carrying wave against 10 us on a pure-decode wave of the SAME width.
+    // `num_logit_rows` is BAKED INTO the captured body (it sizes the lm_head
+    // rows and the logits gather) but is NOT part of `ForwardGraphKey`, whose
+    // axes are the (R, N) buckets. A compact-logit wave therefore cannot share
+    // a graph safely: two waves landing in the same bucket pair with different
+    // `num_sampling` would replay a body that gathers the wrong number of rows,
+    // and the surplus requests would sample an earlier fire's residue -- wrong
+    // tokens, silently. Pure decode is unaffected: `compact_logits` requires
+    // `!is_pure_decode`, so decode always captures with `num_logit_rows == 0`.
+    //
+    // Excluding them rather than widening the key is deliberate: `num_sampling`
+    // is the real (unpadded) request count, so keying on it would add an axis
+    // that varies per fire and would multiply the cache's working set.
     const bool geometry_replayable =
         is_pure_decode ||
         (prefill_graph_enabled() &&
+         !compact_logits &&
          engine.forward_fn.invoke_prefill_graph_capturable());
     return engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
@@ -696,7 +710,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.forward_R,
         in.num_images,
         in.num_clips,
-        in.stage_hooks != nullptr);
+        in.stage_hooks != nullptr,
+        in.compact_logits);
     if (graph_eligible) {
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
