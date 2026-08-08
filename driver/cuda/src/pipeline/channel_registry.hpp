@@ -70,16 +70,37 @@ static __global__ void pack_bool_channel_cell(
     destination[byte] = packed;
 }
 
-static __global__ void mark_seeded_channel_cells(
-    std::uint32_t first_slot,
+// Ring-metadata initialization for an arbitrary SET of slots, scattered from
+// one staged upload. Replaces a per-contiguous-run sequence of four
+// memcpy/memset calls plus `mark_seeded_channel_cells`: the pending set is
+// fragmented in practice (measured: 280 slots forming 112 runs, mean run
+// length 2.5), so the run loop issued ~560 CUDA calls at 10.4 us per run,
+// which is the whole of the wave-boundary cliff §29 traced here. The work
+// itself is identical, and it is now three calls whatever the fragmentation.
+//
+// `staged` is three packed uint32 arrays of `slot_count` each: the slot ids,
+// their `cap1` values, and their `tail` values -- host-side data that the run
+// loop used to read out of `d_cap1_`/`d_tail_` via device-to-device indexing.
+static __global__ void initialize_channel_slots(
+    const std::uint32_t* staged,
     std::uint32_t slot_count,
-    const std::uint32_t* tails,
+    std::uint32_t* cap1,
+    std::uint32_t* head,
+    std::uint32_t* tail,
     std::uint8_t* full) {
-    const std::uint32_t offset = blockIdx.x * blockDim.x + threadIdx.x;
-    if (offset >= slot_count) return;
-    const std::uint32_t slot = first_slot + offset;
-    full[static_cast<std::size_t>(slot) * kMaxRing] =
-        tails[slot] == 0 ? 0 : 1;
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= slot_count) return;
+    const std::uint32_t slot = staged[index];
+    const std::uint32_t slot_cap1 = staged[slot_count + index];
+    const std::uint32_t slot_tail = staged[2u * slot_count + index];
+    cap1[slot] = slot_cap1;
+    head[slot] = 0;
+    tail[slot] = slot_tail;
+    // The run loop zeroed the whole `kMaxRing` full-bit region and then set
+    // cell 0 from the tail; same result, one pass.
+    std::uint8_t* bits = full + static_cast<std::size_t>(slot) * kMaxRing;
+    for (std::uint32_t cell = 0; cell < kMaxRing; ++cell) bits[cell] = 0;
+    bits[0] = slot_tail == 0 ? 0 : 1;
 }
 
 struct PreparedHostPublish {
@@ -174,8 +195,14 @@ class DeviceChannelRegistry {
             CUDA_CHECK(cudaEventCreateWithFlags(
                 &init_done_, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventRecord(init_done_, initialization_stream_));
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &init_staging_done_, cudaEventDisableTiming));
             grow(kInitialChannelSlots);
         } catch (...) {
+            if (init_staging_done_ != nullptr) {
+                cudaEventDestroy(init_staging_done_);
+                init_staging_done_ = nullptr;
+            }
             if (init_done_ != nullptr) {
                 cudaEventDestroy(init_done_);
                 init_done_ = nullptr;
@@ -204,6 +231,9 @@ class DeviceChannelRegistry {
     }
     ~DeviceChannelRegistry() {
         free_all();
+        if (init_staging_done_ != nullptr) {
+            static_cast<void>(cudaEventDestroy(init_staging_done_));
+        }
         if (init_done_ != nullptr) {
             static_cast<void>(cudaEventDestroy(init_done_));
         }
@@ -238,6 +268,28 @@ class DeviceChannelRegistry {
         publish_initialization();
         CUDA_CHECK(cudaStreamWaitEvent(stream, init_done_, 0));
     }
+
+    // Fire-timing only: how much of `order_after_initialization` was the
+    // pending-initialization FLUSH (bind-time enqueue work paid on the lane
+    // thread) rather than the stream-order edge it is named for, and over how
+    // many slots and contiguous runs. Read once per wave and reset.
+    struct InitFlushProbe {
+        std::int64_t slots = 0;
+        /// FLUSH CALLS, not contiguous slot runs. The range path counted runs
+        /// and the number was the fragmentation measure (2.17 slots a run);
+        /// the scatter path issues one upload and one kernel for the whole
+        /// pending set, so there is exactly one "run" per flush and comparing
+        /// it against the old figure would read as fragmentation collapsing
+        /// when only the counter changed meaning.
+        std::int64_t flushes = 0;
+    };
+    InitFlushProbe take_init_flush_probe() {
+        const InitFlushProbe probe = init_flush_probe_;
+        init_flush_probe_ = InitFlushProbe{};
+        return probe;
+    }
+    bool initialization_pending() const { return initialization_pending_; }
+    cudaEvent_t initialization_done() const { return init_done_; }
 
     // Slab-pooled device blocks for lane-thread consumers beyond the channel
     // cells (the tier-0 baked lists): a cold cohort's first-touch acquires
@@ -987,57 +1039,80 @@ class DeviceChannelRegistry {
 
     void flush_pending_initializations() {
         if (pending_initialization_slots_.empty()) return;
+        const std::size_t slot_count = pending_initialization_slots_.size();
+        init_flush_probe_.slots += static_cast<std::int64_t>(slot_count);
+        ++init_flush_probe_.flushes;
         // Full bits gate every cell read, so empty payload bytes need no
         // initialization. Batch only the shared ring metadata here.
-        std::sort(
-            pending_initialization_slots_.begin(),
-            pending_initialization_slots_.end());
-        auto first = pending_initialization_slots_.begin();
-        while (first != pending_initialization_slots_.end()) {
-            auto last = first + 1;
-            while (last != pending_initialization_slots_.end() &&
-                   *last == *(last - 1) + 1) {
-                ++last;
-            }
-            const std::uint32_t first_slot = *first;
-            const std::uint32_t slot_count =
-                static_cast<std::uint32_t>(last - first);
-            const std::size_t metadata_bytes =
-                static_cast<std::size_t>(slot_count) * sizeof(std::uint32_t);
-            CUDA_CHECK(cudaMemcpyAsync(
-                d_cap1_ + first_slot,
-                host_cap1_.data() + first_slot,
-                metadata_bytes,
-                cudaMemcpyHostToDevice,
-                initialization_stream_));
-            CUDA_CHECK(cudaMemsetAsync(
-                d_head_ + first_slot,
-                0,
-                metadata_bytes,
-                initialization_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(
-                d_tail_ + first_slot,
-                host_tail_.data() + first_slot,
-                metadata_bytes,
-                cudaMemcpyHostToDevice,
-                initialization_stream_));
-            CUDA_CHECK(cudaMemsetAsync(
-                d_full_ + static_cast<std::size_t>(first_slot) * kMaxRing,
-                0,
-                static_cast<std::size_t>(slot_count) * kMaxRing,
-                initialization_stream_));
-            constexpr std::uint32_t threads = 128;
-            mark_seeded_channel_cells<<<
-                (slot_count + threads - 1) / threads,
-                threads,
-                0,
-                initialization_stream_>>>(
-                    first_slot, slot_count, d_tail_, d_full_);
-            CUDA_CHECK(cudaGetLastError());
-            first = last;
+        // The host buffer is written NOW but read by a copy that is only
+        // stream-ordered, so a second flush could overwrite it under the
+        // first copy -- and growing either buffer would recycle one out from
+        // under it. One event makes both exact, and it is taken FIRST so the
+        // grow below is as safe as the write.
+        //
+        // KNOWN COUPLING, bounded rather than removed: this event was recorded
+        // on `initialization_stream_` after the PREVIOUS flush, so waiting on
+        // it also waits for anything queued on that stream ahead of it --
+        // including a large `upload_initialization_bytes` baked-list transfer
+        // from a bind. In steady state the prior few-KB copy retired long ago
+        // and this returns immediately; measured across a full 4096-request
+        // run the whole flush is 37 us median and 78 us max, so the tail is
+        // not being paid here in practice.
+        //
+        // The clean decoupling is to give the staging copy and the scatter
+        // kernel a stream of their own and have `initialization_stream_` wait
+        // on them, so the guard covers only this flush's few KB. It is NOT
+        // done here because it changes the initialization stream's FIFO
+        // ordering, which this file's contract leans on (`init_done_` must
+        // dominate every bind-time upload AND this metadata write), and that
+        // is not a semantics change to make against a hazard no measurement
+        // has yet produced.
+        if (init_staging_outstanding_) {
+            CUDA_CHECK(cudaEventSynchronize(init_staging_done_));
+            init_staging_outstanding_ = false;
         }
+        const std::size_t staged_bytes =
+            3 * slot_count * sizeof(std::uint32_t);
+        ensure_device_capacity(
+            init_staging_device_, init_staging_device_capacity_, staged_bytes);
+        ensure_host_capacity(
+            init_staging_host_, init_staging_host_capacity_, staged_bytes);
+        auto* staged = static_cast<std::uint32_t*>(init_staging_host_);
+        for (std::size_t index = 0; index < slot_count; ++index) {
+            const std::uint32_t slot = pending_initialization_slots_[index];
+            staged[index] = slot;
+            staged[slot_count + index] = host_cap1_[slot];
+            staged[2 * slot_count + index] = host_tail_[slot];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            init_staging_device_,
+            init_staging_host_,
+            staged_bytes,
+            cudaMemcpyHostToDevice,
+            initialization_stream_));
+        constexpr std::uint32_t threads = 128;
+        initialize_channel_slots<<<
+            (static_cast<std::uint32_t>(slot_count) + threads - 1) / threads,
+            threads,
+            0,
+            initialization_stream_>>>(
+                static_cast<const std::uint32_t*>(init_staging_device_),
+                static_cast<std::uint32_t>(slot_count),
+                d_cap1_, d_head_, d_tail_, d_full_);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(
+            init_staging_done_, initialization_stream_));
+        init_staging_outstanding_ = true;
         pending_initialization_slots_.clear();
     }
+
+    InitFlushProbe init_flush_probe_{};
+    void* init_staging_device_ = nullptr;
+    std::size_t init_staging_device_capacity_ = 0;
+    void* init_staging_host_ = nullptr;
+    std::size_t init_staging_host_capacity_ = 0;
+    cudaEvent_t init_staging_done_ = nullptr;
+    bool init_staging_outstanding_ = false;
 
     // Pool-backed growth: no CUDA allocation calls on the lane thread once the
     // pools warm up, and no free-under-in-flight-copy hazard — recycled blocks
@@ -1261,10 +1336,23 @@ class DeviceChannelRegistry {
     }
 
     void free_all() {
-        if (initialization_pending_) {
+        if (initialization_pending_ || init_staging_outstanding_) {
             static_cast<void>(
                 cudaStreamSynchronize(initialization_stream_));
             initialization_pending_ = false;
+            init_staging_outstanding_ = false;
+        }
+        if (init_staging_device_ != nullptr) {
+            device_blocks_.release(
+                init_staging_device_, init_staging_device_capacity_);
+            init_staging_device_ = nullptr;
+            init_staging_device_capacity_ = 0;
+        }
+        if (init_staging_host_ != nullptr) {
+            pinned_blocks_.release(
+                init_staging_host_, init_staging_host_capacity_);
+            init_staging_host_ = nullptr;
+            init_staging_host_capacity_ = 0;
         }
         // Per-slot storage lives in the slab pools; their dtors (which run
         // after this) return the slabs to CUDA in one pass.
