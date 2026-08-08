@@ -301,6 +301,12 @@ CudaMemoryPlan plan_cuda_memory(
     bool kimi_selected,
     bool glm5_selected,
     bool kimi_k3_selected,
+    // Only the family that overrides `IModel::prefill_graph_capturable` can
+    // replay a prefill-carrying wave, and only it should pay the enlarged
+    // graph-mode attention workspace. Passed rather than derived by excluding
+    // the specialised flags above: Mixtral, Gemma and Qwen3VL have no flag
+    // here, so "none of the above" would wrongly include them.
+    bool prefill_graph_capable,
     const pie_cuda_driver::KvCacheFormat& kv_format,
     const pie_cuda_driver::ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose)
@@ -626,7 +632,7 @@ CudaMemoryPlan plan_cuda_memory(
             }
             const std::size_t attn_float_bytes =
                 pie_cuda_driver::attention_float_workspace_bytes(
-                    hf, cfg, prop, N, R0);
+                    hf, cfg, prop, N, R0, prefill_graph_capable);
             arena += attn_float_bytes;     // AttentionWorkspace float section
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
             const std::size_t persistent_bytes =

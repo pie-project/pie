@@ -35,10 +35,18 @@ bool has_non_full_attention_layers(const HfConfig& hf);
 // — nothing pins them unless the operator passes max_forward_tokens /
 // max_forward_requests) the config fields are still 0, and only the
 // candidate being scored knows the geometry this buffer has to serve.
+// `prefill_graph_capable` is the planner's answer to "can this model ever
+// replay a prefill-carrying wave". Only the family that overrides
+// `IModel::prefill_graph_capturable` can, and only it should pay the enlarged
+// graph-mode reservation -- the term is linear in `max_tokens` (the cta_tile_q
+// factor cancels between `padded_batch` and `tmp_v`), so charging it to a model
+// that can never use it takes KV pages and perturbs candidate scoring for
+// nothing.
 std::size_t attention_float_workspace_bytes(const HfConfig& hf,
                                             const Config& cfg,
                                             const cudaDeviceProp& prop,
                                             int max_tokens,
-                                            int max_requests);
+                                            int max_requests,
+                                            bool prefill_graph_capable);
 
 }  // namespace pie_cuda_driver
