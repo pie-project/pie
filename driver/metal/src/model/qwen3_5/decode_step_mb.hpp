@@ -111,6 +111,17 @@ struct GdnScanSegment {
     int rows = 0;   // rows the scan covers (the rest stay per-token)
 };
 
+/// How many prompt rows the mixture runs at once, or 0 for one token at a time.
+///
+/// Exported because the routing's LAYOUT follows from it, and a caller that
+/// reads the router's decision has to agree. Grouped, one dispatch writes every
+/// token's ids into dag[0]'s binding packed `experts_per_token` apart; ungrouped,
+/// each token writes at its own scratch row. The router kernel advances
+/// `expert_ids` by `row * k` and never by the row pitch -- the pitch is for the
+/// logits it reads, not the ids it writes -- so guessing this wrong renumbers
+/// one row and silently leaves the rest.
+int prefill_routed_group(const DecodeGeometry& g, int n_tokens, int max_rows);
+
 void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::vector<Dispatch>>& dags,
                             int n_tokens,
@@ -124,7 +135,15 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             /// The same table in the checkpoint's alternate
                             /// affine format, or null when it has none. Only
                             /// `qmv_wide_strided` is read from it.
-                            const MultiBatchPsos* mb_alt_psos = nullptr);
+                            const MultiBatchPsos* mb_alt_psos = nullptr,
+                            /// A sub-range of the per-token DAG, for expert
+                            /// paging. This walk is dispatch-major -- it runs
+                            /// group `i` for every token before group `i+1` --
+                            /// so one index cuts every token's step at the same
+                            /// point, which is what makes a layer's routing
+                            /// decision complete for the whole fire at a cut.
+                            std::size_t begin = 0,
+                            std::size_t end = ~std::size_t(0));
 
 // Point the GDN pair's conv ping-pong at one of its two halves: `even` binds
 // `conv_state` in and `conv_state_out` out, false the reverse. The halves may
@@ -152,6 +171,7 @@ void ab_set_arm(bool b);
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
                            bool force_barriers = false,
-                           const DecodeGeometry* g = nullptr, int n_tokens = 0);
+                           const DecodeGeometry* g = nullptr, int n_tokens = 0,
+                           std::size_t begin = 0, std::size_t end = ~std::size_t(0));
 
 }  // namespace pie::metal

@@ -704,6 +704,14 @@ bool carries_cross_token_state(Kernel kind) {
 // dispatch i is ordered ahead of any token's dispatch i+1, which is every
 // dependency inside a token and every dependency through paged KV. The one
 // exception is the GDN state above, which is serialized token by token.
+int prefill_routed_group(const DecodeGeometry& g, int n_tokens, int max_rows) {
+    if (!g.is_moe() || n_tokens <= 1 || max_rows <= 0) return 0;
+    const std::size_t cap = scratch_slot_elems(g, max_rows);
+    const std::size_t need =
+        std::size_t(moe_sorted_rows(g, n_tokens)) * std::size_t(g.hidden);
+    return need <= cap ? n_tokens : 0;
+}
+
 void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::vector<Dispatch>>& dags,
                             int n_tokens,
@@ -714,7 +722,9 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const DecodeGeometry* geometry,
                             int max_rows,
                             const std::vector<GdnScanSegment>& gdn_scans,
-                            const MultiBatchPsos* mb_alt_psos) {
+                            const MultiBatchPsos* mb_alt_psos,
+                            std::size_t begin,
+                            std::size_t end) {
     const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
     if (n == 0 || dags.size() < n) return;
     const size_t length = dags[0].size();
@@ -722,8 +732,13 @@ void encode_prefill_dags_mb(StepEncoder& se,
     // same shape, that assumption is gone and so is the reorder.
     for (size_t t = 1; t < n; ++t) {
         if (dags[t].size() != length) {
+            // The sub-range goes through unchanged. It indexes a dispatch
+            // within one token's DAG either way, and if the shapes disagree a
+            // cut derived from `dags[0]` means nothing anywhere -- which is a
+            // paging refusal made at plan time, not a case to reinterpret here.
             for (size_t k = 0; k < n; ++k)
-                encode_decode_step_mb(se, dags[k], base_psos, mb_psos, force_barriers);
+                encode_decode_step_mb(se, dags[k], base_psos, mb_psos, force_barriers,
+                                      nullptr, 0, begin, end);
             return;
         }
     }
@@ -747,14 +762,9 @@ void encode_prefill_dags_mb(StepEncoder& se,
     // stack can be several times the rows that are real. A prompt whose stack
     // would not fit keeps the per-token walk rather than overrunning the
     // colour into the next value.
-    int routed_group = 0;
-    if (geometry != nullptr && geometry->is_moe() && n > 1 && max_rows > 0) {
-        const std::size_t cap = scratch_slot_elems(*geometry, max_rows);
-        const std::size_t need = std::size_t(moe_sorted_rows(*geometry, int(n))) *
-                                 std::size_t(geometry->hidden);
-        if (need <= cap) routed_group = int(n);
-    }
-    for (size_t i = 0; i < length; ++i) {
+    const int routed_group =
+        geometry != nullptr ? prefill_routed_group(*geometry, int(n), max_rows) : 0;
+    for (size_t i = begin; i < std::min(end, length); ++i) {
         const Dispatch& d0 = dags[0][i];
         // Priced by ablation rather than by the trace; see `kernel_ablated`.
         // Skipping the WHOLE kind here -- not one token's copy of it -- is what
@@ -1122,9 +1132,11 @@ void encode_prefill_dags_mb(StepEncoder& se,
 
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
-                           bool force_barriers, const DecodeGeometry* g, int n_tokens) {
+                           bool force_barriers, const DecodeGeometry* g, int n_tokens,
+                           std::size_t begin, std::size_t end) {
     const std::vector<int> run_ends = concurrent_run_ends(dag);
-    for (size_t i = 0; i < dag.size(); ++i) {
+    const std::size_t stop = std::min(end, dag.size());
+    for (size_t i = begin; i < stop; ++i) {
         const Dispatch& d = dag[i];
         // Priced by ablation, same as the prefill walk; see `kernel_ablated`.
         if (kernel_ablated(d.kind)) continue;

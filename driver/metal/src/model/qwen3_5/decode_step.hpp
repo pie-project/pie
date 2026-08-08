@@ -177,10 +177,18 @@ struct StepTimingHook {
 // concurrency. If the non-determinism vanishes with force_barriers=true, the cause is a
 // ‖-pair concurrency/barrier issue; if it persists, the race is elsewhere (in-kernel/state).
 // `timing` (optional): when non-null, emit per-boundary timestamp marks for attribution.
+// `begin`/`end` walk a SUB-RANGE of the DAG, which is what expert paging needs: a bank
+// bigger than the working set has to be read through slots the host refills between
+// dispatches, so a step becomes one command buffer per mixture layer instead of one for
+// the step. The default is the whole DAG, so a caller that does not page is unchanged.
+// Barrier decisions still consult the WHOLE dag -- a concurrency run is a property of the
+// step, not of the segment -- and cuts are placed at run ends, so no run is ever split.
 void encode_decode_step(StepEncoder& se,
                         const std::vector<Dispatch>& dag,
                         const DecodeStepPsos& psos,
                         bool force_barriers = false,
-                        const StepTimingHook* timing = nullptr);
+                        const StepTimingHook* timing = nullptr,
+                        std::size_t begin = 0,
+                        std::size_t end = ~std::size_t(0));
 
 }  // namespace pie::metal
