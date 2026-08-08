@@ -1381,13 +1381,17 @@ inline constexpr short get_bytes_per_pack() {
 
 // ── quantized.h dequantize ──
 //
-// Priced before optimising it, because a 4-bit GEMM at 53% of this GPU's fp32
-// peak invites the theory that unpacking is eating the other half. It is not.
-// One Ws tile is BN*BK elements at three ops each -- an AND, a multiply and an
-// add, with the nibble shift folded into `scale / 16` rather than issued --
-// against BM*BN*BK*2 flops of MMA over the same tile. That is 3 / (2 * BM),
-// or 2.3% at BM = 64. Deleting dequantization outright buys 2.3%; the missing
-// half of the peak is in the MMA, not in front of it.
+// Priced before optimising it, because a 4-bit GEMM that looked like 53% of
+// this GPU's peak invited the theory that unpacking was eating the other half.
+// It is not, and the 53% was also the wrong fraction -- a pure fp16 GEMM with
+// no quantization measures 6.32 TFLOP/s at this model's shape (M=128, K=N=5120)
+// and 7.27 at its best, so 5.6 is 89% of what the hardware gives anyone, not
+// 53% of an fp32 ALU peak no GEMM reaches. See finding 15 in the bench wiki.
+//
+// Unpacking itself: one Ws tile is BN*BK elements at three ops each -- an AND,
+// a multiply and an add, with the nibble shift folded into `scale / 16` rather
+// than issued -- against BM*BN*BK*2 flops of MMA over the same tile. That is
+// 3 / (2 * BM), or 2.3% at BM = 64. Deleting dequantization outright buys 2.3%.
 template <typename U, int N, int bits, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
