@@ -580,6 +580,21 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
                 interval.tick().await;
+                // Last target actually APPLIED per driver, as (kv, state,
+                // workspace). A resize is not a cheap message: the CUDA driver
+                // refuses one unless the compute and swap streams are already
+                // drained (`context.cpp` resize_pool, "the quiescence gate
+                // above IS the horizon-empty condition"), and the scheduler
+                // manufactures that drain by holding every launch until the
+                // op settles. So each resize costs a full device idle window
+                // -- measured at 51-75 ms apiece, three per tick.
+                //
+                // The trim targets the committed HIGH WATER, which is
+                // monotonic non-decreasing. Once a server reaches its working
+                // size every later tick therefore asks for the same target it
+                // already applied, and pays three drains to change nothing.
+                // Repeating a target is the steady state, not the exception.
+                let mut applied: Vec<[Option<u64>; 3]> = vec![[None; 3]; driver_ids.len()];
                 loop {
                     interval.tick().await;
                     for (ordinal, driver_id) in driver_ids.iter().copied().enumerate() {
@@ -601,6 +616,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                             page_index: u64::from(target),
                             page_count: u64::from(capacity - target),
                         }];
+                        if applied[ordinal][0] == Some(u64::from(target)) {
+                            // Same target as last time: the pages above it are
+                            // already unmapped. Skipping costs nothing and
+                            // saves the drain.
+                            continue;
+                        }
                         if let Ok(completion) = crate::scheduler::resize_pool(
                             driver_id,
                             pie_driver_abi::PIE_ELASTIC_POOL_KV,
@@ -611,6 +632,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                         .await
                         {
                             if completion.await.is_ok() {
+                                applied[ordinal][0] = Some(u64::from(target));
                                 let rs_high_water =
                                     stores.rs.lock().unwrap().committed_high_water_slots();
                                 let page_bytes =
@@ -621,28 +643,35 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                                         u64::from(rs_high_water).saturating_mul(slot_bytes);
                                     let state_pages =
                                         state_bytes.saturating_add(page_bytes - 1) / page_bytes;
-                                    if let Ok(state) = crate::scheduler::resize_pool(
+                                    if applied[ordinal][1] != Some(state_pages)
+                                        && let Ok(state) = crate::scheduler::resize_pool(
+                                            driver_id,
+                                            pie_driver_abi::PIE_ELASTIC_POOL_STATE,
+                                            state_pages,
+                                            Vec::new(),
+                                            Vec::new(),
+                                        )
+                                        .await
+                                        && state.await.is_ok()
+                                    {
+                                        applied[ordinal][1] = Some(state_pages);
+                                    }
+                                }
+                                // The workspace target is the constant 0, so
+                                // after the first successful trim this one is a
+                                // no-op every single tick.
+                                if applied[ordinal][2] != Some(0)
+                                    && let Ok(workspace) = crate::scheduler::resize_pool(
                                         driver_id,
-                                        pie_driver_abi::PIE_ELASTIC_POOL_STATE,
-                                        state_pages,
+                                        pie_driver_abi::PIE_ELASTIC_POOL_WORKSPACE,
+                                        0,
                                         Vec::new(),
                                         Vec::new(),
                                     )
                                     .await
-                                    {
-                                        let _ = state.await;
-                                    }
-                                }
-                                if let Ok(workspace) = crate::scheduler::resize_pool(
-                                    driver_id,
-                                    pie_driver_abi::PIE_ELASTIC_POOL_WORKSPACE,
-                                    0,
-                                    Vec::new(),
-                                    Vec::new(),
-                                )
-                                .await
+                                    && workspace.await.is_ok()
                                 {
-                                    let _ = workspace.await;
+                                    applied[ordinal][2] = Some(0);
                                 }
                             }
                         }
