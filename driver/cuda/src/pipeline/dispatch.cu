@@ -4654,6 +4654,18 @@ void execute_declared_phase(
         // trivially not "independent" (there is nothing to overlap with).
         // Measured on a 512-way decode wave, the census walked ~300 lanes'
         // slot sets through two `unordered_set`s to re-derive a constant.
+        //
+        // The `groups.size() > 1` seed is why a PREFILL-carrying wave pays for
+        // this and a decode wave does not: decode folds to one group and exits
+        // here, mixed waves produce two and walk the whole census. Measured on
+        // the S cell, same walk length either way (229 vs 236 lanes), 1.83 vs
+        // 0.35 us per lane -- a 5.2x asymmetry that is entirely this block.
+        //
+        // Bounded before touching: the census is ~81% of prefill grouping
+        // cost, which is 92 ms of an 8.4 s wall, so removing it OUTRIGHT is
+        // worth under 1%. Not restructured for that -- only the free part is
+        // taken. Once a shared slot is found the answer cannot change back,
+        // so stop; the sets are read for nothing afterwards.
         bool independent = groups.size() > 1;
         if (independent) {
             std::unordered_set<std::uint32_t> prior_group_slots;
@@ -4667,8 +4679,10 @@ void execute_declared_phase(
                 for (const std::uint32_t slot : group_slots) {
                     if (prior_group_slots.contains(slot)) {
                         independent = false;
+                        break;
                     }
                 }
+                if (!independent) break;
                 prior_group_slots.insert(
                     group_slots.begin(), group_slots.end());
             }
