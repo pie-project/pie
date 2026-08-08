@@ -577,6 +577,25 @@ macro_rules! define_run_one {
                 }
             }
 
+            // Leaving the wait-set is an END-OF-STREAM statement, not a
+            // teardown step: from the moment this lane will not submit again,
+            // every other lane in the fleet is holding its frame seal for a
+            // guest that has nothing left to contribute. The engine cannot
+            // infer this -- an empty queue looks identical between a guest
+            // that is finished and one that is mid-decode -- so the guest,
+            // which does know, has to say it. Closing here rather than after
+            // the drain is what makes that statement on time; the remaining
+            // takes below are unaffected (close never waits for an unsettled
+            // fire). `closed` is not redundant with the engine's `first_close`
+            // latch -- that latch only suppresses the wait-set notify, while
+            // each `close()` still crosses into the host and drains settled
+            // entries -- so the trailing call stays correct but is worth
+            // skipping.
+            let mut closed = false;
+            if submitted >= budget {
+                pipe.close();
+                closed = true;
+            }
             let mut taken = 0usize;
             while taken < submitted {
                 let t = out.take_host::<Vec<i32>>().await?;
@@ -589,6 +608,10 @@ macro_rules! define_run_one {
                 }
                 if stop_tokens.contains(&(t0 as u32)) {
                     stopped = true;
+                    if !closed {
+                        pipe.close();
+                        closed = true;
+                    }
                     continue;
                 }
                 emitted += 1;
@@ -611,8 +634,14 @@ macro_rules! define_run_one {
                 // Refill the window after draining an accepted token. A stopped lane
                 // `continue`s above and never reaches here, so it never submits more.
                 submitted = submit_ahead(submitted, taken)?;
+                if !closed && submitted >= budget {
+                    pipe.close();
+                    closed = true;
+                }
             }
-            pipe.close();
+            if !closed {
+                pipe.close();
+            }
 
             Ok(RunResult {
                 num_prompt_tokens,
