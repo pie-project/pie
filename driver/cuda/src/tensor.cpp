@@ -2,6 +2,10 @@
 
 #include <cuda_runtime.h>
 #include <iostream>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstdio>
 #include <limits>
 
 #include "cuda_check.hpp"
@@ -59,6 +63,34 @@ void* ScopedDeviceAllocationCounter::allocate(
     return reinterpret_cast<void*>(std::uintptr_t{256});
 }
 
+// Hot-path allocator accounting, enabled by PIE_CUDA_LOG_ALLOC=1. The
+// mixtral/gpt-oss MoE forward allocates its scratch per call, and cudaFree
+// synchronizes the device, so the question "what does that churn cost" has to
+// be answered with a number before anyone hoists the buffers.
+std::atomic<long long> g_alloc_calls{0};
+std::atomic<long long> g_free_calls{0};
+std::atomic<long long> g_alloc_us{0};
+std::atomic<long long> g_free_us{0};
+
+bool alloc_logging_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_CUDA_LOG_ALLOC");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+struct AllocStatsDump {
+    ~AllocStatsDump() {
+        if (!alloc_logging_enabled()) return;
+        std::fprintf(stderr,
+            "[pie-alloc] allocs=%lld (%lld us total)  frees=%lld (%lld us total)\n",
+            g_alloc_calls.load(), g_alloc_us.load(),
+            g_free_calls.load(), g_free_us.load());
+    }
+};
+AllocStatsDump g_alloc_stats_dump;
+
 DeviceMemoryBlock allocate_device_memory(
     std::size_t bytes,
     std::size_t alignment) {
@@ -71,16 +103,46 @@ DeviceMemoryBlock allocate_device_memory(
             alignment);
         block.arena_owned = true;
     } else {
+        const auto t0 = std::chrono::steady_clock::now();
         CUDA_CHECK(cudaMalloc(&block.ptr, bytes));
+        if (alloc_logging_enabled()) {
+            g_alloc_us.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0).count(),
+                std::memory_order_relaxed);
+        }
     }
     sample_memory_callback();
+    // PIE_CUDA_LOG_ALLOC=1: report the first allocations so we can tell
+    // whether a forward runs with an ARENA installed (frees become no-ops and
+    // addresses are recycled) or with the plain cudaMalloc/cudaFree pair
+    // (cudaFree synchronizes the device, so recycling is safe but costly).
+    // g_memory_allocator is thread_local, so this can only be answered on the
+    // thread that actually runs the forward.
+    {
+        static const bool log_alloc = [] {
+            const char* v = std::getenv("PIE_CUDA_LOG_ALLOC");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (log_alloc) {
+            g_alloc_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     return block;
 }
 
 void free_device_memory(DeviceMemoryBlock block) noexcept {
     if (block.ptr == nullptr || block.arena_owned) return;
     sample_memory_callback();
+    const auto t0 = std::chrono::steady_clock::now();
     cudaFree(block.ptr);
+    if (alloc_logging_enabled()) {
+        g_free_calls.fetch_add(1, std::memory_order_relaxed);
+        g_free_us.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count(),
+            std::memory_order_relaxed);
+    }
     sample_memory_callback();
 }
 
