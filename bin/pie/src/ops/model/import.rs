@@ -115,9 +115,10 @@ pub struct ImportArgs {
     /// recommendation — see the note on `--help`.
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub max_shard_size: Option<u64>,
-    /// After the artifact is written and every tensor digest verifies, delete
-    /// the source weight files it was computed from. Config and tokenizer
-    /// files stay.
+    /// Delete source weight files only after the artifact tensors copied from
+    /// them verify. With --max-shard-size, completed output shards verify and
+    /// release covered source files during the import; the final open shard is
+    /// released after the root verifies. Config and tokenizer files stay.
     ///
     /// Only for a source that is already on disk. Reclaiming the HuggingFace
     /// snapshots an import downloaded is `pie cache clear snapshots`, which
