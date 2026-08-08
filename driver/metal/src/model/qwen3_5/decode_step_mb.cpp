@@ -257,19 +257,37 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             //     that the knob is honoured.
             //   * NOT the recurrent state, and NOT the dense GEMM
             //     (`PIE_METAL_QMM_MIN_BATCH=64` does not help).
+            //   * NOT a missing bind. `PIE_METAL_MOE_TRACE=1` now prints what
+            //     `bind_scratch` actually put in the argument table, and the mb
+            //     decode's layer-0 sort (ordinal 12301) writes `tile_expert` to
+            //     colour 6 while its expert projections (12303) read bind 12
+            //     from colour 6, with `row_expert` on 5 and `sorted_x` on 3 --
+            //     the schedule's contract, honoured, with no `SKIPPED` line on
+            //     any DAG. The prefill's rows bind the same colours at their
+            //     own offsets.
             //
-            // That leaves what the decode binds or passes, which is where to
-            // look next. The obvious instrument does not work here: golden taps
-            // turn pool recycling off, which takes scratch from 0.184 to 2.616
-            // GiB and puts an 18.16 GiB checkpoint over the GPU's limit
-            // (`kIOGPUCommandBufferCallbackErrorOutOfMemory`).
+            // That leaves what the two paths PUT in those colours, which no
+            // instrument in the tree can currently read on this checkpoint.
+            // Golden taps turn pool recycling off, which takes scratch from
+            // 0.184 to 2.616 GiB and puts an 18.16 GiB checkpoint over the
+            // GPU's limit (`kIOGPUCommandBufferCallbackErrorOutOfMemory`).
             // `PIE_METAL_TAPS_RECYCLE=1` dumps, but only the LAST layer's
             // values survive the recycling and by then both arms have diverged.
             // Truncating the checkpoint to one layer via `num_hidden_layers`
             // does not help either: the heap is reserved from the checkpoint's
             // tensors, not from the geometry, so a 1-layer DAG still asks for
             // 18.26 GiB and the paging staging refuses `1 routed layers in the
-            // DAG against 40 staged`.
+            // DAG against 40 staged`. Reading the sorted stack needs a tap that
+            // can name ONE dispatch, which is the next thing to build.
+            //
+            // One lead was checked here and is NOT it, recorded so the next
+            // reader does not spend the afternoon on it: the schedule colours
+            // the sort's `perm` and the gate's output `gp` the SAME slot (both
+            // colour 1 above), which would be a WAR hazard if the gather were
+            // still reading `perm` when the gate wrote `gp`. It is not --
+            // `concurrency_group` returns 0 for every mixture kind, so
+            // `concurrent_run_ends` leaves each of them alone in its run and
+            // `barrier_after_mb` emits a barrier after all of them.
             //
             // Not a reason to raise `moe_batch_min_per_expert` past 1, which
             // is the shape of fix that suggests itself: that constant carries
