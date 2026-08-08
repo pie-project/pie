@@ -1863,10 +1863,18 @@ void gemma4_moe_block(
             Lw.moe_gate_up_proj->data(),
             moe_ws.expert_gate_up.data(),
             N, K, H, Im, stream);
+        // The GEMV writes its rows in the fused bank's own order, so the
+        // split has to read that order too -- `moe_gate_up_proj` is built in
+        // flashinfer's [linear|gate] layout, not HuggingFace's [gate|up],
+        // which is what `gemma4_moe_gate_up_swapped()` reports and what the
+        // host-routed path below already passes. Omitting it here took the
+        // `gate_second = false` default and computed `gelu_tanh(up) * gate`:
+        // wrong, but smoothly wrong, so 26B-A4B stayed fluent and looped
+        // instead of failing.
         kernels::launch_chunked_geglu_tanh_bf16(
             moe_ws.expert_gate_up.data(),
             moe_ws.expert_act.data(),
-            routes, Im, stream);
+            routes, Im, stream, /*gate_second=*/gemma4_moe_gate_up_swapped());
         kernels::launch_moe_down_decode_gemv_bf16(
             moe_ws.topk_idx.data(),
             moe_ws.expert_act.data(),
