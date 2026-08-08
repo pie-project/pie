@@ -206,32 +206,34 @@ void prepare_llama_like_decode_plan(
                 // `PIE_PREFILL_GRAPH` could make such a wave replay on this
                 // family.
                 //
-                // ARMED under the flag, so `PIE_PREFILL_GRAPH=1` means what
-                // its name says; inert at the default 0, so the default path
-                // is bit-for-bit unchanged.
+                // Left `false`, matching upstream, and NOT armed to follow
+                // `PIE_PREFILL_GRAPH` -- which now defaults ON, so arming here
+                // would turn graph-mode planning on for every prefill wave by
+                // default. Measured: it does, `plan_us` 93 -> 99-103 us on an
+                // over-cliff wave, and it buys exactly nothing, because a
+                // SECOND gate is shut independently.
                 //
-                // Arming it costs ~4-6% on 4096x64 @c256, and profiling
-                // (rather than subtracting) says what that is: **the graph
-                // CAPTURES**, at ~10-14.5 ms each. With the flag on, 79 waves
-                // spend more than 2 ms in `forward_enqueue` and together they
-                // are 0.798 s of an 8.8 s run, against a replay saving of
-                // ~0.199 s. `plan_us` barely moves (93 -> 103 us), so it is
-                // NOT the planning — an earlier reading here said it was, from
-                // a grain sweep whose two terms (padding waste and capture
-                // count) cancel, and from a second-touch experiment that was
-                // confounded because declining to capture means paying the
-                // eager path instead.
+                // Both gates, and both are upstream's:
+                //   1. this `false` -- `cache.graph_capturable` is
+                //      `enable_cuda_graph && causal_mask && !custom_mask`, so
+                //      `forward_graph_replay_eligible`'s `geometry_replayable`
+                //      collapses to `is_pure_decode` for this family;
+                //   2. the wave is never graph-PADDED, so `graph_pad_requests`
+                //      is 0, so `frame.cpp` never pads `num_logit_rows` up to
+                //      `forward_R`, so the `logit_rows_keyed` invariant the
+                //      dispatch gate tests is false. Measured directly: of 263
+                //      prefill-carrying waves in a default run, ZERO have a
+                //      token count that is a multiple of the 128-token grain.
                 //
-                // The mechanism itself works completely: over-cliff
-                // `forward_enqueue` drops 1,136 -> 18 us and the emitted
-                // tokens are bit-identical to the eager path on the
-                // deterministic c1 cell. What it needs is the captures taken
-                // OUT OF BAND — `capture_prefill_graph_lattice` in
-                // `batch/forward.cpp` does that behind
-                // `PIE_PREFILL_GRAPH_LATTICE`, and with it the same cell reads
-                // +0.2% at 4,096 requests and +0.95% at 16,384.
-                /*graph_mode_plan=*/
-                prefill_graph_enabled() && score_window == 0,
+                // So `PIE_PREFILL_GRAPH=1` currently produces zero graph
+                // captures and zero replays on this family (over-cliff
+                // `forward_enqueue` 1,150 us, against ~13 us for a replay),
+                // and fixing either gate alone leaves the other. Arming this
+                // is a prerequisite, not a fix; see
+                // `.wiki/contention/agent-charlie.md` §53 for the measurement
+                // and `capture_prefill_graph_lattice` in `batch/forward.cpp`
+                // for the out-of-band capture the path needs once it fires.
+                /*graph_mode_plan=*/false,
                 fwd_cfg.sliding_window,
                 /*full_attention_variant=*/false,
                 cache.hnd_layout(),
