@@ -2926,3 +2926,45 @@ template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4")]]
     const device uint32_t*, const device bfloat*, const device bfloat*,
     const device bfloat*, device bfloat*, const constant int&,
     const constant int&, uint3, uint, uint);
+
+// The other direction, which the note above argues for and never tested. If
+// "fewer, fatter threadgroups is what it minds" then 128 threads is not the
+// floor of that argument -- 64 is. A 2x1 or 1x2 warp shape halves the
+// threadgroup at the same tile, so six fit on a core where three do, and a
+// standalone `matmul2d` sweep at this checkpoint's prefill shape (M=128,
+// K=N=5120) does put its best arm at two simdgroups: 6.33 TFLOP/s against
+// 6.29 at four and 3.23 at eight.
+//
+// IT LOSES, and it loses to the cost the argument predicted. A lane holds
+// TM*TN*2 accumulator fragments and halving the simdgroups doubles one of TM
+// or TN, so 16 becomes 32 and the registers give back what the threadgroup
+// count won. `roofline_probe <kernels> 128 32`, M1 Max, whole-step TFLOP/s:
+//
+//     BM=64  2x2  (128 thr)   3.88   the shipping shape
+//     BM=64  2x1  ( 64 thr)   3.61   -7.0%
+//     BM=64  1x2  ( 64 thr)   3.58   -7.7%
+//     BM=32  1x2  ( 64 thr)   3.34   -13.9%
+//
+// So the occupancy axis is now closed in BOTH directions around 2x2 -- eight
+// simdgroups is -9.7% by the table above, two is -7.0% by this one. That is
+// worth more than either arm winning would have been: it means the shipping
+// warp shape is a peak and not a default nobody questioned. Kept instantiated
+// and undispatched, like the 256-thread pair, so the next person to have this
+// idea can re-run it in a minute instead of re-deriving it.
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 32, 2, 1>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 32, 1, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 32, 32, 32, 1, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
