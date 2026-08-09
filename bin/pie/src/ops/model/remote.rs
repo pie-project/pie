@@ -6,7 +6,7 @@
 //! the seam. Disabling `remote-import` removes this file from the build without
 //! changing local checkpoint handling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -228,21 +228,61 @@ impl RemoteSnapshot {
                 anyhow!("{repo}@{requested_revision}: Hub response has no commit SHA")
             })?;
             let siblings = info.siblings.unwrap_or_default();
-            let mut weights: Vec<RemoteFileInfo> = siblings
+            let weight_paths = if siblings
                 .iter()
-                .filter(|entry| {
-                    entry.rfilename == "model.safetensors"
-                        || (entry.rfilename.starts_with("model-")
-                            && entry.rfilename.ends_with(".safetensors"))
+                .any(|entry| entry.rfilename == "model.safetensors.index.json")
+            {
+                let url = resolve_url(
+                    &endpoint,
+                    &repo,
+                    &revision,
+                    "model.safetensors.index.json",
+                )?;
+                let index: serde_json::Value = client
+                    .get(url)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                index
+                    .get("weight_map")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| anyhow!("model.safetensors.index.json has no weight_map"))?
+                    .values()
+                    .map(|value| {
+                        value.as_str().map(str::to_string).ok_or_else(|| {
+                            anyhow!("model.safetensors.index.json contains a non-string shard")
+                        })
+                    })
+                    .collect::<Result<BTreeSet<_>>>()?
+            } else if siblings
+                .iter()
+                .any(|entry| entry.rfilename == "model.safetensors")
+            {
+                BTreeSet::from(["model.safetensors".to_string()])
+            } else {
+                siblings
+                    .iter()
+                    .filter(|entry| entry.rfilename.ends_with(".safetensors"))
+                    .map(|entry| entry.rfilename.clone())
+                    .collect()
+            };
+            let mut weights: Vec<RemoteFileInfo> = weight_paths
+                .into_iter()
+                .map(|path| {
+                    let sibling = siblings
+                        .iter()
+                        .find(|entry| entry.rfilename == path)
+                        .ok_or_else(|| {
+                            anyhow!("model.safetensors.index.json names absent shard {path:?}")
+                        })?;
+                    Ok(RemoteFileInfo {
+                        path,
+                        size_bytes: sibling.size.unwrap_or(0),
+                    })
                 })
-                .map(|entry| RemoteFileInfo {
-                    path: entry.rfilename.clone(),
-                    size_bytes: entry.size.unwrap_or(0),
-                })
-                .collect();
-            if weights.iter().any(|file| file.path == "model.safetensors") {
-                weights.retain(|file| file.path == "model.safetensors");
-            }
+                .collect::<Result<_>>()?;
             weights.sort_unstable_by(|a, b| a.path.cmp(&b.path));
             if weights.is_empty() {
                 bail!("{repo}@{revision} has no model safetensors files");
